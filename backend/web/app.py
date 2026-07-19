@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.db import client as db_client
+from backend.health import snapshot as health_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ _DIST = Path(__file__).parent.parent / "dist"
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return health_snapshot()
 
 
 @app.get("/api/saves")

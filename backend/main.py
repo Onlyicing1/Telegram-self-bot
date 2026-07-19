@@ -35,6 +35,14 @@ from backend.bio import engine as bio_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
 from backend.db import client as db_client
+from backend.health import (
+    check_stale,
+    mark_started,
+    set_bio_cron_ok,
+    set_supervisor_ok,
+    set_telethon_connected,
+    update_heartbeat,
+)
 from backend.web.app import app as web_app
 
 logging.basicConfig(
@@ -52,6 +60,20 @@ _uvicorn_server: uvicorn.Server | None = None
 _WATCHDOG_INTERVAL = 60
 _WATCHDOG_TIMEOUT = 15
 _RECONNECT_DELAY = 10
+_HEARTBEAT_INTERVAL = 5.0
+
+
+async def _heartbeat(shutdown: asyncio.Event) -> None:
+    """Update the health heartbeat every few seconds while running."""
+    while not shutdown.is_set():
+        try:
+            update_heartbeat()
+            check_stale()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Heartbeat error: %s", exc)
+        await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
 
 async def _run_web(port: int) -> None:
@@ -69,13 +91,17 @@ async def _run_web(port: int) -> None:
 
 async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
     """Run run_until_disconnected() in a loop, reconnecting on exit."""
+    set_supervisor_ok(True)
     while not shutdown.is_set():
+        set_telethon_connected(client.is_connected())
         try:
             await client.run_until_disconnected()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Telethon run_until_disconnected error: %s", exc)
+
+        set_telethon_connected(False)
 
         if shutdown.is_set():
             break
@@ -87,11 +113,13 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
             if not await client.is_user_authorized():
                 logger.error("Reconnect: session not authorized — will retry")
                 continue
+            set_telethon_connected(True)
             logger.info("Telethon reconnected successfully")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error("Reconnect failed: %s — will retry in %ds", exc, _RECONNECT_DELAY)
+    set_supervisor_ok(False)
 
 
 async def _watchdog(client, shutdown: asyncio.Event) -> None:
@@ -101,7 +129,9 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
             await asyncio.sleep(_WATCHDOG_INTERVAL)
             if shutdown.is_set():
                 break
-            if not client.is_connected():
+            connected = client.is_connected()
+            set_telethon_connected(connected)
+            if not connected:
                 logger.warning("Watchdog: client not connected — skipping ping")
                 continue
             try:
@@ -129,6 +159,8 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
 async def main() -> None:
     cfg = cfg_module.load()
 
+    mark_started()
+
     shutdown: asyncio.Event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -152,6 +184,7 @@ async def main() -> None:
     # ── Phase 2: Telethon client ──────────────────────────────────────────
     logger.info("[2/5] Connecting Telethon")
     client = await build_client(cfg["API_ID"], cfg["API_HASH"], cfg["SESSION_STRING"])
+    set_telethon_connected(True)
 
     # ── Phase 3: Register command handlers (exactly once) ─────────────────
     logger.info("[3/5] Registering command handlers")
@@ -169,19 +202,24 @@ async def main() -> None:
             logger.info("[4/5] Bio cron started (BIO_UPDATE_ENABLED=true)")
         else:
             logger.info("[4/5] Bio cron not active — skipping")
+        set_bio_cron_ok(bio_engine.is_running())
     except Exception as exc:
         logger.warning("[4/5] Bio cron resume check failed: %s", exc)
+        set_bio_cron_ok(False)
 
     # ── Phase 5: Web server (background, non-blocking) ────────────────────
     logger.info("[5/5] Starting web server on port %s", cfg["PORT"])
     web_task = asyncio.create_task(_run_web(cfg["PORT"]), name="lifeos-web")
 
-    # ── Supervisors: Telethon + watchdog ───────────────────────────────────
+    # ── Supervisors: Telethon + watchdog + heartbeat ────────────────────────
     tg_supervisor = asyncio.create_task(
         _supervise_telethon(client, shutdown), name="lifeos-tg-supervisor"
     )
     watchdog_task = asyncio.create_task(
         _watchdog(client, shutdown), name="lifeos-watchdog"
+    )
+    heartbeat_task = asyncio.create_task(
+        _heartbeat(shutdown), name="lifeos-heartbeat"
     )
 
     logger.info("LifeOS online.")
@@ -192,6 +230,9 @@ async def main() -> None:
     # ── Shutdown A: bio cron ──────────────────────────────────────────────
     logger.info("Shutdown: stopping bio cron")
     bio_engine.stop_cron()
+    set_bio_cron_ok(False)
+    set_supervisor_ok(False)
+    set_telethon_connected(False)
 
     # ── Shutdown B: web server ────────────────────────────────────────────
     logger.info("Shutdown: signalling web server")

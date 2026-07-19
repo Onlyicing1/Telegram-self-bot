@@ -1083,6 +1083,42 @@ single integer, not a list.
 
 ---
 
+## 25. Git Workspace Recovery
+
+1. NEVER assume the repository is missing just because `.git` is not visible.
+2. If any git command fails with:
+   - "fatal: not a git repository"
+   - missing `.git`
+   - missing remote
+   then STOP and attempt repository recovery BEFORE reporting failure.
+3. Recovery procedure (mandatory):
+   Step 1:
+   Check whether the Bolt workspace is connected to GitHub.
+   Step 2:
+   If Bolt shows "Synced to GitHub" or a connected repository in the UI, treat that repository as the source of truth.
+   Step 3:
+   Restore the local git metadata from the connected repository instead of giving up.
+   Step 4:
+   After recovery verify:
+   - `.git` exists
+   - `git status`
+   - `git remote -v`
+   - current branch
+   - latest commit
+   Step 5:
+   Continue the original task exactly where it stopped.
+4. NEVER tell the user to reconnect GitHub before attempting the recovery procedure.
+5. NEVER claim "there is no repository" unless the recovery procedure has already failed.
+6. NEVER stop only because `.git` disappeared.
+7. If the connected repository already contains the requested changes, report that instead of trying to recreate commits.
+8. When a workspace reset occurs, recover first, continue second, explain last.
+9. Pushing is mandatory whenever the repository is connected and the current task requires a push.
+10. Do NOT create forks, new repositories, or new remotes if the Bolt workspace is already connected to GitHub.
+11. Always prefer restoring the existing workspace over rebuilding it.
+12. These rules have higher priority than any previous Git workflow instructions in AGENTS.md.
+
+---
+
 ## Document Version
 
 This document reflects the state of the repository as of the commit that
