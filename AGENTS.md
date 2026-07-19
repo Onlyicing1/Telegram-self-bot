@@ -198,8 +198,10 @@ architecture.
 
 ### `backend/db/client.py` — Database Layer
 
-Supabase singleton client with automatic in-memory fallback. See §9 for full
-architecture.
+Supabase singleton client with automatic in-memory fallback. All public
+functions are async. Supabase's synchronous `.execute()` calls are offloaded
+to worker threads via `asyncio.to_thread()` with a 20s hard timeout, so a
+stalled HTTP request never blocks the event loop. See §9 for full architecture.
 
 ### `backend/web/app.py` — FastAPI Web Server
 
@@ -486,6 +488,11 @@ task. Stored in module-level `_task`.
 **Singleton pattern:** `get_db()` initializes the Supabase client on first
 call. If env vars are missing or initialization fails, returns `None` and all
 operations fall back to in-memory storage.
+
+**Non-blocking I/O:** Every public function is async. Supabase's synchronous
+`.execute()` calls are offloaded to worker threads via `asyncio.to_thread()`
+with a 20s hard timeout (`_run_sync` wrapper). A stalled HTTP request never
+blocks the event loop.
 
 **In-memory fallback:** A module-level dict with three keys:
 ```python
@@ -943,8 +950,8 @@ network) is wrapped in error handling that degrades gracefully.
 5. **Verify before pushing.** Ensure the build passes and the commit
    contains only intended changes.
 
-6. **Remote:** `https://github.com/Onlyicing2/Telegram-self-bot.git`
-   (branch: `main`).
+6. **Remote:** Use the repository already connected to the current
+   workspace/session. Never hard-code or guess a repository URL.
 
 7. **Don't push broken or incomplete work.** A shipped feature beats
    several half-built ones.
@@ -981,9 +988,8 @@ network) is wrapped in error handling that degrades gracefully.
 9. **Verify file existence and location** after creating files. Don't
    assume the write succeeded without checking.
 
-10. **Never guess URLs.** Use URLs provided by the user or documented in
-    this file. The Git remote is:
-    `https://github.com/Onlyicing2/Telegram-self-bot.git`
+10. **Never guess URLs.** Use the repository already connected to the
+    current workspace/session. Never hard-code a repository URL.
 
 11. **Commit only what was asked.** If asked to commit one file, stage and
     commit only that file. Don't `git add .` indiscriminately.
