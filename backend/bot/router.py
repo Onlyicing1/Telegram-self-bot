@@ -19,7 +19,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("delete", lambda: delete.register(client, owner_id)),
         ("organize", lambda: organize.register(client, owner_id)),
         ("bio", lambda: bio.register(client, owner_id, tz_str)),
-        ("discover", lambda: discover.register(client, owner_id)),
+        ("discover", lambda: discover.register(client, owner_id, tz_str)),
         ("database", lambda: database.register(client, owner_id, tz_str)),
     ]
 
