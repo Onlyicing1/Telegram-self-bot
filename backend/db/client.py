@@ -1,19 +1,17 @@
 """
 Database layer — Supabase if available, in-memory fallback otherwise.
 
-The singleton client is initialised on first access. If Supabase env
-vars are missing or the connection fails, all operations silently
-degrade to in-memory storage so the bot never crashes.
-
-Every public function wraps its Supabase call in try/except so that
-a network error, missing table, or DNS failure never propagates to
-the caller — the in-memory fallback is used instead.
+Every public function is async. Supabase's synchronous .execute() calls are
+offloaded to a worker thread via asyncio.to_thread() with a hard timeout, so
+a stalled HTTP request never blocks the event loop. If Supabase is missing or
+fails, all operations silently degrade to in-memory storage.
 """
 import asyncio
 import logging
 import os
 import random
 import string
+import time
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -27,6 +25,8 @@ _initialised = False
 _SHORT_CODE_PREFIX = "S"
 _SHORT_CODE_NUM_LEN = 4
 _SHORT_CODE_ALPHABET = string.ascii_uppercase + string.digits
+
+_DB_TIMEOUT = 20.0
 
 
 def _check_available() -> bool:
@@ -65,6 +65,14 @@ def is_available() -> bool:
     return _available
 
 
+async def _run_sync(fn, *args, **kwargs):
+    """Run a synchronous Supabase call in a worker thread with a hard timeout."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(fn, *args, **kwargs),
+        timeout=_DB_TIMEOUT,
+    )
+
+
 async def log(owner_id: int, level: str, message: str, context: dict | None = None) -> None:
     try:
         entry = {
@@ -76,28 +84,26 @@ async def log(owner_id: int, level: str, message: str, context: dict | None = No
         }
         db = get_db()
         if db:
-            db.table("bot_logs").insert(entry).execute()
+            await _run_sync(lambda: db.table("bot_logs").insert(entry).execute())
         else:
             entry["id"] = len(_fallback["bot_logs"]) + 1
             _fallback["bot_logs"].append(entry)
     except Exception:
-        pass
+        logger.warning("db.log failed — using fallback", exc_info=True)
+        entry["id"] = len(_fallback["bot_logs"]) + 1
+        _fallback["bot_logs"].append(entry)
 
 
 async def get_next_save_code() -> str:
-    """Generate a compact, human-readable save code (e.g. S391, A82).
-
-    Tries a sequential numeric code first (S + zero-padded count) so codes
-    are stable and sortable. If that collides with an existing row (e.g.
-    legacy SV-NNNNNN rows were removed), falls back to a random alphanumeric
-    code. Always verifies uniqueness against the DB before returning.
-    """
+    """Generate a compact save code (e.g. S0001). Sequential with collision fallback."""
     async with _save_code_lock:
         db = get_db()
         count = 0
         if db:
             try:
-                result = db.table("saved_items").select("id", count="exact").execute()
+                result = await _run_sync(
+                    lambda: db.table("saved_items").select("id", count="exact").execute()
+                )
                 count = result.count or 0
             except Exception:
                 count = len(_fallback["saved_items"])
@@ -119,12 +125,11 @@ async def get_next_save_code() -> str:
 
 
 async def _is_code_free(code: str) -> bool:
-    """Check that a code is not already used as save_code or short_code."""
     db = get_db()
     if db:
         try:
-            res = (
-                db.table("saved_items")
+            res = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("id")
                 .or_(f"save_code.eq.{code},short_code.eq.{code}")
                 .limit(1)
@@ -139,11 +144,11 @@ async def _is_code_free(code: str) -> bool:
     return True
 
 
-def insert_save(data: dict) -> dict | None:
+async def insert_save(data: dict) -> dict | None:
     db = get_db()
     if db:
         try:
-            result = db.table("saved_items").insert(data).execute()
+            result = await _run_sync(lambda: db.table("saved_items").insert(data).execute())
             return result.data[0] if result.data else None
         except Exception as exc:
             logger.warning("Supabase insert_save failed (%s) — using fallback.", exc)
@@ -152,18 +157,14 @@ def insert_save(data: dict) -> dict | None:
     return data
 
 
-def query_save(save_code: str) -> dict | None:
-    """Look up a saved item by short_code OR legacy save_code.
-
-    Tries short_code first (new format), then falls back to save_code
-    (legacy SV-NNNNNN) so old commands keep working.
-    """
+async def query_save(save_code: str) -> dict | None:
+    """Look up by short_code OR legacy save_code."""
     code = save_code.upper()
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("saved_items")
+            result = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("*")
                 .or_(f"short_code.eq.{code},save_code.eq.{code}")
                 .maybe_single()
@@ -180,20 +181,20 @@ def query_save(save_code: str) -> dict | None:
     return None
 
 
-def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, int]:
+async def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, int]:
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("saved_items")
+            result = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("*")
                 .eq("owner_id", owner_id)
                 .order("created_at", desc=True)
                 .range(offset, offset + limit - 1)
                 .execute()
             )
-            count_res = (
-                db.table("saved_items")
+            count_res = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("id", count="exact")
                 .eq("owner_id", owner_id)
                 .execute()
@@ -206,13 +207,12 @@ def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, i
     return items[offset:offset + limit], total
 
 
-def list_recent_saves(owner_id: int, limit: int = 10) -> list:
-    """Return recent saves for .list — uses idx_saved_items_owner_created."""
+async def list_recent_saves(owner_id: int, limit: int = 10) -> list:
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("saved_items")
+            result = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("short_code,save_code,save_type,media_type,file_name,mime_type,created_at")
                 .eq("owner_id", owner_id)
                 .order("created_at", desc=True)
@@ -230,18 +230,13 @@ def list_recent_saves(owner_id: int, limit: int = 10) -> list:
     return items[:limit]
 
 
-def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
-    """Search saves by caption, file_name, save_code, short_code, mime_type.
-
-    Uses trigram indexes (pg_trgm) for fast ILIKE matching. Falls back to
-    a simple in-memory scan when Supabase is unavailable.
-    """
+async def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
     pattern = f"%{query}%"
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("saved_items")
+            result = await _run_sync(
+                lambda: db.table("saved_items")
                 .select("short_code,save_code,save_type,media_type,file_name,mime_type,created_at")
                 .eq("owner_id", owner_id)
                 .or_(
@@ -271,20 +266,20 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
     return matches[:limit]
 
 
-def delete_save(owner_id: int, code: str) -> dict | None:
-    """Delete a saved_items row by short_code or save_code. Returns the row or None."""
-    target = query_save(code)
+async def delete_save(owner_id: int, code: str) -> dict | None:
+    target = await query_save(code)
     if not target or target.get("owner_id") != owner_id:
         return None
     db = get_db()
     if db:
         try:
             sc = target.get("short_code") or target.get("save_code")
-            res = (
-                db.table("saved_items")
+            col = "short_code" if target.get("short_code") else "save_code"
+            res = await _run_sync(
+                lambda: db.table("saved_items")
                 .delete()
                 .eq("owner_id", owner_id)
-                .eq("short_code" if target.get("short_code") else "save_code", sc)
+                .eq(col, sc)
                 .execute()
             )
             return target if (res.data or []) else None
@@ -298,14 +293,16 @@ def delete_save(owner_id: int, code: str) -> dict | None:
     return target
 
 
-def count_saves(owner_id: int, save_type: str | None = None) -> int:
+async def count_saves(owner_id: int, save_type: str | None = None) -> int:
     db = get_db()
     if db:
         try:
-            q = db.table("saved_items").select("id", count="exact").eq("owner_id", owner_id)
-            if save_type:
-                q = q.eq("save_type", save_type)
-            result = q.execute()
+            def _q():
+                q = db.table("saved_items").select("id", count="exact").eq("owner_id", owner_id)
+                if save_type:
+                    q = q.eq("save_type", save_type)
+                return q.execute()
+            result = await _run_sync(_q)
             return result.count or 0
         except Exception as exc:
             logger.warning("Supabase count_saves failed (%s) — using fallback.", exc)
@@ -315,12 +312,12 @@ def count_saves(owner_id: int, save_type: str | None = None) -> int:
     return len(items)
 
 
-def get_bio_state(owner_id: int) -> dict | None:
+async def get_bio_state(owner_id: int) -> dict | None:
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("bio_state")
+            result = await _run_sync(
+                lambda: db.table("bio_state")
                 .select("*")
                 .eq("owner_id", owner_id)
                 .maybe_single()
@@ -332,8 +329,8 @@ def get_bio_state(owner_id: int) -> dict | None:
     return _fallback["bio_state"].get(owner_id)
 
 
-def get_or_create_bio_state(owner_id: int) -> dict:
-    state = get_bio_state(owner_id)
+async def get_or_create_bio_state(owner_id: int) -> dict:
+    state = await get_bio_state(owner_id)
     if state:
         return state
 
@@ -350,9 +347,9 @@ def get_or_create_bio_state(owner_id: int) -> dict:
     db = get_db()
     if db:
         try:
-            db.table("bio_state").insert(default).execute()
-            result = (
-                db.table("bio_state")
+            await _run_sync(lambda: db.table("bio_state").insert(default).execute())
+            result = await _run_sync(
+                lambda: db.table("bio_state")
                 .select("*")
                 .eq("owner_id", owner_id)
                 .maybe_single()
@@ -366,11 +363,13 @@ def get_or_create_bio_state(owner_id: int) -> dict:
     return default
 
 
-def update_bio_state(owner_id: int, updates: dict) -> None:
+async def update_bio_state(owner_id: int, updates: dict) -> None:
     db = get_db()
     if db:
         try:
-            db.table("bio_state").update(updates).eq("owner_id", owner_id).execute()
+            await _run_sync(
+                lambda: db.table("bio_state").update(updates).eq("owner_id", owner_id).execute()
+            )
             return
         except Exception as exc:
             logger.warning("Supabase update_bio_state failed (%s) — using fallback.", exc)
@@ -379,12 +378,12 @@ def update_bio_state(owner_id: int, updates: dict) -> None:
     _fallback["bio_state"][owner_id] = state
 
 
-def count_logs(owner_id: int) -> int:
+async def count_logs(owner_id: int) -> int:
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("bot_logs")
+            result = await _run_sync(
+                lambda: db.table("bot_logs")
                 .select("id", count="exact")
                 .eq("owner_id", owner_id)
                 .execute()
@@ -395,12 +394,12 @@ def count_logs(owner_id: int) -> int:
     return len([l for l in _fallback["bot_logs"] if l.get("owner_id") == owner_id])
 
 
-def list_logs(owner_id: int, limit: int = 100) -> list:
+async def list_logs(owner_id: int, limit: int = 100) -> list:
     db = get_db()
     if db:
         try:
-            result = (
-                db.table("bot_logs")
+            result = await _run_sync(
+                lambda: db.table("bot_logs")
                 .select("*")
                 .eq("owner_id", owner_id)
                 .order("created_at", desc=True)
@@ -414,13 +413,13 @@ def list_logs(owner_id: int, limit: int = 100) -> list:
     return logs[-limit:] if limit > 0 else logs
 
 
-def clean_logs(owner_id: int, days: int = 7) -> int:
+async def clean_logs(owner_id: int, days: int = 7) -> int:
     db = get_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     if db:
         try:
-            result = (
-                db.table("bot_logs")
+            result = await _run_sync(
+                lambda: db.table("bot_logs")
                 .delete()
                 .eq("owner_id", owner_id)
                 .lt("created_at", cutoff)
