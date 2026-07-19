@@ -4,8 +4,7 @@
 > This document contains everything needed to manually recreate the
 > entire Supabase project from scratch without reading source code.
 >
-> Repository: `https://github.com/Onlyicing3/Telegram-self-bot`
-> Branch HEAD: `141e963d8a5990cc43662b0391a56aa15a679a78`
+> Repository: use the repository connected to the current workspace/session.
 
 ---
 
@@ -81,10 +80,11 @@ usage, and no `psql` calls anywhere in the codebase.
    function with no persistence. This is a deliberate design choice,
    not an error path.
 
-3. **Synchronous HTTP calls in async context.** The `supabase-py`
-   client uses `httpx` in synchronous mode. Every `.execute()` call
-   blocks the asyncio event loop for the duration of the HTTP
-   round-trip. This is a known architectural trade-off, not a bug.
+3. **Non-blocking HTTP calls in async context.** The `supabase-py`
+   client uses `httpx` in synchronous mode. Every `.execute()` call is
+   offloaded to a worker thread via `asyncio.to_thread()` with a 20 s
+   hard timeout, so a stalled HTTP request never blocks the asyncio
+   event loop. All public db_client functions are async.
 
 4. **No direct SQL.** The backend never executes raw SQL. All
    database access is via the Supabase client's query builder
@@ -1025,8 +1025,9 @@ the authoritative migration.
 12. No foreign keys exist between any tables.
 13. No Supabase Auth, Storage, Realtime, Edge Functions, or RPC are
     used.
-14. The `supabase-py` client is synchronous (blocks the asyncio event
-    loop).
+14. The `supabase-py` client is synchronous, but all `.execute()`
+    calls are offloaded to worker threads via `asyncio.to_thread()`
+    with a 20 s timeout, so the event loop is never blocked.
 15. The in-memory fallback uses a Python dict with keys
     `saved_items` (list), `bio_state` (dict keyed by owner_id),
     `bot_logs` (list).
@@ -1252,22 +1253,19 @@ can be inserted directly into the database (bypassing the
 application). The application enforces valid values at the code
 level, but the database itself does not.
 
-#### R-6: Synchronous Supabase Calls Block the Event Loop
+#### R-6: Synchronous Supabase Calls (RESOLVED)
 
-**Severity:** Medium
+**Severity:** Resolved
 
-The `supabase-py` client uses `httpx` in synchronous mode. Every
-`.execute()` call blocks the asyncio event loop for the duration of
-the HTTP round-trip. Under normal conditions (Supabase responding in
-<100ms) this is invisible, but under DB latency spikes:
+The `supabase-py` client uses `httpx` in synchronous mode. Previously,
+every `.execute()` call blocked the asyncio event loop for the
+duration of the HTTP round-trip, which could silently stall the bot
+under DB latency spikes.
 
-- Telethon may miss incoming events or delay responses.
-- The bio cron may fire late (the sleep is followed by a blocking DB
-  call).
-- Concurrent commands may appear to queue behind each other.
-
-**Fix direction:** Use `supabase-py` async client or run synchronous
-calls in a thread executor.
+**Resolution:** All `.execute()` calls are now offloaded to worker
+threads via `asyncio.to_thread()` with a 20 s hard timeout. All
+public `db_client` functions are async. A stalled HTTP request can no
+longer block the event loop.
 
 #### R-7: No GIN Index on `tags` Array
 
@@ -1353,13 +1351,14 @@ causing the reported count to be `0`.
 | Severity | Count | IDs |
 |---|---|---|
 | High | 1 | R-1 |
-| Medium | 4 | R-2, R-3, R-6, R-8, R-11 |
+| Medium | 3 | R-2, R-3, R-8, R-11 |
 | Low | 6 | R-4, R-5, R-7, R-9, R-10, R-12 |
+| Resolved | 1 | R-6 |
 
 ---
 
 ### End of Document
 
-This document reflects the state of the repository at commit
-`141e963d8a5990cc43662b0391a56aa15a679a78`. If the codebase changes
-in ways that invalidate any section above, update this document.
+This document reflects the state of the repository as of the latest
+commit. If the codebase changes in ways that invalidate any section
+above, update this document.
