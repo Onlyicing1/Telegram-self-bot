@@ -1,17 +1,19 @@
 """
 .ping    — Edit trigger with PONG (zero-spam policy).
 .id      — Chat ID + Message ID of the current context.
-.help    — Interactive help menu (single message, edit-only navigation).
+.help    — Interactive inline help panel (helper bot inline keyboard).
 .health  — Full health dashboard.
 .kill    — Diagnostic snapshot + stalled-task recovery.
 .logs    — View recent diagnostic events (black box).
 
-Help navigation:
-  - .help sends ONE message (the main menu).
-  - Replying with a number edits that SAME message into the category page.
-  - Replying 0 returns to the main menu.
-  - Navigation reply messages are auto-deleted (clean chat).
-  - State is tracked per-owner via a module-level dict (single owner bot).
+Help panel:
+  - .help deletes the trigger (zero-spam) and sends ONE inline message
+    via the helper bot with category buttons.
+  - Tapping a category edits that SAME message to show commands.
+  - Every category page has Back (returns to category list) and Close
+    (deletes the panel message).
+  - Falls back to a plain-text edit-in-place menu when the helper bot
+    is not available (no BOT_TOKEN).
 """
 import asyncio
 import logging
@@ -25,6 +27,8 @@ from backend import diagnostics, health
 from backend.bio import engine as bio_engine
 from backend.bot.handlers.guard import is_owner
 from backend.db import client as db_client
+from backend.helper import InlinePanelBuilder, register_panel, get_panel
+from backend.helper.client import get_client
 
 
 def _resolve_tz() -> str:
@@ -117,36 +121,59 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
-def _build_main_menu() -> str:
+def _build_main_menu_text() -> str:
     lines = ["**LifeOS Command Center**\n"]
     for i, (label, _) in enumerate(_HELP_CATEGORIES, start=1):
-        lines.append(f"`{i}` • {label}")
-    lines.append("\n_Reply with a number._")
+        lines.append(f"{i} • {label}")
+    lines.append("\n_Tap a category._")
     return "\n".join(lines)
 
 
-def _build_category_page(index: int) -> str:
+def _build_category_page_text(index: int) -> str:
     _, lines = _HELP_CATEGORIES[index]
-    page = list(lines)
-    page.append("\n_Reply `0` to return._")
-    return "\n".join(page)
+    return "\n".join(lines)
 
 
-# ── Help state (single owner) ───────────────────────────────────────────
-
-_help_state: dict[int, dict] = {}
-
-
-def _get_help_state(owner_id: int) -> dict | None:
-    return _help_state.get(owner_id)
-
-
-def _set_help_state(owner_id: int, msg_id: int) -> None:
-    _help_state[owner_id] = {"msg_id": msg_id}
+def _build_main_menu_keyboard() -> list:
+    builder = InlinePanelBuilder()
+    for i, (label, _) in enumerate(_HELP_CATEGORIES):
+        builder.add_row(label, f"panel:help:cat:{i}")
+    builder.add_row("Close", "panel:help:close")
+    return builder.build()
 
 
-def _clear_help_state(owner_id: int) -> None:
-    _help_state.pop(owner_id, None)
+def _build_category_keyboard() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_buttons(("Back", "panel:help:back"), ("Close", "panel:help:close"))
+    return builder.build()
+
+
+async def _help_panel_handler(event, extra: str) -> None:
+    if extra == "close":
+        try:
+            await event.delete()
+        except Exception as exc:
+            logger.warning("help panel close failed: %s", exc)
+        return
+    if extra == "back":
+        await event.edit(_build_main_menu_text(), buttons=_build_main_menu_keyboard())
+        return
+    if extra.startswith("cat:"):
+        idx_str = extra[4:]
+        if idx_str.isdigit():
+            idx = int(idx_str)
+            if 0 <= idx < len(_HELP_CATEGORIES):
+                await event.edit(
+                    _build_category_page_text(idx),
+                    buttons=_build_category_keyboard(),
+                )
+                return
+    await event.edit(_build_main_menu_text(), buttons=_build_main_menu_keyboard())
+
+
+def _register_help_panel() -> None:
+    if get_panel("help") is None:
+        register_panel("help", _help_panel_handler)
 
 
 # ── Health dashboard ────────────────────────────────────────────────────
@@ -322,54 +349,30 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("id_cmd failed: %s", exc)
 
-    # ── .help — interactive menu ──────────────────────────────────────
+    _register_help_panel()
+
+    # ── .help — inline panel via helper bot ───────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
     async def help_cmd(event):
         if not is_owner(event, owner_id):
             return
-        try:
-            await event.edit(_build_main_menu())
-            _set_help_state(owner_id, event.message.id)
-        except Exception as exc:
-            logger.warning("help edit failed: %s", exc)
-
-    # ── Help navigation (reply with number) ────────────────────────────
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^(\d+)$"))
-    async def help_nav(event):
-        if not is_owner(event, owner_id):
+        helper = get_client()
+        if helper is None:
+            await event.edit(_build_main_menu_text())
             return
-
-        state = _get_help_state(owner_id)
-        if not state:
-            return
-
-        reply_msg = await event.message.get_reply_message()
-        if not reply_msg or reply_msg.id != state["msg_id"]:
-            return
-
-        num = int(event.pattern_match.group(1))
-
-        # Auto-delete the navigation reply (clean chat)
         try:
             await event.delete()
-        except Exception:
-            pass
-
-        if num == 0:
-            # Return to main menu
-            try:
-                await reply_msg.edit(_build_main_menu())
-            except Exception as exc:
-                logger.warning("help nav edit failed: %s", exc)
-            return
-
-        if num < 1 or num > len(_HELP_CATEGORIES):
-            return
-
-        try:
-            await reply_msg.edit(_build_category_page(num - 1))
+            await helper.send_message(
+                event.chat_id,
+                _build_main_menu_text(),
+                buttons=_build_main_menu_keyboard(),
+            )
         except Exception as exc:
-            logger.warning("help nav edit failed: %s", exc)
+            logger.warning("help panel send failed: %s", exc)
+            try:
+                await event.edit(_build_main_menu_text())
+            except Exception:
+                pass
 
     # ── .health — full dashboard ──────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
