@@ -37,10 +37,12 @@ from backend.bot.router import register_all
 from backend.db import client as db_client
 from backend.health import (
     check_stale,
+    increment_restart,
     mark_started,
     set_bio_cron_ok,
     set_supervisor_ok,
     set_telethon_connected,
+    set_watchdog_ok,
     update_heartbeat,
 )
 from backend.web.app import app as web_app
@@ -111,6 +113,7 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
         if shutdown.is_set():
             break
 
+        increment_restart()
         logger.warning("Telethon disconnected — reconnecting in %ds...", _RECONNECT_DELAY)
         await asyncio.sleep(_RECONNECT_DELAY)
         try:
@@ -145,9 +148,11 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
             try:
                 await asyncio.wait_for(client.get_me(), timeout=_WATCHDOG_TIMEOUT)
                 record_event("watchdog", "health check", 0, "SUCCESS")
+                set_watchdog_ok(True)
             except asyncio.TimeoutError:
                 logger.warning("Watchdog: health check timed out — forcing disconnect")
                 record_event("watchdog", "health check", _WATCHDOG_TIMEOUT * 1000, "TIMEOUT")
+                set_watchdog_ok(False)
                 try:
                     await client.disconnect()
                 except Exception:
@@ -157,6 +162,7 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
             except Exception as exc:
                 logger.warning("Watchdog: health check failed (%s) — forcing disconnect", exc)
                 record_event("watchdog", "health check", 0, "ERROR", str(exc))
+                set_watchdog_ok(False)
                 try:
                     await client.disconnect()
                 except Exception:

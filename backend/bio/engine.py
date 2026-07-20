@@ -117,6 +117,12 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
                 "updated_at": datetime.now(tz).isoformat(),
             })
 
+            try:
+                from backend.health import set_last_bio_update
+                set_last_bio_update()
+            except Exception:
+                pass
+
         except asyncio.CancelledError:
             logger.info("Bio cron cancelled.")
             raise
