@@ -204,7 +204,7 @@ All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dash
 
 1. Go to [my.telegram.org](https://my.telegram.org) and log in.
 2. Click **API development tools**.
-3. Create an application — you'll get an **API ID** (number) and **API Hash** (string).
+3. Create an application — you'll get an **API ID** (number) and an API Hash (string).
 4. Save these — you'll need them for `API_ID` and `API_HASH`.
 
 ### Step 2: Generate SESSION_STRING
@@ -333,21 +333,76 @@ Or in the Render dashboard, add a new environment variable:
 
 ## Enabling Inline Mode
 
-Inline mode allows the helper bot to be mentioned in any chat via `@bot_username` and present inline results. This is useful for quick-save panels and search.
+Inline Mode is what lets the self-bot insert helper-bot-authored messages (with
+inline buttons) into **any** chat — Saved Messages, private chats, and groups —
+without the helper bot needing to be a member of that chat. This is the official
+Telegram Inline Bot flow:
+
+1. The self-bot calls `client.inline_query(@helper_bot, "help")`.
+2. The helper bot answers with an `InlineQueryResultArticle` containing the
+   menu text and category buttons.
+3. The self-bot clicks the first result to insert it into the current chat.
+4. The message appears from **your account** with a small "via @bot" attribution.
+5. Callback button presses route back to the helper bot.
+
+The helper bot **never** sends messages directly into chats. All UI is delivered
+via Inline Mode so it works everywhere.
+
+### Required BotFather Settings
+
+The helper bot **must** have Inline Mode enabled, or `.help` will fall back to a
+plain-text menu (no buttons).
 
 1. Open [@BotFather](https://t.me/BotFather) on Telegram.
 2. Send `/setinline`.
 3. Select your helper bot from the list.
-4. Send a placeholder message (e.g., "Search LifeOS...").
-5. BotFather will confirm: "Inline mode enabled for @your_bot_username."
+4. Send a placeholder message when prompted (e.g., `Search LifeOS...`).
+5. BotFather confirms: **"Inline mode enabled for @your_bot_username."**
 
-### Test Inline Mode
+You can verify at any time by sending `/setinline` again.
 
-In any chat, type:
-```
-@lifeos_helper_bot vacation
-```
-You should see inline results from your saved items (once inline search is implemented in a future update).
+### Required Environment Variables
+
+| Variable | Required? | Purpose |
+|---|---|---|
+| `BOT_TOKEN` | **Yes** for inline UI | Bot token from BotFather (see [Creating the Helper Bot](#creating-the-helper-bot-with-botfather)) |
+| `API_ID`, `API_HASH`, `SESSION_STRING`, `BOT_OWNER_ID` | Yes (always) | Self-bot credentials |
+
+No extra variable is needed for the bot username — LifeOS reads it
+automatically from Telegram when the helper bot starts.
+
+### How to Test Inline Mode
+
+1. Ensure `BOT_TOKEN` is set and the bot is running.
+2. In **any** chat (including Saved Messages), type:
+   ```
+   .help
+   ```
+3. You should see the interactive help panel appear as a message from your
+   account (with "via @bot"). The original `.help` command is deleted only
+   **after** the panel is successfully inserted.
+4. Tap category buttons to navigate. Tap **Close** to remove the panel.
+
+If you see a plain text menu instead of buttons, Inline Mode is not enabled —
+repeat the BotFather steps above.
+
+### Common Mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `.help` shows plain text, no buttons | Inline Mode not enabled in BotFather | Run `/setinline` on @BotFather |
+| `.help` command disappears and nothing replaces it | Old code used `helper.send_message()` which fails in Saved Messages | Update to latest code — new flow uses `inline_query` + `click` |
+| "via @bot" attribution is missing | Message was sent as a normal edit, not via inline mode | Ensure the helper bot is connected and Inline Mode is enabled |
+| Inline query returns 0 results | Helper bot not started, or InlineQuery handler not registered | Check logs for "Helper bot online" on startup |
+| `PeerIdInvalidError` in logs | Helper bot tried to send to a chat it can't reach | This is the old architecture — update to the inline-query flow |
+
+### Why "via @bot" Appears
+
+When a message is sent via Inline Mode, Telegram adds a "via @bot_username"
+attribution under the sender's name. This is standard Telegram behavior for all
+inline bots (like @gif, @pic, @vote). It cannot be removed — it's how Telegram
+identifies which bot generated the inline result. The message is still sent from
+**your account**, not from the bot.
 
 ---
 
@@ -418,7 +473,7 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 |---|---|
 | `.ping` | Edits message to `PONG` |
 | `.id` | Shows Chat ID + Message ID |
-| `.help` | Opens interactive help menu (reply with a number to navigate) |
+| `.help` | Opens interactive inline help panel (via Inline Mode — works in any chat) |
 | `.health` | Full health dashboard (process, Telegram, watchdog, bio, memory, CPU, uptime) |
 
 ### Save Engine (reply to a message first)
