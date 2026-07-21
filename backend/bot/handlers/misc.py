@@ -1,19 +1,24 @@
 """
 .ping    — Edit trigger with PONG (zero-spam policy).
 .id      — Chat ID + Message ID of the current context.
-.help    — Interactive inline help panel (helper bot inline keyboard).
+.help    — Interactive inline help panel via Telegram Inline Mode.
 .health  — Full health dashboard.
 .kill    — Diagnostic snapshot + stalled-task recovery.
 .logs    — View recent diagnostic events (black box).
 
-Help panel:
-  - .help deletes the trigger (zero-spam) and sends ONE inline message
-    via the helper bot with category buttons.
-  - Tapping a category edits that SAME message to show commands.
-  - Every category page has Back (returns to category list) and Close
-    (deletes the panel message).
-  - Falls back to a plain-text edit-in-place menu when the helper bot
-    is not available (no BOT_TOKEN).
+Help panel (Inline Mode architecture):
+  - .help calls send_inline_panel(client, event, "help")
+  - send_inline_panel performs:
+      1. client.inline_query(@helper_bot, "help")
+      2. Verify results count > 0
+      3. Click the first result → inserts into the chat from MY ACCOUNT
+      4. Delete the original command ONLY after successful insertion
+  - The helper bot answers the InlineQuery with one
+    InlineQueryResultArticle containing the menu text + category buttons.
+  - The message appears from the owner's account with "via @bot".
+  - Callback button presses route back to the helper bot.
+  - Falls back to plain-text edit-in-place if inline query fails or
+    returns zero results (command is NOT deleted in that case).
 """
 import asyncio
 import logging
@@ -27,8 +32,13 @@ from backend import diagnostics, health
 from backend.bio import engine as bio_engine
 from backend.bot.handlers.guard import is_owner
 from backend.db import client as db_client
-from backend.helper import InlinePanelBuilder, register_panel, get_panel
-from backend.helper.client import get_client
+from backend.helper import (
+    InlinePanelBuilder,
+    register_panel,
+    get_panel,
+    register_inline_builder,
+    send_inline_panel,
+)
 
 
 def _resolve_tz() -> str:
@@ -148,6 +158,11 @@ def _build_category_keyboard() -> list:
     return builder.build()
 
 
+async def _help_inline_builder() -> tuple[str, list]:
+    """Build the main menu (text + buttons) for the inline query result."""
+    return _build_main_menu_text(), _build_main_menu_keyboard()
+
+
 async def _help_panel_handler(event, extra: str) -> None:
     if extra == "close":
         try:
@@ -174,6 +189,7 @@ async def _help_panel_handler(event, extra: str) -> None:
 def _register_help_panel() -> None:
     if get_panel("help") is None:
         register_panel("help", _help_panel_handler)
+    register_inline_builder("help", _help_inline_builder)
 
 
 # ── Health dashboard ────────────────────────────────────────────────────
@@ -223,7 +239,6 @@ def _build_health_report(snap):
     last_bio = snap.get("last_bio_update_s")
     status = snap.get("status", "unknown")
 
-    # Process section
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         mem_mb = usage.ru_maxrss / 1024
@@ -232,7 +247,6 @@ def _build_health_report(snap):
         mem_mb = None
         cpu_s = None
 
-    # Task counts
     try:
         all_tasks = asyncio.all_tasks()
         running = sum(1 for t in all_tasks if not t.done())
@@ -243,10 +257,8 @@ def _build_health_report(snap):
         pending = None
         locked = None
 
-    # DB status
     db_ok = db_client.is_available()
 
-    # Heartbeat status
     if heartbeat_age is not None and heartbeat_age <= 15.0:
         hb_status = "OK"
     elif heartbeat_age is not None:
@@ -256,38 +268,30 @@ def _build_health_report(snap):
 
     lines = ["🩺 **LifeOS Health Dashboard**", ""]
 
-    # Process
     lines.append(f"{_indicator(process_ok)} **Process**: {'Alive' if process_ok else 'Dead'}")
     if mem_mb is not None:
         lines.append(f"   • Memory: `{mem_mb:.1f} MB`")
     if cpu_s is not None:
         lines.append(f"   • CPU: `{cpu_s:.2f}s`")
 
-    # Telegram
     lines.append(f"{_indicator(telegram_ok)} **Telegram**: {'Connected' if telegram_ok else 'Disconnected'}")
     lines.append(f"   • Last event: {_format_age(last_tg_event)}")
 
-    # Supervisor
     lines.append(f"{_indicator(supervisor_ok)} **Supervisor**: {'Running' if supervisor_ok else 'Stopped'}")
 
-    # Watchdog
     lines.append(f"{_indicator(watchdog_ok)} **Watchdog**: {'Running' if watchdog_ok else 'Stopped'}")
     lines.append(f"   • Last check: {_format_age(last_watchdog)}")
 
-    # Bio Cron
     lines.append(f"{_indicator(bio_cron_ok)} **Bio Cron**: {'Running' if bio_cron_ok else 'Stopped'}")
     lines.append(f"   • Last update: {_format_age(last_bio)}")
 
-    # Heartbeat
     hb_icon = "🟢" if hb_status == "OK" else ("🟡" if hb_status == "WARNING" else "🔴")
     lines.append(f"{hb_icon} **Heartbeat**: {hb_status}")
     if heartbeat_age is not None:
         lines.append(f"   • Age: `{int(heartbeat_age)}s`")
 
-    # Restart counter
     lines.append(f"{'🟢' if restart_count == 0 else '🟡'} **Restarts**: `{restart_count}`")
 
-    # Tasks
     if running is not None:
         lines.append(f"{'🟢' if running < 20 else '🟡'} **Running Tasks**: `{running}`")
     if pending is not None:
@@ -295,10 +299,8 @@ def _build_health_report(snap):
     if locked is not None:
         lines.append(f"{'🟢' if locked == 0 else '🟡'} **Locked Tasks**: `{locked}`")
 
-    # Database
     lines.append(f"{_indicator(db_ok)} **Database**: {'Available' if db_ok else 'Fallback'}")
 
-    # Uptime
     lines.append(f"{'🟢' if uptime_s and uptime_s > 0 else '🔴'} **Uptime**: `{_format_uptime(uptime_s)}`")
 
     lines.append("")
@@ -351,28 +353,21 @@ def register(client, owner_id: int):
 
     _register_help_panel()
 
-    # ── .help — inline panel via helper bot ───────────────────────────
+    # ── .help — inline panel via Telegram Inline Mode ───────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
     async def help_cmd(event):
         if not is_owner(event, owner_id):
             return
-        helper = get_client()
-        if helper is None:
-            await event.edit(_build_main_menu_text())
-            return
-        try:
-            await event.delete()
-            await helper.send_message(
-                event.chat_id,
-                _build_main_menu_text(),
-                buttons=_build_main_menu_keyboard(),
-            )
-        except Exception as exc:
-            logger.warning("help panel send failed: %s", exc)
+
+        logger.info("HELP COMMAND — chat=%s msg_id=%s", event.chat_id, event.message.id)
+
+        success = await send_inline_panel(client, event, "help")
+        if not success:
+            logger.info("HELP FALLBACK — editing trigger in-place")
             try:
                 await event.edit(_build_main_menu_text())
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("help fallback edit failed: %s", exc)
 
     # ── .health — full dashboard ──────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
