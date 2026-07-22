@@ -21,6 +21,8 @@ Reliability:
   - A watchdog pings Telegram every 60s; if the ping times out, the client
     is force-disconnected so the supervisor can reconnect.
   - Bio cron is supervised: if the cron loop exits unexpectedly, it restarts.
+  - Helper bot is supervised: run_until_disconnected() keeps its event loop
+    alive so InlineQuery and CallbackQuery events are processed.
   - No background coroutine may silently die.
 """
 import asyncio
@@ -142,6 +144,41 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
     set_supervisor_ok(False)
 
 
+async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
+    """Keep the helper bot's event loop alive so it processes InlineQuery
+    and CallbackQuery events.
+
+    Without this, the helper bot connects but has no run_until_disconnected()
+    task, so its internal read loop may stall and events are never delivered
+    to registered handlers.
+    """
+    while not shutdown.is_set():
+        try:
+            logger.info("[HELPER] Supervisor: starting run_until_disconnected()")
+            await helper_client.run_until_disconnected()
+            logger.info("[HELPER] Supervisor: run_until_disconnected() returned")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[HELPER] Supervisor: run_until_disconnected error: %s", exc)
+            record_event("helper", "run_until_disconnected", 0, "ERROR", str(exc))
+
+        if shutdown.is_set():
+            break
+
+        logger.warning("[HELPER] Supervisor: helper disconnected — reconnecting in %ds", _RECONNECT_DELAY)
+        await asyncio.sleep(_RECONNECT_DELAY)
+        try:
+            await helper_client.connect()
+            logger.info("[HELPER] Supervisor: helper reconnected")
+            record_event("helper", "reconnect", 0, "SUCCESS")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[HELPER] Supervisor: reconnect failed: %s — will retry", exc)
+            record_event("helper", "reconnect", 0, "ERROR", str(exc))
+
+
 async def _watchdog(client, shutdown: asyncio.Event) -> None:
     """Periodically check Telethon health; force-disconnect if stalled."""
     while not shutdown.is_set():
@@ -230,8 +267,10 @@ async def main() -> None:
                 set_owner_id(cfg["OWNER_ID"])
                 register_input_listener(client, cfg["OWNER_ID"])
                 logger.info("[3.5/5] Helper bot online — Inline Mode enabled")
-        except Exception as exc:
-            logger.warning("[3.5/5] Helper bot failed: %s — inline UI disabled", exc)
+                logger.info("[3.5/5] Helper username: '%s'", get_bot_username())
+                logger.info("[3.5/5] Registered inline builders will be logged by inline_engine")
+        except Exception:
+            logger.exception("[3.5/5] Helper bot failed — inline UI disabled")
             helper_client = None
     else:
         logger.info("[3.5/5] Helper bot: no BOT_TOKEN — inline UI disabled")
@@ -267,6 +306,14 @@ async def main() -> None:
     heartbeat_task = asyncio.create_task(
         _heartbeat(shutdown), name="lifeos-heartbeat"
     )
+
+    # ── Helper bot supervisor: keeps event loop alive for InlineQuery ──────
+    helper_supervisor = None
+    if helper_client is not None:
+        helper_supervisor = asyncio.create_task(
+            _supervise_helper(helper_client, shutdown), name="lifeos-helper-supervisor"
+        )
+        logger.info("[3.5/5] Helper bot supervisor started")
 
     logger.info("LifeOS online.")
 
