@@ -155,30 +155,70 @@ async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
     task, so its internal read loop may stall and events are never delivered
     to registered handlers.
     """
+    import time as _time
+    import asyncio as _asyncio
+
+    logger.info("[TRACE] _supervise_helper ENTER: helper connected=%s, loop=%d, task='%s'",
+                helper_client.is_connected(),
+                id(_asyncio.get_running_loop()),
+                _asyncio.current_task().get_name() if _asyncio.current_task() else "(none)")
+
+    # ── List helper event handlers at startup ──
+    try:
+        handlers = helper_client.list_event_handlers()
+        logger.info("[TRACE] _supervise_helper: helper has %d event handlers registered", len(handlers))
+        for i, (etype, _) in enumerate(handlers):
+            logger.info("[TRACE] _supervise_helper: handler[%d] type=%s", i, etype)
+    except Exception as e:
+        logger.warning("[TRACE] _supervise_helper: failed to list handlers: %s", e)
+
     while not shutdown.is_set():
         try:
-            logger.info("[HELPER] Supervisor: starting run_until_disconnected()")
-            await helper_client.run_until_disconnected()
-            logger.info("[HELPER] Supervisor: run_until_disconnected() returned")
+            logger.info("[TRACE] _supervise_helper: starting run_until_disconnected()")
+            t0 = _time.monotonic()
+
+            # ── Run run_until_disconnected with a heartbeat ──
+            # We create the coroutine and wrap it in a task so we can log
+            # periodic heartbeats while it blocks.
+            rud = _asyncio.ensure_future(helper_client.run_until_disconnected())
+
+            heartbeat_count = 0
+            while not rud.done():
+                try:
+                    await _asyncio.wait_for(_asyncio.shield(rud), timeout=5.0)
+                except _asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    elapsed = _time.monotonic() - t0
+                    logger.info("[TRACE] _supervise_helper HEARTBEAT: #%d, elapsed=%.1fs, helper_connected=%s, tasks=%d",
+                                heartbeat_count, elapsed, helper_client.is_connected(), len(_asyncio.all_tasks()))
+                    # Log all task names for forensic snapshot
+                    for i, t in enumerate(_asyncio.all_tasks()):
+                        logger.info("[TRACE] _supervise_helper task[%d]: name='%s', done=%s", i, t.get_name(), t.done())
+                except _asyncio.CancelledError:
+                    rud.cancel()
+                    raise
+
+            t1 = _time.monotonic()
+            logger.info("[TRACE] _supervise_helper run_until_disconnected returned: elapsed=%.3fs", t1 - t0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[HELPER] Supervisor: run_until_disconnected error: %s", exc)
+            logger.warning("[TRACE] _supervise_helper: run_until_disconnected error: %s", exc)
             record_event("helper", "run_until_disconnected", 0, "ERROR", str(exc))
 
         if shutdown.is_set():
             break
 
-        logger.warning("[HELPER] Supervisor: helper disconnected — reconnecting in %ds", _RECONNECT_DELAY)
+        logger.warning("[TRACE] _supervise_helper: helper disconnected — reconnecting in %ds", _RECONNECT_DELAY)
         await asyncio.sleep(_RECONNECT_DELAY)
         try:
             await helper_client.connect()
-            logger.info("[HELPER] Supervisor: helper reconnected")
+            logger.info("[TRACE] _supervise_helper: helper reconnected")
             record_event("helper", "reconnect", 0, "SUCCESS")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("[HELPER] Supervisor: reconnect failed: %s — will retry", exc)
+            logger.error("[TRACE] _supervise_helper: reconnect failed: %s — will retry", exc)
             record_event("helper", "reconnect", 0, "ERROR", str(exc))
 
 

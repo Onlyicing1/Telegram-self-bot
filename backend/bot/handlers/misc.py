@@ -438,17 +438,68 @@ def register(client, owner_id: int):
     print(f"[FORENSIC] misc.register: registering .help", flush=True)
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
     async def help_cmd(event):
-        if not is_owner(event, owner_id):
+        import time as _time
+        import asyncio as _asyncio
+        t0 = _time.monotonic() * 1000.0
+        logger.info("[TRACE] help_cmd ENTER: t=%.1fms, sender_id=%s, chat_id=%s, msg_id=%s, owner_id=%s, loop=%d, task='%s'",
+                    t0, event.sender_id, event.chat_id, event.message.id, owner_id,
+                    id(_asyncio.get_running_loop()),
+                    _asyncio.current_task().get_name() if _asyncio.current_task() else "(none)")
+
+        # ── Owner check ──
+        owner_ok = is_owner(event, owner_id)
+        t1 = _time.monotonic() * 1000.0
+        logger.info("[TRACE] help_cmd owner check: ok=%s, elapsed=%.1fms, sender_id=%s, owner_id=%s",
+                    owner_ok, t1 - t0, event.sender_id, owner_id)
+        if not owner_ok:
+            logger.warning("[TRACE] help_cmd ABORT: owner check failed — ignoring")
             return
+
+        # ── Helper client state ──
         helper = get_client()
+        t2 = _time.monotonic() * 1000.0
+        logger.info("[TRACE] help_cmd helper check: helper=%s, elapsed=%.1fms",
+                    "None" if helper is None else f"connected={helper.is_connected()}", t2 - t0)
         if helper is None:
+            logger.warning("[TRACE] help_cmd FALLBACK: no helper bot — editing message with plain text")
             await event.edit(_build_main_menu_text())
             return
+
+        # ── Helper event handlers snapshot ──
         try:
+            handlers = helper.list_event_handlers()
+            logger.info("[TRACE] help_cmd helper event_handlers=%d", len(handlers))
+            for i, (etype, _) in enumerate(handlers):
+                logger.info("[TRACE] help_cmd helper handler[%d] type=%s", i, etype)
+        except Exception as e:
+            logger.warning("[TRACE] help_cmd: failed to list helper handlers: %s", e)
+
+        # ── All asyncio tasks snapshot ──
+        try:
+            all_tasks = _asyncio.all_tasks()
+            logger.info("[TRACE] help_cmd task_count=%d", len(all_tasks))
+            for i, t in enumerate(all_tasks):
+                logger.info("[TRACE] help_cmd task[%d] name='%s', done=%s", i, t.get_name(), t.done())
+        except RuntimeError:
+            logger.warning("[TRACE] help_cmd: could not enumerate tasks")
+
+        # ── Execute inline panel send ──
+        try:
+            logger.info("[TRACE] help_cmd BEFORE event.delete: elapsed=%.1fms", t2 - t0)
             await event.delete()
+            t3 = _time.monotonic() * 1000.0
+            logger.info("[TRACE] help_cmd AFTER event.delete: elapsed=%.1fms", t3 - t0)
+
+            logger.info("[TRACE] help_cmd BEFORE send_inline_panel: elapsed=%.1fms, chat_id=%s, query='help'",
+                        t3 - t0, event.chat_id)
             await send_inline_panel(client, event.chat_id, "help")
+            t4 = _time.monotonic() * 1000.0
+            logger.info("[TRACE] help_cmd AFTER send_inline_panel: elapsed=%.1fms", t4 - t0)
         except Exception as exc:
-            logger.warning("help inline send failed: %s", exc)
+            t_exc = _time.monotonic() * 1000.0
+            logger.error("[TRACE] help_cmd EXCEPTION: elapsed=%.1fms, exc_type=%s, exc=%s",
+                         t_exc - t0, type(exc).__name__, exc)
+            logger.exception("[TRACE] help_cmd exception traceback:")
             try:
                 await event.edit(_build_main_menu_text())
             except Exception:

@@ -12,6 +12,8 @@ a panel is in "input" state (Type B commands).
 """
 import asyncio
 import logging
+import time
+import traceback
 
 from telethon import events
 
@@ -26,16 +28,93 @@ from backend.helper.input_state import (
 logger = logging.getLogger(__name__)
 
 
+def _now_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def _loop_id() -> int:
+    try:
+        return id(asyncio.get_running_loop())
+    except RuntimeError:
+        return 0
+
+
+def _task_name() -> str:
+    try:
+        t = asyncio.current_task()
+        return t.get_name() if t else "(none)"
+    except RuntimeError:
+        return "(no-loop)"
+
+
+def _task_count() -> int:
+    try:
+        return len(asyncio.all_tasks())
+    except RuntimeError:
+        return -1
+
+
 async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     """Trigger inline mode and auto-send the first result.
 
     Returns True on success, False on failure.
     """
-    logger.info("HELP STEP 3 - send_inline_panel entered: chat_id=%s, query='%s'", chat_id, query)
-    result = await inline_engine.trigger(self_client, chat_id, query)
-    logger.info("HELP STEP 3 - send_inline_panel: trigger() returned: ok=%s", result)
+    t_enter = _now_ms()
+    logger.info("[TRACE] send_inline_panel ENTER: t=%.1fms, chat_id=%s, query='%s', loop=%d, task='%s', tasks=%d",
+                t_enter, chat_id, query, _loop_id(), _task_name(), _task_count())
+
+    # ── Pre-flight: verify self_client ──
+    sc_connected = self_client.is_connected() if self_client else False
+    logger.info("[TRACE] send_inline_panel pre-flight: self_client connected=%s, is_none=%s",
+                sc_connected, self_client is None)
+
+    # ── Pre-flight: verify helper username ──
+    helper_username = inline_engine.get_helper_username()
+    logger.info("[TRACE] send_inline_panel pre-flight: helper_username='%s'", helper_username)
+    if not helper_username:
+        logger.error("[TRACE] send_inline_panel ABORT: helper_username is empty — inline UI will fail")
+        return False
+
+    # ── Pre-flight: verify helper client state ──
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper is not None:
+        hc_connected = helper.is_connected()
+        logger.info("[TRACE] send_inline_panel pre-flight: helper_client connected=%s, loop=%d, is_none=False",
+                    hc_connected, _loop_id())
+        try:
+            handlers = helper.list_event_handlers()
+            logger.info("[TRACE] send_inline_panel pre-flight: helper_client event_handlers=%d", len(handlers))
+        except Exception as e:
+            logger.warning("[TRACE] send_inline_panel pre-flight: failed to list helper handlers: %s", e)
+    else:
+        logger.warning("[TRACE] send_inline_panel pre-flight: helper_client is None — get_client() returned None")
+
+    # ── List all asyncio tasks for forensic snapshot ──
+    try:
+        all_tasks = asyncio.all_tasks()
+        for i, t in enumerate(all_tasks):
+            logger.info("[TRACE] send_inline_panel task[%d]: name='%s', done=%s, cancelled=%s",
+                        i, t.get_name(), t.done(), t.cancelled())
+    except RuntimeError:
+        logger.warning("[TRACE] send_inline_panel: could not enumerate tasks")
+
+    t_before_trigger = _now_ms()
+    logger.info("[TRACE] send_inline_panel BEFORE trigger: elapsed=%.1fms", t_before_trigger - t_enter)
+    try:
+        result = await inline_engine.trigger(self_client, chat_id, query)
+        t_after_trigger = _now_ms()
+        logger.info("[TRACE] send_inline_panel AFTER trigger: elapsed=%.1fms, ok=%s",
+                    t_after_trigger - t_enter, result)
+    except Exception as exc:
+        t_after_trigger = _now_ms()
+        logger.error("[TRACE] send_inline_panel trigger EXCEPTION: elapsed=%.1fms, exc_type=%s, exc=%s",
+                     t_after_trigger - t_enter, type(exc).__name__, exc)
+        logger.exception("[TRACE] send_inline_panel trigger traceback:")
+        result = False
+
     if not result:
-        logger.warning("HELP STEP 3 - send_inline_panel returning False — REASON: trigger() returned False, see HELP STEP 4+ logs for exact failure")
+        logger.warning("[TRACE] send_inline_panel returning False — trigger() returned False")
     return result
 
 

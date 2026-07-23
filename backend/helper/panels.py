@@ -24,6 +24,7 @@ then edit the message with the result. Input handlers set a pending
 input state and edit the message to show a prompt.
 """
 import logging
+import time
 from typing import Awaitable, Callable, Any
 
 from telethon import events
@@ -42,6 +43,10 @@ InputConfig = dict[str, Any]
 _panels: dict[str, PanelHandler] = {}
 _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
+
+
+def _now_ms() -> float:
+    return time.monotonic() * 1000.0
 
 
 class InlinePanelBuilder:
@@ -119,14 +124,22 @@ def register_callback_handlers(client, owner_id: int) -> None:
 
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
+        t_enter = _now_ms()
+        logger.info("[TIMING] _callback_router ENTER: t=%.1fms, data=%s, sender_id=%s, msg_id=%s",
+                    t_enter, event.data, event.sender_id, event.msg_id)
         logger.info("HELP STEP 13 - callback received: data=%s, sender_id=%s, msg_id=%s",
                     event.data, event.sender_id, event.msg_id)
 
         if not is_owner(event, owner_id):
+            t_after = _now_ms()
+            logger.warning("[TIMING] _callback_router owner check FAILED: elapsed=%.1fms, sender_id=%s, owner_id=%s",
+                           t_after - t_enter, event.sender_id, owner_id)
             logger.warning("HELP STEP 13 - callback owner check FAILED: sender_id=%s, owner_id=%s",
                         event.sender_id, owner_id)
             return
 
+        t_after_owner = _now_ms()
+        logger.info("[TIMING] _callback_router owner check PASS: elapsed=%.1fms", t_after_owner - t_enter)
         logger.info("HELP STEP 13 - callback owner check passed")
 
         data = event.data.decode("utf-8") if event.data else ""
@@ -147,7 +160,11 @@ def register_callback_handlers(client, owner_id: int) -> None:
                 await _handle_input(event, data[6:], owner_id)
             else:
                 logger.warning("HELP STEP 13 - callback unknown prefix in data='%s'", data)
+            t_dispatched = _now_ms()
+            logger.info("[TIMING] _callback_router dispatch DONE: elapsed=%.1fms", t_dispatched - t_enter)
         except Exception:
+            t_err = _now_ms()
+            logger.info("[TIMING] _callback_router EXCEPTION: elapsed=%.1fms", t_err - t_enter)
             logger.exception("HELP STEP 13 - callback router error (data='%s')", data)
 
 
@@ -165,10 +182,17 @@ async def _handle_panel(event, remainder: str) -> None:
         return
 
     logger.info("[CALLBACK] panel handler found — invoking")
+    t_before = _now_ms()
     try:
         await handler(event, extra)
+        t_after = _now_ms()
+        logger.info("[TIMING] _handle_panel handler DONE: elapsed=%.1fms, panel_id='%s'",
+                    t_after - t_before, panel_id)
         logger.info("[CALLBACK] panel handler completed")
     except Exception:
+        t_after = _now_ms()
+        logger.info("[TIMING] _handle_panel handler EXCEPTION: elapsed=%.1fms, panel_id='%s'",
+                    t_after - t_before, panel_id)
         logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
 
 
@@ -186,8 +210,12 @@ async def _handle_action(event, remainder: str) -> None:
         return
 
     logger.info("[CALLBACK] action handler found — invoking")
+    t_before = _now_ms()
     try:
         result = await handler(event, extra)
+        t_after_handler = _now_ms()
+        logger.info("[TIMING] _handle_action handler DONE: elapsed=%.1fms, action_id='%s'",
+                    t_after_handler - t_before, action_id)
         logger.info("[CALLBACK] action handler returned: type=%s", type(result).__name__)
 
         if result is None:
@@ -197,12 +225,20 @@ async def _handle_action(event, remainder: str) -> None:
         else:
             text, buttons = result, []
         if text:
+            t_before_edit = _now_ms()
             try:
                 await event.edit(text, buttons=buttons)
+                t_after_edit = _now_ms()
+                logger.info("[TIMING] _handle_action edit DONE: elapsed=%.1fms", t_after_edit - t_before_edit)
                 logger.info("[CALLBACK] action result edit succeeded")
             except Exception as exc:
+                t_after_edit = _now_ms()
+                logger.info("[TIMING] _handle_action edit FAILED: elapsed=%.1fms", t_after_edit - t_before_edit)
                 logger.warning("[CALLBACK] action result edit failed: %s", exc)
     except Exception:
+        t_after = _now_ms()
+        logger.info("[TIMING] _handle_action EXCEPTION: elapsed=%.1fms, action_id='%s'",
+                    t_after - t_before, action_id)
         logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
 
 
@@ -238,8 +274,13 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
     builder = InlinePanelBuilder()
     builder.add_row("Cancel", f"panel:{panel_id}")
 
+    t_before = _now_ms()
     try:
         await event.edit(prompt, buttons=builder.build())
+        t_after = _now_ms()
+        logger.info("[TIMING] _handle_input edit DONE: elapsed=%.1fms", t_after - t_before)
         logger.info("[CALLBACK] input prompt edit succeeded")
     except Exception as exc:
+        t_after = _now_ms()
+        logger.info("[TIMING] _handle_input edit FAILED: elapsed=%.1fms", t_after - t_before)
         logger.warning("[CALLBACK] input prompt edit failed: %s", exc)
