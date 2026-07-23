@@ -166,6 +166,7 @@ async def _send_inline_builder(event, extra: str) -> list:
 
 
 def register(client, owner_id: int):
+    print(f"[FORENSIC] retrieve.register() ENTERED: client_id={id(client)}, owner_id={owner_id}", flush=True)
 
     register_panel("preview", _preview_inline_builder)
     register_panel("send", _send_inline_builder)

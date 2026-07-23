@@ -252,7 +252,9 @@ async def main() -> None:
 
     # ── Phase 3: Register command handlers (exactly once) ─────────────────
     logger.info("[3/5] Registering command handlers")
+    print(f"[FORENSIC] main.py: calling register_all(client={id(client)}, owner_id={cfg['OWNER_ID']}, tz={cfg['TZ']})", flush=True)
     register_all(client, cfg["OWNER_ID"], cfg["TZ"])
+    print(f"[FORENSIC] main.py: register_all() returned", flush=True)
 
     # ── Phase 3.5: Helper bot (optional — Inline Mode + callbacks) ────────
     helper_client = None

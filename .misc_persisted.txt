@@ -582,3 +582,5 @@ def register(client, owner_id: int):
             await send_inline_panel(client, event.chat_id, query)
         except Exception as exc:
             logger.warning("logs inline send failed: %s", exc)
+
+(exit 0, 7ms)
