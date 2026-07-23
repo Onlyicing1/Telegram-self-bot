@@ -155,10 +155,15 @@ async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
     task, so its internal read loop may stall and events are never delivered
     to registered handlers.
     """
+    import time as _time
+    logger.info("[TIMING] _supervise_helper ENTER: helper connected=%s", helper_client.is_connected())
     while not shutdown.is_set():
         try:
             logger.info("[HELPER] Supervisor: starting run_until_disconnected()")
+            t0 = _time.monotonic()
             await helper_client.run_until_disconnected()
+            t1 = _time.monotonic()
+            logger.info("[TIMING] _supervise_helper run_until_disconnected returned: elapsed=%.3fs", t1 - t0)
             logger.info("[HELPER] Supervisor: run_until_disconnected() returned")
         except asyncio.CancelledError:
             raise
