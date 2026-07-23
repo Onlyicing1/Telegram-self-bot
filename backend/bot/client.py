@@ -8,7 +8,7 @@ Connection parameters tuned for Render Free tier:
   flood_sleep_threshold — auto-sleep up to 60 s on Telegram flood responses
 """
 import logging
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
@@ -40,4 +40,35 @@ async def build_client(
 
     me = await client.get_me()
     logger.info("Telethon connected as %s (id=%s)", me.first_name, me.id)
+
+    _forensic_client_id = id(client)
+    print(f"[FORENSIC] CHECKPOINT-1 after client.connect()+authorize: "
+          f"client_id={id(client)}, user={me.first_name}, user_id={me.id}", flush=True)
+
+    async def _raw_update_handler(update):
+        print(f"[FORENSIC-RAW] Update received: type={type(update).__name__}, "
+              f"client_id={id(client)}, "
+              f"same_as_handler_client={id(client) == _forensic_client_id}", flush=True)
+
+    client.add_event_handler(_raw_update_handler, events.Raw)
+    print(f"[FORENSIC] Raw update handler registered on client_id={id(client)}", flush=True)
+
+    async def _all_newmessage_handler(event):
+        try:
+            print(
+                f"[FORENSIC-MSG] NewMessage BEFORE any filtering: "
+                f"raw_text={event.raw_text!r}, "
+                f"outgoing={getattr(event, 'out', 'N/A')}, "
+                f"chat_id={event.chat_id}, "
+                f"sender_id={event.sender_id}, "
+                f"client_id={id(client)}, "
+                f"same_as_handler_client={id(client) == _forensic_client_id}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[FORENSIC-MSG] Error reading event: {type(exc).__name__}: {exc}", flush=True)
+
+    client.add_event_handler(_all_newmessage_handler, events.NewMessage())
+    print(f"[FORENSIC] All-NewMessage handler registered on client_id={id(client)}", flush=True)
+
     return client

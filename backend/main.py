@@ -112,6 +112,8 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
     while not shutdown.is_set():
         set_telethon_connected(client.is_connected())
         try:
+            print(f"[FORENSIC] CHECKPOINT-2 before run_until_disconnected(): "
+                  f"id(client)={id(client)}", flush=True)
             await client.run_until_disconnected()
         except asyncio.CancelledError:
             raise
@@ -248,6 +250,7 @@ async def main() -> None:
     # ── Phase 2: Telethon client ──────────────────────────────────────────
     logger.info("[2/5] Connecting Telethon")
     client = await build_client(cfg["API_ID"], cfg["API_HASH"], cfg["SESSION_STRING"])
+    print(f"[FORENSIC] main.py: client returned from build_client, id(client)={id(client)}", flush=True)
     set_telethon_connected(True)
 
     # ── Phase 3: Register command handlers (exactly once) ─────────────────
