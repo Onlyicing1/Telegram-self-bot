@@ -142,6 +142,11 @@ def register_callback_handlers(client, owner_id: int) -> None:
         logger.info("[TIMING] _callback_router owner check PASS: elapsed=%.1fms", t_after_owner - t_enter)
         logger.info("HELP STEP 13 - callback owner check passed")
 
+        try:
+            await event.answer()
+        except Exception:
+            pass
+
         data = event.data.decode("utf-8") if event.data else ""
         if not data:
             logger.warning("HELP STEP 13 - empty callback data — ignoring")
