@@ -121,7 +121,7 @@ async def _list_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -156,7 +156,7 @@ async def _find_inline_builder(event, extra: str) -> list:
     builder.add_row("Enter Search Text", "input:find:query")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )

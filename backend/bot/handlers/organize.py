@@ -107,7 +107,7 @@ async def _organize_inline_builder(event, extra: str) -> list:
     builder.add_row("🧹 Clean Old Logs", "action:organize_clean")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )

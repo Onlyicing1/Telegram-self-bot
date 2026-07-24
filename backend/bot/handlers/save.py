@@ -416,7 +416,7 @@ async def _save_inline_builder(event, extra: str) -> list:
     builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
