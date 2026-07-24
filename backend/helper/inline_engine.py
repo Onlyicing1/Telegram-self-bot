@@ -31,6 +31,7 @@ from telethon.tl.custom import Button
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
+from backend.helper import trace_collector
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ async def trigger(self_client, chat_id: int, query: str) -> bool:
     Returns True on success, False on failure.
     """
     t_enter = _now_ms()
+    trace_collector.trace("TRIGGER ENTER (inline_engine)")
     logger.info("[TRACE] trigger ENTER: t=%.1fms, chat_id=%s, query='%s', loop=%d, task='%s', tasks=%d",
                 t_enter, chat_id, query, _loop_id(), _task_name(), _task_count())
 
@@ -117,6 +119,7 @@ async def trigger(self_client, chat_id: int, query: str) -> bool:
     logger.info("[TRACE] trigger pre-flight: helper_username='%s'", _helper_username)
     if not _helper_username:
         logger.error("[TRACE] trigger ABORT: helper username not set — set_helper_username() was never called or get_bot_username() returned empty")
+        trace_collector.trace("TRIGGER ABORT: helper_username not set")
         return False
 
     # ── Pre-flight: verify helper client is alive ──
@@ -140,10 +143,12 @@ async def trigger(self_client, chat_id: int, query: str) -> bool:
     t_before_iq = _now_ms()
     logger.info("[TRACE] trigger BEFORE inline_query: elapsed=%.1fms, bot='@%s', query='%s'",
                 t_before_iq - t_enter, _helper_username, query)
+    trace_collector.trace("BEFORE INLINE_QUERY")
 
     try:
         results = await self_client.inline_query(_helper_username, query)
         t_after_iq = _now_ms()
+        trace_collector.trace(f"AFTER INLINE_QUERY: results={len(results) if results else 0}")
         logger.info("[TRACE] trigger AFTER inline_query: elapsed=%.1fms, type=%s, results_count=%d",
                     t_after_iq - t_enter,
                     type(results).__name__, len(results) if results else 0)
@@ -155,14 +160,17 @@ async def trigger(self_client, chat_id: int, query: str) -> bool:
             t_before_click = _now_ms()
             logger.info("[TRACE] trigger BEFORE click: elapsed=%.1fms, chat_id=%s",
                         t_before_click - t_enter, chat_id)
+            trace_collector.trace("BEFORE CLICK")
             try:
                 sent_msg = await results[0].click(chat_id)
                 t_after_click = _now_ms()
+                trace_collector.trace("AFTER CLICK: success")
                 logger.info("[TRACE] trigger AFTER click: elapsed=%.1fms, sent_msg=%s",
                             t_after_click - t_enter, sent_msg)
                 return True
             except Exception as click_exc:
                 t_after_click = _now_ms()
+                trace_collector.trace(f"CLICK EXCEPTION: {type(click_exc).__name__}: {click_exc}")
                 logger.error("[TRACE] trigger click FAILED: elapsed=%.1fms, exc=%s",
                              t_after_click - t_enter, click_exc)
                 logger.exception("[TRACE] trigger click exception traceback:")
@@ -171,12 +179,14 @@ async def trigger(self_client, chat_id: int, query: str) -> bool:
             t_zero = _now_ms()
             logger.error("[TRACE] trigger ZERO RESULTS: elapsed=%.1fms, query='%s', helper='@%s' — helper bot InlineQuery handler did not answer or returned empty list",
                          t_zero - t_enter, query, _helper_username)
+            trace_collector.trace("ZERO RESULTS from inline_query")
             return False
     except Exception as exc:
         t_exc = _now_ms()
         logger.error("[TRACE] trigger inline_query EXCEPTION: elapsed=%.1fms, exc_type=%s, exc=%s",
                      t_exc - t_enter, type(exc).__name__, exc)
         logger.exception("[TRACE] trigger inline_query exception traceback:")
+        trace_collector.trace(f"INLINE_QUERY EXCEPTION: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -202,6 +212,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
     @helper_client.on(events.InlineQuery())
     async def _inline_router(event):
         t_enter = _now_ms()
+        trace_collector.trace("INLINE_ROUTER ENTER")
         logger.info("[TRACE] _inline_router ENTER: t=%.1fms, query='%s', user_id=%s, loop=%d, task='%s', tasks=%d",
                     t_enter, event.query, event.sender_id, _loop_id(), _task_name(), _task_count())
 
@@ -210,6 +221,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
         owner_ok = is_owner(event, owner_id)
         t_after_owner = _now_ms()
         if not owner_ok:
+            trace_collector.trace("INLINE_ROUTER: owner check FAILED")
             logger.warning("[TRACE] _inline_router owner check FAILED: elapsed=%.1fms, sender_id=%s, owner_id=%s",
                            t_after_owner - t_enter, event.sender_id, owner_id)
             try:
@@ -219,6 +231,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             return
 
         logger.info("[TRACE] _inline_router owner check PASS: elapsed=%.1fms", t_after_owner - t_enter)
+        trace_collector.trace("INLINE_ROUTER: owner check PASS")
 
         # ── Parse query ──
         raw_query = event.query.strip()
@@ -235,6 +248,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
         extra = parts[1] if len(parts) > 1 else ""
 
         logger.info("[TRACE] _inline_router parsed: panel_id='%s', extra='%s'", panel_id, extra)
+        trace_collector.trace(f"INLINE_ROUTER: parsed panel_id='{panel_id}', extra='{extra}'")
 
         # ── Builder lookup ──
         builder = get_inline_builder(panel_id)
@@ -248,6 +262,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             return
 
         logger.info("[TRACE] _inline_router: builder found for '%s' — invoking", panel_id)
+        trace_collector.trace("BUILDER ENTER")
 
         # ── Builder execution ──
         t_before_build = _now_ms()
@@ -258,6 +273,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             t_after_build = _now_ms()
             logger.info("[TRACE] _inline_router AFTER builder: elapsed=%.1fms, results_count=%d",
                         t_after_build - t_enter, len(results) if results else 0)
+            trace_collector.trace(f"BUILDER DONE: results={len(results) if results else 0}")
 
             if not results:
                 logger.warning("[TRACE] _inline_router: builder returned empty list for panel_id='%s'", panel_id)
@@ -266,8 +282,10 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             t_before_answer = _now_ms()
             logger.info("[TRACE] _inline_router BEFORE event.answer: elapsed=%.1fms, results_count=%d",
                         t_before_answer - t_enter, len(results) if results else 0)
+            trace_collector.trace("EVENT.ANSWER")
             await event.answer(results)
             t_after_answer = _now_ms()
+            trace_collector.trace("EVENT.ANSWER DONE")
             logger.info("[TRACE] _inline_router AFTER event.answer: elapsed=%.1fms",
                         t_after_answer - t_enter)
         except Exception as exc:
@@ -275,6 +293,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             logger.error("[TRACE] _inline_router builder/answer EXCEPTION: elapsed=%.1fms, exc_type=%s, exc=%s",
                          t_err - t_enter, type(exc).__name__, exc)
             logger.exception("[TRACE] _inline_router builder/answer traceback:")
+            trace_collector.trace(f"INLINE_ROUTER EXCEPTION: {type(exc).__name__}: {exc}")
             try:
                 await event.answer([])
             except Exception:

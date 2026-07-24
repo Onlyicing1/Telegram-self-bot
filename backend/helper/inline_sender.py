@@ -19,6 +19,7 @@ from telethon import events
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper import inline_engine
+from backend.helper import trace_collector
 from backend.helper.input_state import (
     get_pending,
     clear_pending,
@@ -60,6 +61,7 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     Returns True on success, False on failure.
     """
     t_enter = _now_ms()
+    trace_collector.trace("SEND_INLINE_PANEL ENTER (sender)")
     logger.info("[TRACE] send_inline_panel ENTER: t=%.1fms, chat_id=%s, query='%s', loop=%d, task='%s', tasks=%d",
                 t_enter, chat_id, query, _loop_id(), _task_name(), _task_count())
 
@@ -73,6 +75,7 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     logger.info("[TRACE] send_inline_panel pre-flight: helper_username='%s'", helper_username)
     if not helper_username:
         logger.error("[TRACE] send_inline_panel ABORT: helper_username is empty — inline UI will fail")
+        trace_collector.trace("SEND_INLINE_PANEL ABORT: helper_username empty")
         return False
 
     # ── Pre-flight: verify helper client state ──
@@ -102,8 +105,10 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     t_before_trigger = _now_ms()
     logger.info("[TRACE] send_inline_panel BEFORE trigger: elapsed=%.1fms", t_before_trigger - t_enter)
     try:
+        trace_collector.trace("TRIGGER ENTER (sender calls inline_engine.trigger)")
         result = await inline_engine.trigger(self_client, chat_id, query)
         t_after_trigger = _now_ms()
+        trace_collector.trace(f"TRIGGER DONE: ok={result}")
         logger.info("[TRACE] send_inline_panel AFTER trigger: elapsed=%.1fms, ok=%s",
                     t_after_trigger - t_enter, result)
     except Exception as exc:
