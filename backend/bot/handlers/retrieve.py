@@ -132,7 +132,7 @@ async def _preview_inline_builder(event, extra: str) -> list:
     builder.add_row("Enter Code", "input:preview:code")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -152,7 +152,7 @@ async def _send_inline_builder(event, extra: str) -> list:
     builder.add_row("Enter Code", "input:send:code")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )

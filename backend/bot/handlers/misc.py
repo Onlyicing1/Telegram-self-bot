@@ -178,7 +178,7 @@ async def _help_inline_builder(event, extra: str) -> list:
     from telethon.tl import types
     text = _build_main_menu_text()
     buttons = _build_main_menu_keyboard()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -193,7 +193,6 @@ async def _help_inline_builder(event, extra: str) -> list:
 
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
-
 
 # ── Health dashboard ────────────────────────────────────────────────────
 
@@ -319,7 +318,7 @@ async def _health_inline_builder(event, extra: str) -> list:
     builder.add_row("Refresh", "action:health_refresh")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=report,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -346,7 +345,7 @@ async def _kill_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=full_text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -376,7 +375,7 @@ async def _logs_inline_builder(event, extra: str) -> list:
     builder.add_row("Last 50", "action:logs_50")
     builder.add_row("Close", "panel:help:close")
     buttons = builder.build()
-    msg = types.InputBotInlineMessageTextAuto(
+    msg = types.InputBotInlineMessageText(
         message=text,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
@@ -477,10 +476,6 @@ def register(client, owner_id: int):
                 pass
 
     # ── Inline builders + panel registration ────────────────────────────
-    # Must run AFTER .help handler registration so a failure here cannot
-    # prevent the .help handler from being registered. Wrapped in
-    # try/except so any error is isolated and does not block subsequent
-    # handler registrations (.health, .kill, .logs).
     try:
         _register_help_panel()
         register_inline_builder("help", _help_inline_builder)
