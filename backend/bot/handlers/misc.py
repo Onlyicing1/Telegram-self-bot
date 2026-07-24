@@ -124,6 +124,9 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
+_MAIN_MENU_BODY = "\u200b"
+
+
 def _build_main_menu_text() -> str:
     lines = ["**LifeOS Command Center**\n"]
     for i, (label, _) in enumerate(_HELP_CATEGORIES, start=1):
@@ -139,9 +142,16 @@ def _build_category_page_text(index: int) -> str:
 
 def _build_main_menu_keyboard() -> list:
     builder = InlinePanelBuilder()
-    for i, (label, _) in enumerate(_HELP_CATEGORIES):
-        builder.add_row(label, f"panel:help:cat:{i}")
-    builder.add_row("Close", "panel:help:close")
+    cats = _HELP_CATEGORIES
+    for i in range(0, len(cats) - 1, 2):
+        builder.add_buttons(
+            (cats[i][0], f"panel:help:cat:{i}"),
+            (cats[i + 1][0], f"panel:help:cat:{i + 1}"),
+        )
+    builder.add_buttons(
+        (cats[-1][0], f"panel:help:cat:{len(cats) - 1}"),
+        ("Close", "panel:help:close"),
+    )
     return builder.build()
 
 
@@ -152,34 +162,46 @@ def _build_category_keyboard() -> list:
 
 
 async def _help_panel_handler(event, extra: str) -> None:
+    logger.info("[HELP_PANEL] handler entered: extra='%s', msg_id=%s, sender_id=%s",
+                extra, event.msg_id, event.sender_id)
     if extra == "close":
         try:
+            await event.answer()
             await event.delete()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[HELP_PANEL] close failed: %s", exc)
         return
     if extra == "back":
-        await event.edit(_build_main_menu_text(), buttons=_build_main_menu_keyboard())
+        try:
+            await event.edit(_MAIN_MENU_BODY, buttons=_build_main_menu_keyboard())
+        except Exception as exc:
+            logger.warning("[HELP_PANEL] back edit failed: %s", exc)
         return
     if extra.startswith("cat:"):
         idx_str = extra[4:]
         if idx_str.isdigit():
             idx = int(idx_str)
             if 0 <= idx < len(_HELP_CATEGORIES):
-                await event.edit(
-                    _build_category_page_text(idx),
-                    buttons=_build_category_keyboard(),
-                )
+                logger.info("[HELP_PANEL] opening category %d ('%s')", idx, _HELP_CATEGORIES[idx][0])
+                try:
+                    await event.edit(
+                        _build_category_page_text(idx),
+                        buttons=_build_category_keyboard(),
+                    )
+                except Exception as exc:
+                    logger.warning("[HELP_PANEL] cat %d edit failed: %s", idx, exc)
                 return
-    await event.edit(_build_main_menu_text(), buttons=_build_main_menu_keyboard())
+    try:
+        await event.edit(_MAIN_MENU_BODY, buttons=_build_main_menu_keyboard())
+    except Exception as exc:
+        logger.warning("[HELP_PANEL] default edit failed: %s", exc)
 
 
 async def _help_inline_builder(event, extra: str) -> list:
     from telethon.tl import types
-    text = _build_main_menu_text()
     buttons = _build_main_menu_keyboard()
     msg = types.InputBotInlineMessageText(
-        message=text,
+        message=_MAIN_MENU_BODY,
         reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
     )
     result = types.InputBotInlineResult(
