@@ -60,66 +60,28 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
 
     Returns True on success, False on failure.
     """
-    t_enter = _now_ms()
     trace_collector.trace("SEND_INLINE_PANEL ENTER (sender)")
-    logger.info("[TRACE] send_inline_panel ENTER: t=%.1fms, chat_id=%s, query='%s', loop=%d, task='%s', tasks=%d",
-                t_enter, chat_id, query, _loop_id(), _task_name(), _task_count())
 
-    # ── Pre-flight: verify self_client ──
-    sc_connected = self_client.is_connected() if self_client else False
-    logger.info("[TRACE] send_inline_panel pre-flight: self_client connected=%s, is_none=%s",
-                sc_connected, self_client is None)
-
-    # ── Pre-flight: verify helper username ──
     helper_username = inline_engine.get_helper_username()
-    logger.info("[TRACE] send_inline_panel pre-flight: helper_username='%s'", helper_username)
     if not helper_username:
-        logger.error("[TRACE] send_inline_panel ABORT: helper_username is empty — inline UI will fail")
         trace_collector.trace("SEND_INLINE_PANEL ABORT: helper_username empty")
         return False
 
-    # ── Pre-flight: verify helper client state ──
     from backend.helper.client import get_client
     helper = get_client()
     if helper is not None:
-        hc_connected = helper.is_connected()
-        logger.info("[TRACE] send_inline_panel pre-flight: helper_client connected=%s, loop=%d, is_none=False",
-                    hc_connected, _loop_id())
-        try:
-            handlers = helper.list_event_handlers()
-            logger.info("[TRACE] send_inline_panel pre-flight: helper_client event_handlers=%d", len(handlers))
-        except Exception as e:
-            logger.warning("[TRACE] send_inline_panel pre-flight: failed to list helper handlers: %s", e)
+        trace_collector.trace(f"HELPER connected={helper.is_connected()}")
     else:
-        logger.warning("[TRACE] send_inline_panel pre-flight: helper_client is None — get_client() returned None")
+        trace_collector.trace("HELPER is None")
 
-    # ── List all asyncio tasks for forensic snapshot ──
+    trace_collector.trace("TRIGGER ENTER (sender)")
     try:
-        all_tasks = asyncio.all_tasks()
-        for i, t in enumerate(all_tasks):
-            logger.info("[TRACE] send_inline_panel task[%d]: name='%s', done=%s, cancelled=%s",
-                        i, t.get_name(), t.done(), t.cancelled())
-    except RuntimeError:
-        logger.warning("[TRACE] send_inline_panel: could not enumerate tasks")
-
-    t_before_trigger = _now_ms()
-    logger.info("[TRACE] send_inline_panel BEFORE trigger: elapsed=%.1fms", t_before_trigger - t_enter)
-    try:
-        trace_collector.trace("TRIGGER ENTER (sender calls inline_engine.trigger)")
         result = await inline_engine.trigger(self_client, chat_id, query)
-        t_after_trigger = _now_ms()
         trace_collector.trace(f"TRIGGER DONE: ok={result}")
-        logger.info("[TRACE] send_inline_panel AFTER trigger: elapsed=%.1fms, ok=%s",
-                    t_after_trigger - t_enter, result)
     except Exception as exc:
-        t_after_trigger = _now_ms()
-        logger.error("[TRACE] send_inline_panel trigger EXCEPTION: elapsed=%.1fms, exc_type=%s, exc=%s",
-                     t_after_trigger - t_enter, type(exc).__name__, exc)
-        logger.exception("[TRACE] send_inline_panel trigger traceback:")
+        trace_collector.trace(f"TRIGGER EXCEPTION: {type(exc).__name__}: {exc}")
         result = False
 
-    if not result:
-        logger.warning("[TRACE] send_inline_panel returning False — trigger() returned False")
     return result
 
 
