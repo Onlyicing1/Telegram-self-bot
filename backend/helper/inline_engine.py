@@ -174,7 +174,7 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
 
         # ── Parse query ──
         trace_collector.trace("BEFORE PARSE_QUERY")
-        raw_query = event.query.strip()
+        raw_query = event.text.strip()
         if not raw_query:
             trace_collector.trace("AFTER PARSE_QUERY: empty query")
             try:
