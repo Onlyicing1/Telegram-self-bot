@@ -95,6 +95,36 @@ def get_helper_username() -> str:
     return _helper_username
 
 
+def _to_keyboard_button_rows(rows: list) -> list:
+    """Convert plain-list button rows into proper KeyboardButtonRow TLObjects.
+
+    InlinePanelBuilder.build() returns list[list[Button]], but
+    ReplyInlineMarkup expects list[KeyboardButtonRow]. Plain lists
+    cause 'a TLObject was expected' during serialization in event.answer().
+    """
+    fixed = []
+    for row in rows:
+        if isinstance(row, types.KeyboardButtonRow):
+            fixed.append(row)
+        elif isinstance(row, list):
+            fixed.append(types.KeyboardButtonRow(buttons=row))
+        else:
+            fixed.append(types.KeyboardButtonRow(buttons=[row]))
+    return fixed
+
+
+def _sanitize_results(results: list) -> list:
+    """Ensure every result and its reply_markup contain only valid TLObjects."""
+    for r in results:
+        msg = getattr(r, "send_message", None)
+        if msg is None:
+            continue
+        rm = getattr(msg, "reply_markup", None)
+        if rm is not None and hasattr(rm, "rows") and rm.rows:
+            rm.rows = _to_keyboard_button_rows(rm.rows)
+    return results
+
+
 def register_inline_builder(query_key: str, builder: InlineResultBuilder) -> None:
     """Register a builder that returns inline results for a query key."""
     _builders[query_key] = builder
@@ -212,6 +242,22 @@ def register_inline_handler(helper_client, owner_id: int) -> None:
             if not results:
                 trace_collector.trace("BUILDER returned empty list")
 
+            # ── Sanitize results: convert plain-list rows to KeyboardButtonRow ──
+            results = _sanitize_results(results)
+
+            # ── Diagnostic logging before event.answer() ──
+            trace_collector.trace(f"PRE_ANSWER: type(results)={type(results).__name__}, len(results)={len(results)}")
+            if results:
+                r0 = results[0]
+                trace_collector.trace(f"PRE_ANSWER: type(results[0])={type(r0).__name__}")
+                sm = getattr(r0, "send_message", None)
+                if sm is not None:
+                    trace_collector.trace(f"PRE_ANSWER: type(results[0].send_message)={type(sm).__name__}")
+                    rm = getattr(sm, "reply_markup", None)
+                    trace_collector.trace(f"PRE_ANSWER: type(results[0].send_message.reply_markup)={type(rm).__name__ if rm is not None else 'None'}")
+                    if rm is not None and hasattr(rm, "rows") and rm.rows:
+                        trace_collector.trace(f"PRE_ANSWER: reply_markup.rows count={len(rm.rows)}, type(rows[0])={type(rm.rows[0]).__name__}")
+
             # ── Answer inline query ──
             trace_collector.trace(f"BEFORE EVENT.ANSWER: results_count={result_count}")
             await event.answer(results)
@@ -252,7 +298,7 @@ def make_result(
 
     msg = types.InputBotInlineMessageText(
         message=body_text,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
+        reply_markup=types.ReplyInlineMarkup(rows=_to_keyboard_button_rows(buttons)) if buttons else None,
     )
 
     return types.InputBotInlineResult(
@@ -278,5 +324,5 @@ def make_button_rows(buttons_data: list[list[tuple[str, str]]]) -> list:
                     data=truncate_callback_data(data).encode("utf-8"),
                 )
             )
-        rows.append(row_buttons)
+        rows.append(types.KeyboardButtonRow(buttons=row_buttons))
     return rows
