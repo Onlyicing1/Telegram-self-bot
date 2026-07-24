@@ -195,8 +195,6 @@ async def _del_inline_builder(event, extra: str) -> list:
 
 
 def register(client, owner_id: int):
-    print(f"[FORENSIC] delete.register() ENTERED: client_id={id(client)}, owner_id={owner_id}", flush=True)
-
     register_panel("del", _del_inline_builder)
     register_inline_builder("del", _del_inline_builder)
     register_input("del", "n", {

@@ -1,6 +1,6 @@
 """
 Save Engine
-  .save f / .s f  — Forward save: metadata log + forward to Saved Messages, no download.
+  .save f / .s f  — Forward save: metadata log + forward to Saved-Messages, no download.
   .save d / .s d  — Deep save: download → validate → upload → DB record → cleanup.
   .save            — Inline panel: choose Forward or Deep save.
 
@@ -430,8 +430,6 @@ async def _save_inline_builder(event, extra: str) -> list:
 
 
 def register(client, owner_id: int, tz_str: str) -> None:
-    print(f"[FORENSIC] save.register() ENTERED: client_id={id(client)}, owner_id={owner_id}, tz={tz_str}", flush=True)
-
     register_panel("save", _save_panel_handler)
     register_inline_builder("save", _save_inline_builder)
 
