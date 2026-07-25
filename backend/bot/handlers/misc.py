@@ -124,7 +124,7 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
-_MAIN_MENU_BODY = "\u200b"
+_MAIN_MENU_BODY = "·"
 
 
 def _build_main_menu_text() -> str:
