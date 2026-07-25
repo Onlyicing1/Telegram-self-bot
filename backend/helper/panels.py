@@ -120,10 +120,25 @@ def register_callback_handlers(client, owner_id: int) -> None:
       - ``action:`` → action execution handler (Type A)
       - ``input:`` → input state setup (Type B)
     """
-    logger.info("HELP STEP 12 - callback handler registered: owner_id=%s", owner_id)
+    logger.info("=== CALLBACK REGISTRATION DIAGNOSTIC ===")
+    logger.info("CALLBACK owner_id=%s", owner_id)
+    logger.info("CALLBACK_CLIENT id=%s type=%s", id(client), type(client).__name__)
+    logger.info("CALLBACK_CLIENT is_connected=%s", client.is_connected())
+
+    try:
+        handlers_before = client.list_event_handlers()
+        logger.info("CALLBACK HANDLERS BEFORE: count=%d", len(handlers_before))
+        for i, (builder, handler) in enumerate(handlers_before):
+            logger.info("CALLBACK HANDLER BEFORE[%d]: builder_type=%s, builder=%r, handler=%s",
+                        i, type(builder).__name__, builder, getattr(handler, '__name__', str(handler)))
+    except Exception as exc:
+        logger.warning("CALLBACK HANDLERS BEFORE dump failed: %s", exc)
+
+    logger.info("CALLBACK BEFORE add_event_handler: id(client)=%s", id(client))
 
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
+        logger.info("CALLBACK ENTER")
         t_enter = _now_ms()
         logger.info("[TIMING] _callback_router ENTER: t=%.1fms, data=%s, sender_id=%s, message_id=%s",
                     t_enter, event.data, event.sender_id, event.message_id)
@@ -171,6 +186,21 @@ def register_callback_handlers(client, owner_id: int) -> None:
             t_err = _now_ms()
             logger.info("[TIMING] _callback_router EXCEPTION: elapsed=%.1fms", t_err - t_enter)
             logger.exception("HELP STEP 13 - callback router error (data='%s')", data)
+
+    logger.info("CALLBACK AFTER add_event_handler: id(client)=%s", id(client))
+
+    try:
+        handlers_after = client.list_event_handlers()
+        logger.info("CALLBACK HANDLERS AFTER: count=%d", len(handlers_after))
+        for i, (builder, handler) in enumerate(handlers_after):
+            logger.info("CALLBACK HANDLER AFTER[%d]: builder_type=%s, builder=%r, handler=%s",
+                        i, type(builder).__name__, builder, getattr(handler, '__name__', str(handler)))
+        has_callback = any(isinstance(builder, events.CallbackQuery) for builder, _ in handlers_after)
+        logger.info("CALLBACK CallbackQuery ATTACHED=%s", has_callback)
+    except Exception as exc:
+        logger.warning("CALLBACK HANDLERS AFTER dump failed: %s", exc)
+
+    logger.info("=== END CALLBACK REGISTRATION DIAGNOSTIC ===")
 
 
 async def _handle_panel(event, remainder: str) -> None:
