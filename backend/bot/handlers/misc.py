@@ -163,7 +163,7 @@ def _build_category_keyboard() -> list:
 
 async def _help_panel_handler(event, extra: str) -> None:
     logger.info("[HELP_PANEL] handler entered: extra='%s', msg_id=%s, sender_id=%s",
-                extra, event.msg_id, event.sender_id)
+                extra, event.message_id, event.sender_id)
     if extra == "close":
         try:
             await event.answer()
