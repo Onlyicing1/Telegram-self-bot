@@ -125,10 +125,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
         t_enter = _now_ms()
-        logger.info("[TIMING] _callback_router ENTER: t=%.1fms, data=%s, sender_id=%s, msg_id=%s",
-                    t_enter, event.data, event.sender_id, event.msg_id)
-        logger.info("HELP STEP 13 - callback received: data=%s, sender_id=%s, msg_id=%s",
-                    event.data, event.sender_id, event.msg_id)
+        logger.info("[TIMING] _callback_router ENTER: t=%.1fms, data=%s, sender_id=%s, message_id=%s",
+                    t_enter, event.data, event.sender_id, event.message_id)
+        logger.info("HELP STEP 13 - callback received: data=%s, sender_id=%s, message_id=%s",
+                    event.data, event.sender_id, event.message_id)
 
         if not is_owner(event, owner_id):
             t_after = _now_ms()
@@ -268,7 +268,7 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
         return
 
     chat_id = event.chat_id
-    inline_msg_id = event.msg_id or 0
+    inline_msg_id = event.message_id or 0
     logger.info("[CALLBACK] setting pending: owner_id=%s, panel_id='%s', chat_id=%s, inline_msg_id=%s",
                 owner_id, panel_id, chat_id, inline_msg_id)
     set_pending(
