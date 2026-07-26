@@ -13,7 +13,8 @@ Callback data format:
   - Input request:    input:<panel_id>:<input_id>
 
 Every callback resets the panel auto-delete timer.
-Close immediately deletes the inline message (never edits it).
+Close immediately deletes the inline message, cancels the timer,
+and clears TargetContext and input state.
 """
 import logging
 from typing import Awaitable, Callable, Any
@@ -22,9 +23,10 @@ from telethon import events
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
-from backend.helper.input_state import set_pending
-from backend.helper.panel_timer import reset_timer, delete_panel
+from backend.helper.input_state import set_pending, clear_pending
+from backend.helper.panel_timer import reset_timer, delete_panel, stop_timer
 from backend.helper.panel_render import to_edit_buttons
+from backend.helper.target_context import clear_target
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +42,9 @@ _inputs: dict[str, dict[str, InputConfig]] = {}
 class InlinePanelBuilder:
     """Builds inline keyboard layouts for the helper bot.
 
-    Single button API (Option A):
-      All methods store tuples: ("Text", "callback_data")
-      build() returns list[list[(text, data)]] — never Button objects.
-      The renderer converts tuples to Button objects.
+    All methods store tuples: ("Text", "callback_data")
+    build() returns list[list[(text, data)]].
+    The renderer normalizes tuples to Button objects.
     """
 
     def __init__(self):
@@ -119,8 +120,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
 
         try:
             if data == "panel:help:close":
-                if helper and chat_id and msg_id:
-                    await delete_panel(helper, chat_id, msg_id)
+                await _handle_close(helper, chat_id, msg_id, owner_id)
+                return
+
+            if data.endswith(":noop"):
                 return
 
             if data.startswith("panel:"):
@@ -129,8 +132,18 @@ def register_callback_handlers(client, owner_id: int) -> None:
                 await _handle_action(event, data[7:])
             elif data.startswith("input:"):
                 await _handle_input(event, data[6:], owner_id)
+            else:
+                logger.warning("Unknown callback data: %s", data)
         except Exception:
             logger.exception("Callback router error (data='%s')", data)
+
+
+async def _handle_close(helper, chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Close handler: delete panel, cancel timer, clear all state."""
+    clear_pending(owner_id)
+    clear_target(owner_id)
+    if helper and chat_id and msg_id:
+        await delete_panel(helper, chat_id, msg_id)
 
 
 async def _handle_panel(event, remainder: str) -> None:
@@ -140,6 +153,7 @@ async def _handle_panel(event, remainder: str) -> None:
 
     handler = get_panel(panel_id)
     if handler is None:
+        logger.warning("No panel handler for panel_id='%s'", panel_id)
         return
 
     try:
@@ -155,6 +169,7 @@ async def _handle_action(event, remainder: str) -> None:
 
     handler = get_action(action_id)
     if handler is None:
+        logger.warning("No action handler for action_id='%s'", action_id)
         return
 
     try:
@@ -181,6 +196,7 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
 
     input_cfg = get_input(panel_id, input_id)
     if input_cfg is None:
+        logger.warning("No input config for panel='%s' input='%s'", panel_id, input_id)
         return
 
     prompt = input_cfg.get("prompt", "Enter input:")

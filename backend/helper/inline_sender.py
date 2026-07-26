@@ -4,8 +4,8 @@ Inline sender — self-bot side of the Inline Mode architecture.
 Provides send_inline_panel which:
   1. Triggers inline mode on the helper bot.
   2. Auto-sends the first inline result.
-  3. Deletes the triggering command message (zero-spam).
-  4. Starts the panel auto-delete timer.
+  3. Starts the panel auto-delete timer (120 seconds).
+  4. Deletes the triggering command message (zero-spam).
 
 Also provides register_input_listener which wires a NewMessage
 handler on the self-bot to listen for the owner's next message when
@@ -24,14 +24,19 @@ logger = logging.getLogger(__name__)
 
 
 async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
-    """Trigger inline mode and auto-send the first result."""
+    """Trigger inline mode, auto-send the first result, start auto-delete timer."""
     helper_username = inline_engine.get_helper_username()
     if not helper_username:
         return False
 
     try:
-        result = await inline_engine.trigger(self_client, chat_id, query)
-        return result
+        success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
+        if success and msg_id:
+            from backend.helper.client import get_client
+            helper = get_client()
+            if helper:
+                start_timer(helper, msg_chat_id, msg_id)
+        return success
     except Exception:
         return False
 
