@@ -50,15 +50,24 @@ def get_helper_username() -> str:
 
 
 def _to_keyboard_button_rows(rows: list) -> list:
-    """Convert plain-list button rows into proper KeyboardButtonRow TLObjects."""
+    """Convert tuple-based button rows into KeyboardButtonRow TLObjects.
+
+    Input: list of rows, each row is a list of (text, callback_data) tuples.
+    Output: list of KeyboardButtonRow objects.
+    """
     fixed = []
     for row in rows:
         if isinstance(row, types.KeyboardButtonRow):
             fixed.append(row)
-        elif isinstance(row, list):
-            fixed.append(types.KeyboardButtonRow(buttons=row))
         else:
-            fixed.append(types.KeyboardButtonRow(buttons=[row]))
+            row_buttons = [
+                types.KeyboardButtonCallback(
+                    text=text,
+                    data=truncate_callback_data(data).encode("utf-8"),
+                )
+                for text, data in row
+            ]
+            fixed.append(types.KeyboardButtonRow(buttons=row_buttons))
     return fixed
 
 
@@ -172,16 +181,19 @@ def make_result(
 
 
 def make_button_rows(buttons_data: list[list[tuple[str, str]]]) -> list:
-    """Convert a list of button rows into ReplyInlineMarkup rows."""
+    """Convert tuple-based button rows into KeyboardButtonRow TLObjects.
+
+    Input: list of rows, each row is a list of (text, callback_data) tuples.
+    Output: list of KeyboardButtonRow objects.
+    """
     rows = []
     for row_data in buttons_data:
-        row_buttons = []
-        for text, data in row_data:
-            row_buttons.append(
-                types.KeyboardButtonCallback(
-                    text=text,
-                    data=truncate_callback_data(data).encode("utf-8"),
-                )
+        row_buttons = [
+            types.KeyboardButtonCallback(
+                text=text,
+                data=truncate_callback_data(data).encode("utf-8"),
             )
+            for text, data in row_data
+        ]
         rows.append(types.KeyboardButtonRow(buttons=row_buttons))
     return rows

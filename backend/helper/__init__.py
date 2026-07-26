@@ -43,7 +43,7 @@ from backend.helper.panel_timer import (
     stop_timer,
     delete_panel,
 )
-from backend.helper.panel_render import render, render_edit
+from backend.helper.panel_render import render, render_edit, to_edit_buttons
 from backend.helper import watchdog
 
 __all__ = [
@@ -76,5 +76,6 @@ __all__ = [
     "delete_panel",
     "render",
     "render_edit",
+    "to_edit_buttons",
     "watchdog",
 ]
