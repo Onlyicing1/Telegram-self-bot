@@ -18,6 +18,7 @@ Callback data format:
   - Close:            nav:close
 """
 import logging
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Any
 
 from telethon import events
@@ -57,80 +58,124 @@ _inputs: dict[str, dict[str, InputConfig]] = {}
 # Navigation stack: chat_id:msg_id -> list of (panel_id, extra) for Back
 _nav_stack: dict[str, list[tuple[str, str]]] = {}
 
-
-class InlinePanelBuilder:
-    """Builds inline keyboard layouts. Tuples: ("Text", "callback_data")."""
-
-    def __init__(self):
-        self._rows: list[list[tuple[str, str]]] = []
-
-    def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
-        self._rows.append([(text, callback_data)])
-        return self
-
-    def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
-        self._rows.append(list(buttons))
-        return self
-
-    def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
-        self._rows.append(("__url__", text, url))
-        return self
-
-    def build(self) -> list[list[tuple[str, str]]]:
-        return self._rows
-
-
-def register_panel(panel_id: str, handler: PanelHandler) -> None:
-    _panels[panel_id] = handler
-
-
-def get_panel(panel_id: str) -> PanelHandler | None:
-    return _panels.get(panel_id)
-
-
-def register_action(action_id: str, handler: ActionHandler) -> None:
-    _actions[action_id] = handler
-
-
-def get_action(action_id: str) -> ActionHandler | None:
-    return _actions.get(action_id)
-
-
-def register_input(panel_id: str, input_id: str, config: InputConfig) -> None:
-    if panel_id not in _inputs:
-        _inputs[panel_id] = {}
-    _inputs[panel_id][input_id] = config
-
-
-def get_input(panel_id: str, input_id: str) -> InputConfig | None:
-    return _inputs.get(panel_id, {}).get(input_id)
+# ── Session tracing ──
+# Every panel creation gets a unique session ID. Every callback logs
+# session_id, owner_id, chat_id, msg_id, callback_data, nav_stack,
+# id(nav_stack), id(_nav_stack), and all dict keys. Every mutation
+# logs before AND after state. This proves exactly where nav_stack
+# transitions from non-empty to empty.
+_session_counter: int = 0
+_sessions: dict[str, dict] = {}  # nav_key -> {session_id, chat_id, msg_id, created_at}
 
 
 def _nav_key(chat_id: int, msg_id: int) -> str:
     return f"{chat_id}:{msg_id}"
 
 
+def _get_or_create_session(chat_id: int, msg_id: int) -> str:
+    """Get or create a panel session ID for this chat_id:msg_id key."""
+    global _session_counter
+    k = _nav_key(chat_id, msg_id)
+    if k not in _sessions:
+        _session_counter += 1
+        sid = f"PANEL-SESSION-{_session_counter:06d}"
+        _sessions[k] = {
+            "session_id": sid,
+            "chat_id": chat_id,
+            "msg_id": msg_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info(
+            "[PANEL] SESSION CREATED session=%s key=%s chat_id=%s msg_id=%s "
+            "nav_stack_dict_id=0x%x nav_stack_keys=%s",
+            sid, k, chat_id, msg_id,
+            id(_nav_stack), list(_nav_stack.keys()),
+        )
+    return _sessions[k]["session_id"]
+
+
+def _log_session(session_id: str, chat_id: int, msg_id: int,
+                 callback_data: str, label: str) -> None:
+    """Log full session state at a callback boundary."""
+    k = _nav_key(chat_id, msg_id)
+    stack = _nav_stack.get(k)
+    stack_copy = list(stack) if stack else []
+    logger.info(
+        "[PANEL] %s session=%s chat=%s msg=%s "
+        "callback_data='%s' key=%s stack=%s "
+        "stack_obj=0x%x nav_stack_dict_id=0x%x "
+        "nav_stack_keys=%s",
+        label, session_id, chat_id, msg_id,
+        callback_data, k, stack_copy,
+        id(stack) if stack else 0, id(_nav_stack),
+        list(_nav_stack.keys()),
+    )
+
+
 def _push_nav(chat_id: int, msg_id: int, panel_id: str, extra: str) -> None:
     k = _nav_key(chat_id, msg_id)
+    before = list(_nav_stack.get(k, []))
     if k not in _nav_stack:
         _nav_stack[k] = []
     _nav_stack[k].append((panel_id, extra))
+    after = list(_nav_stack[k])
+    logger.info(
+        "[PANEL] PUSH key=%s before=%s after=%s pushed=(%s,%s) "
+        "stack_obj=0x%x dict_id=0x%x dict_keys=%s",
+        k, before, after, panel_id, extra,
+        id(_nav_stack[k]), id(_nav_stack),
+        list(_nav_stack.keys()),
+    )
 
 
 def _pop_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
     k = _nav_key(chat_id, msg_id)
+    before = list(_nav_stack.get(k, []))
     stack = _nav_stack.get(k)
     if not stack:
+        logger.info(
+            "[PANEL] POP key=%s before=%s after=[] popped=None "
+            "stack_obj=0x0 dict_id=0x%x dict_keys=%s",
+            k, before, id(_nav_stack),
+            list(_nav_stack.keys()),
+        )
         return None
-    return stack.pop()
+    result = stack.pop()
+    after = list(_nav_stack.get(k, []))
+    logger.info(
+        "[PANEL] POP key=%s before=%s after=%s popped=%s "
+        "stack_obj=0x%x dict_id=0x%x dict_keys=%s",
+        k, before, after, result,
+        id(stack), id(_nav_stack),
+        list(_nav_stack.keys()),
+    )
+    return result
 
 
 def _clear_nav(chat_id: int, msg_id: int) -> None:
-    _nav_stack.pop(_nav_key(chat_id, msg_id), None)
+    k = _nav_key(chat_id, msg_id)
+    before = list(_nav_stack.get(k, []))
+    _nav_stack.pop(k, None)
+    logger.info(
+        "[PANEL] CLEAR key=%s before=%s after=REMOVED "
+        "dict_id=0x%x dict_keys=%s",
+        k, before, id(_nav_stack),
+        list(_nav_stack.keys()),
+    )
 
 
 def _get_nav_stack(chat_id: int, msg_id: int) -> list[tuple[str, str]]:
-    return list(_nav_stack.get(_nav_key(chat_id, msg_id), []))
+    k = _nav_key(chat_id, msg_id)
+    stack = _nav_stack.get(k)
+    result = list(stack) if stack else []
+    logger.info(
+        "[PANEL] LOOKUP key=%s found=%s result=%s "
+        "stack_obj=0x%x dict_id=0x%x dict_keys=%s",
+        k, stack is not None, result,
+        id(stack) if stack else 0, id(_nav_stack),
+        list(_nav_stack.keys()),
+    )
+    return result
 
 
 def _append_footer(buttons: list) -> list:
@@ -182,6 +227,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
         data = event.data.decode("utf-8") if event.data else ""
         step(trace_id, 1, f"callback received: data='{data}', chat_id={chat_id}, msg_id={msg_id}, sender_id={sender_id}")
 
+        # Session trace — log full state at callback entry
+        session_id = _get_or_create_session(chat_id, msg_id)
+        _log_session(session_id, chat_id, msg_id, data, "CALLBACK ENTRY")
+
         # Step 2: router entered
         step(trace_id, 2, f"router entered: _callback_router (helper bot client)")
 
@@ -211,17 +260,22 @@ def register_callback_handlers(client, owner_id: int) -> None:
         # Step 5: panel state
         nav_before = _get_nav_stack(chat_id, msg_id)
         step(trace_id, 5, f"panel state: nav_stack_before={nav_before}")
+        _log_session(session_id, chat_id, msg_id, data, "BEFORE DISPATCH")
 
         try:
             if data == "nav:close":
                 step(trace_id, 3, "Close handler entered")
+                _log_session(session_id, chat_id, msg_id, data, "CLOSE ENTER")
                 await _handle_close(self_client, chat_id, msg_id, owner_id, trace_id)
+                _log_session(session_id, chat_id, msg_id, data, "CLOSE EXIT")
                 finish_trace(trace_id)
                 return
 
             if data == "nav:back":
                 step(trace_id, 3, "Back handler entered")
+                _log_session(session_id, chat_id, msg_id, data, "BACK ENTER")
                 await _handle_back(event, self_client, chat_id, msg_id, trace_id)
+                _log_session(session_id, chat_id, msg_id, data, "BACK EXIT")
                 finish_trace(trace_id)
                 return
 
@@ -232,13 +286,19 @@ def register_callback_handlers(client, owner_id: int) -> None:
 
             if data.startswith("panel:"):
                 step(trace_id, 2, f"handler selected: _handle_panel (panel navigation)")
+                _log_session(session_id, chat_id, msg_id, data, "PANEL ENTER")
                 await _handle_panel(event, chat_id, msg_id, data[6:], trace_id)
+                _log_session(session_id, chat_id, msg_id, data, "PANEL EXIT")
             elif data.startswith("action:"):
                 step(trace_id, 2, f"handler selected: _handle_action (action execution)")
+                _log_session(session_id, chat_id, msg_id, data, "ACTION ENTER")
                 await _handle_action(event, chat_id, msg_id, data[7:], trace_id)
+                _log_session(session_id, chat_id, msg_id, data, "ACTION EXIT")
             elif data.startswith("input:"):
                 step(trace_id, 2, f"handler selected: _handle_input (input request)")
+                _log_session(session_id, chat_id, msg_id, data, "INPUT ENTER")
                 await _handle_input(event, chat_id, msg_id, data[6:], owner_id, trace_id)
+                _log_session(session_id, chat_id, msg_id, data, "INPUT EXIT")
             else:
                 step(trace_id, 2, f"unknown callback data: {data}", ok=False)
                 logger.warning("Unknown callback data: %s", data)
@@ -246,6 +306,7 @@ def register_callback_handlers(client, owner_id: int) -> None:
             # Step 11: handler finished
             nav_after = _get_nav_stack(chat_id, msg_id)
             step(trace_id, 11, f"handler finished: success, nav_stack_after={nav_after}")
+            _log_session(session_id, chat_id, msg_id, data, "AFTER DISPATCH")
         except Exception as exc:
             log_exception(trace_id, exc)
             logger.exception("Callback router error (data='%s', trace=%s)", data, trace_id)

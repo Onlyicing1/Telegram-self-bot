@@ -97,9 +97,16 @@ async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int
         msg = await results[0].click(chat_id)
         if msg is not None:
             msg_id = getattr(msg, "id", 0) or 0
+            msg_chat_id = getattr(msg, "chat_id", 0) or chat_id
+            logger.info(
+                "[PANEL] TRIGGER RESULT query='%s' click_chat_id=%s "
+                "msg_chat_id=%s msg_id=%s entity_chat_id=%s",
+                query, chat_id,
+                msg_chat_id, msg_id, chat_id,
+            )
             if not msg_id:
                 logger.warning("trigger: click() returned message with id=0")
-            return True, chat_id, msg_id
+            return True, msg_chat_id, msg_id
         logger.warning("trigger: click() returned None for query '%s'", query)
         return False, chat_id, 0
     except Exception as exc:

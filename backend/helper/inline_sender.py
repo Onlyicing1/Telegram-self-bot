@@ -26,6 +26,12 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
 
     try:
         success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
+        logger.info(
+            "[PANEL] PANEL CREATED query='%s' trigger_chat_id=%s trigger_msg_id=%s "
+            "success=%s init_panel_key='%s:%s'",
+            query, msg_chat_id, msg_id, success,
+            msg_chat_id, msg_id,
+        )
         if success and msg_id:
             init_panel(self_client, msg_chat_id, msg_id)
         return success
