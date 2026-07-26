@@ -2,6 +2,7 @@
 .ping    — Edit trigger with PONG (zero-spam policy).
 .id      — Chat ID + Message ID of the current context.
 .help    — Interactive inline help panel (via Inline Mode).
+.panel   — Context panel for the replied message.
 .health  — Full health dashboard (inline panel).
 .kill    — Diagnostic snapshot + stalled-task recovery (inline panel).
 .logs    — View recent diagnostic events (inline panel).
@@ -24,10 +25,14 @@ from backend.helper import (
     InlinePanelBuilder,
     register_panel,
     register_inline_builder,
+    register_action,
     send_inline_panel,
     render,
     render_edit,
     to_edit_buttons,
+    TargetContext,
+    set_target,
+    get_target,
 )
 from backend.helper.client import get_client
 
@@ -52,6 +57,7 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
             "`.id` — Chat & Msg IDs",
             "`.help` — This menu",
             "`.health` — Health dashboard",
+            "`.panel` — Context panel (reply to msg)",
         ],
     ),
     (
@@ -178,6 +184,139 @@ def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
 
 
+async def _context_panel_handler(event, extra: str) -> None:
+    """Context panel: shows info about the replied message with actions."""
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+
+    if not ctx or ctx.kind != "reply":
+        text, buttons = render_edit(
+            "Context Panel",
+            "Reply context expired.\n\nUse `.panel` while replying to a message.",
+            [[("Close", "panel:help:close")]],
+        )
+        try:
+            await event.edit(text, buttons=buttons)
+        except Exception as exc:
+            logger.warning("context panel expired edit failed: %s", exc)
+        return
+
+    if extra.startswith("exec:"):
+        action = extra[5:]
+        from backend.helper.inline_engine import _self_client
+        client = _self_client
+
+        if action == "save_f":
+            from backend.services import save_service
+            reply_msg = await ctx.resolve(client)
+            if reply_msg is None:
+                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
+                                            [[("Close", "panel:help:close")]])
+                await event.edit(text, buttons=buttons)
+                return
+            result = await save_service.execute_save(client, owner_id, reply_msg, "f", ctx.tz_str)
+            builder = InlinePanelBuilder()
+            builder.add_row("Close", "panel:help:close")
+            text, btns = render_edit("Save Engine", result, builder.build())
+            await event.edit(text, buttons=btns)
+            return
+
+        elif action == "save_d":
+            from backend.services import save_service
+            reply_msg = await ctx.resolve(client)
+            if reply_msg is None:
+                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
+                                            [[("Close", "panel:help:close")]])
+                await event.edit(text, buttons=buttons)
+                return
+            result = await save_service.execute_save(client, owner_id, reply_msg, "d", ctx.tz_str)
+            builder = InlinePanelBuilder()
+            builder.add_row("Close", "panel:help:close")
+            text, btns = render_edit("Save Engine", result, builder.build())
+            await event.edit(text, buttons=btns)
+            return
+
+        elif action == "preview":
+            from backend.helper.inline_engine import _self_client
+            from backend.services import retrieve_service
+            reply_msg = await ctx.resolve(_self_client)
+            if reply_msg is None:
+                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
+                                            [[("Close", "panel:help:close")]])
+                await event.edit(text, buttons=buttons)
+                return
+            result = await retrieve_service.do_preview(_self_client, owner_id, str(reply_msg.id))
+            builder = InlinePanelBuilder()
+            builder.add_row("Back", "panel:context")
+            builder.add_row("Close", "panel:help:close")
+            text, btns = render_edit("Preview", result, builder.build())
+            await event.edit(text, buttons=btns)
+            return
+
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
+    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
+    builder.add_row("👁 Preview", "panel:context:exec:preview")
+    builder.add_row("Close", "panel:help:close")
+    text, buttons = render_edit(
+        "Context Panel",
+        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
+        builder.build(),
+    )
+    try:
+        await event.edit(text, buttons=buttons)
+    except Exception as exc:
+        logger.warning("context panel edit failed: %s", exc)
+
+
+async def _context_inline_builder(event, extra: str) -> list:
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+
+    if not ctx or ctx.kind != "reply":
+        builder = InlinePanelBuilder()
+        builder.add_row("Close", "panel:help:close")
+        return [render("Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.",
+                       builder.build())]
+
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
+    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
+    builder.add_row("👁 Preview", "panel:context:exec:preview")
+    builder.add_row("Close", "panel:help:close")
+    return [render(
+        "Context Panel",
+        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
+        builder.build(),
+    )]
+
+
+async def _context_error_panel_handler(event, extra: str) -> None:
+    text, buttons = render_edit(
+        "Context Panel",
+        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
+        [[("Close", "panel:help:close")]],
+    )
+    try:
+        await event.edit(text, buttons=buttons)
+    except Exception as exc:
+        logger.warning("context error panel edit failed: %s", exc)
+
+
+async def _context_error_inline_builder(event, extra: str) -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("Close", "panel:help:close")
+    return [render(
+        "Context Panel",
+        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
+        builder.build(),
+    )]
+
+
 def _format_uptime(uptime_s):
     if uptime_s is None or uptime_s < 0:
         return "unknown"
@@ -292,6 +431,15 @@ async def _health_inline_builder(event, extra: str) -> list:
     return [render("Health Dashboard", report, builder.build())]
 
 
+async def _health_refresh_action(event, extra: str) -> tuple:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    builder.add_row("Close", "panel:help:close")
+    return report, to_edit_buttons(builder.build())
+
+
 async def _kill_inline_builder(event, extra: str) -> list:
     snap = health.snapshot()
     self_client = _get_self_client()
@@ -323,6 +471,26 @@ async def _logs_inline_builder(event, extra: str) -> list:
     builder.add_row("Last 50", "action:logs_50")
     builder.add_row("Close", "panel:help:close")
     return [render("Event Log", text, builder.build())]
+
+
+async def _logs_errors_action(event, extra: str) -> tuple:
+    events_list = diagnostics.filter_events(limit=20, errors_only=True)
+    text = diagnostics.format_events(events_list)
+    builder = InlinePanelBuilder()
+    builder.add_row("Back", "panel:logs")
+    builder.add_row("Last 50", "action:logs_50")
+    builder.add_row("Close", "panel:help:close")
+    return text, to_edit_buttons(builder.build())
+
+
+async def _logs_50_action(event, extra: str) -> tuple:
+    events_list = diagnostics.filter_events(limit=50, errors_only=False)
+    text = diagnostics.format_events(events_list)
+    builder = InlinePanelBuilder()
+    builder.add_row("Back", "panel:logs")
+    builder.add_row("Errors Only", "action:logs_errors")
+    builder.add_row("Close", "panel:help:close")
+    return text, to_edit_buttons(builder.build())
 
 
 def _get_self_client():
@@ -387,12 +555,60 @@ def register(client, owner_id: int):
             except Exception:
                 pass
 
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.panel$"))
+    async def panel_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        reply = await event.message.get_reply_message()
+        if not reply:
+            helper = get_client()
+            if helper is None:
+                await event.edit("⚠️ Reply to a message first, then use `.panel`")
+                return
+            try:
+                await event.delete()
+                await send_inline_panel(client, event.chat_id, "context_error")
+            except Exception as exc:
+                logger.warning("panel error inline send failed: %s", exc)
+            return
+
+        helper = get_client()
+        if helper is None:
+            await event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN).")
+            return
+
+        set_target(owner_id, TargetContext(
+            owner_id=owner_id,
+            kind="reply",
+            reply_chat_id=reply.chat_id,
+            reply_msg_id=reply.id,
+            tz_str=_resolve_tz(),
+        ))
+
+        try:
+            await event.delete()
+            await send_inline_panel(client, event.chat_id, "context")
+        except Exception as exc:
+            logger.warning("panel inline send failed: %s", exc)
+            try:
+                await event.edit(f"⚠️ Panel failed: {exc}")
+            except Exception:
+                pass
+
     try:
         _register_help_panel()
+        register_panel("context", _context_panel_handler)
+        register_panel("context_error", _context_error_panel_handler)
         register_inline_builder("help", _help_inline_builder)
         register_inline_builder("health", _health_inline_builder)
         register_inline_builder("kill", _kill_inline_builder)
         register_inline_builder("logs", _logs_inline_builder)
+        register_inline_builder("context", _context_inline_builder)
+        register_inline_builder("context_error", _context_error_inline_builder)
+        register_action("health_refresh", _health_refresh_action)
+        register_action("logs_errors", _logs_errors_action)
+        register_action("logs_50", _logs_50_action)
     except Exception as exc:
         logger.warning("Inline builder registration failed: %s", exc)
 
