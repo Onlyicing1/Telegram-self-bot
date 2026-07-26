@@ -44,6 +44,7 @@ from backend.helper.panel_settings import (
     load as load_settings,
 )
 from backend.helper.panel_render import render, render_edit, to_edit_buttons
+from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper import watchdog
 
 __all__ = [
@@ -83,5 +84,6 @@ __all__ = [
     "render",
     "render_edit",
     "to_edit_buttons",
+    "configure_callback_trace",
     "watchdog",
 ]

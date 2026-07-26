@@ -44,6 +44,7 @@ from backend.helper.inline_engine import (
 )
 from backend.helper.inline_sender import register_input_listener
 from backend.helper.panel_settings import load as load_panel_settings
+from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper import watchdog as helper_watchdog
 from backend.health import (
     check_stale,
@@ -236,6 +237,7 @@ async def main() -> None:
                 set_self_client(client)
                 set_helper_username(get_bot_username())
                 set_owner_id(cfg["OWNER_ID"])
+                configure_callback_trace(client, cfg["OWNER_ID"])
                 register_input_listener(client, cfg["OWNER_ID"])
                 helper_watchdog.configure(cfg["BOT_TOKEN"], client, cfg["OWNER_ID"])
                 helper_watchdog.start()
