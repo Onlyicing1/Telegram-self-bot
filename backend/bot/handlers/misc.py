@@ -33,6 +33,8 @@ from backend.helper import (
     TargetContext,
     set_target,
     get_target,
+    is_auto_close_enabled,
+    toggle_auto_close,
 )
 from backend.helper.client import get_client
 
@@ -132,22 +134,12 @@ def _build_main_menu_buttons() -> list:
             (cats[i][0], f"panel:help:cat:{i}"),
             (cats[i + 1][0], f"panel:help:cat:{i + 1}"),
         )
-    builder.add_buttons(
-        (cats[-1][0], f"panel:help:cat:{len(cats) - 1}"),
-        ("Close", "panel:help:close"),
-    )
-    return builder.build()
-
-
-def _build_category_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_buttons(("Back", "panel:help:back"), ("Close", "panel:help:close"))
+    builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
+    builder.add_row("⚙️ Settings", "panel:settings")
     return builder.build()
 
 
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    if extra == "close":
-        return None
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
     if extra.startswith("cat:"):
@@ -157,23 +149,50 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
             if 0 <= idx < len(_HELP_CATEGORIES):
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
-                return _HELP_CATEGORIES[idx][0], body, _build_category_buttons()
+                return _HELP_CATEGORIES[idx][0], body, []
     return "LifeOS Command Center", "", _build_main_menu_buttons()
 
 
 async def _help_inline_builder(event, extra: str) -> list:
-    buttons = _build_main_menu_buttons()
-    buttons.append([("Disable Auto Close", "timer:toggle")])
-    buttons.append([("Close", "panel:help:close")])
-    return [render("LifeOS", "Auto Close\n120s", buttons)]
+    return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
+
+
+async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    enabled = is_auto_close_enabled()
+    status = "ON" if enabled else "OFF"
+    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if enabled else 'stay open until manually closed'}."
+    builder = InlinePanelBuilder()
+    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
+    return "Settings", body, builder.build()
+
+
+async def _settings_inline_builder(event, extra: str) -> list:
+    enabled = is_auto_close_enabled()
+    status = "ON" if enabled else "OFF"
+    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if enabled else 'stay open until manually closed'}."
+    builder = InlinePanelBuilder()
+    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
+    return [render("Settings", body, builder.build())]
+
+
+async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str, list] | None:
+    new_val = toggle_auto_close()
+    status = "ON" if new_val else "OFF"
+    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if new_val else 'stay open until manually closed'}."
+    builder = InlinePanelBuilder()
+    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
+    return "Settings", body, builder.build()
 
 
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
+    register_panel("settings", _settings_panel_handler)
+    register_inline_builder("help", _help_inline_builder)
+    register_inline_builder("settings", _settings_inline_builder)
+    register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
 
 
 async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    """Context panel: shows info about the replied message with actions."""
     from backend.helper.inline_engine import _owner_id
 
     owner_id = _owner_id
@@ -210,9 +229,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             if reply_msg is None:
                 return "Context Panel", "Reply message no longer exists.", []
             result = await retrieve_service.do_preview(_self_client, owner_id, str(reply_msg.id))
-            builder = InlinePanelBuilder()
-            builder.add_row("Back", "panel:context")
-            return "Preview", result, builder.build()
+            return "Preview", result, []
 
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
@@ -228,21 +245,15 @@ async def _context_inline_builder(event, extra: str) -> list:
     ctx = get_target(owner_id)
 
     if not ctx or ctx.kind != "reply":
-        builder = InlinePanelBuilder()
-        builder.add_row("Disable Auto Close", "timer:toggle")
-        builder.add_row("Close", "panel:help:close")
-        return [render("Context Panel", "Auto Close\n120s\n\nReply context expired.\n\nUse `.panel` while replying to a message.",
-                       builder.build())]
+        return [render("Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", [])]
 
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
     return [render(
         "Context Panel",
-        f"Auto Close\n120s\n\n**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
+        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
         builder.build(),
     )]
 
@@ -252,13 +263,10 @@ async def _context_error_panel_handler(event, extra: str) -> tuple[str, str, lis
 
 
 async def _context_error_inline_builder(event, extra: str) -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
     return [render(
         "Context Panel",
-        "Auto Close\n120s\n\nNo replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
-        builder.build(),
+        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
+        [],
     )]
 
 
@@ -367,14 +375,20 @@ def _build_health_report(snap):
     return "\n".join(lines)
 
 
+async def _health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
 async def _health_inline_builder(event, extra: str) -> list:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
     builder.add_row("Refresh", "action:health_refresh")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Health Dashboard", f"Auto Close\n120s\n\n{report}", builder.build())]
+    return [render("Health Dashboard", report, builder.build())]
 
 
 async def _health_refresh_action(event, extra: str) -> tuple[str, str, list] | None:
@@ -395,10 +409,24 @@ async def _kill_inline_builder(event, extra: str) -> list:
         self_client, 0, _resolve_tz(), bio_engine, db_client
     )
     full_text = report + recovery
+    return [render("Diagnostics", full_text, [])]
+
+
+async def _logs_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    limit = 20
+    if extra and extra.isdigit():
+        limit = min(int(extra), 500)
+    elif extra == "errors":
+        limit = 20
+    events_list = diagnostics.filter_events(
+        limit=limit,
+        errors_only=(extra == "errors"),
+    )
+    text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Diagnostics", f"Auto Close\n120s\n\n{full_text}", builder.build())]
+    builder.add_row("Errors Only", "action:logs_errors")
+    builder.add_row("Last 50", "action:logs_50")
+    return "Event Log", text, builder.build()
 
 
 async def _logs_inline_builder(event, extra: str) -> list:
@@ -415,16 +443,13 @@ async def _logs_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Errors Only", "action:logs_errors")
     builder.add_row("Last 50", "action:logs_50")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Event Log", f"Auto Close\n120s\n\n{text}", builder.build())]
+    return [render("Event Log", text, builder.build())]
 
 
 async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=20, errors_only=True)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:logs")
     builder.add_row("Last 50", "action:logs_50")
     return "Event Log", text, builder.build()
 
@@ -433,7 +458,6 @@ async def _logs_50_action(event, extra: str) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=50, errors_only=False)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:logs")
     builder.add_row("Errors Only", "action:logs_errors")
     return "Event Log", text, builder.build()
 
@@ -548,7 +572,8 @@ def register(client, owner_id: int):
         _register_help_panel()
         register_panel("context", _context_panel_handler)
         register_panel("context_error", _context_error_panel_handler)
-        register_inline_builder("help", _help_inline_builder)
+        register_panel("health", _health_panel_handler)
+        register_panel("logs", _logs_panel_handler)
         register_inline_builder("health", _health_inline_builder)
         register_inline_builder("kill", _kill_inline_builder)
         register_inline_builder("logs", _logs_inline_builder)

@@ -19,8 +19,6 @@ from backend.helper import (
     register_inline_builder,
     send_inline_panel,
     render,
-    render_edit,
-    to_edit_buttons,
     TargetContext,
     set_target,
     get_target,
@@ -56,9 +54,7 @@ async def _save_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:exec:f")
     builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Save Engine", "Auto Close\n120s\n\nChoose a save mode:", builder.build())]
+    return [render("Save Engine", "Choose a save mode:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str) -> None:

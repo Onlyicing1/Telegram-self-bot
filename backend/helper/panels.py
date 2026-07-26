@@ -1,22 +1,20 @@
 """
-Inline panel system for the helper bot.
+Inline panel system — clean minimal UX.
 
-Provides:
-  - InlinePanelBuilder — builds inline keyboards with rows of buttons.
-  - register_panel(panel_id, handler) — registers a callback handler.
-  - register_action(action_id, handler) — registers an action handler (Type A).
-  - register_input(panel_id, input_id, handler, prompt) — registers input (Type B).
+Design:
+  - Every panel has ONE footer: [ ← Back ] [ ✕ Close ]
+  - No per-panel auto-close buttons. Auto-close is global (panel_settings).
+  - Navigation stack: Back returns to previous panel, never rebuilds.
+  - Timer edits the same message every 30s (no second message).
+  - Handlers return (title, body, buttons) WITHOUT footer — the router
+    appends the footer automatically.
 
 Callback data format:
   - Panel navigation:  panel:<panel_id>:<extra>
   - Action execution:  action:<action_id>:<extra>
   - Input request:    input:<panel_id>:<input_id>
-  - Timer toggle:     timer:toggle
-
-Every panel handler returns (title, body, buttons) and the router
-wraps the result with the auto-close toggle and Close button.
-Close immediately deletes the inline message, cancels the timer,
-and clears TargetContext and input state.
+  - Back navigation:  nav:back
+  - Close:            nav:close
 """
 import logging
 from typing import Awaitable, Callable, Any
@@ -27,13 +25,11 @@ from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending
 from backend.helper.panel_timer import (
-    toggle as timer_toggle,
-    get_state as timer_get_state,
-    get_countdown_text,
-    get_toggle_button_text,
-    destroy as timer_destroy,
+    init_panel,
     set_content as timer_set_content,
-    TimerState,
+    destroy as timer_destroy,
+    stop_timer,
+    has_timer,
 )
 from backend.helper.panel_render import to_edit_buttons
 from backend.helper.target_context import clear_target
@@ -49,14 +45,12 @@ _panels: dict[str, PanelHandler] = {}
 _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
+# Navigation stack: chat_id:msg_id -> list of (panel_id, extra) for Back
+_nav_stack: dict[str, list[tuple[str, str]]] = {}
+
 
 class InlinePanelBuilder:
-    """Builds inline keyboard layouts for the helper bot.
-
-    All methods store tuples: ("Text", "callback_data")
-    build() returns list[list[(text, data)]].
-    The renderer normalizes tuples to Button objects.
-    """
+    """Builds inline keyboard layouts. Tuples: ("Text", "callback_data")."""
 
     def __init__(self):
         self._rows: list[list[tuple[str, str]]] = []
@@ -103,31 +97,52 @@ def get_input(panel_id: str, input_id: str) -> InputConfig | None:
     return _inputs.get(panel_id, {}).get(input_id)
 
 
-def _wrap_buttons(chat_id: int, msg_id: int, content_buttons: list) -> list:
-    """Append the toggle and Close buttons to the handler's button rows."""
-    result = list(content_buttons) if content_buttons else []
-    toggle_text = get_toggle_button_text(chat_id, msg_id)
-    result.append([(toggle_text, "timer:toggle")])
-    result.append([("Close", "panel:help:close")])
+def _nav_key(chat_id: int, msg_id: int) -> str:
+    return f"{chat_id}:{msg_id}"
+
+
+def _push_nav(chat_id: int, msg_id: int, panel_id: str, extra: str) -> None:
+    k = _nav_key(chat_id, msg_id)
+    if k not in _nav_stack:
+        _nav_stack[k] = []
+    _nav_stack[k].append((panel_id, extra))
+
+
+def _pop_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
+    k = _nav_key(chat_id, msg_id)
+    stack = _nav_stack.get(k)
+    if not stack:
+        return None
+    return stack.pop()
+
+
+def _clear_nav(chat_id: int, msg_id: int) -> None:
+    _nav_stack.pop(_nav_key(chat_id, msg_id), None)
+
+
+def _append_footer(buttons: list) -> list:
+    """Append the single footer row: [ ← Back ] [ ✕ Close ]"""
+    result = list(buttons) if buttons else []
+    result.append([("← Back", "nav:back"), ("✕ Close", "nav:close")])
     return result
 
 
-def _build_message(chat_id: int, msg_id: int, title: str, body: str, buttons: list) -> tuple[str, list]:
-    """Wrap a handler result with the countdown header and toggle/close buttons."""
-    countdown = get_countdown_text(chat_id, msg_id)
-    header = f"**{title}**\n\n{countdown}"
-    if body:
-        full_text = f"{header}\n\n{body}"
+def _build_message(title: str, body: str, buttons: list) -> tuple[str, list]:
+    """Build the full message text and button layout with footer."""
+    if title and body:
+        text = f"**{title}**\n\n{body}"
+    elif title:
+        text = f"**{title}**"
     else:
-        full_text = header
-    wrapped = _wrap_buttons(chat_id, msg_id, buttons)
-    return full_text, to_edit_buttons(wrapped)
+        text = body or ""
+    footer_buttons = _append_footer(buttons)
+    return text, to_edit_buttons(footer_buttons)
 
 
 async def _apply_result(event, chat_id: int, msg_id: int, title: str, body: str, buttons: list) -> None:
-    """Edit the inline message with the wrapped panel content."""
+    """Edit the inline message with the panel content + footer."""
     timer_set_content(chat_id, msg_id, title, body, buttons)
-    text, btns = _build_message(chat_id, msg_id, title, body, buttons)
+    text, btns = _build_message(title, body, buttons)
     try:
         await event.edit(text, buttons=btns)
     except Exception as exc:
@@ -159,12 +174,12 @@ def register_callback_handlers(client, owner_id: int) -> None:
             return
 
         try:
-            if data == "panel:help:close":
+            if data == "nav:close":
                 await _handle_close(self_client, chat_id, msg_id, owner_id)
                 return
 
-            if data == "timer:toggle":
-                await _handle_timer_toggle(self_client, chat_id, msg_id, event)
+            if data == "nav:back":
+                await _handle_back(event, self_client, chat_id, msg_id)
                 return
 
             if data.endswith(":noop"):
@@ -182,33 +197,33 @@ def register_callback_handlers(client, owner_id: int) -> None:
             logger.exception("Callback router error (data='%s')", data)
 
 
-async def _handle_timer_toggle(self_client, chat_id: int, msg_id: int, event) -> None:
-    """Toggle auto-close state and re-render the panel."""
-    new_state = timer_toggle(self_client, chat_id, msg_id)
-    if new_state == TimerState.PAUSED:
-        try:
-            await event.edit(
-                f"**LifeOS**\n\nAuto Close\nDisabled",
-                buttons=to_edit_buttons(_wrap_buttons(chat_id, msg_id, [])),
-            )
-        except Exception as exc:
-            logger.warning("Timer toggle (pause) edit failed: %s", exc)
-    else:
-        countdown = get_countdown_text(chat_id, msg_id)
-        try:
-            await event.edit(
-                f"**LifeOS**\n\n{countdown}",
-                buttons=to_edit_buttons(_wrap_buttons(chat_id, msg_id, [])),
-            )
-        except Exception as exc:
-            logger.warning("Timer toggle (enable) edit failed: %s", exc)
-
-
 async def _handle_close(self_client, chat_id: int, msg_id: int, owner_id: int) -> None:
-    """Close handler: delete panel, cancel timer, clear all state."""
+    """Close: delete panel, cancel timer, clear all state."""
     clear_pending(owner_id)
     clear_target(owner_id)
+    _clear_nav(chat_id, msg_id)
     timer_destroy(self_client, chat_id, msg_id)
+
+
+async def _handle_back(event, self_client, chat_id: int, msg_id: int) -> None:
+    """Back: pop navigation stack and re-render previous panel."""
+    prev = _pop_nav(chat_id, msg_id)
+    if prev is None:
+        await _handle_close(self_client, chat_id, msg_id, 0)
+        return
+    panel_id, extra = prev
+    handler = get_panel(panel_id)
+    if handler is None:
+        await _handle_close(self_client, chat_id, msg_id, 0)
+        return
+    try:
+        result = await handler(event, extra)
+        if result is None:
+            return
+        title, body, buttons = result if isinstance(result, tuple) else (result, "", [])
+        await _apply_result(event, chat_id, msg_id, title, body, buttons)
+    except Exception:
+        logger.exception("Back handler '%s' failed", panel_id)
 
 
 async def _handle_panel(event, chat_id: int, msg_id: int, remainder: str) -> None:
@@ -220,6 +235,9 @@ async def _handle_panel(event, chat_id: int, msg_id: int, remainder: str) -> Non
     if handler is None:
         logger.warning("No panel handler for panel_id='%s'", panel_id)
         return
+
+    if panel_id != "help":
+        _push_nav(chat_id, msg_id, panel_id, extra)
 
     try:
         result = await handler(event, extra)
@@ -263,19 +281,18 @@ async def _handle_input(event, chat_id: int, msg_id: int, remainder: str, owner_
 
     prompt = input_cfg.get("prompt", "Enter input:")
     handler = input_cfg.get("handler")
-
     if handler is None:
         return
+
+    _push_nav(chat_id, msg_id, panel_id, "")
 
     set_pending(
         owner_id, panel_id, handler, chat_id, prompt,
         inline_chat_id=chat_id, inline_msg_id=msg_id,
     )
 
-    builder = InlinePanelBuilder()
-    builder.add_row("Cancel", f"panel:{panel_id}")
-
+    text, btns = _build_message(panel_id.title(), prompt, [])
     try:
-        await event.edit(prompt, buttons=to_edit_buttons(builder.build()))
+        await event.edit(text, buttons=btns)
     except Exception as exc:
         logger.warning("Input prompt edit failed: %s", exc)

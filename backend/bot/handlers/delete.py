@@ -17,7 +17,6 @@ from backend.helper import (
     register_input,
     send_inline_panel,
     render,
-    render_edit,
     to_edit_buttons,
 )
 from backend.helper.client import get_client
@@ -32,12 +31,10 @@ async def _del_n_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg
         result = "⚠️ Please enter a number between 1 and 500."
     else:
         result = await delete_service.do_del_n(_self_client, chat_id, int(text))
-    builder = InlinePanelBuilder()
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del n inline edit failed: %s", exc)
@@ -50,12 +47,10 @@ async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
         result = "⚠️ Please enter a valid message ID (number)."
     else:
         result = await delete_service.do_del_id(_self_client, chat_id, int(text))
-    builder = InlinePanelBuilder()
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del id inline edit failed: %s", exc)
@@ -64,15 +59,21 @@ async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
 async def _del_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await delete_service.do_del_code(_self_client, _owner_id, text)
-    builder = InlinePanelBuilder()
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del code inline edit failed: %s", exc)
+
+
+async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    builder = InlinePanelBuilder()
+    builder.add_row("Delete last N messages", "input:del:n")
+    builder.add_row("Delete from Msg ID", "input:del:id")
+    builder.add_row("Delete saved item by code", "input:del:code")
+    return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
@@ -80,13 +81,11 @@ async def _del_inline_builder(event, extra: str) -> list:
     builder.add_row("Delete last N messages", "input:del:n")
     builder.add_row("Delete from Msg ID", "input:del:id")
     builder.add_row("Delete saved item by code", "input:del:code")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Delete", "Auto Close\n120s\n\nChoose a deletion mode:", builder.build())]
+    return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
 def register(client, owner_id: int):
-    register_panel("del", _del_inline_builder)
+    register_panel("del", _del_panel_handler)
     register_inline_builder("del", _del_inline_builder)
     register_input("del", "n", {
         "handler": _del_n_input_handler,

@@ -19,7 +19,6 @@ from backend.helper import (
     register_input,
     send_inline_panel,
     render,
-    render_edit,
     to_edit_buttons,
 )
 from backend.helper.client import get_client
@@ -31,44 +30,33 @@ async def _bio_on_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    return "Bio Engine", result, builder.build()
+    return "Bio Engine", result, []
 
 
 async def _bio_off_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_off(_owner_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    return "Bio Engine", result, builder.build()
+    return "Bio Engine", result, []
 
 
 async def _bio_show_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await bio_service.do_show(_owner_id, _resolve_tz())
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    return "Bio Engine", result, builder.build()
+    return "Bio Engine", result, []
 
 
 async def _bio_help_action(event, extra: str) -> tuple[str, str, list] | None:
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    return "Bio Engine", bio_service._HELP, builder.build()
+    return "Bio Engine", bio_service._HELP, []
 
 
 async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_template(_owner_id, text)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio template inline edit failed: %s", exc)
@@ -77,13 +65,10 @@ async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inl
 async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_text(_owner_id, text)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio text inline edit failed: %s", exc)
@@ -92,13 +77,10 @@ async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_mood(_owner_id, text)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:bio")
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio mood inline edit failed: %s", exc)
@@ -125,9 +107,7 @@ async def _bio_inline_builder(event, extra: str) -> list:
     builder.add_row("💬 Set Text", "input:bio:text")
     builder.add_row("💭 Set Mood", "input:bio:mood")
     builder.add_row("❓ Help", "action:bio_help")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Bio Engine", "Auto Close\n120s\n\nChoose an action:", builder.build())]
+    return [render("Bio Engine", "Choose an action:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):

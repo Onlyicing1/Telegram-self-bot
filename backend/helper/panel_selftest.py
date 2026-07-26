@@ -8,13 +8,11 @@ from backend.helper.panels import get_panel, get_action, _panels, _actions
 from backend.helper.panel_timer import (
     _panels as _timer_panels,
     init_panel,
-    toggle,
-    get_state,
     destroy,
     has_timer,
     active_count,
-    TimerState,
 )
+from backend.helper.panel_settings import is_auto_close_enabled, set_auto_close_enabled
 
 
 async def run_selftest(self_client, helper_client, owner_id: int) -> str:
@@ -48,20 +46,26 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
         report.append(f"Reason: {trigger_reason}")
         return "\n".join(report)
 
-    # 3. timer created via init_panel
+    # 3. timer created via init_panel (only if auto-close is ON)
+    was_enabled = is_auto_close_enabled()
+    set_auto_close_enabled(True)
     init_panel(self_client, msg_chat_id, msg_id)
     timer_ok = has_timer(msg_chat_id, msg_id)
     report.append(f"Timer Init ....... {'OK' if timer_ok else 'FAIL'}")
 
-    # 4. toggle to paused
-    toggle(self_client, msg_chat_id, msg_id)
-    paused_ok = get_state(msg_chat_id, msg_id) == TimerState.PAUSED
-    report.append(f"Toggle Pause ..... {'OK' if paused_ok else 'FAIL'}")
+    # 4. disable auto-close → new panels should NOT have timers
+    set_auto_close_enabled(False)
+    destroy(self_client, msg_chat_id, msg_id)
+    init_panel(self_client, msg_chat_id, msg_id)
+    no_timer_when_disabled = not has_timer(msg_chat_id, msg_id)
+    report.append(f"Disabled No Timer. {'OK' if no_timer_when_disabled else 'FAIL'}")
 
-    # 5. toggle back to active
-    toggle(self_client, msg_chat_id, msg_id)
-    active_ok = get_state(msg_chat_id, msg_id) == TimerState.ACTIVE
-    report.append(f"Toggle Active .... {'OK' if active_ok else 'FAIL'}")
+    # 5. re-enable → new panels should have timers
+    set_auto_close_enabled(True)
+    destroy(self_client, msg_chat_id, msg_id)
+    init_panel(self_client, msg_chat_id, msg_id)
+    timer_when_enabled = has_timer(msg_chat_id, msg_id)
+    report.append(f"Enabled Timer ... {'OK' if timer_when_enabled else 'FAIL'}")
 
     # 6. only one timer exists
     one_timer = active_count() == 1
@@ -80,9 +84,12 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     actions_ok = len(_actions) > 0
     report.append(f"Actions .......... {'OK' if actions_ok else 'FAIL'}")
 
+    # Restore original preference
+    set_auto_close_enabled(was_enabled)
+
     all_ok = all([
-        callback_ok, trigger_ok, timer_ok, paused_ok,
-        active_ok, one_timer, destroyed, no_leak, actions_ok,
+        callback_ok, trigger_ok, timer_ok, no_timer_when_disabled,
+        timer_when_enabled, one_timer, destroyed, no_leak, actions_ok,
     ])
 
     if not all_ok:

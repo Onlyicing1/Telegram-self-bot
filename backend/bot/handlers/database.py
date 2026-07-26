@@ -17,7 +17,6 @@ from backend.helper import (
     register_action,
     send_inline_panel,
     render,
-    render_edit,
     to_edit_buttons,
 )
 from backend.helper.client import get_client
@@ -28,26 +27,20 @@ logger = logging.getLogger(__name__)
 async def _db_clean_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await database_service.do_clean(_self_client, _owner_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:db")
-    return "Database", result, builder.build()
+    return "Database", result, []
 
 
 async def _db_stats_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await database_service.do_stats(_owner_id, _resolve_tz())
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:db")
-    return "Database", result, builder.build()
+    return "Database", result, []
 
 
 async def _db_vacuum_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await database_service.do_vacuum(_self_client, _owner_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:db")
-    return "Database", result, builder.build()
+    return "Database", result, []
 
 
 async def _db_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -63,9 +56,7 @@ async def _db_inline_builder(event, extra: str) -> list:
     builder.add_row("📊 Statistics", "action:db_stats")
     builder.add_row("🧹 Clean Orphans", "action:db_clean")
     builder.add_row("⚙️ Vacuum", "action:db_vacuum")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Database", "Auto Close\n120s\n\nChoose an action:", builder.build())]
+    return [render("Database", "Choose an action:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):
