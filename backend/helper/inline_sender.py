@@ -18,13 +18,13 @@ from telethon import events
 from backend.bot.handlers.guard import is_owner
 from backend.helper import inline_engine
 from backend.helper.input_state import get_pending, clear_pending
-from backend.helper.panel_timer import start_timer
+from backend.helper.panel_timer import init_panel
 
 logger = logging.getLogger(__name__)
 
 
 async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
-    """Trigger inline mode, auto-send the first result, start auto-delete timer."""
+    """Trigger inline mode, auto-send the first result, init auto-close timer."""
     helper_username = inline_engine.get_helper_username()
     if not helper_username:
         return False
@@ -32,7 +32,7 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     try:
         success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
         if success and msg_id:
-            start_timer(self_client, msg_chat_id, msg_id)
+            init_panel(self_client, msg_chat_id, msg_id)
         return success
     except Exception:
         return False

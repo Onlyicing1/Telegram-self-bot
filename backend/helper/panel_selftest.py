@@ -5,7 +5,16 @@ Outputs ONE structured report. No spam logging.
 """
 from backend.helper import inline_engine
 from backend.helper.panels import get_panel, get_action, _panels, _actions
-from backend.helper.panel_timer import _timers
+from backend.helper.panel_timer import (
+    _panels as _timer_panels,
+    init_panel,
+    toggle,
+    get_state,
+    destroy,
+    has_timer,
+    active_count,
+    TimerState,
+)
 
 
 async def run_selftest(self_client, helper_client, owner_id: int) -> str:
@@ -18,12 +27,6 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     if not callback_ok:
         report.append("")
         report.append("FAILED")
-        report.append("")
-        report.append("Step:")
-        report.append("register_panel('help')")
-        report.append("")
-        report.append("Reason:")
-        report.append("no panel handler registered for 'help'")
         return "\n".join(report)
 
     # 2. trigger() returns success
@@ -42,52 +45,44 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     if not trigger_ok:
         report.append("")
         report.append("FAILED")
-        report.append("")
-        report.append("Step:")
-        report.append("trigger()")
-        report.append("")
-        report.append("Reason:")
-        report.append(trigger_reason)
+        report.append(f"Reason: {trigger_reason}")
         return "\n".join(report)
 
-    # 3. inline query answered (helper returned results)
-    inline_query_ok = trigger_ok
-    report.append(f"Inline Query ..... {'OK' if inline_query_ok else 'FAIL'}")
+    # 3. timer created via init_panel
+    init_panel(self_client, msg_chat_id, msg_id)
+    timer_ok = has_timer(msg_chat_id, msg_id)
+    report.append(f"Timer Init ....... {'OK' if timer_ok else 'FAIL'}")
 
-    # 4. click() returned a message
-    click_ok = msg_id > 0
-    report.append(f"Click ............ {'OK' if click_ok else 'FAIL'}")
+    # 4. toggle to paused
+    toggle(self_client, msg_chat_id, msg_id)
+    paused_ok = get_state(msg_chat_id, msg_id) == TimerState.PAUSED
+    report.append(f"Toggle Pause ..... {'OK' if paused_ok else 'FAIL'}")
 
-    # 5. timer created
-    timer_ok = False
-    try:
-        from backend.helper.panel_timer import start_timer
-        start_timer(self_client, msg_chat_id, msg_id)
-        timer_key = f"{msg_chat_id}:{msg_id}"
-        timer_ok = timer_key in _timers and not _timers[timer_key].done()
-    except Exception:
-        pass
-    report.append(f"Timer ............ {'OK' if timer_ok else 'FAIL'}")
+    # 5. toggle back to active
+    toggle(self_client, msg_chat_id, msg_id)
+    active_ok = get_state(msg_chat_id, msg_id) == TimerState.ACTIVE
+    report.append(f"Toggle Active .... {'OK' if active_ok else 'FAIL'}")
 
-    # 6. timer exists in registry
-    timer_registry_ok = timer_ok
-    report.append(f"Timer Registry ... {'OK' if timer_registry_ok else 'FAIL'}")
+    # 6. only one timer exists
+    one_timer = active_count() == 1
+    report.append(f"Single Timer ..... {'OK' if one_timer else 'FAIL'}")
 
-    # 7. inline message id stored (non-zero)
-    msg_id_stored = msg_id > 0
-    report.append(f"Inline Msg ID .... {'OK' if msg_id_stored else 'FAIL'}")
+    # 7. destroy clears state
+    destroy(self_client, msg_chat_id, msg_id)
+    destroyed = not has_timer(msg_chat_id, msg_id)
+    report.append(f"Destroy .......... {'OK' if destroyed else 'FAIL'}")
 
-    # 8. close callback reachable
-    close_ok = "panel:help" in str(_panels.get("help")) or get_panel("help") is not None
-    report.append(f"Close ............ {'OK' if close_ok else 'FAIL'}")
+    # 8. no timer leaks
+    no_leak = active_count() == 0
+    report.append(f"No Leaks ......... {'OK' if no_leak else 'FAIL'}")
 
-    # 9. callback registered (actions)
+    # 9. actions registered
     actions_ok = len(_actions) > 0
     report.append(f"Actions .......... {'OK' if actions_ok else 'FAIL'}")
 
     all_ok = all([
-        callback_ok, trigger_ok, inline_query_ok, click_ok,
-        timer_ok, timer_registry_ok, msg_id_stored, close_ok, actions_ok,
+        callback_ok, trigger_ok, timer_ok, paused_ok,
+        active_ok, one_timer, destroyed, no_leak, actions_ok,
     ])
 
     if not all_ok:

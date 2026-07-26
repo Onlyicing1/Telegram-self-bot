@@ -24,39 +24,36 @@ from backend.helper.client import get_client
 logger = logging.getLogger(__name__)
 
 
-async def _organize_list_action(event, extra: str) -> tuple:
+async def _organize_list_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_list(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:organize")
-    builder.add_row("Close", "panel:help:close")
-    return result, builder.build()
+    return "Organizer", result, builder.build()
 
 
-async def _organize_clean_action(event, extra: str) -> tuple:
+async def _organize_clean_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_clean(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:organize")
-    builder.add_row("Close", "panel:help:close")
-    return result, builder.build()
+    return "Organizer", result, builder.build()
 
 
-async def _organize_panel_handler(event, extra: str) -> None:
+async def _organize_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("📋 Data Overview", "action:organize_list")
     builder.add_row("🧹 Clean Old Logs", "action:organize_clean")
-    builder.add_row("Close", "panel:help:close")
-    text, buttons = render_edit("Organizer", "Choose an action:", builder.build())
-    await event.edit(text, buttons=buttons)
+    return "Organizer", "Choose an action:", builder.build()
 
 
 async def _organize_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📋 Data Overview", "action:organize_list")
     builder.add_row("🧹 Clean Old Logs", "action:organize_clean")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Organizer", "Choose an action:", builder.build())]
+    return [render("Organizer", "Auto Close\n120s\n\nChoose an action:", builder.build())]
 
 
 def register(client, owner_id: int):

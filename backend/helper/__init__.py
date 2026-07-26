@@ -38,10 +38,16 @@ from backend.helper.target_context import (
 )
 from backend.helper.pagination import build_pagination_row, paginate
 from backend.helper.panel_timer import (
-    start_timer,
-    reset_timer,
-    stop_timer,
-    delete_panel,
+    init_panel,
+    toggle as timer_toggle,
+    destroy as timer_destroy,
+    get_state as timer_get_state,
+    get_countdown_text,
+    get_toggle_button_text,
+    set_content as timer_set_content,
+    has_timer,
+    active_count,
+    TimerState,
 )
 from backend.helper.panel_render import render, render_edit, to_edit_buttons
 from backend.helper import watchdog
@@ -70,10 +76,16 @@ __all__ = [
     "clear_target",
     "build_pagination_row",
     "paginate",
-    "start_timer",
-    "reset_timer",
-    "stop_timer",
-    "delete_panel",
+    "init_panel",
+    "timer_toggle",
+    "timer_destroy",
+    "timer_get_state",
+    "get_countdown_text",
+    "get_toggle_button_text",
+    "timer_set_content",
+    "has_timer",
+    "active_count",
+    "TimerState",
     "render",
     "render_edit",
     "to_edit_buttons",

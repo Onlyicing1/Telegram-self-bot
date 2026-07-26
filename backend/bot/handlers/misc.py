@@ -145,16 +145,11 @@ def _build_category_buttons() -> list:
     return builder.build()
 
 
-async def _help_panel_handler(event, extra: str) -> None:
+async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "close":
-        return
+        return None
     if extra == "back":
-        text, buttons = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
-        try:
-            await event.edit(text, buttons=buttons)
-        except Exception as exc:
-            logger.warning("help back edit failed: %s", exc)
-        return
+        return "LifeOS Command Center", "", _build_main_menu_buttons()
     if extra.startswith("cat:"):
         idx_str = extra[4:]
         if idx_str.isdigit():
@@ -162,29 +157,22 @@ async def _help_panel_handler(event, extra: str) -> None:
             if 0 <= idx < len(_HELP_CATEGORIES):
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
-                text, buttons = render_edit(_HELP_CATEGORIES[idx][0], body, _build_category_buttons())
-                try:
-                    await event.edit(text, buttons=buttons)
-                except Exception as exc:
-                    logger.warning("help cat %d edit failed: %s", idx, exc)
-                return
-    text, buttons = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
-    try:
-        await event.edit(text, buttons=buttons)
-    except Exception as exc:
-        logger.warning("help default edit failed: %s", exc)
+                return _HELP_CATEGORIES[idx][0], body, _build_category_buttons()
+    return "LifeOS Command Center", "", _build_main_menu_buttons()
 
 
 async def _help_inline_builder(event, extra: str) -> list:
     buttons = _build_main_menu_buttons()
-    return [render("LifeOS Command Center", "", buttons)]
+    buttons.append([("Disable Auto Close", "timer:toggle")])
+    buttons.append([("Close", "panel:help:close")])
+    return [render("LifeOS", "Auto Close\n120s", buttons)]
 
 
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
 
 
-async def _context_panel_handler(event, extra: str) -> None:
+async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     """Context panel: shows info about the replied message with actions."""
     from backend.helper.inline_engine import _owner_id
 
@@ -192,16 +180,7 @@ async def _context_panel_handler(event, extra: str) -> None:
     ctx = get_target(owner_id)
 
     if not ctx or ctx.kind != "reply":
-        text, buttons = render_edit(
-            "Context Panel",
-            "Reply context expired.\n\nUse `.panel` while replying to a message.",
-            [[("Close", "panel:help:close")]],
-        )
-        try:
-            await event.edit(text, buttons=buttons)
-        except Exception as exc:
-            logger.warning("context panel expired edit failed: %s", exc)
-        return
+        return "Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", []
 
     if extra.startswith("exec:"):
         action = extra[5:]
@@ -212,63 +191,34 @@ async def _context_panel_handler(event, extra: str) -> None:
             from backend.services import save_service
             reply_msg = await ctx.resolve(client)
             if reply_msg is None:
-                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
-                                            [[("Close", "panel:help:close")]])
-                await event.edit(text, buttons=buttons)
-                return
+                return "Context Panel", "Reply message no longer exists.", []
             result = await save_service.execute_save(client, owner_id, reply_msg, "f", ctx.tz_str)
-            builder = InlinePanelBuilder()
-            builder.add_row("Close", "panel:help:close")
-            text, btns = render_edit("Save Engine", result, builder.build())
-            await event.edit(text, buttons=btns)
-            return
+            return "Save Engine", result, []
 
         elif action == "save_d":
             from backend.services import save_service
             reply_msg = await ctx.resolve(client)
             if reply_msg is None:
-                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
-                                            [[("Close", "panel:help:close")]])
-                await event.edit(text, buttons=buttons)
-                return
+                return "Context Panel", "Reply message no longer exists.", []
             result = await save_service.execute_save(client, owner_id, reply_msg, "d", ctx.tz_str)
-            builder = InlinePanelBuilder()
-            builder.add_row("Close", "panel:help:close")
-            text, btns = render_edit("Save Engine", result, builder.build())
-            await event.edit(text, buttons=btns)
-            return
+            return "Save Engine", result, []
 
         elif action == "preview":
             from backend.helper.inline_engine import _self_client
             from backend.services import retrieve_service
             reply_msg = await ctx.resolve(_self_client)
             if reply_msg is None:
-                text, buttons = render_edit("Context Panel", "Reply message no longer exists.",
-                                            [[("Close", "panel:help:close")]])
-                await event.edit(text, buttons=buttons)
-                return
+                return "Context Panel", "Reply message no longer exists.", []
             result = await retrieve_service.do_preview(_self_client, owner_id, str(reply_msg.id))
             builder = InlinePanelBuilder()
             builder.add_row("Back", "panel:context")
-            builder.add_row("Close", "panel:help:close")
-            text, btns = render_edit("Preview", result, builder.build())
-            await event.edit(text, buttons=btns)
-            return
+            return "Preview", result, builder.build()
 
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
-    builder.add_row("Close", "panel:help:close")
-    text, buttons = render_edit(
-        "Context Panel",
-        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
-        builder.build(),
-    )
-    try:
-        await event.edit(text, buttons=buttons)
-    except Exception as exc:
-        logger.warning("context panel edit failed: %s", exc)
+    return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
 
 
 async def _context_inline_builder(event, extra: str) -> list:
@@ -279,40 +229,35 @@ async def _context_inline_builder(event, extra: str) -> list:
 
     if not ctx or ctx.kind != "reply":
         builder = InlinePanelBuilder()
+        builder.add_row("Disable Auto Close", "timer:toggle")
         builder.add_row("Close", "panel:help:close")
-        return [render("Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.",
+        return [render("Context Panel", "Auto Close\n120s\n\nReply context expired.\n\nUse `.panel` while replying to a message.",
                        builder.build())]
 
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
     return [render(
         "Context Panel",
-        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
+        f"Auto Close\n120s\n\n**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
         builder.build(),
     )]
 
 
-async def _context_error_panel_handler(event, extra: str) -> None:
-    text, buttons = render_edit(
-        "Context Panel",
-        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
-        [[("Close", "panel:help:close")]],
-    )
-    try:
-        await event.edit(text, buttons=buttons)
-    except Exception as exc:
-        logger.warning("context error panel edit failed: %s", exc)
+async def _context_error_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "Context Panel", "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.", []
 
 
 async def _context_error_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
     return [render(
         "Context Panel",
-        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
+        "Auto Close\n120s\n\nNo replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
         builder.build(),
     )]
 
@@ -427,17 +372,17 @@ async def _health_inline_builder(event, extra: str) -> list:
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
     builder.add_row("Refresh", "action:health_refresh")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Health Dashboard", report, builder.build())]
+    return [render("Health Dashboard", f"Auto Close\n120s\n\n{report}", builder.build())]
 
 
-async def _health_refresh_action(event, extra: str) -> tuple:
+async def _health_refresh_action(event, extra: str) -> tuple[str, str, list] | None:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
     builder.add_row("Refresh", "action:health_refresh")
-    builder.add_row("Close", "panel:help:close")
-    return report, to_edit_buttons(builder.build())
+    return "Health Dashboard", report, builder.build()
 
 
 async def _kill_inline_builder(event, extra: str) -> list:
@@ -451,8 +396,9 @@ async def _kill_inline_builder(event, extra: str) -> list:
     )
     full_text = report + recovery
     builder = InlinePanelBuilder()
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Diagnostics", full_text, builder.build())]
+    return [render("Diagnostics", f"Auto Close\n120s\n\n{full_text}", builder.build())]
 
 
 async def _logs_inline_builder(event, extra: str) -> list:
@@ -469,28 +415,27 @@ async def _logs_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Errors Only", "action:logs_errors")
     builder.add_row("Last 50", "action:logs_50")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Event Log", text, builder.build())]
+    return [render("Event Log", f"Auto Close\n120s\n\n{text}", builder.build())]
 
 
-async def _logs_errors_action(event, extra: str) -> tuple:
+async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=20, errors_only=True)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:logs")
     builder.add_row("Last 50", "action:logs_50")
-    builder.add_row("Close", "panel:help:close")
-    return text, to_edit_buttons(builder.build())
+    return "Event Log", text, builder.build()
 
 
-async def _logs_50_action(event, extra: str) -> tuple:
+async def _logs_50_action(event, extra: str) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=50, errors_only=False)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:logs")
     builder.add_row("Errors Only", "action:logs_errors")
-    builder.add_row("Close", "panel:help:close")
-    return text, to_edit_buttons(builder.build())
+    return "Event Log", text, builder.build()
 
 
 def _get_self_client():

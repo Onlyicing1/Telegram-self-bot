@@ -30,7 +30,7 @@ from backend.helper.client import get_client
 logger = logging.getLogger(__name__)
 
 
-async def _save_panel_handler(event, extra: str) -> None:
+async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
 
     client = _self_client
@@ -40,34 +40,25 @@ async def _save_panel_handler(event, extra: str) -> None:
         mode = extra[5:]
         ctx = get_target(owner_id)
         if not ctx or ctx.kind != "reply":
-            text, buttons = render_edit("Save Engine", "Reply context expired. Use `.save` while replying to a message.",
-                                        [[("Close", "panel:help:close")]])
-            await event.edit(text, buttons=buttons)
-            return
+            return "Save Engine", "Reply context expired. Use `.save` while replying to a message.", []
 
         reply_msg = await ctx.resolve(client)
         if reply_msg is None:
-            text, buttons = render_edit("Save Engine", "Reply message no longer exists.",
-                                        [[("Close", "panel:help:close")]])
-            await event.edit(text, buttons=buttons)
-            return
+            return "Save Engine", "Reply message no longer exists.", []
 
         result = await save_service.execute_save(client, owner_id, reply_msg, mode, ctx.tz_str)
-        builder = InlinePanelBuilder()
-        builder.add_row("Close", "panel:help:close")
-        text, buttons = render_edit("Save Engine", result, builder.build())
-        await event.edit(text, buttons=buttons)
-        return
+        return "Save Engine", result, []
 
-    await event.edit("⚠️ Unknown save action.")
+    return "Save Engine", "Unknown save action.", []
 
 
 async def _save_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:exec:f")
     builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Save Engine", "Choose a save mode:", builder.build())]
+    return [render("Save Engine", "Auto Close\n120s\n\nChoose a save mode:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str) -> None:
