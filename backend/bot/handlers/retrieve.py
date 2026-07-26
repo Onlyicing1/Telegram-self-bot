@@ -56,15 +56,17 @@ async def _send_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_
 async def _preview_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Code", "input:preview:code")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Preview", "Enter a save code to preview:", builder.build())]
+    return [render("Preview", "Auto Close\n120s\n\nEnter a save code to preview:", builder.build())]
 
 
 async def _send_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Code", "input:send:code")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Send", "Enter a save code to forward to this chat:", builder.build())]
+    return [render("Send", "Auto Close\n120s\n\nEnter a save code to forward to this chat:", builder.build())]
 
 
 def register(client, owner_id: int):

@@ -34,8 +34,9 @@ async def _list_inline_builder(event, extra: str) -> list:
         limit = min(int(extra), 50)
     text = await discover_service.do_list(_owner_id, limit, tz_str)
     builder = InlinePanelBuilder()
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Recent Saves", text, builder.build())]
+    return [render("Recent Saves", f"Auto Close\n120s\n\n{text}", builder.build())]
 
 
 async def _find_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -56,8 +57,9 @@ async def _find_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_
 async def _find_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Search Text", "input:find:query")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Search", "Enter search text:", builder.build())]
+    return [render("Search", "Auto Close\n120s\n\nEnter search text:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):

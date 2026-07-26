@@ -80,8 +80,9 @@ async def _del_inline_builder(event, extra: str) -> list:
     builder.add_row("Delete last N messages", "input:del:n")
     builder.add_row("Delete from Msg ID", "input:del:id")
     builder.add_row("Delete saved item by code", "input:del:code")
+    builder.add_row("Disable Auto Close", "timer:toggle")
     builder.add_row("Close", "panel:help:close")
-    return [render("Delete", "Choose a deletion mode:", builder.build())]
+    return [render("Delete", "Auto Close\n120s\n\nChoose a deletion mode:", builder.build())]
 
 
 def register(client, owner_id: int):
