@@ -15,7 +15,6 @@ from backend.helper import (
     register_input,
     send_inline_panel,
     render,
-    render_edit,
     to_edit_buttons,
 )
 from backend.helper.client import get_client
@@ -26,13 +25,10 @@ logger = logging.getLogger(__name__)
 async def _preview_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await retrieve_service.do_preview(_self_client, _owner_id, text)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:help:back")
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("preview inline edit failed: %s", exc)
@@ -41,37 +37,42 @@ async def _preview_input_handler(text, chat_id, msg_id, inline_chat_id, inline_m
 async def _send_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await retrieve_service.do_send(_self_client, _owner_id, text, chat_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("Back", "panel:help:back")
-    builder.add_row("Close", "panel:help:close")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("send inline edit failed: %s", exc)
 
 
+async def _preview_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    builder = InlinePanelBuilder()
+    builder.add_row("Enter Code", "input:preview:code")
+    return "Preview", "Enter a save code to preview:", builder.build()
+
+
 async def _preview_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Code", "input:preview:code")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Preview", "Auto Close\n120s\n\nEnter a save code to preview:", builder.build())]
+    return [render("Preview", "Enter a save code to preview:", builder.build())]
+
+
+async def _send_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    builder = InlinePanelBuilder()
+    builder.add_row("Enter Code", "input:send:code")
+    return "Send", "Enter a save code to forward to this chat:", builder.build()
 
 
 async def _send_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Code", "input:send:code")
-    builder.add_row("Disable Auto Close", "timer:toggle")
-    builder.add_row("Close", "panel:help:close")
-    return [render("Send", "Auto Close\n120s\n\nEnter a save code to forward to this chat:", builder.build())]
+    return [render("Send", "Enter a save code to forward to this chat:", builder.build())]
 
 
 def register(client, owner_id: int):
-    register_panel("preview", _preview_inline_builder)
-    register_panel("send", _send_inline_builder)
+    register_panel("preview", _preview_panel_handler)
+    register_panel("send", _send_panel_handler)
     register_inline_builder("preview", _preview_inline_builder)
     register_inline_builder("send", _send_inline_builder)
     register_input("preview", "code", {
