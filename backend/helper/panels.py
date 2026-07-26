@@ -27,6 +27,7 @@ from backend.helper.input_state import set_pending, clear_pending
 from backend.helper.panel_timer import reset_timer, delete_panel, stop_timer
 from backend.helper.panel_render import to_edit_buttons
 from backend.helper.target_context import clear_target
+from backend.helper.inline_engine import get_self_client
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +101,15 @@ def register_callback_handlers(client, owner_id: int) -> None:
         if not is_owner(event, owner_id):
             return
 
-        from backend.helper.client import get_client
-        helper = get_client()
+        self_client = get_self_client()
+        if self_client is None:
+            self_client = client
 
         chat_id = event.chat_id
         msg_id = event.message_id or 0
 
-        if helper and chat_id and msg_id:
-            reset_timer(helper, chat_id, msg_id)
+        if chat_id and msg_id:
+            reset_timer(self_client, chat_id, msg_id)
 
         try:
             await event.answer()
@@ -120,7 +122,7 @@ def register_callback_handlers(client, owner_id: int) -> None:
 
         try:
             if data == "panel:help:close":
-                await _handle_close(helper, chat_id, msg_id, owner_id)
+                await _handle_close(self_client, chat_id, msg_id, owner_id)
                 return
 
             if data.endswith(":noop"):
@@ -138,12 +140,12 @@ def register_callback_handlers(client, owner_id: int) -> None:
             logger.exception("Callback router error (data='%s')", data)
 
 
-async def _handle_close(helper, chat_id: int, msg_id: int, owner_id: int) -> None:
+async def _handle_close(self_client, chat_id: int, msg_id: int, owner_id: int) -> None:
     """Close handler: delete panel, cancel timer, clear all state."""
     clear_pending(owner_id)
     clear_target(owner_id)
-    if helper and chat_id and msg_id:
-        await delete_panel(helper, chat_id, msg_id)
+    if chat_id and msg_id:
+        await delete_panel(self_client, chat_id, msg_id)
 
 
 async def _handle_panel(event, remainder: str) -> None:

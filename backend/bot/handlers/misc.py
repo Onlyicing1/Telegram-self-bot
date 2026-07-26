@@ -587,8 +587,11 @@ def register(client, owner_id: int):
         ))
 
         try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, "context")
+            success = await send_inline_panel(client, event.chat_id, "context")
+            if success:
+                await event.delete()
+            else:
+                await event.edit("⚠️ Panel failed to open. Check logs.")
         except Exception as exc:
             logger.warning("panel inline send failed: %s", exc)
             try:

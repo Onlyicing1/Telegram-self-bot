@@ -32,10 +32,7 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     try:
         success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
         if success and msg_id:
-            from backend.helper.client import get_client
-            helper = get_client()
-            if helper:
-                start_timer(helper, msg_chat_id, msg_id)
+            start_timer(self_client, msg_chat_id, msg_id)
         return success
     except Exception:
         return False
