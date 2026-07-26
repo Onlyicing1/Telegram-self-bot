@@ -44,6 +44,51 @@ from backend.helper.input_state import set_pending
 
 logger = logging.getLogger(__name__)
 
+
+def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]:
+    """Safely resolve (chat_id, msg_id, inline_message_id) from any callback event.
+
+    Telethon's CallbackQuery.Event does NOT have a ``msg_id`` attribute.
+    Depending on the callback source:
+      - Bot messages in chats: ``event.message_id`` is set, ``event.inline_message_id`` is None.
+      - Inline messages (sent via inline mode): ``event.inline_message_id`` is set,
+        ``event.message_id`` may be None.
+
+    This helper never raises — it returns (None, None, None) if nothing can be resolved.
+    """
+    chat_id = None
+    msg_id = None
+    inline_message_id = None
+
+    try:
+        chat_id = getattr(event, "chat_id", None)
+    except Exception:
+        pass
+
+    try:
+        msg_id = getattr(event, "message_id", None)
+    except Exception:
+        pass
+
+    try:
+        inline_message_id = getattr(event, "inline_message_id", None)
+    except Exception:
+        pass
+
+    if msg_id is None and inline_message_id is None:
+        try:
+            orig = getattr(event, "original_update", None)
+            if orig is not None:
+                msg_id = getattr(orig, "msg_id", None)
+                if msg_id is None:
+                    raw_msg_id = getattr(orig, "msg_id", None)
+                    if hasattr(raw_msg_id, "id"):
+                        msg_id = raw_msg_id.id
+        except Exception:
+            pass
+
+    return chat_id, msg_id, inline_message_id
+
 PanelHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[None]]
 ActionHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[str]]
 InputConfig = dict[str, Any]
@@ -89,8 +134,15 @@ def _create_session(chat_id: int, msg_id: int, panel_type: str = "unknown") -> s
     return sid
 
 
-def _get_session(chat_id: int, msg_id: int) -> dict | None:
+def _get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
     """Look up session metadata by (chat_id, msg_id)."""
+    if chat_id is None or msg_id is None:
+        logger.info(
+            "[PANEL] SESSION LOOKUP skipped: chat_id=%s msg_id=%s "
+            "all_keys=%s",
+            chat_id, msg_id, list(_sessions.keys()),
+        )
+        return None
     key = (chat_id, msg_id)
     session = _sessions.get(key)
     logger.info(
@@ -105,7 +157,7 @@ def _get_session(chat_id: int, msg_id: int) -> dict | None:
     return session
 
 
-def _log_callback(session_id: str, chat_id: int, msg_id: int,
+def _log_callback(session_id: str, chat_id: int | None, msg_id: int | None,
                   callback_data: str, label: str,
                   inline_message_id: str | None = None) -> None:
     """Log full callback state at a boundary."""
@@ -198,22 +250,29 @@ def register_callback_handlers(client, owner_id: int) -> None:
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
         t_enter = _now_ms()
-        chat_id = event.chat_id
-        msg_id = event.msg_id or 0
+        chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
         sender_id = event.sender_id
         data_raw = event.data
         data = data_raw.decode("utf-8") if data_raw else ""
-        inline_msg_id = getattr(event, "inline_message_id", None)
 
         logger.info(
-            "[TIMING] _callback_router ENTER: t=%.1fms, data=%s, sender_id=%s, "
-            "msg_id=%s, chat_id=%s, inline_message_id=%s",
-            t_enter, data_raw, sender_id, msg_id, chat_id, inline_msg_id,
+            "[PANEL] CALLBACK RESOLVED event_type=%s chat_id=%s msg_id=%s "
+            "inline_message_id=%s peer=%s",
+            type(event).__name__, chat_id, msg_id, inline_msg_id,
+            getattr(event, "peer_id", None),
         )
         logger.info(
             "HELP STEP 13 - callback received: data=%s, sender_id=%s, msg_id=%s, chat_id=%s",
             data_raw, sender_id, msg_id, chat_id,
         )
+
+        if chat_id is None and inline_msg_id is None:
+            logger.warning(
+                "[PANEL] CALLBACK UNRESOLVABLE: no chat_id and no inline_message_id — "
+                "returning safely (data='%s')",
+                data,
+            )
+            return
 
         # Session trace — log full state at callback entry
         session = _get_session(chat_id, msg_id)
@@ -372,15 +431,14 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
         logger.warning("[CALLBACK] input config has no handler")
         return
 
-    chat_id = event.chat_id
-    inline_msg_id = event.msg_id or 0
+    chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
     logger.info(
         "[CALLBACK] setting pending: owner_id=%s, panel_id='%s', chat_id=%s, inline_msg_id=%s",
         owner_id, panel_id, chat_id, inline_msg_id,
     )
     set_pending(
-        owner_id, panel_id, handler, chat_id, prompt,
-        inline_chat_id=chat_id, inline_msg_id=inline_msg_id,
+        owner_id, panel_id, handler, chat_id or 0, prompt,
+        inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
     )
 
     builder = InlinePanelBuilder()
