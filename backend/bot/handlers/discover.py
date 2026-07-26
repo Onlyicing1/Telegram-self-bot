@@ -18,6 +18,7 @@ from backend.helper import (
     send_inline_panel,
     render,
     render_edit,
+    to_edit_buttons,
 )
 from backend.helper.client import get_client
 
@@ -46,7 +47,7 @@ async def _find_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=builder.build())
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("find inline edit failed: %s", exc)
