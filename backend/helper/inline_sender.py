@@ -15,6 +15,7 @@ from backend.bot.handlers.guard import is_owner
 from backend.helper import inline_engine
 from backend.helper.input_state import get_pending, clear_pending
 from backend.helper.panel_timer import init_panel
+from backend.helper.panels import _create_session
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
             msg_chat_id, msg_id,
         )
         if success and msg_id:
+            _create_session(msg_chat_id, msg_id, panel_type=query)
             init_panel(self_client, msg_chat_id, msg_id)
         return success
     except Exception:
