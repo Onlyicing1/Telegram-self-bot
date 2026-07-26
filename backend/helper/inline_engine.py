@@ -30,6 +30,11 @@ def set_self_client(client) -> None:
     _self_client = client
 
 
+def get_self_client():
+    """Return the self-bot client (set during startup)."""
+    return _self_client
+
+
 def set_helper_client_ref(client) -> None:
     global _helper_client_ref
     _helper_client_ref = client
@@ -81,18 +86,24 @@ async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int
     Returns (success, chat_id, msg_id). msg_id is 0 on failure.
     """
     if not _helper_username:
+        logger.warning("trigger: no helper username set — cannot inline query")
         return False, chat_id, 0
 
     try:
-        results = await self_client.inline_query(_helper_username, query)
-        if results:
-            msg = await results[0].click(chat_id)
-            if msg is not None:
-                msg_id = getattr(msg, "id", 0) or 0
-                return True, chat_id, msg_id
-            return True, chat_id, 0
+        results = await self_client.inline_query(_helper_username, query, entity=chat_id)
+        if not results:
+            logger.warning("trigger: helper returned zero results for query '%s'", query)
+            return False, chat_id, 0
+        msg = await results[0].click(chat_id)
+        if msg is not None:
+            msg_id = getattr(msg, "id", 0) or 0
+            if not msg_id:
+                logger.warning("trigger: click() returned message with id=0")
+            return True, chat_id, msg_id
+        logger.warning("trigger: click() returned None for query '%s'", query)
         return False, chat_id, 0
-    except Exception:
+    except Exception as exc:
+        logger.error("trigger: exception for query '%s': %s", query, exc)
         return False, chat_id, 0
 
 
