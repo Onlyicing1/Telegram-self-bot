@@ -3,6 +3,11 @@ PanelRenderer — reusable inline panel renderer.
 
 Every panel must use this renderer. No panel may manually build layouts.
 
+Single button API (Option A):
+  Builders always return tuples: ("Text", "callback_data")
+  render() and render_edit() create Button objects from tuples.
+  No other format is ever used.
+
 Rules:
   - NO ASCII
   - NO separators
@@ -23,12 +28,7 @@ def render(
 ) -> types.InputBotInlineResult:
     """Build a single inline result with a clean minimal layout.
 
-    The layout is:
-      <title>           (bold)
-      <body>            (optional, plain text)
-
-    Buttons are passed as a list of rows, each row a list of
-    (text, callback_data) tuples.
+    buttons: list of rows, each row is a list of (text, callback_data) tuples.
     """
     if title and body:
         message = f"**{title}**\n\n{body}"
@@ -37,7 +37,7 @@ def render(
     else:
         message = body or ""
 
-    markup_rows = _build_button_rows(buttons) if buttons else None
+    markup_rows = _to_inline_rows(buttons) if buttons else None
 
     msg = types.InputBotInlineMessageText(
         message=message,
@@ -59,7 +59,8 @@ def render_edit(
 ) -> tuple[str, list]:
     """Return (text, buttons) for event.edit() calls.
 
-    buttons arg/output format: list of rows, each row is list of (text, data) tuples.
+    buttons arg: list of rows, each row is a list of (text, callback_data) tuples.
+    buttons output: list of lists of Button objects (for Telethon event.edit).
     """
     if title and body:
         text = f"**{title}**\n\n{body}"
@@ -68,22 +69,22 @@ def render_edit(
     else:
         text = body or ""
 
-    built = _build_button_rows(buttons) if buttons else []
+    built = to_edit_buttons(buttons) if buttons else []
     return text, built
 
 
-def _build_button_rows(buttons: list) -> list:
-    """Convert list-of-rows of (text, data) tuples into KeyboardButtonRow list."""
+def to_edit_buttons(buttons: list) -> list:
+    """Convert list[list[(text, data)]] to list[list[Button]] for event.edit()."""
+    return [
+        [Button.inline(text, truncate_callback_data(data)) for text, data in row]
+        for row in buttons
+    ]
+
+
+def _to_inline_rows(buttons: list) -> list:
+    """Convert list[list[(text, data)]] to list[KeyboardButtonRow] for ReplyInlineMarkup."""
     rows = []
     for row in buttons:
-        row_buttons = []
-        for item in row:
-            if isinstance(item, Button):
-                row_buttons.append(item)
-            else:
-                text, data = item
-                row_buttons.append(
-                    Button.inline(text, truncate_callback_data(data))
-                )
+        row_buttons = [Button.inline(text, truncate_callback_data(data)) for text, data in row]
         rows.append(types.KeyboardButtonRow(buttons=row_buttons))
     return rows

@@ -3,10 +3,11 @@ Reusable paginator for inline panels.
 
 Provides a standard Previous / Page X / Y / Next row builder.
 No other module may implement pagination logic.
-"""
-from telethon.tl.custom import Button
 
-from backend.helper.context import truncate_callback_data
+Single button API (Option A):
+  Returns tuples: ("Text", "callback_data")
+  The renderer converts tuples to Button objects.
+"""
 
 
 def build_pagination_row(
@@ -17,7 +18,7 @@ def build_pagination_row(
 ) -> list:
     """Build a single pagination row [Prev] [Page X/Y] [Next].
 
-    Returns a list of Button objects for one keyboard row.
+    Returns a list of (text, callback_data) tuples for one keyboard row.
     """
     buttons = []
 
@@ -25,20 +26,15 @@ def build_pagination_row(
         prev_data = f"panel:{panel_id}:page:{current_page - 1}"
         if extra_prefix:
             prev_data = f"panel:{panel_id}:{extra_prefix}:page:{current_page - 1}"
-        buttons.append(Button.inline("‹ Prev", truncate_callback_data(prev_data)))
+        buttons.append(("‹ Prev", prev_data))
 
-    buttons.append(
-        Button.inline(
-            f"{current_page}/{total_pages}",
-            truncate_callback_data(f"panel:{panel_id}:noop"),
-        )
-    )
+    buttons.append((f"{current_page}/{total_pages}", f"panel:{panel_id}:noop"))
 
     if current_page < total_pages:
         next_data = f"panel:{panel_id}:page:{current_page + 1}"
         if extra_prefix:
             next_data = f"panel:{panel_id}:{extra_prefix}:page:{current_page + 1}"
-        buttons.append(Button.inline("Next ›", truncate_callback_data(next_data)))
+        buttons.append(("Next ›", next_data))
 
     return buttons
 

@@ -20,6 +20,7 @@ from backend.helper import (
     send_inline_panel,
     render,
     render_edit,
+    to_edit_buttons,
 )
 from backend.helper.client import get_client
 
@@ -33,7 +34,7 @@ async def _bio_on_action(event, extra: str) -> tuple:
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
-    return result, builder.build()
+    return result, to_edit_buttons(builder.build())
 
 
 async def _bio_off_action(event, extra: str) -> tuple:
@@ -42,7 +43,7 @@ async def _bio_off_action(event, extra: str) -> tuple:
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
-    return result, builder.build()
+    return result, to_edit_buttons(builder.build())
 
 
 async def _bio_show_action(event, extra: str) -> tuple:
@@ -52,14 +53,14 @@ async def _bio_show_action(event, extra: str) -> tuple:
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
-    return result, builder.build()
+    return result, to_edit_buttons(builder.build())
 
 
 async def _bio_help_action(event, extra: str) -> tuple:
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
-    return bio_service._HELP, builder.build()
+    return bio_service._HELP, to_edit_buttons(builder.build())
 
 
 async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -71,7 +72,7 @@ async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inl
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=builder.build())
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio template inline edit failed: %s", exc)
@@ -86,7 +87,7 @@ async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=builder.build())
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio text inline edit failed: %s", exc)
@@ -101,7 +102,7 @@ async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=builder.build())
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=to_edit_buttons(builder.build()))
             await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio mood inline edit failed: %s", exc)

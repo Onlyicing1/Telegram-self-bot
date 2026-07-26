@@ -19,12 +19,12 @@ import logging
 from typing import Awaitable, Callable, Any
 
 from telethon import events
-from telethon.tl.custom import Button
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending
 from backend.helper.panel_timer import reset_timer, delete_panel
+from backend.helper.panel_render import to_edit_buttons
 
 logger = logging.getLogger(__name__)
 
@@ -38,25 +38,30 @@ _inputs: dict[str, dict[str, InputConfig]] = {}
 
 
 class InlinePanelBuilder:
-    """Builds inline keyboard layouts for the helper bot."""
+    """Builds inline keyboard layouts for the helper bot.
+
+    Single button API (Option A):
+      All methods store tuples: ("Text", "callback_data")
+      build() returns list[list[(text, data)]] — never Button objects.
+      The renderer converts tuples to Button objects.
+    """
 
     def __init__(self):
-        self._rows: list[list[Any]] = []
+        self._rows: list[list[tuple[str, str]]] = []
 
     def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.inline(text, truncate_callback_data(callback_data))])
+        self._rows.append([(text, callback_data)])
         return self
 
     def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
-        row = [Button.inline(text, truncate_callback_data(data)) for text, data in buttons]
-        self._rows.append(row)
+        self._rows.append(list(buttons))
         return self
 
     def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.url(text, url)])
+        self._rows.append(("__url__", text, url))
         return self
 
-    def build(self) -> list[list[Any]]:
+    def build(self) -> list[list[tuple[str, str]]]:
         return self._rows
 
 
@@ -162,7 +167,7 @@ async def _handle_action(event, remainder: str) -> None:
             text, buttons = result, []
         if text:
             try:
-                await event.edit(text, buttons=buttons)
+                await event.edit(text, buttons=to_edit_buttons(buttons))
             except Exception as exc:
                 logger.warning("Action result edit failed: %s", exc)
     except Exception:
@@ -196,6 +201,6 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
     builder.add_row("Cancel", f"panel:{panel_id}")
 
     try:
-        await event.edit(prompt, buttons=builder.build())
+        await event.edit(prompt, buttons=to_edit_buttons(builder.build()))
     except Exception as exc:
         logger.warning("Input prompt edit failed: %s", exc)
