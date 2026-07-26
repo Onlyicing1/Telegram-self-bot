@@ -12,6 +12,7 @@ from telethon import events, types
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
+from backend.helper.panel_render import _to_inline_rows, _normalize_row
 
 logger = logging.getLogger(__name__)
 
@@ -50,25 +51,8 @@ def get_helper_username() -> str:
 
 
 def _to_keyboard_button_rows(rows: list) -> list:
-    """Convert tuple-based button rows into KeyboardButtonRow TLObjects.
-
-    Input: list of rows, each row is a list of (text, callback_data) tuples.
-    Output: list of KeyboardButtonRow objects.
-    """
-    fixed = []
-    for row in rows:
-        if isinstance(row, types.KeyboardButtonRow):
-            fixed.append(row)
-        else:
-            row_buttons = [
-                types.KeyboardButtonCallback(
-                    text=text,
-                    data=truncate_callback_data(data).encode("utf-8"),
-                )
-                for text, data in row
-            ]
-            fixed.append(types.KeyboardButtonRow(buttons=row_buttons))
-    return fixed
+    """Convert any button rows (tuples OR TLObjects) into KeyboardButtonRow TLObjects."""
+    return _to_inline_rows(rows) if rows else []
 
 
 def _sanitize_results(results: list) -> list:
@@ -91,19 +75,25 @@ def get_inline_builder(query_key: str) -> InlineResultBuilder | None:
     return _builders.get(query_key)
 
 
-async def trigger(self_client, chat_id: int, query: str) -> bool:
-    """Trigger inline mode and auto-send the first result."""
+async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int]:
+    """Trigger inline mode and auto-send the first result.
+
+    Returns (success, chat_id, msg_id). msg_id is 0 on failure.
+    """
     if not _helper_username:
-        return False
+        return False, chat_id, 0
 
     try:
         results = await self_client.inline_query(_helper_username, query)
         if results:
-            await results[0].click(chat_id)
-            return True
-        return False
+            msg = await results[0].click(chat_id)
+            if msg is not None:
+                msg_id = getattr(msg, "id", 0) or 0
+                return True, chat_id, msg_id
+            return True, chat_id, 0
+        return False, chat_id, 0
     except Exception:
-        return False
+        return False, chat_id, 0
 
 
 def register_inline_handler(helper_client, owner_id: int) -> None:
@@ -159,7 +149,7 @@ def make_result(
     buttons: list | None = None,
     query_id: int = 0,
 ) -> types.InputBotInlineResult:
-    """Build a single InputBotInlineResult with a text message and buttons."""
+    """Build a single InputBotInlineResult. Accepts tuples OR Button objects."""
     body_text = title
     if description:
         body_text = f"{title}\n\n{description}"
@@ -180,20 +170,6 @@ def make_result(
     )
 
 
-def make_button_rows(buttons_data: list[list[tuple[str, str]]]) -> list:
-    """Convert tuple-based button rows into KeyboardButtonRow TLObjects.
-
-    Input: list of rows, each row is a list of (text, callback_data) tuples.
-    Output: list of KeyboardButtonRow objects.
-    """
-    rows = []
-    for row_data in buttons_data:
-        row_buttons = [
-            types.KeyboardButtonCallback(
-                text=text,
-                data=truncate_callback_data(data).encode("utf-8"),
-            )
-            for text, data in row_data
-        ]
-        rows.append(types.KeyboardButtonRow(buttons=row_buttons))
-    return rows
+def make_button_rows(buttons_data: list) -> list:
+    """Convert any button layout into KeyboardButtonRow TLObjects."""
+    return _to_keyboard_button_rows(buttons_data)
