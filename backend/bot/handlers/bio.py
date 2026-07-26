@@ -1,30 +1,16 @@
 """
 Bio command handler.
 
-  .bio help              — Token reference
-  .bio template <tpl>    — Set template
-  .bio text <text>       — Set {text} token
-  .bio mood <mood>       — Set {mood} token
-  .bio on                — Start timezone-synchronized cron
-  .bio off                — Stop cron
-  .bio show              — Inspect current state
-  .bio                   — Inline panel: choose bio action
-
-Inline Mode:
-  - .bio (no args) → inline panel with buttons.
-  - .bio on/off/show → Type A: execute immediately via callback.
-  - .bio template/text/mood → Type B: input prompt for text.
-  - All .bio <subcommand> with args still work as edit-in-place (backward compat).
+Business logic lives in backend.services.bio_service.
+This handler is only the Telethon wiring + panel rendering.
 """
 import logging
-from datetime import datetime
 
 from telethon import events
 
-from backend.bio import engine as bio_engine
 from backend.bot.handlers.guard import is_owner
 from backend.db import client as db_client
-from backend.diagnostics import record_event
+from backend.services import bio_service
 from backend.helper import (
     InlinePanelBuilder,
     register_panel,
@@ -32,108 +18,18 @@ from backend.helper import (
     register_action,
     register_input,
     send_inline_panel,
+    render,
+    render_edit,
 )
 from backend.helper.client import get_client
 
 logger = logging.getLogger(__name__)
 
-_HELP = (
-    "**Bio Engine — Token Reference**\n\n"
-    "`{time}` — Current time (HH:MM)\n"
-    "`{mood}` — Current mood value\n"
-    "`{text}` — Custom freeform text\n\n"
-    "**Commands**\n"
-    "`.bio text <text>` — Set {text}\n"
-    "`.bio mood <mood>` — Set {mood}\n"
-    "`.bio on` — Start cron sync\n"
-    "`.bio off` — Stop cron sync\n"
-    "`.bio show` — Inspect state\n"
-    "`.bio template <tpl>` — Set template\n\n"
-    "**Example template**\n"
-    "`🕒 {time} | 💭 {mood} | 📝 {text}`"
-)
-
-
-async def _do_on(client, owner_id: int, tz_str: str) -> str:
-    try:
-        db_client.update_bio_state(owner_id, {"is_active": True})
-    except Exception as exc:
-        return f"❌ DB error: {exc}"
-    bio_engine.start_cron(client, owner_id, tz_str)
-    record_event("bio", "cron on", 0, "SUCCESS")
-    state = db_client.get_or_create_bio_state(owner_id)
-    preview = bio_engine.render_bio(
-        state.get("template", "🕒 {time} | 💭 {mood}"),
-        state.get("mood", "😊"),
-        state.get("custom_text", ""),
-        tz_str,
-    )
-    return f"✅ Bio cron **ON**\nPreview: `{preview}`"
-
-
-async def _do_off(owner_id: int) -> str:
-    try:
-        db_client.update_bio_state(owner_id, {"is_active": False})
-    except Exception as exc:
-        return f"❌ DB error: {exc}"
-    bio_engine.stop_cron()
-    record_event("bio", "cron off", 0, "SUCCESS")
-    return "⏹ Bio cron **OFF**"
-
-
-async def _do_show(owner_id: int, tz_str: str) -> str:
-    state = db_client.get_or_create_bio_state(owner_id)
-    now = bio_engine._get_tz(tz_str)
-    now_dt = datetime.now(now)
-    preview = bio_engine.render_bio(
-        state.get("template", "🕒 {time} | 💭 {mood}"),
-        state.get("mood", "😊"),
-        state.get("custom_text", ""),
-        tz_str,
-    )
-    status = "ON" if bio_engine.is_running() else "OFF"
-    return (
-        f"**Bio State**\n\n"
-        f"Status: `{status}`\n"
-        f"Template: `{state.get('template') or '🕒 {time} | 💭 {mood}'}`\n"
-        f"Mood: `{state.get('mood') or '😊'}`\n"
-        f"Text: `{state.get('custom_text') or '—'}`\n"
-        f"Last Bio: `{state.get('last_bio') or '—'}`\n"
-        f"Preview: `{preview}`\n"
-        f"Server Time ({tz_str}): `{now_dt.strftime('%H:%M:%S')}`"
-    )
-
-
-async def _do_template(owner_id: int, template: str) -> str:
-    if not template:
-        return "⚠️ Template cannot be empty."
-    try:
-        db_client.update_bio_state(owner_id, {"template": template})
-    except Exception as exc:
-        return f"❌ DB error: {exc}"
-    return f"✅ Template updated:\n`{template}`"
-
-
-async def _do_text(owner_id: int, text: str) -> str:
-    try:
-        db_client.update_bio_state(owner_id, {"custom_text": text})
-    except Exception as exc:
-        return f"❌ DB error: {exc}"
-    return f"✅ Text set to: `{text}`"
-
-
-async def _do_mood(owner_id: int, mood: str) -> str:
-    try:
-        db_client.update_bio_state(owner_id, {"mood": mood})
-    except Exception as exc:
-        return f"❌ DB error: {exc}"
-    return f"✅ Mood set to: `{mood}`"
-
 
 async def _bio_on_action(event, extra: str) -> tuple:
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.bot.handlers.misc import _resolve_tz
-    result = await _do_on(_self_client, _owner_id, _resolve_tz())
+    result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -142,7 +38,7 @@ async def _bio_on_action(event, extra: str) -> tuple:
 
 async def _bio_off_action(event, extra: str) -> tuple:
     from backend.helper.inline_engine import _owner_id
-    result = await _do_off(_owner_id)
+    result = await bio_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -152,7 +48,7 @@ async def _bio_off_action(event, extra: str) -> tuple:
 async def _bio_show_action(event, extra: str) -> tuple:
     from backend.helper.inline_engine import _owner_id
     from backend.bot.handlers.misc import _resolve_tz
-    result = await _do_show(_owner_id, _resolve_tz())
+    result = await bio_service.do_show(_owner_id, _resolve_tz())
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -163,12 +59,12 @@ async def _bio_help_action(event, extra: str) -> tuple:
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
-    return _HELP, builder.build()
+    return bio_service._HELP, builder.build()
 
 
 async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
-    result = await _do_template(_owner_id, text)
+    result = await bio_service.do_template(_owner_id, text)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -183,7 +79,7 @@ async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inl
 
 async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
-    result = await _do_text(_owner_id, text)
+    result = await bio_service.do_text(_owner_id, text)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -198,7 +94,7 @@ async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 
 async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id
-    result = await _do_mood(_owner_id, text)
+    result = await bio_service.do_mood(_owner_id, text)
     builder = InlinePanelBuilder()
     builder.add_row("Back", "panel:bio")
     builder.add_row("Close", "panel:help:close")
@@ -212,7 +108,6 @@ async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 
 
 async def _bio_panel_handler(event, extra: str) -> None:
-    text = "**Bio Engine**\n\nChoose an action:"
     builder = InlinePanelBuilder()
     builder.add_row("✅ Bio ON", "action:bio_on")
     builder.add_row("⏹ Bio OFF", "action:bio_off")
@@ -222,12 +117,11 @@ async def _bio_panel_handler(event, extra: str) -> None:
     builder.add_row("💭 Set Mood", "input:bio:mood")
     builder.add_row("❓ Help", "action:bio_help")
     builder.add_row("Close", "panel:help:close")
-    await event.edit(text, buttons=builder.build())
+    text, buttons = render_edit("Bio Engine", "Choose an action:", builder.build())
+    await event.edit(text, buttons=buttons)
 
 
 async def _bio_inline_builder(event, extra: str) -> list:
-    from telethon.tl import types
-    text = "**Bio Engine**\n\nChoose an action:"
     builder = InlinePanelBuilder()
     builder.add_row("✅ Bio ON", "action:bio_on")
     builder.add_row("⏹ Bio OFF", "action:bio_off")
@@ -237,18 +131,7 @@ async def _bio_inline_builder(event, extra: str) -> list:
     builder.add_row("💭 Set Mood", "input:bio:mood")
     builder.add_row("❓ Help", "action:bio_help")
     builder.add_row("Close", "panel:help:close")
-    buttons = builder.build()
-    msg = types.InputBotInlineMessageText(
-        message=text,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
-    )
-    result = types.InputBotInlineResult(
-        id="0",
-        type="article",
-        title="Bio Engine",
-        send_message=msg,
-    )
-    return [result]
+    return [render("Bio Engine", "Choose an action:", builder.build())]
 
 
 def register(client, owner_id: int, tz_str: str):
@@ -282,7 +165,7 @@ def register(client, owner_id: int, tz_str: str):
         if not arg:
             helper = get_client()
             if helper is None:
-                await event.edit(_HELP)
+                await event.edit(bio_service._HELP)
                 return
             try:
                 await event.delete()
@@ -305,26 +188,26 @@ def register(client, owner_id: int, tz_str: str):
                     "To change: `.bio template <new template>`"
                 )
             else:
-                await event.edit(_HELP)
+                await event.edit(bio_service._HELP)
             return
 
         if arg.startswith("template "):
-            result = await _do_template(owner_id, arg[9:].strip())
+            result = await bio_service.do_template(owner_id, arg[9:].strip())
             await event.edit(result)
         elif arg.startswith("text "):
-            result = await _do_text(owner_id, arg[5:].strip())
+            result = await bio_service.do_text(owner_id, arg[5:].strip())
             await event.edit(result)
         elif arg.startswith("mood "):
-            result = await _do_mood(owner_id, arg[5:].strip())
+            result = await bio_service.do_mood(owner_id, arg[5:].strip())
             await event.edit(result)
         elif arg == "on":
-            result = await _do_on(client, owner_id, tz_str)
+            result = await bio_service.do_on(client, owner_id, tz_str)
             await event.edit(result)
         elif arg == "off":
-            result = await _do_off(owner_id)
+            result = await bio_service.do_off(owner_id)
             await event.edit(result)
         elif arg == "show":
-            result = await _do_show(owner_id, tz_str)
+            result = await bio_service.do_show(owner_id, tz_str)
             await event.edit(result)
         else:
             await event.edit("⚠️ Unknown bio command. Try `.bio help`")

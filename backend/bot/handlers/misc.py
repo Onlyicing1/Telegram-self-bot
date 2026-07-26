@@ -6,12 +6,7 @@
 .kill    — Diagnostic snapshot + stalled-task recovery (inline panel).
 .logs    — View recent diagnostic events (inline panel).
 
-Inline Mode architecture:
-  - .help triggers inline mode → self sends inline result with buttons.
-  - .health/.kill/.logs trigger inline mode → self sends inline result.
-  - All panel navigation happens via callbacks (no new messages).
-  - Falls back to plain-text edit-in-place when the helper bot is not
-    available (no BOT_TOKEN).
+Falls back to plain-text edit-in-place when the helper bot is not available.
 """
 import asyncio
 import logging
@@ -28,12 +23,12 @@ from backend.db import client as db_client
 from backend.helper import (
     InlinePanelBuilder,
     register_panel,
-    get_panel,
     register_inline_builder,
     send_inline_panel,
+    render,
+    render_edit,
 )
 from backend.helper.client import get_client
-from backend.helper import trace_collector
 
 
 def _resolve_tz() -> str:
@@ -46,8 +41,6 @@ def _resolve_tz() -> str:
 
 
 logger = logging.getLogger(__name__)
-
-# ── Help menu data ──────────────────────────────────────────────────────
 
 _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
     (
@@ -124,23 +117,7 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
 ]
 
 
-_MAIN_MENU_BODY = "·"
-
-
-def _build_main_menu_text() -> str:
-    lines = ["**LifeOS Command Center**\n"]
-    for i, (label, _) in enumerate(_HELP_CATEGORIES, start=1):
-        lines.append(f"{i} • {label}")
-    lines.append("\n_Tap a category._")
-    return "\n".join(lines)
-
-
-def _build_category_page_text(index: int) -> str:
-    _, lines = _HELP_CATEGORIES[index]
-    return "\n".join(lines)
-
-
-def _build_main_menu_keyboard() -> list:
+def _build_main_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     cats = _HELP_CATEGORIES
     for i in range(0, len(cats) - 1, 2):
@@ -155,68 +132,49 @@ def _build_main_menu_keyboard() -> list:
     return builder.build()
 
 
-def _build_category_keyboard() -> list:
+def _build_category_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(("Back", "panel:help:back"), ("Close", "panel:help:close"))
     return builder.build()
 
 
 async def _help_panel_handler(event, extra: str) -> None:
-    logger.info("[HELP_PANEL] handler entered: extra='%s', msg_id=%s, sender_id=%s",
-                extra, event.message_id, event.sender_id)
     if extra == "close":
-        try:
-            await event.answer()
-            await event.delete()
-        except Exception as exc:
-            logger.warning("[HELP_PANEL] close failed: %s", exc)
         return
     if extra == "back":
+        text, buttons = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
         try:
-            await event.edit(_MAIN_MENU_BODY, buttons=_build_main_menu_keyboard())
+            await event.edit(text, buttons=buttons)
         except Exception as exc:
-            logger.warning("[HELP_PANEL] back edit failed: %s", exc)
+            logger.warning("help back edit failed: %s", exc)
         return
     if extra.startswith("cat:"):
         idx_str = extra[4:]
         if idx_str.isdigit():
             idx = int(idx_str)
             if 0 <= idx < len(_HELP_CATEGORIES):
-                logger.info("[HELP_PANEL] opening category %d ('%s')", idx, _HELP_CATEGORIES[idx][0])
+                _, lines = _HELP_CATEGORIES[idx]
+                body = "\n".join(lines)
+                text, buttons = render_edit(_HELP_CATEGORIES[idx][0], body, _build_category_buttons())
                 try:
-                    await event.edit(
-                        _build_category_page_text(idx),
-                        buttons=_build_category_keyboard(),
-                    )
+                    await event.edit(text, buttons=buttons)
                 except Exception as exc:
-                    logger.warning("[HELP_PANEL] cat %d edit failed: %s", idx, exc)
+                    logger.warning("help cat %d edit failed: %s", idx, exc)
                 return
+    text, buttons = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
     try:
-        await event.edit(_MAIN_MENU_BODY, buttons=_build_main_menu_keyboard())
+        await event.edit(text, buttons=buttons)
     except Exception as exc:
-        logger.warning("[HELP_PANEL] default edit failed: %s", exc)
+        logger.warning("help default edit failed: %s", exc)
 
 
 async def _help_inline_builder(event, extra: str) -> list:
-    from telethon.tl import types
-    buttons = _build_main_menu_keyboard()
-    msg = types.InputBotInlineMessageText(
-        message=_MAIN_MENU_BODY,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
-    )
-    result = types.InputBotInlineResult(
-        id="0",
-        type="article",
-        title="LifeOS Command Center",
-        send_message=msg,
-    )
-    return [result]
+    buttons = _build_main_menu_buttons()
+    return [render("LifeOS Command Center", "", buttons)]
 
 
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
-
-# ── Health dashboard ────────────────────────────────────────────────────
 
 
 def _format_uptime(uptime_s):
@@ -270,12 +228,8 @@ def _build_health_report(snap):
     try:
         all_tasks = asyncio.all_tasks()
         running = sum(1 for t in all_tasks if not t.done())
-        pending = sum(1 for t in all_tasks if not t.done())
-        locked = 0
     except Exception:
         running = None
-        pending = None
-        locked = None
 
     db_ok = db_client.is_available()
 
@@ -314,10 +268,6 @@ def _build_health_report(snap):
 
     if running is not None:
         lines.append(f"{'🟢' if running < 20 else '🟡'} **Running Tasks**: `{running}`")
-    if pending is not None:
-        lines.append(f"{'🟢' if pending < 20 else '🟡'} **Pending Async**: `{pending}`")
-    if locked is not None:
-        lines.append(f"{'🟢' if locked == 0 else '🟡'} **Locked Tasks**: `{locked}`")
 
     lines.append(f"{_indicator(db_ok)} **Database**: {'Available' if db_ok else 'Fallback'}")
 
@@ -333,28 +283,15 @@ def _build_health_report(snap):
 
 
 async def _health_inline_builder(event, extra: str) -> list:
-    from telethon.tl import types
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
     builder.add_row("Refresh", "action:health_refresh")
     builder.add_row("Close", "panel:help:close")
-    buttons = builder.build()
-    msg = types.InputBotInlineMessageText(
-        message=report,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
-    )
-    result = types.InputBotInlineResult(
-        id="0",
-        type="article",
-        title="LifeOS Health Dashboard",
-        send_message=msg,
-    )
-    return [result]
+    return [render("Health Dashboard", report, builder.build())]
 
 
 async def _kill_inline_builder(event, extra: str) -> list:
-    from telethon.tl import types
     snap = health.snapshot()
     self_client = _get_self_client()
     report = diagnostics.build_diagnostic_report(
@@ -366,22 +303,10 @@ async def _kill_inline_builder(event, extra: str) -> list:
     full_text = report + recovery
     builder = InlinePanelBuilder()
     builder.add_row("Close", "panel:help:close")
-    buttons = builder.build()
-    msg = types.InputBotInlineMessageText(
-        message=full_text,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
-    )
-    result = types.InputBotInlineResult(
-        id="0",
-        type="article",
-        title="LifeOS Diagnostics",
-        send_message=msg,
-    )
-    return [result]
+    return [render("Diagnostics", full_text, builder.build())]
 
 
 async def _logs_inline_builder(event, extra: str) -> list:
-    from telethon.tl import types
     limit = 20
     if extra and extra.isdigit():
         limit = min(int(extra), 500)
@@ -396,18 +321,7 @@ async def _logs_inline_builder(event, extra: str) -> list:
     builder.add_row("Errors Only", "action:logs_errors")
     builder.add_row("Last 50", "action:logs_50")
     builder.add_row("Close", "panel:help:close")
-    buttons = builder.build()
-    msg = types.InputBotInlineMessageText(
-        message=text,
-        reply_markup=types.ReplyInlineMarkup(rows=buttons) if buttons else None,
-    )
-    result = types.InputBotInlineResult(
-        id="0",
-        type="article",
-        title="LifeOS Event Log",
-        send_message=msg,
-    )
-    return [result]
+    return [render("Event Log", text, builder.build())]
 
 
 def _get_self_client():
@@ -416,7 +330,6 @@ def _get_self_client():
 
 
 async def _safe_edit(event, text: str) -> None:
-    """Edit a message, splitting if it exceeds Telegram's limit."""
     parts = diagnostics.split_message(text)
     for i, part in enumerate(parts):
         if i == 0:
@@ -426,7 +339,6 @@ async def _safe_edit(event, text: str) -> None:
 
 
 def register(client, owner_id: int):
-    # ── .ping ──────────────────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
     async def ping(event):
         if not is_owner(event, owner_id):
@@ -436,7 +348,6 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("ping edit failed: %s", exc)
 
-    # ── .id ────────────────────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.id$"))
     async def id_cmd(event):
         if not is_owner(event, owner_id):
@@ -453,51 +364,28 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("id_cmd failed: %s", exc)
 
-    # ── .help — inline panel via Inline Mode ───────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
     async def help_cmd(event):
-        trace_collector.reset()
-        trace_collector.trace("HELP ENTER")
-
-        owner_ok = is_owner(event, owner_id)
-        trace_collector.trace(f"OWNER CHECK: ok={owner_ok}")
-        if not owner_ok:
-            trace_collector.trace("RETURN: owner check failed")
-            await trace_collector.flush_to_saved_messages(client)
+        if not is_owner(event, owner_id):
             return
 
         helper = get_client()
-        trace_collector.trace(f"HELPER CHECK: {'None' if helper is None else 'connected=' + str(helper.is_connected())}")
         if helper is None:
-            trace_collector.trace("RETURN: no helper bot, fallback to text")
-            await trace_collector.flush_to_saved_messages(client)
-            await event.edit(_build_main_menu_text())
+            text, _ = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
+            await event.edit(text)
             return
 
         try:
-            handlers = helper.list_event_handlers()
-            trace_collector.trace(f"HELPER HANDLERS: count={len(handlers)}")
-        except Exception:
-            pass
-
-        try:
-            trace_collector.trace("DELETE MESSAGE")
             await event.delete()
-
-            trace_collector.trace("SEND_INLINE_PANEL ENTER")
             await send_inline_panel(client, event.chat_id, "help")
-            trace_collector.trace("SEND_INLINE_PANEL DONE")
-            trace_collector.trace("RETURN: success")
-            await trace_collector.flush_to_saved_messages(client)
         except Exception as exc:
-            trace_collector.trace(f"EXCEPTION: {type(exc).__name__}: {exc}")
-            await trace_collector.flush_to_saved_messages(client)
+            logger.warning("help inline send failed: %s", exc)
             try:
-                await event.edit(_build_main_menu_text())
+                text, _ = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
+                await event.edit(text)
             except Exception:
                 pass
 
-    # ── Inline builders + panel registration ────────────────────────────
     try:
         _register_help_panel()
         register_inline_builder("help", _help_inline_builder)
@@ -505,9 +393,8 @@ def register(client, owner_id: int):
         register_inline_builder("kill", _kill_inline_builder)
         register_inline_builder("logs", _logs_inline_builder)
     except Exception as exc:
-        logger.warning("[MISC] Inline builder registration failed: %s — inline panels disabled", exc)
+        logger.warning("Inline builder registration failed: %s", exc)
 
-    # ── .health — inline panel via Inline Mode ──────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
     async def health_cmd(event):
         if not is_owner(event, owner_id):
@@ -528,14 +415,7 @@ def register(client, owner_id: int):
             diagnostics.record_event("health", "snapshot", 0, "SUCCESS")
         except Exception as exc:
             logger.warning("health inline send failed: %s", exc)
-            try:
-                snap = health.snapshot()
-                report = _build_health_report(snap)
-                await _safe_edit(event, report)
-            except Exception:
-                pass
 
-    # ── .kill — diagnostic snapshot + recovery ─────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.kill$"))
     async def kill_cmd(event):
         if not is_owner(event, owner_id):
@@ -562,20 +442,7 @@ def register(client, owner_id: int):
             diagnostics.record_event("diagnostics", "kill", 0, "SUCCESS")
         except Exception as exc:
             logger.warning("kill inline send failed: %s", exc)
-            try:
-                await event.edit("⏳ Collecting diagnostics...")
-                snap = health.snapshot()
-                report = diagnostics.build_diagnostic_report(
-                    client, bio_engine, db_client, snap
-                )
-                recovery = await diagnostics.recover_stalled(
-                    client, owner_id, _resolve_tz(), bio_engine, db_client
-                )
-                await _safe_edit(event, report + recovery)
-            except Exception:
-                pass
 
-    # ── .logs — diagnostic event viewer ────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.logs(?:\s+(.+))?$"))
     async def logs_cmd(event):
         if not is_owner(event, owner_id):

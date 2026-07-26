@@ -16,13 +16,10 @@ Shutdown sequence on SIGTERM / SIGINT:
   D. Telethon disconnected cleanly
 
 Reliability:
-  - Telethon is supervised: if run_until_disconnected() returns (connection
-    lost), the supervisor reconnects automatically.
-  - A watchdog pings Telegram every 60s; if the ping times out, the client
-    is force-disconnected so the supervisor can reconnect.
-  - Bio cron is supervised: if the cron loop exits unexpectedly, it restarts.
-  - Helper bot is supervised: run_until_disconnected() keeps its event loop
-    alive so InlineQuery and CallbackQuery events are processed.
+  - Telethon is supervised: auto-reconnect on disconnect.
+  - Watchdog pings Telegram every 60s; force-disconnect if stalled.
+  - Helper bot watchdog checks every 30s; reconnects or rebuilds automatically.
+  - Bio cron is supervised: restarts if loop exits unexpectedly.
   - No background coroutine may silently die.
 """
 import asyncio
@@ -31,7 +28,6 @@ import signal
 import sys
 
 import uvicorn
-from telethon import events
 
 import backend.config as cfg_module
 from backend.bio import engine as bio_engine
@@ -47,6 +43,7 @@ from backend.helper.inline_engine import (
     set_owner_id,
 )
 from backend.helper.inline_sender import register_input_listener
+from backend.helper import watchdog as helper_watchdog
 from backend.health import (
     check_stale,
     increment_restart,
@@ -79,17 +76,14 @@ _HEARTBEAT_INTERVAL = 5.0
 
 
 async def _heartbeat(shutdown: asyncio.Event) -> None:
-    """Update the health heartbeat every few seconds while running."""
     while not shutdown.is_set():
         try:
             update_heartbeat()
             check_stale()
-            record_event("watchdog", "heartbeat", 0, "SUCCESS")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Heartbeat error: %s", exc)
-            record_event("watchdog", "heartbeat", 0, "ERROR", str(exc))
         await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
 
@@ -107,7 +101,6 @@ async def _run_web(port: int) -> None:
 
 
 async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
-    """Run run_until_disconnected() in a loop, reconnecting on exit."""
     set_supervisor_ok(True)
     while not shutdown.is_set():
         set_telethon_connected(client.is_connected())
@@ -117,10 +110,8 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
             raise
         except Exception as exc:
             logger.warning("Telethon run_until_disconnected error: %s", exc)
-            record_event("telethon", "run_until_disconnected", 0, "ERROR", str(exc))
 
         set_telethon_connected(False)
-        record_event("telethon", "disconnected", 0, "WARNING")
 
         if shutdown.is_set():
             break
@@ -132,27 +123,17 @@ async def _supervise_telethon(client, shutdown: asyncio.Event) -> None:
             await client.connect()
             if not await client.is_user_authorized():
                 logger.error("Reconnect: session not authorized — will retry")
-                record_event("telethon", "reconnect", 0, "ERROR", "not authorized")
                 continue
             set_telethon_connected(True)
-            record_event("telethon", "reconnect", 0, "SUCCESS")
             logger.info("Telethon reconnected successfully")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error("Reconnect failed: %s — will retry in %ds", exc, _RECONNECT_DELAY)
-            record_event("telethon", "reconnect", 0, "ERROR", str(exc))
     set_supervisor_ok(False)
 
 
 async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
-    """Keep the helper bot's event loop alive so it processes InlineQuery
-    and CallbackQuery events.
-
-    Without this, the helper bot connects but has no run_until_disconnected()
-    task, so its internal read loop may stall and events are never delivered
-    to registered handlers.
-    """
     while not shutdown.is_set():
         try:
             await helper_client.run_until_disconnected()
@@ -160,7 +141,6 @@ async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
             raise
         except Exception as exc:
             logger.warning("Helper bot run_until_disconnected error: %s", exc)
-            record_event("helper", "run_until_disconnected", 0, "ERROR", str(exc))
 
         if shutdown.is_set():
             break
@@ -169,16 +149,13 @@ async def _supervise_helper(helper_client, shutdown: asyncio.Event) -> None:
         await asyncio.sleep(_RECONNECT_DELAY)
         try:
             await helper_client.connect()
-            record_event("helper", "reconnect", 0, "SUCCESS")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error("Helper bot reconnect failed: %s — will retry", exc)
-            record_event("helper", "reconnect", 0, "ERROR", str(exc))
 
 
 async def _watchdog(client, shutdown: asyncio.Event) -> None:
-    """Periodically check Telethon health; force-disconnect if stalled."""
     while not shutdown.is_set():
         try:
             await asyncio.sleep(_WATCHDOG_INTERVAL)
@@ -191,11 +168,9 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
                 continue
             try:
                 await asyncio.wait_for(client.get_me(), timeout=_WATCHDOG_TIMEOUT)
-                record_event("watchdog", "health check", 0, "SUCCESS")
                 set_watchdog_ok(True)
             except asyncio.TimeoutError:
                 logger.warning("Watchdog: health check timed out — forcing disconnect")
-                record_event("watchdog", "health check", _WATCHDOG_TIMEOUT * 1000, "TIMEOUT")
                 set_watchdog_ok(False)
                 try:
                     await client.disconnect()
@@ -205,7 +180,6 @@ async def _watchdog(client, shutdown: asyncio.Event) -> None:
                 raise
             except Exception as exc:
                 logger.warning("Watchdog: health check failed (%s) — forcing disconnect", exc)
-                record_event("watchdog", "health check", 0, "ERROR", str(exc))
                 set_watchdog_ok(False)
                 try:
                     await client.disconnect()
@@ -230,7 +204,6 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    # ── Phase 1: Database warm-up (optional) ──────────────────────────────
     logger.info("[1/5] Database warm-up")
     db = db_client.get_db()
     if db:
@@ -242,16 +215,13 @@ async def main() -> None:
     else:
         logger.info("[1/5] Using in-memory fallback — no database required")
 
-    # ── Phase 2: Telethon client ──────────────────────────────────────────
     logger.info("[2/5] Connecting Telethon")
     client = await build_client(cfg["API_ID"], cfg["API_HASH"], cfg["SESSION_STRING"])
     set_telethon_connected(True)
 
-    # ── Phase 3: Register command handlers (exactly once) ─────────────────
     logger.info("[3/5] Registering command handlers")
     register_all(client, cfg["OWNER_ID"], cfg["TZ"])
 
-    # ── Phase 3.5: Helper bot (optional — Inline Mode + callbacks) ────────
     helper_client = None
     if cfg.get("HELPER_BOT_ENABLED"):
         logger.info("[3.5/5] Starting helper bot")
@@ -264,6 +234,8 @@ async def main() -> None:
                 set_helper_username(get_bot_username())
                 set_owner_id(cfg["OWNER_ID"])
                 register_input_listener(client, cfg["OWNER_ID"])
+                helper_watchdog.configure(cfg["BOT_TOKEN"], client, cfg["OWNER_ID"])
+                helper_watchdog.start()
                 logger.info("[3.5/5] Helper bot online — Inline Mode enabled")
         except Exception:
             logger.exception("[3.5/5] Helper bot failed — inline UI disabled")
@@ -271,7 +243,6 @@ async def main() -> None:
     else:
         logger.info("[3.5/5] Helper bot: no BOT_TOKEN — inline UI disabled")
 
-    # ── Phase 4: Resume bio cron if it was active before last restart ─────
     logger.info("[4/5] Bio cron resume check")
     try:
         state = db_client.get_bio_state(cfg["OWNER_ID"])
@@ -288,11 +259,9 @@ async def main() -> None:
         logger.warning("[4/5] Bio cron resume check failed: %s", exc)
         set_bio_cron_ok(False)
 
-    # ── Phase 5: Web server (background, non-blocking) ────────────────────
     logger.info("[5/5] Starting web server on port %s", cfg["PORT"])
     web_task = asyncio.create_task(_run_web(cfg["PORT"]), name="lifeos-web")
 
-    # ── Supervisors: Telethon + watchdog + heartbeat ────────────────────────
     tg_supervisor = asyncio.create_task(
         _supervise_telethon(client, shutdown), name="lifeos-tg-supervisor"
     )
@@ -303,7 +272,6 @@ async def main() -> None:
         _heartbeat(shutdown), name="lifeos-heartbeat"
     )
 
-    # ── Helper bot supervisor: keeps event loop alive for InlineQuery ──────
     helper_supervisor = None
     if helper_client is not None:
         helper_supervisor = asyncio.create_task(
@@ -313,34 +281,31 @@ async def main() -> None:
 
     logger.info("LifeOS online.")
 
-    # Wait for shutdown signal — supervisors keep the bot alive indefinitely
     await shutdown.wait()
 
-    # ── Shutdown A: bio cron ──────────────────────────────────────────────
     logger.info("Shutdown: stopping bio cron")
     bio_engine.stop_cron()
     set_bio_cron_ok(False)
     set_supervisor_ok(False)
     set_telethon_connected(False)
 
-    # ── Shutdown B: web server ────────────────────────────────────────────
+    logger.info("Shutdown: stopping helper watchdog")
+    helper_watchdog.stop()
+
     logger.info("Shutdown: signalling web server")
     if _uvicorn_server is not None:
         _uvicorn_server.should_exit = True
 
-    # ── Shutdown C: all remaining tasks ───────────────────────────────────
     logger.info("Shutdown: cancelling all tasks")
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
 
-    # ── Shutdown D: Helper bot ──────────────────────────────────────────
     if helper_client is not None:
         logger.info("Shutdown: disconnecting helper bot")
         await disconnect_helper()
 
-    # ── Shutdown E: Telethon ─────────────────────────────────────────────
     logger.info("Shutdown: disconnecting Telethon")
     try:
         await client.disconnect()
