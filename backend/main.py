@@ -43,6 +43,7 @@ from backend.helper.inline_engine import (
     set_owner_id,
 )
 from backend.helper.inline_sender import register_input_listener
+from backend.helper.panel_settings import load as load_panel_settings
 from backend.helper import watchdog as helper_watchdog
 from backend.health import (
     check_stale,
@@ -214,6 +215,8 @@ async def main() -> None:
             logger.warning("[1/5] Database warm-up failed (%s) — continuing", exc)
     else:
         logger.info("[1/5] Using in-memory fallback — no database required")
+
+    load_panel_settings()
 
     logger.info("[2/5] Connecting Telethon")
     client = await build_client(cfg["API_ID"], cfg["API_HASH"], cfg["SESSION_STRING"])
