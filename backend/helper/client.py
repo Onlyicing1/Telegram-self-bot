@@ -4,7 +4,13 @@ Helper bot client factory.
 Creates a Telethon TelegramClient using a bot token (not a user session).
 The helper bot is optional — if BOT_TOKEN is not set, build_helper returns None
 and all inline UI features are silently disabled.
+
+All network operations have bounded timeouts:
+  - connect(): 30s
+  - start(bot_token): 30s (wraps connect + auth)
+  - get_me(): 15s
 """
+import asyncio
 import logging
 import os
 
@@ -12,6 +18,10 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
+
+_CONNECT_TIMEOUT = 30
+_START_TIMEOUT = 30
+_GET_ME_TIMEOUT = 15
 
 _client: TelegramClient | None = None
 _bot_username: str = ""
@@ -23,12 +33,6 @@ def is_available() -> bool:
 
 def get_bot_username() -> str:
     return _bot_username
-
-
-def _mask_token(token: str) -> str:
-    if len(token) <= 10:
-        return "***"
-    return f"{token[:6]}...{token[-4:]}"
 
 
 async def build_helper(bot_token: str) -> TelegramClient | None:
@@ -60,9 +64,12 @@ async def build_helper(bot_token: str) -> TelegramClient | None:
     )
 
     try:
-        await client.connect()
-        await client.start(bot_token=clean_token)
-        me = await client.get_me()
+        await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+        await asyncio.wait_for(
+            client.start(bot_token=clean_token),
+            timeout=_START_TIMEOUT,
+        )
+        me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
         _bot_username = (me.username or "").lstrip("@")
         logger.info("Helper bot connected: @%s (id=%s)", me.username, me.id)
     except Exception as exc:
@@ -84,8 +91,8 @@ async def disconnect_helper() -> None:
     global _client
     if _client is not None:
         try:
-            await _client.disconnect()
-        except Exception as exc:
+            await asyncio.wait_for(_client.disconnect(), timeout=10.0)
+        except (asyncio.TimeoutError, Exception) as exc:
             logger.warning("Helper bot disconnect error: %s", exc)
         _client = None
 

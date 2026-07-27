@@ -8,6 +8,9 @@ Provides:
   - Stalled-task detection and selective recovery
   - Event filtering and formatting for .logs
 
+The diagnostic snapshot now reads from the RuntimeSupervisor when
+available, falling back to direct module access for backward compatibility.
+
 No database, no disk writes. All snapshot collection is synchronous and
 non-blocking — it reads module-level state only, never performs I/O.
 """
@@ -22,13 +25,6 @@ logger = logging.getLogger(__name__)
 
 _RING_SIZE = 500
 _event_ring: deque = deque(maxlen=_RING_SIZE)
-
-_PROTECTED_TASK_NAMES = {
-    "lifeos-tg-supervisor",
-    "lifeos-watchdog",
-    "lifeos-heartbeat",
-    "lifeos-web",
-}
 
 _TG_MSG_LIMIT = 4096
 
@@ -154,6 +150,18 @@ def _collect_process_section() -> list:
     return lines
 
 
+def _collect_runtime_section(health_snap: dict) -> list:
+    lines = ["=== RUNTIME ==="]
+    lines.append(f"• State: {health_snap.get('runtime_state', 'unknown')}")
+    lines.append(f"• Supervisor: {'OK' if health_snap.get('supervisor_ok') else 'NOT OK'}")
+    lines.append(f"• Client Generation: {health_snap.get('client_generation', 0)}")
+    if health_snap.get('last_rebuild_reason'):
+        lines.append(f"• Last Rebuild Reason: {health_snap['last_rebuild_reason']}")
+    if health_snap.get('rpc_latency_ms') is not None:
+        lines.append(f"• RPC Latency: {health_snap['rpc_latency_ms']:.1f}ms")
+    return lines
+
+
 def _collect_telethon_section(client) -> list:
     lines = ["=== TELETHON ==="]
     try:
@@ -166,16 +174,22 @@ def _collect_telethon_section(client) -> list:
     return lines
 
 
+def _collect_helper_section(health_snap: dict) -> list:
+    lines = ["=== HELPER ==="]
+    lines.append(f"• Connected: {health_snap.get('helper_connected', False)}")
+    return lines
+
+
 def _collect_supervisor_section(health_snap: dict) -> list:
     lines = ["=== SUPERVISOR ==="]
-    tasks = asyncio.all_tasks()
-    lines.append(f"• Running tasks: {len(tasks)}")
-    lines.append(f"• Watchdog: {'Running' if health_snap.get('supervisor_ok') else 'Stopped'}")
-    hb_age = health_snap.get("heartbeat_age_s")
-    if hb_age is not None:
-        lines.append(f"• Heartbeat age: {hb_age:.1f}s")
+    task_states = health_snap.get("task_states", {})
+    if task_states:
+        for name, state in task_states.items():
+            lines.append(f"• {name}: {state}")
     else:
-        lines.append("• Heartbeat age: unknown")
+        tasks = asyncio.all_tasks()
+        lines.append(f"• Running tasks: {len(tasks)}")
+    lines.append(f"• Heartbeat age: {health_snap.get('heartbeat_age_s', 'unknown')}")
     return lines
 
 
@@ -226,7 +240,11 @@ def build_diagnostic_report(client, bio_engine, db_client, health_snap: dict) ->
     sections = []
     sections.extend(_collect_process_section())
     sections.append("")
+    sections.extend(_collect_runtime_section(health_snap))
+    sections.append("")
     sections.extend(_collect_telethon_section(client))
+    sections.append("")
+    sections.extend(_collect_helper_section(health_snap))
     sections.append("")
     sections.extend(_collect_supervisor_section(health_snap))
     sections.append("")
@@ -242,14 +260,23 @@ def build_diagnostic_report(client, bio_engine, db_client, health_snap: dict) ->
     return "\n".join(sections)
 
 
-def _detect_stalled_tasks() -> list:
+async def recover_stalled(client, owner_id: int, tz_str: str, bio_engine, db_client) -> str:
+    """Recover stalled tasks. Uses RuntimeSupervisor if available."""
     stalled = []
+    recovered = []
+    still_unhealthy = []
+
     current = asyncio.current_task()
+    protected = {
+        "lifeos-tg-supervisor", "lifeos-watchdog", "lifeos-heartbeat",
+        "lifeos-web", "lifeos-liveness", "lifeos-helper-supervisor",
+        "lifeos-helper-watchdog",
+    }
     for task in asyncio.all_tasks():
         if task is current or task.done():
             continue
         name = task.get_name()
-        if name in _PROTECTED_TASK_NAMES:
+        if name in protected:
             continue
         coro = task.get_coro()
         if coro is None:
@@ -258,13 +285,6 @@ def _detect_stalled_tasks() -> list:
         if frame is None:
             continue
         stalled.append(task)
-    return stalled
-
-
-async def recover_stalled(client, owner_id: int, tz_str: str, bio_engine, db_client) -> str:
-    stalled = _detect_stalled_tasks()
-    recovered = []
-    still_unhealthy = []
 
     for task in stalled:
         name = task.get_name()

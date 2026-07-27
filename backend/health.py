@@ -1,22 +1,24 @@
 """
-Lightweight production health monitor.
+Runtime health telemetry — comprehensive state tracking for the
+RuntimeSupervisor FSM.
 
-A single module-level state object tracks:
-  - process liveness (heartbeat updated every few seconds)
-  - Telethon connection state + last event timestamp
-  - supervisor loop status
-  - watchdog status + last check timestamp
-  - bio cron status + last successful update timestamp
-  - restart counter (Telethon reconnects)
-  - process uptime
+Tracks:
+  - runtime_state (FSM state string)
+  - heartbeat (timestamp + age)
+  - last_rpc (last successful RPC call)
+  - last_command (last owner command processed)
+  - last_update (last Telethon update received)
+  - restart_count (Telethon reconnects)
+  - task_states (managed task states)
+  - supervisor_ok
+  - helper_connected
+  - bio_cron_ok
+  - client_generation
+  - last_rebuild_reason
+  - rpc_latency_ms
 
-The heartbeat is updated by a background coroutine started from main.py.
-If the heartbeat becomes stale (no update within the threshold), a WARNING
-is logged on each check so operators can detect a stalled event loop.
-
-All access is synchronous and lock-free — the values are simple primitives
-written by one task and read by the FastAPI request handler. This keeps the
-architecture deterministic and avoids any I/O in the health path.
+All access is synchronous and lock-free — simple primitives written by
+the supervisor and read by the FastAPI request handler.
 """
 import logging
 import time
@@ -28,16 +30,28 @@ _STALE_THRESHOLD = 15.0
 
 _started_at: float = 0.0
 _last_heartbeat: float = 0.0
+_last_stale_warn: float = 0.0
+
+_runtime_state: str = "STARTING"
 _telethon_connected: bool = False
 _supervisor_ok: bool = False
 _bio_cron_ok: bool = False
-_last_stale_warn: float = 0.0
+_helper_connected: bool = False
 
 _restart_count: int = 0
+_last_rpc: float = 0.0
+_last_command: float = 0.0
+_last_update: float = 0.0
+_client_generation: int = 0
+_last_rebuild_reason: str = ""
+_rpc_latency_ms: float = 0.0
+
 _watchdog_ok: bool = False
 _last_watchdog_check: float = 0.0
 _last_telethon_event: float = 0.0
 _last_bio_update: float = 0.0
+
+_task_states: dict[str, str] = {}
 
 
 def mark_started() -> None:
@@ -53,12 +67,21 @@ def update_heartbeat() -> None:
     _last_heartbeat = time.time()
 
 
+def set_heartbeat() -> None:
+    global _last_heartbeat
+    _last_heartbeat = time.time()
+
+
+def set_runtime_state(state: str) -> None:
+    global _runtime_state
+    _runtime_state = state
+
+
 def set_telethon_connected(connected: bool) -> None:
-    global _telethon_connected, _last_telethon_event
+    global _telethon_connected
     if _telethon_connected and not connected:
-        logger.warning("health: Telethon disconnected unexpectedly")
+        logger.warning("health: Telethon disconnected")
     _telethon_connected = bool(connected)
-    _last_telethon_event = time.time()
 
 
 def set_supervisor_ok(ok: bool) -> None:
@@ -71,10 +94,29 @@ def set_bio_cron_ok(ok: bool) -> None:
     _bio_cron_ok = bool(ok)
 
 
-def set_watchdog_ok(ok: bool) -> None:
-    global _watchdog_ok, _last_watchdog_check
-    _watchdog_ok = bool(ok)
-    _last_watchdog_check = time.time()
+def set_helper_connected(connected: bool) -> None:
+    global _helper_connected
+    _helper_connected = bool(connected)
+
+
+def set_last_rpc() -> None:
+    global _last_rpc
+    _last_rpc = time.time()
+
+
+def set_last_command() -> None:
+    global _last_command
+    _last_command = time.time()
+
+
+def set_last_update() -> None:
+    global _last_update
+    _last_update = time.time()
+
+
+def set_restart_count(count: int) -> None:
+    global _restart_count
+    _restart_count = count
 
 
 def increment_restart() -> None:
@@ -82,9 +124,47 @@ def increment_restart() -> None:
     _restart_count += 1
 
 
+def set_client_generation(gen: int) -> None:
+    global _client_generation
+    _client_generation = gen
+
+
+def set_last_rebuild_reason(reason: str) -> None:
+    global _last_rebuild_reason
+    _last_rebuild_reason = reason
+
+
+def set_rpc_latency(ms: float) -> None:
+    global _rpc_latency_ms
+    _rpc_latency_ms = round(ms, 1)
+
+
+def set_watchdog_ok(ok: bool) -> None:
+    global _watchdog_ok, _last_watchdog_check
+    _watchdog_ok = bool(ok)
+    _last_watchdog_check = time.time()
+
+
 def set_last_bio_update() -> None:
     global _last_bio_update
     _last_bio_update = time.time()
+
+
+def set_task_state(name: str, state: str) -> None:
+    _task_states[name] = state
+
+
+def set_task_states(states: dict[str, str]) -> None:
+    global _task_states
+    _task_states = dict(states)
+
+
+def get_last_command() -> float:
+    return _last_command
+
+
+def get_last_update() -> float:
+    return _last_update
 
 
 def _heartbeat_age() -> float:
@@ -106,7 +186,6 @@ def _age_or_none(ts: float) -> float | None:
 
 
 def check_stale() -> None:
-    """Log a WARNING once per stale episode if the heartbeat is stale."""
     global _last_stale_warn
     age = _heartbeat_age()
     if age > _STALE_THRESHOLD:
@@ -117,19 +196,33 @@ def check_stale() -> None:
 
 
 def snapshot() -> dict:
-    """Return a serializable health snapshot for /health."""
     age = _heartbeat_age()
     alive = age >= 0 and age < _STALE_THRESHOLD
     check_stale()
+    status = "ok"
+    if not alive:
+        status = "degraded"
+    if _runtime_state in ("FAILED", "STOPPING"):
+        status = "down"
+
     return {
-        "status": "ok" if alive else "degraded",
+        "status": status,
+        "runtime_state": _runtime_state,
         "process_alive": alive,
         "telethon_connected": _telethon_connected,
-        "heartbeat_age_s": round(age, 2) if age >= 0 else None,
         "supervisor_ok": _supervisor_ok,
+        "helper_connected": _helper_connected,
         "bio_cron_ok": _bio_cron_ok,
+        "heartbeat_age_s": round(age, 2) if age >= 0 else None,
         "uptime_s": round(_uptime(), 1) if _uptime() >= 0 else None,
         "restart_count": _restart_count,
+        "client_generation": _client_generation,
+        "last_rebuild_reason": _last_rebuild_reason or None,
+        "last_rpc_s": _age_or_none(_last_rpc),
+        "last_command_s": _age_or_none(_last_command),
+        "last_update_s": _age_or_none(_last_update),
+        "rpc_latency_ms": _rpc_latency_ms if _rpc_latency_ms else None,
+        "task_states": dict(_task_states),
         "watchdog_ok": _watchdog_ok,
         "last_watchdog_check_s": _age_or_none(_last_watchdog_check),
         "last_telethon_event_s": _age_or_none(_last_telethon_event),
