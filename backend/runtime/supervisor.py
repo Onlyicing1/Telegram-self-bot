@@ -51,6 +51,7 @@ from backend.health import (
     set_last_update,
     set_heartbeat,
     set_restart_count,
+    increment_restart,
     set_last_rebuild_reason,
     set_client_generation,
     set_task_state,
@@ -621,9 +622,7 @@ class RuntimeSupervisor:
     ) -> None:
         old = self._managed_tasks.pop(name, None)
         if old:
-            # Best-effort: cancel old task before creating new one
-            if old.task and not old.task.done():
-                old.task.cancel()
+            asyncio.create_task(old.stop(timeout=5.0))
         task = ManagedTask(name, factory, watchdog_interval=watchdog_interval)
         self._managed_tasks[name] = task
         task.start()
