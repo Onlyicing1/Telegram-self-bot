@@ -8,12 +8,16 @@ Guarantees:
 - FloodWaitError is caught and slept precisely; all other errors are
   logged as warnings so the loop never terminates on Telegram throttles.
 - API calls have a 30s timeout to prevent hangs on stalled connections.
-- The cron loop is supervised: if it exits unexpectedly, it restarts.
+- The cron loop is supervised: if it exits unexpectedly, it restarts
+  with exponential backoff + jitter.
+- stop_cron is deterministic: cancels the task and awaits its termination,
+  guaranteeing the old cron is completely dead before returning.
 - Only one updater task can exist at a time (start_cron is idempotent).
 - Timezone resolved via zoneinfo with UTC fallback — never crashes.
 """
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -27,7 +31,16 @@ logger = logging.getLogger(__name__)
 
 _task: asyncio.Task | None = None
 _API_TIMEOUT = 30
-_RESTART_DELAY = 10
+_BACKOFF_BASE = 2.0
+_BACKOFF_MAX = 60.0
+_BACKOFF_JITTER = 0.3
+_STOP_TIMEOUT = 10.0
+
+
+def _backoff(attempt: int) -> float:
+    base = min(_BACKOFF_MAX, _BACKOFF_BASE * (2 ** attempt))
+    jitter = random.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER) * base
+    return max(1.0, base + jitter)
 
 
 def _get_tz(tz_str: str):
@@ -132,6 +145,7 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
 
 async def _supervised_cron(client, owner_id: int, tz_str: str) -> None:
     """Supervisor: restarts _cron_loop if it exits unexpectedly."""
+    attempt = 0
     while True:
         try:
             await _cron_loop(client, owner_id, tz_str)
@@ -140,11 +154,13 @@ async def _supervised_cron(client, owner_id: int, tz_str: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            attempt += 1
+            delay = _backoff(attempt)
             logger.exception(
-                "Bio cron crashed unexpectedly — restarting in %ds: %s",
-                _RESTART_DELAY, exc,
+                "Bio cron crashed unexpectedly — restarting in %.1fs: %s",
+                delay, exc,
             )
-            await asyncio.sleep(_RESTART_DELAY)
+            await asyncio.sleep(delay)
 
 
 def start_cron(client, owner_id: int, tz_str: str) -> None:
@@ -155,10 +171,20 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
     record_event("bio", "start_cron", 0, "SUCCESS")
 
 
-def stop_cron() -> None:
+async def stop_cron() -> None:
+    """Deterministic stop: cancel and await the cron task.
+
+    Guarantees the old cron is completely dead before returning.
+    """
     global _task
     if _task and not _task.done():
         _task.cancel()
+        try:
+            await asyncio.wait_for(_task, timeout=_STOP_TIMEOUT)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
     _task = None
     record_event("bio", "stop_cron", 0, "SUCCESS")
 
