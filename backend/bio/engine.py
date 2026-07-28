@@ -16,6 +16,7 @@ Guarantees:
 - Timezone resolved via zoneinfo with UTC fallback — never crashes.
 """
 import asyncio
+import time
 import logging
 import random
 from datetime import datetime, timezone
@@ -96,13 +97,13 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
             if new_bio == (last_bio or ""):
                 continue
 
-            t0 = asyncio.get_event_loop().time()
+            t0 = time.monotonic()
             try:
                 await asyncio.wait_for(
                     client(UpdateProfileRequest(about=new_bio)),
                     timeout=_API_TIMEOUT,
                 )
-                record_event("bio", "UpdateProfileRequest", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+                record_event("bio", "UpdateProfileRequest", (time.monotonic() - t0) * 1000, "SUCCESS")
             except asyncio.TimeoutError:
                 logger.warning(
                     "Bio API call timed out (%ds) — will retry next minute",

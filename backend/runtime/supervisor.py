@@ -1,39 +1,43 @@
 """
-RuntimeSupervisor — central FSM that owns every runtime coroutine.
+RuntimeSupervisor — single-owner FSM with heartbeat-driven recovery.
 
-Managed tasks:
-  - self-client (TelegramClient run_until_disconnected + supervision)
-  - helper-client (optional, supervised reconnect)
-  - bio-cron (cron loop)
-  - heartbeat (updates health heartbeat)
-  - liveness-probe (RPC-based health check via get_me)
-  - panel-timer-manager (inline panel auto-close timers)
+Architecture:
+  - ONE supervisor loop (the run() method)
+  - ONE heartbeat task (30s interval, real Telegram RPC via get_me)
+  - ONE self-client at a time
+  - NO recursive recovery — the loop owns all recovery
+  - NO separate liveness probe — the heartbeat IS the liveness check
+  - The heartbeat NEVER disconnects the client — it only reports failure
+  - The supervisor decides and executes atomic recovery
 
-The supervisor implements a proper FSM:
-  STARTING → CONNECTING → AUTHORIZING → REGISTERING → READY
-  READY → DEGRADED (helper down, bio stopped)
-  READY/DEGRADED → RECOVERING (transient failure) → READY
-  READY/DEGRADED → REBUILDING (repeated failures) → READY/FAILED
-  * → STOPPING → (process exit)
+Recovery procedure (atomic):
+  1. Set a recovery lock so the heartbeat doesn't trigger double recovery
+  2. Stop bio cron
+  3. Stop helper bot
+  4. Clear all inline panel state (timers, sessions, pending inputs, targets)
+  5. Cancel the run_until_disconnected task
+  6. Disconnect and dispose the dead client
+  7. Build a completely new client
+  8. Re-register all handlers
+  9. Re-wire inline engine, callback trace, input listener
+  10. Restart helper bot
+  11. Restart bio cron
+  12. Resume run_until_disconnected
 
-Design guarantees:
-  - Only one TelegramClient exists at a time (old one fully disconnected
-    and removed before a new one is created).
-  - Handler registration happens exactly once per client generation.
-  - All network operations have bounded timeouts.
-  - Exponential backoff with jitter for reconnect/rebuild delays.
-  - Deterministic shutdown: every managed task is cancelled and awaited.
+If recovery fails repeatedly:
+  - Retry with exponential backoff up to _MAX_RECOVERY_ATTEMPTS
+  - After max attempts: sys.exit(1) so Render restarts the process
 """
 import asyncio
 import logging
 import random
+import sys
 import time
 from typing import Any
 
 from telethon import TelegramClient
 
 from backend.runtime.states import RuntimeState
-from backend.runtime.managed_task import ManagedTask
 from backend.bio import engine as bio_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
@@ -47,10 +51,8 @@ from backend.health import (
     set_bio_cron_ok,
     set_helper_connected,
     set_last_rpc,
-    set_last_command,
     set_last_update,
     set_heartbeat,
-    set_restart_count,
     increment_restart,
     set_last_rebuild_reason,
     set_client_generation,
@@ -63,9 +65,8 @@ from backend.helper.client import (
     build_helper,
     disconnect_helper,
     get_bot_username,
-    get_client as get_helper_client,
 )
-from backend.helper.panels import register_callback_handlers
+from backend.helper.panels import register_callback_handlers, clear_all_sessions
 from backend.helper.inline_engine import (
     register_inline_handler,
     set_self_client,
@@ -78,22 +79,18 @@ from backend.helper.panel_settings import load as load_panel_settings
 from backend.helper.panel_timer import stop_all as stop_all_timers
 from backend.helper.input_state import clear_all as clear_all_pending
 from backend.helper.target_context import clear_all as clear_all_targets
-from backend.helper.panels import clear_all_sessions
 
 logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT = 30
 _AUTHORIZE_TIMEOUT = 15
 _GET_ME_TIMEOUT = 15
-_LIVENESS_INTERVAL = 60
-_LIVENESS_TIMEOUT = 15
-_HEARTBEAT_INTERVAL = 5.0
+_HEARTBEAT_INTERVAL = 30.0
+_RPC_TIMEOUT = 15.0
 _BACKOFF_BASE = 2.0
-_BACKOFF_MAX = 120.0
+_BACKOFF_MAX = 300.0
 _BACKOFF_JITTER = 0.3
-_MAX_RECONNECT_ATTEMPTS = 3
-_MAX_REBUILD_ATTEMPTS = 5
-_HELPER_MAX_RECONNECT = 3
+_MAX_RECOVERY_ATTEMPTS = 10
 
 
 def _backoff(attempt: int) -> float:
@@ -108,10 +105,10 @@ class RuntimeSupervisor:
         "session_string", "bot_token", "port",
         "state", "client", "client_generation",
         "helper_client", "helper_enabled",
-        "_reconnect_attempts", "_rebuild_attempts",
-        "_helper_reconnect_attempts", "_helper_permanent_failure",
-        "shutdown_event", "_managed_tasks",
-        "_uvicorn_server",
+        "shutdown_event", "_uvicorn_server",
+        "_heartbeat_task", "_run_task",
+        "_recovery_lock", "_recovery_attempts",
+        "_client_alive",
     )
 
     def __init__(self, cfg: dict):
@@ -130,21 +127,19 @@ class RuntimeSupervisor:
         self.client_generation: int = 0
         self.helper_client: TelegramClient | None = None
 
-        self._reconnect_attempts = 0
-        self._rebuild_attempts = 0
-        self._helper_reconnect_attempts = 0
-        self._helper_permanent_failure = False
+        self.shutdown_event = asyncio.Event()
         self._uvicorn_server: Any = None
 
-        self.shutdown_event = asyncio.Event()
-        self._managed_tasks: dict[str, ManagedTask] = {}
-
-    # ── State transitions ──
+        self._heartbeat_task: asyncio.Task | None = None
+        self._run_task: asyncio.Task | None = None
+        self._recovery_lock = asyncio.Lock()
+        self._recovery_attempts: int = 0
+        self._client_alive: bool = False
 
     def _transition(self, new_state: RuntimeState) -> None:
         if self.state == new_state:
             return
-        logger.info("Runtime: %s → %s", self.state, new_state)
+        logger.info("Runtime: %s -> %s", self.state, new_state)
         self.state = new_state
         set_runtime_state(str(new_state))
 
@@ -155,7 +150,6 @@ class RuntimeSupervisor:
         set_supervisor_ok(True)
         self._transition(RuntimeState.STARTING)
 
-        # Phase 1: DB warm-up
         logger.info("[1/5] Database warm-up")
         db = db_client.get_db()
         if db:
@@ -169,17 +163,63 @@ class RuntimeSupervisor:
 
         load_panel_settings()
 
-        # Phase 2-3: Connect + authorize + register
-        await self._connect_and_register()
+        logger.info("[2/5] Building self-client")
+        await self._build_and_register()
 
-        # Phase 3.5: Helper bot
         if self.helper_enabled:
+            logger.info("[3/5] Starting helper bot")
             await self._start_helper()
         else:
-            logger.info("[3.5/5] Helper bot: no BOT_TOKEN — inline UI disabled")
+            logger.info("[3/5] Helper bot: no BOT_TOKEN — inline UI disabled")
 
-        # Phase 4: Bio cron
         logger.info("[4/5] Bio cron resume check")
+        self._resume_bio_cron()
+
+        logger.info("[5/5] Starting web server on port %s", self.port)
+        self._start_web_server()
+
+        self._transition(RuntimeState.READY)
+        set_supervisor_ok(True)
+        logger.info("LifeOS online.")
+
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name="lifeos-heartbeat"
+        )
+        self._run_task = asyncio.create_task(
+            self._run_loop(), name="lifeos-run"
+        )
+
+    async def _build_and_register(self) -> None:
+        """Build a fresh client, authorize, register handlers. Does not start run_until_disconnected."""
+        self._transition(RuntimeState.CONNECTING)
+        try:
+            self.client = await build_client(
+                self.api_id, self.api_hash, self.session_string
+            )
+            self.client_generation += 1
+            set_client_generation(self.client_generation)
+            set_telethon_connected(True)
+            self._client_alive = True
+            record_event("runtime", "build_client", 0, "SUCCESS",
+                         f"gen={self.client_generation}")
+        except Exception as exc:
+            logger.error("Failed to build client: %s", exc)
+            record_event("runtime", "build_client", 0, "ERROR", str(exc))
+            self._transition(RuntimeState.FAILED)
+            raise
+
+        self._transition(RuntimeState.REGISTERING)
+        register_all(self.client, self.owner_id, self.tz_str)
+        set_last_update()
+        record_event("runtime", "register_handlers", 0, "SUCCESS",
+                     f"gen={self.client_generation}")
+
+        if self.helper_enabled:
+            set_self_client(self.client)
+            configure_callback_trace(self.client, self.owner_id)
+            register_input_listener(self.client, self.owner_id)
+
+    def _resume_bio_cron(self) -> None:
         try:
             state = db_client.get_bio_state(self.owner_id)
             if state and state.get("is_active"):
@@ -195,64 +235,6 @@ class RuntimeSupervisor:
             logger.warning("[4/5] Bio cron resume check failed: %s", exc)
             set_bio_cron_ok(False)
 
-        # Phase 5: Web server + managed tasks
-        logger.info("[5/5] Starting web server on port %s", self.port)
-        self._create_managed_task("lifeos-web", self._run_web, watchdog_interval=60)
-        self._create_managed_task("lifeos-heartbeat", self._heartbeat, watchdog_interval=15)
-        self._create_managed_task("lifeos-liveness", self._liveness_probe, watchdog_interval=120)
-
-        self._transition(RuntimeState.READY)
-        set_supervisor_ok(True)
-        logger.info("LifeOS online.")
-
-    async def _connect_and_register(self) -> None:
-        self._transition(RuntimeState.CONNECTING)
-        try:
-            self.client = await build_client(
-                self.api_id, self.api_hash, self.session_string
-            )
-            self.client_generation += 1
-            set_client_generation(self.client_generation)
-            set_telethon_connected(True)
-            record_event("runtime", "build_client", 0, "SUCCESS",
-                         f"gen={self.client_generation}")
-        except Exception as exc:
-            logger.error("Failed to build client: %s", exc)
-            record_event("runtime", "build_client", 0, "ERROR", str(exc))
-            self._transition(RuntimeState.FAILED)
-            raise
-
-        self._transition(RuntimeState.AUTHORIZING)
-        try:
-            if not await asyncio.wait_for(
-                self.client.is_user_authorized(), timeout=_AUTHORIZE_TIMEOUT
-            ):
-                raise RuntimeError("Session not authorized")
-            set_last_rpc()
-        except asyncio.TimeoutError:
-            logger.error("Authorization check timed out")
-            record_event("runtime", "authorize", 0, "TIMEOUT")
-            self._transition(RuntimeState.FAILED)
-            raise
-        except Exception as exc:
-            logger.error("Authorization failed: %s", exc)
-            record_event("runtime", "authorize", 0, "ERROR", str(exc))
-            self._transition(RuntimeState.FAILED)
-            raise
-
-        self._transition(RuntimeState.REGISTERING)
-        register_all(self.client, self.owner_id, self.tz_str)
-        set_last_update()
-        record_event("runtime", "register_handlers", 0, "SUCCESS",
-                     f"gen={self.client_generation}")
-
-        # Start the self-client supervisor task
-        self._create_managed_task(
-            "lifeos-tg-supervisor",
-            lambda: self._supervise_self_client(),
-            watchdog_interval=60,
-        )
-
     def _start_bio_cron(self) -> None:
         if self.client is None:
             logger.warning("Cannot start bio cron — no client")
@@ -260,183 +242,7 @@ class RuntimeSupervisor:
         bio_engine.start_cron(self.client, self.owner_id, self.tz_str)
         set_bio_cron_ok(True)
 
-    # ── Self-client supervision ──
-
-    async def _supervise_self_client(self) -> None:
-        """Run the self-client until disconnected, then trigger recovery."""
-        if self.client is None:
-            return
-        client = self.client
-        set_telethon_connected(client.is_connected())
-        set_task_state("lifeos-tg-supervisor", "RUNNING")
-        try:
-            await client.run_until_disconnected()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Self-client run_until_disconnected error: %s", exc)
-
-        if self.shutdown_event.is_set():
-            return
-
-        set_telethon_connected(False)
-        set_task_state("lifeos-tg-supervisor", "RECOVERING")
-        increment_restart()
-        logger.warning("Self-client disconnected — entering recovery")
-        self._transition(RuntimeState.RECOVERING)
-        await self._recover_self_client()
-
-    async def _recover_self_client(self) -> None:
-        """Attempt reconnect with exponential backoff, then rebuild."""
-        client = self.client
-        if client is None:
-            return
-
-        while self._reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
-            self._reconnect_attempts += 1
-            delay = _backoff(self._reconnect_attempts)
-            logger.info(
-                "Reconnect attempt %d/%d in %.1fs",
-                self._reconnect_attempts, _MAX_RECONNECT_ATTEMPTS, delay,
-            )
-            await asyncio.sleep(delay)
-
-            if self.shutdown_event.is_set():
-                return
-
-            try:
-                await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
-                if not await asyncio.wait_for(
-                    client.is_user_authorized(), timeout=_AUTHORIZE_TIMEOUT
-                ):
-                    logger.error("Reconnect: session not authorized")
-                    continue
-                set_telethon_connected(True)
-                set_last_rpc()
-                self._reconnect_attempts = 0
-                self._transition(RuntimeState.READY)
-                set_task_state("lifeos-tg-supervisor", "RUNNING")
-                record_event("runtime", "reconnect", 0, "SUCCESS")
-                logger.info("Self-client reconnected successfully")
-                # Re-enter run_until_disconnected
-                await client.run_until_disconnected()
-                if self.shutdown_event.is_set():
-                    return
-                set_telethon_connected(False)
-                set_task_state("lifeos-tg-supervisor", "RECOVERING")
-                self._transition(RuntimeState.RECOVERING)
-            except asyncio.TimeoutError:
-                logger.warning("Reconnect timed out")
-                record_event("runtime", "reconnect", 0, "TIMEOUT")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Reconnect failed: %s", exc)
-                record_event("runtime", "reconnect", 0, "ERROR", str(exc))
-
-        # Reconnect failed — rebuild
-        logger.warning("Reconnect exhausted — rebuilding client")
-        set_last_rebuild_reason("reconnect_exhausted")
-        await self._rebuild_self_client()
-
-    async def _rebuild_self_client(self) -> None:
-        """Destroy the old client and create a new one from scratch."""
-        self._transition(RuntimeState.REBUILDING)
-        self._rebuild_attempts += 1
-
-        if self._rebuild_attempts > _MAX_REBUILD_ATTEMPTS:
-            logger.error("Rebuild limit exceeded — entering FAILED state")
-            self._transition(RuntimeState.FAILED)
-            set_supervisor_ok(False)
-            self.shutdown_event.set()
-            return
-
-        old_client = self.client
-        self.client = None
-        set_telethon_connected(False)
-
-        # Clear stale inline panel state from the old client
-        stop_all_timers()
-        clear_all_sessions()
-        clear_all_pending()
-        clear_all_targets()
-
-        # Fully disconnect and abandon the old client
-        if old_client is not None:
-            try:
-                await asyncio.wait_for(old_client.disconnect(), timeout=10.0)
-            except (asyncio.TimeoutError, Exception):
-                logger.warning("Old client disconnect during rebuild timed out")
-            old_client = None
-
-        # Stop the old supervisor task's watchdog without cancelling the
-        # currently-executing task (which IS the old supervisor task).
-        old_task = self._managed_tasks.pop("lifeos-tg-supervisor", None)
-        if old_task:
-            await old_task.stop_watchdog(timeout=5.0)
-
-        delay = _backoff(self._rebuild_attempts)
-        logger.info("Rebuild attempt %d in %.1fs", self._rebuild_attempts, delay)
-        await asyncio.sleep(delay)
-
-        if self.shutdown_event.is_set():
-            return
-
-        try:
-            new_client = await build_client(
-                self.api_id, self.api_hash, self.session_string
-            )
-            self.client = new_client
-            self.client_generation += 1
-            set_client_generation(self.client_generation)
-            set_telethon_connected(True)
-            set_last_rpc()
-
-            # Re-register all handlers on the new client
-            register_all(new_client, self.owner_id, self.tz_str)
-
-            # Re-wire inline panel dependencies onto the new client
-            if self.helper_enabled:
-                set_self_client(new_client)
-                configure_callback_trace(new_client, self.owner_id)
-                register_input_listener(new_client, self.owner_id)
-
-            record_event("runtime", "rebuild", 0, "SUCCESS",
-                         f"gen={self.client_generation}")
-            logger.info("Self-client rebuilt (gen=%d)", self.client_generation)
-
-            self._reconnect_attempts = 0
-            self._rebuild_attempts = 0
-            self._transition(RuntimeState.READY)
-
-            # Start a new supervisor task for the new client
-            self._create_managed_task(
-                "lifeos-tg-supervisor",
-                lambda: self._supervise_self_client(),
-                watchdog_interval=60,
-            )
-
-            # Restart bio cron with the new client
-            try:
-                state = db_client.get_bio_state(self.owner_id)
-                if state and state.get("is_active"):
-                    await bio_engine.stop_cron()
-                    await asyncio.sleep(0.5)
-                    bio_engine.start_cron(new_client, self.owner_id, self.tz_str)
-                    set_bio_cron_ok(True)
-            except Exception:
-                pass
-
-        except Exception as exc:
-            logger.error("Rebuild failed: %s", exc)
-            record_event("runtime", "rebuild", 0, "ERROR", str(exc))
-            set_last_rebuild_reason(f"rebuild_error: {exc}")
-            await self._rebuild_self_client()
-
-    # ── Helper client ──
-
     async def _start_helper(self) -> None:
-        logger.info("[3.5/5] Starting helper bot")
         try:
             self.helper_client = await build_helper(self.bot_token)
             if self.helper_client is not None:
@@ -448,14 +254,12 @@ class RuntimeSupervisor:
                 configure_callback_trace(self.client, self.owner_id)
                 register_input_listener(self.client, self.owner_id)
                 set_helper_connected(True)
-                self._create_managed_task(
-                    "lifeos-helper-supervisor",
-                    lambda: self._supervise_helper(),
-                    watchdog_interval=30,
+                asyncio.create_task(
+                    self._supervise_helper(), name="lifeos-helper"
                 )
-                logger.info("[3.5/5] Helper bot online — Inline Mode enabled")
+                logger.info("[3/5] Helper bot online — Inline Mode enabled")
         except Exception:
-            logger.exception("[3.5/5] Helper bot failed — inline UI disabled")
+            logger.exception("[3/5] Helper bot failed — inline UI disabled")
             self.helper_client = None
             set_helper_connected(False)
 
@@ -468,166 +272,41 @@ class RuntimeSupervisor:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Helper run_until_disconnected error: %s", exc)
-
+            logger.warning("Helper disconnected: %s", exc)
         if self.shutdown_event.is_set():
             return
-
         set_helper_connected(False)
-        await self._recover_helper()
+        await self._reconnect_helper()
 
-    async def _recover_helper(self) -> None:
-        """Reconnect helper with backoff, rebuild after repeated failures."""
-        if self._helper_permanent_failure:
-            logger.warning("Helper permanently failed — not retrying")
-            return
-
-        helper = self.helper_client
-        if helper is None:
-            return
-
-        while self._helper_reconnect_attempts < _HELPER_MAX_RECONNECT:
-            self._helper_reconnect_attempts += 1
-            delay = _backoff(self._helper_reconnect_attempts)
-            logger.info(
-                "Helper reconnect attempt %d/%d in %.1fs",
-                self._helper_reconnect_attempts, _HELPER_MAX_RECONNECT, delay,
-            )
+    async def _reconnect_helper(self) -> None:
+        attempts = 0
+        while attempts < 5 and not self.shutdown_event.is_set():
+            attempts += 1
+            delay = _backoff(attempts)
+            logger.info("Helper reconnect %d in %.1fs", attempts, delay)
             await asyncio.sleep(delay)
-
-            if self.shutdown_event.is_set():
-                return
-
+            helper = self.helper_client
+            if helper is None:
+                break
             try:
                 await asyncio.wait_for(helper.connect(), timeout=_CONNECT_TIMEOUT)
                 if helper.is_connected():
                     set_helper_connected(True)
-                    self._helper_reconnect_attempts = 0
-                    logger.info("Helper reconnected successfully")
+                    logger.info("Helper reconnected")
                     await helper.run_until_disconnected()
                     if self.shutdown_event.is_set():
                         return
                     set_helper_connected(False)
-            except asyncio.TimeoutError:
-                logger.warning("Helper reconnect timed out")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("Helper reconnect failed: %s", exc)
-
-        # Rebuild helper
-        logger.warning("Helper reconnect exhausted — rebuilding")
-        set_last_rebuild_reason("helper_reconnect_exhausted")
-        await self._rebuild_helper()
-
-    async def _rebuild_helper(self) -> None:
-        old = self.helper_client
-        self.helper_client = None
-
-        if old is not None:
-            try:
-                await asyncio.wait_for(old.disconnect(), timeout=10.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-
-        old_task = self._managed_tasks.pop("lifeos-helper-supervisor", None)
-        if old_task:
-            await old_task.stop(timeout=5.0)
-
-        delay = _backoff(1)
-        await asyncio.sleep(delay)
-
-        if self.shutdown_event.is_set():
-            return
-
-        try:
-            new_client = await build_helper(self.bot_token)
-            if new_client is None:
-                self._helper_permanent_failure = True
-                return
-
-            self.helper_client = new_client
-            register_callback_handlers(new_client, self.owner_id)
-            register_inline_handler(new_client, self.owner_id)
-            set_self_client(self.client)
-            set_helper_username(get_bot_username())
-            set_owner_id(self.owner_id)
-            if self.client is not None:
-                configure_callback_trace(self.client, self.owner_id)
-                register_input_listener(self.client, self.owner_id)
-            set_helper_connected(True)
-            self._helper_reconnect_attempts = 0
-            record_event("runtime", "helper_rebuild", 0, "SUCCESS")
-
-            self._create_managed_task(
-                "lifeos-helper-supervisor",
-                lambda: self._supervise_helper(),
-                watchdog_interval=30,
-            )
-        except Exception as exc:
-            logger.error("Helper rebuild failed: %s", exc)
-            record_event("runtime", "helper_rebuild", 0, "ERROR", str(exc))
-            self._helper_permanent_failure = True
+        if not self.shutdown_event.is_set():
+            logger.warning("Helper reconnect exhausted — giving up")
             set_helper_connected(False)
 
-    # ── Heartbeat ──
-
-    async def _heartbeat(self) -> None:
-        while not self.shutdown_event.is_set():
-            try:
-                update_heartbeat()
-                check_stale()
-                set_heartbeat()
-                for name, mt in self._managed_tasks.items():
-                    set_task_state(name, mt.state())
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Heartbeat error: %s", exc)
-            await asyncio.sleep(_HEARTBEAT_INTERVAL)
-
-    # ── Liveness probe ──
-
-    async def _liveness_probe(self) -> None:
-        """RPC-based liveness check. Uses get_me(), never 'last update'."""
-        while not self.shutdown_event.is_set():
-            await asyncio.sleep(_LIVENESS_INTERVAL)
-            if self.shutdown_event.is_set():
-                return
-
-            client = self.client
-            if client is None or not client.is_connected():
-                logger.warning("Liveness: client not connected — skipping")
-                continue
-
-            t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(client.get_me(), timeout=_LIVENESS_TIMEOUT)
-                latency_ms = (time.monotonic() - t0) * 1000
-                set_last_rpc()
-                set_rpc_latency(latency_ms)
-                record_event("runtime", "liveness_probe", latency_ms, "SUCCESS")
-            except asyncio.TimeoutError:
-                logger.warning("Liveness: get_me timed out — forcing disconnect")
-                set_rpc_latency(_LIVENESS_TIMEOUT * 1000)
-                record_event("runtime", "liveness_probe", 0, "TIMEOUT")
-                set_last_rebuild_reason("liveness_timeout")
-                try:
-                    await asyncio.wait_for(client.disconnect(), timeout=10.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Liveness: get_me failed (%s) — forcing disconnect", exc)
-                record_event("runtime", "liveness_probe", 0, "ERROR", str(exc))
-                set_last_rebuild_reason(f"liveness_error: {exc}")
-                try:
-                    await asyncio.wait_for(client.disconnect(), timeout=10.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-
-    # ── Web server ──
+    def _start_web_server(self) -> None:
+        asyncio.create_task(self._run_web(), name="lifeos-web")
 
     async def _run_web(self) -> None:
         import uvicorn
@@ -644,23 +323,203 @@ class RuntimeSupervisor:
         self._uvicorn_server = uvicorn.Server(config)
         await self._uvicorn_server.serve()
 
-    # ── Managed task helpers ──
+    # ── Main run loop ──
 
-    def _create_managed_task(
-        self, name: str, factory: callable, watchdog_interval: float = 30.0
-    ) -> None:
-        old = self._managed_tasks.pop(name, None)
-        if old:
-            old._stop_requested = True
-            old._running = False
-            if old._watchdog_task and not old._watchdog_task.done():
-                old._watchdog_task.cancel()
-            if old.task and not old.task.done():
-                old.task.cancel()
-        task = ManagedTask(name, factory, watchdog_interval=watchdog_interval)
-        self._managed_tasks[name] = task
-        task.start()
-        set_task_state(name, task.state())
+    async def _run_loop(self) -> None:
+        """Run the self-client until disconnected. The heartbeat handles recovery."""
+        while not self.shutdown_event.is_set():
+            client = self.client
+            if client is None:
+                await asyncio.sleep(1)
+                continue
+            try:
+                await client.run_until_disconnected()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("run_until_disconnected error: %s", exc)
+
+            if self.shutdown_event.is_set():
+                break
+
+            self._client_alive = False
+            set_telethon_connected(False)
+            logger.warning("Self-client disconnected — waiting for heartbeat recovery")
+
+    # ── Heartbeat (30s, real RPC) ──
+
+    async def _heartbeat_loop(self) -> None:
+        """Single heartbeat: every 30s, do a real Telegram RPC (get_me).
+
+        The heartbeat NEVER disconnects the client. It only detects failure
+        and triggers recovery via _trigger_recovery(). The supervisor owns
+        the entire recovery lifecycle.
+        """
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            if self.shutdown_event.is_set():
+                return
+
+            try:
+                update_heartbeat()
+                check_stale()
+                set_heartbeat()
+                set_task_state("lifeos-heartbeat", "RUNNING")
+            except Exception:
+                pass
+
+            client = self.client
+            if client is None:
+                continue
+
+            if not self._client_alive:
+                continue
+
+            if self._recovery_lock.locked():
+                continue
+
+            t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
+                latency_ms = (time.monotonic() - t0) * 1000
+                set_last_rpc()
+                set_rpc_latency(latency_ms)
+                record_event("runtime", "heartbeat_rpc", latency_ms, "SUCCESS")
+                self._recovery_attempts = 0
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Heartbeat RPC failed: %s — triggering recovery", exc)
+                record_event("runtime", "heartbeat_rpc", 0, "FAILED", str(exc))
+                set_last_rebuild_reason(f"heartbeat_rpc_failed: {type(exc).__name__}")
+                asyncio.create_task(self._trigger_recovery(), name="lifeos-recovery")
+
+    async def _trigger_recovery(self) -> None:
+        """Atomic recovery: stop everything, rebuild, restart everything.
+
+        No recursive calls. Uses _recovery_lock to prevent double-trigger.
+        On repeated failure: exponential backoff, then sys.exit(1).
+        """
+        if self.shutdown_event.is_set():
+            return
+
+        async with self._recovery_lock:
+            self._transition(RuntimeState.RECOVERING)
+            set_task_state("lifeos-recovery", "RUNNING")
+
+            self._recovery_attempts += 1
+            attempt = self._recovery_attempts
+
+            if attempt > _MAX_RECOVERY_ATTEMPTS:
+                logger.error(
+                    "Recovery attempt %d/%d — limit exceeded, exiting process",
+                    attempt, _MAX_RECOVERY_ATTEMPTS,
+                )
+                self._transition(RuntimeState.FAILED)
+                set_supervisor_ok(False)
+                set_task_state("lifeos-recovery", "FAILED")
+                self.shutdown_event.set()
+                sys.exit(1)
+
+            delay = _backoff(attempt)
+            logger.warning(
+                "Recovery attempt %d/%d in %.1fs",
+                attempt, _MAX_RECOVERY_ATTEMPTS, delay,
+            )
+            record_event("runtime", "recovery_start", 0, "ATTEMPT",
+                         f"attempt={attempt}")
+
+            # ── Phase 1: Stop everything that depends on the self-client ──
+
+            logger.info("Recovery: stopping bio cron")
+            try:
+                await bio_engine.stop_cron()
+            except Exception as exc:
+                logger.warning("Recovery: bio stop error: %s", exc)
+            set_bio_cron_ok(False)
+
+            logger.info("Recovery: stopping helper bot")
+            await self._stop_helper()
+            set_helper_connected(False)
+
+            logger.info("Recovery: clearing inline panel state")
+            stop_all_timers()
+            clear_all_sessions()
+            clear_all_pending()
+            clear_all_targets()
+
+            if self._run_task and not self._run_task.done():
+                self._run_task.cancel()
+                try:
+                    await asyncio.wait_for(self._run_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+                self._run_task = None
+
+            logger.info("Recovery: disposing dead client")
+            old_client = self.client
+            self.client = None
+            self._client_alive = False
+            set_telethon_connected(False)
+            if old_client is not None:
+                try:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=10.0)
+                except (asyncio.TimeoutError, Exception):
+                    logger.warning("Recovery: old client disconnect timed out")
+
+            # ── Phase 2: Wait with backoff ──
+
+            await asyncio.sleep(delay)
+
+            if self.shutdown_event.is_set():
+                return
+
+            # ── Phase 3: Build new client and re-register everything ──
+
+            try:
+                logger.info("Recovery: building new client")
+                await self._build_and_register()
+                record_event("runtime", "recovery", 0, "SUCCESS",
+                             f"gen={self.client_generation}")
+                logger.info("Recovery: new client ready (gen=%d)", self.client_generation)
+
+                if self.helper_enabled:
+                    logger.info("Recovery: restarting helper bot")
+                    await self._start_helper()
+
+                logger.info("Recovery: restarting bio cron")
+                self._resume_bio_cron()
+
+                self._run_task = asyncio.create_task(
+                    self._run_loop(), name="lifeos-run"
+                )
+
+                self._recovery_attempts = 0
+                self._transition(RuntimeState.READY)
+                set_supervisor_ok(True)
+                set_task_state("lifeos-recovery", "DONE")
+                increment_restart()
+                logger.info("Recovery complete — system operational")
+
+            except Exception as exc:
+                logger.error("Recovery attempt %d failed: %s", attempt, exc)
+                record_event("runtime", "recovery", 0, "ERROR", str(exc))
+                set_last_rebuild_reason(f"recovery_error: {exc}")
+                set_task_state("lifeos-recovery", "FAILED")
+
+    async def _stop_helper(self) -> None:
+        """Stop and disconnect the helper bot."""
+        helper = self.helper_client
+        self.helper_client = None
+        if helper is not None:
+            try:
+                await asyncio.wait_for(helper.disconnect(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        try:
+            await disconnect_helper()
+        except Exception:
+            pass
 
     # ── Shutdown ──
 
@@ -669,42 +528,40 @@ class RuntimeSupervisor:
         self._transition(RuntimeState.STOPPING)
         self.shutdown_event.set()
 
-        # Clear inline panel state
         stop_all_timers()
         clear_all_sessions()
         clear_all_pending()
         clear_all_targets()
 
-        # Stop bio cron deterministically
         logger.info("Shutdown: stopping bio cron")
-        await bio_engine.stop_cron()
+        try:
+            await bio_engine.stop_cron()
+        except Exception:
+            pass
         set_bio_cron_ok(False)
 
-        # Signal web server
-        logger.info("Shutdown: signalling web server")
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await asyncio.wait_for(self._heartbeat_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._heartbeat_task = None
+
+        if self._run_task and not self._run_task.done():
+            self._run_task.cancel()
+            try:
+                await asyncio.wait_for(self._run_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._run_task = None
+
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
 
-        # Stop all managed tasks
-        logger.info("Shutdown: stopping managed tasks")
-        for name, mt in list(self._managed_tasks.items()):
-            try:
-                await mt.stop(timeout=10.0)
-                set_task_state(name, "STOPPED")
-            except Exception as exc:
-                logger.warning("Shutdown: task '%s' stop error: %s", name, exc)
-        self._managed_tasks.clear()
+        await self._stop_helper()
+        set_helper_connected(False)
 
-        # Disconnect helper
-        if self.helper_client is not None:
-            logger.info("Shutdown: disconnecting helper bot")
-            try:
-                await disconnect_helper()
-            except Exception as exc:
-                logger.warning("Helper disconnect: %s", exc)
-            set_helper_connected(False)
-
-        # Disconnect self-client
         if self.client is not None:
             logger.info("Shutdown: disconnecting Telethon")
             try:
@@ -720,6 +577,9 @@ class RuntimeSupervisor:
 
     def task_states(self) -> dict[str, str]:
         states = {}
-        for name, mt in self._managed_tasks.items():
-            states[name] = mt.state()
+        if self._heartbeat_task:
+            states["lifeos-heartbeat"] = "RUNNING" if not self._heartbeat_task.done() else "STOPPED"
+        if self._run_task:
+            states["lifeos-run"] = "RUNNING" if not self._run_task.done() else "STOPPED"
+        states["lifeos-recovery"] = "RECOVERING" if self._recovery_lock.locked else "IDLE"
         return states

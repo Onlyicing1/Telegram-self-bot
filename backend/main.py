@@ -2,16 +2,19 @@
 LifeOS — deterministic entry point.
 
 Everything starts through the RuntimeSupervisor, which owns every runtime
-coroutine via ManagedTask wrappers with automatic watchdog restart.
+coroutine: self-client run loop, heartbeat, helper bot, bio cron, web server.
 
 Startup:
   1. Config validation (hard-exit on missing required vars)
   2. RuntimeSupervisor.start() — connects, authorizes, registers,
-     starts helper, bio cron, web server, heartbeat, liveness probe
+     starts helper, bio cron, web server, heartbeat, run loop
 
 Shutdown (SIGTERM/SIGINT):
-  RuntimeSupervisor.stop() — deterministic shutdown of all managed tasks,
+  RuntimeSupervisor.stop() — deterministic shutdown of all tasks,
   bio cron, helper, and self-client.
+
+If recovery fails repeatedly, the supervisor calls sys.exit(1) so
+Render's platform restarts the process automatically.
 """
 import asyncio
 import logging
