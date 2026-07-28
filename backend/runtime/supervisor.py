@@ -73,8 +73,8 @@ from backend.helper.inline_engine import (
     set_owner_id,
 )
 from backend.helper.inline_sender import register_input_listener
-from backend.helper.panel_settings import load as load_panel_settings
 from backend.helper.callback_trace import configure as configure_callback_trace
+from backend.helper.panel_settings import load as load_panel_settings
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +340,7 @@ class RuntimeSupervisor:
             logger.error("Rebuild limit exceeded — entering FAILED state")
             self._transition(RuntimeState.FAILED)
             set_supervisor_ok(False)
+            self.shutdown_event.set()
             return
 
         old_client = self.client
@@ -354,10 +355,11 @@ class RuntimeSupervisor:
                 logger.warning("Old client disconnect during rebuild timed out")
             old_client = None
 
-        # Stop the old supervisor task
+        # Stop the old supervisor task's watchdog without cancelling the
+        # currently-executing task (which IS the old supervisor task).
         old_task = self._managed_tasks.pop("lifeos-tg-supervisor", None)
         if old_task:
-            await old_task.stop(timeout=5.0)
+            await old_task.stop_watchdog(timeout=5.0)
 
         delay = _backoff(self._rebuild_attempts)
         logger.info("Rebuild attempt %d in %.1fs", self._rebuild_attempts, delay)
@@ -378,6 +380,13 @@ class RuntimeSupervisor:
 
             # Re-register all handlers on the new client
             register_all(new_client, self.owner_id, self.tz_str)
+
+            # Re-wire inline panel dependencies onto the new client
+            if self.helper_enabled:
+                set_self_client(new_client)
+                configure_callback_trace(new_client, self.owner_id)
+                register_input_listener(new_client, self.owner_id)
+
             record_event("runtime", "rebuild", 0, "SUCCESS",
                          f"gen={self.client_generation}")
             logger.info("Self-client rebuilt (gen=%d)", self.client_generation)
@@ -603,8 +612,9 @@ class RuntimeSupervisor:
 
     async def _run_web(self) -> None:
         import uvicorn
-        from backend.web.app import app as web_app
+        from backend.web.app import app as web_app, set_owner_id as web_set_owner_id
 
+        web_set_owner_id(self.owner_id)
         config = uvicorn.Config(
             web_app,
             host="0.0.0.0",

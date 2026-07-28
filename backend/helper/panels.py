@@ -157,6 +157,13 @@ def _get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
     return session
 
 
+def clear_session(chat_id: int | None, msg_id: int | None) -> None:
+    """Remove session metadata for (chat_id, msg_id)."""
+    if chat_id is None or msg_id is None:
+        return
+    _sessions.pop((chat_id, msg_id), None)
+
+
 def _log_callback(session_id: str, chat_id: int | None, msg_id: int | None,
                   callback_data: str, label: str,
                   inline_message_id: str | None = None) -> None:
