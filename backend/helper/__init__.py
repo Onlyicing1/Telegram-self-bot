@@ -27,12 +27,14 @@ from backend.helper.target_context import (
     set_target,
     get_target,
     clear_target,
+    clear_all as clear_all_targets,
 )
 from backend.helper.pagination import build_pagination_row, paginate
 from backend.helper.panel_timer import (
     init_panel,
     destroy as timer_destroy,
     stop_timer,
+    stop_all as stop_all_timers,
     set_content as timer_set_content,
     has_timer,
     active_count,
@@ -69,6 +71,7 @@ __all__ = [
     "set_target",
     "get_target",
     "clear_target",
+    "clear_all_targets",
     "build_pagination_row",
     "paginate",
     "init_panel",
@@ -77,6 +80,7 @@ __all__ = [
     "timer_set_content",
     "has_timer",
     "active_count",
+    "stop_all_timers",
     "is_auto_close_enabled",
     "set_auto_close_enabled",
     "toggle_auto_close",

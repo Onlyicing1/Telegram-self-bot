@@ -150,6 +150,11 @@ def set_last_bio_update() -> None:
     _last_bio_update = time.time()
 
 
+def set_last_telethon_event() -> None:
+    global _last_telethon_event
+    _last_telethon_event = time.time()
+
+
 def set_task_state(name: str, state: str) -> None:
     _task_states[name] = state
 

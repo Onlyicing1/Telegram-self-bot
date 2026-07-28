@@ -60,3 +60,8 @@ def get_target(owner_id: int) -> TargetContext | None:
 
 def clear_target(owner_id: int) -> TargetContext | None:
     return _store.pop(owner_id, None)
+
+
+def clear_all() -> None:
+    """Clear all target contexts."""
+    _store.clear()
