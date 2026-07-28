@@ -22,6 +22,12 @@ The callback router dispatches based on the prefix. Panel handlers
 edit the inline message in-place. Action handlers execute logic and
 then edit the message with the result. Input handlers set a pending
 input state and edit the message to show a prompt.
+
+SESSION TRACING:
+  Every panel creation gets a unique PANEL-SESSION-NNNNNN ID.
+  Every callback logs session_id, chat_id, msg_id, callback_data.
+  Every mutation logs before/after state with object ids and dict keys.
+  This proves exactly where nav_stack changes.
 """
 import logging
 from typing import Awaitable, Callable, Any
