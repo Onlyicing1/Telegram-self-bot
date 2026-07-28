@@ -107,6 +107,18 @@ class ManagedTask:
                 pass
         self.task = None
 
+    async def stop_watchdog(self, timeout: float = 5.0) -> None:
+        """Stop the watchdog without cancelling the main task."""
+        self._stop_requested = True
+        self._running = False
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(self._watchdog_task, timeout=timeout)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._watchdog_task = None
+
     @property
     def is_alive(self) -> bool:
         return self.task is not None and not self.task.done()

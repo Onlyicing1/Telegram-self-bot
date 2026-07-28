@@ -14,6 +14,7 @@ import asyncio
 import logging
 
 from backend.helper.panel_settings import is_auto_close_enabled
+from backend.helper.panels import clear_session
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ def destroy(self_client, chat_id: int, msg_id: int) -> None:
     entry = _panels.pop(k, None)
     if entry:
         _cancel_entry_task(entry)
+    _clear_session(chat_id, msg_id)
     try:
         asyncio.create_task(self_client.delete_messages(chat_id, [msg_id]))
     except Exception:
@@ -143,6 +145,7 @@ def stop_timer(chat_id: int, msg_id: int) -> None:
     entry = _panels.pop(k, None)
     if entry:
         _cancel_entry_task(entry)
+    _clear_session(chat_id, msg_id)
 
 
 def has_timer(chat_id: int, msg_id: int) -> bool:

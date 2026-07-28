@@ -18,6 +18,13 @@ app = FastAPI(title="LifeOS", docs_url=None, redoc_url=None)
 
 _DIST = Path(__file__).parent.parent / "dist"
 
+_owner_id: int = 0
+
+
+def set_owner_id(owner_id: int) -> None:
+    global _owner_id
+    _owner_id = owner_id
+
 
 @app.get("/health")
 async def health():
@@ -27,7 +34,7 @@ async def health():
 @app.get("/api/saves")
 async def list_saves(limit: int = 50, offset: int = 0):
     try:
-        items, total = db_client.list_saves(0, limit=limit, offset=offset)
+        items, total = db_client.list_saves(_owner_id, limit=limit, offset=offset)
         return {"items": items, "total": total}
     except Exception as exc:
         logger.error("api/saves error: %s", exc)
@@ -51,7 +58,7 @@ async def get_save(save_code: str):
 @app.get("/api/bio")
 async def get_bio():
     try:
-        state = db_client.get_bio_state(0)
+        state = db_client.get_bio_state(_owner_id)
         return state or {}
     except Exception as exc:
         logger.error("api/bio error: %s", exc)
@@ -61,7 +68,7 @@ async def get_bio():
 @app.get("/api/logs")
 async def get_logs(limit: int = 100):
     try:
-        logs = db_client.list_logs(0, limit=limit)
+        logs = db_client.list_logs(_owner_id, limit=limit)
         return {"logs": logs}
     except Exception as exc:
         logger.error("api/logs error: %s", exc)
