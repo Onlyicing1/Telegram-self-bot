@@ -22,17 +22,8 @@ The callback router dispatches based on the prefix. Panel handlers
 edit the inline message in-place. Action handlers execute logic and
 then edit the message with the result. Input handlers set a pending
 input state and edit the message to show a prompt.
-
-SESSION TRACING:
-  Every panel creation gets a unique PANEL-SESSION-NNNNNN ID.
-  Every callback logs session_id, chat_id, msg_id, callback_data.
-  Every mutation logs before/after state with object ids and dict keys.
-  This proves exactly where nav_stack changes.
 """
 import logging
-import time
-import uuid as _uuid
-from datetime import datetime, timezone
 from typing import Awaitable, Callable, Any
 
 from telethon import events
@@ -98,87 +89,37 @@ _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
 
-def _now_ms() -> float:
-    return time.monotonic() * 1000.0
-
-
-# ── Session / identity tracing ──
-# Every panel creation gets a unique session ID and panel UUID.
-# Every callback logs the session state so we can prove whether
-# the Close callback operates on the same message that was created.
 _session_counter: int = 0
-# Key: (chat_id, msg_id) -> session metadata dict
 _sessions: dict[tuple[int, int], dict] = {}
 
 
 def _create_session(chat_id: int, msg_id: int, panel_type: str = "unknown") -> str:
-    """Create a new panel session with a unique ID and UUID."""
     global _session_counter
     _session_counter += 1
     sid = f"PANEL-SESSION-{_session_counter:06d}"
-    panel_uuid = str(_uuid.uuid4())
-    key = (chat_id, msg_id)
-    _sessions[key] = {
+    _sessions[(chat_id, msg_id)] = {
         "session_id": sid,
-        "panel_uuid": panel_uuid,
         "chat_id": chat_id,
         "msg_id": msg_id,
         "panel_type": panel_type,
-        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    logger.info(
-        "[PANEL] SESSION CREATED session=%s panel_uuid=%s "
-        "chat_id=%s msg_id=%s panel_type='%s' key=%s",
-        sid, panel_uuid, chat_id, msg_id, panel_type, key,
-    )
     return sid
 
 
 def _get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
-    """Look up session metadata by (chat_id, msg_id)."""
     if chat_id is None or msg_id is None:
-        logger.info(
-            "[PANEL] SESSION LOOKUP skipped: chat_id=%s msg_id=%s "
-            "all_keys=%s",
-            chat_id, msg_id, list(_sessions.keys()),
-        )
         return None
-    key = (chat_id, msg_id)
-    session = _sessions.get(key)
-    logger.info(
-        "[PANEL] SESSION LOOKUP key=%s found=%s "
-        "session_id=%s panel_uuid=%s "
-        "all_keys=%s",
-        key, session is not None,
-        session.get("session_id", "N/A") if session else "N/A",
-        session.get("panel_uuid", "N/A") if session else "N/A",
-        list(_sessions.keys()),
-    )
-    return session
+    return _sessions.get((chat_id, msg_id))
 
 
 def clear_session(chat_id: int | None, msg_id: int | None) -> None:
-    """Remove session metadata for (chat_id, msg_id)."""
     if chat_id is None or msg_id is None:
         return
     _sessions.pop((chat_id, msg_id), None)
 
 
-def _log_callback(session_id: str, chat_id: int | None, msg_id: int | None,
-                  callback_data: str, label: str,
-                  inline_message_id: str | None = None) -> None:
-    """Log full callback state at a boundary."""
-    session = _get_session(chat_id, msg_id)
-    panel_uuid = session.get("panel_uuid", "N/A") if session else "N/A"
-    logger.info(
-        "[PANEL] %s session=%s panel_uuid=%s "
-        "chat=%s msg=%s callback_data='%s' "
-        "inline_message_id=%s session_found=%s",
-        label, session_id, panel_uuid,
-        chat_id, msg_id, callback_data,
-        inline_message_id,
-        session is not None,
-    )
+def clear_all_sessions() -> None:
+    _sessions.clear()
 
 
 class InlinePanelBuilder:
@@ -252,82 +193,36 @@ def register_callback_handlers(client, owner_id: int) -> None:
       - ``action:`` → action execution handler (Type A)
       - ``input:`` → input state setup (Type B)
     """
-    logger.info("HELP STEP 12 - callback handler registered: owner_id=%s", owner_id)
+    logger.info("[PANEL] callback handler registered: owner_id=%s", owner_id)
 
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
-        t_enter = _now_ms()
         chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
         sender_id = event.sender_id
         data_raw = event.data
         data = data_raw.decode("utf-8") if data_raw else ""
 
-        logger.info(
-            "[PANEL] CALLBACK RESOLVED event_type=%s chat_id=%s msg_id=%s "
-            "inline_message_id=%s peer=%s",
-            type(event).__name__, chat_id, msg_id, inline_msg_id,
-            getattr(event, "peer_id", None),
-        )
-        logger.info(
-            "HELP STEP 13 - callback received: data=%s, sender_id=%s, msg_id=%s, chat_id=%s",
-            data_raw, sender_id, msg_id, chat_id,
-        )
-
         if chat_id is None and inline_msg_id is None:
-            logger.warning(
-                "[PANEL] CALLBACK UNRESOLVABLE: no chat_id and no inline_message_id — "
-                "returning safely (data='%s')",
-                data,
-            )
+            logger.warning("[PANEL] callback unresolvable: no chat_id and no inline_message_id")
             return
-
-        # Session trace — log full state at callback entry
-        session = _get_session(chat_id, msg_id)
-        session_id = session.get("session_id", "NO-SESSION") if session else "NO-SESSION"
-        _log_callback(session_id, chat_id, msg_id, data, "CALLBACK ENTRY", inline_msg_id)
 
         if not is_owner(event, owner_id):
-            t_after = _now_ms()
-            logger.warning(
-                "[TIMING] _callback_router owner check FAILED: elapsed=%.1fms, "
-                "sender_id=%s, owner_id=%s",
-                t_after - t_enter, sender_id, owner_id,
-            )
-            logger.warning(
-                "HELP STEP 13 - callback owner check FAILED: sender_id=%s, owner_id=%s",
-                sender_id, owner_id,
-            )
             return
-
-        t_after_owner = _now_ms()
-        logger.info("[TIMING] _callback_router owner check PASS: elapsed=%.1fms", t_after_owner - t_enter)
-        logger.info("HELP STEP 13 - callback owner check passed")
 
         if not data:
-            logger.warning("HELP STEP 13 - empty callback data — ignoring")
             return
 
-        logger.info("HELP STEP 13 - callback dispatching: data='%s'", data)
-        _log_callback(session_id, chat_id, msg_id, data, "BEFORE DISPATCH", inline_msg_id)
         try:
             if data.startswith("panel:"):
-                logger.info("HELP STEP 13 - callback → _handle_panel(remainder='%s')", data[6:])
                 await _handle_panel(event, data[6:])
             elif data.startswith("action:"):
-                logger.info("HELP STEP 13 - callback → _handle_action(remainder='%s')", data[7:])
                 await _handle_action(event, data[7:])
             elif data.startswith("input:"):
-                logger.info("HELP STEP 13 - callback → _handle_input(remainder='%s')", data[6:])
                 await _handle_input(event, data[6:], owner_id)
             else:
-                logger.warning("HELP STEP 13 - callback unknown prefix in data='%s'", data)
-            t_dispatched = _now_ms()
-            logger.info("[TIMING] _callback_router dispatch DONE: elapsed=%.1fms", t_dispatched - t_enter)
-            _log_callback(session_id, chat_id, msg_id, data, "AFTER DISPATCH", inline_msg_id)
+                logger.warning("[PANEL] unknown callback prefix: '%s'", data)
         except Exception:
-            t_err = _now_ms()
-            logger.info("[TIMING] _callback_router EXCEPTION: elapsed=%.1fms", t_err - t_enter)
-            logger.exception("HELP STEP 13 - callback router error (data='%s')", data)
+            logger.exception("[PANEL] callback router error (data='%s')", data)
 
 
 async def _handle_panel(event, remainder: str) -> None:
@@ -335,32 +230,23 @@ async def _handle_panel(event, remainder: str) -> None:
     panel_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
 
-    logger.info("[CALLBACK] _handle_panel: panel_id='%s', extra='%s'", panel_id, extra)
-
     handler = get_panel(panel_id)
     if handler is None:
-        logger.warning(
-            "[CALLBACK] no panel registered for id='%s' (registered: %s)",
-            panel_id, list(_panels.keys()),
-        )
+        logger.warning("[CALLBACK] no panel registered for id='%s'", panel_id)
         return
 
-    logger.info("[CALLBACK] panel handler found — invoking")
-    t_before = _now_ms()
     try:
-        await handler(event, extra)
-        t_after = _now_ms()
-        logger.info(
-            "[TIMING] _handle_panel handler DONE: elapsed=%.1fms, panel_id='%s'",
-            t_after - t_before, panel_id,
-        )
-        logger.info("[CALLBACK] panel handler completed")
+        result = await handler(event, extra)
+        if result is None:
+            return
+        title, body, buttons = result
+        from backend.helper.panel_render import render_edit
+        text, built_buttons = render_edit(title, body, buttons)
+        try:
+            await event.edit(text, buttons=built_buttons)
+        except Exception as exc:
+            logger.warning("[CALLBACK] panel edit failed: %s", exc)
     except Exception:
-        t_after = _now_ms()
-        logger.info(
-            "[TIMING] _handle_panel handler EXCEPTION: elapsed=%.1fms, panel_id='%s'",
-            t_after - t_before, panel_id,
-        )
         logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
 
 
@@ -369,50 +255,29 @@ async def _handle_action(event, remainder: str) -> None:
     action_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
 
-    logger.info("[CALLBACK] _handle_action: action_id='%s', extra='%s'", action_id, extra)
-
     handler = get_action(action_id)
     if handler is None:
-        logger.warning(
-            "[CALLBACK] no action registered for id='%s' (registered: %s)",
-            action_id, list(_actions.keys()),
-        )
+        logger.warning("[CALLBACK] no action registered for id='%s'", action_id)
         return
 
-    logger.info("[CALLBACK] action handler found — invoking")
-    t_before = _now_ms()
     try:
         result = await handler(event, extra)
-        t_after_handler = _now_ms()
-        logger.info(
-            "[TIMING] _handle_action handler DONE: elapsed=%.1fms, action_id='%s'",
-            t_after_handler - t_before, action_id,
-        )
-        logger.info("[CALLBACK] action handler returned: type=%s", type(result).__name__)
-
         if result is None:
             return
         if isinstance(result, tuple):
-            text, buttons = result
+            if len(result) == 3:
+                title, body, buttons = result
+            else:
+                title, body, buttons = result[0], result[1] if len(result) > 1 else "", result[2] if len(result) > 2 else []
         else:
-            text, buttons = result, []
-        if text:
-            t_before_edit = _now_ms()
-            try:
-                await event.edit(text, buttons=buttons)
-                t_after_edit = _now_ms()
-                logger.info("[TIMING] _handle_action edit DONE: elapsed=%.1fms", t_after_edit - t_before_edit)
-                logger.info("[CALLBACK] action result edit succeeded")
-            except Exception as exc:
-                t_after_edit = _now_ms()
-                logger.info("[TIMING] _handle_action edit FAILED: elapsed=%.1fms", t_after_edit - t_before_edit)
-                logger.warning("[CALLBACK] action result edit failed: %s", exc)
+            title, body, buttons = result, "", []
+        from backend.helper.panel_render import render_edit
+        text, built_buttons = render_edit(title, body, buttons)
+        try:
+            await event.edit(text, buttons=built_buttons)
+        except Exception as exc:
+            logger.warning("[CALLBACK] action edit failed: %s", exc)
     except Exception:
-        t_after = _now_ms()
-        logger.info(
-            "[TIMING] _handle_action EXCEPTION: elapsed=%.1fms, action_id='%s'",
-            t_after - t_before, action_id,
-        )
         logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
 
 
@@ -421,14 +286,9 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
     panel_id = parts[0]
     input_id = parts[1] if len(parts) > 1 else ""
 
-    logger.info("[CALLBACK] _handle_input: panel_id='%s', input_id='%s'", panel_id, input_id)
-
     input_cfg = get_input(panel_id, input_id)
     if input_cfg is None:
-        logger.warning(
-            "[CALLBACK] no input registered: panel='%s', input_id='%s' (registered: %s)",
-            panel_id, input_id, list(_inputs.keys()),
-        )
+        logger.warning("[CALLBACK] no input registered: panel='%s', input_id='%s'", panel_id, input_id)
         return
 
     prompt = input_cfg.get("prompt", "Enter input:")
@@ -439,10 +299,6 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
         return
 
     chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
-    logger.info(
-        "[CALLBACK] setting pending: owner_id=%s, panel_id='%s', chat_id=%s, inline_msg_id=%s",
-        owner_id, panel_id, chat_id, inline_msg_id,
-    )
     set_pending(
         owner_id, panel_id, handler, chat_id or 0, prompt,
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
@@ -451,13 +307,7 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
     builder = InlinePanelBuilder()
     builder.add_row("Cancel", f"panel:{panel_id}")
 
-    t_before = _now_ms()
     try:
         await event.edit(prompt, buttons=builder.build())
-        t_after = _now_ms()
-        logger.info("[TIMING] _handle_input edit DONE: elapsed=%.1fms", t_after - t_before)
-        logger.info("[CALLBACK] input prompt edit succeeded")
     except Exception as exc:
-        t_after = _now_ms()
-        logger.info("[TIMING] _handle_input edit FAILED: elapsed=%.1fms", t_after - t_before)
         logger.warning("[CALLBACK] input prompt edit failed: %s", exc)

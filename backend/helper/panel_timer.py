@@ -42,7 +42,11 @@ def _key(chat_id: int, msg_id: int) -> str:
 
 
 def _now() -> float:
-    return asyncio.get_event_loop().time()
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        import time
+        return time.monotonic()
 
 
 def init_panel(self_client, chat_id: int, msg_id: int, title: str = "LifeOS", body: str = "", buttons: list = None) -> None:
@@ -156,3 +160,11 @@ def has_timer(chat_id: int, msg_id: int) -> bool:
 
 def active_count() -> int:
     return sum(1 for e in _panels.values() if e.task is not None and not e.task.done())
+
+
+def stop_all() -> None:
+    """Cancel all active panel timers without deleting messages."""
+    for k in list(_panels.keys()):
+        entry = _panels.pop(k, None)
+        if entry:
+            _cancel_entry_task(entry)

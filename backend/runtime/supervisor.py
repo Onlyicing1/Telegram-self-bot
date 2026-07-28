@@ -75,6 +75,10 @@ from backend.helper.inline_engine import (
 from backend.helper.inline_sender import register_input_listener
 from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper.panel_settings import load as load_panel_settings
+from backend.helper.panel_timer import stop_all as stop_all_timers
+from backend.helper.input_state import clear_all as clear_all_pending
+from backend.helper.target_context import clear_all as clear_all_targets
+from backend.helper.panels import clear_all_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +268,7 @@ class RuntimeSupervisor:
             return
         client = self.client
         set_telethon_connected(client.is_connected())
+        set_task_state("lifeos-tg-supervisor", "RUNNING")
         try:
             await client.run_until_disconnected()
         except asyncio.CancelledError:
@@ -275,6 +280,7 @@ class RuntimeSupervisor:
             return
 
         set_telethon_connected(False)
+        set_task_state("lifeos-tg-supervisor", "RECOVERING")
         increment_restart()
         logger.warning("Self-client disconnected — entering recovery")
         self._transition(RuntimeState.RECOVERING)
@@ -309,6 +315,7 @@ class RuntimeSupervisor:
                 set_last_rpc()
                 self._reconnect_attempts = 0
                 self._transition(RuntimeState.READY)
+                set_task_state("lifeos-tg-supervisor", "RUNNING")
                 record_event("runtime", "reconnect", 0, "SUCCESS")
                 logger.info("Self-client reconnected successfully")
                 # Re-enter run_until_disconnected
@@ -316,6 +323,7 @@ class RuntimeSupervisor:
                 if self.shutdown_event.is_set():
                     return
                 set_telethon_connected(False)
+                set_task_state("lifeos-tg-supervisor", "RECOVERING")
                 self._transition(RuntimeState.RECOVERING)
             except asyncio.TimeoutError:
                 logger.warning("Reconnect timed out")
@@ -346,6 +354,12 @@ class RuntimeSupervisor:
         old_client = self.client
         self.client = None
         set_telethon_connected(False)
+
+        # Clear stale inline panel state from the old client
+        stop_all_timers()
+        clear_all_sessions()
+        clear_all_pending()
+        clear_all_targets()
 
         # Fully disconnect and abandon the old client
         if old_client is not None:
@@ -538,6 +552,9 @@ class RuntimeSupervisor:
             set_self_client(self.client)
             set_helper_username(get_bot_username())
             set_owner_id(self.owner_id)
+            if self.client is not None:
+                configure_callback_trace(self.client, self.owner_id)
+                register_input_listener(self.client, self.owner_id)
             set_helper_connected(True)
             self._helper_reconnect_attempts = 0
             record_event("runtime", "helper_rebuild", 0, "SUCCESS")
@@ -561,6 +578,8 @@ class RuntimeSupervisor:
                 update_heartbeat()
                 check_stale()
                 set_heartbeat()
+                for name, mt in self._managed_tasks.items():
+                    set_task_state(name, mt.state())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -632,7 +651,12 @@ class RuntimeSupervisor:
     ) -> None:
         old = self._managed_tasks.pop(name, None)
         if old:
-            asyncio.create_task(old.stop(timeout=5.0))
+            old._stop_requested = True
+            old._running = False
+            if old._watchdog_task and not old._watchdog_task.done():
+                old._watchdog_task.cancel()
+            if old.task and not old.task.done():
+                old.task.cancel()
         task = ManagedTask(name, factory, watchdog_interval=watchdog_interval)
         self._managed_tasks[name] = task
         task.start()
@@ -644,6 +668,12 @@ class RuntimeSupervisor:
         logger.info("Shutdown initiated")
         self._transition(RuntimeState.STOPPING)
         self.shutdown_event.set()
+
+        # Clear inline panel state
+        stop_all_timers()
+        clear_all_sessions()
+        clear_all_pending()
+        clear_all_targets()
 
         # Stop bio cron deterministically
         logger.info("Shutdown: stopping bio cron")

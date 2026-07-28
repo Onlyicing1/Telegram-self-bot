@@ -55,3 +55,8 @@ def clear_pending(owner_id: int) -> dict | None:
 def has_pending(owner_id: int) -> bool:
     """Check if there's a pending input for the owner."""
     return owner_id in _pending
+
+
+def clear_all() -> None:
+    """Clear all pending input states."""
+    _pending.clear()
