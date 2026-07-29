@@ -46,6 +46,15 @@ from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.panel_timer import set_content, stop_timer, destroy as timer_destroy
+from backend.helper.session_manager import (
+    create_session as _create_session,
+    get_session as _get_session,
+    push_nav as _push_nav,
+    pop_nav as _pop_nav,
+    current_nav as _current_nav,
+    clear_session,
+    clear_all_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,69 +103,28 @@ _panels: dict[str, PanelHandler] = {}
 _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
-_session_counter: int = 0
-_sessions: dict[tuple[int, int], dict] = {}
 
+class InlinePanelBuilder:
+    """Builds inline keyboard layouts for the helper bot."""
 
-def _create_session(chat_id: int, msg_id: int, panel_type: str = "unknown") -> str:
-    global _session_counter
-    _session_counter += 1
-    sid = f"PANEL-SESSION-{_session_counter:06d}"
-    _sessions[(chat_id, msg_id)] = {
-        "session_id": sid,
-        "chat_id": chat_id,
-        "msg_id": msg_id,
-        "panel_type": panel_type,
-        "nav_stack": [panel_type],
-    }
-    return sid
+    def __init__(self):
+        self._rows: list[list[Any]] = []
 
+    def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
+        self._rows.append([Button.inline(text, truncate_callback_data(callback_data))])
+        return self
 
-def _get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
-    if chat_id is None or msg_id is None:
-        return None
-    return _sessions.get((chat_id, msg_id))
+    def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
+        row = [Button.inline(text, truncate_callback_data(data)) for text, data in buttons]
+        self._rows.append(row)
+        return self
 
+    def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
+        self._rows.append([Button.url(text, url)])
+        return self
 
-def _push_nav(chat_id: int, msg_id: int, panel_id: str) -> None:
-    session = _get_session(chat_id, msg_id)
-    if session is None:
-        _create_session(chat_id, msg_id, panel_id)
-        return
-    stack = session.get("nav_stack", [])
-    if stack and stack[-1] == panel_id:
-        return
-    stack.append(panel_id)
-    session["nav_stack"] = stack
-
-
-def _pop_nav(chat_id: int, msg_id: int) -> str | None:
-    session = _get_session(chat_id, msg_id)
-    if session is None:
-        return None
-    stack = session.get("nav_stack", [])
-    if len(stack) <= 1:
-        return None
-    stack.pop()
-    return stack[-1]
-
-
-def _current_nav(chat_id: int, msg_id: int) -> str | None:
-    session = _get_session(chat_id, msg_id)
-    if session is None:
-        return None
-    stack = session.get("nav_stack", [])
-    return stack[-1] if stack else None
-
-
-def clear_session(chat_id: int | None, msg_id: int | None) -> None:
-    if chat_id is None or msg_id is None:
-        return
-    _sessions.pop((chat_id, msg_id), None)
-
-
-def clear_all_sessions() -> None:
-    _sessions.clear()
+    def build(self) -> list[list[Any]]:
+        return self._rows
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
@@ -199,29 +167,6 @@ def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) 
         _add_nav_buttons(builder, panel_id)
         buttons = builder.build()
     return title, body, buttons
-
-
-class InlinePanelBuilder:
-    """Builds inline keyboard layouts for the helper bot."""
-
-    def __init__(self):
-        self._rows: list[list[Any]] = []
-
-    def add_row(self, text: str, callback_data: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.inline(text, truncate_callback_data(callback_data))])
-        return self
-
-    def add_buttons(self, *buttons: tuple[str, str]) -> "InlinePanelBuilder":
-        row = [Button.inline(text, truncate_callback_data(data)) for text, data in buttons]
-        self._rows.append(row)
-        return self
-
-    def add_url(self, text: str, url: str) -> "InlinePanelBuilder":
-        self._rows.append([Button.url(text, url)])
-        return self
-
-    def build(self) -> list[list[Any]]:
-        return self._rows
 
 
 def register_panel(panel_id: str, handler: PanelHandler) -> None:

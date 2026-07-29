@@ -15,7 +15,7 @@ from backend.bot.handlers.guard import is_owner
 from backend.helper import inline_engine
 from backend.helper.input_state import get_pending, clear_pending
 from backend.helper.panel_timer import init_panel
-from backend.helper.panels import _create_session
+from backend.helper.session_manager import create_session as _create_session
 
 logger = logging.getLogger(__name__)
 

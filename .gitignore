@@ -25,3 +25,8 @@ dist-ssr
 __pycache__/
 *.pyc
 *.tsbuildinfo
+
+# Build artifacts and temp files
+*.zip
+small_batch_*.json
+.gitkeep
