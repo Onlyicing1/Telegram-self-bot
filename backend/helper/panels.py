@@ -124,7 +124,7 @@ class InlinePanelBuilder:
         return self
 
     def build(self) -> list[list[Any]]:
-        return self._rows
+        return [list(row) for row in self._rows]
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
@@ -136,11 +136,8 @@ def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
     )
 
 
-def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) -> tuple[str, str, list]:
-    """Ensure every panel has navigation buttons. Handles None/empty buttons safely."""
-    if buttons is None:
-        buttons = []
-    has_nav = False
+def _has_nav_buttons(buttons: list) -> bool:
+    """Check if the button list already contains navigation buttons."""
     for row in buttons:
         if isinstance(row, list):
             for btn in row:
@@ -149,24 +146,27 @@ def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) 
                     continue
                 if isinstance(data, bytes):
                     if b"panel:_nav:" in data:
-                        has_nav = True
-                        break
+                        return True
                 elif isinstance(data, str):
                     if "panel:_nav:" in data:
-                        has_nav = True
-                        break
-        if has_nav:
-            break
-    if not has_nav:
-        builder = InlinePanelBuilder()
-        for row in buttons:
-            if isinstance(row, list):
-                builder._rows.append(row)
-            else:
-                builder._rows.append([row])
-        _add_nav_buttons(builder, panel_id)
-        buttons = builder.build()
-    return title, body, buttons
+                        return True
+    return False
+
+
+def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) -> tuple[str, str, list]:
+    """Ensure every panel has navigation buttons. Always builds a fresh keyboard — never mutates the input list."""
+    if buttons is None:
+        buttons = []
+    if _has_nav_buttons(buttons):
+        return title, body, [list(row) if isinstance(row, list) else [row] for row in buttons]
+    builder = InlinePanelBuilder()
+    for row in buttons:
+        if isinstance(row, list):
+            builder._rows.append(list(row))
+        else:
+            builder._rows.append([row])
+    _add_nav_buttons(builder, panel_id)
+    return title, body, builder.build()
 
 
 def register_panel(panel_id: str, handler: PanelHandler) -> None:
@@ -305,10 +305,19 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         clear_pending(owner_id)
         stop_timer(chat_id, msg_id)
         clear_session(chat_id, msg_id)
+        deleted = False
         try:
             await event.delete()
-        except Exception as exc:
-            logger.warning("[CALLBACK] close delete failed: %s", exc)
+            deleted = True
+        except Exception:
+            pass
+        if not deleted and chat_id is not None and msg_id is not None:
+            try:
+                client = event.client or event.original_update
+                if client is not None:
+                    await client.delete_messages(chat_id, [msg_id])
+            except Exception as exc:
+                logger.warning("[CALLBACK] close delete failed: %s", exc)
         return
 
     if action == "back":
