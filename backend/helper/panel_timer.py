@@ -14,7 +14,6 @@ import asyncio
 import logging
 
 from backend.helper.panel_settings import is_auto_close_enabled
-from backend.helper.session_manager import clear_session
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +105,7 @@ async def _timer_loop(self_client, chat_id: int, msg_id: int) -> None:
         entry = _panels.get(_key(chat_id, msg_id))
         if entry is None or not is_auto_close_enabled():
             return
-        destroy(self_client, chat_id, msg_id)
+        await destroy(self_client, chat_id, msg_id)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -130,23 +129,23 @@ async def _edit_countdown(self_client, chat_id: int, msg_id: int, seconds: int) 
         pass
 
 
-def destroy(self_client, chat_id: int, msg_id: int) -> None:
-    """Fully clear timer state, pending input, panel session, and edit the panel to a closed state.
+async def destroy(self_client, chat_id: int, msg_id: int) -> None:
+    """Auto-close entry point — calls the shared close_panel function.
 
-    Inline messages cannot be deleted via the Telegram API. Instead, we edit
-    the message to a 'closed' state with no buttons, making it visually dead.
+    This is the EXACT same code path as pressing the Close button.
+    No duplicate implementation.
     """
+    from backend.helper.panels import close_panel
     from backend.helper.input_state import clear_all as clear_all_pending
+
     k = _key(chat_id, msg_id)
     entry = _panels.pop(k, None)
     if entry:
         _cancel_entry_task(entry)
-    clear_session(chat_id, msg_id)
+
     clear_all_pending()
-    try:
-        asyncio.create_task(self_client.edit_message(chat_id, msg_id, message="✕ **Panel closed**", buttons=[]))
-    except Exception:
-        pass
+
+    await close_panel(None, chat_id, msg_id, 0)
 
 
 def stop_timer(chat_id: int, msg_id: int) -> None:
