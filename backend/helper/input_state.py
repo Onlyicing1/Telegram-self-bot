@@ -12,6 +12,7 @@ The input handler receives: (text, chat_id, msg_id, inline_chat_id, inline_msg_i
 so it can edit the inline panel message after processing the input.
 """
 import logging
+import time
 from typing import Awaitable, Callable, Any
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 InputHandler = Callable[[str, int, int, int, int], Awaitable[None]]
 
 _pending: dict[int, dict] = {}
+
+_INPUT_TIMEOUT_S = 120
 
 
 def set_pending(
@@ -30,7 +33,7 @@ def set_pending(
     inline_chat_id: int = 0,
     inline_msg_id: int = 0,
 ) -> None:
-    """Set a pending input request for the owner."""
+    """Set a pending input request for the owner. Replaces any previous pending input."""
     _pending[owner_id] = {
         "panel_id": panel_id,
         "handler": handler,
@@ -38,13 +41,22 @@ def set_pending(
         "prompt": prompt,
         "inline_chat_id": inline_chat_id,
         "inline_msg_id": inline_msg_id,
+        "created_at": time.monotonic(),
     }
     logger.debug("Input pending for owner %s: panel=%s", owner_id, panel_id)
 
 
 def get_pending(owner_id: int) -> dict | None:
-    """Get the pending input request, or None."""
-    return _pending.get(owner_id)
+    """Get the pending input request, or None. Auto-expires stale inputs."""
+    entry = _pending.get(owner_id)
+    if entry is None:
+        return None
+    created_at = entry.get("created_at", 0)
+    if time.monotonic() - created_at > _INPUT_TIMEOUT_S:
+        _pending.pop(owner_id, None)
+        logger.info("Input for owner %s expired (timeout=%ds)", owner_id, _INPUT_TIMEOUT_S)
+        return None
+    return entry
 
 
 def clear_pending(owner_id: int) -> dict | None:
@@ -54,7 +66,7 @@ def clear_pending(owner_id: int) -> dict | None:
 
 def has_pending(owner_id: int) -> bool:
     """Check if there's a pending input for the owner."""
-    return owner_id in _pending
+    return get_pending(owner_id) is not None
 
 
 def clear_all() -> None:
