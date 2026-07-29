@@ -76,7 +76,17 @@ def render(
     body: str = "",
     buttons: list | None = None,
 ) -> types.InputBotInlineResult:
-    """Build a single inline result. Accepts tuples OR Button objects."""
+    """Build a single inline result. Accepts tuples OR Button objects.
+
+    Navigation buttons (Back, Home, Close) are appended to every panel
+    so the initial render matches all subsequent callback edits.
+    """
+    from backend.helper.panels import _finalize_panel
+
+    if buttons is None:
+        buttons = []
+    title, body, buttons = _finalize_panel(title, body, buttons, "render")
+
     if title and body:
         message = f"**{title}**\n\n{body}"
     elif title:

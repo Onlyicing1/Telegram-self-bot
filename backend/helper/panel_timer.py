@@ -150,12 +150,11 @@ def destroy(self_client, chat_id: int, msg_id: int) -> None:
 
 
 def stop_timer(chat_id: int, msg_id: int) -> None:
-    """Cancel timer without deleting the message."""
+    """Cancel timer without clearing session or deleting the message."""
     k = _key(chat_id, msg_id)
     entry = _panels.pop(k, None)
     if entry:
         _cancel_entry_task(entry)
-    clear_session(chat_id, msg_id)
 
 
 def has_timer(chat_id: int, msg_id: int) -> bool:
