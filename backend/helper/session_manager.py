@@ -29,6 +29,7 @@ def create_session(chat_id: int, msg_id: int, panel_type: str = "unknown") -> st
         "msg_id": msg_id,
         "panel_type": panel_type,
         "nav_stack": [panel_type],
+        "current_extra": "",
     }
     return sid
 
@@ -38,6 +39,14 @@ def get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
     if chat_id is None or msg_id is None:
         return None
     return _sessions.get((chat_id, msg_id))
+
+
+def find_session_by_chat(chat_id: int) -> dict | None:
+    """Find an active session by chat_id, ignoring msg_id."""
+    for (cid, _mid), session in _sessions.items():
+        if cid == chat_id:
+            return session
+    return None
 
 
 def push_nav(chat_id: int, msg_id: int, panel_id: str) -> None:
@@ -66,15 +75,13 @@ def pop_nav(chat_id: int, msg_id: int) -> str | None:
 
 
 def reset_nav(chat_id: int, msg_id: int, panel_id: str = "help") -> None:
-    """Reset the navigation stack to a single root panel.
-
-    Used by the Home button to guarantee a clean stack with no duplicates.
-    """
+    """Reset the navigation stack to a single root panel."""
     session = get_session(chat_id, msg_id)
     if session is None:
         create_session(chat_id, msg_id, panel_id)
         return
     session["nav_stack"] = [panel_id]
+    session["current_extra"] = ""
 
 
 def current_nav(chat_id: int, msg_id: int) -> str | None:
@@ -84,6 +91,13 @@ def current_nav(chat_id: int, msg_id: int) -> str | None:
         return None
     stack = session.get("nav_stack", [])
     return stack[-1] if stack else None
+
+
+def set_current_extra(chat_id: int, msg_id: int, extra: str) -> None:
+    """Update the current extra (sub-view) for the active panel."""
+    session = get_session(chat_id, msg_id)
+    if session is not None:
+        session["current_extra"] = extra
 
 
 def clear_session(chat_id: int | None, msg_id: int | None) -> None:
