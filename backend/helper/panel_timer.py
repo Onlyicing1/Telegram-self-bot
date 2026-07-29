@@ -14,7 +14,7 @@ import asyncio
 import logging
 
 from backend.helper.panel_settings import is_auto_close_enabled
-from backend.helper.panels import clear_session
+from backend.helper.session_manager import clear_session
 
 logger = logging.getLogger(__name__)
 

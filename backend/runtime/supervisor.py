@@ -57,7 +57,8 @@ from backend.helper.client import (
     disconnect_helper,
     get_bot_username,
 )
-from backend.helper.panels import register_callback_handlers, clear_all_sessions
+from backend.helper.panels import register_callback_handlers
+from backend.helper.session_manager import clear_all_sessions
 from backend.helper.inline_engine import (
     register_inline_handler,
     set_self_client,
@@ -577,9 +578,7 @@ class RuntimeSupervisor:
 
     async def _cancel_orphan_tasks(self) -> None:
         """Cancel every asyncio task except the watchdog, the recovery task,
-        and the current task. This prevents zombie tasks from the old client
-        generation from surviving into the new one.
-        """
+        and the current task."""
         current = asyncio.current_task()
         protected_names = {"lifeos-watchdog", "lifeos-web"}
         to_cancel = []
