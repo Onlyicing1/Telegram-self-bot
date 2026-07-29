@@ -18,7 +18,7 @@ Callback data format:
   - Action execution:  ``action:<action_id>:<extra>``
   - Input request:    ``input:<panel_id>:<input_id>``
   - Close:            ``panel:_nav:close``
-  - Home:             ``panel:help``
+  - Home:             ``panel:_nav:home``
   - Back:             ``panel:_nav:back``
 
 The callback router dispatches based on the prefix. Panel handlers
@@ -51,6 +51,7 @@ from backend.helper.session_manager import (
     get_session as _get_session,
     push_nav as _push_nav,
     pop_nav as _pop_nav,
+    reset_nav as _reset_nav,
     current_nav as _current_nav,
     clear_session,
     clear_all_sessions,
@@ -171,7 +172,7 @@ def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
     """Append Back, Home, and Close buttons to every panel."""
     builder.add_buttons(
         ("‹ Back", "panel:_nav:back"),
-        ("🏠 Home", "panel:help"),
+        ("🏠 Home", "panel:_nav:home"),
         ("✕ Close", "panel:_nav:close"),
     )
 
@@ -347,18 +348,57 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
 
 
+async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Completely destroy the current inline panel.
+
+    - Cancel and remove the auto-close timer
+    - Clear pending input state
+    - Clear the panel session (navigation stack)
+    - Clear the render cache
+    - Edit the inline message to a 'closed' state with no buttons
+    - Fallback to self_client.edit_message if event.edit fails
+    """
+    from backend.helper.inline_engine import get_self_client
+
+    clear_pending(owner_id)
+    stop_timer(chat_id, msg_id)
+    clear_session(chat_id, msg_id)
+    _last_render.pop((chat_id, msg_id), None)
+
+    closed_text = "✕ **Panel closed**"
+    try:
+        await event.edit(closed_text, buttons=[])
+        _last_render[(chat_id, msg_id)] = (closed_text, ())
+        return
+    except Exception:
+        pass
+
+    self_client = get_self_client()
+    if self_client is not None and chat_id and msg_id:
+        try:
+            await self_client.edit_message(chat_id, msg_id, message=closed_text, buttons=[])
+            _last_render[(chat_id, msg_id)] = (closed_text, ())
+        except Exception:
+            pass
+
+
 async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
     """Handle Back, Home, and Close navigation buttons."""
     if action == "close":
+        await _handle_close(event, chat_id, msg_id, owner_id)
+        return
+
+    if action == "home":
+        _reset_nav(chat_id, msg_id, "help")
         clear_pending(owner_id)
-        stop_timer(chat_id, msg_id)
-        clear_session(chat_id, msg_id)
-        _last_render.pop((chat_id, msg_id), None)
+        handler = get_panel("help")
+        if handler is None:
+            return
         try:
-            await event.edit("✕ **Panel closed**", buttons=[])
-            _last_render[(chat_id, msg_id)] = ("✕ **Panel closed**", ())
+            result = await handler(event, "")
+            await _render_and_edit(event, result, "help", chat_id, msg_id)
         except Exception:
-            pass
+            logger.exception("[CALLBACK] home navigation FAILED")
         return
 
     if action == "back":
@@ -372,7 +412,6 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
             handler = get_panel("help")
         if handler is None:
             return
-        _push_nav(chat_id, msg_id, prev_panel)
         try:
             result = await handler(event, "")
             await _render_and_edit(event, result, prev_panel, chat_id, msg_id)

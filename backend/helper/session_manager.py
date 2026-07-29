@@ -62,7 +62,19 @@ def pop_nav(chat_id: int, msg_id: int) -> str | None:
     if len(stack) <= 1:
         return None
     stack.pop()
-    return stack[-1]
+    return stack[-1] if stack else None
+
+
+def reset_nav(chat_id: int, msg_id: int, panel_id: str = "help") -> None:
+    """Reset the navigation stack to a single root panel.
+
+    Used by the Home button to guarantee a clean stack with no duplicates.
+    """
+    session = get_session(chat_id, msg_id)
+    if session is None:
+        create_session(chat_id, msg_id, panel_id)
+        return
+    session["nav_stack"] = [panel_id]
 
 
 def current_nav(chat_id: int, msg_id: int) -> str | None:
