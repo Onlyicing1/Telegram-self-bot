@@ -1,26 +1,6 @@
 """
 Inline panel system for the helper bot.
 
-Provides:
-  - ``InlinePanelBuilder`` — builds inline keyboards with rows of buttons.
-  - ``register_panel(panel_id, handler)`` — registers a callback handler
-    for a panel ID.
-  - ``get_panel(panel_id)`` — retrieves a registered panel handler.
-  - ``register_action(action_id, handler)`` — registers an action handler
-    for immediate execution (Type A commands).
-  - ``register_input(panel_id, input_id, handler, prompt)`` — registers
-    an input handler for Type B commands requiring user text input.
-  - ``register_callback_handlers(client, owner_id)`` — wires the callback
-    query router onto the helper bot client.
-
-Callback data format:
-  - Panel navigation:  ``panel:<panel_id>:<extra>``
-  - Action execution:  ``action:<action_id>:<extra>``
-  - Input request:    ``input:<panel_id>:<input_id>``
-  - Close:            ``panel:_nav:close``
-  - Home:             ``panel:_nav:home``
-  - Back:             ``panel:_nav:back``
-
 ROOT MENU rules:
   - Root menu (nav_stack length 1) has ONLY Close — never Back or Home.
   - Submenus (nav_stack length > 1) have Back, Home, and Close.
@@ -41,7 +21,7 @@ from telethon.tl.custom import Button
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
-from backend.helper.panel_timer import set_content, stop_timer, destroy as timer_destroy
+from backend.helper.panel_timer import set_content, stop_timer
 from backend.helper.session_manager import (
     create_session as _create_session,
     get_session as _get_session,
@@ -50,6 +30,8 @@ from backend.helper.session_manager import (
     pop_nav as _pop_nav,
     reset_nav as _reset_nav,
     current_nav as _current_nav,
+    is_root_view as _is_root_view,
+    nav_depth as _nav_depth,
     set_current_extra as _set_current_extra,
     clear_session,
     clear_all_sessions,
@@ -61,7 +43,6 @@ _last_render: dict[tuple[int | None, int | None], tuple[str, tuple]] = {}
 
 
 def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
-    """Create a comparable representation of button callback data."""
     result = []
     for row in buttons:
         row_data = []
@@ -79,7 +60,6 @@ def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
 
 
 async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> bool:
-    """Edit the inline message, skipping silently if content hasn't changed."""
     key = (chat_id, msg_id)
     new_repr = (text, _buttons_repr(buttons))
     last = _last_render.get(key)
@@ -99,7 +79,6 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
 
 
 def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]:
-    """Safely resolve (chat_id, msg_id, inline_message_id) from any callback event."""
     chat_id = None
     msg_id = None
     inline_message_id = None
@@ -144,8 +123,6 @@ _inputs: dict[str, dict[str, InputConfig]] = {}
 
 
 class InlinePanelBuilder:
-    """Builds inline keyboard layouts for the helper bot."""
-
     def __init__(self):
         self._rows: list[list[Any]] = []
 
@@ -166,22 +143,11 @@ class InlinePanelBuilder:
         return [list(row) for row in self._rows]
 
 
-def _is_root(chat_id: int, msg_id: int) -> bool:
-    """Check if the current view is the root menu (nav_stack length <= 1)."""
-    session = _get_session(chat_id, msg_id)
-    if session is None:
-        return True
-    stack = session.get("nav_stack", [])
-    return len(stack) <= 1
-
-
 def _add_close_button(builder: InlinePanelBuilder) -> None:
-    """Append only a Close button — used for the root menu."""
     builder.add_row("✕ Close", "panel:_nav:close")
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
-    """Append Back, Home, and Close buttons — used for submenus."""
     builder.add_buttons(
         ("‹ Back", "panel:_nav:back"),
         ("🏠 Home", "panel:_nav:home"),
@@ -190,7 +156,6 @@ def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
 
 
 def _has_nav_buttons(buttons: list) -> bool:
-    """Check if the button list already contains any navigation buttons."""
     for row in buttons:
         if isinstance(row, list):
             for btn in row:
@@ -210,12 +175,6 @@ def _finalize_panel(
     title: str, body: str, buttons: list | None, panel_id: str,
     chat_id: int | None = None, msg_id: int | None = None,
 ) -> tuple[str, str, list]:
-    """Ensure every panel has the correct navigation buttons.
-
-    Root menu (nav_stack length 1): only Close.
-    Submenus (nav_stack length > 1): Back, Home, Close.
-    Never mutates the input button list — always builds a fresh copy.
-    """
     if buttons is None:
         buttons = []
     if _has_nav_buttons(buttons):
@@ -230,7 +189,7 @@ def _finalize_panel(
 
     is_root = True
     if chat_id is not None and msg_id is not None:
-        is_root = _is_root(chat_id, msg_id)
+        is_root = _is_root_view(chat_id, msg_id)
 
     if is_root:
         _add_close_button(builder)
@@ -270,7 +229,6 @@ def get_input(panel_id: str, input_id: str) -> InputConfig | None:
 
 
 async def _safe_answer(event) -> None:
-    """Answer the callback query to remove the loading spinner."""
     try:
         await event.answer()
     except Exception:
@@ -278,7 +236,6 @@ async def _safe_answer(event) -> None:
 
 
 def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list) -> None:
-    """Sync panel content to the timer so countdown re-renders show current state."""
     try:
         set_content(chat_id, msg_id, title, body, buttons)
     except Exception:
@@ -286,7 +243,6 @@ def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
 
 
 def _extract_render_result(result) -> tuple[str, str, list]:
-    """Normalize a handler return value into (title, body, buttons)."""
     if result is None:
         return "", "", []
     if isinstance(result, tuple):
@@ -300,7 +256,6 @@ def _extract_render_result(result) -> tuple[str, str, list]:
 
 
 async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
-    """Finalize panel buttons, sync timer, and edit the message."""
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
         return
@@ -312,7 +267,6 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
 
 
 def register_callback_handlers(client, owner_id: int) -> None:
-    """Wire the callback query router onto the helper bot client."""
     logger.info("[PANEL] callback handler registered: owner_id=%s", owner_id)
 
     @client.on(events.CallbackQuery())
@@ -366,8 +320,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.warning("[CALLBACK] no panel registered for id='%s'", panel_id)
         return
 
-    _push_nav(chat_id, msg_id, panel_id)
-    _set_current_extra(chat_id, msg_id, extra)
+    _push_nav(chat_id, msg_id, panel_id, extra)
     clear_pending(owner_id)
 
     try:
@@ -378,15 +331,6 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
 
 async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None:
-    """Completely destroy the current inline panel.
-
-    - Cancel and remove the auto-close timer
-    - Clear pending input state
-    - Clear the panel session (navigation stack)
-    - Clear the render cache
-    - Edit the inline message to a 'closed' state with no buttons
-    - Fallback to self_client.edit_message if event.edit fails
-    """
     from backend.helper.inline_engine import get_self_client
 
     clear_pending(owner_id)
@@ -412,14 +356,12 @@ async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None
 
 
 async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
-    """Handle Back, Home, and Close navigation buttons."""
     if action == "close":
         await _handle_close(event, chat_id, msg_id, owner_id)
         return
 
     if action == "home":
-        _reset_nav(chat_id, msg_id, "help")
-        _set_current_extra(chat_id, msg_id, "")
+        _reset_nav(chat_id, msg_id, "help", "")
         clear_pending(owner_id)
         handler = get_panel("help")
         if handler is None:
@@ -432,19 +374,20 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         return
 
     if action == "back":
-        prev_panel = _pop_nav(chat_id, msg_id)
-        _set_current_extra(chat_id, msg_id, "")
+        prev = _pop_nav(chat_id, msg_id)
         clear_pending(owner_id)
-        if prev_panel is None:
-            prev_panel = "help"
+        if prev is None:
+            prev = ("help", "")
+        prev_panel, prev_extra = prev
         handler = get_panel(prev_panel)
         if handler is None:
             prev_panel = "help"
+            prev_extra = ""
             handler = get_panel("help")
         if handler is None:
             return
         try:
-            result = await handler(event, "")
+            result = await handler(event, prev_extra)
             await _render_and_edit(event, result, prev_panel, chat_id, msg_id)
         except Exception:
             logger.exception("[CALLBACK] back navigation FAILED")
@@ -468,7 +411,8 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
 
     try:
         result = await handler(event, extra)
-        current_panel = _current_nav(chat_id, msg_id) or action_id
+        nav = _current_nav(chat_id, msg_id)
+        current_panel = nav[0] if nav else action_id
         await _render_and_edit(event, result, current_panel, chat_id, msg_id)
     except Exception:
         logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
