@@ -1,18 +1,12 @@
 """
 Session manager — owns all panel session state.
 
-This module is the single owner of panel session data (navigation stacks,
-session IDs, and the session registry). Both ``panels.py`` and
-``panel_timer.py`` import from here, so neither needs to import the other
-for session-related operations.
-
 The navigation stack stores (panel_id, extra) tuples so that different
 views within the same panel (e.g. help root vs help category) are
 distinguishable.  Root is always stack length 1.
 
-Session lifecycle:
-  Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
-  Nothing survives after Destroy.
+Sessions are keyed by (chat_id, msg_id).  For inline messages that lack
+a msg_id, the inline_message_id string is used as a secondary lookup key.
 """
 import logging
 
@@ -20,10 +14,13 @@ logger = logging.getLogger(__name__)
 
 _session_counter: int = 0
 _sessions: dict[tuple[int, int], dict] = {}
+_inline_sessions: dict[str, tuple[int, int]] = {}
 
 
-def create_session(chat_id: int, msg_id: int, panel_type: str = "unknown", extra: str = "") -> str:
-    """Create a new panel session with a unique ID."""
+def create_session(
+    chat_id: int, msg_id: int, panel_type: str = "unknown",
+    extra: str = "", inline_message_id: str = "",
+) -> str:
     global _session_counter
     _session_counter += 1
     sid = f"PANEL-SESSION-{_session_counter:06d}"
@@ -33,7 +30,10 @@ def create_session(chat_id: int, msg_id: int, panel_type: str = "unknown", extra
         "msg_id": msg_id,
         "panel_type": panel_type,
         "nav_stack": [(panel_type, extra)],
+        "inline_message_id": inline_message_id,
     }
+    if inline_message_id:
+        _inline_sessions[inline_message_id] = (chat_id, msg_id)
     return sid
 
 
@@ -41,6 +41,15 @@ def get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
     if chat_id is None or msg_id is None:
         return None
     return _sessions.get((chat_id, msg_id))
+
+
+def get_session_by_inline_id(inline_message_id: str | None) -> dict | None:
+    if not inline_message_id:
+        return None
+    key = _inline_sessions.get(inline_message_id)
+    if key is None:
+        return None
+    return _sessions.get(key)
 
 
 def find_session_by_chat(chat_id: int) -> dict | None:
@@ -51,10 +60,6 @@ def find_session_by_chat(chat_id: int) -> dict | None:
 
 
 def push_nav(chat_id: int, msg_id: int, panel_id: str, extra: str = "") -> None:
-    """Push a (panel_id, extra) view onto the navigation stack.
-
-    Skips if the exact same view is already on top.
-    """
     session = get_session(chat_id, msg_id)
     if session is None:
         create_session(chat_id, msg_id, panel_id, extra)
@@ -67,7 +72,6 @@ def push_nav(chat_id: int, msg_id: int, panel_id: str, extra: str = "") -> None:
 
 
 def pop_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
-    """Pop the current view and return the previous (panel_id, extra), or None."""
     session = get_session(chat_id, msg_id)
     if session is None:
         return None
@@ -82,7 +86,6 @@ def pop_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
 
 
 def reset_nav(chat_id: int, msg_id: int, panel_id: str = "help", extra: str = "") -> None:
-    """Reset the navigation stack to a single root view."""
     session = get_session(chat_id, msg_id)
     if session is None:
         create_session(chat_id, msg_id, panel_id, extra)
@@ -91,7 +94,6 @@ def reset_nav(chat_id: int, msg_id: int, panel_id: str = "help", extra: str = ""
 
 
 def current_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
-    """Return the (panel_id, extra) at the top of the stack, or None."""
     session = get_session(chat_id, msg_id)
     if session is None:
         return None
@@ -103,7 +105,6 @@ def current_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
 
 
 def is_root_view(chat_id: int, msg_id: int) -> bool:
-    """True when the current view is the root (stack length <= 1)."""
     session = get_session(chat_id, msg_id)
     if session is None:
         return True
@@ -112,7 +113,6 @@ def is_root_view(chat_id: int, msg_id: int) -> bool:
 
 
 def nav_depth(chat_id: int, msg_id: int) -> int:
-    """Return the current navigation stack depth."""
     session = get_session(chat_id, msg_id)
     if session is None:
         return 0
@@ -120,7 +120,6 @@ def nav_depth(chat_id: int, msg_id: int) -> int:
 
 
 def set_current_extra(chat_id: int, msg_id: int, extra: str) -> None:
-    """Update extra on the topmost stack entry."""
     session = get_session(chat_id, msg_id)
     if session is None:
         return
@@ -138,8 +137,13 @@ def set_current_extra(chat_id: int, msg_id: int, extra: str) -> None:
 def clear_session(chat_id: int | None, msg_id: int | None) -> None:
     if chat_id is None or msg_id is None:
         return
-    _sessions.pop((chat_id, msg_id), None)
+    session = _sessions.pop((chat_id, msg_id), None)
+    if session:
+        imid = session.get("inline_message_id", "")
+        if imid:
+            _inline_sessions.pop(imid, None)
 
 
 def clear_all_sessions() -> None:
     _sessions.clear()
+    _inline_sessions.clear()

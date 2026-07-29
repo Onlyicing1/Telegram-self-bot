@@ -4,12 +4,9 @@ Inline panel system for the helper bot.
 ROOT MENU rules:
   - Root menu (nav_stack length 1) has ONLY Close — never Back or Home.
   - Submenus (nav_stack length > 1) have Back, Home, and Close.
-  - The root menu is always rendered deterministically — navigation never
-    mutates its button layout.
 
 SESSION LIFECYCLE:
   Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
-  Nothing survives after Destroy. No leaked session, timer, callback, or input.
 """
 import asyncio
 import logging
@@ -25,6 +22,7 @@ from backend.helper.panel_timer import set_content, stop_timer
 from backend.helper.session_manager import (
     create_session as _create_session,
     get_session as _get_session,
+    get_session_by_inline_id as _get_session_by_inline_id,
     find_session_by_chat as _find_session_by_chat,
     push_nav as _push_nav,
     pop_nav as _pop_nav,
@@ -64,17 +62,20 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
     new_repr = (text, _buttons_repr(buttons))
     last = _last_render.get(key)
     if last == new_repr:
+        logger.info("[CALLBACK] edit skipped — content unchanged (key=%s:%s)", chat_id, msg_id)
         return False
     try:
         await event.edit(text, buttons=buttons if buttons else [])
         _last_render[key] = new_repr
+        logger.info("[CALLBACK] edit OK (key=%s:%s)", chat_id, msg_id)
         return True
     except Exception as exc:
         msg_lower = str(exc).lower()
         if "not modified" in msg_lower:
             _last_render[key] = new_repr
+            logger.info("[CALLBACK] edit not-modified (key=%s:%s)", chat_id, msg_id)
             return False
-        logger.warning("[CALLBACK] edit failed: %s", exc)
+        logger.warning("[CALLBACK] edit FAILED: %s (key=%s:%s)", exc, chat_id, msg_id)
         return False
 
 
@@ -258,6 +259,7 @@ def _extract_render_result(result) -> tuple[str, str, list]:
 async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
+        logger.warning("[CALLBACK] render_and_edit: empty result for panel='%s'", panel_id)
         return
     title, body, buttons = _finalize_panel(title, body, buttons, panel_id, chat_id, msg_id)
     from backend.helper.panel_render import render_edit
@@ -266,8 +268,35 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     await _safe_edit(event, text, built_buttons, chat_id, msg_id)
 
 
+def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> dict | None:
+    """Look up session by (chat_id, msg_id), falling back to inline_message_id."""
+    session = _get_session(chat_id, msg_id)
+    if session is not None:
+        logger.info(
+            "[CALLBACK] session lookup OK by (chat_id=%s, msg_id=%s) → session_id=%s",
+            chat_id, msg_id, session.get("session_id", "?"),
+        )
+        return session
+
+    if inline_message_id:
+        session = _get_session_by_inline_id(inline_message_id)
+        if session is not None:
+            logger.info(
+                "[CALLBACK] session lookup OK by inline_message_id='%s' → session_id=%s",
+                inline_message_id, session.get("session_id", "?"),
+            )
+            return session
+
+    logger.warning(
+        "[CALLBACK] session lookup FAILED: chat_id=%s msg_id=%s inline_message_id='%s' — "
+        "callback will be dropped",
+        chat_id, msg_id, inline_message_id or "",
+    )
+    return None
+
+
 def register_callback_handlers(client, owner_id: int) -> None:
-    logger.info("[PANEL] callback handler registered: owner_id=%s", owner_id)
+    logger.info("[PANEL] callback handler registered: owner_id=%s client_id=%s", owner_id, id(client))
 
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
@@ -275,63 +304,101 @@ def register_callback_handlers(client, owner_id: int) -> None:
         data_raw = event.data
         data = data_raw.decode("utf-8") if data_raw else ""
 
-        if chat_id is None and inline_msg_id is None:
-            logger.warning("[PANEL] callback unresolvable: no chat_id and no inline_message_id")
+        sender_id = getattr(event, "sender_id", None)
+
+        logger.info(
+            "[CALLBACK] ─── INCOMING ─── data='%s' sender_id=%s owner_id=%s "
+            "chat_id=%s msg_id=%s inline_msg_id='%s'",
+            data, sender_id, owner_id,
+            chat_id, msg_id, inline_msg_id or "",
+        )
+
+        if chat_id is None and not inline_msg_id:
+            logger.warning("[CALLBACK] REJECT: unresolvable — no chat_id and no inline_message_id")
+            await _safe_answer(event)
             return
 
         if not is_owner(event, owner_id):
+            logger.info("[CALLBACK] REJECT: not owner (sender_id=%s owner_id=%s)", sender_id, owner_id)
             await _safe_answer(event)
             return
 
         if not data:
+            logger.warning("[CALLBACK] REJECT: empty callback data")
             await _safe_answer(event)
             return
 
-        if _get_session(chat_id, msg_id) is None:
+        session = _resolve_session(chat_id, msg_id, inline_msg_id)
+        if session is None:
+            logger.warning(
+                "[CALLBACK] REJECT: no session for chat_id=%s msg_id=%s inline_msg_id='%s'",
+                chat_id, msg_id, inline_msg_id or "",
+            )
             await _safe_answer(event)
             return
+
+        logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s", data, session.get("session_id", "?"))
 
         try:
             if data.startswith("panel:"):
-                await _handle_panel(event, data[6:], chat_id, msg_id, owner_id)
+                logger.info("[CALLBACK] → panel handler: remainder='%s'", data[6:])
+                await _handle_panel(event, data[6:], chat_id, msg_id, owner_id, inline_msg_id)
             elif data.startswith("action:"):
+                logger.info("[CALLBACK] → action handler: remainder='%s'", data[7:])
                 await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
             elif data.startswith("input:"):
+                logger.info("[CALLBACK] → input handler: remainder='%s'", data[6:])
                 await _handle_input(event, data[6:], owner_id, chat_id, msg_id)
             else:
-                logger.warning("[PANEL] unknown callback prefix: '%s'", data)
-        except Exception:
-            logger.exception("[PANEL] callback router error (data='%s')", data)
+                logger.warning("[CALLBACK] unknown callback prefix: '%s'", data)
+        except Exception as exc:
+            logger.exception("[CALLBACK] callback router error (data='%s'): %s", data, exc)
         finally:
             await _safe_answer(event)
 
 
-async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> None:
+async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int, inline_msg_id: str | None = None) -> None:
     parts = remainder.split(":", 1)
     panel_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
 
+    logger.info(
+        "[CALLBACK] _handle_panel: panel_id='%s' extra='%s' chat_id=%s msg_id=%s",
+        panel_id, extra, chat_id, msg_id,
+    )
+
     if panel_id == "_nav":
+        logger.info("[CALLBACK] → navigation: action='%s'", extra)
         await _handle_navigation(event, extra, chat_id, msg_id, owner_id)
         return
 
     handler = get_panel(panel_id)
     if handler is None:
-        logger.warning("[CALLBACK] no panel registered for id='%s'", panel_id)
+        logger.warning(
+            "[CALLBACK] _handle_panel: NO HANDLER for panel_id='%s' — "
+            "registered panels: %s",
+            panel_id, list(_panels.keys()),
+        )
         return
+
+    logger.info("[CALLBACK] _handle_panel: handler found for '%s', calling...", panel_id)
 
     _push_nav(chat_id, msg_id, panel_id, extra)
     clear_pending(owner_id)
 
     try:
         result = await handler(event, extra)
+        logger.info("[CALLBACK] _handle_panel: handler returned, rendering... (panel='%s')", panel_id)
         await _render_and_edit(event, result, panel_id, chat_id, msg_id)
-    except Exception:
-        logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
+        logger.info("[CALLBACK] _handle_panel: COMPLETE for panel='%s'", panel_id)
+    except Exception as exc:
+        logger.exception("[CALLBACK] _handle_panel: handler '%s' FAILED: %s", panel_id, exc)
 
 
 async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None:
     from backend.helper.inline_engine import get_self_client
+
+    logger.info("[CALLBACK] _handle_close: chat_id=%s msg_id=%s", chat_id, msg_id)
 
     clear_pending(owner_id)
     stop_timer(chat_id, msg_id)
@@ -342,20 +409,24 @@ async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None
     try:
         await event.edit(closed_text, buttons=[])
         _last_render[(chat_id, msg_id)] = (closed_text, ())
+        logger.info("[CALLBACK] _handle_close: edit OK")
         return
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[CALLBACK] _handle_close: event.edit failed: %s", exc)
 
     self_client = get_self_client()
     if self_client is not None and chat_id and msg_id:
         try:
             await self_client.edit_message(chat_id, msg_id, message=closed_text, buttons=[])
             _last_render[(chat_id, msg_id)] = (closed_text, ())
-        except Exception:
-            pass
+            logger.info("[CALLBACK] _handle_close: self_client.edit_message OK")
+        except Exception as exc:
+            logger.warning("[CALLBACK] _handle_close: self_client.edit_message FAILED: %s", exc)
 
 
 async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
+    logger.info("[CALLBACK] _handle_navigation: action='%s' chat_id=%s msg_id=%s", action, chat_id, msg_id)
+
     if action == "close":
         await _handle_close(event, chat_id, msg_id, owner_id)
         return
@@ -365,12 +436,14 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         clear_pending(owner_id)
         handler = get_panel("help")
         if handler is None:
+            logger.warning("[CALLBACK] _handle_navigation: no 'help' panel registered")
             return
         try:
             result = await handler(event, "")
             await _render_and_edit(event, result, "help", chat_id, msg_id)
-        except Exception:
-            logger.exception("[CALLBACK] home navigation FAILED")
+            logger.info("[CALLBACK] _handle_navigation: home COMPLETE")
+        except Exception as exc:
+            logger.exception("[CALLBACK] _handle_navigation: home FAILED: %s", exc)
         return
 
     if action == "back":
@@ -379,18 +452,21 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         if prev is None:
             prev = ("help", "")
         prev_panel, prev_extra = prev
+        logger.info("[CALLBACK] _handle_navigation: back → panel='%s' extra='%s'", prev_panel, prev_extra)
         handler = get_panel(prev_panel)
         if handler is None:
             prev_panel = "help"
             prev_extra = ""
             handler = get_panel("help")
         if handler is None:
+            logger.warning("[CALLBACK] _handle_navigation: back — no handler for '%s'", prev_panel)
             return
         try:
             result = await handler(event, prev_extra)
             await _render_and_edit(event, result, prev_panel, chat_id, msg_id)
-        except Exception:
-            logger.exception("[CALLBACK] back navigation FAILED")
+            logger.info("[CALLBACK] _handle_navigation: back COMPLETE")
+        except Exception as exc:
+            logger.exception("[CALLBACK] _handle_navigation: back FAILED: %s", exc)
         return
 
     if action == "noop":
@@ -402,9 +478,15 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
     action_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
 
+    logger.info("[CALLBACK] _handle_action: action_id='%s' extra='%s'", action_id, extra)
+
     handler = get_action(action_id)
     if handler is None:
-        logger.warning("[CALLBACK] no action registered for id='%s'", action_id)
+        logger.warning(
+            "[CALLBACK] _handle_action: NO HANDLER for action_id='%s' — "
+            "registered actions: %s",
+            action_id, list(_actions.keys()),
+        )
         return
 
     clear_pending(owner_id)
@@ -414,8 +496,9 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
         nav = _current_nav(chat_id, msg_id)
         current_panel = nav[0] if nav else action_id
         await _render_and_edit(event, result, current_panel, chat_id, msg_id)
-    except Exception:
-        logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
+        logger.info("[CALLBACK] _handle_action: COMPLETE for action='%s'", action_id)
+    except Exception as exc:
+        logger.exception("[CALLBACK] _handle_action: '%s' FAILED: %s", action_id, exc)
 
 
 async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_id: int) -> None:
@@ -423,16 +506,22 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     panel_id = parts[0]
     input_id = parts[1] if len(parts) > 1 else ""
 
+    logger.info("[CALLBACK] _handle_input: panel_id='%s' input_id='%s'", panel_id, input_id)
+
     input_cfg = get_input(panel_id, input_id)
     if input_cfg is None:
-        logger.warning("[CALLBACK] no input registered: panel='%s', input_id='%s'", panel_id, input_id)
+        logger.warning(
+            "[CALLBACK] _handle_input: NO INPUT registered for panel='%s' input_id='%s' — "
+            "registered inputs: %s",
+            panel_id, input_id, {k: list(v.keys()) for k, v in _inputs.items()},
+        )
         return
 
     prompt = input_cfg.get("prompt", "Enter input:")
     handler = input_cfg.get("handler")
 
     if handler is None:
-        logger.warning("[CALLBACK] input config has no handler")
+        logger.warning("[CALLBACK] _handle_input: config has no handler")
         return
 
     clear_pending(owner_id)
@@ -448,3 +537,4 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)
     await _safe_edit(event, prompt, built, chat_id, msg_id)
+    logger.info("[CALLBACK] _handle_input: prompt sent for panel='%s'", panel_id)

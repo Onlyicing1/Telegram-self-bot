@@ -80,25 +80,26 @@ def get_inline_builder(query_key: str) -> InlineResultBuilder | None:
     return _builders.get(query_key)
 
 
-async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int]:
+async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int, str]:
     """Trigger inline mode and auto-send the first result.
 
-    Returns (success, chat_id, msg_id). msg_id is 0 on failure.
+    Returns (success, chat_id, msg_id, inline_message_id).
+    msg_id is 0 on failure. inline_message_id is "" when not applicable.
     """
     if not _helper_username:
         logger.warning("trigger: no helper username set — cannot inline query")
-        return False, chat_id, 0
+        return False, chat_id, 0, ""
 
     try:
         results = await self_client.inline_query(_helper_username, query, entity=chat_id)
         if not results:
             logger.warning("trigger: helper returned zero results for query '%s'", query)
-            return False, chat_id, 0
+            return False, chat_id, 0, ""
         msg = await results[0].click(chat_id)
         if msg is not None:
             msg_id = getattr(msg, "id", 0) or 0
             msg_chat_id = getattr(msg, "chat_id", 0) or chat_id
-            inline_msg_id = getattr(msg, "inline_message_id", None)
+            inline_msg_id = getattr(msg, "inline_message_id", None) or ""
             peer_id = None
             try:
                 peer = getattr(msg, "peer_id", None)
@@ -116,12 +117,12 @@ async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int
             )
             if not msg_id:
                 logger.warning("trigger: click() returned message with id=0")
-            return True, msg_chat_id, msg_id
+            return True, msg_chat_id, msg_id, inline_msg_id
         logger.warning("trigger: click() returned None for query '%s'", query)
-        return False, chat_id, 0
+        return False, chat_id, 0, ""
     except Exception as exc:
         logger.error("trigger: exception for query '%s': %s", query, exc)
-        return False, chat_id, 0
+        return False, chat_id, 0, ""
 
 
 def register_inline_handler(helper_client, owner_id: int) -> None:
