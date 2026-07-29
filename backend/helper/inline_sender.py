@@ -18,7 +18,6 @@ from backend.helper.panel_timer import init_panel, set_content
 from backend.helper.session_manager import (
     create_session as _create_session,
     find_session_by_chat as _find_session_by_chat,
-    get_session as _get_session,
     push_nav as _push_nav,
     clear_session,
 )
@@ -29,6 +28,7 @@ logger = logging.getLogger(__name__)
 async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     helper_username = inline_engine.get_helper_username()
     if not helper_username:
+        logger.warning("[PANEL] send_inline_panel: no helper username — aborting")
         return False
 
     existing = _find_session_by_chat(chat_id)
@@ -76,21 +76,25 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
             clear_session(old_chat_id, old_msg_id)
 
     try:
-        success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
+        success, msg_chat_id, msg_id, inline_msg_id = await inline_engine.trigger(self_client, chat_id, query)
         logger.info(
-            "[PANEL] PANEL CREATED query='%s' trigger_chat_id=%s trigger_msg_id=%s "
-            "success=%s init_panel_key='%s:%s'",
-            query, msg_chat_id, msg_id, success,
-            msg_chat_id, msg_id,
+            "[PANEL] PANEL CREATED query='%s' chat_id=%s msg_id=%s "
+            "inline_msg_id='%s' success=%s",
+            query, msg_chat_id, msg_id, inline_msg_id, success,
         )
         if success and msg_id:
             parts = query.split(":", 1)
             panel_id = parts[0]
             extra = parts[1] if len(parts) > 1 else ""
-            _create_session(msg_chat_id, msg_id, panel_type=panel_id, extra=extra)
+            _create_session(
+                msg_chat_id, msg_id,
+                panel_type=panel_id, extra=extra,
+                inline_message_id=inline_msg_id,
+            )
             init_panel(self_client, msg_chat_id, msg_id)
         return success
     except Exception:
+        logger.exception("[PANEL] send_inline_panel: exception")
         return False
 
 
