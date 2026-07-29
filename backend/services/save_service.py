@@ -18,10 +18,9 @@ from telethon.tl.types import (
 from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
-
-_MAX_DEEP_BYTES = 50 * 1024 * 1024
 
 _MEDIA_TYPE_MAP = {
     "image/jpeg": "Photo",
@@ -250,11 +249,13 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
         if not media:
             return "⚠️ Replied message has no downloadable media."
 
-        if file_size and file_size > _MAX_DEEP_BYTES:
+        max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
+        if file_size and file_size > max_bytes:
             mb = file_size / (1024 * 1024)
+            limit_mb = settings_service.max_deep_save_mb()
             return (
                 f"⚠️ File is {mb:.1f} MB — exceeds the "
-                f"{_MAX_DEEP_BYTES // (1024 * 1024)} MB deep-save limit.\n"
+                f"{limit_mb} MB deep-save limit.\n"
                 "Use `.save f` for a forward save instead."
             )
 

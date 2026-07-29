@@ -8,6 +8,7 @@ import logging
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,10 @@ async def do_list(owner_id: int) -> str:
 async def do_clean(owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        deleted = db_client.clean_logs(owner_id, days=7)
+        days = settings_service.log_cleanup_days()
+        deleted = db_client.clean_logs(owner_id, days=days)
         record_event("organize", "clean", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        return f"🧹 Cleaned `{deleted}` log entries older than 7 days."
+        return f"🧹 Cleaned `{deleted}` log entries older than {days} days."
     except Exception as exc:
         logger.error("organize clean failed: %s", exc)
         record_event("organize", "clean", 0, "ERROR", str(exc))

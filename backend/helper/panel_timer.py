@@ -1,7 +1,7 @@
 """
 PanelTimer — single-message auto-close timer for inline panels.
 
-Respects the global auto-close preference (panel_settings).
+Respects the global auto-close preference (settings_service).
 When auto-close is OFF globally, no timer task is created at all.
 
 When ON, a single asyncio task per panel edits the SAME inline message
@@ -13,13 +13,11 @@ No second message. No new messages. Only edits.
 import asyncio
 import logging
 
-from backend.helper.panel_settings import is_auto_close_enabled
+from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
-_DURATION = 120
 _COUNTDOWN_INTERVAL = 30
-_COUNTDOWN_VALUES = [90, 60, 30]
 
 
 class _PanelEntry:
@@ -57,7 +55,7 @@ def init_panel(self_client, chat_id: int, msg_id: int, title: str = "LifeOS", bo
     entry.body = body
     entry.buttons = buttons or []
     _panels[k] = entry
-    if is_auto_close_enabled():
+    if settings_service.is_auto_close_enabled():
         _start_timer(self_client, chat_id, msg_id, entry)
 
 
@@ -74,8 +72,9 @@ def set_content(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
 
 
 def _start_timer(self_client, chat_id: int, msg_id: int, entry: _PanelEntry) -> None:
-    entry.expire_at = _now() + _DURATION
-    entry.task = asyncio.create_task(_timer_loop(self_client, chat_id, msg_id))
+    duration = settings_service.panel_auto_close_seconds()
+    entry.expire_at = _now() + duration
+    entry.task = asyncio.create_task(_timer_loop(self_client, chat_id, msg_id, duration))
 
 
 def _cancel_entry_task(entry: _PanelEntry) -> None:
@@ -90,20 +89,27 @@ def _cancel_task(k: str) -> None:
         _cancel_entry_task(entry)
 
 
-async def _timer_loop(self_client, chat_id: int, msg_id: int) -> None:
-    """Single task: countdown every 30s via edits, then delete at 120s."""
+async def _timer_loop(self_client, chat_id: int, msg_id: int, duration: int) -> None:
+    """Single task: countdown via edits, then delete at expiry.
+
+    The countdown interval is fixed at 30s. The number of countdown
+    steps is computed from the DB-backed duration so the timer always
+    matches the configured auto-close seconds.
+    """
     try:
-        for value in _COUNTDOWN_VALUES:
+        steps = max(1, duration // _COUNTDOWN_INTERVAL)
+        for i in range(steps):
             await asyncio.sleep(_COUNTDOWN_INTERVAL)
             entry = _panels.get(_key(chat_id, msg_id))
             if entry is None or entry.task is None or entry.task.done():
                 return
-            if not is_auto_close_enabled():
+            if not settings_service.is_auto_close_enabled():
                 return
-            await _edit_countdown(self_client, chat_id, msg_id, value)
-        await asyncio.sleep(_COUNTDOWN_INTERVAL)
+            remaining = duration - (i + 1) * _COUNTDOWN_INTERVAL
+            if remaining > 0:
+                await _edit_countdown(self_client, chat_id, msg_id, remaining)
         entry = _panels.get(_key(chat_id, msg_id))
-        if entry is None or not is_auto_close_enabled():
+        if entry is None or not settings_service.is_auto_close_enabled():
             return
         await destroy(self_client, chat_id, msg_id)
     except asyncio.CancelledError:

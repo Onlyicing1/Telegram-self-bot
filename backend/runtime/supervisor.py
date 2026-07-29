@@ -67,7 +67,7 @@ from backend.helper.inline_engine import (
 )
 from backend.helper.inline_sender import register_input_listener
 from backend.helper.callback_trace import configure as configure_callback_trace
-from backend.helper.panel_settings import load as load_panel_settings
+from backend.services import settings_service as settings_svc
 from backend.helper.panel_timer import stop_all as stop_all_timers
 from backend.helper.input_state import clear_all as clear_all_pending
 from backend.helper.target_context import clear_all as clear_all_targets
@@ -155,7 +155,7 @@ class RuntimeSupervisor:
         else:
             logger.info("[1/5] Using in-memory fallback")
 
-        load_panel_settings()
+        settings_svc.load_all()
 
         logger.info("[2/5] Building self-client")
         await self._build_and_register()

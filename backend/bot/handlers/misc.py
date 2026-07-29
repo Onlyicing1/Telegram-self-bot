@@ -26,6 +26,7 @@ from backend.helper import (
     register_panel,
     register_inline_builder,
     register_action,
+    register_input,
     send_inline_panel,
     render,
     render_edit,
@@ -174,31 +175,45 @@ async def _help_inline_builder(event, extra: str) -> list:
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
-async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    enabled = is_auto_close_enabled()
-    status = "ON" if enabled else "OFF"
-    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if enabled else 'stay open until manually closed'}."
+def _build_settings_body() -> str:
+    from backend.services import settings_service
+    auto_close = settings_service.is_auto_close_enabled()
+    close_secs = settings_service.panel_auto_close_seconds()
+    max_mb = settings_service.max_deep_save_mb()
+    batch = settings_service.delete_batch_size()
+    cleanup_days = settings_service.log_cleanup_days()
+    ac_status = "ON" if auto_close else "OFF"
+    return (
+        "**⚙️ LifeOS Settings**\n\n"
+        f"Auto Close: `{ac_status}`\n"
+        f"Auto-Close Delay: `{close_secs}s`\n"
+        f"Max Deep Save: `{max_mb} MB`\n"
+        f"Delete Batch Size: `{batch}`\n"
+        f"Log Retention: `{cleanup_days} days`"
+    )
+
+
+def _build_settings_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
-    return "Settings", body, builder.build()
+    builder.add_row("Toggle Auto Close", "action:settings_toggle_autoclose")
+    builder.add_row("Set Auto-Close Delay", "input:settings:auto_close_seconds")
+    builder.add_row("Set Max Deep Save (MB)", "input:settings:max_deep_save_mb")
+    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
+    builder.add_row("Set Log Retention (days)", "input:settings:log_cleanup_days")
+    return builder.build()
+
+
+async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
 async def _settings_inline_builder(event, extra: str) -> list:
-    enabled = is_auto_close_enabled()
-    status = "ON" if enabled else "OFF"
-    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if enabled else 'stay open until manually closed'}."
-    builder = InlinePanelBuilder()
-    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
-    return [render("Settings", body, builder.build())]
+    return [render("Settings", _build_settings_body(), _build_settings_buttons())]
 
 
 async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str, list] | None:
-    new_val = toggle_auto_close()
-    status = "ON" if new_val else "OFF"
-    body = f"**Auto Close: {status}**\n\nPanels will {'auto-delete after 120s' if new_val else 'stay open until manually closed'}."
-    builder = InlinePanelBuilder()
-    builder.add_row(f"Auto Close: {status}", "action:settings_toggle_autoclose")
-    return "Settings", body, builder.build()
+    toggle_auto_close()
+    return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
 async def _general_ping_action(event, extra: str) -> tuple[str, str, list] | None:
@@ -252,6 +267,94 @@ async def _general_health_action(event, extra: str) -> tuple[str, str, list] | N
     return "Health Dashboard", report, builder.build()
 
 
+async def _settings_auto_close_seconds_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 10 and 3600."
+    else:
+        ok = settings_service.set_panel_auto_close_seconds(int(text))
+        result = f"✅ Auto-close delay set to `{text}s`" if ok else "⚠️ Value must be between 10 and 3600."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings auto_close_seconds inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_max_deep_save_mb_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 500."
+    else:
+        ok = settings_service.set_max_deep_save_mb(int(text))
+        result = f"✅ Max deep save set to `{text} MB`" if ok else "⚠️ Value must be between 1 and 500."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings max_deep_save_mb inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_delete_batch_size_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 1000."
+    else:
+        ok = settings_service.set_delete_batch_size(int(text))
+        result = f"✅ Delete batch size set to `{text}`" if ok else "⚠️ Value must be between 1 and 1000."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings delete_batch_size inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_log_cleanup_days_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 365."
+    else:
+        ok = settings_service.set_log_cleanup_days(int(text))
+        result = f"✅ Log retention set to `{text} days`" if ok else "⚠️ Value must be between 1 and 365."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings log_cleanup_days inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
     register_panel("settings", _settings_panel_handler)
@@ -261,6 +364,22 @@ def _register_help_panel() -> None:
     register_action("general_ping", _general_ping_action)
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
+    register_input("settings", "auto_close_seconds", {
+        "handler": _settings_auto_close_seconds_handler,
+        "prompt": "**Auto-Close Delay**\n\nEnter the delay in seconds (10-3600):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "max_deep_save_mb", {
+        "handler": _settings_max_deep_save_mb_handler,
+        "prompt": "**Max Deep Save Size**\n\nEnter the maximum file size in MB (1-500):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "delete_batch_size", {
+        "handler": _settings_delete_batch_size_handler,
+        "prompt": "**Delete Batch Size**\n\nEnter the batch size for message deletion (1-1000):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "log_cleanup_days", {
+        "handler": _settings_log_cleanup_days_handler,
+        "prompt": "**Log Retention**\n\nEnter the number of days to retain logs (1-365):\n\n_Reply with the number below._",
+    })
 
 
 async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
