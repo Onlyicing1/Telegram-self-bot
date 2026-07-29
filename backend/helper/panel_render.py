@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_button(btn) -> types.KeyboardButtonCallback:
-    """Convert a single button (tuple OR TLObject) into KeyboardButtonCallback."""
     if isinstance(btn, tuple):
         text, data = btn[0], btn[1]
         return Button.inline(text, truncate_callback_data(str(data)))
@@ -35,7 +34,6 @@ def _normalize_button(btn) -> types.KeyboardButtonCallback:
 
 
 def _normalize_row(row) -> list:
-    """Normalize a single row (list of buttons OR a single button) into a list of Button objects."""
     if isinstance(row, types.KeyboardButtonRow):
         return row
     if isinstance(row, list):
@@ -44,7 +42,6 @@ def _normalize_row(row) -> list:
 
 
 def to_edit_buttons(buttons: list) -> list:
-    """Convert any button layout to list[list[Button]] for event.edit()."""
     if not buttons:
         return []
     result = []
@@ -58,7 +55,6 @@ def to_edit_buttons(buttons: list) -> list:
 
 
 def _to_inline_rows(buttons: list) -> list:
-    """Convert any button layout to list[KeyboardButtonRow] for ReplyInlineMarkup."""
     if not buttons:
         return []
     rows = []
@@ -78,8 +74,8 @@ def render(
 ) -> types.InputBotInlineResult:
     """Build a single inline result. Accepts tuples OR Button objects.
 
-    The root menu's initial render adds only a Close button (no Back/Home).
-    Submenus get Back, Home, and Close via _finalize_panel during callback edits.
+    Initial render always adds only Close (root menu).  Subsequent callback
+    edits add Back+Home+Close via _finalize_panel when the view is a submenu.
     """
     if buttons is None:
         buttons = []
@@ -122,7 +118,6 @@ def render_edit(
     body: str = "",
     buttons: list | None = None,
 ) -> tuple[str, list]:
-    """Return (text, buttons) for event.edit(). Accepts tuples OR Button objects."""
     if title and body:
         text = f"**{title}**\n\n{body}"
     elif title:
