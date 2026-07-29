@@ -8,10 +8,9 @@ import logging
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
-
-_BATCH = 100
 
 
 async def do_del_n(client, chat_id, n: int) -> str:
@@ -40,7 +39,7 @@ async def do_del_id(client, chat_id, start_id: int) -> str:
         msg_ids = []
         async for msg in client.iter_messages(chat_id, min_id=start_id - 1):
             msg_ids.append(msg.id)
-            if len(msg_ids) >= _BATCH:
+            if len(msg_ids) >= settings_service.delete_batch_size():
                 await client.delete_messages(chat_id, msg_ids)
                 msg_ids = []
         if msg_ids:

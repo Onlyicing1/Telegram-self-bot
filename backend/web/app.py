@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend.db import client as db_client
 from backend.health import snapshot as health_snapshot
+from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,15 @@ async def get_bio():
         return state or {}
     except Exception as exc:
         logger.error("api/bio error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/settings")
+async def get_settings():
+    try:
+        return settings_service.get_all()
+    except Exception as exc:
+        logger.error("api/settings error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
