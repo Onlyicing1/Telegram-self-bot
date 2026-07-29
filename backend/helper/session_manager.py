@@ -59,6 +59,13 @@ def find_session_by_chat(chat_id: int) -> dict | None:
     return None
 
 
+def find_session_by_msg_id(msg_id: int) -> dict | None:
+    for (_cid, mid), session in _sessions.items():
+        if mid == msg_id:
+            return session
+    return None
+
+
 def push_nav(chat_id: int, msg_id: int, panel_id: str, extra: str = "") -> None:
     session = get_session(chat_id, msg_id)
     if session is None:
