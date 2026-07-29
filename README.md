@@ -10,18 +10,28 @@ Built on **Telethon** + **Supabase** + **FastAPI** + **React**, deployed on **Re
 
 1. [What Is LifeOS?](#what-is-lifeos)
 2. [Architecture](#architecture)
-3. [Self Bot](#self-bot)
-4. [Helper Bot](#helper-bot)
-5. [Supabase](#supabase)
-6. [Quick Start](#quick-start)
-7. [Environment Variables](#environment-variables)
-8. [Creating the Helper Bot with BotFather](#creating-the-helper-bot-with-botfather)
-9. [Enabling Inline Mode](#enabling-inline-mode)
-10. [Deploying on Render](#deploying-on-render)
-11. [Commands](#commands)
-12. [Troubleshooting](#troubleshooting)
-13. [Update Instructions](#update-instructions)
-14. [Recovery Instructions](#recovery-instructions)
+3. [Runtime Supervisor](#runtime-supervisor)
+4. [Self Client](#self-client)
+5. [Helper Bot](#helper-bot)
+6. [Panel System](#panel-system)
+7. [Navigation](#navigation)
+8. [Callback Engine](#callback-engine)
+9. [Session System](#session-system)
+10. [Database Layer](#database-layer)
+11. [Bio Engine](#bio-engine)
+12. [Save Engine](#save-engine)
+13. [Retrieve](#retrieve)
+14. [Organizer](#organizer)
+15. [Diagnostics](#diagnostics)
+16. [Settings](#settings)
+17. [Database Panel](#database-panel)
+18. [Database](#database)
+19. [Quick Start](#quick-start)
+20. [Environment Variables](#environment-variables)
+21. [Helper Bot Setup](#helper-bot-setup)
+22. [Deploying on Render](#deploying-on-render)
+23. [Commands](#commands)
+24. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -36,8 +46,9 @@ LifeOS is a **self-bot** — it operates *your own* Telegram account via Teletho
 - **Discovery** — Full-text search across captions, filenames, save codes, and MIME types.
 - **Organizer** — Data overview, log cleanup, multi-message deletion.
 - **Health Dashboard** — `.health` shows process, Telegram, watchdog, bio cron, memory, CPU, uptime, and more.
-- **Interactive Help** — `.help` opens a numbered menu; reply with a number to navigate, reply `0` to go back.
+- **Interactive Panels** — `.help` opens an inline panel with category buttons. Tap to navigate, tap Close to dismiss.
 - **Helper Bot** (optional) — A secondary bot token for inline keyboards, callback queries, and interactive menus.
+- **Self-Healing** — A runtime supervisor with watchdog heartbeat and atomic recovery. Never stays in a broken state.
 
 ---
 
@@ -57,15 +68,15 @@ LifeOS is a **self-bot** — it operates *your own* Telegram account via Teletho
 │         │  business logic │  + callbacks      │                │
 │         └─────────────────┴───────────────────┘                │
 │                          │                                    │
-│                   ┌──────┴───────┐                            │
-│                   │  Bio Cron    │                            │
-│                   │  Engine      │                            │
-│                   └──────┬───────┘                            │
+│  ┌───────────────────────┴──────────────────────────────┐     │
+│  │              Runtime Supervisor                       │     │
+│  │  Watchdog (30s heartbeat) + Atomic Recovery           │     │
+│  └───────────────────────┬──────────────────────────────┘     │
 │                          │                                    │
-│                   ┌──────┴───────┐                            │
-│                   │  Supabase    │ ← service-role key           │
-│                   │  (optional)  │   in-memory fallback         │
-│                   └──────────────┘                            │
+│  ┌──────────┐  ┌─────────┴──┐  ┌──────────────┐              │
+│  │ Bio Cron  │  │ Panel Timer │  │  Supabase    │              │
+│  │ Engine    │  │ (auto-close)│  │ (optional)   │              │
+│  └──────────┘  └────────────┘  └──────────────┘              │
 └──────────────────────────────────────────────────────────────┘
                          │
                    ┌─────┴──────┐
@@ -74,21 +85,44 @@ LifeOS is a **self-bot** — it operates *your own* Telegram account via Teletho
                    └────────────┘
 ```
 
-**Single event loop.** The self-bot, helper bot, bio cron, and web server all share one asyncio loop. No threads, no multiprocessing. Clean shutdown cancels every task before disconnect.
+**Single event loop.** The self-bot, helper bot, bio cron, panel timers, web server, and watchdog all share one asyncio loop. No threads, no multiprocessing. Clean shutdown cancels every task before disconnect.
 
 ### Repository Structure
 
 ```
 backend/
-├── main.py              # asyncio entry point — startup + shutdown
+├── main.py              # asyncio entry point — delegates to RuntimeSupervisor
 ├── config.py            # env var loader
+├── diagnostics.py       # event recording + diagnostic reports
+├── health.py            # health snapshot for /health and .health
 ├── bot/                 # Self-bot layer (the brain)
 │   ├── client.py        # Telethon StringSession client factory
 │   ├── router.py        # registers all command handlers
-│   └── handlers/        # .ping, .save, .bio, .help, .health, etc.
+│   └── handlers/        # .ping, .save, .bio, .help, .health, .db, etc.
 ├── helper/              # Helper bot layer (inline UI)
 │   ├── client.py        # Bot token client factory
-│   └── panels.py        # InlinePanelBuilder + callback router
+│   ├── panels.py        # InlinePanelBuilder + callback router
+│   ├── inline_engine.py # Inline Mode core: trigger, builders, result factory
+│   ├── inline_sender.py # Self-bot side: send_inline_panel + input listener
+│   ├── input_state.py   # Pending input state for Type B commands
+│   ├── context.py       # Callback data encoding/decoding utilities
+│   ├── session_manager.py  # In-memory panel sessions + nav stack
+│   ├── panel_settings.py   # Global auto-close preference (DB-backed)
+│   ├── panel_timer.py   # Per-panel auto-close countdown timer
+│   ├── panel_render.py  # Panel rendering helpers
+│   └── ...
+├── runtime/             # Self-healing runtime
+│   ├── supervisor.py    # RuntimeSupervisor — watchdog + recovery
+│   ├── states.py        # RuntimeState enum
+│   └── managed_task.py  # Task wrapper
+├── services/            # Business logic (shared by commands + panels)
+│   ├── save_service.py
+│   ├── retrieve_service.py
+│   ├── delete_service.py
+│   ├── organize_service.py
+│   ├── database_service.py
+│   ├── bio_service.py
+│   └── discover_service.py
 ├── bio/
 │   └── engine.py        # Bio cron loop
 ├── db/
@@ -97,14 +131,59 @@ backend/
     └── app.py           # FastAPI — /health, /api/*, SPA serving
 
 src/                     # React dashboard (TypeScript + Vite + Tailwind)
-supabase/migrations/      # SQL migrations
+sql/                    # Per-table SQL schema scripts
+supabase/migrations/     # Migration history
 ```
 
 ---
 
-## Self Bot
+## Runtime Supervisor
 
-The **self-bot** is the brain of LifeOS. It connects to Telegram using your own account credentials (API ID, API Hash, and a StringSession) via Telethon. It processes all commands, manages the bio cron, saves media, and handles business logic.
+The `RuntimeSupervisor` (`backend/runtime/supervisor.py`) is the self-healing core of LifeOS. It replaces the simpler `main.py` orchestration with a watchdog-driven recovery system.
+
+### Watchdog
+
+- A single asyncio task runs forever at 30-second intervals.
+- Each tick performs a **real RPC** (`client.get_me()`) as the heartbeat.
+- **3 consecutive heartbeat failures** → the self-client is declared dead.
+- Recovery is **atomic** — lock-protected, so duplicate recoveries are impossible.
+
+### Recovery Sequence
+
+1. Stop bio cron.
+2. Stop helper bot.
+3. Clear all inline panel state (sessions, timers, pending inputs, targets).
+4. Cancel the run task and all orphan asyncio tasks.
+5. Dispose the dead client.
+6. Wait with exponential backoff (2s base, 300s max, 30% jitter).
+7. Build a new client, authorize, re-register all handlers.
+8. Reconnect callback trace and input listeners.
+9. Restart helper bot (if enabled).
+10. Resume bio cron.
+11. Verify with a fresh heartbeat RPC.
+12. Start a new run task.
+
+### Failure Modes
+
+- Up to **5 recovery attempts** with exponential backoff.
+- If all 5 fail → `sys.exit(1)` so Render restarts the process.
+- The process **never stays alive in a broken state**.
+
+### Runtime States
+
+```
+STARTING → CONNECTING → REGISTERING → READY
+                                        ↓
+                              RECOVERING → READY (success)
+                                        ↓
+                                     FAILED → sys.exit(1)
+```
+
+---
+
+## Self Client
+
+The **self-client** is the brain of LifeOS. It connects to Telegram using your own account credentials (API ID, API Hash, and a StringSession) via Telethon.
 
 ### How It Works
 
@@ -120,6 +199,7 @@ The **self-bot** is the brain of LifeOS. It connects to Telegram using your own 
 - **Edit-first:** All responses edit the triggering message. Zero spam.
 - **Headless:** No interactive prompts. The session string encodes the auth key.
 - **Auto-reconnect:** 5 retries, 2s delay, 60s flood-sleep threshold.
+- **Exactly one active client** at all times — the supervisor guarantees this.
 
 ---
 
@@ -127,7 +207,7 @@ The **self-bot** is the brain of LifeOS. It connects to Telegram using your own 
 
 The **helper bot** is an optional secondary Telegram client that uses a **bot token** (from BotFather) instead of a user session. It operates as a pure **Inline Engine + Callback Engine**:
 
-- **Inline Mode** — answers `InlineQuery` events by generating panel results (buttons, text).
+- **Inline Mode** — answers `InlineQuery` events by generating panel results (text + buttons).
 - **Callback queries** — handles button presses on inline messages.
 - **Never sends messages directly** — all UI is delivered through Inline Mode.
 
@@ -168,55 +248,151 @@ Helper edits the inline message in-place (zero spam)
 - **Type A commands** (no input needed) — tap button → execute immediately → edit panel with result.
 - **Type B commands** (need input) — tap button → panel becomes input screen → reply with text → execute → edit panel.
 - **Full backward compatibility** — `.save f`, `.bio on`, `.preview S391` etc. still work as edit-in-place commands.
-- **Inline panels** — `.help`, `.save`, `.bio`, `.db`, `.organize`, `.del`, `.find`, `.preview`, `.send` all open inline panels when called without arguments.
-
-### Command Types
-
-| Type | Description | Examples |
-|---|---|---|
-| **Type A** | No user input required — tap button → execute immediately | `.health`, `.bio on`, `.bio off`, `.db stats`, `.organize clean` |
-| **Type B** | Requires user input — panel becomes input screen, reply with text | `.save`, `.preview`, `.send`, `.bio text`, `.bio mood`, `.bio template`, `.find`, `.del` |
-
-### Architecture
-
-```
-Self Bot (brain)              Helper Bot (Inline + Callback Engine)
-     │                              │
-     │  .help (command)             │
-     ├─────────────────────►        │
-     │  inline_query("help")        │
-     │                              │  answers InlineQuery
-     │                              │  with panel result
-     │◄─────────────────────        │
-     │  self sends result           │
-     │  "OwnerName via @HelperBot"  │
-     │                              │
-     │  user taps button            │
-     │                              │  callback query
-     │                              │  → panel/action/input handler
-     │                              │  edits inline message
-     │                              │  (zero new messages)
-```
-
-### Helper Bot Modules
-
-```
-backend/helper/
-├── __init__.py          # Public API exports
-├── client.py            # Bot token client factory + username storage
-├── panels.py            # InlinePanelBuilder + callback router (panel/action/input)
-├── inline_engine.py     # Inline Mode core: trigger, builders, result factory
-├── inline_sender.py     # Self-bot side: send_inline_panel + input listener
-├── input_state.py       # Pending input state for Type B commands
-├── context.py           # Callback data encoding/decoding utilities
-└── tmp_context.py       # Temporary context store (e.g. reply message ref)
-```
+- **Auto-reconnect** — 5 attempts with exponential backoff. If exhausted, the self-bot continues without inline UI.
 
 ---
 
-## Supabase
+## Panel System
 
-LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persistence. Three tables store saved items, bio state, and structured logs.
+The panel system provides interactive inline UIs for commands that benefit from buttons and navigation. It lives in `backend/helper/`.
+
+### Components
+
+| Component | File | Role |
+|---|---|---|
+| InlinePanelBuilder | `panels.py` | Builds button layouts (rows of inline buttons) |
+| Panel handlers | `panels.py` | Registered functions that return `(title, body, buttons)` |
+| Action handlers | `panels.py` | Registered functions that execute an action and return a new panel |
+| Input handlers | `panels.py` | Registered configs for Type B text-input prompts |
+| Inline Engine | `inline_engine.py` | Generates `InputBotInlineResult` objects for InlineQuery answers |
+| Inline Sender | `inline_sender.py` | Self-bot side: triggers inline mode, auto-sends result, listens for text replies |
+| Panel Renderer | `panel_render.py` | Converts (title, body, buttons) into display text + button rows |
+| Panel Timer | `panel_timer.py` | Per-panel auto-close countdown (120s, edits every 30s) |
+
+### Panel Types
+
+| Panel ID | Trigger | Description |
+|---|---|---|
+| `help` | `.help` | Category menu → command list per category |
+| `settings` | Settings button in help | Auto-close toggle |
+| `context` | `.panel` (reply to msg) | Forward save, deep save, preview |
+| `context_error` | `.panel` (no reply) | Error: "reply to a message first" |
+| `health` | `.health` | Health dashboard with refresh button |
+| `kill` | `.kill` | Diagnostic snapshot + stalled-task recovery |
+| `logs` | `.logs` | Event log with filter buttons |
+
+### Button Conventions
+
+- **Root menu** (nav stack length 1): only a **Close** button.
+- **Submenus** (nav stack length > 1): **Back**, **Home**, and **Close** buttons.
+- Callback data is truncated to 64 bytes (Telegram limit) via `truncate_callback_data()`.
+
+---
+
+## Navigation
+
+Navigation within panels uses an in-memory stack stored per session.
+
+### Nav Stack
+
+Each session has a `nav_stack` — a list of `(panel_id, extra)` tuples:
+
+- **Root** is always stack length 1.
+- **Push** — navigating to a submenu pushes a new `(panel_id, extra)` entry.
+- **Pop** (Back) — removes the top entry, returns to the previous panel.
+- **Reset** (Home) — clears the stack to `[("help", "")]`.
+- **Close** — destroys the session entirely.
+
+### Navigation Buttons
+
+| Button | Callback Data | Behavior |
+|---|---|---|
+| ‹ Back | `panel:_nav:back` | Pop nav stack, render previous panel |
+| 🏠 Home | `panel:_nav:home` | Reset to help root, render help menu |
+| ✕ Close | `panel:_nav:close` | Destroy session, edit message to "Panel closed" |
+
+### Close Button
+
+Both the Close button and the auto-close timer call the same `close_panel()`
+function, ensuring identical cleanup: clear pending input, stop timer, clear
+session, clear render cache, edit message to closed state.
+
+---
+
+## Callback Engine
+
+The callback engine routes button presses (`CallbackQuery` events) to the
+correct handler.
+
+### Routing
+
+```
+CallbackQuery event
+    │
+    ├── Resolve (chat_id, msg_id, inline_message_id)
+    ├── Check is_owner()
+    ├── Look up session by (chat_id, msg_id) or inline_message_id
+    ├── Decode callback data
+    │
+    ├── "panel:..."  → _handle_panel  → panel handler → render + edit
+    ├── "action:..." → _handle_action → action handler → render + edit
+    ├── "input:..."  → _handle_input  → set pending input → prompt + edit
+    └── "panel:_nav:..." → _handle_navigation → back/home/close
+```
+
+### Render Deduplication
+
+Before editing, the callback engine compares the new `(text, buttons_repr)`
+against the last render stored in `_last_render`. If identical, the edit is
+skipped — avoiding Telegram "not modified" errors.
+
+---
+
+## Session System
+
+Sessions are **in-memory only** — they do not persist to the database.
+
+### Session Structure
+
+```python
+{
+    "session_id": "PANEL-SESSION-000001",
+    "chat_id": 123456,
+    "msg_id": 789,
+    "panel_type": "help",
+    "nav_stack": [("help", "")],
+    "inline_message_id": "",  # secondary lookup key
+}
+```
+
+### Lookup
+
+Sessions are keyed by `(chat_id, msg_id)`. For inline messages that lack a
+`msg_id`, the `inline_message_id` string is used as a secondary lookup key.
+
+### Lifecycle
+
+```
+Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
+```
+
+- **Create** — when a panel is first triggered via inline mode.
+- **Destroy** — on Close button, auto-close timer, shutdown, or recovery.
+- **No persistence** — all sessions are lost on restart. Inline messages
+  from before a restart become non-interactive.
+
+---
+
+## Database Layer
+
+The database layer (`backend/db/client.py`) provides a Supabase singleton
+client with automatic in-memory fallback.
+
+### Design Principle
+
+The bot is designed to run **with or without Supabase**. If env vars are
+missing or the connection fails, all operations silently degrade to an
+in-memory dict. The bot never crashes due to a database error.
 
 ### When Supabase Is Available
 
@@ -226,19 +402,182 @@ LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persi
 
 ### When Supabase Is NOT Available
 
-- Env vars are missing or the connection fails.
-- All operations fall back to an in-memory dict.
+- Env vars are missing or initialization fails.
+- All operations use the in-memory `_fallback` dict.
 - Data does NOT persist across restarts — but the bot continues to work.
 
-### Tables
+### Public Functions
+
+| Function | Table | Behavior |
+|---|---|---|
+| `log()` | `bot_logs` | Insert a log entry |
+| `get_next_save_code()` | `saved_items` | Generate a unique short code (`SNNNN`) |
+| `insert_save()` | `saved_items` | Insert a save record |
+| `query_save()` | `saved_items` | Look up by `short_code` OR `save_code` |
+| `list_saves()` | `saved_items` | Paginated list, ordered by `created_at` desc |
+| `list_recent_saves()` | `saved_items` | Recent saves (subset of columns) |
+| `search_saves()` | `saved_items` | ILIKE search across caption, filename, codes, MIME |
+| `delete_save()` | `saved_items` | Delete by code |
+| `list_all_saves()` | `saved_items` | All saves for an owner |
+| `cleanup_orphans()` | `saved_items` | Delete rows by ID list |
+| `get_stats()` | `saved_items` | Aggregate statistics |
+| `count_saves()` | `saved_items` | Count, optionally filtered by type |
+| `get_bio_state()` | `bio_state` | Get state by owner_id |
+| `get_or_create_bio_state()` | `bio_state` | Get or insert default |
+| `update_bio_state()` | `bio_state` | Update by owner_id |
+| `count_logs()` | `bot_logs` | Count for owner |
+| `list_logs()` | `bot_logs` | Recent logs, ordered desc |
+| `clean_logs()` | `bot_logs` | Delete logs older than N days |
+
+---
+
+## Bio Engine
+
+The bio engine (`backend/bio/engine.py`) is a cron loop that rewrites your
+Telegram profile bio ("about" field) every minute.
+
+### Template Tokens
+
+| Token | Replaced With |
+|---|---|
+| `{time}` | Current time as `HH:MM` (in the configured timezone) |
+| `{mood}` | The mood value (set via `.bio mood`) |
+| `{text}` | Custom text (set via `.bio text`) |
+
+### Design Guarantees
+
+- **Fires at minute boundaries** — sleeps to the next `xx:xx:00`, not a fixed interval.
+- **Deduplication** — skips the API call when the rendered string hasn't changed.
+- **FloodWait handling** — catches `FloodWaitError`, sleeps the exact seconds + 1.
+- **Never terminates on errors** — all non-cancellation errors are logged and retried next tick.
+- **Single task** — `start_cron()` is idempotent; only one updater can exist.
+- **Self-stopping** — if `is_active` becomes `False` in the DB, the loop exits on the next tick.
+
+---
+
+## Save Engine
+
+The save engine handles two types of saves:
+
+### Forward Save (`.save f`)
+
+- Forwards the replied message to Saved Messages using Telegram's native forward API.
+- No download — instant.
+- Records metadata (save code, origin, sender, media type, tags) in the database.
+
+### Deep Save (`.save d`)
+
+- Downloads the media to a `BytesIO` buffer (50 MB hard limit).
+- Re-uploads to Saved Messages with a rich caption (sender, chat ID, msg ID, timestamp, media type, MIME, size, filename, tags).
+- Buffer is always closed in a `finally` block — zero memory leaks.
+- Empty-download guard: aborts if the download produces zero bytes.
+
+### Save Codes
+
+- **Short code** (current): `SNNNN` format (e.g., `S0001`). Generated atomically via `asyncio.Lock`.
+- **Legacy code**: `SV-NNNNNN` format. Preserved for backward compatibility.
+- Lookups try `short_code` first, then fall back to `save_code`.
+
+---
+
+## Retrieve
+
+Retrieval commands let you access previously saved items:
+
+| Command | Behavior |
+|---|---|
+| `.preview <code>` | Shows metadata for a saved item (type, media, MIME, size, sender, origin, tags) |
+| `.r <code>` / `.retrieve <code>` | Alias for `.preview` |
+| `.send <code>` | Forwards the saved asset from Saved Messages into the current chat |
+
+Lookups are case-insensitive and work with both `short_code` and legacy `save_code`.
+
+---
+
+## Organizer
+
+The organizer provides data management commands:
+
+| Command | Behavior |
+|---|---|
+| `.del <n>` | Delete last N outgoing messages (1-500 range, batch-deletes in chunks of 100) |
+| `.del id <msgid>` | Delete all messages from msg_id forward |
+| `.del <code>` | Delete a saved item from the index |
+| `.organize list` | Data overview: save counts, log count, bio status |
+| `.organize clean` | Purge logs older than 7 days |
+
+---
+
+## Diagnostics
+
+Diagnostics provide visibility into the bot's internal state:
+
+| Command | Behavior |
+|---|---|
+| `.kill` | Snapshot + stalled-task recovery (collects diagnostics, attempts recovery) |
+| `.logs` | Recent events (last 20) |
+| `.logs 50` | Last 50 events |
+| `.logs errors` | Errors only |
+| `.logs module <name>` | Filter by module |
+
+Events are recorded via `diagnostics.record_event()` and stored in memory
+(not in the database). The `.kill` command also attempts to recover stalled
+asyncio tasks.
+
+---
+
+## Settings
+
+Panel settings are stored in the `panel_settings` database table and cached
+in memory.
+
+### Auto-Close
+
+- **Default**: ON (panels auto-close after 120 seconds).
+- **Toggle**: `.help` → Settings → Auto Close button, or the settings panel.
+- **Behavior**: When ON, a timer task edits the panel message every 30s with
+  a countdown (90s → 60s → 30s → closed). When OFF, panels stay open until
+  manually closed.
+- **Persistence**: The preference is stored in `panel_settings` (key = `"global"`)
+  and loaded at startup.
+
+---
+
+## Database Panel
+
+The database panel (`.db` commands) provides database maintenance:
+
+| Command | Behavior |
+|---|---|
+| `.db clean` | Remove orphan rows (saved items whose Telegram messages no longer exist) |
+| `.db stats` | Database statistics (total items, breakdown by type, size estimate, date range) |
+| `.db vacuum` | Cleanup + optimize (removes orphans, reports remaining count) |
+
+### How It Works
+
+1. `find_orphans()` iterates all `saved_items` rows for the owner.
+2. For each row, it checks if the Telegram message still exists via `client.get_messages()`.
+3. Rows whose messages are gone (or have no `saved_chat_id`/`saved_msg_id`) are collected as orphan IDs.
+4. `cleanup_orphans()` deletes those rows by ID.
+
+---
+
+## Database
+
+LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persistence. The database contains **four tables**:
 
 | Table | Purpose |
 |---|---|
 | `saved_items` | Media save records — save code, type, origin, metadata, tags |
 | `bio_state` | Singleton bio engine state per owner — template, mood, text |
-| `bot_logs` | Structured activity logs — level, message, JSONB context |
+| `bot_logs` | Structured activity log — level, message, JSONB context |
+| `panel_settings` | Global panel preferences — auto-close toggle |
 
-All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key.
+All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key, which bypasses RLS.
+
+For the complete schema reference — every column, type, index, constraint, and RLS policy — see **[DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)**.
+
+For standalone SQL scripts, see the [`sql/`](sql/) directory.
 
 ---
 
@@ -256,11 +595,8 @@ All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dash
 1. Go to [my.telegram.org](https://my.telegram.org) and log in.
 2. Click **API development tools**.
 3. Create an application — you'll get an **API ID** (number) and an **API Hash** (string).
-4. Save these — you'll need them for `API_ID` and `API_HASH`.
 
 ### Step 2: Generate SESSION_STRING
-
-You must generate a Telethon `StringSession` **once** on your local machine:
 
 ```bash
 pip install telethon
@@ -282,12 +618,11 @@ Copy the output string — this is your `SESSION_STRING`.
 
 ### Step 3: Find Your Telegram User ID
 
-Your `BOT_OWNER_ID` is your numeric Telegram user ID. You can find it by messaging [@userinfobot](https://t.me/userinfobot) on Telegram.
+Message [@userinfobot](https://t.me/userinfobot) on Telegram to get your numeric user ID. This is your `BOT_OWNER_ID`.
 
 ### Step 4: Local Development
 
 ```bash
-# Clone the repo
 git clone <your-repo-url>
 cd lifeos
 
@@ -298,13 +633,13 @@ pip install -r backend/requirements.txt
 npm install
 npm run build    # builds to dist/ (served by FastAPI)
 
-# Set environment variables (see below)
+# Set environment variables
 export API_ID=123456
 export API_HASH=your_api_hash
 export SESSION_STRING=your_session_string
 export BOT_OWNER_ID=123456789
 
-# Run the bot
+# Run
 python -m backend.main
 ```
 
@@ -314,20 +649,20 @@ The dashboard is available at `http://localhost:8000`.
 
 ## Environment Variables
 
-### Required (bot won't start without these)
+### Required
 
 | Variable | Description |
 |---|---|
 | `API_ID` | Telegram API ID from [my.telegram.org](https://my.telegram.org) |
 | `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) |
-| `SESSION_STRING` | Telethon StringSession (generated in Step 2 above) |
-| `BOT_OWNER_ID` | Your Telegram numeric user ID (from [@userinfobot](https://t.me/userinfobot)) |
+| `SESSION_STRING` | Telethon StringSession (generated above) |
+| `BOT_OWNER_ID` | Your Telegram numeric user ID |
 
 ### Optional — Helper Bot
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOT_TOKEN` | `""` | Bot token from BotFather. If set, the helper bot starts and inline UI is enabled. If empty, inline UI is disabled. |
+| `BOT_TOKEN` | `""` | Bot token from BotFather. Enables inline UI. If empty, inline UI is disabled. |
 
 ### Optional — Supabase
 
@@ -340,175 +675,74 @@ The dashboard is available at `http://localhost:8000`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GHOST_ROOM` | `""` | Reserved for future use. |
 | `DATABASE_URL` | `""` | PostgreSQL connection string (backup, currently unused). |
 | `TZ` | `Asia/Tehran` | Timezone for bio engine and timestamps. |
 | `PORT` | `8000` | Web server port (Render sets this automatically). |
 | `BIO_UPDATE_ENABLED` | `false` | Set to `true` to auto-start bio cron on boot. |
 | `LOG_LEVEL` | `INFO` | Python logging level. |
 
-> **Note:** Supabase is optional. Without it, the bot uses in-memory storage and all commands still work — but data won't persist across restarts.
-
 ---
 
 ## Helper Bot Setup
 
-The helper bot requires a one-time setup through BotFather. Follow every step below — Inline Mode is **required** for the inline panel architecture to work.
+The helper bot requires a one-time setup through BotFather. Inline Mode is **required**.
 
 ### Step 1: Create the Bot
 
-1. Open Telegram and message [@BotFather](https://t.me/BotFather).
+1. Message [@BotFather](https://t.me/BotFather) on Telegram.
 2. Send `/newbot`.
-3. Choose a **name** for your bot (e.g., "LifeOS Helper").
-4. Choose a **username** for your bot (must end in `bot`, e.g., `lifeos_helper_bot`).
-5. BotFather will give you a **bot token** that looks like `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`.
-6. Copy this token — this is your `BOT_TOKEN`.
+3. Choose a name and username (must end in `bot`).
+4. Copy the bot token — this is your `BOT_TOKEN`.
 
-### Step 2: Disable Group Privacy (Optional)
-
-Group Privacy mode prevents bots from seeing all messages in groups. If you plan to use LifeOS in group chats, disable it:
-
-1. Send `/setprivacy` to [@BotFather](https://t.me/BotFather).
-2. Select your helper bot.
-3. Choose **Disable**.
-
-> **Note:** This is optional. In Saved Messages (where most LifeOS commands are used), Group Privacy does not apply. You only need this if you use LifeOS commands in group chats.
-
-### Step 3: Enable Inline Mode (REQUIRED)
-
-Inline Mode is **required** for the helper bot to work. Without it, inline panels cannot be triggered.
+### Step 2: Enable Inline Mode (Required)
 
 1. Send `/setinline` to [@BotFather](https://t.me/BotFather).
-2. Select your helper bot from the list.
-3. Send a **placeholder message** — this is the hint text shown when someone types `@your_bot_username` in any chat. Example: `Search LifeOS...` or `LifeOS panels`.
-4. BotFather will confirm: "Inline mode enabled for @your_bot_username."
-
-### Step 4: Set Bot Description
-
-The bot description appears when someone opens a chat with your bot:
-
-1. Send `/setdescription` to [@BotFather](https://t.me/BotFather).
 2. Select your helper bot.
-3. Send the description text, e.g.:
-   ```
-   LifeOS Helper Bot — Inline Mode engine for the LifeOS self-bot.
-   This bot powers inline panels and callback buttons.
-   Do not message this bot directly — use LifeOS commands instead.
-   ```
+3. Send a placeholder message (e.g., `LifeOS panels`).
+4. BotFather confirms inline mode is enabled.
 
-### Step 5: Set About Text
+### Step 3: Disable Group Privacy (Optional)
 
-The about text appears on the bot's profile page:
+Only needed if you use LifeOS commands in group chats:
 
-1. Send `/setabouttext` to [@BotFather](https://t.me/BotFather).
-2. Select your helper bot.
-3. Send the about text, e.g.:
-   ```
-   LifeOS Helper — Inline panel engine for the LifeOS Telegram self-bot.
-   Created with Telethon + FastAPI.
-   ```
+1. Send `/setprivacy` to [@BotFather](https://t.me/BotFather).
+2. Select your bot.
+3. Choose **Disable**.
 
-### Step 6: Set Bot Commands (Optional)
-
-Bot commands show up as suggestions in the bot's chat interface:
-
-1. Send `/setcommands` to [@BotFather](https://t.me/BotFather).
-2. Select your helper bot.
-3. Send the commands list:
-   ```
-   help - Show LifeOS help panel
-   health - Show health dashboard
-   ```
-
-> **Note:** These commands are for the bot's own chat. LifeOS commands (`.help`, `.health`, etc.) are used from your own account, not the bot's chat.
-
-### Step 7: Configure Environment Variables
-
-Add the following environment variables to your Render service (or local `.env`):
-
-| Variable | Required? | Description |
-|---|---|---|
-| `BOT_TOKEN` | **Yes** (for inline UI) | Bot token from BotFather (Step 1). If empty, inline UI is disabled — the self-bot still works without it. |
-| `API_ID` | Yes | Telegram API ID from [my.telegram.org](https://my.telegram.org) — same as the self-bot. |
-| `API_HASH` | Yes | Telegram API Hash from [my.telegram.org](https://my.telegram.org) — same as the self-bot. |
-
-> **Important:** The helper bot uses the same `API_ID` and `API_HASH` as the self-bot. It only needs the `BOT_TOKEN` to be different.
-
-### Step 8: Verify Inline Mode
+### Step 4: Verify
 
 After deploying with `BOT_TOKEN` set:
 
-1. In any Telegram chat, type `@your_helper_bot_username` followed by any text.
-2. You should see the inline placeholder text you set in Step 3.
-3. If you see "No results", that's normal — the helper bot only generates results when triggered by the self-bot's `inline_query()` call.
+1. Send `.help` from your account in any chat.
+2. The command message should disappear.
+3. An inline message should appear with category buttons.
+4. Tap a category — the message edits in-place.
+5. Tap Close — the message shows "Panel closed".
 
-### Step 9: Test LifeOS Inline Panels
-
-1. Send `.help` from your own account in any chat (or Saved Messages).
-2. The command message should disappear (deleted by the self-bot).
-3. An inline message should appear: `YourName via @your_helper_bot_username` with category buttons.
-4. Tap a category button — the message should edit in-place to show that category's commands.
-5. Tap "Back" — the message should return to the category list.
-6. Tap "Close" — the message should be deleted.
-
-If you see the plain text menu instead of buttons, the helper bot is not running or `BOT_TOKEN` is not set correctly.
+If you see plain text instead of buttons, the helper bot is not running or `BOT_TOKEN` is not set correctly.
 
 ---
 
 ## Deploying on Render
 
-LifeOS is designed for [Render](https://render.com)'s Free tier.
-
-### Step 1: Push to GitHub
-
-Push your repository to GitHub. Render connects to your GitHub repo.
-
-### Step 2: Create a Web Service
-
-1. Go to [render.com](https://render.com) and sign in.
-2. Click **New** → **Web Service**.
+1. Push your repository to GitHub.
+2. On [render.com](https://render.com), create a new Web Service.
 3. Connect your GitHub repository.
-4. Render reads `render.yaml` automatically — or set:
+4. Render reads `render.yaml` automatically, or set:
    - **Environment:** Python
    - **Start Command:** `python -m backend.main`
    - **Health Check Path:** `/health`
-
-### Step 3: Add Environment Variables
-
-In the Render dashboard, add all environment variables:
-
-| Variable | Required? | How to set |
-|---|---|---|
-| `API_ID` | Yes | From my.telegram.org |
-| `API_HASH` | Yes | From my.telegram.org |
-| `SESSION_STRING` | Yes | Generated in Step 2 of Quick Start |
-| `BOT_OWNER_ID` | Yes | Your Telegram user ID |
-| `BOT_TOKEN` | No | From BotFather (enables inline UI) |
-| `SUPABASE_URL` | No | From Supabase dashboard |
-| `SUPABASE_SERVICE_ROLE_KEY` | No | From Supabase dashboard |
-| `TZ` | No | Default: `Asia/Tehran` |
-| `BIO_UPDATE_ENABLED` | No | Default: `false` |
-| `LOG_LEVEL` | No | Default: `INFO` |
-
-### Step 4: Deploy
-
-1. Click **Create Web Service**.
-2. Render builds the Python environment from `backend/requirements.txt`.
-3. Render starts `python -m backend.main`.
-4. The health check hits `/health` — it must return 200.
-5. The Telethon client connects and the bot is live.
-
-### Step 5: Build the Dashboard (Optional)
+5. Add all environment variables in the Render dashboard.
+6. Click **Create Web Service**.
 
 The React dashboard is not built automatically by Render. To serve it:
 
 ```bash
-# Locally
 npm install
 npm run build    # produces dist/
 ```
 
-Ensure `dist/` is available to the Python process. The FastAPI app checks for `dist/` at startup and mounts it as static files if present.
+Ensure `dist/` is available to the Python process. The FastAPI app mounts it as static files if present.
 
 ---
 
@@ -521,9 +755,10 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 | Command | Description |
 |---|---|
 | `.ping` | Edits message to `PONG` |
-| `.id` | Shows Chat ID + Message ID |
-| `.help` | Opens interactive help menu (reply with a number to navigate) |
-| `.health` | Full health dashboard (process, Telegram, watchdog, bio, memory, CPU, uptime) |
+| `.id` | Shows Your ID, Current Chat ID, and Current Message ID |
+| `.help` | Opens interactive inline help panel |
+| `.health` | Full health dashboard |
+| `.panel` | Context panel for the replied message |
 
 ### Save Engine (reply to a message first)
 
@@ -555,7 +790,7 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 | `.del 5` | Delete last 5 outgoing messages |
 | `.del id 12345` | Delete all messages from ID 12345 forward |
 | `.del S391` | Delete saved item from the index |
-| `.organize list` | Data overview (saves, logs, bio status) |
+| `.organize list` | Data overview |
 | `.organize clean` | Purge logs older than 7 days |
 
 ### Bio Engine
@@ -594,189 +829,46 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 
 ### Bot won't start
 
-**Problem:** `sys.exit(1)` on startup.
-
-**Cause:** A required environment variable is missing (`API_ID`, `API_HASH`, `SESSION_STRING`, or `BOT_OWNER_ID`).
-
-**Fix:** Check that all four required variables are set in your environment or Render dashboard.
+A required environment variable is missing (`API_ID`, `API_HASH`, `SESSION_STRING`, or `BOT_OWNER_ID`). Check that all four are set.
 
 ### Session not authorized
 
-**Problem:** `RuntimeError: Telethon session is not authorized.`
-
-**Cause:** The `SESSION_STRING` is invalid or expired.
-
-**Fix:** Regenerate the session string on your local machine (see [Quick Start](#quick-start)) and update the environment variable.
+The `SESSION_STRING` is invalid or expired. Regenerate it locally (see [Quick Start](#quick-start)).
 
 ### Helper bot fails to start
 
-**Problem:** Warning log: `Helper bot failed: ... — inline UI disabled`
-
-**Cause:** `BOT_TOKEN` is set but invalid, or the bot token doesn't match a BotFather bot.
-
-**Fix:**
-1. Verify the token with BotFather: send `/token` to [@BotFather](https://t.me/BotFather), select your bot, and compare.
-2. Update `BOT_TOKEN` with the correct token.
-3. Redeploy.
+`BOT_TOKEN` is set but invalid. Verify the token with BotFather: send `/token`, select your bot, and compare.
 
 ### Inline panels not working (plain text instead of buttons)
 
-**Problem:** `.help` shows a plain text menu instead of inline buttons.
+The helper bot is not running. Check that `BOT_TOKEN` is set and valid. Ensure Inline Mode is enabled via BotFather (`/setinline`).
 
-**Cause:** The helper bot is not running (no `BOT_TOKEN` set, or the bot failed to start).
+### Commands don't respond
 
-**Fix:**
-1. Check that `BOT_TOKEN` is set in your environment.
-2. Check logs for helper bot startup errors.
-3. Verify the token is valid (see "Helper bot fails to start" above).
-4. Ensure Inline Mode is enabled via BotFather (`/setinline`).
-
-### Inline mode shows "No results"
-
-**Problem:** Typing `@your_helper_bot` in a chat shows "No results".
-
-**Cause:** This is normal behavior. The helper bot only generates inline results when triggered by the self-bot's `inline_query()` call. Direct typing won't show results unless the self-bot is running and triggers the query.
-
-**Fix:** No fix needed — this is expected. Use LifeOS commands (`.help`, `.health`, etc.) from your own account to trigger inline panels.
-
-### Bot starts but commands don't respond
-
-**Problem:** You send `.ping` but nothing happens.
-
-**Cause:** Your `BOT_OWNER_ID` doesn't match your Telegram user ID.
-
-**Fix:** Find your correct user ID via [@userinfobot](https://t.me/userinfobot) and update `BOT_OWNER_ID`.
+Your `BOT_OWNER_ID` doesn't match your Telegram user ID. Find your correct ID via [@userinfobot](https://t.me/userinfobot).
 
 ### Bio cron not updating
 
-**Problem:** `.bio on` works but bio doesn't change.
-
-**Cause:** The rendered bio string may be identical to the current one (deduplication), or FloodWait is active.
-
-**Fix:**
-1. Run `.bio show` to check the last rendered bio.
-2. Change the template or text/mood tokens so the rendered string differs.
-3. Wait — FloodWait errors are auto-slept and retried.
+The rendered bio string may be identical to the current one (deduplication), or FloodWait is active. Run `.bio show` to check the last rendered bio. Change the template or tokens so the rendered string differs.
 
 ### Health check fails on Render
 
-**Problem:** Render marks the service as unhealthy.
-
-**Cause:** The FastAPI server isn't responding on `/health`.
-
-**Fix:**
-1. Check Render logs for Python errors.
-2. Ensure `PORT` is set (Render sets this automatically).
-3. The `/health` endpoint returns `{"status": "ok"}` — if it's not, check for import errors.
+The FastAPI server isn't responding on `/health`. Check Render logs for Python errors. Ensure `PORT` is set (Render sets this automatically).
 
 ### Database not persisting
 
-**Problem:** Saved items disappear after restart.
+Supabase env vars are not set. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your environment.
 
-**Cause:** Supabase env vars are not set, so the bot is using in-memory fallback.
+### Bot keeps restarting
 
-**Fix:** Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your environment.
-
----
-
-## Update Instructions
-
-### Updating the Bot Code
-
-1. Pull the latest code from your repository:
-   ```bash
-   git pull origin main
-   ```
-
-2. Install any new dependencies:
-   ```bash
-   pip install -r backend/requirements.txt
-   npm install
-   ```
-
-3. Rebuild the dashboard:
-   ```bash
-   npm run build
-   ```
-
-4. Restart the bot:
-   ```bash
-   python -m backend.main
-   ```
-
-### Updating on Render
-
-1. Push your changes to GitHub.
-2. Render automatically detects the push and redeploys.
-3. If auto-deploy is off, click **Manual Deploy** in the Render dashboard.
-
-### Updating Environment Variables
-
-1. Go to the Render dashboard.
-2. Select your LifeOS service.
-3. Click **Environment**.
-4. Add or update variables.
-5. Save — Render redeploys automatically.
-
-### Updating the Session String
-
-If your session expires:
-
-1. Regenerate the `SESSION_STRING` locally (see [Quick Start](#quick-start)).
-2. Update the `SESSION_STRING` environment variable in Render.
-3. Redeploy.
-
----
-
-## Recovery Instructions
-
-### If the Bot Crashes
-
-The bot is designed to never crash, but if it does:
-
-1. Check Render logs for the error.
-2. Common causes:
-   - **Missing env vars:** Add them and redeploy.
-   - **Invalid session:** Regenerate `SESSION_STRING`.
-   - **Supabase down:** The bot falls back to in-memory — no action needed.
-3. Render auto-restarts the service on crash.
-
-### If the Bio Cron Stops
-
-1. Run `.bio show` to check the state.
-2. If `is_active` is `True` but the cron isn't running:
-   - Run `.bio off` then `.bio on` to restart.
-3. If the issue persists, run `.kill` to collect diagnostics and recover stalled tasks.
-
-### If Telethon Disconnects
-
-The auto-reconnect system handles this:
-- 5 retries with 2s delay.
-- If all retries fail, the watchdog forces a disconnect and reconnect cycle.
-- Check `.health` for `restart_count` and `telethon_connected` status.
-
-### If the Helper Bot Disconnects
-
-1. The helper bot has the same auto-reconnect as the self-bot.
-2. If it fails to start, the self-bot continues without inline UI.
-3. Check `.health` or Render logs for helper bot errors.
-4. Verify `BOT_TOKEN` is correct.
-
-### Full Reset
-
-If everything is broken and you need a clean start:
-
-1. Stop the bot.
-2. Regenerate `SESSION_STRING` locally.
-3. Clear the database (optional — or let it keep existing data).
-4. Update all environment variables.
-5. Restart: `python -m backend.main`.
+The runtime supervisor's watchdog detected 3 consecutive heartbeat failures and triggered recovery. After 5 failed recovery attempts, the process exits so Render can restart it. Check `.kill` output or Render logs for the root cause.
 
 ---
 
 ## Project Philosophy
 
 - **Never crash.** Every external operation degrades gracefully.
+- **Never stay broken.** The watchdog detects dead clients and recovers atomically.
 - **Zero spam.** Every command edits the triggering message in-place.
 - **Owner-only.** One permission gate. Non-owner messages are silently ignored.
 - **Deterministic.** Bio cron fires at minute boundaries. Save codes are atomic.
