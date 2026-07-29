@@ -5,8 +5,7 @@ Respects the global auto-close preference (settings_service).
 When auto-close is OFF globally, no timer task is created at all.
 
 When ON, a single asyncio task per panel edits the SAME inline message
-every 30 seconds with the updated countdown:
-  120s → 90s → 60s → 30s → delete
+at the configured countdown interval with the updated countdown.
 
 No second message. No new messages. Only edits.
 """
@@ -16,8 +15,6 @@ import logging
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
-
-_COUNTDOWN_INTERVAL = 30
 
 
 class _PanelEntry:
@@ -72,7 +69,7 @@ def set_content(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
 
 
 def _start_timer(self_client, chat_id: int, msg_id: int, entry: _PanelEntry) -> None:
-    duration = settings_service.panel_auto_close_seconds()
+    duration = settings_service.auto_close_delay_seconds()
     entry.expire_at = _now() + duration
     entry.task = asyncio.create_task(_timer_loop(self_client, chat_id, msg_id, duration))
 
@@ -92,20 +89,20 @@ def _cancel_task(k: str) -> None:
 async def _timer_loop(self_client, chat_id: int, msg_id: int, duration: int) -> None:
     """Single task: countdown via edits, then delete at expiry.
 
-    The countdown interval is fixed at 30s. The number of countdown
-    steps is computed from the DB-backed duration so the timer always
-    matches the configured auto-close seconds.
+    The countdown interval and duration are both read from the DB-backed
+    settings_service so the timer always matches the configured values.
     """
     try:
-        steps = max(1, duration // _COUNTDOWN_INTERVAL)
+        interval = settings_service.panel_countdown_interval()
+        steps = max(1, duration // interval)
         for i in range(steps):
-            await asyncio.sleep(_COUNTDOWN_INTERVAL)
+            await asyncio.sleep(interval)
             entry = _panels.get(_key(chat_id, msg_id))
             if entry is None or entry.task is None or entry.task.done():
                 return
             if not settings_service.is_auto_close_enabled():
                 return
-            remaining = duration - (i + 1) * _COUNTDOWN_INTERVAL
+            remaining = duration - (i + 1) * interval
             if remaining > 0:
                 await _edit_countdown(self_client, chat_id, msg_id, remaining)
         entry = _panels.get(_key(chat_id, msg_id))
