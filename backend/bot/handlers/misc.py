@@ -57,9 +57,7 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
             "**General**\n",
             "`.ping` — PONG",
             "`.id` — Chat & Msg IDs",
-            "`.help` — This menu",
             "`.health` — Health dashboard",
-            "`.panel` — Context panel (reply to msg)",
         ],
     ),
     (
@@ -144,8 +142,6 @@ def _build_general_buttons() -> list:
     builder.add_row("🏓 Ping", "action:general_ping")
     builder.add_row("🆔 Chat & Msg IDs", "action:general_id")
     builder.add_row("🩺 Health Dashboard", "action:general_health")
-    builder.add_row("📦 Context Panel", "action:general_panel")
-    builder.add_row("🏠 Help Menu", "action:general_help")
     return builder.build()
 
 
@@ -213,20 +209,39 @@ async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
 
     owner_id = _owner_id
-    ctx = get_target(owner_id)
-    lines = []
-    if ctx and ctx.kind == "reply":
-        lines.append(f"**Reply Chat ID:** `{ctx.reply_chat_id}`")
-        lines.append(f"**Reply Msg ID:** `{ctx.reply_msg_id}`")
-    else:
-        client = _self_client
-        if client is not None:
+    client = _self_client
+
+    your_id = "N/A"
+    if client is not None:
+        try:
             me = await client.get_me()
-            lines.append(f"**Your ID:** `{me.id}`")
-        else:
-            lines.append("Reply to a message and use `.panel` first to see IDs.")
-    body = "\n".join(lines) if lines else "No context available."
-    return "Chat & Msg IDs", body, _build_general_buttons()
+            your_id = str(me.id)
+        except Exception:
+            pass
+    elif owner_id:
+        your_id = str(owner_id)
+
+    chat_id_val = "N/A"
+    msg_id_val = "N/A"
+    try:
+        cid = getattr(event, "chat_id", None)
+        if cid is not None:
+            chat_id_val = str(cid)
+    except Exception:
+        pass
+    try:
+        mid = getattr(event, "message_id", None)
+        if mid is not None:
+            msg_id_val = str(mid)
+    except Exception:
+        pass
+
+    body = (
+        f"**Your ID:**\n`{your_id}`\n\n"
+        f"**Current Chat ID:**\n`{chat_id_val}`\n\n"
+        f"**Current Message ID:**\n`{msg_id_val}`"
+    )
+    return "Chat & Message IDs", body, _build_general_buttons()
 
 
 async def _general_health_action(event, extra: str) -> tuple[str, str, list] | None:
@@ -235,32 +250,6 @@ async def _general_health_action(event, extra: str) -> tuple[str, str, list] | N
     builder = InlinePanelBuilder()
     builder.add_row("Refresh", "action:health_refresh")
     return "Health Dashboard", report, builder.build()
-
-
-async def _general_panel_action(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-
-    owner_id = _owner_id
-    ctx = get_target(owner_id)
-    if not ctx or ctx.kind != "reply":
-        return (
-            "Context Panel",
-            "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
-            _build_general_buttons(),
-        )
-    builder = InlinePanelBuilder()
-    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
-    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
-    builder.add_row("👁 Preview", "panel:context:exec:preview")
-    return (
-        "Context Panel",
-        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
-        builder.build(),
-    )
-
-
-async def _general_help_action(event, extra: str) -> tuple[str, str, list] | None:
-    return "LifeOS Command Center", "", _build_main_menu_buttons()
 
 
 def _register_help_panel() -> None:
@@ -272,8 +261,6 @@ def _register_help_panel() -> None:
     register_action("general_ping", _general_ping_action)
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
-    register_action("general_panel", _general_panel_action)
-    register_action("general_help", _general_help_action)
 
 
 async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:

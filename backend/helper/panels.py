@@ -416,10 +416,19 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.exception("[CALLBACK] _handle_panel: handler '%s' FAILED: %s", panel_id, exc)
 
 
-async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None:
+async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Shared close logic used by both the Close button and auto-close timer.
+
+    Steps (identical for both paths):
+      1. Clear pending input state
+      2. Stop and remove the panel timer
+      3. Clear the panel session (destroys nav stack)
+      4. Clear render cache
+      5. Edit the inline message to closed state with no buttons
+    """
     from backend.helper.inline_engine import get_self_client
 
-    logger.info("[CALLBACK] _handle_close: chat_id=%s msg_id=%s", chat_id, msg_id)
+    logger.info("[CLOSE] close_panel: chat_id=%s msg_id=%s", chat_id, msg_id)
 
     clear_pending(owner_id)
     stop_timer(chat_id, msg_id)
@@ -427,29 +436,31 @@ async def _handle_close(event, chat_id: int, msg_id: int, owner_id: int) -> None
     _last_render.pop((chat_id, msg_id), None)
 
     closed_text = "✕ **Panel closed**"
-    try:
-        await event.edit(closed_text, buttons=[])
-        _last_render[(chat_id, msg_id)] = (closed_text, ())
-        logger.info("[CALLBACK] _handle_close: edit OK")
-        return
-    except Exception as exc:
-        logger.warning("[CALLBACK] _handle_close: event.edit failed: %s", exc)
+
+    if event is not None:
+        try:
+            await event.edit(closed_text, buttons=[])
+            _last_render[(chat_id, msg_id)] = (closed_text, ())
+            logger.info("[CLOSE] event.edit OK")
+            return
+        except Exception as exc:
+            logger.warning("[CLOSE] event.edit failed: %s", exc)
 
     self_client = get_self_client()
     if self_client is not None and chat_id and msg_id:
         try:
             await self_client.edit_message(chat_id, msg_id, message=closed_text, buttons=[])
             _last_render[(chat_id, msg_id)] = (closed_text, ())
-            logger.info("[CALLBACK] _handle_close: self_client.edit_message OK")
+            logger.info("[CLOSE] self_client.edit_message OK")
         except Exception as exc:
-            logger.warning("[CALLBACK] _handle_close: self_client.edit_message FAILED: %s", exc)
+            logger.warning("[CLOSE] self_client.edit_message FAILED: %s", exc)
 
 
 async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
     logger.info("[CALLBACK] _handle_navigation: action='%s' chat_id=%s msg_id=%s", action, chat_id, msg_id)
 
     if action == "close":
-        await _handle_close(event, chat_id, msg_id, owner_id)
+        await close_panel(event, chat_id, msg_id, owner_id)
         return
 
     if action == "home":

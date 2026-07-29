@@ -55,14 +55,14 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
 
     # 4. disable auto-close → new panels should NOT have timers
     set_auto_close_enabled(False)
-    destroy(self_client, msg_chat_id, msg_id)
+    await destroy(self_client, msg_chat_id, msg_id)
     init_panel(self_client, msg_chat_id, msg_id)
     no_timer_when_disabled = not has_timer(msg_chat_id, msg_id)
     report.append(f"Disabled No Timer. {'OK' if no_timer_when_disabled else 'FAIL'}")
 
     # 5. re-enable → new panels should have timers
     set_auto_close_enabled(True)
-    destroy(self_client, msg_chat_id, msg_id)
+    await destroy(self_client, msg_chat_id, msg_id)
     init_panel(self_client, msg_chat_id, msg_id)
     timer_when_enabled = has_timer(msg_chat_id, msg_id)
     report.append(f"Enabled Timer ... {'OK' if timer_when_enabled else 'FAIL'}")
@@ -72,7 +72,7 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     report.append(f"Single Timer ..... {'OK' if one_timer else 'FAIL'}")
 
     # 7. destroy clears state
-    destroy(self_client, msg_chat_id, msg_id)
+    await destroy(self_client, msg_chat_id, msg_id)
     destroyed = not has_timer(msg_chat_id, msg_id)
     report.append(f"Destroy .......... {'OK' if destroyed else 'FAIL'}")
 
