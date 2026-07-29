@@ -24,6 +24,7 @@ from backend.helper.session_manager import (
     get_session as _get_session,
     get_session_by_inline_id as _get_session_by_inline_id,
     find_session_by_chat as _find_session_by_chat,
+    find_session_by_msg_id as _find_session_by_msg_id,
     push_nav as _push_nav,
     pop_nav as _pop_nav,
     reset_nav as _reset_nav,
@@ -268,31 +269,48 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     await _safe_edit(event, text, built_buttons, chat_id, msg_id)
 
 
-def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> dict | None:
-    """Look up session by (chat_id, msg_id), falling back to inline_message_id."""
+def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[dict | None, int, int]:
+    """Look up session by (chat_id, msg_id), falling back to msg_id-only, then inline_message_id.
+
+    Returns (session, resolved_chat_id, resolved_msg_id) so callers always use
+    the identity the session was created with — not the callback's local view.
+    """
     session = _get_session(chat_id, msg_id)
     if session is not None:
         logger.info(
             "[CALLBACK] session lookup OK by (chat_id=%s, msg_id=%s) → session_id=%s",
             chat_id, msg_id, session.get("session_id", "?"),
         )
-        return session
+        return session, chat_id or 0, msg_id or 0
+
+    if not chat_id and msg_id:
+        session = _find_session_by_msg_id(msg_id)
+        if session is not None:
+            real_chat = session.get("chat_id", 0) or 0
+            real_msg = session.get("msg_id", msg_id) or msg_id
+            logger.info(
+                "[CALLBACK] session lookup OK by msg_id=%s → resolved (chat_id=%s, msg_id=%s) session_id=%s",
+                msg_id, real_chat, real_msg, session.get("session_id", "?"),
+            )
+            return session, real_chat, real_msg
 
     if inline_message_id:
         session = _get_session_by_inline_id(inline_message_id)
         if session is not None:
+            real_chat = session.get("chat_id", 0) or 0
+            real_msg = session.get("msg_id", 0) or 0
             logger.info(
-                "[CALLBACK] session lookup OK by inline_message_id='%s' → session_id=%s",
-                inline_message_id, session.get("session_id", "?"),
+                "[CALLBACK] session lookup OK by inline_message_id='%s' → resolved (chat_id=%s, msg_id=%s) session_id=%s",
+                inline_message_id, real_chat, real_msg, session.get("session_id", "?"),
             )
-            return session
+            return session, real_chat, real_msg
 
     logger.warning(
         "[CALLBACK] session lookup FAILED: chat_id=%s msg_id=%s inline_message_id='%s' — "
         "callback will be dropped",
         chat_id, msg_id, inline_message_id or "",
     )
-    return None
+    return None, chat_id or 0, msg_id or 0
 
 
 def register_callback_handlers(client, owner_id: int) -> None:
@@ -328,7 +346,7 @@ def register_callback_handlers(client, owner_id: int) -> None:
             await _safe_answer(event)
             return
 
-        session = _resolve_session(chat_id, msg_id, inline_msg_id)
+        session, real_chat_id, real_msg_id = _resolve_session(chat_id, msg_id, inline_msg_id)
         if session is None:
             logger.warning(
                 "[CALLBACK] REJECT: no session for chat_id=%s msg_id=%s inline_msg_id='%s'",
@@ -337,7 +355,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
             await _safe_answer(event)
             return
 
-        logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s", data, session.get("session_id", "?"))
+        chat_id = real_chat_id
+        msg_id = real_msg_id
+
+        logger.info("[CALLBACK] DISPATCH: data='%s' session_id=%s chat_id=%s msg_id=%s", data, session.get("session_id", "?"), chat_id, msg_id)
 
         try:
             if data.startswith("panel:"):
