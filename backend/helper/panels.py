@@ -17,9 +17,9 @@ Callback data format:
   - Panel navigation:  ``panel:<panel_id>:<extra>``
   - Action execution:  ``action:<action_id>:<extra>``
   - Input request:    ``input:<panel_id>:<input_id>``
-  - Close:            ``panel:close``
+  - Close:            ``panel:_nav:close``
   - Home:             ``panel:help``
-  - Back:             ``panel:<panel_id>:back`` (per-panel back navigation)
+  - Back:             ``panel:_nav:back``
 
 The callback router dispatches based on the prefix. Panel handlers
 edit the inline message in-place. Action handlers execute logic and
@@ -57,6 +57,46 @@ from backend.helper.session_manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+_last_render: dict[tuple[int | None, int | None], tuple[str, tuple]] = {}
+
+
+def _buttons_repr(buttons: list) -> tuple[tuple[str, ...], ...]:
+    """Create a comparable representation of button callback data."""
+    result = []
+    for row in buttons:
+        row_data = []
+        if isinstance(row, list):
+            for btn in row:
+                data = getattr(btn, "data", None)
+                if isinstance(data, bytes):
+                    row_data.append(data.decode("utf-8", errors="replace"))
+                elif isinstance(data, str):
+                    row_data.append(data)
+                else:
+                    row_data.append(str(data))
+        result.append(tuple(row_data))
+    return tuple(result)
+
+
+async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_id: int | None) -> bool:
+    """Edit the inline message, skipping silently if content hasn't changed."""
+    key = (chat_id, msg_id)
+    new_repr = (text, _buttons_repr(buttons))
+    last = _last_render.get(key)
+    if last == new_repr:
+        return False
+    try:
+        await event.edit(text, buttons=buttons if buttons else [])
+        _last_render[key] = new_repr
+        return True
+    except Exception as exc:
+        msg_lower = str(exc).lower()
+        if "not modified" in msg_lower:
+            _last_render[key] = new_repr
+            return False
+        logger.warning("[CALLBACK] edit failed: %s", exc)
+        return False
 
 
 def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]:
@@ -214,6 +254,32 @@ def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
         pass
 
 
+def _extract_render_result(result) -> tuple[str, str, list]:
+    """Normalize a handler return value into (title, body, buttons)."""
+    if result is None:
+        return "", "", []
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        elif len(result) == 2:
+            return result[0], result[1], []
+        else:
+            return (result[0] if result else ""), (result[1] if len(result) > 1 else ""), (result[2] if len(result) > 2 else [])
+    return str(result), "", []
+
+
+async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, msg_id: int | None) -> None:
+    """Finalize panel buttons, sync timer, and edit the message."""
+    title, body, buttons = _extract_render_result(result)
+    if not title and not body and not buttons:
+        return
+    title, body, buttons = _finalize_panel(title, body, buttons, panel_id)
+    from backend.helper.panel_render import render_edit
+    text, built_buttons = render_edit(title, body, buttons)
+    _sync_timer(chat_id or 0, msg_id or 0, title, body, buttons)
+    await _safe_edit(event, text, built_buttons, chat_id, msg_id)
+
+
 def register_callback_handlers(client, owner_id: int) -> None:
     """Wire the callback query router onto the helper bot client."""
     logger.info("[PANEL] callback handler registered: owner_id=%s", owner_id)
@@ -221,7 +287,6 @@ def register_callback_handlers(client, owner_id: int) -> None:
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
         chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
-        sender_id = event.sender_id
         data_raw = event.data
         data = data_raw.decode("utf-8") if data_raw else ""
 
@@ -234,6 +299,10 @@ def register_callback_handlers(client, owner_id: int) -> None:
             return
 
         if not data:
+            await _safe_answer(event)
+            return
+
+        if _get_session(chat_id, msg_id) is None:
             await _safe_answer(event)
             return
 
@@ -273,28 +342,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
     try:
         result = await handler(event, extra)
-        if result is None:
-            return
-        if isinstance(result, tuple):
-            if len(result) == 3:
-                title, body, buttons = result
-            elif len(result) == 2:
-                title, body = result
-                buttons = []
-            else:
-                title = result[0] if result else ""
-                body = result[1] if len(result) > 1 else ""
-                buttons = result[2] if len(result) > 2 else []
-        else:
-            title, body, buttons = str(result), "", []
-        title, body, buttons = _finalize_panel(title, body, buttons, panel_id)
-        from backend.helper.panel_render import render_edit
-        text, built_buttons = render_edit(title, body, buttons)
-        _sync_timer(chat_id, msg_id, title, body, buttons)
-        try:
-            await event.edit(text, buttons=built_buttons)
-        except Exception as exc:
-            logger.warning("[CALLBACK] panel edit failed: %s", exc)
+        await _render_and_edit(event, result, panel_id, chat_id, msg_id)
     except Exception:
         logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
 
@@ -305,19 +353,12 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         clear_pending(owner_id)
         stop_timer(chat_id, msg_id)
         clear_session(chat_id, msg_id)
-        deleted = False
+        _last_render.pop((chat_id, msg_id), None)
         try:
-            await event.delete()
-            deleted = True
+            await event.edit("✕ **Panel closed**", buttons=[])
+            _last_render[(chat_id, msg_id)] = ("✕ **Panel closed**", ())
         except Exception:
             pass
-        if not deleted and chat_id is not None and msg_id is not None:
-            try:
-                client = event.client or event.original_update
-                if client is not None:
-                    await client.delete_messages(chat_id, [msg_id])
-            except Exception as exc:
-                logger.warning("[CALLBACK] close delete failed: %s", exc)
         return
 
     if action == "back":
@@ -334,28 +375,7 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         _push_nav(chat_id, msg_id, prev_panel)
         try:
             result = await handler(event, "")
-            if result is None:
-                return
-            if isinstance(result, tuple):
-                if len(result) == 3:
-                    title, body, buttons = result
-                elif len(result) == 2:
-                    title, body = result
-                    buttons = []
-                else:
-                    title = result[0] if result else ""
-                    body = result[1] if len(result) > 1 else ""
-                    buttons = result[2] if len(result) > 2 else []
-            else:
-                title, body, buttons = str(result), "", []
-            title, body, buttons = _finalize_panel(title, body, buttons, prev_panel)
-            from backend.helper.panel_render import render_edit
-            text, built_buttons = render_edit(title, body, buttons)
-            _sync_timer(chat_id, msg_id, title, body, buttons)
-            try:
-                await event.edit(text, buttons=built_buttons)
-            except Exception as exc:
-                logger.warning("[CALLBACK] back edit failed: %s", exc)
+            await _render_and_edit(event, result, prev_panel, chat_id, msg_id)
         except Exception:
             logger.exception("[CALLBACK] back navigation FAILED")
         return
@@ -378,30 +398,8 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
 
     try:
         result = await handler(event, extra)
-        if result is None:
-            return
-        if isinstance(result, tuple):
-            if len(result) == 3:
-                title, body, buttons = result
-            elif len(result) == 2:
-                title, body = result
-                buttons = []
-            else:
-                title = result[0] if result else ""
-                body = result[1] if len(result) > 1 else ""
-                buttons = result[2] if len(result) > 2 else []
-        else:
-            title, body, buttons = str(result), "", []
-
         current_panel = _current_nav(chat_id, msg_id) or action_id
-        title, body, buttons = _finalize_panel(title, body, buttons, current_panel)
-        from backend.helper.panel_render import render_edit
-        text, built_buttons = render_edit(title, body, buttons)
-        _sync_timer(chat_id, msg_id, title, body, buttons)
-        try:
-            await event.edit(text, buttons=built_buttons)
-        except Exception as exc:
-            logger.warning("[CALLBACK] action edit failed: %s", exc)
+        await _render_and_edit(event, result, current_panel, chat_id, msg_id)
     except Exception:
         logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
 
@@ -433,9 +431,6 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     builder.add_row("Cancel", f"panel:{panel_id}")
     _add_nav_buttons(builder, panel_id)
 
-    _sync_timer(chat_id, msg_id, panel_id, prompt, builder.build())
-
-    try:
-        await event.edit(prompt, buttons=builder.build())
-    except Exception as exc:
-        logger.warning("[CALLBACK] input prompt edit failed: %s", exc)
+    built = builder.build()
+    _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)
+    await _safe_edit(event, prompt, built, chat_id, msg_id)
