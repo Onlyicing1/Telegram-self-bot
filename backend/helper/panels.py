@@ -168,8 +168,10 @@ def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
     )
 
 
-def _finalize_panel(title: str, body: str, buttons: list, panel_id: str) -> tuple[str, str, list]:
-    """Ensure every panel has navigation buttons."""
+def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) -> tuple[str, str, list]:
+    """Ensure every panel has navigation buttons. Handles None/empty buttons safely."""
+    if buttons is None:
+        buttons = []
     has_nav = False
     for row in buttons:
         if isinstance(row, list):
@@ -322,14 +324,24 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
     if extra != "back":
         _push_nav(chat_id, msg_id, panel_id)
 
-    if extra and extra != "back":
-        clear_pending(owner_id)
+    clear_pending(owner_id)
 
     try:
         result = await handler(event, extra)
         if result is None:
             return
-        title, body, buttons = result
+        if isinstance(result, tuple):
+            if len(result) == 3:
+                title, body, buttons = result
+            elif len(result) == 2:
+                title, body = result
+                buttons = []
+            else:
+                title = result[0] if result else ""
+                body = result[1] if len(result) > 1 else ""
+                buttons = result[2] if len(result) > 2 else []
+        else:
+            title, body, buttons = str(result), "", []
         title, body, buttons = _finalize_panel(title, body, buttons, panel_id)
         from backend.helper.panel_render import render_edit
         text, built_buttons = render_edit(title, body, buttons)
@@ -365,11 +377,23 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
             handler = get_panel("help")
         if handler is None:
             return
+        _push_nav(chat_id, msg_id, prev_panel)
         try:
             result = await handler(event, "")
             if result is None:
                 return
-            title, body, buttons = result
+            if isinstance(result, tuple):
+                if len(result) == 3:
+                    title, body, buttons = result
+                elif len(result) == 2:
+                    title, body = result
+                    buttons = []
+                else:
+                    title = result[0] if result else ""
+                    body = result[1] if len(result) > 1 else ""
+                    buttons = result[2] if len(result) > 2 else []
+            else:
+                title, body, buttons = str(result), "", []
             title, body, buttons = _finalize_panel(title, body, buttons, prev_panel)
             from backend.helper.panel_render import render_edit
             text, built_buttons = render_edit(title, body, buttons)
@@ -405,10 +429,15 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
         if isinstance(result, tuple):
             if len(result) == 3:
                 title, body, buttons = result
+            elif len(result) == 2:
+                title, body = result
+                buttons = []
             else:
-                title, body, buttons = result[0], result[1] if len(result) > 1 else "", result[2] if len(result) > 2 else []
+                title = result[0] if result else ""
+                body = result[1] if len(result) > 1 else ""
+                buttons = result[2] if len(result) > 2 else []
         else:
-            title, body, buttons = result, "", []
+            title, body, buttons = str(result), "", []
 
         current_panel = _current_nav(chat_id, msg_id) or action_id
         title, body, buttons = _finalize_panel(title, body, buttons, current_panel)
