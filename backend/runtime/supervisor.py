@@ -101,6 +101,7 @@ class RuntimeSupervisor:
         "_watchdog_task", "_run_task",
         "_recovery_lock", "_recovery_attempts",
         "_client_alive", "_consecutive_failures",
+        "_input_listener_registered",
     )
 
     def __init__(self, cfg: dict):
@@ -128,6 +129,7 @@ class RuntimeSupervisor:
         self._recovery_attempts: int = 0
         self._client_alive: bool = False
         self._consecutive_failures: int = 0
+        self._input_listener_registered: bool = False
 
     def _transition(self, new_state: RuntimeState) -> None:
         if self.state == new_state:
@@ -211,7 +213,6 @@ class RuntimeSupervisor:
         if self.helper_enabled:
             set_self_client(self.client)
             configure_callback_trace(self.client, self.owner_id)
-            register_input_listener(self.client, self.owner_id)
 
     def _resume_bio_cron(self) -> None:
         try:
@@ -246,7 +247,9 @@ class RuntimeSupervisor:
                 set_helper_username(get_bot_username())
                 set_owner_id(self.owner_id)
                 configure_callback_trace(self.client, self.owner_id)
-                register_input_listener(self.client, self.owner_id)
+                if not self._input_listener_registered:
+                    register_input_listener(self.client, self.owner_id)
+                    self._input_listener_registered = True
                 set_helper_connected(True)
                 asyncio.create_task(
                     self._supervise_helper(), name="lifeos-helper"
@@ -517,12 +520,9 @@ class RuntimeSupervisor:
                     set_self_client(self.client)
                     configure_callback_trace(self.client, self.owner_id)
 
-                logger.info("Recovery: reconnecting input listeners")
-                if self.helper_enabled:
-                    register_input_listener(self.client, self.owner_id)
-
                 if self.helper_enabled:
                     logger.info("Recovery: restarting helper bot")
+                    self._input_listener_registered = False
                     await self._start_helper()
 
                 logger.info("Recovery: resuming bio engine")
