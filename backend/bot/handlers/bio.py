@@ -51,39 +51,51 @@ async def _bio_help_action(event, extra: str) -> tuple[str, str, list] | None:
 
 
 async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _owner_id
+    from backend.helper.inline_engine import _owner_id, _self_client
     result = await bio_service.do_template(_owner_id, text)
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio template inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _owner_id
+    from backend.helper.inline_engine import _owner_id, _self_client
     result = await bio_service.do_text(_owner_id, text)
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio text inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _owner_id
+    from backend.helper.inline_engine import _owner_id, _self_client
     result = await bio_service.do_mood(_owner_id, text)
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("bio mood inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:

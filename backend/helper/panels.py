@@ -17,18 +17,25 @@ Callback data format:
   - Panel navigation:  ``panel:<panel_id>:<extra>``
   - Action execution:  ``action:<action_id>:<extra>``
   - Input request:    ``input:<panel_id>:<input_id>``
+  - Close:            ``panel:close``
+  - Home:             ``panel:help``
+  - Back:             ``panel:<panel_id>:back`` (per-panel back navigation)
 
 The callback router dispatches based on the prefix. Panel handlers
 edit the inline message in-place. Action handlers execute logic and
 then edit the message with the result. Input handlers set a pending
 input state and edit the message to show a prompt.
 
-SESSION TRACING:
-  Every panel creation gets a unique PANEL-SESSION-NNNNNN ID.
-  Every callback logs session_id, chat_id, msg_id, callback_data.
-  Every mutation logs before/after state with object ids and dict keys.
-  This proves exactly where nav_stack changes.
+Every panel render automatically appends navigation buttons:
+  - Back (returns to the panel that opened this one, or Home if none)
+  - Home (returns to the main menu)
+  - Close (terminates the panel session)
+
+SESSION LIFECYCLE:
+  Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
+  Nothing survives after Destroy. No leaked session, timer, callback, or input.
 """
+import asyncio
 import logging
 from typing import Awaitable, Callable, Any
 
@@ -37,22 +44,14 @@ from telethon.tl.custom import Button
 
 from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
-from backend.helper.input_state import set_pending
+from backend.helper.input_state import set_pending, clear_pending, get_pending
+from backend.helper.panel_timer import set_content, stop_timer, destroy as timer_destroy
 
 logger = logging.getLogger(__name__)
 
 
 def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]:
-    """Safely resolve (chat_id, msg_id, inline_message_id) from any callback event.
-
-    Telethon's CallbackQuery.Event does NOT have a ``msg_id`` attribute.
-    Depending on the callback source:
-      - Bot messages in chats: ``event.message_id`` is set, ``event.inline_message_id`` is None.
-      - Inline messages (sent via inline mode): ``event.inline_message_id`` is set,
-        ``event.message_id`` may be None.
-
-    This helper never raises — it returns (None, None, None) if nothing can be resolved.
-    """
+    """Safely resolve (chat_id, msg_id, inline_message_id) from any callback event."""
     chat_id = None
     msg_id = None
     inline_message_id = None
@@ -86,6 +85,7 @@ def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]
 
     return chat_id, msg_id, inline_message_id
 
+
 PanelHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[None]]
 ActionHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[str]]
 InputConfig = dict[str, Any]
@@ -93,7 +93,6 @@ InputConfig = dict[str, Any]
 _panels: dict[str, PanelHandler] = {}
 _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
-
 
 _session_counter: int = 0
 _sessions: dict[tuple[int, int], dict] = {}
@@ -108,6 +107,7 @@ def _create_session(chat_id: int, msg_id: int, panel_type: str = "unknown") -> s
         "chat_id": chat_id,
         "msg_id": msg_id,
         "panel_type": panel_type,
+        "nav_stack": [panel_type],
     }
     return sid
 
@@ -118,6 +118,37 @@ def _get_session(chat_id: int | None, msg_id: int | None) -> dict | None:
     return _sessions.get((chat_id, msg_id))
 
 
+def _push_nav(chat_id: int, msg_id: int, panel_id: str) -> None:
+    session = _get_session(chat_id, msg_id)
+    if session is None:
+        _create_session(chat_id, msg_id, panel_id)
+        return
+    stack = session.get("nav_stack", [])
+    if stack and stack[-1] == panel_id:
+        return
+    stack.append(panel_id)
+    session["nav_stack"] = stack
+
+
+def _pop_nav(chat_id: int, msg_id: int) -> str | None:
+    session = _get_session(chat_id, msg_id)
+    if session is None:
+        return None
+    stack = session.get("nav_stack", [])
+    if len(stack) <= 1:
+        return None
+    stack.pop()
+    return stack[-1]
+
+
+def _current_nav(chat_id: int, msg_id: int) -> str | None:
+    session = _get_session(chat_id, msg_id)
+    if session is None:
+        return None
+    stack = session.get("nav_stack", [])
+    return stack[-1] if stack else None
+
+
 def clear_session(chat_id: int | None, msg_id: int | None) -> None:
     if chat_id is None or msg_id is None:
         return
@@ -126,6 +157,48 @@ def clear_session(chat_id: int | None, msg_id: int | None) -> None:
 
 def clear_all_sessions() -> None:
     _sessions.clear()
+
+
+def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
+    """Append Back, Home, and Close buttons to every panel."""
+    builder.add_buttons(
+        ("‹ Back", "panel:_nav:back"),
+        ("🏠 Home", "panel:help"),
+        ("✕ Close", "panel:_nav:close"),
+    )
+
+
+def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) -> tuple[str, str, list]:
+    """Ensure every panel has navigation buttons. Handles None/empty buttons safely."""
+    if buttons is None:
+        buttons = []
+    has_nav = False
+    for row in buttons:
+        if isinstance(row, list):
+            for btn in row:
+                data = getattr(btn, "data", None)
+                if data is None:
+                    continue
+                if isinstance(data, bytes):
+                    if b"panel:_nav:" in data:
+                        has_nav = True
+                        break
+                elif isinstance(data, str):
+                    if "panel:_nav:" in data:
+                        has_nav = True
+                        break
+        if has_nav:
+            break
+    if not has_nav:
+        builder = InlinePanelBuilder()
+        for row in buttons:
+            if isinstance(row, list):
+                builder._rows.append(row)
+            else:
+                builder._rows.append([row])
+        _add_nav_buttons(builder, panel_id)
+        buttons = builder.build()
+    return title, body, buttons
 
 
 class InlinePanelBuilder:
@@ -161,11 +234,6 @@ def get_panel(panel_id: str) -> PanelHandler | None:
 
 
 def register_action(action_id: str, handler: ActionHandler) -> None:
-    """Register an action handler for Type A (immediate execution) commands.
-
-    The handler receives the callback event and extra data, and returns
-    a result string to display in the panel.
-    """
     _actions[action_id] = handler
     logger.info("[ACTION] Registered: id='%s' (total=%d)", action_id, len(_actions))
 
@@ -175,12 +243,6 @@ def get_action(action_id: str) -> ActionHandler | None:
 
 
 def register_input(panel_id: str, input_id: str, handler: InputConfig) -> None:
-    """Register an input handler for Type B (requires user input) commands.
-
-    The ``handler`` dict contains:
-      - ``handler``: async callable(text, chat_id, msg_id) -> None
-      - ``prompt``: str to display when waiting for input
-    """
     if panel_id not in _inputs:
         _inputs[panel_id] = {}
     _inputs[panel_id][input_id] = handler
@@ -191,14 +253,24 @@ def get_input(panel_id: str, input_id: str) -> InputConfig | None:
     return _inputs.get(panel_id, {}).get(input_id)
 
 
-def register_callback_handlers(client, owner_id: int) -> None:
-    """Wire the callback query router onto the helper bot client.
+async def _safe_answer(event) -> None:
+    """Answer the callback query to remove the loading spinner."""
+    try:
+        await event.answer()
+    except Exception:
+        pass
 
-    Dispatches based on callback data prefix:
-      - ``panel:`` → panel navigation handler
-      - ``action:`` → action execution handler (Type A)
-      - ``input:`` → input state setup (Type B)
-    """
+
+def _sync_timer(chat_id: int, msg_id: int, title: str, body: str, buttons: list) -> None:
+    """Sync panel content to the timer so countdown re-renders show current state."""
+    try:
+        set_content(chat_id, msg_id, title, body, buttons)
+    except Exception:
+        pass
+
+
+def register_callback_handlers(client, owner_id: int) -> None:
+    """Wire the callback query router onto the helper bot client."""
     logger.info("[PANEL] callback handler registered: owner_id=%s", owner_id)
 
     @client.on(events.CallbackQuery())
@@ -213,41 +285,67 @@ def register_callback_handlers(client, owner_id: int) -> None:
             return
 
         if not is_owner(event, owner_id):
+            await _safe_answer(event)
             return
 
         if not data:
+            await _safe_answer(event)
             return
 
         try:
             if data.startswith("panel:"):
-                await _handle_panel(event, data[6:])
+                await _handle_panel(event, data[6:], chat_id, msg_id, owner_id)
             elif data.startswith("action:"):
-                await _handle_action(event, data[7:])
+                await _handle_action(event, data[7:], chat_id, msg_id, owner_id)
             elif data.startswith("input:"):
-                await _handle_input(event, data[6:], owner_id)
+                await _handle_input(event, data[6:], owner_id, chat_id, msg_id)
             else:
                 logger.warning("[PANEL] unknown callback prefix: '%s'", data)
         except Exception:
             logger.exception("[PANEL] callback router error (data='%s')", data)
+        finally:
+            await _safe_answer(event)
 
 
-async def _handle_panel(event, remainder: str) -> None:
+async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> None:
     parts = remainder.split(":", 1)
     panel_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
+
+    if panel_id == "_nav":
+        await _handle_navigation(event, extra, chat_id, msg_id, owner_id)
+        return
 
     handler = get_panel(panel_id)
     if handler is None:
         logger.warning("[CALLBACK] no panel registered for id='%s'", panel_id)
         return
 
+    if extra != "back":
+        _push_nav(chat_id, msg_id, panel_id)
+
+    clear_pending(owner_id)
+
     try:
         result = await handler(event, extra)
         if result is None:
             return
-        title, body, buttons = result
+        if isinstance(result, tuple):
+            if len(result) == 3:
+                title, body, buttons = result
+            elif len(result) == 2:
+                title, body = result
+                buttons = []
+            else:
+                title = result[0] if result else ""
+                body = result[1] if len(result) > 1 else ""
+                buttons = result[2] if len(result) > 2 else []
+        else:
+            title, body, buttons = str(result), "", []
+        title, body, buttons = _finalize_panel(title, body, buttons, panel_id)
         from backend.helper.panel_render import render_edit
         text, built_buttons = render_edit(title, body, buttons)
+        _sync_timer(chat_id, msg_id, title, body, buttons)
         try:
             await event.edit(text, buttons=built_buttons)
         except Exception as exc:
@@ -256,7 +354,63 @@ async def _handle_panel(event, remainder: str) -> None:
         logger.exception("[CALLBACK] panel handler '%s' FAILED", panel_id)
 
 
-async def _handle_action(event, remainder: str) -> None:
+async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Handle Back, Home, and Close navigation buttons."""
+    if action == "close":
+        clear_pending(owner_id)
+        stop_timer(chat_id, msg_id)
+        clear_session(chat_id, msg_id)
+        try:
+            await event.delete()
+        except Exception as exc:
+            logger.warning("[CALLBACK] close delete failed: %s", exc)
+        return
+
+    if action == "back":
+        prev_panel = _pop_nav(chat_id, msg_id)
+        clear_pending(owner_id)
+        if prev_panel is None:
+            prev_panel = "help"
+        handler = get_panel(prev_panel)
+        if handler is None:
+            prev_panel = "help"
+            handler = get_panel("help")
+        if handler is None:
+            return
+        _push_nav(chat_id, msg_id, prev_panel)
+        try:
+            result = await handler(event, "")
+            if result is None:
+                return
+            if isinstance(result, tuple):
+                if len(result) == 3:
+                    title, body, buttons = result
+                elif len(result) == 2:
+                    title, body = result
+                    buttons = []
+                else:
+                    title = result[0] if result else ""
+                    body = result[1] if len(result) > 1 else ""
+                    buttons = result[2] if len(result) > 2 else []
+            else:
+                title, body, buttons = str(result), "", []
+            title, body, buttons = _finalize_panel(title, body, buttons, prev_panel)
+            from backend.helper.panel_render import render_edit
+            text, built_buttons = render_edit(title, body, buttons)
+            _sync_timer(chat_id, msg_id, title, body, buttons)
+            try:
+                await event.edit(text, buttons=built_buttons)
+            except Exception as exc:
+                logger.warning("[CALLBACK] back edit failed: %s", exc)
+        except Exception:
+            logger.exception("[CALLBACK] back navigation FAILED")
+        return
+
+    if action == "noop":
+        return
+
+
+async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner_id: int) -> None:
     parts = remainder.split(":", 1)
     action_id = parts[0]
     extra = parts[1] if len(parts) > 1 else ""
@@ -266,6 +420,8 @@ async def _handle_action(event, remainder: str) -> None:
         logger.warning("[CALLBACK] no action registered for id='%s'", action_id)
         return
 
+    clear_pending(owner_id)
+
     try:
         result = await handler(event, extra)
         if result is None:
@@ -273,12 +429,21 @@ async def _handle_action(event, remainder: str) -> None:
         if isinstance(result, tuple):
             if len(result) == 3:
                 title, body, buttons = result
+            elif len(result) == 2:
+                title, body = result
+                buttons = []
             else:
-                title, body, buttons = result[0], result[1] if len(result) > 1 else "", result[2] if len(result) > 2 else []
+                title = result[0] if result else ""
+                body = result[1] if len(result) > 1 else ""
+                buttons = result[2] if len(result) > 2 else []
         else:
-            title, body, buttons = result, "", []
+            title, body, buttons = str(result), "", []
+
+        current_panel = _current_nav(chat_id, msg_id) or action_id
+        title, body, buttons = _finalize_panel(title, body, buttons, current_panel)
         from backend.helper.panel_render import render_edit
         text, built_buttons = render_edit(title, body, buttons)
+        _sync_timer(chat_id, msg_id, title, body, buttons)
         try:
             await event.edit(text, buttons=built_buttons)
         except Exception as exc:
@@ -287,7 +452,7 @@ async def _handle_action(event, remainder: str) -> None:
         logger.exception("[CALLBACK] action handler '%s' FAILED", action_id)
 
 
-async def _handle_input(event, remainder: str, owner_id: int) -> None:
+async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_id: int) -> None:
     parts = remainder.split(":", 1)
     panel_id = parts[0]
     input_id = parts[1] if len(parts) > 1 else ""
@@ -304,7 +469,7 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
         logger.warning("[CALLBACK] input config has no handler")
         return
 
-    chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
+    clear_pending(owner_id)
     set_pending(
         owner_id, panel_id, handler, chat_id or 0, prompt,
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
@@ -312,6 +477,9 @@ async def _handle_input(event, remainder: str, owner_id: int) -> None:
 
     builder = InlinePanelBuilder()
     builder.add_row("Cancel", f"panel:{panel_id}")
+    _add_nav_buttons(builder, panel_id)
+
+    _sync_timer(chat_id, msg_id, panel_id, prompt, builder.build())
 
     try:
         await event.edit(prompt, buttons=builder.build())

@@ -47,7 +47,10 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
         result = await save_service.execute_save(client, owner_id, reply_msg, mode, ctx.tz_str)
         return "Save Engine", result, []
 
-    return "Save Engine", "Unknown save action.", []
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Forward Save", "panel:save:exec:f")
+    builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
+    return "Save Engine", "Choose a save mode:", builder.build()
 
 
 async def _save_inline_builder(event, extra: str) -> list:
