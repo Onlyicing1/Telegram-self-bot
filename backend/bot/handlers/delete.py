@@ -35,9 +35,13 @@ async def _del_n_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del n inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -51,9 +55,13 @@ async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del id inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _del_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -63,9 +71,13 @@ async def _del_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("del code inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:

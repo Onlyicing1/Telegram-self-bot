@@ -47,16 +47,20 @@ async def _list_inline_builder(event, extra: str) -> list:
 
 
 async def _find_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _owner_id
+    from backend.helper.inline_engine import _owner_id, _self_client
     from backend.bot.handlers.misc import _resolve_tz
     result = await discover_service.do_find(_owner_id, text, _resolve_tz())
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
-            await helper.delete_messages(chat_id, [msg_id])
         except Exception as exc:
             logger.warning("find inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _find_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
