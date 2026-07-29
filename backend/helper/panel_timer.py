@@ -131,7 +131,11 @@ async def _edit_countdown(self_client, chat_id: int, msg_id: int, seconds: int) 
 
 
 def destroy(self_client, chat_id: int, msg_id: int) -> None:
-    """Fully clear timer state, pending input, panel session, and delete the panel message."""
+    """Fully clear timer state, pending input, panel session, and edit the panel to a closed state.
+
+    Inline messages cannot be deleted via the Telegram API. Instead, we edit
+    the message to a 'closed' state with no buttons, making it visually dead.
+    """
     from backend.helper.input_state import clear_all as clear_all_pending
     k = _key(chat_id, msg_id)
     entry = _panels.pop(k, None)
@@ -140,7 +144,7 @@ def destroy(self_client, chat_id: int, msg_id: int) -> None:
     clear_session(chat_id, msg_id)
     clear_all_pending()
     try:
-        asyncio.create_task(self_client.delete_messages(chat_id, [msg_id]))
+        asyncio.create_task(self_client.edit_message(chat_id, msg_id, message="✕ **Panel closed**", buttons=[]))
     except Exception:
         pass
 
