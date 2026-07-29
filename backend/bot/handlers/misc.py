@@ -139,6 +139,23 @@ def _build_main_menu_buttons() -> list:
     return builder.build()
 
 
+def _build_general_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🏓 Ping", "action:general_ping")
+    builder.add_row("🆔 Chat & Msg IDs", "action:general_id")
+    builder.add_row("🩺 Health Dashboard", "action:general_health")
+    builder.add_row("📦 Context Panel", "action:general_panel")
+    builder.add_row("🏠 Help Menu", "action:general_help")
+    return builder.build()
+
+
+def _general_body() -> str:
+    return (
+        "**General**\n\n"
+        "Tap a button to execute instantly."
+    )
+
+
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -147,6 +164,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
         if idx_str.isdigit():
             idx = int(idx_str)
             if 0 <= idx < len(_HELP_CATEGORIES):
+                if idx == 0:
+                    return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -154,6 +173,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 
 
 async def _help_inline_builder(event, extra: str) -> list:
+    if extra.startswith("cat:0"):
+        return [render("General", _general_body(), _build_general_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
@@ -184,12 +205,75 @@ async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str
     return "Settings", body, builder.build()
 
 
+async def _general_ping_action(event, extra: str) -> tuple[str, str, list] | None:
+    return "PONG", "", _build_general_buttons()
+
+
+async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+    lines = []
+    if ctx and ctx.kind == "reply":
+        lines.append(f"**Reply Chat ID:** `{ctx.reply_chat_id}`")
+        lines.append(f"**Reply Msg ID:** `{ctx.reply_msg_id}`")
+    else:
+        client = _self_client
+        if client is not None:
+            me = await client.get_me()
+            lines.append(f"**Your ID:** `{me.id}`")
+        else:
+            lines.append("Reply to a message and use `.panel` first to see IDs.")
+    body = "\n".join(lines) if lines else "No context available."
+    return "Chat & Msg IDs", body, _build_general_buttons()
+
+
+async def _general_health_action(event, extra: str) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+async def _general_panel_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+    if not ctx or ctx.kind != "reply":
+        return (
+            "Context Panel",
+            "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
+            _build_general_buttons(),
+        )
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
+    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
+    builder.add_row("👁 Preview", "panel:context:exec:preview")
+    return (
+        "Context Panel",
+        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
+        builder.build(),
+    )
+
+
+async def _general_help_action(event, extra: str) -> tuple[str, str, list] | None:
+    return "LifeOS Command Center", "", _build_main_menu_buttons()
+
+
 def _register_help_panel() -> None:
     register_panel("help", _help_panel_handler)
     register_panel("settings", _settings_panel_handler)
     register_inline_builder("help", _help_inline_builder)
     register_inline_builder("settings", _settings_inline_builder)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
+    register_action("general_ping", _general_ping_action)
+    register_action("general_id", _general_id_action)
+    register_action("general_health", _general_health_action)
+    register_action("general_panel", _general_panel_action)
+    register_action("general_help", _general_help_action)
 
 
 async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
