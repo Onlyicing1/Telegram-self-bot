@@ -25,6 +25,17 @@ async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     if not helper_username:
         return False
 
+    from backend.helper.session_manager import find_session_by_chat, clear_session
+    from backend.helper.panel_timer import stop_timer
+
+    existing = find_session_by_chat(chat_id)
+    if existing is not None:
+        old_msg_id = existing.get("msg_id", 0)
+        old_chat_id = existing.get("chat_id", 0)
+        if old_msg_id and old_chat_id:
+            stop_timer(old_chat_id, old_msg_id)
+            clear_session(old_chat_id, old_msg_id)
+
     try:
         success, msg_chat_id, msg_id = await inline_engine.trigger(self_client, chat_id, query)
         logger.info(

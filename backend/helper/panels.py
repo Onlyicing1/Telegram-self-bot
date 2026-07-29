@@ -21,15 +21,11 @@ Callback data format:
   - Home:             ``panel:_nav:home``
   - Back:             ``panel:_nav:back``
 
-The callback router dispatches based on the prefix. Panel handlers
-edit the inline message in-place. Action handlers execute logic and
-then edit the message with the result. Input handlers set a pending
-input state and edit the message to show a prompt.
-
-Every panel render automatically appends navigation buttons:
-  - Back (returns to the panel that opened this one, or Home if none)
-  - Home (returns to the main menu)
-  - Close (terminates the panel session)
+ROOT MENU rules:
+  - Root menu (nav_stack length 1) has ONLY Close — never Back or Home.
+  - Submenus (nav_stack length > 1) have Back, Home, and Close.
+  - The root menu is always rendered deterministically — navigation never
+    mutates its button layout.
 
 SESSION LIFECYCLE:
   Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
@@ -49,10 +45,12 @@ from backend.helper.panel_timer import set_content, stop_timer, destroy as timer
 from backend.helper.session_manager import (
     create_session as _create_session,
     get_session as _get_session,
+    find_session_by_chat as _find_session_by_chat,
     push_nav as _push_nav,
     pop_nav as _pop_nav,
     reset_nav as _reset_nav,
     current_nav as _current_nav,
+    set_current_extra as _set_current_extra,
     clear_session,
     clear_all_sessions,
 )
@@ -168,17 +166,31 @@ class InlinePanelBuilder:
         return [list(row) for row in self._rows]
 
 
-def _add_nav_buttons(builder: InlinePanelBuilder, panel_id: str) -> None:
-    """Append Back, Home, and Close buttons to every panel."""
+def _is_root(chat_id: int, msg_id: int) -> bool:
+    """Check if the current view is the root menu (nav_stack length <= 1)."""
+    session = _get_session(chat_id, msg_id)
+    if session is None:
+        return True
+    stack = session.get("nav_stack", [])
+    return len(stack) <= 1
+
+
+def _add_close_button(builder: InlinePanelBuilder) -> None:
+    """Append only a Close button — used for the root menu."""
+    builder.add_row("✕ Close", "panel:_nav:close")
+
+
+def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
+    """Append Back, Home, and Close buttons — used for submenus."""
     builder.add_buttons(
         ("‹ Back", "panel:_nav:back"),
         ("🏠 Home", "panel:_nav:home"),
-        ("✕ Close", "panel:_nav:close"),
     )
+    builder.add_row("✕ Close", "panel:_nav:close")
 
 
 def _has_nav_buttons(buttons: list) -> bool:
-    """Check if the button list already contains navigation buttons."""
+    """Check if the button list already contains any navigation buttons."""
     for row in buttons:
         if isinstance(row, list):
             for btn in row:
@@ -194,19 +206,37 @@ def _has_nav_buttons(buttons: list) -> bool:
     return False
 
 
-def _finalize_panel(title: str, body: str, buttons: list | None, panel_id: str) -> tuple[str, str, list]:
-    """Ensure every panel has navigation buttons. Always builds a fresh keyboard — never mutates the input list."""
+def _finalize_panel(
+    title: str, body: str, buttons: list | None, panel_id: str,
+    chat_id: int | None = None, msg_id: int | None = None,
+) -> tuple[str, str, list]:
+    """Ensure every panel has the correct navigation buttons.
+
+    Root menu (nav_stack length 1): only Close.
+    Submenus (nav_stack length > 1): Back, Home, Close.
+    Never mutates the input button list — always builds a fresh copy.
+    """
     if buttons is None:
         buttons = []
     if _has_nav_buttons(buttons):
         return title, body, [list(row) if isinstance(row, list) else [row] for row in buttons]
+
     builder = InlinePanelBuilder()
     for row in buttons:
         if isinstance(row, list):
             builder._rows.append(list(row))
         else:
             builder._rows.append([row])
-    _add_nav_buttons(builder, panel_id)
+
+    is_root = True
+    if chat_id is not None and msg_id is not None:
+        is_root = _is_root(chat_id, msg_id)
+
+    if is_root:
+        _add_close_button(builder)
+    else:
+        _add_nav_buttons(builder)
+
     return title, body, builder.build()
 
 
@@ -274,7 +304,7 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
     title, body, buttons = _extract_render_result(result)
     if not title and not body and not buttons:
         return
-    title, body, buttons = _finalize_panel(title, body, buttons, panel_id)
+    title, body, buttons = _finalize_panel(title, body, buttons, panel_id, chat_id, msg_id)
     from backend.helper.panel_render import render_edit
     text, built_buttons = render_edit(title, body, buttons)
     _sync_timer(chat_id or 0, msg_id or 0, title, body, buttons)
@@ -336,9 +366,8 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.warning("[CALLBACK] no panel registered for id='%s'", panel_id)
         return
 
-    if extra != "back":
-        _push_nav(chat_id, msg_id, panel_id)
-
+    _push_nav(chat_id, msg_id, panel_id)
+    _set_current_extra(chat_id, msg_id, extra)
     clear_pending(owner_id)
 
     try:
@@ -390,6 +419,7 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
 
     if action == "home":
         _reset_nav(chat_id, msg_id, "help")
+        _set_current_extra(chat_id, msg_id, "")
         clear_pending(owner_id)
         handler = get_panel("help")
         if handler is None:
@@ -403,6 +433,7 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
 
     if action == "back":
         prev_panel = _pop_nav(chat_id, msg_id)
+        _set_current_extra(chat_id, msg_id, "")
         clear_pending(owner_id)
         if prev_panel is None:
             prev_panel = "help"
@@ -468,7 +499,7 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
 
     builder = InlinePanelBuilder()
     builder.add_row("Cancel", f"panel:{panel_id}")
-    _add_nav_buttons(builder, panel_id)
+    _add_nav_buttons(builder)
 
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)

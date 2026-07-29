@@ -78,14 +78,22 @@ def render(
 ) -> types.InputBotInlineResult:
     """Build a single inline result. Accepts tuples OR Button objects.
 
-    Navigation buttons (Back, Home, Close) are appended to every panel
-    so the initial render matches all subsequent callback edits.
+    The root menu's initial render adds only a Close button (no Back/Home).
+    Submenus get Back, Home, and Close via _finalize_panel during callback edits.
     """
-    from backend.helper.panels import _finalize_panel
-
     if buttons is None:
         buttons = []
-    title, body, buttons = _finalize_panel(title, body, buttons, "render")
+
+    from backend.helper.panels import _has_nav_buttons, InlinePanelBuilder, _add_close_button
+    if not _has_nav_buttons(buttons):
+        builder = InlinePanelBuilder()
+        for row in buttons:
+            if isinstance(row, list):
+                builder._rows.append(list(row))
+            else:
+                builder._rows.append([row])
+        _add_close_button(builder)
+        buttons = builder.build()
 
     if title and body:
         message = f"**{title}**\n\n{body}"
