@@ -111,10 +111,10 @@ through the service-role key.
 ### Typical Usage
 
 - **Insert** — `.save f` / `.save d\` calls \`insert_save()`.
-- **Query by code** — `.preview <code>` / `.send <code>\` calls `query_save()`,
-  which looks up by `short_code\` OR `save_code` (case-insensitive).
-- **List recent** — `.list\` calls `list_recent_saves()`, selects a subset of
-  columns ordered by `created_at DESC`.
+- **Query by code** — `.preview <code>` / `.send <code>\` calls \`query_save()`,
+  which looks up by \`short_code\` OR \`save_code` (case-insensitive).
+- **List recent** — `.list\` calls \`list_recent_saves()`, selects a subset of
+  columns ordered by \`created_at DESC`.
 - **Search** — `.find <query>\` calls `search_saves()`, uses trigram indexes
   for ILIKE matching across `caption`, `file_name`, `save_code`,
   `short_code`, `mime_type`.
