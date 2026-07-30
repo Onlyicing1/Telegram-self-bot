@@ -30,7 +30,7 @@ Architecture:
    - A default + validator + typed accessor here
    No panel code needs to change.
 
-## Settings (13 columns on panel_settings)
+## Settings (12 columns on panel_settings)
 
 | Column                  | Type    | Default | Range/Constraint        |
 |-------------------------|---------|---------|-------------------------|
@@ -42,7 +42,6 @@ Architecture:
 | panel_timeout_seconds   | int     | 300     | 30..86400 (seconds)     |
 | allow_multiple_panels   | bool    | false   | must be boolean         |
 | reuse_existing_panel    | bool    | true    | must be boolean         |
-| theme                   | str     | "dark"  | non-empty string        |
 | language                | str     | "en"    | non-empty string        |
 | diagnostics_enabled     | bool    | true    | must be boolean         |
 | debug_callbacks        | bool    | false   | must be boolean         |
@@ -64,7 +63,6 @@ _DEFAULTS: dict[str, Any] = {
     "panel_timeout_seconds": 300,
     "allow_multiple_panels": False,
     "reuse_existing_panel": True,
-    "theme": "dark",
     "language": "en",
     "diagnostics_enabled": True,
     "debug_callbacks": False,
@@ -104,7 +102,6 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "panel_timeout_seconds": _validate_int_range(30, 86400),
     "allow_multiple_panels": _validate_bool,
     "reuse_existing_panel": _validate_bool,
-    "theme": _validate_nonempty_str,
     "language": _validate_nonempty_str,
     "diagnostics_enabled": _validate_bool,
     "debug_callbacks": _validate_bool,
@@ -291,15 +288,6 @@ def set_panel_timeout_seconds(seconds: int) -> bool:
 
 
 # ── Typed accessors: strings ──
-
-def theme() -> str:
-    _ensure_loaded()
-    return str(_cache.get("theme", "dark"))
-
-
-def set_theme(value: str) -> bool:
-    return set_setting("theme", value)
-
 
 def language() -> str:
     _ensure_loaded()
