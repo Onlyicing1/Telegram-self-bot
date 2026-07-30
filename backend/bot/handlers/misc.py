@@ -177,29 +177,52 @@ async def _help_inline_builder(event, extra: str) -> list:
 
 def _build_settings_body() -> str:
     from backend.services import settings_service
-    auto_close = settings_service.is_auto_close_enabled()
-    close_secs = settings_service.panel_auto_close_seconds()
-    max_mb = settings_service.max_deep_save_mb()
-    batch = settings_service.delete_batch_size()
-    cleanup_days = settings_service.log_cleanup_days()
-    ac_status = "ON" if auto_close else "OFF"
+    ac = settings_service.is_auto_close_enabled()
+    acd = settings_service.auto_close_delay()
+    mds = settings_service.max_deep_save_mb()
+    dbs = settings_service.delete_batch_size()
+    lrd = settings_service.log_retention_days()
+    pts = settings_service.panel_timeout_seconds()
+    amp = settings_service.is_allow_multiple_panels()
+    rep = settings_service.is_reuse_existing_panel()
+    th = settings_service.theme()
+    lang = settings_service.language()
+    de = settings_service.is_diagnostics_enabled()
+    dbg = settings_service.is_debug_callbacks()
+    oo = settings_service.is_owner_only()
     return (
         "**⚙️ LifeOS Settings**\n\n"
-        f"Auto Close: `{ac_status}`\n"
-        f"Auto-Close Delay: `{close_secs}s`\n"
-        f"Max Deep Save: `{max_mb} MB`\n"
-        f"Delete Batch Size: `{batch}`\n"
-        f"Log Retention: `{cleanup_days} days`"
+        f"Auto Close: `{'ON' if ac else 'OFF'}`\n"
+        f"Auto-Close Delay: `{acd}s`\n"
+        f"Max Deep Save: `{mds} MB`\n"
+        f"Delete Batch Size: `{dbs}`\n"
+        f"Log Retention: `{lrd} days`\n"
+        f"Panel Timeout: `{pts}s`\n"
+        f"Allow Multiple Panels: `{'ON' if amp else 'OFF'}`\n"
+        f"Reuse Existing Panel: `{'ON' if rep else 'OFF'}`\n"
+        f"Theme: `{th}`\n"
+        f"Language: `{lang}`\n"
+        f"Diagnostics: `{'ON' if de else 'OFF'}`\n"
+        f"Debug Callbacks: `{'ON' if dbg else 'OFF'}`\n"
+        f"Owner Only: `{'ON' if oo else 'OFF'}`"
     )
 
 
 def _build_settings_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Toggle Auto Close", "action:settings_toggle_autoclose")
-    builder.add_row("Set Auto-Close Delay", "input:settings:auto_close_seconds")
+    builder.add_row("Toggle Diagnostics", "action:settings_toggle_diagnostics")
+    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks")
+    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only")
+    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels")
+    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel")
+    builder.add_row("Set Auto-Close Delay", "input:settings:auto_close_delay")
     builder.add_row("Set Max Deep Save (MB)", "input:settings:max_deep_save_mb")
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
-    builder.add_row("Set Log Retention (days)", "input:settings:log_cleanup_days")
+    builder.add_row("Set Log Retention (days)", "input:settings:log_retention_days")
+    builder.add_row("Set Panel Timeout (s)", "input:settings:panel_timeout_seconds")
+    builder.add_row("Set Theme", "input:settings:theme")
+    builder.add_row("Set Language", "input:settings:language")
     return builder.build()
 
 
@@ -212,7 +235,38 @@ async def _settings_inline_builder(event, extra: str) -> list:
 
 
 async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str, list] | None:
-    toggle_auto_close()
+    from backend.services import settings_service
+    settings_service.toggle_auto_close()
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_diagnostics_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_diagnostics_enabled(not settings_service.is_diagnostics_enabled())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_debug_callbacks_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_debug_callbacks(not settings_service.is_debug_callbacks())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_owner_only_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_owner_only(not settings_service.is_owner_only())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_multiple_panels_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_allow_multiple_panels(not settings_service.is_allow_multiple_panels())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_reuse_panel_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_reuse_existing_panel(not settings_service.is_reuse_existing_panel())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
@@ -267,21 +321,21 @@ async def _general_health_action(event, extra: str) -> tuple[str, str, list] | N
     return "Health Dashboard", report, builder.build()
 
 
-async def _settings_auto_close_seconds_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+async def _settings_auto_close_delay_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.services import settings_service
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 10 and 3600."
+        result = "⚠️ Please enter a number between 5 and 3600."
     else:
-        ok = settings_service.set_panel_auto_close_seconds(int(text))
-        result = f"✅ Auto-close delay set to `{text}s`" if ok else "⚠️ Value must be between 10 and 3600."
+        ok = settings_service.set_auto_close_delay(int(text))
+        result = f"✅ Auto-close delay set to `{text}s`" if ok else "⚠️ Value must be between 5 and 3600."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
-            logger.warning("settings auto_close_seconds inline edit failed: %s", exc)
+            logger.warning("settings auto_close_delay inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -340,14 +394,80 @@ async def _settings_log_cleanup_days_handler(text, chat_id, msg_id, inline_chat_
     if not text.isdigit():
         result = "⚠️ Please enter a number between 1 and 365."
     else:
-        ok = settings_service.set_log_cleanup_days(int(text))
+        ok = settings_service.set_log_retention_days(int(text))
         result = f"✅ Log retention set to `{text} days`" if ok else "⚠️ Value must be between 1 and 365."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
-            logger.warning("settings log_cleanup_days inline edit failed: %s", exc)
+            logger.warning("settings log_retention_days inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_panel_timeout_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 30 and 86400."
+    else:
+        ok = settings_service.set_panel_timeout_seconds(int(text))
+        result = f"✅ Panel timeout set to `{text}s`" if ok else "⚠️ Value must be between 30 and 86400."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings panel_timeout inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_theme_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text:
+        result = "⚠️ Theme cannot be empty."
+    else:
+        ok = settings_service.set_theme(text)
+        result = f"✅ Theme set to `{text}`" if ok else "⚠️ Invalid theme."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings theme inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text:
+        result = "⚠️ Language cannot be empty."
+    else:
+        ok = settings_service.set_language(text)
+        result = f"✅ Language set to `{text}`" if ok else "⚠️ Invalid language."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings language inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -361,12 +481,17 @@ def _register_help_panel() -> None:
     register_inline_builder("help", _help_inline_builder)
     register_inline_builder("settings", _settings_inline_builder)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
+    register_action("settings_toggle_diagnostics", _settings_toggle_diagnostics_action)
+    register_action("settings_toggle_debug_callbacks", _settings_toggle_debug_callbacks_action)
+    register_action("settings_toggle_owner_only", _settings_toggle_owner_only_action)
+    register_action("settings_toggle_multiple_panels", _settings_toggle_multiple_panels_action)
+    register_action("settings_toggle_reuse_panel", _settings_toggle_reuse_panel_action)
     register_action("general_ping", _general_ping_action)
     register_action("general_id", _general_id_action)
     register_action("general_health", _general_health_action)
-    register_input("settings", "auto_close_seconds", {
-        "handler": _settings_auto_close_seconds_handler,
-        "prompt": "**Auto-Close Delay**\n\nEnter the delay in seconds (10-3600):\n\n_Reply with the number below._",
+    register_input("settings", "auto_close_delay", {
+        "handler": _settings_auto_close_delay_handler,
+        "prompt": "**Auto-Close Delay**\n\nEnter the delay in seconds (5-3600):\n\n_Reply with the number below._",
     })
     register_input("settings", "max_deep_save_mb", {
         "handler": _settings_max_deep_save_mb_handler,
@@ -376,9 +501,21 @@ def _register_help_panel() -> None:
         "handler": _settings_delete_batch_size_handler,
         "prompt": "**Delete Batch Size**\n\nEnter the batch size for message deletion (1-1000):\n\n_Reply with the number below._",
     })
-    register_input("settings", "log_cleanup_days", {
+    register_input("settings", "log_retention_days", {
         "handler": _settings_log_cleanup_days_handler,
         "prompt": "**Log Retention**\n\nEnter the number of days to retain logs (1-365):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "panel_timeout_seconds", {
+        "handler": _settings_panel_timeout_handler,
+        "prompt": "**Panel Timeout**\n\nEnter the panel timeout in seconds (30-86400):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "theme", {
+        "handler": _settings_theme_handler,
+        "prompt": "**Theme**\n\nEnter the theme name (e.g. dark, light):\n\n_Reply with the theme below._",
+    })
+    register_input("settings", "language", {
+        "handler": _settings_language_handler,
+        "prompt": "**Language**\n\nEnter the language code (e.g. en, fa):\n\n_Reply with the language code below._",
     })
 
 
@@ -800,6 +937,10 @@ def register(client, owner_id: int):
     async def kill_cmd(event):
         if not is_owner(event, owner_id):
             return
+        from backend.services import settings_service
+        if not settings_service.is_diagnostics_enabled():
+            await event.edit("⚠️ Diagnostics are disabled. Enable them in Settings.")
+            return
         helper = get_client()
         if helper is None:
             try:
@@ -826,6 +967,10 @@ def register(client, owner_id: int):
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.logs(?:\s+(.+))?$"))
     async def logs_cmd(event):
         if not is_owner(event, owner_id):
+            return
+        from backend.services import settings_service
+        if not settings_service.is_diagnostics_enabled():
+            await event.edit("⚠️ Diagnostics are disabled. Enable them in Settings.")
             return
 
         arg = (event.pattern_match.group(1) or "").strip()
