@@ -13,6 +13,8 @@ reconnect loops by giving up after _MAX_REBUILD_ATTEMPTS.
 import asyncio
 import logging
 
+from backend.runtime.task_guard import guarded_create_task
+
 logger = logging.getLogger(__name__)
 
 _CHECK_INTERVAL = 30
@@ -28,7 +30,7 @@ def start() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = asyncio.create_task(_watchdog_loop(), name="lifeos-helper-watchdog")
+    _task = guarded_create_task(_watchdog_loop(), name="lifeos-helper-watchdog")
     logger.info("Helper watchdog started")
 
 

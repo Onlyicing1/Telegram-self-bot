@@ -28,6 +28,7 @@ from telethon.tl.functions.account import UpdateProfileRequest
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.runtime.tracer import trace, trace_exception
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,10 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = asyncio.create_task(_supervised_cron(client, owner_id, tz_str))
+    _task = guarded_create_task(
+        _supervised_cron(client, owner_id, tz_str),
+        name="lifeos-bio-cron",
+    )
     trace("BIO_CRON_START_REQUESTED")
     record_event("bio", "start_cron", 0, "SUCCESS")
 
