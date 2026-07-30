@@ -402,6 +402,31 @@ def get_stats(owner_id: int) -> dict:
     }
 
 
+def update_save_field(owner_id: int, code: str, field: str, value) -> dict | None:
+    """Update a single field on a saved_items row by short_code or save_code.
+    Returns the updated row, or None if not found / not owned.
+    """
+    target = query_save(code)
+    if not target or target.get("owner_id") != owner_id:
+        return None
+    db = get_db()
+    if db:
+        try:
+            sc = target.get("short_code") or target.get("save_code")
+            res = (
+                db.table("saved_items")
+                .update({field: value})
+                .eq("owner_id", owner_id)
+                .eq("short_code" if target.get("short_code") else "save_code", sc)
+                .execute()
+            )
+            return res.data[0] if (res.data or []) else None
+        except Exception as exc:
+            logger.warning("Supabase update_save_field failed (%s) — using fallback.", exc)
+    target[field] = value
+    return target
+
+
 def count_saves(owner_id: int, save_type: str | None = None) -> int:
     db = get_db()
     if db:
