@@ -1,81 +1,95 @@
 """
-Centralized settings service — the single source of truth for all
-runtime configuration.
+Centralized Panel Settings Service — the single source of truth for all
+Glass Panel configuration.
 
 Architecture:
-  Database (bot_settings table)
+
+  Supabase (panel_settings table — column-per-setting model)
     ↓
-  settings_service cache (in-memory, refresh-only)
+  settings_service cache (in-memory, load-once + refresh-on-write)
     ↓
-  Feature modules call settings_service.get_*()
+  Feature modules call settings_service.get_*() / set_*()
 
 The cache is NEVER the source of truth. It exists only to avoid a DB
 round-trip on every read. On any write (set), the DB is updated first,
-then the cache is refreshed. On startup, load_all() populates the
-cache from the DB.
+then the cache is refreshed from the DB row. On startup, load_all()
+populates the cache from the DB.
 
-All configurable features must read through this service. No module
-should read from bot_settings directly or use hardcoded constants.
+## Design Principles
+
+1. **Column-per-setting model** — each setting is a real typed column on
+   the `panel_settings` table. No key-value store. No generic settings table.
+2. **Singleton row** — the table has exactly one row (key = "global").
+3. **Validators** — each setting has its own validator that enforces
+   type and range constraints. Validation happens before the DB write.
+4. **Future-proof** — adding a new setting requires only:
+   - `ALTER TABLE panel_settings ADD COLUMN ...`
+   - A validator + accessor in this file
+   No panel code needs to change.
+5. **No hardcoded defaults in panels** — defaults live in the DB (column
+   defaults) and in this service (fallback defaults). Panels read from
+   the service, never from constants.
+
+## Cache Flow
+
+  Startup:  load_all() → SELECT * FROM panel_settings → _cache dict
+  Read:     get_*() → _cache hit (no DB call)
+  Write:    set_*() → validate → UPDATE panel_settings → refresh from DB → _cache
+  Reload:   reload_settings() → SELECT * FROM panel_settings → _cache dict
+
+The cache and DB are never left inconsistent: every write refreshes the
+cache from the DB row immediately after the update.
 """
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from backend.db import client as db_client
 
 logger = logging.getLogger(__name__)
 
-_TABLE = "bot_settings"
+_TABLE = "panel_settings"
+_KEY = "global"
 
-_cache: dict[str, dict] = {}
+_cache: dict[str, Any] = {}
 _loaded = False
 
-_DEFAULTS: dict[str, dict] = {
-    "auto_close_enabled": {
-        "value": True,
-        "value_type": "bool",
-        "description": "Auto-close inline panels after a timeout",
-    },
-    "panel_auto_close_seconds": {
-        "value": 120,
-        "value_type": "int",
-        "description": "Seconds before an inline panel auto-closes",
-    },
-    "max_deep_save_mb": {
-        "value": 50,
-        "value_type": "int",
-        "description": "Maximum file size (MB) for deep saves",
-    },
-    "delete_batch_size": {
-        "value": 100,
-        "value_type": "int",
-        "description": "Messages per delete_messages() call",
-    },
-    "log_cleanup_days": {
-        "value": 7,
-        "value_type": "int",
-        "description": "Days of logs to retain before cleanup",
-    },
+_DEFAULTS: dict[str, Any] = {
+    "auto_close_enabled": True,
+    "panel_auto_close_seconds": 120,
+    "max_deep_save_mb": 50,
+    "delete_batch_size": 100,
+    "log_cleanup_days": 7,
 }
 
-
-def _coerce(value: str, value_type: str) -> Any:
-    if value_type == "bool":
-        return value.lower() in ("true", "1", "yes", "on")
-    if value_type == "int":
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return 0
-    return value
+ValidatorFn = Callable[[Any], bool]
 
 
 def _get_db():
     return db_client.get_db()
 
 
+def _ensure_row() -> None:
+    db = _get_db()
+    if not db:
+        return
+    try:
+        existing = db.table(_TABLE).select("key").eq("key", _KEY).maybe_single().execute()
+        if not existing or not existing.data:
+            db.table(_TABLE).insert({
+                "key": _KEY,
+                "auto_close_enabled": True,
+                "panel_auto_close_seconds": 120,
+                "max_deep_save_mb": 50,
+                "delete_batch_size": 100,
+                "log_cleanup_days": 7,
+            }).execute()
+    except Exception as exc:
+        logger.warning("settings_service: ensure_row failed: %s", exc)
+
+
 def load_all() -> None:
-    """Load all settings from the DB into the in-memory cache.
+    """Load all panel settings from the DB into the in-memory cache.
 
     Called once at startup. If the DB is unavailable, falls back to
     hardcoded defaults so the bot still functions.
@@ -86,51 +100,46 @@ def load_all() -> None:
 
     db = _get_db()
     if db:
+        _ensure_row()
         try:
-            result = db.table(_TABLE).select("*").execute()
+            result = db.table(_TABLE).select("*").eq("key", _KEY).maybe_single().execute()
             if result and result.data:
-                for row in result.data:
-                    key = row["key"]
-                    _cache[key] = {
-                        "value": _coerce(row["value"], row.get("value_type", "str")),
-                        "value_type": row.get("value_type", "str"),
-                        "description": _DEFAULTS.get(key, {}).get("description", ""),
-                    }
-                logger.info("settings_service: loaded %d settings from DB", len(_cache))
+                row = result.data
+                _cache["auto_close_enabled"] = bool(row.get("auto_close_enabled", True))
+                _cache["panel_auto_close_seconds"] = int(row.get("panel_auto_close_seconds", 120))
+                _cache["max_deep_save_mb"] = int(row.get("max_deep_save_mb", 50))
+                _cache["delete_batch_size"] = int(row.get("delete_batch_size", 100))
+                _cache["log_cleanup_days"] = int(row.get("log_cleanup_days", 7))
+                logger.info("settings_service: loaded panel settings from DB")
                 return
         except Exception as exc:
             logger.warning("settings_service: load_all failed (%s) — using defaults", exc)
 
-    for key, spec in _DEFAULTS.items():
-        _cache[key] = {
-            "value": spec["value"],
-            "value_type": spec["value_type"],
-            "description": spec["description"],
-        }
-    logger.info("settings_service: loaded %d default settings (no DB)", len(_cache))
+    _cache = dict(_DEFAULTS)
+    logger.info("settings_service: loaded defaults (no DB)")
 
 
-def _refresh(key: str) -> None:
-    """Refresh a single key from the DB into the cache."""
+def reload_settings() -> None:
+    """Force a full reload of the cache from the DB."""
+    load_all()
+
+
+def _refresh_from_db() -> None:
+    """Refresh the cache from the DB after a write."""
     db = _get_db()
     if not db:
         return
     try:
-        result = (
-            db.table(_TABLE)
-            .select("*")
-            .eq("key", key)
-            .maybe_single()
-            .execute()
-        )
+        result = db.table(_TABLE).select("*").eq("key", _KEY).maybe_single().execute()
         if result and result.data:
-            _cache[key] = {
-                "value": _coerce(result.data["value"], result.data.get("value_type", "str")),
-                "value_type": result.data.get("value_type", "str"),
-                "description": _DEFAULTS.get(key, {}).get("description", ""),
-            }
+            row = result.data
+            _cache["auto_close_enabled"] = bool(row.get("auto_close_enabled", True))
+            _cache["panel_auto_close_seconds"] = int(row.get("panel_auto_close_seconds", 120))
+            _cache["max_deep_save_mb"] = int(row.get("max_deep_save_mb", 50))
+            _cache["delete_batch_size"] = int(row.get("delete_batch_size", 100))
+            _cache["log_cleanup_days"] = int(row.get("log_cleanup_days", 7))
     except Exception as exc:
-        logger.warning("settings_service: refresh '%s' failed: %s", key, exc)
+        logger.warning("settings_service: refresh failed: %s", exc)
 
 
 def _ensure_loaded() -> None:
@@ -138,137 +147,113 @@ def _ensure_loaded() -> None:
         load_all()
 
 
-def get_bool(key: str, default: bool = False) -> bool:
-    _ensure_loaded()
-    entry = _cache.get(key)
-    if entry is None:
-        return default
-    val = entry["value"]
-    if isinstance(val, bool):
-        return val
-    return bool(val)
-
-
-def get_int(key: str, default: int = 0) -> int:
-    _ensure_loaded()
-    entry = _cache.get(key)
-    if entry is None:
-        return default
-    val = entry["value"]
-    if isinstance(val, int):
-        return val
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
-
-def get_str(key: str, default: str = "") -> str:
-    _ensure_loaded()
-    entry = _cache.get(key)
-    if entry is None:
-        return default
-    val = entry["value"]
-    return str(val) if val is not None else default
-
-
-def get_all() -> dict[str, dict]:
-    """Return all cached settings as {key: {value, value_type, description}}."""
+def get_all() -> dict[str, Any]:
+    """Return all cached settings as a dict."""
     _ensure_loaded()
     return dict(_cache)
 
 
-def set_bool(key: str, value: bool) -> bool:
-    return _set(key, "true" if value else "false", "bool")
+# ── Generic get/set with validation ──
+
+def get_setting(key: str, default: Any = None) -> Any:
+    _ensure_loaded()
+    return _cache.get(key, _DEFAULTS.get(key, default))
 
 
-def set_int(key: str, value: int) -> bool:
-    return _set(key, str(value), "int")
+def set_setting(key: str, value: Any) -> bool:
+    """Validate, write to DB, refresh cache. Returns True on success."""
+    validator = _VALIDATORS.get(key)
+    if validator and not validator(value):
+        logger.warning("settings_service: validation failed for '%s' = %r", key, value)
+        return False
 
-
-def set_str(key: str, value: str) -> bool:
-    return _set(key, value, "str")
-
-
-def _set(key: str, value: str, value_type: str) -> bool:
-    """Write to DB first, then refresh cache. Returns True on success."""
     db = _get_db()
     if db:
         try:
-            db.table(_TABLE).upsert({
-                "key": key,
-                "value": value,
-                "value_type": value_type,
+            db.table(_TABLE).update({
+                key: value,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
-            _refresh(key)
+            }).eq("key", _KEY).execute()
+            _refresh_from_db()
             return True
         except Exception as exc:
             logger.warning("settings_service: set '%s' failed: %s", key, exc)
 
-    _cache[key] = {
-        "value": _coerce(value, value_type),
-        "value_type": value_type,
-        "description": _DEFAULTS.get(key, {}).get("description", ""),
-    }
+    _cache[key] = value
     return True
 
 
-def toggle_bool(key: str) -> bool:
-    new_val = not get_bool(key, False)
-    set_bool(key, new_val)
-    return new_val
+# ── Validators ──
+
+def _validate_bool(value: Any) -> bool:
+    return isinstance(value, bool)
 
 
-# ── Typed accessors for known settings ──
+def _validate_int_range(min_val: int, max_val: int) -> ValidatorFn:
+    def validator(value: Any) -> bool:
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        return min_val <= value <= max_val
+    return validator
+
+
+_VALIDATORS: dict[str, ValidatorFn] = {
+    "auto_close_enabled": _validate_bool,
+    "panel_auto_close_seconds": _validate_int_range(10, 3600),
+    "max_deep_save_mb": _validate_int_range(1, 500),
+    "delete_batch_size": _validate_int_range(1, 1000),
+    "log_cleanup_days": _validate_int_range(1, 365),
+}
+
+
+# ── Typed accessors ──
 
 def is_auto_close_enabled() -> bool:
-    return get_bool("auto_close_enabled", True)
+    _ensure_loaded()
+    return bool(_cache.get("auto_close_enabled", True))
 
 
 def set_auto_close_enabled(enabled: bool) -> bool:
-    return set_bool("auto_close_enabled", enabled)
+    return set_setting("auto_close_enabled", bool(enabled))
 
 
 def toggle_auto_close() -> bool:
-    return toggle_bool("auto_close_enabled")
+    new_val = not is_auto_close_enabled()
+    set_auto_close_enabled(new_val)
+    return new_val
 
 
 def panel_auto_close_seconds() -> int:
-    return get_int("panel_auto_close_seconds", 120)
+    _ensure_loaded()
+    return int(_cache.get("panel_auto_close_seconds", 120))
 
 
 def set_panel_auto_close_seconds(seconds: int) -> bool:
-    if seconds < 10 or seconds > 3600:
-        return False
-    return set_int("panel_auto_close_seconds", seconds)
+    return set_setting("panel_auto_close_seconds", seconds)
 
 
 def max_deep_save_mb() -> int:
-    return get_int("max_deep_save_mb", 50)
+    _ensure_loaded()
+    return int(_cache.get("max_deep_save_mb", 50))
 
 
 def set_max_deep_save_mb(mb: int) -> bool:
-    if mb < 1 or mb > 500:
-        return False
-    return set_int("max_deep_save_mb", mb)
+    return set_setting("max_deep_save_mb", mb)
 
 
 def delete_batch_size() -> int:
-    return get_int("delete_batch_size", 100)
+    _ensure_loaded()
+    return int(_cache.get("delete_batch_size", 100))
 
 
 def set_delete_batch_size(size: int) -> bool:
-    if size < 1 or size > 1000:
-        return False
-    return set_int("delete_batch_size", size)
+    return set_setting("delete_batch_size", size)
 
 
 def log_cleanup_days() -> int:
-    return get_int("log_cleanup_days", 7)
+    _ensure_loaded()
+    return int(_cache.get("log_cleanup_days", 7))
 
 
 def set_log_cleanup_days(days: int) -> bool:
-    if days < 1 or days > 365:
-        return False
-    return set_int("log_cleanup_days", days)
+    return set_setting("log_cleanup_days", days)

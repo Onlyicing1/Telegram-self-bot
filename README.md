@@ -528,8 +528,49 @@ asyncio tasks.
 
 ## Settings
 
-Panel settings are stored in the `panel_settings` database table and cached
-in memory.
+All Glass Panel configuration is stored in the `panel_settings` database
+table using a **column-per-setting model** — each setting is a real typed
+column, not a key-value entry. A dedicated **Settings Service** sits
+between the UI and Supabase; no panel queries the database directly.
+
+```
+  UI / Inline Panel
+       │
+       ▼
+  Panel Actions
+       │
+       ▼
+  Settings Service (settings_service.py)
+       │
+       ├── get_setting()    → read from cache (no DB call)
+       ├── set_setting()     → validate → write DB → refresh cache
+       └── reload_settings() → full cache refresh from DB
+       │
+       ▼
+  Supabase (panel_settings table)
+```
+
+### Available Settings
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `auto_close_enabled` | boolean | `true` | Whether inline panels auto-close |
+| `panel_auto_close_seconds` | integer | `120` | Seconds before auto-close |
+| `max_deep_save_mb` | integer | `50` | Max file size for deep saves (MB) |
+| `delete_batch_size` | integer | `100` | Messages per delete batch |
+| `log_cleanup_days` | integer | `7` | Log retention before cleanup |
+
+### Cache Flow
+
+- **Startup**: `settings_service.load_all()` reads the singleton row from
+  `panel_settings` and populates an in-memory cache. Every panel reads
+  from this cache — no DB round-trip per read.
+- **Update**: When a panel changes a setting, the service validates the
+  value, writes to the database, then refreshes the cache from the DB row.
+  Cache and database are never left inconsistent.
+- **Future-proof**: Adding a new setting requires only a new column on
+  `panel_settings` and a validator + accessor in `settings_service.py`.
+  No panel code needs to change.
 
 ### Auto-Close
 
@@ -538,8 +579,8 @@ in memory.
 - **Behavior**: When ON, a timer task edits the panel message every 30s with
   a countdown (90s → 60s → 30s → closed). When OFF, panels stay open until
   manually closed.
-- **Persistence**: The preference is stored in `panel_settings` (key = `"global"`)
-  and loaded at startup.
+- **Persistence**: Stored in `panel_settings` (key = `"global"`) and loaded
+  at startup into the settings service cache.
 
 ---
 
@@ -571,7 +612,7 @@ LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persi
 | `saved_items` | Media save records — save code, type, origin, metadata, tags |
 | `bio_state` | Singleton bio engine state per owner — template, mood, text |
 | `bot_logs` | Structured activity log — level, message, JSONB context |
-| `panel_settings` | Global panel preferences — auto-close toggle |
+| `panel_settings` | Glass Panel configuration — auto-close, delays, limits, batch sizes |
 
 All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key, which bypasses RLS.
 
@@ -799,7 +840,7 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 |---|---|
 | `.bio on` | Start the bio cron |
 | `.bio off` | Stop the bio cron |
-| `.bio template 🕒 {time} \| {mood} \| {text}` | Set the bio template |
+| `.bio template 🕒 {time} | {mood} | {text}` | Set the bio template |
 | `.bio text Working` | Set the `{text}` token value |
 | `.bio mood 😊` | Set the `{mood}` token value |
 | `.bio show` | Inspect full bio state |

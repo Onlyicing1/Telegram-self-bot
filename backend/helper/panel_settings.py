@@ -1,7 +1,7 @@
 """
 Global panel settings — delegates to settings_service.
 
-All settings are now stored in the bot_settings table via the
+All panel configuration is stored in the panel_settings table via the
 centralized settings_service. This module remains as a compatibility
 shim so existing imports (backend.helper.panel_settings) continue
 to work without changes.
