@@ -164,7 +164,6 @@ class RuntimeSupervisor:
 
         settings_svc.load_all()
         logger.info("Panel settings loaded.")
-        logger.info("Panel settings loaded.")
 
         logger.info("[2/5] Building self-client")
         await self._build_and_register()
@@ -204,7 +203,11 @@ class RuntimeSupervisor:
             set_telethon_connected(True)
             self._client_alive = True
             self._consecutive_failures = 0
-            update_heartbeat_state(self_connected=True, client_generation=self.client_generation)
+            update_heartbeat_state(
+                self_connected=True,
+                client_generation=self.client_generation,
+                _client_ref=self.client,
+            )
             record_event("runtime", "build_client", 0, "SUCCESS",
                          f"gen={self.client_generation}")
         except Exception as exc:
@@ -363,6 +366,7 @@ class RuntimeSupervisor:
             set_telethon_connected(False)
             update_heartbeat_state(self_connected=False)
             trace("SELF_DISCONNECTED", gen=self.client_generation, reason="run_until_disconnected_returned")
+            trace("SELF_RUN_LOOP_EXITED", gen=self.client_generation)
             logger.warning("Self-client disconnected — watchdog will detect and recover")
 
     async def _watchdog_loop(self) -> None:
