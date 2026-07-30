@@ -533,11 +533,12 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
 
 
 async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_id: int) -> None:
-    parts = remainder.split(":", 1)
+    parts = remainder.split(":", 2)
     panel_id = parts[0]
     input_id = parts[1] if len(parts) > 1 else ""
+    extra = parts[2] if len(parts) > 2 else ""
 
-    logger.info("[CALLBACK] _handle_input: panel_id='%s' input_id='%s'", panel_id, input_id)
+    logger.info("[CALLBACK] _handle_input: panel_id='%s' input_id='%s' extra='%s'", panel_id, input_id, extra)
 
     input_cfg = get_input(panel_id, input_id)
     if input_cfg is None:
@@ -559,6 +560,7 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
     set_pending(
         owner_id, panel_id, handler, chat_id or 0, prompt,
         inline_chat_id=chat_id or 0, inline_msg_id=msg_id or 0,
+        extra=extra,
     )
 
     builder = InlinePanelBuilder()
