@@ -116,6 +116,8 @@ backend/
 │   ├── states.py        # RuntimeState enum
 │   └── managed_task.py  # Task wrapper
 ├── services/            # Business logic (shared by commands + panels)
+│   ├── panel_settings_repository.py  # Raw DB access (ONLY module touching panel_settings)
+│   ├── settings_service.py           # Cache + validation + typed accessors
 │   ├── save_service.py
 │   ├── retrieve_service.py
 │   ├── delete_service.py
@@ -267,14 +269,14 @@ The panel system provides interactive inline UIs for commands that benefit from 
 | Inline Engine | `inline_engine.py` | Generates `InputBotInlineResult` objects for InlineQuery answers |
 | Inline Sender | `inline_sender.py` | Self-bot side: triggers inline mode, auto-sends result, listens for text replies |
 | Panel Renderer | `panel_render.py` | Converts (title, body, buttons) into display text + button rows |
-| Panel Timer | `panel_timer.py` | Per-panel auto-close countdown (120s, edits every 30s) |
+| Panel Timer | `panel_timer.py` | Per-panel auto-close countdown (reads delay from settings cache) |
 
 ### Panel Types
 
 | Panel ID | Trigger | Description |
 |---|---|---|
 | `help` | `.help` | Category menu → command list per category |
-| `settings` | Settings button in help | Auto-close toggle |
+| `settings` | Settings button in help | All 13 panel settings with toggle/input buttons |
 | `context` | `.panel` (reply to msg) | Forward save, deep save, preview |
 | `context_error` | `.panel` (no reply) | Error: "reply to a message first" |
 | `health` | `.health` | Health dashboard with refresh button |
@@ -330,7 +332,7 @@ correct handler.
 CallbackQuery event
     │
     ├── Resolve (chat_id, msg_id, inline_message_id)
-    ├── Check is_owner()
+    ├── Check is_owner() (gated by owner_only setting)
     ├── Look up session by (chat_id, msg_id) or inline_message_id
     ├── Decode callback data
     │
@@ -345,6 +347,11 @@ CallbackQuery event
 Before editing, the callback engine compares the new `(text, buttons_repr)`
 against the last render stored in `_last_render`. If identical, the edit is
 skipped — avoiding Telegram "not modified" errors.
+
+### Debug Callbacks
+
+When `debug_callbacks` is `true` in panel_settings, every callback step is
+logged verbosely (incoming, reject, dispatch, panel/action/input routing).
 
 ---
 
@@ -467,7 +474,7 @@ The save engine handles two types of saves:
 
 ### Deep Save (`.save d`)
 
-- Downloads the media to a `BytesIO` buffer (50 MB hard limit).
+- Downloads the media to a `BytesIO` buffer (max size from `max_deep_save_mb` setting).
 - Re-uploads to Saved Messages with a rich caption (sender, chat ID, msg ID, timestamp, media type, MIME, size, filename, tags).
 - Buffer is always closed in a `finally` block — zero memory leaks.
 - Empty-download guard: aborts if the download produces zero bytes.
@@ -500,11 +507,11 @@ The organizer provides data management commands:
 
 | Command | Behavior |
 |---|---|
-| `.del <n>` | Delete last N outgoing messages (1-500 range, batch-deletes in chunks of 100) |
+| `.del <n>` | Delete last N outgoing messages (1-500 range, batch size from `delete_batch_size` setting) |
 | `.del id <msgid>` | Delete all messages from msg_id forward |
 | `.del <code>` | Delete a saved item from the index |
 | `.organize list` | Data overview: save counts, log count, bio status |
-| `.organize clean` | Purge logs older than 7 days |
+| `.organize clean` | Purge logs older than `log_retention_days` setting |
 
 ---
 
@@ -514,8 +521,8 @@ Diagnostics provide visibility into the bot's internal state:
 
 | Command | Behavior |
 |---|---|
-| `.kill` | Snapshot + stalled-task recovery (collects diagnostics, attempts recovery) |
-| `.logs` | Recent events (last 20) |
+| `.kill` | Snapshot + stalled-task recovery (gated by `diagnostics_enabled` setting) |
+| `.logs` | Recent events (last 20) (gated by `diagnostics_enabled` setting) |
 | `.logs 50` | Last 50 events |
 | `.logs errors` | Errors only |
 | `.logs module <name>` | Filter by module |
@@ -524,63 +531,89 @@ Events are recorded via `diagnostics.record_event()` and stored in memory
 (not in the database). The `.kill` command also attempts to recover stalled
 asyncio tasks.
 
+When `diagnostics_enabled` is `false`, `.kill` and `.logs` show a message
+telling the user to enable diagnostics in Settings.
+
 ---
 
 ## Settings
 
 All Glass Panel configuration is stored in the `panel_settings` database
 table using a **column-per-setting model** — each setting is a real typed
-column, not a key-value entry. A dedicated **Settings Service** sits
-between the UI and Supabase; no panel queries the database directly.
+column, not a key-value entry. The architecture is strictly layered:
 
 ```
-  UI / Inline Panel
-       │
-       ▼
-  Panel Actions
-       │
-       ▼
-  Settings Service (settings_service.py)
-       │
-       ├── get_setting()    → read from cache (no DB call)
-       ├── set_setting()     → validate → write DB → refresh cache
-       └── reload_settings() → full cache refresh from DB
-       │
-       ▼
   Supabase (panel_settings table)
+       │
+       ▼
+  PanelSettingsRepository  (raw DB access — the ONLY module that touches the table)
+       │
+       ▼
+  PanelSettingsService     (cache + validation + typed accessors)
+       │
+       ├── get_setting()         → read from cache (no DB call)
+       ├── set_setting()          → validate → write DB → refresh cache
+       └── reload_panel_settings() → full cache refresh from DB
+       │
+       ▼
+  Glass Panel (reads via get_*(), writes via set_*())
 ```
 
-### Available Settings
+**NO PANEL MAY ACCESS SUPABASE DIRECTLY.** All reads and writes go through
+the service, which delegates DB access to the repository.
 
-| Setting | Type | Default | Description |
-|---|---|---|---|
-| `auto_close_enabled` | boolean | `true` | Whether inline panels auto-close |
-| `panel_auto_close_seconds` | integer | `120` | Seconds before auto-close |
-| `max_deep_save_mb` | integer | `50` | Max file size for deep saves (MB) |
-| `delete_batch_size` | integer | `100` | Messages per delete batch |
-| `log_cleanup_days` | integer | `7` | Log retention before cleanup |
+### Available Settings (13 columns)
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `auto_close_enabled` | boolean | `true` | — | Whether inline panels auto-close |
+| `auto_close_delay` | integer | `120` | 5..3600 | Seconds before auto-close |
+| `max_deep_save_mb` | integer | `50` | 1..500 | Max file size for deep saves (MB) |
+| `delete_batch_size` | integer | `100` | 1..1000 | Messages per delete batch |
+| `log_retention_days` | integer | `7` | 1..365 | Log retention before cleanup |
+| `panel_timeout_seconds` | integer | `300` | 30..86400 | Panel timeout (seconds) |
+| `allow_multiple_panels` | boolean | `false` | — | Allow multiple simultaneous panels |
+| `reuse_existing_panel` | boolean | `true` | — | Reuse an existing panel instead of creating new |
+| `theme` | string | `"dark"` | non-empty | UI theme name |
+| `language` | string | `"en"` | non-empty | Language code |
+| `diagnostics_enabled` | boolean | `true` | — | Show diagnostics info (`.kill`, `.logs`) |
+| `debug_callbacks` | boolean | `false` | — | Enable verbose callback logging |
+| `owner_only` | boolean | `true` | — | Restrict panel access to owner only |
 
 ### Cache Flow
 
-- **Startup**: `settings_service.load_all()` reads the singleton row from
-  `panel_settings` and populates an in-memory cache. Every panel reads
-  from this cache — no DB round-trip per read.
+- **Startup**: `RuntimeSupervisor.start()` calls `settings_service.load_all()`,
+  which delegates to `PanelSettingsRepository.load()` — a single `SELECT *`
+  on the global row. The result populates the in-memory cache. Every panel
+  reads from this cache — no DB round-trip per read.
 - **Update**: When a panel changes a setting, the service validates the
-  value, writes to the database, then refreshes the cache from the DB row.
-  Cache and database are never left inconsistent.
-- **Future-proof**: Adding a new setting requires only a new column on
-  `panel_settings` and a validator + accessor in `settings_service.py`.
-  No panel code needs to change.
+  value, writes to the DB via the repository, then reloads the cache from
+  the DB row. Cache and database are never left inconsistent.
+- **Reload**: `reload_panel_settings()` forces a full cache refresh from
+  the DB without restart.
+- **Performance**: The database is NEVER queried on a button click. Only
+  cache reads. Database writes only when settings change.
 
 ### Auto-Close
 
 - **Default**: ON (panels auto-close after 120 seconds).
 - **Toggle**: `.help` → Settings → Auto Close button, or the settings panel.
 - **Behavior**: When ON, a timer task edits the panel message every 30s with
-  a countdown (90s → 60s → 30s → closed). When OFF, panels stay open until
-  manually closed.
+  a countdown. When OFF, panels stay open until manually closed.
 - **Persistence**: Stored in `panel_settings` (key = `"global"`) and loaded
   at startup into the settings service cache.
+
+### Diagnostics
+
+- When `diagnostics_enabled` is `false`, `.kill` and `.logs` commands are
+  hidden with a message telling the user to enable diagnostics in Settings.
+- When `debug_callbacks` is `true`, every callback step is logged verbosely.
+
+### Owner-Only Safety
+
+- When `owner_only` is `true`, the Glass Panel callback router enforces
+  `is_owner()` on every button press. When `false`, callbacks from any
+  user are accepted.
 
 ---
 
@@ -612,7 +645,7 @@ LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persi
 | `saved_items` | Media save records — save code, type, origin, metadata, tags |
 | `bio_state` | Singleton bio engine state per owner — template, mood, text |
 | `bot_logs` | Structured activity log — level, message, JSONB context |
-| `panel_settings` | Glass Panel configuration — auto-close, delays, limits, batch sizes |
+| `panel_settings` | Glass Panel configuration — 13 typed columns (auto-close, limits, diagnostics, theme, etc.) |
 
 All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key, which bypasses RLS.
 
@@ -832,7 +865,7 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 | `.del id 12345` | Delete all messages from ID 12345 forward |
 | `.del S391` | Delete saved item from the index |
 | `.organize list` | Data overview |
-| `.organize clean` | Purge logs older than 7 days |
+| `.organize clean` | Purge logs older than `log_retention_days` setting |
 
 ### Bio Engine
 
