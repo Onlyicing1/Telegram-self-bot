@@ -30,7 +30,7 @@ The database contains **four tables** in the `public\` schema:
 
 | Table | Purpose | PK | Rows |
 |---|---|---|---|
-| `saved_items` | Media save records (forward + deep) | `id` (bigserial) | One per save |
+| \`saved_items` | Media save records (forward + deep) | `id` (bigserial) | One per save |
 | `bio_state` | Bio cron engine state per owner | `id` (bigserial) | One per owner |
 | `bot_logs` | Structured activity log | `id` (bigserial) | One per event |
 | `panel_settings` | Glass Panel configuration (column-per-setting) | `key` (text) | One row (`"global"`) |
@@ -49,10 +49,10 @@ Stores metadata for every media save operation (forward save and deep save).
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
-| `id` | `bigserial` | NO | `nextval(...)` | Primary key |
+| \`id` | `bigserial` | NO | `nextval(...)` | Primary key |
 | `save_code` | `text` | NO | — | Legacy code, format `SV-NNNNNN`. Unique. |
 | `save_type` | `text` | NO | — | `'forward'\` or `'deep'`. CHECK constraint enforced. |
-| `origin_chat_id` | `bigint` | YES | — | Telegram chat ID where the message originated |
+| \`origin_chat_id` | `bigint` | YES | — | Telegram chat ID where the message originated |
 | `origin_msg_id` | `bigint` | YES | — | Telegram message ID of the original message |
 | `saved_chat_id` | `bigint` | YES | — | Chat ID where saved (Saved Messages = `me`) |
 | `saved_msg_id` | `bigint` | YES | — | Message ID in the saved location |
@@ -110,7 +110,7 @@ through the service-role key.
 
 ### Typical Usage
 
-- **Insert** — `.save f` / `.save d\` calls `insert_save()`.
+- **Insert** — `.save f` / `.save d\` calls \`insert_save()`.
 - **Query by code** — `.preview <code>` / `.send <code>\` calls `query_save()`,
   which looks up by `short_code\` OR `save_code` (case-insensitive).
 - **List recent** — `.list\` calls `list_recent_saves()`, selects a subset of

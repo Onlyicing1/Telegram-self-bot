@@ -62,14 +62,6 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         ],
     ),
     (
-        "Save Engine",
-        [
-            "**Save Engine**  _(reply to a message)_\n",
-            "`.save f` · `.s f` — Forward save",
-            "`.save d` · `.s d` — Deep save",
-        ],
-    ),
-    (
         "Retrieve",
         [
             "**Retrieve**\n",
@@ -133,7 +125,8 @@ def _build_main_menu_buttons() -> list:
             (cats[i][0], f"panel:help:cat:{i}"),
             (cats[i + 1][0], f"panel:help:cat:{i + 1}"),
         )
-    builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
+    if len(cats) % 2 == 1:
+        builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
     builder.add_row("⚙️ Settings", "panel:settings")
     return builder.build()
 
@@ -153,6 +146,21 @@ def _general_body() -> str:
     )
 
 
+def _retrieve_body() -> str:
+    return (
+        "**Retrieve**\n\n"
+        "Tap a button to preview, send, or browse saved items."
+    )
+
+
+def _build_retrieve_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("👁 Preview Item", "panel:preview")
+    builder.add_row("📤 Send Item", "panel:send")
+    builder.add_row("📋 Saved Items", "panel:retrieve_saved")
+    return builder.build()
+
+
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -163,6 +171,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
             if 0 <= idx < len(_HELP_CATEGORIES):
                 if idx == 0:
                     return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
+                if idx == 1:
+                    return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -172,6 +182,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 async def _help_inline_builder(event, extra: str) -> list:
     if extra.startswith("cat:0"):
         return [render("General", _general_body(), _build_general_buttons())]
+    if extra.startswith("cat:1"):
+        return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
