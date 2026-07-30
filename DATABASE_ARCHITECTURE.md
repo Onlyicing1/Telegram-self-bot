@@ -33,7 +33,7 @@ The database contains **four tables** in the `public` schema:
 | `saved_items` | Media save records (forward + deep) | `id` (bigserial) | One per save |
 | `bio_state` | Bio cron engine state per owner | `id` (bigserial) | One per owner |
 | `bot_logs` | Structured activity log | `id` (bigserial) | One per event |
-| `panel_settings` | Global panel auto-close preference | `key` (text) | One row (`"global"`) |
+| `panel_settings` | Glass Panel configuration (column-per-setting) | `key` (text) | One row (`"global"`) |
 
 All access goes through the Supabase PostgREST API via the `supabase-py` client.
 The backend uses the **service-role key**, which bypasses RLS. The frontend
@@ -136,7 +136,7 @@ Singleton-per-owner state for the bio cron engine.
 |---|---|---|---|---|
 | `id` | `bigserial` | NO | `nextval(...)` | Primary key |
 | `owner_id` | `bigint` | NO | — | Telegram user ID. Unique. |
-| `template` | `text` | NO | `'🕒 {time} \| 💭 {mood}'` | Bio template with tokens |
+| `template` | `text` | NO | `'🕒 {time} | 💭 {mood}'` | Bio template with tokens |
 | `mood` | `text` | NO | `'😊'` | Current mood emoji |
 | `custom_text` | `text` | NO | `''` | Freeform text token value |
 | `is_active` | `boolean` | NO | `false` | Whether the bio cron is running |
@@ -239,14 +239,20 @@ Structured activity log for bot events.
 
 ## 5. panel_settings
 
-Global panel preferences. Currently stores only the auto-close toggle.
+Glass Panel configuration — column-per-setting model. Stores ONLY
+configuration values used by the Glass Panel. Each setting is a real
+typed column; there is no key-value store.
 
 ### Columns
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
 | `key` | `text` | NO | — | Primary key. Always `"global"`. |
-| `auto_close_enabled` | `boolean` | NO | `true` | Whether panels auto-close after 120 seconds |
+| `auto_close_enabled` | `boolean` | NO | `true` | Whether panels auto-close after the configured delay |
+| `panel_auto_close_seconds` | `integer` | NO | `120` | Seconds before an inline panel auto-closes |
+| `max_deep_save_mb` | `integer` | NO | `50` | Maximum file size (MB) for deep saves |
+| `delete_batch_size` | `integer` | NO | `100` | Messages per `delete_messages()` call |
+| `log_cleanup_days` | `integer` | NO | `7` | Days of logs to retain before cleanup |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
 
 ### Primary Key
@@ -273,13 +279,22 @@ Global panel preferences. Currently stores only the auto-close toggle.
 
 ### Typical Usage
 
-- **Load** — `panel_settings.load()` reads the `auto_close_enabled` value
-  for key `"global"` at startup. Caches in memory.
-- **Toggle** — `panel_settings.toggle_auto_close()` flips the value and
-  upserts the row. The timer engine reads the in-memory cache on every
-  panel init and every tick.
-- **Upsert** — `panel_settings.set_auto_close_enabled(enabled)` upserts
-  `{"key": "global", "auto_close_enabled": enabled, "updated_at": now()}`.
+- **Load** — `settings_service.load_all()` reads the singleton row at
+  startup and populates the in-memory cache.
+- **Read** — Feature modules call `settings_service.is_auto_close_enabled()`,
+  `.panel_auto_close_seconds()`, `.max_deep_save_mb()`, etc. These read from
+  the cache — no DB round-trip.
+- **Write** — `settings_service.set_*()` validates the value, writes to the
+  DB, then refreshes the cache from the DB row. Cache and DB are never left
+  inconsistent.
+- **Reload** — `settings_service.reload_settings()` forces a full cache
+  refresh from the DB.
+
+### Adding a New Setting
+
+1. `ALTER TABLE panel_settings ADD COLUMN <name> <type> NOT NULL DEFAULT <value>;`
+2. Add a validator + typed accessor in `settings_service.py`.
+3. No panel code needs to change — panels call `get_setting()` / `set_setting()`.
 
 ---
 
@@ -327,13 +342,103 @@ This means:
 
 ## 8. Panel Database
 
+### Glass Panel Database Philosophy
+
+The `panel_settings` table stores **ONLY** configuration values used by
+the Glass Panel. It must never become a generic project settings table.
+
+Examples of what belongs here:
+- Auto Close (enabled/disabled)
+- Auto Close Delay (seconds)
+- Max Deep Save Size (MB)
+- Delete Batch Size
+- Log Retention (days)
+- Future panel configuration values
+
+Each setting is a **real typed column** on the `panel_settings` table.
+There is no key-value store, no `value`/`value_type` serialization. This
+ensures type safety, database-level defaults, and straightforward
+validation.
+
+### Separation of Databases
+
+Every subsystem owns its own table. The Glass Panel database is ONLY
+responsible for panel configuration.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Supabase (source of truth)              │
+│                                                            │
+│  saved_items    — Save Engine data          (untouched)    │
+│  bio_state      — Bio Engine state          (untouched)    │
+│  bot_logs       — Structured activity log   (untouched)    │
+│  panel_settings — Glass Panel configuration (this table)   │
+│                                                            │
+│  ❌ bot_settings — DROPPED (migrated into panel_settings)  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Settings Service Architecture
+
+A dedicated settings service sits between the UI/panels and Supabase.
+No panel is allowed to directly query Supabase.
+
+```
+  UI / Inline Panel
+       │
+       ▼
+  Panel Actions (register_action / register_input)
+       │
+       ▼
+  Settings Service (settings_service.py)
+       │
+       ├── get_setting()    → read from cache (no DB call)
+       ├── set_setting()     → validate → write DB → refresh cache
+       └── reload_settings() → full cache refresh from DB
+       │
+       ▼
+  Supabase (panel_settings table)
+```
+
+### Cache Flow
+
+**Startup (read flow):**
+```
+RuntimeSupervisor.start()
+    └── settings_service.load_all()
+          └── SELECT * FROM panel_settings WHERE key = 'global'
+                └── populate _cache dict
+                      └── every panel reads from _cache (no DB call)
+```
+
+**Update (write flow):**
+```
+Panel action
+    └── settings_service.set_setting(key, value)
+          ├── 1. Validate (per-setting validator)
+          ├── 2. UPDATE panel_settings SET key = value
+          ├── 3. SELECT * FROM panel_settings → refresh _cache
+          └── 4. UI re-renders from updated cache
+
+  Cache and DB are never left inconsistent.
+```
+
+**Future-proofing:**
+
+Adding a new setting (e.g. `download_timeout`) requires only:
+1. `ALTER TABLE panel_settings ADD COLUMN download_timeout integer NOT NULL DEFAULT 30;`
+2. A validator + accessor in `settings_service.py`:
+   ```python
+   _VALIDATORS["download_timeout"] = _validate_int_range(1, 300)
+   def download_timeout() -> int:
+       _ensure_loaded()
+       return int(_cache.get("download_timeout", 30))
+   def set_download_timeout(seconds: int) -> bool:
+       return set_setting("download_timeout", seconds)
+   ```
+3. No panel rewrite needed.
+
 ### What It Stores
-
-The `panel_settings` table stores global panel preferences. Currently, the
-only preference is `auto_close_enabled` — whether inline panels auto-close
-after 120 seconds of inactivity.
-
-### How Sessions Are Stored
 
 Panel sessions are **not stored in the database**. They live entirely in
 memory (`backend/helper/session_manager.py`). Each session is keyed by
@@ -351,11 +456,12 @@ persist across restarts.
 
 ### How Panel Settings Are Stored
 
-The `panel_settings` table has a single row with `key = "global"`. The
-`auto_close_enabled` boolean controls whether the timer engine creates
-auto-close tasks for new panels. The value is loaded once at startup
-(`panel_settings.load()`) and cached in memory. Toggles are persisted
-immediately via upsert.
+The `panel_settings` table has a single row with `key = "global"`. Each
+column is a typed setting. The settings service (`settings_service.py`)
+loads all columns at startup into an in-memory cache. Every panel reads
+from the cache. Writes go through `set_setting()` which validates, writes
+to the DB, and refreshes the cache — ensuring cache and DB are never
+inconsistent.
 
 ### How Navigation Is Persisted
 
@@ -382,8 +488,8 @@ _fallback = {
 ```
 
 The `panel_settings` table does not have an explicit fallback entry —
-the in-memory cache in `panel_settings.py` serves as the fallback
-(defaulting to `auto_close_enabled = True`).
+the in-memory cache in `settings_service.py` serves as the fallback
+(defaulting to hardcoded `_DEFAULTS`).
 
 All public functions in `db/client.py` wrap their Supabase calls in
 `try/except`. On any error, they log a warning and use the fallback.
@@ -399,7 +505,9 @@ The bot never crashes due to a database error.
 | `20260714111706_create_lifeos_tables.sql` | 2026-07-14 | Authoritative schema. Recreated RLS as SELECT-only. Added indexes. Lacks CHECK constraints (but they persist from the initial migration when both run). |
 | `20260718143752_20260718_save_ux_redesign.sql.sql` | 2026-07-18 | Added `file_name` and `short_code` columns to `saved_items`. Added trigram indexes for full-text search. Enabled `pg_trgm` extension. |
 | `20260726143924_create_panel_settings_table.sql` | 2026-07-26 | Created `panel_settings` table for global auto-close preference. |
+| `20260729213959_20260729120000_create_bot_settings_table.sql` | 2026-07-29 | Created `bot_settings` key-value table (later superseded). |
+| `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` data into `panel_settings` as typed columns. Added `panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`, `log_cleanup_days`. Dropped `bot_settings`. |
 
 The SQL scripts in [`sql/`](sql/) represent the **current consolidated
-schema** — the result of applying all four migrations in sequence. They are
+schema** — the result of applying all migrations in sequence. They are
 authoritative for a fresh database setup.
