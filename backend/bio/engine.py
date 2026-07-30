@@ -27,6 +27,8 @@ from telethon.tl.functions.account import UpdateProfileRequest
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.runtime.tracer import trace, trace_exception
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ def _seconds_to_next_minute(tz) -> float:
 
 async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
     tz = _get_tz(tz_str)
+    trace("BIO_CRON_STARTED", tz=tz_str)
     logger.info("Bio cron started (tz=%s)", tz_str)
 
     while True:
@@ -83,6 +86,7 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
             state = db_client.get_bio_state(owner_id)
 
             if not state or not state.get("is_active"):
+                trace("BIO_CRON_STOPPED", reason="is_active_false")
                 logger.info("Bio cron: is_active=False — stopping loop.")
                 return
 
@@ -138,9 +142,11 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
                 pass
 
         except asyncio.CancelledError:
+            trace("BIO_CRON_CANCELLED")
             logger.info("Bio cron cancelled.")
             raise
-        except Exception:
+        except Exception as exc:
+            trace_exception("BIO_CRON_TICK_ERROR", exc)
             logger.exception("Bio cron tick error (will retry next minute)")
 
 
@@ -150,13 +156,16 @@ async def _supervised_cron(client, owner_id: int, tz_str: str) -> None:
     while True:
         try:
             await _cron_loop(client, owner_id, tz_str)
+            trace("BIO_CRON_SUPERVISOR_EXIT", reason="loop_exited_normally")
             logger.info("Bio cron supervisor: loop exited normally.")
             return
         except asyncio.CancelledError:
+            trace("BIO_CRON_SUPERVISOR_CANCELLED")
             raise
         except Exception as exc:
             attempt += 1
             delay = _backoff(attempt)
+            trace_exception("BIO_CRON_CRASHED", exc, attempt=attempt, backoff_delay=delay)
             logger.exception(
                 "Bio cron crashed unexpectedly — restarting in %.1fs: %s",
                 delay, exc,
@@ -168,7 +177,11 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = asyncio.create_task(_supervised_cron(client, owner_id, tz_str))
+    _task = guarded_create_task(
+        _supervised_cron(client, owner_id, tz_str),
+        name="lifeos-bio-cron",
+    )
+    trace("BIO_CRON_START_REQUESTED")
     record_event("bio", "start_cron", 0, "SUCCESS")
 
 
@@ -179,6 +192,7 @@ async def stop_cron() -> None:
     """
     global _task
     if _task and not _task.done():
+        trace("BIO_CRON_STOP_REQUESTED")
         _task.cancel()
         try:
             await asyncio.wait_for(_task, timeout=_STOP_TIMEOUT)

@@ -14,6 +14,7 @@ import asyncio
 import logging
 
 from backend.services import settings_service
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,10 @@ def set_content(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
 def _start_timer(self_client, chat_id: int, msg_id: int, entry: _PanelEntry) -> None:
     duration = settings_service.auto_close_delay()
     entry.expire_at = _now() + duration
-    entry.task = asyncio.create_task(_timer_loop(self_client, chat_id, msg_id, duration))
+    entry.task = guarded_create_task(
+        _timer_loop(self_client, chat_id, msg_id, duration),
+        name=f"lifeos-panel-timer-{msg_id}",
+    )
 
 
 def _cancel_entry_task(entry: _PanelEntry) -> None:

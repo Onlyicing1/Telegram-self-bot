@@ -17,6 +17,8 @@ import os
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+from backend.runtime.tracer import trace, trace_exception
+
 logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT = 30
@@ -71,9 +73,10 @@ async def build_helper(bot_token: str) -> TelegramClient | None:
         )
         me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
         _bot_username = (me.username or "").lstrip("@")
+        trace("HELPER_CONNECTED", username=_bot_username, id=me.id)
         logger.info("Helper bot connected: @%s (id=%s)", me.username, me.id)
     except Exception as exc:
-        logger.error("Helper bot login failed: %s", exc)
+        trace_exception("HELPER_CONNECT_FAILED", exc)
         try:
             await client.disconnect()
         except Exception:
@@ -90,6 +93,7 @@ async def build_helper(bot_token: str) -> TelegramClient | None:
 async def disconnect_helper() -> None:
     global _client
     if _client is not None:
+        trace("HELPER_DISCONNECTED", reason="disconnect_helper_called")
         try:
             await asyncio.wait_for(_client.disconnect(), timeout=10.0)
         except (asyncio.TimeoutError, Exception) as exc:

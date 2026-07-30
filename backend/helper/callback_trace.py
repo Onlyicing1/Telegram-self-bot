@@ -10,6 +10,9 @@ import asyncio
 import logging
 import traceback as tb_mod
 
+from backend.runtime.tracer import trace_task_crash
+from backend.runtime.task_guard import guarded_create_task
+
 logger = logging.getLogger(__name__)
 
 _counter = 0
@@ -66,7 +69,7 @@ def finish_trace(trace_id: str) -> None:
     del _traces[trace_id]
     logger.info("CALLBACK TRACE:\n%s", text)
     if _self_client is not None:
-        asyncio.create_task(_send_to_saved(text))
+        guarded_create_task(_send_to_saved(text), name="lifeos-callback-trace-send")
 
 
 async def _send_to_saved(text: str) -> None:
