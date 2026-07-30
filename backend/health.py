@@ -51,6 +51,8 @@ _watchdog_ok: bool = False
 _last_watchdog_check: float = 0.0
 _last_telethon_event: float = 0.0
 _last_bio_update: float = 0.0
+_last_callback: float = 0.0
+_last_event_dispatch: float = 0.0
 
 _task_states: dict[str, str] = {}
 
@@ -161,6 +163,16 @@ def set_last_telethon_event() -> None:
     _last_telethon_event = time.time()
 
 
+def set_last_callback() -> None:
+    global _last_callback
+    _last_callback = time.time()
+
+
+def set_last_event_dispatch() -> None:
+    global _last_event_dispatch
+    _last_event_dispatch = time.time()
+
+
 def set_task_state(name: str, state: str) -> None:
     _task_states[name] = state
 
@@ -184,6 +196,18 @@ def get_last_telethon_event() -> float:
 
 def get_last_handler_dispatched() -> float:
     return _last_handler_dispatched
+
+
+def get_last_callback() -> float:
+    return _last_callback
+
+
+def get_last_event_dispatch() -> float:
+    return _last_event_dispatch
+
+
+def get_last_rpc() -> float:
+    return _last_rpc
 
 
 def _heartbeat_age() -> float:
@@ -247,4 +271,6 @@ def snapshot() -> dict:
         "last_watchdog_check_s": _age_or_none(_last_watchdog_check),
         "last_telethon_event_s": _age_or_none(_last_telethon_event),
         "last_bio_update_s": _age_or_none(_last_bio_update),
+        "last_callback_s": _age_or_none(_last_callback),
+        "last_event_dispatch_s": _age_or_none(_last_event_dispatch),
     }
