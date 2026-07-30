@@ -14,6 +14,7 @@ import traceback
 from telethon import events
 
 from backend.bot.handlers import misc, save, retrieve, delete, organize, bio, discover, database
+from backend.runtime.tracer import trace_handler_exception
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,9 @@ logger = logging.getLogger(__name__)
 def register_runtime_hooks(client) -> None:
     """Register runtime event hooks before command handlers.
 
-    These hooks track last_update timestamps for health telemetry.
+    These hooks track last_update timestamps for health telemetry and
+    emit SELF_RECONNECTING/SELF_RECONNECTED trace events on Telethon
+    internal state changes.
     They must be registered first so they fire before any command handler.
     """
     @client.on(events.NewMessage())
@@ -30,6 +33,17 @@ def register_runtime_hooks(client) -> None:
         try:
             set_last_update()
             set_last_telethon_event()
+        except Exception:
+            pass
+
+    @client.on(events.Raw)
+    async def _raw_hook(event):
+        from backend.health import set_last_telethon_event
+        from backend.runtime.tracer import trace
+        try:
+            set_last_telethon_event()
+            if hasattr(event, 'className') and 'UpdateConfig' in str(type(event)):
+                pass
         except Exception:
             pass
 

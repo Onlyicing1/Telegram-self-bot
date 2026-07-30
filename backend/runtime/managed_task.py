@@ -20,6 +20,8 @@ Guarantees:
 import asyncio
 import logging
 
+from backend.runtime.tracer import trace_task_crash, trace_task_cancelled
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,11 +75,14 @@ class ManagedTask:
                 if self.task and not self.task.cancelled():
                     exc = self.task.exception()
                 if exc:
-                    logger.warning(
+                    trace_task_crash(self.name, exc, "unknown")
+                    logger.exception(
                         "ManagedTask '%s' died with: %s — restarting in %.1fs",
                         self.name, exc, self._restart_delay,
+                        exc_info=exc,
                     )
                 else:
+                    trace_task_cancelled(self.name, "unknown")
                     logger.warning(
                         "ManagedTask '%s' exited unexpectedly — restarting in %.1fs",
                         self.name, self._restart_delay,
