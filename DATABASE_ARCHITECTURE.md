@@ -243,16 +243,42 @@ Glass Panel configuration — column-per-setting model. Stores ONLY
 configuration values used by the Glass Panel. Each setting is a real
 typed column; there is no key-value store.
 
+### Architecture (Repository Pattern)
+
+```
+  Supabase (panel_settings table)
+       │
+       ▼
+  PanelSettingsRepository  (raw DB access — ONLY module touching the table)
+       │
+       ▼
+  PanelSettingsService     (cache + validation + typed accessors)
+       │
+       ▼
+  Glass Panel
+```
+
+No panel may access Supabase directly. All reads and writes go through
+the service, which delegates DB access to the repository.
+
 ### Columns
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
 | `key` | `text` | NO | — | Primary key. Always `"global"`. |
 | `auto_close_enabled` | `boolean` | NO | `true` | Whether panels auto-close after the configured delay |
-| `panel_auto_close_seconds` | `integer` | NO | `120` | Seconds before an inline panel auto-closes |
-| `max_deep_save_mb` | `integer` | NO | `50` | Maximum file size (MB) for deep saves |
-| `delete_batch_size` | `integer` | NO | `100` | Messages per `delete_messages()` call |
-| `log_cleanup_days` | `integer` | NO | `7` | Days of logs to retain before cleanup |
+| `auto_close_delay` | `integer` | NO | `120` | Seconds before an inline panel auto-closes (5..3600) |
+| `max_deep_save_mb` | `integer` | NO | `50` | Maximum file size (MB) for deep saves (1..500) |
+| `delete_batch_size` | `integer` | NO | `100` | Messages per `delete_messages()` call (1..1000) |
+| `log_retention_days` | `integer` | NO | `7` | Days of logs to retain before cleanup (1..365) |
+| `panel_timeout_seconds` | `integer` | NO | `300` | Panel timeout in seconds (30..86400) |
+| `allow_multiple_panels` | `boolean` | NO | `false` | Allow multiple simultaneous panels |
+| `reuse_existing_panel` | `boolean` | NO | `true` | Reuse an existing panel instead of creating new |
+| `theme` | `text` | NO | `'dark'` | UI theme name |
+| `language` | `text` | NO | `'en'` | Language code |
+| `diagnostics_enabled` | `boolean` | NO | `true` | Show diagnostics info (`.kill`, `.logs`) |
+| `debug_callbacks` | `boolean` | NO | `false` | Enable verbose callback logging |
+| `owner_only` | `boolean` | NO | `true` | Restrict panel access to owner only |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
 
 ### Primary Key
@@ -279,16 +305,39 @@ typed column; there is no key-value store.
 
 ### Typical Usage
 
-- **Load** — `settings_service.load_all()` reads the singleton row at
-  startup and populates the in-memory cache.
+- **Load** — `settings_service.load_all()` delegates to
+  `PanelSettingsRepository.load()`, which runs `SELECT * FROM panel_settings
+  WHERE key = 'global'`. The result populates the in-memory cache.
 - **Read** — Feature modules call `settings_service.is_auto_close_enabled()`,
-  `.panel_auto_close_seconds()`, `.max_deep_save_mb()`, etc. These read from
-  the cache — no DB round-trip.
-- **Write** — `settings_service.set_*()` validates the value, writes to the
-  DB, then refreshes the cache from the DB row. Cache and DB are never left
-  inconsistent.
-- **Reload** — `settings_service.reload_settings()` forces a full cache
-  refresh from the DB.
+  `.auto_close_delay()`, `.max_deep_save_mb()`, `.delete_batch_size()`,
+  `.log_retention_days()`, `.panel_timeout_seconds()`,
+  `.is_allow_multiple_panels()`, `.is_reuse_existing_panel()`,
+  `.theme()`, `.language()`, `.is_diagnostics_enabled()`,
+  `.is_debug_callbacks()`, `.is_owner_only()`. These read from the
+  cache — no DB round-trip.
+- **Write** — `settings_service.set_*()` validates the value, writes to
+  the DB via the repository, then reloads the cache from the DB row.
+  Cache and DB are never left inconsistent.
+- **Reload** — `settings_service.reload_panel_settings()` forces a full
+  cache refresh from the DB without restart.
+
+### Validation Rules
+
+| Setting | Validator |
+|---|---|
+| `auto_close_enabled` | must be boolean |
+| `auto_close_delay` | integer 5..3600 |
+| `max_deep_save_mb` | integer 1..500 |
+| `delete_batch_size` | integer 1..1000 |
+| `log_retention_days` | integer 1..365 |
+| `panel_timeout_seconds` | integer 30..86400 |
+| `allow_multiple_panels` | must be boolean |
+| `reuse_existing_panel` | must be boolean |
+| `theme` | non-empty string |
+| `language` | non-empty string |
+| `diagnostics_enabled` | must be boolean |
+| `debug_callbacks` | must be boolean |
+| `owner_only` | must be boolean |
 
 ### Adding a New Setting
 
@@ -378,27 +427,31 @@ responsible for panel configuration.
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Settings Service Architecture
-
-A dedicated settings service sits between the UI/panels and Supabase.
-No panel is allowed to directly query Supabase.
+### Settings Service Architecture (Repository Pattern)
 
 ```
-  UI / Inline Panel
-       │
-       ▼
-  Panel Actions (register_action / register_input)
-       │
-       ▼
-  Settings Service (settings_service.py)
-       │
-       ├── get_setting()    → read from cache (no DB call)
-       ├── set_setting()     → validate → write DB → refresh cache
-       └── reload_settings() → full cache refresh from DB
-       │
-       ▼
   Supabase (panel_settings table)
+       │
+       ▼
+  PanelSettingsRepository  (panel_settings_repository.py)
+       │  ├── load()          → SELECT * FROM panel_settings WHERE key='global'
+       │  ├── update_field()  → UPDATE panel_settings SET field = value
+       │  ├── update_fields() → UPDATE panel_settings SET f1=v1, f2=v2
+       │  └── reload()        → alias for load()
+       │
+       ▼
+  PanelSettingsService     (settings_service.py)
+       │  ├── load_all()            → repo.load() → populate cache
+       │  ├── reload_panel_settings() → repo.reload() → refresh cache
+       │  ├── get_setting() / get_all()  → cache read (no DB)
+       │  ├── set_setting()         → validate → repo.update_field() → refresh cache
+       │  └── 13 typed getters + 13 typed setters
+       │
+       ▼
+  Glass Panel (panels.py, misc.py, save_service, delete_service, etc.)
 ```
+
+**NO PANEL MAY ACCESS SUPABASE DIRECTLY.**
 
 ### Cache Flow
 
@@ -406,9 +459,10 @@ No panel is allowed to directly query Supabase.
 ```
 RuntimeSupervisor.start()
     └── settings_service.load_all()
-          └── SELECT * FROM panel_settings WHERE key = 'global'
-                └── populate _cache dict
-                      └── every panel reads from _cache (no DB call)
+          └── PanelSettingsRepository.load()
+                └── SELECT * FROM panel_settings WHERE key = 'global'
+                      └── populate _cache dict
+                            └── every panel reads from _cache (no DB call)
 ```
 
 **Update (write flow):**
@@ -416,8 +470,8 @@ RuntimeSupervisor.start()
 Panel action
     └── settings_service.set_setting(key, value)
           ├── 1. Validate (per-setting validator)
-          ├── 2. UPDATE panel_settings SET key = value
-          ├── 3. SELECT * FROM panel_settings → refresh _cache
+          ├── 2. PanelSettingsRepository.update_field(key, value)
+          ├── 3. PanelSettingsRepository.load() → refresh _cache
           └── 4. UI re-renders from updated cache
 
   Cache and DB are never left inconsistent.
@@ -457,11 +511,12 @@ persist across restarts.
 ### How Panel Settings Are Stored
 
 The `panel_settings` table has a single row with `key = "global"`. Each
-column is a typed setting. The settings service (`settings_service.py`)
-loads all columns at startup into an in-memory cache. Every panel reads
-from the cache. Writes go through `set_setting()` which validates, writes
-to the DB, and refreshes the cache — ensuring cache and DB are never
-inconsistent.
+column is a typed setting (13 columns total). The settings service
+(`settings_service.py`) loads all columns at startup into an in-memory
+cache via the `PanelSettingsRepository`. Every panel reads from the cache.
+Writes go through `set_setting()` which validates, writes to the DB via
+the repository, and refreshes the cache — ensuring cache and DB are
+never inconsistent.
 
 ### How Navigation Is Persisted
 
@@ -489,7 +544,7 @@ _fallback = {
 
 The `panel_settings` table does not have an explicit fallback entry —
 the in-memory cache in `settings_service.py` serves as the fallback
-(defaulting to hardcoded `_DEFAULTS`).
+(defaulting to hardcoded `_DEFAULTS` for all 13 settings).
 
 All public functions in `db/client.py` wrap their Supabase calls in
 `try/except`. On any error, they log a warning and use the fallback.
@@ -506,7 +561,8 @@ The bot never crashes due to a database error.
 | `20260718143752_20260718_save_ux_redesign.sql.sql` | 2026-07-18 | Added `file_name` and `short_code` columns to `saved_items`. Added trigram indexes for full-text search. Enabled `pg_trgm` extension. |
 | `20260726143924_create_panel_settings_table.sql` | 2026-07-26 | Created `panel_settings` table for global auto-close preference. |
 | `20260729213959_20260729120000_create_bot_settings_table.sql` | 2026-07-29 | Created `bot_settings` key-value table (later superseded). |
-| `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` data into `panel_settings` as typed columns. Added `panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`, `log_cleanup_days`. Dropped `bot_settings`. |
+| `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` data into `panel_settings` as typed columns. Added `auto_close_delay`, `max_deep_save_mb`, `delete_batch_size`, `log_retention_days`. Dropped `bot_settings`. |
+| `20260730230000_panel_settings_full_13_columns.sql` | 2026-07-30 | Added `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `theme`, `language`, `diagnostics_enabled`, `debug_callbacks`, `owner_only` columns. Introduced PanelSettingsRepository layer. |
 
 The SQL scripts in [`sql/`](sql/) represent the **current consolidated
 schema** — the result of applying all migrations in sequence. They are
