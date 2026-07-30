@@ -270,6 +270,11 @@ async def _render_and_edit(event, result, panel_id: str, chat_id: int | None, ms
 
 
 def _resolve_session(chat_id: int | None, msg_id: int | None, inline_message_id: str | None) -> tuple[dict | None, int, int]:
+    """Look up session by (chat_id, msg_id), falling back to msg_id-only, then inline_message_id.
+
+    Returns (session, resolved_chat_id, resolved_msg_id) so callers always use
+    the identity the session was created with — not the callback's local view.
+    """
     session = _get_session(chat_id, msg_id)
     if session is not None:
         logger.info(
@@ -425,6 +430,15 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
 
 
 async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Shared close logic used by both the Close button and auto-close timer.
+
+    Steps (identical for both paths):
+      1. Clear pending input state
+      2. Stop and remove the panel timer
+      3. Clear the panel session (destroys nav stack)
+      4. Clear render cache
+      5. Edit the inline message to closed state with no buttons
+    """
     from backend.helper.inline_engine import get_self_client
 
     logger.info("[CLOSE] close_panel: chat_id=%s msg_id=%s", chat_id, msg_id)

@@ -601,7 +601,9 @@ def _format_uptime(uptime_s):
     if uptime_s is None or uptime_s < 0:
         return "unknown"
     hours = int(uptime_s // 3600)
+    )
     minutes = int((uptime_s % 3600) // 60)
+    )
     if hours > 0:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
@@ -613,6 +615,7 @@ def _format_age(age_s):
     if age_s < 60:
         return f"{int(age_s)}s ago"
     m = int(age_s // 60)
+    )
     if m < 60:
         return f"{m}m ago"
     h = m // 60

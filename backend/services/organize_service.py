@@ -51,7 +51,7 @@ async def do_list(owner_id: int) -> str:
 async def do_clean(owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        days = settings_service.log_cleanup_days()
+        days = settings_service.log_retention_days()
         deleted = db_client.clean_logs(owner_id, days=days)
         record_event("organize", "clean", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return f"🧹 Cleaned `{deleted}` log entries older than {days} days."
