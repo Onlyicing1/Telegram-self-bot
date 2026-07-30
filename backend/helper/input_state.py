@@ -32,6 +32,7 @@ def set_pending(
     prompt: str,
     inline_chat_id: int = 0,
     inline_msg_id: int = 0,
+    extra: str = "",
 ) -> None:
     """Set a pending input request for the owner. Replaces any previous pending input."""
     _pending[owner_id] = {
@@ -41,6 +42,7 @@ def set_pending(
         "prompt": prompt,
         "inline_chat_id": inline_chat_id,
         "inline_msg_id": inline_msg_id,
+        "extra": extra,
         "created_at": time.monotonic(),
     }
     logger.debug("Input pending for owner %s: panel=%s", owner_id, panel_id)
