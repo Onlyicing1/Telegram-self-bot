@@ -30,6 +30,7 @@ import traceback
 import backend.config as cfg_module
 from backend.runtime.supervisor import RuntimeSupervisor
 from backend.runtime.tracer import trace, trace_exception, trace_uncaught
+from backend.runtime.task_guard import guarded_create_task
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -70,8 +71,8 @@ async def main() -> None:
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(
-                _handle_signal(supervisor_placeholder[0])
+            loop.add_signal_handler(sig, lambda: guarded_create_task(
+                _handle_signal(supervisor_placeholder[0]), name="lifeos-signal-handler"
             ))
         except NotImplementedError:
             pass

@@ -21,6 +21,7 @@ import asyncio
 import logging
 
 from backend.runtime.tracer import trace_task_crash, trace_task_cancelled
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class ManagedTask:
         self._running = True
         self._stop_requested = False
         self._spawn()
-        self._watchdog_task = asyncio.create_task(
+        self._watchdog_task = guarded_create_task(
             self._watch(), name=f"{self.name}-watchdog"
         )
 
@@ -60,7 +61,7 @@ class ManagedTask:
         if self._stop_requested:
             return
         coro = self.factory()
-        self.task = asyncio.create_task(coro, name=self.name)
+        self.task = guarded_create_task(coro, name=self.name)
         logger.info("ManagedTask '%s' started", self.name)
 
     async def _watch(self) -> None:
