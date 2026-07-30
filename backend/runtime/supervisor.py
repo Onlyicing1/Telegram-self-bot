@@ -164,6 +164,7 @@ class RuntimeSupervisor:
 
         settings_svc.load_all()
         logger.info("Panel settings loaded.")
+        logger.info("Panel settings loaded.")
 
         logger.info("[2/5] Building self-client")
         await self._build_and_register()
