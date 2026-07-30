@@ -116,11 +116,13 @@ def build_caption(
 ) -> str:
     size_str = f"{file_size / 1024:.1f} KB" if file_size else "—"
     return (
-        f"📦 DeepSaved\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📦 LifeOS\n\n"
+        f"Code:\n{save_code}\n\n"
+        f"Folder:\nUnfiled\n\n"
+        f"Saved:\n{dt.strftime('%Y-%m-%d %H:%M')}\n"
+        f"━━━━━━━━━━━━━━\n\n"
         f"🎙 Sender: {sender}\n"
-        f"💬 Chat ID: `{chat_id}`\n"
-        f"🆔 Msg ID: `{msg_id}`\n"
-        f"🕒 Time: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
         f"🖼 Type: {media_type}\n"
         f"🧾 MIME: {mime or '—'}\n"
         f"📦 Size: {size_str}\n"
