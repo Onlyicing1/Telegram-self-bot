@@ -27,10 +27,20 @@ def register_runtime_hooks(client) -> None:
     """
     @client.on(events.NewMessage())
     async def _runtime_update_hook(event):
-        from backend.health import set_last_update, set_last_telethon_event
+        from backend.health import set_last_update, set_last_telethon_event, set_last_event_dispatch
         try:
             set_last_update()
             set_last_telethon_event()
+            set_last_event_dispatch()
+        except Exception:
+            pass
+
+    @client.on(events.MessageEdited())
+    async def _runtime_edit_hook(event):
+        from backend.health import set_last_telethon_event, set_last_event_dispatch
+        try:
+            set_last_telethon_event()
+            set_last_event_dispatch()
         except Exception:
             pass
 

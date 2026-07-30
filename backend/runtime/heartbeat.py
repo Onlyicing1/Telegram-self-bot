@@ -12,6 +12,15 @@ Logs a single structured line containing:
   - Last RPC latency
   - Active Telethon update queue size (if available)
   - Number of registered handlers
+  - last_update_age — age of last incoming Telegram update
+  - last_event_age — age of last dispatched event
+  - last_rpc_age — age of last successful RPC
+  - last_command_age — age of last handled owner command
+  - last_callback_age — age of last callback query
+
+Stall detection:
+  - If updates stop arriving while RPC is still healthy → UPDATE_PIPELINE_STALLED
+  - If dispatcher stops processing updates → EVENT_DISPATCH_STALLED
 
 The heartbeat is separate from the watchdog RPC check — it runs on its own
 timer and never blocks or interferes with recovery.
@@ -27,6 +36,7 @@ from backend.runtime.task_guard import guarded_create_task
 logger = logging.getLogger("backend.heartbeat")
 
 _INTERVAL = 30.0
+_STALL_THRESHOLD = 120.0
 _task: asyncio.Task | None = None
 
 _state_ref: dict = {
@@ -92,6 +102,28 @@ async def _heartbeat_loop() -> None:
         handler_count = _count_handlers(client) if client else _state_ref.get("registered_handlers", -1)
         queue_size = _get_update_queue_size(client) if client else _state_ref.get("update_queue_size", -1)
 
+        # ── Age tracking ──
+        from backend.health import (
+            get_last_telethon_event,
+            get_last_event_dispatch,
+            get_last_rpc,
+            get_last_command,
+            get_last_callback,
+        )
+
+        now = time.time()
+        last_update = get_last_telethon_event()
+        last_event = get_last_event_dispatch()
+        last_rpc = get_last_rpc()
+        last_command = get_last_command()
+        last_callback = get_last_callback()
+
+        last_update_age = f"{now - last_update:.0f}s" if last_update > 0 else "never"
+        last_event_age = f"{now - last_event:.0f}s" if last_event > 0 else "never"
+        last_rpc_age = f"{now - last_rpc:.0f}s" if last_rpc > 0 else "never"
+        last_command_age = f"{now - last_command:.0f}s" if last_command > 0 else "never"
+        last_callback_age = f"{now - last_callback:.0f}s" if last_callback > 0 else "never"
+
         trace(
             "RUNTIME_HEARTBEAT",
             self_connected=_state_ref.get("self_connected", False),
@@ -104,7 +136,47 @@ async def _heartbeat_loop() -> None:
             rpc_latency_ms=f"{_state_ref.get('rpc_latency_ms', 0):.1f}",
             update_queue_size=queue_size,
             registered_handlers=handler_count,
+            last_update_age=last_update_age,
+            last_event_age=last_event_age,
+            last_rpc_age=last_rpc_age,
+            last_command_age=last_command_age,
+            last_callback_age=last_callback_age,
         )
+
+        # ── Stall detection (trace only, never reconnect) ──
+        rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
+
+        if last_update > 0 and (now - last_update) > _STALL_THRESHOLD:
+            if rpc_healthy:
+                trace(
+                    "UPDATE_PIPELINE_STALLED",
+                    last_update_age=last_update_age,
+                    last_rpc_age=last_rpc_age,
+                    threshold=f"{_STALL_THRESHOLD:.0f}s",
+                    gen=_state_ref.get("client_generation", 0),
+                )
+                logger.warning(
+                    "UPDATE_PIPELINE_STALLED — no updates for %s but RPC is healthy "
+                    "(last_rpc_age=%s, gen=%d)",
+                    last_update_age, last_rpc_age,
+                    _state_ref.get("client_generation", 0),
+                )
+
+        if last_update > 0 and last_event > 0 and (now - last_event) > _STALL_THRESHOLD:
+            if (now - last_update) < _STALL_THRESHOLD:
+                trace(
+                    "EVENT_DISPATCH_STALLED",
+                    last_update_age=last_update_age,
+                    last_event_age=last_event_age,
+                    threshold=f"{_STALL_THRESHOLD:.0f}s",
+                    gen=_state_ref.get("client_generation", 0),
+                )
+                logger.warning(
+                    "EVENT_DISPATCH_STALLED — updates arriving (%s) but no event "
+                    "dispatched for %s (gen=%d)",
+                    last_update_age, last_event_age,
+                    _state_ref.get("client_generation", 0),
+                )
 
 
 def start_heartbeat() -> None:

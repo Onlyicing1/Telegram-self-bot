@@ -63,6 +63,7 @@ from backend.helper.client import (
     get_bot_username,
 )
 from backend.helper.panels import register_callback_handlers
+from backend.helper.client import register_helper_hooks
 from backend.helper.session_manager import clear_all_sessions
 from backend.helper.inline_engine import (
     register_inline_handler,
@@ -259,6 +260,7 @@ class RuntimeSupervisor:
             self.helper_client = await build_helper(self.bot_token)
             if self.helper_client is not None:
                 register_callback_handlers(self.helper_client, self.owner_id)
+                register_helper_hooks(self.helper_client)
                 register_inline_handler(self.helper_client, self.owner_id)
                 set_self_client(self.client)
                 set_helper_username(get_bot_username())

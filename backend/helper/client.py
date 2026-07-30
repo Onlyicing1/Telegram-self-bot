@@ -14,7 +14,7 @@ import asyncio
 import logging
 import os
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from backend.runtime.tracer import trace, trace_exception
@@ -103,3 +103,27 @@ async def disconnect_helper() -> None:
 
 def get_client() -> TelegramClient | None:
     return _client
+
+
+def register_helper_hooks(client) -> None:
+    """Register runtime event hooks on the helper bot client.
+
+    Tracks CallbackQuery and Raw events for health telemetry.
+    Must be called after the helper bot is connected.
+    """
+    @client.on(events.CallbackQuery())
+    async def _helper_callback_hook(event):
+        from backend.health import set_last_callback, set_last_event_dispatch
+        try:
+            set_last_callback()
+            set_last_event_dispatch()
+        except Exception:
+            pass
+
+    @client.on(events.Raw)
+    async def _helper_raw_hook(event):
+        from backend.health import set_last_telethon_event
+        try:
+            set_last_telethon_event()
+        except Exception:
+            pass
