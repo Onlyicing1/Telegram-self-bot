@@ -8,6 +8,7 @@ Tracks:
   - last_rpc (last successful RPC call)
   - last_command (last owner command processed)
   - last_update (last Telethon update received)
+  - last_handler_dispatched (last handler that actually processed an event)
   - restart_count (Telethon reconnects)
   - task_states (managed task states)
   - supervisor_ok
@@ -42,6 +43,7 @@ _restart_count: int = 0
 _last_rpc: float = 0.0
 _last_command: float = 0.0
 _last_update: float = 0.0
+_last_handler_dispatched: float = 0.0
 _client_generation: int = 0
 _last_rebuild_reason: str = ""
 _rpc_latency_ms: float = 0.0
@@ -114,6 +116,11 @@ def set_last_update() -> None:
     _last_update = time.time()
 
 
+def set_last_handler_dispatched() -> None:
+    global _last_handler_dispatched
+    _last_handler_dispatched = time.time()
+
+
 def set_restart_count(count: int) -> None:
     global _restart_count
     _restart_count = count
@@ -172,6 +179,14 @@ def get_last_update() -> float:
     return _last_update
 
 
+def get_last_telethon_event() -> float:
+    return _last_telethon_event
+
+
+def get_last_handler_dispatched() -> float:
+    return _last_handler_dispatched
+
+
 def _heartbeat_age() -> float:
     if not _last_heartbeat:
         return -1.0
@@ -226,6 +241,7 @@ def snapshot() -> dict:
         "last_rpc_s": _age_or_none(_last_rpc),
         "last_command_s": _age_or_none(_last_command),
         "last_update_s": _age_or_none(_last_update),
+        "last_handler_dispatched_s": _age_or_none(_last_handler_dispatched),
         "rpc_latency_ms": _rpc_latency_ms if _rpc_latency_ms else None,
         "task_states": dict(_task_states),
         "watchdog_ok": _watchdog_ok,

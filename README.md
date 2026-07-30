@@ -45,613 +45,249 @@ LifeOS is a **self-bot** — it operates *your own* Telegram account via Teletho
 - **Bio Engine** — A timezone-synced cron that rewrites your profile bio every minute using `{time}`, `{mood}`, `{text}` tokens.
 - **Discovery** — Full-text search across captions, filenames, save codes, and MIME types.
 - **Organizer** — Data overview, log cleanup, multi-message deletion.
-- **Health Dashboard** — `.health` shows process, Telegram, watchdog, bio cron, memory, CPU, uptime, and more.
-- **Interactive Panels** — `.help` opens an inline panel with category buttons. Tap to navigate, tap Close to dismiss.
-- **Helper Bot** (optional) — A secondary bot token for inline keyboards, callback queries, and interactive menus.
-- **Self-Healing** — A runtime supervisor with watchdog heartbeat and atomic recovery. Never stays in a broken state.
+- **Glass Panel** — Interactive inline-button panels for all commands, settings, and diagnostics.
+- **Diagnostics** — Health dashboard, stalled-task recovery, event logging.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    Python asyncio process                     │
-│                                                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐     │
-│  │  Self Bot    │  │ Helper Bot  │  │  FastAPI + Uvicorn  │     │
-│  │ (Telethon    │  │ (Telethon   │  │  /health  /api/*    │     │
-│  │  StringSess) │  │  Bot Token) │  │  React dashboard    │     │
-│  └──────┬───────┘  └──────┬──────┘  └─────────┬──────────┘     │
-│         │                 │                   │                │
-│         │  commands +     │  inline keyboards │  HTTP API      │
-│         │  business logic │  + callbacks      │                │
-│         └─────────────────┴───────────────────┘                │
-│                          │                                    │
-│  ┌───────────────────────┴──────────────────────────────┐     │
-│  │              Runtime Supervisor                       │     │
-│  │  Watchdog (30s heartbeat) + Atomic Recovery           │     │
-│  └───────────────────────┬──────────────────────────────┘     │
-│                          │                                    │
-│  ┌──────────┐  ┌─────────┴──┐  ┌──────────────┐              │
-│  │ Bio Cron  │  │ Panel Timer │  │  Supabase    │              │
-│  │ Engine    │  │ (auto-close)│  │ (optional)   │              │
-│  └──────────┘  └────────────┘  └──────────────┘              │
-└──────────────────────────────────────────────────────────────┘
-                         │
-                   ┌─────┴──────┐
-                   │  React     │ ← dark Material 3 dashboard
-                   │  Dashboard │   polls /api/* every 30s
-                   └────────────┘
-```
-
-**Single event loop.** The self-bot, helper bot, bio cron, panel timers, web server, and watchdog all share one asyncio loop. No threads, no multiprocessing. Clean shutdown cancels every task before disconnect.
-
-### Repository Structure
-
-```
-backend/
-├── main.py              # asyncio entry point — delegates to RuntimeSupervisor
-├── config.py            # env var loader
-├── diagnostics.py       # event recording + diagnostic reports
-├── health.py            # health snapshot for /health and .health
-├── bot/                 # Self-bot layer (the brain)
-│   ├── client.py        # Telethon StringSession client factory
-│   ├── router.py        # registers all command handlers
-│   └── handlers/        # .ping, .save, .bio, .help, .health, .db, etc.
-├── helper/              # Helper bot layer (inline UI)
-│   ├── client.py        # Bot token client factory
-│   ├── panels.py        # InlinePanelBuilder + callback router
-│   ├── inline_engine.py # Inline Mode core: trigger, builders, result factory
-│   ├── inline_sender.py # Self-bot side: send_inline_panel + input listener
-│   ├── input_state.py   # Pending input state for Type B commands
-│   ├── context.py       # Callback data encoding/decoding utilities
-│   ├── session_manager.py  # In-memory panel sessions + nav stack
-│   ├── panel_settings.py   # Global auto-close preference (DB-backed)
-│   ├── panel_timer.py   # Per-panel auto-close countdown timer
-│   ├── panel_render.py  # Panel rendering helpers
-│   └── ...
-├── runtime/             # Self-healing runtime
-│   ├── supervisor.py    # RuntimeSupervisor — watchdog + recovery
-│   ├── states.py        # RuntimeState enum
-│   └── managed_task.py  # Task wrapper
-├── services/            # Business logic (shared by commands + panels)
-│   ├── panel_settings_repository.py  # Raw DB access (ONLY module touching panel_settings)
-│   ├── settings_service.py           # Cache + validation + typed accessors
-│   ├── save_service.py
-│   ├── retrieve_service.py
-│   ├── delete_service.py
-│   ├── organize_service.py
-│   ├── database_service.py
-│   ├── bio_service.py
-│   └── discover_service.py
-├── bio/
-│   └── engine.py        # Bio cron loop
-├── db/
-│   └── client.py        # Supabase singleton + in-memory fallback
-└── web/
-    └── app.py           # FastAPI — /health, /api/*, SPA serving
-
-src/                     # React dashboard (TypeScript + Vite + Tailwind)
-sql/                    # Per-table SQL schema scripts
-supabase/migrations/     # Migration history
+┌─────────────────────────────────────────────────────────┐
+│                    backend/main.py                        │
+│                  (asyncio entry point)                   │
+│                                                          │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐  │
+│  │  Telethon    │  │  FastAPI     │  │  Bio Cron       │  │
+│  │  Self-Client  │  │  Web Server  │  │  Engine         │  │
+│  │  (StringSess) │  │  (Uvicorn)   │  │  (asyncio task) │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬────────┘  │
+│         │                 │                   │          │
+│  ┌──────┴───────┐  ┌──────┴───────┐  ┌────────┴────────┐  │
+│  │  Bot Handlers │  │  Web Routes  │  │  Bio Engine     │  │
+│  │  (commands)    │  │  (/health,   │  │  (render_bio,   │  │
+│  │                │  │   /api/*)    │  │   cron loop)    │  │
+│  └──────┬───────┘  └──────────────┘  └─────────────────┘  │
+│         │                                                │
+│  ┌──────┴───────────────────────────────────────────────┐ │
+│  │              Services Layer                           │ │
+│  │  (save_service, retrieve_service, delete_service,    │ │
+│  │   organize_service, bio_service, settings_service,   │ │
+│  │   database_service, discover_service)                │ │
+│  └──────┬───────────────────────────────────────────────┘ │
+│         │                                                │
+│  ┌──────┴───────┐  ┌──────────────┐  ┌─────────────────┐  │
+│  │  DB Client   │  │  Helper Bot  │  │  Runtime         │  │
+│  │  (Supabase)  │  │  (Telethon)  │  │  Supervisor      │  │
+│  └──────────────┘  └──────────────┘  └─────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Runtime Supervisor
 
-The `RuntimeSupervisor` (`backend/runtime/supervisor.py`) is the self-healing core of LifeOS. It replaces the simpler `main.py` orchestration with a watchdog-driven recovery system.
+The runtime supervisor (`backend/runtime/supervisor.py`) manages long-running
+asyncio tasks (bio cron, watchdog, heartbeat) with automatic restart on
+failure. It provides:
 
-### Watchdog
-
-- A single asyncio task runs forever at 30-second intervals.
-- Each tick performs a **real RPC** (`client.get_me()`) as the heartbeat.
-- **3 consecutive heartbeat failures** → the self-client is declared dead.
-- Recovery is **atomic** — lock-protected, so duplicate recoveries are impossible.
-
-### Recovery Sequence
-
-1. Stop bio cron.
-2. Stop helper bot.
-3. Clear all inline panel state (sessions, timers, pending inputs, targets).
-4. Cancel the run task and all orphan asyncio tasks.
-5. Dispose the dead client.
-6. Wait with exponential backoff (2s base, 300s max, 30% jitter).
-7. Build a new client, authorize, re-register all handlers.
-8. Reconnect callback trace and input listeners.
-9. Restart helper bot (if enabled).
-10. Resume bio cron.
-11. Verify with a fresh heartbeat RPC.
-12. Start a new run task.
-
-### Failure Modes
-
-- Up to **5 recovery attempts** with exponential backoff.
-- If all 5 fail → `sys.exit(1)` so Render restarts the process.
-- The process **never stays alive in a broken state**.
-
-### Runtime States
-
-```
-STARTING → CONNECTING → REGISTERING → READY
-                                        ↓
-                              RECOVERING → READY (success)
-                                        ↓
-                                     FAILED → sys.exit(1)
-```
+- **Task lifecycle management** — start, stop, monitor.
+- **Automatic restart** — failed tasks are restarted with exponential
+  backoff.
+- **Health snapshots** — exposes task state for the health dashboard.
 
 ---
 
 ## Self Client
 
-The **self-client** is the brain of LifeOS. It connects to Telegram using your own account credentials (API ID, API Hash, and a StringSession) via Telethon.
+The self-client is the main Telethon `TelegramClient` that operates the
+owner's Telegram account. It uses a `StringSession` (never file-based).
 
-### How It Works
-
-1. You generate a `StringSession` once on your local machine (see [Quick Start](#quick-start)).
-2. The session string is stored as an environment variable (`SESSION_STRING`).
-3. On startup, Telethon connects using this session — no interactive login, no file on disk.
-4. You type commands (`.save f`, `.bio on`, etc.) in any chat on your phone or desktop.
-5. The bot edits your message in-place with the result. No new messages are sent.
-
-### Key Properties
-
-- **Owner-only:** Every command checks `is_owner(event, owner_id)`. Non-owner messages are silently ignored.
-- **Edit-first:** All responses edit the triggering message. Zero spam.
-- **Headless:** No interactive prompts. The session string encodes the auth key.
-- **Auto-reconnect:** 5 retries, 2s delay, 60s flood-sleep threshold.
-- **Exactly one active client** at all times — the supervisor guarantees this.
+- Created in `backend/bot/client.py`.
+- Connects and authorizes at startup.
+- Runs until disconnected via `client.run_until_disconnected()`.
 
 ---
 
 ## Helper Bot
 
-The **helper bot** is an optional secondary Telegram client that uses a **bot token** (from BotFather) instead of a user session. It operates as a pure **Inline Engine + Callback Engine**:
+The helper bot is a **separate** Telethon client that operates a real bot
+account (via `BOT_TOKEN`). It provides:
 
-- **Inline Mode** — answers `InlineQuery` events by generating panel results (text + buttons).
-- **Callback queries** — handles button presses on inline messages.
-- **Never sends messages directly** — all UI is delivered through Inline Mode.
+- **Inline buttons** — the Glass Panel system uses inline keyboard buttons,
+  which require a real bot account (self-bots cannot send inline buttons).
+- **Panel rendering** — sends and edits messages with inline keyboards.
+- **Callback handling** — processes button presses via callback queries.
 
-The self-bot remains the brain. The helper bot is purely a presentation layer.
-
-### How It Works (Inline Mode Architecture)
-
-```
-Self account (.help / .health / etc.)
-    │
-    │  1. Self triggers inline mode: client.inline_query(@helper_bot, "help")
-    │
-    ▼
-Helper Bot receives InlineQuery
-    │
-    │  2. Helper generates inline result (text + buttons)
-    │
-    ▼
-Self account auto-sends the first inline result
-    │
-    │  3. Message appears as:
-    │     "Parham via @LifeOSHelper"
-    │     with inline buttons
-    │
-    ▼
-User taps a button
-    │
-    │  4. Callback query → helper bot → panel/action/input handler
-    │
-    ▼
-Helper edits the inline message in-place (zero spam)
-```
-
-### Key Properties
-
-- **Self account is the author** — all inline messages show your name with "via @HelperBot".
-- **Zero spam** — no new messages sent; panels are edited in-place.
-- **Type A commands** (no input needed) — tap button → execute immediately → edit panel with result.
-- **Type B commands** (need input) — tap button → panel becomes input screen → reply with text → execute → edit panel.
-- **Full backward compatibility** — `.save f`, `.bio on`, `.preview S391` etc. still work as edit-in-place commands.
-- **Auto-reconnect** — 5 attempts with exponential backoff. If exhausted, the self-bot continues without inline UI.
+The helper bot is optional — if `BOT_TOKEN` is not set, the bot falls back
+to plain-text edit-in-place mode for all commands.
 
 ---
 
 ## Panel System
 
-The panel system provides interactive inline UIs for commands that benefit from buttons and navigation. It lives in `backend/helper/`.
-
-### Components
-
-| Component | File | Role |
-|---|---|---|
-| InlinePanelBuilder | `panels.py` | Builds button layouts (rows of inline buttons) |
-| Panel handlers | `panels.py` | Registered functions that return `(title, body, buttons)` |
-| Action handlers | `panels.py` | Registered functions that execute an action and return a new panel |
-| Input handlers | `panels.py` | Registered configs for Type B text-input prompts |
-| Inline Engine | `inline_engine.py` | Generates `InputBotInlineResult` objects for InlineQuery answers |
-| Inline Sender | `inline_sender.py` | Self-bot side: triggers inline mode, auto-sends result, listens for text replies |
-| Panel Renderer | `panel_render.py` | Converts (title, body, buttons) into display text + button rows |
-| Panel Timer | `panel_timer.py` | Per-panel auto-close countdown (reads delay from settings cache) |
+The Glass Panel system provides interactive inline-button panels for all
+commands and settings. It replaces the old plain-text command interface.
 
 ### Panel Types
 
-| Panel ID | Trigger | Description |
+| Panel | Trigger | Purpose |
 |---|---|---|
-| `help` | `.help` | Category menu → command list per category |
-| `settings` | Settings button in help | All 13 panel settings with toggle/input buttons |
-| `context` | `.panel` (reply to msg) | Forward save, deep save, preview |
-| `context_error` | `.panel` (no reply) | Error: "reply to a message first" |
-| `health` | `.health` | Health dashboard with refresh button |
-| `kill` | `.kill` | Diagnostic snapshot + stalled-task recovery |
-| `logs` | `.logs` | Event log with filter buttons |
+| Help | `.help` | Main menu with category buttons |
+| Context | `.panel` | Actions on a replied message (save, preview) |
+| Settings | Settings button in Help | View and toggle all settings |
+| Health | `.health` | Health dashboard with refresh |
+| Diagnostics | `.kill` | Diagnostic snapshot + recovery |
+| Logs | `.logs` | Event log viewer with filters |
+| Save | `.save` | Save engine panel (forward/deep) |
+| Retrieve | `.preview` / `.send` | Preview and send saved items |
+| Database | `.db` | Database management panel |
+| Discover | `.discover` | Search saved items |
 
-### Button Conventions
+### Navigation
 
-- **Root menu** (nav stack length 1): only a **Close** button.
-- **Submenus** (nav stack length > 1): **Back**, **Home**, and **Close** buttons.
-- Callback data is truncated to 64 bytes (Telegram limit) via `truncate_callback_data()`.
+Panels use a hierarchical navigation model:
 
----
+- **Home** — returns to the main Help menu.
+- **Close** — closes the current panel.
+- **Back** — returns to the parent panel.
 
-## Navigation
-
-Navigation within panels uses an in-memory stack stored per session.
-
-### Nav Stack
-
-Each session has a `nav_stack` — a list of `(panel_id, extra)` tuples:
-
-- **Root** is always stack length 1.
-- **Push** — navigating to a submenu pushes a new `(panel_id, extra)` entry.
-- **Pop** (Back) — removes the top entry, returns to the previous panel.
-- **Reset** (Home) — clears the stack to `[("help", "")]`.
-- **Close** — destroys the session entirely.
-
-### Navigation Buttons
-
-| Button | Callback Data | Behavior |
-|---|---|---|
-| ‹ Back | `panel:_nav:back` | Pop nav stack, render previous panel |
-| 🏠 Home | `panel:_nav:home` | Reset to help root, render help menu |
-| ✕ Close | `panel:_nav:close` | Destroy session, edit message to "Panel closed" |
-
-### Close Button
-
-Both the Close button and the auto-close timer call the same `close_panel()`
-function, ensuring identical cleanup: clear pending input, stop timer, clear
-session, clear render cache, edit message to closed state.
+Navigation buttons are always at the bottom of the panel.
 
 ---
 
 ## Callback Engine
 
-The callback engine routes button presses (`CallbackQuery` events) to the
-correct handler.
+The callback engine (`backend/helper/inline_engine.py`) processes button
+presses. It:
 
-### Routing
-
-```
-CallbackQuery event
-    │
-    ├── Resolve (chat_id, msg_id, inline_message_id)
-    ├── Check is_owner() (gated by owner_only setting)
-    ├── Look up session by (chat_id, msg_id) or inline_message_id
-    ├── Decode callback data
-    │
-    ├── "panel:..."  → _handle_panel  → panel handler → render + edit
-    ├── "action:..." → _handle_action → action handler → render + edit
-    ├── "input:..."  → _handle_input  → set pending input → prompt + edit
-    └── "panel:_nav:..." → _handle_navigation → back/home/close
-```
-
-### Render Deduplication
-
-Before editing, the callback engine compares the new `(text, buttons_repr)`
-against the last render stored in `_last_render`. If identical, the edit is
-skipped — avoiding Telegram "not modified" errors.
-
-### Debug Callbacks
-
-When `debug_callbacks` is `true` in panel_settings, every callback step is
-logged verbosely (incoming, reject, dispatch, panel/action/input routing).
+1. Receives the callback query from the helper bot.
+2. Parses the callback data (format: `type:panel:action`).
+3. Dispatches to the registered panel handler or action handler.
+4. Renders the result and edits the panel message in-place.
 
 ---
 
 ## Session System
 
-Sessions are **in-memory only** — they do not persist to the database.
+The session system (`backend/helper/session_manager.py`) manages panel
+sessions — one per chat. It tracks:
 
-### Session Structure
-
-```python
-{
-    "session_id": "PANEL-SESSION-000001",
-    "chat_id": 123456,
-    "msg_id": 789,
-    "panel_type": "help",
-    "nav_stack": [("help", "")],
-    "inline_message_id": "",  # secondary lookup key
-}
-```
-
-### Lookup
-
-Sessions are keyed by `(chat_id, msg_id)`. For inline messages that lack a
-`msg_id`, the `inline_message_id` string is used as a secondary lookup key.
-
-### Lifecycle
-
-```
-Create → Render → Wait → Action/Input → Update → Back/Home/Close → Destroy
-```
-
-- **Create** — when a panel is first triggered via inline mode.
-- **Destroy** — on Close button, auto-close timer, shutdown, or recovery.
-- **No persistence** — all sessions are lost on restart. Inline messages
-  from before a restart become non-interactive.
+- The current panel name.
+- The panel message ID (for editing).
+- Auto-close timers.
 
 ---
 
 ## Database Layer
 
-The database layer (`backend/db/client.py`) provides a Supabase singleton
-client with automatic in-memory fallback.
-
-### Design Principle
-
-The bot is designed to run **with or without Supabase**. If env vars are
-missing or the connection fails, all operations silently degrade to an
-in-memory dict. The bot never crashes due to a database error.
-
-### When Supabase Is Available
-
-- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are both set.
-- All writes go through the service-role key, which bypasses RLS.
-- Data persists across restarts.
-
-### When Supabase Is NOT Available
-
-- Env vars are missing or initialization fails.
-- All operations use the in-memory `_fallback` dict.
-- Data does NOT persist across restarts — but the bot continues to work.
-
-### Public Functions
-
-| Function | Table | Behavior |
-|---|---|---|
-| `log()` | `bot_logs` | Insert a log entry |
-| `get_next_save_code()` | `saved_items` | Generate a unique short code (`SNNNN`) |
-| `insert_save()` | `saved_items` | Insert a save record |
-| `query_save()` | `saved_items` | Look up by `short_code` OR `save_code` |
-| `list_saves()` | `saved_items` | Paginated list, ordered by `created_at` desc |
-| `list_recent_saves()` | `saved_items` | Recent saves (subset of columns) |
-| `search_saves()` | `saved_items` | ILIKE search across caption, filename, codes, MIME |
-| `delete_save()` | `saved_items` | Delete by code |
-| `list_all_saves()` | `saved_items` | All saves for an owner |
-| `cleanup_orphans()` | `saved_items` | Delete rows by ID list |
-| `get_stats()` | `saved_items` | Aggregate statistics |
-| `count_saves()` | `saved_items` | Count, optionally filtered by type |
-| `get_bio_state()` | `bio_state` | Get state by owner_id |
-| `get_or_create_bio_state()` | `bio_state` | Get or insert default |
-| `update_bio_state()` | `bio_state` | Update by owner_id |
-| `count_logs()` | `bot_logs` | Count for owner |
-| `list_logs()` | `bot_logs` | Recent logs, ordered desc |
-| `clean_logs()` | `bot_logs` | Delete logs older than N days |
+The database layer (`backend/db/client.py`) provides a Supabase client
+with automatic in-memory fallback. See [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)
+for full schema documentation.
 
 ---
 
 ## Bio Engine
 
-The bio engine (`backend/bio/engine.py`) is a cron loop that rewrites your
-Telegram profile bio ("about" field) every minute.
+The bio engine (`backend/bio/engine.py`) rewrites the owner's Telegram
+profile bio every minute using a template with `{time}`, `{mood}`, `{text}`
+tokens.
 
-### Template Tokens
-
-| Token | Replaced With |
-|---|---|
-| `{time}` | Current time as `HH:MM` (in the configured timezone) |
-| `{mood}` | The mood value (set via `.bio mood`) |
-| `{text}` | Custom text (set via `.bio text`) |
-
-### Design Guarantees
-
-- **Fires at minute boundaries** — sleeps to the next `xx:xx:00`, not a fixed interval.
-- **Deduplication** — skips the API call when the rendered string hasn't changed.
-- **FloodWait handling** — catches `FloodWaitError`, sleeps the exact seconds + 1.
-- **Never terminates on errors** — all non-cancellation errors are logged and retried next tick.
-- **Single task** — `start_cron()` is idempotent; only one updater can exist.
-- **Self-stopping** — if `is_active` becomes `False` in the DB, the loop exits on the next tick.
+- Fires at each minute boundary (not a fixed interval).
+- Deduplicates — skips the API call when the bio string hasn't changed.
+- Handles `FloodWaitError` by sleeping the exact wait time.
+- Never terminates on recoverable errors.
 
 ---
 
 ## Save Engine
 
-The save engine handles two types of saves:
+The save engine (`backend/services/save_service.py`) provides two save modes:
 
-### Forward Save (`.save f`)
+- **Forward save** (`.save f`) — forwards the replied message to Saved
+  Messages. Instant, no download.
+- **Deep save** (`.save d`) — downloads media, re-uploads to Saved Messages
+  with a rich caption. 50 MB hard limit.
 
-- Forwards the replied message to Saved Messages using Telegram's native forward API.
-- No download — instant.
-- Records metadata (save code, origin, sender, media type, tags) in the database.
-
-### Deep Save (`.save d`)
-
-- Downloads the media to a `BytesIO` buffer (max size from `max_deep_save_mb` setting).
-- Re-uploads to Saved Messages with a rich caption (sender, chat ID, msg ID, timestamp, media type, MIME, size, filename, tags).
-- Buffer is always closed in a `finally` block — zero memory leaks.
-- Empty-download guard: aborts if the download produces zero bytes.
-
-### Save Codes
-
-- **Short code** (current): `SNNNN` format (e.g., `S0001`). Generated atomically via `asyncio.Lock`.
-- **Legacy code**: `SV-NNNNNN` format. Preserved for backward compatibility.
-- Lookups try `short_code` first, then fall back to `save_code`.
+Both modes store full metadata in the `saved_items` table.
 
 ---
 
 ## Retrieve
 
-Retrieval commands let you access previously saved items:
+The retrieve system (`backend/services/retrieve_service.py`) provides:
 
-| Command | Behavior |
-|---|---|
-| `.preview <code>` | Shows metadata for a saved item (type, media, MIME, size, sender, origin, tags) |
-| `.r <code>` / `.retrieve <code>` | Alias for `.preview` |
-| `.send <code>` | Forwards the saved asset from Saved Messages into the current chat |
-
-Lookups are case-insensitive and work with both `short_code` and legacy `save_code`.
+- `.preview <code>` — show metadata for a saved item.
+- `.send <code>` — forward the saved asset to the current chat.
 
 ---
 
 ## Organizer
 
-The organizer provides data management commands:
+The organizer (`backend/services/organize_service.py`) provides:
 
-| Command | Behavior |
-|---|---|
-| `.del <n>` | Delete last N outgoing messages (1-500 range, batch size from `delete_batch_size` setting) |
-| `.del id <msgid>` | Delete all messages from msg_id forward |
-| `.del <code>` | Delete a saved item from the index |
-| `.organize list` | Data overview: save counts, log count, bio status |
-| `.organize clean` | Purge logs older than `log_retention_days` setting |
+- `.organize list` — data overview (save counts, log count, bio status).
+- `.organize clean` — purge logs older than 7 days.
 
 ---
 
 ## Diagnostics
 
-Diagnostics provide visibility into the bot's internal state:
+The diagnostics system (`backend/diagnostics.py`) provides:
 
-| Command | Behavior |
-|---|---|
-| `.kill` | Snapshot + stalled-task recovery (gated by `diagnostics_enabled` setting) |
-| `.logs` | Recent events (last 20) (gated by `diagnostics_enabled` setting) |
-| `.logs 50` | Last 50 events |
-| `.logs errors` | Errors only |
-| `.logs module <name>` | Filter by module |
-
-Events are recorded via `diagnostics.record_event()` and stored in memory
-(not in the database). The `.kill` command also attempts to recover stalled
-asyncio tasks.
-
-When `diagnostics_enabled` is `false`, `.kill` and `.logs` show a message
-telling the user to enable diagnostics in Settings.
+- `.kill` — diagnostic snapshot + stalled-task recovery.
+- `.logs` — event log viewer with filters (errors only, last N, by module).
+- Health snapshots for the health dashboard.
 
 ---
 
 ## Settings
 
-All Glass Panel configuration is stored in the `panel_settings` database
-table using a **column-per-setting model** — each setting is a real typed
-column, not a key-value entry. The architecture is strictly layered:
+The settings system (`backend/services/settings_service.py`) manages all
+Glass Panel configuration. Settings are stored as typed columns on the
+`panel_settings` table.
 
-```
-  Supabase (panel_settings table)
-       │
-       ▼
-  PanelSettingsRepository  (raw DB access — the ONLY module that touches the table)
-       │
-       ▼
-  PanelSettingsService     (cache + validation + typed accessors)
-       │
-       ├── get_setting()         → read from cache (no DB call)
-       ├── set_setting()          → validate → write DB → refresh cache
-       └── reload_panel_settings() → full cache refresh from DB
-       │
-       ▼
-  Glass Panel (reads via get_*(), writes via set_*())
-```
-
-**NO PANEL MAY ACCESS SUPABASE DIRECTLY.** All reads and writes go through
-the service, which delegates DB access to the repository.
-
-### Available Settings (13 columns)
+### Available Settings
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `auto_close_enabled` | boolean | `true` | — | Whether inline panels auto-close |
+| `auto_close_enabled` | boolean | `true` | — | Whether panels auto-close |
 | `auto_close_delay` | integer | `120` | 5..3600 | Seconds before auto-close |
-| `max_deep_save_mb` | integer | `50` | 1..500 | Max file size for deep saves (MB) |
-| `delete_batch_size` | integer | `100` | 1..1000 | Messages per delete batch |
-| `log_retention_days` | integer | `7` | 1..365 | Log retention before cleanup |
-| `panel_timeout_seconds` | integer | `300` | 30..86400 | Panel timeout (seconds) |
+| `max_deep_save_mb` | integer | `50` | 1..500 | Max file size for deep save |
+| `delete_batch_size` | integer | `100` | 1..1000 | Batch size for message deletion |
+| `log_retention_days` | integer | `7` | 1..365 | Days to retain logs |
+| `panel_timeout_seconds` | integer | `300` | 30..86400 | Panel timeout in seconds |
 | `allow_multiple_panels` | boolean | `false` | — | Allow multiple simultaneous panels |
 | `reuse_existing_panel` | boolean | `true` | — | Reuse an existing panel instead of creating new |
-| `theme` | string | `"dark"` | non-empty | UI theme name |
 | `language` | string | `"en"` | non-empty | Language code |
 | `diagnostics_enabled` | boolean | `true` | — | Show diagnostics info (`.kill`, `.logs`) |
-| `debug_callbacks` | boolean | `false` | — | Enable verbose callback logging |
-| `owner_only` | boolean | `true` | — | Restrict panel access to owner only |
-
-### Cache Flow
-
-- **Startup**: `RuntimeSupervisor.start()` calls `settings_service.load_all()`,
-  which delegates to `PanelSettingsRepository.load()` — a single `SELECT *`
-  on the global row. The result populates the in-memory cache. Every panel
-  reads from this cache — no DB round-trip per read.
-- **Update**: When a panel changes a setting, the service validates the
-  value, writes to the DB via the repository, then reloads the cache from
-  the DB row. Cache and database are never left inconsistent.
-- **Reload**: `reload_panel_settings()` forces a full cache refresh from
-  the DB without restart.
-- **Performance**: The database is NEVER queried on a button click. Only
-  cache reads. Database writes only when settings change.
-
-### Auto-Close
-
-- **Default**: ON (panels auto-close after 120 seconds).
-- **Toggle**: `.help` → Settings → Auto Close button, or the settings panel.
-- **Behavior**: When ON, a timer task edits the panel message every 30s with
-  a countdown. When OFF, panels stay open until manually closed.
-- **Persistence**: Stored in `panel_settings` (key = `"global"`) and loaded
-  at startup into the settings service cache.
-
-### Diagnostics
-
-- When `diagnostics_enabled` is `false`, `.kill` and `.logs` commands are
-  hidden with a message telling the user to enable diagnostics in Settings.
-- When `debug_callbacks` is `true`, every callback step is logged verbosely.
-
-### Owner-Only Safety
-
-- When `owner_only` is `true`, the Glass Panel callback router enforces
-  `is_owner()` on every button press. When `false`, callbacks from any
-  user are accepted.
+| `debug_callbacks` | boolean | `false` | — | Debug callback tracing |
+| `owner_only` | boolean | `true` | — | Restrict commands to owner only |
 
 ---
 
 ## Database Panel
 
-The database panel (`.db` commands) provides database maintenance:
+The database panel (`.db`) provides:
 
-| Command | Behavior |
-|---|---|
-| `.db clean` | Remove orphan rows (saved items whose Telegram messages no longer exist) |
-| `.db stats` | Database statistics (total items, breakdown by type, size estimate, date range) |
-| `.db vacuum` | Cleanup + optimize (removes orphans, reports remaining count) |
-
-### How It Works
-
-1. `find_orphans()` iterates all `saved_items` rows for the owner.
-2. For each row, it checks if the Telegram message still exists via `client.get_messages()`.
-3. Rows whose messages are gone (or have no `saved_chat_id`/`saved_msg_id`) are collected as orphan IDs.
-4. `cleanup_orphans()` deletes those rows by ID.
+- `.db clean` — remove orphan rows.
+- `.db stats` — database statistics.
+- `.db vacuum` — cleanup + optimize.
 
 ---
 
 ## Database
 
-LifeOS uses [Supabase](https://supabase.com/) (hosted PostgreSQL) for data persistence. The database contains **four tables**:
+Four tables in the `public` schema:
 
 | Table | Purpose |
 |---|---|
-| `saved_items` | Media save records — save code, type, origin, metadata, tags |
+| `saved_items` | Media save records (forward + deep) |
 | `bio_state` | Singleton bio engine state per owner — template, mood, text |
 | `bot_logs` | Structured activity log — level, message, JSONB context |
-| `panel_settings` | Glass Panel configuration — 13 typed columns (auto-close, limits, diagnostics, theme, etc.) |
+| `panel_settings` | Glass Panel configuration — 12 typed columns (auto-close, limits, diagnostics, etc.) |
 
 All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key, which bypasses RLS.
-
-For the complete schema reference — every column, type, index, constraint, and RLS policy — see **[DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)**.
-
-For standalone SQL scripts, see the [`sql/`](sql/) directory.
 
 ---
 
@@ -660,64 +296,63 @@ For standalone SQL scripts, see the [`sql/`](sql/) directory.
 ### Prerequisites
 
 - Python 3.11+
-- Node.js 18+ (for the dashboard)
-- A Telegram account with API credentials from [my.telegram.org](https://my.telegram.org)
-- A Supabase project (optional — the bot works without it)
+- Node.js 18+ (for dashboard build)
+- A Telegram account with API credentials
+- A Supabase project (optional — bot works without it)
 
-### Step 1: Get Telegram API Credentials
-
-1. Go to [my.telegram.org](https://my.telegram.org) and log in.
-2. Click **API development tools**.
-3. Create an application — you'll get an **API ID** (number) and an **API Hash** (string).
-
-### Step 2: Generate SESSION_STRING
+### 1. Clone and Install
 
 ```bash
-pip install telethon
-python -c "
+git clone <repo-url>
+cd lifeos
+pip install -r backend/requirements.txt
+npm install
+```
+
+### 2. Generate Session String
+
+```python
+# Run this locally ONCE to generate your session string:
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-api_id   = int(input('API_ID: '))
-api_hash = input('API_HASH: ')
+api_id = YOUR_API_ID
+api_hash = 'YOUR_API_HASH'
 
 with TelegramClient(StringSession(), api_id, api_hash) as client:
-    print('\\n--- SESSION_STRING ---')
     print(client.session.save())
-    print('--- copy the line above ---')
-"
 ```
 
-Copy the output string — this is your `SESSION_STRING`.
+Copy the printed string — this is your `SESSION_STRING`.
 
-### Step 3: Find Your Telegram User ID
+### 3. Configure Environment
 
-Message [@userinfobot](https://t.me/userinfobot) on Telegram to get your numeric user ID. This is your `BOT_OWNER_ID`.
+Create a `.env` file (or set env vars on Render):
 
-### Step 4: Local Development
+```env
+API_ID=12345
+API_HASH=your_api_hash
+SESSION_STRING=your_session_string
+BOT_OWNER_ID=123456789
+BOT_TOKEN=your_bot_token  # Optional — for Glass Panel mode
+SUPABASE_URL=your_supabase_url  # Optional
+SUPABASE_SERVICE_ROLE_KEY=your_key  # Optional
+TZ=Asia/Tehran
+```
+
+### 4. Run
 
 ```bash
-git clone <your-repo-url>
-cd lifeos
-
-# Backend
-pip install -r backend/requirements.txt
-
-# Frontend
-npm install
-npm run build    # builds to dist/ (served by FastAPI)
-
-# Set environment variables
-export API_ID=123456
-export API_HASH=your_api_hash
-export SESSION_STRING=your_session_string
-export BOT_OWNER_ID=123456789
-
-# Run
 python -m backend.main
 ```
 
-The dashboard is available at `http://localhost:8000`.
+### 5. Build Dashboard (Optional)
+
+```bash
+npm run build
+```
+
+The built dashboard is served by FastAPI at `/`.
 
 ---
 
@@ -725,159 +360,105 @@ The dashboard is available at `http://localhost:8000`.
 
 ### Required
 
-| Variable | Description |
-|---|---|
-| `API_ID` | Telegram API ID from [my.telegram.org](https://my.telegram.org) |
-| `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) |
-| `SESSION_STRING` | Telethon StringSession (generated above) |
-| `BOT_OWNER_ID` | Your Telegram numeric user ID |
+| Variable | Type | Description |
+|---|---|---|
+| `API_ID` | int | Telegram API ID from my.telegram.org |
+| `API_HASH` | str | Telegram API Hash from my.telegram.org |
+| `SESSION_STRING` | str | Telethon StringSession (generated offline) |
+| `BOT_OWNER_ID` | int | Telegram numeric user ID of the bot owner |
 
-### Optional — Helper Bot
+### Optional
 
 | Variable | Default | Description |
 |---|---|---|
-| `BOT_TOKEN` | `""` | Bot token from BotFather. Enables inline UI. If empty, inline UI is disabled. |
-
-### Optional — Supabase
-
-| Variable | Default | Description |
-|---|---|---|
-| `SUPABASE_URL` | `""` | Supabase project URL. Empty = in-memory fallback. |
-| `SUPABASE_SERVICE_ROLE_KEY` | `""` | Supabase service role key. Empty = in-memory fallback. |
-
-### Optional — General
-
-| Variable | Default | Description |
-|---|---|---|
-| `DATABASE_URL` | `""` | PostgreSQL connection string (backup, currently unused). |
-| `TZ` | `Asia/Tehran` | Timezone for bio engine and timestamps. |
-| `PORT` | `8000` | Web server port (Render sets this automatically). |
-| `BIO_UPDATE_ENABLED` | `false` | Set to `true` to auto-start bio cron on boot. |
-| `LOG_LEVEL` | `INFO` | Python logging level. |
+| `BOT_TOKEN` | `""` | Helper bot token for Glass Panel mode |
+| `SUPABASE_URL` | `""` | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | `""` | Supabase service role key |
+| `DATABASE_URL` | `""` | PostgreSQL connection string (unused) |
+| `TZ` | `Asia/Tehran` | Timezone for bio engine and timestamps |
+| `PORT` | `8000` | Web server port |
+| `BIO_UPDATE_ENABLED` | `false` | Auto-start bio cron on boot |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
 ---
 
 ## Helper Bot Setup
 
-The helper bot requires a one-time setup through BotFather. Inline Mode is **required**.
+The Glass Panel system requires a **separate** Telegram bot account:
 
-### Step 1: Create the Bot
+1. Create a new bot via [@BotFather](https://t.me/BotFather).
+2. Copy the bot token.
+3. Set `BOT_TOKEN` in your environment.
+4. Start the bot — the helper bot will connect automatically.
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram.
-2. Send `/newbot`.
-3. Choose a name and username (must end in `bot`).
-4. Copy the bot token — this is your `BOT_TOKEN`.
-
-### Step 2: Enable Inline Mode (Required)
-
-1. Send `/setinline` to [@BotFather](https://t.me/BotFather).
-2. Select your helper bot.
-3. Send a placeholder message (e.g., `LifeOS panels`).
-4. BotFather confirms inline mode is enabled.
-
-### Step 3: Disable Group Privacy (Optional)
-
-Only needed if you use LifeOS commands in group chats:
-
-1. Send `/setprivacy` to [@BotFather](https://t.me/BotFather).
-2. Select your bot.
-3. Choose **Disable**.
-
-### Step 4: Verify
-
-After deploying with `BOT_TOKEN` set:
-
-1. Send `.help` from your account in any chat.
-2. The command message should disappear.
-3. An inline message should appear with category buttons.
-4. Tap a category — the message edits in-place.
-5. Tap Close — the message shows "Panel closed".
-
-If you see plain text instead of buttons, the helper bot is not running or `BOT_TOKEN` is not set correctly.
+Without `BOT_TOKEN`, the bot falls back to plain-text edit-in-place mode.
 
 ---
 
 ## Deploying on Render
 
-1. Push your repository to GitHub.
-2. On [render.com](https://render.com), create a new Web Service.
-3. Connect your GitHub repository.
-4. Render reads `render.yaml` automatically, or set:
-   - **Environment:** Python
-   - **Start Command:** `python -m backend.main`
-   - **Health Check Path:** `/health`
-5. Add all environment variables in the Render dashboard.
-6. Click **Create Web Service**.
+1. Push code to GitHub.
+2. Create a new Web Service on Render, connected to your GitHub repo.
+3. Set the start command: `python -m backend.main`.
+4. Set the health check path: `/health`.
+5. Add all environment variables (see above).
+6. Deploy.
 
-The React dashboard is not built automatically by Render. To serve it:
-
-```bash
-npm install
-npm run build    # produces dist/
-```
-
-Ensure `dist/` is available to the Python process. The FastAPI app mounts it as static files if present.
+Render will build the Python environment from `backend/requirements.txt`
+and start the bot.
 
 ---
 
 ## Commands
 
-All commands use the `.` prefix. All commands only fire on your own outgoing messages. Every response edits the triggering message in-place.
+All commands use the `.` prefix. Commands only fire on outgoing messages
+(sent from the owner's own account).
 
 ### Utility
 
 | Command | Description |
 |---|---|
-| `.ping` | Edits message to `PONG` |
-| `.id` | Shows Your ID, Current Chat ID, and Current Message ID |
-| `.help` | Opens interactive inline help panel |
-| `.health` | Full health dashboard |
-| `.panel` | Context panel for the replied message |
+| `.ping` | PONG |
+| `.id` | Chat & Message IDs |
+| `.help` | Interactive help panel |
+| `.panel` | Context panel for replied message |
+| `.health` | Health dashboard |
+| `.kill` | Diagnostic snapshot + recovery |
+| `.logs` | Event log viewer |
 
-### Save Engine (reply to a message first)
-
-| Command | Description |
-|---|---|
-| `.save f` / `.s f` | Forward save — instant, no download |
-| `.save d` / `.s d` | Deep save — download + re-upload with rich caption |
-
-### Discovery
+### Save Engine
 
 | Command | Description |
 |---|---|
-| `.list` | Show 10 recent saves |
-| `.list 20` | Show 20 recent saves |
-| `.find vacation` | Search by caption, filename, code, or MIME |
+| `.save f` | Forward save to Saved Messages |
+| `.save d` | Deep save (download + re-upload) |
 
-### Retrieval
+### Retrieve
 
 | Command | Description |
 |---|---|
-| `.preview S391` | Show metadata for a save code |
-| `.r S391` / `.retrieve S391` | Alias for `.preview` |
-| `.send S391` | Forward the saved asset into this chat |
+| `.preview <code>` | Show metadata for a saved item |
+| `.send <code>` | Forward saved asset to current chat |
 
 ### Organizer
 
 | Command | Description |
 |---|---|
-| `.del 5` | Delete last 5 outgoing messages |
-| `.del id 12345` | Delete all messages from ID 12345 forward |
-| `.del S391` | Delete saved item from the index |
+| `.del <n>` | Delete last n outgoing messages |
+| `.del id <msgid>` | Delete from message ID |
 | `.organize list` | Data overview |
-| `.organize clean` | Purge logs older than `log_retention_days` setting |
+| `.organize clean` | Purge old logs |
 
 ### Bio Engine
 
 | Command | Description |
 |---|---|
-| `.bio on` | Start the bio cron |
-| `.bio off` | Stop the bio cron |
-| `.bio template 🕒 {time} | {mood} | {text}` | Set the bio template |
-| `.bio text Working` | Set the `{text}` token value |
-| `.bio mood 😊` | Set the `{mood}` token value |
-| `.bio show` | Inspect full bio state |
-| `.bio help` | Token reference |
+| `.bio on` | Start bio cron |
+| `.bio off` | Stop bio cron |
+| `.bio show` | Show bio state |
+| `.bio template <tpl>` | Set bio template |
+| `.bio text <text>` | Set {text} token |
+| `.bio mood <mood>` | Set {mood} token |
 
 ### Database
 
@@ -887,78 +468,27 @@ All commands use the `.` prefix. All commands only fire on your own outgoing mes
 | `.db stats` | Database statistics |
 | `.db vacuum` | Cleanup + optimize |
 
-### Diagnostics
-
-| Command | Description |
-|---|---|
-| `.kill` | Snapshot + stalled-task recovery |
-| `.logs` | Recent events (last 20) |
-| `.logs 50` | Last 50 events |
-| `.logs errors` | Errors only |
-| `.logs module <name>` | Filter by module |
-
 ---
 
 ## Troubleshooting
 
 ### Bot won't start
 
-A required environment variable is missing (`API_ID`, `API_HASH`, `SESSION_STRING`, or `BOT_OWNER_ID`). Check that all four are set.
+- Check that all required env vars are set (`API_ID`, `API_HASH`,
+  `SESSION_STRING`, `BOT_OWNER_ID`).
+- Check that the session string is valid (regenerate if needed).
+- Check logs for connection errors.
 
-### Session not authorized
+### Panels not working
 
-The `SESSION_STRING` is invalid or expired. Regenerate it locally (see [Quick Start](#quick-start)).
+- Ensure `BOT_TOKEN` is set — Glass Panel mode requires the helper bot.
+- Without `BOT_TOKEN`, commands fall back to plain-text edit-in-place.
 
-### Helper bot fails to start
+### Database errors
 
-`BOT_TOKEN` is set but invalid. Verify the token with BotFather: send `/token`, select your bot, and compare.
-
-### Inline panels not working (plain text instead of buttons)
-
-The helper bot is not running. Check that `BOT_TOKEN` is set and valid. Ensure Inline Mode is enabled via BotFather (`/setinline`).
-
-### Commands don't respond
-
-Your `BOT_OWNER_ID` doesn't match your Telegram user ID. Find your correct ID via [@userinfobot](https://t.me/userinfobot).
-
-### Bio cron not updating
-
-The rendered bio string may be identical to the current one (deduplication), or FloodWait is active. Run `.bio show` to check the last rendered bio. Change the template or tokens so the rendered string differs.
-
-### Health check fails on Render
-
-The FastAPI server isn't responding on `/health`. Check Render logs for Python errors. Ensure `PORT` is set (Render sets this automatically).
-
-### Database not persisting
-
-Supabase env vars are not set. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your environment.
-
-### Bot keeps restarting
-
-The runtime supervisor's watchdog detected 3 consecutive heartbeat failures and triggered recovery. After 5 failed recovery attempts, the process exits so Render can restart it. Check `.kill` output or Render logs for the root cause.
-
----
-
-## Project Philosophy
-
-- **Never crash.** Every external operation degrades gracefully.
-- **Never stay broken.** The watchdog detects dead clients and recovers atomically.
-- **Zero spam.** Every command edits the triggering message in-place.
-- **Owner-only.** One permission gate. Non-owner messages are silently ignored.
-- **Deterministic.** Bio cron fires at minute boundaries. Save codes are atomic.
-- **Single process.** One asyncio loop. No threads, no multiprocessing.
-- **Data safety.** Never `DROP` tables or `DELETE` columns. Migrations are additive.
-
----
-
-## Credits
-
-- **[Telethon](https://github.com/LonamiWebs/Telethon)** — Telegram MTProto library
-- **[FastAPI](https://fastapi.tiangolo.com/)** — Web framework
-- **[Supabase](https://supabase.com/)** — PostgreSQL backend
-- **[React](https://react.dev/)** + **[Vite](https://vitejs.dev/)** — Dashboard
-- **[Tailwind CSS](https://tailwindcss.com/)** — Styling
-- **[Render](https://render.com/)** — Hosting
+- The bot works without Supabase — all operations fall back to in-memory.
+- Check `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set correctly.
+- Check that all migrations have been applied.
 
 ---
 

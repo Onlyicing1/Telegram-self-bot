@@ -42,11 +42,11 @@ Architecture:
 | panel_timeout_seconds   | int     | 300     | 30..86400 (seconds)     |
 | allow_multiple_panels   | bool    | false   | must be boolean         |
 | reuse_existing_panel    | bool    | true    | must be boolean         |
-| theme                   | str     | "dark"  | non-empty string        |
 | language                | str     | "en"    | non-empty string        |
 | diagnostics_enabled     | bool    | true    | must be boolean         |
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
+| update_stale_seconds    | int     | 300     | 60..3600 (seconds)      |
 """
 import logging
 from typing import Any, Callable
@@ -64,11 +64,11 @@ _DEFAULTS: dict[str, Any] = {
     "panel_timeout_seconds": 300,
     "allow_multiple_panels": False,
     "reuse_existing_panel": True,
-    "theme": "dark",
     "language": "en",
     "diagnostics_enabled": True,
     "debug_callbacks": False,
     "owner_only": True,
+    "update_stale_seconds": 300,
 }
 
 _cache: dict[str, Any] = {}
@@ -104,11 +104,11 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "panel_timeout_seconds": _validate_int_range(30, 86400),
     "allow_multiple_panels": _validate_bool,
     "reuse_existing_panel": _validate_bool,
-    "theme": _validate_nonempty_str,
     "language": _validate_nonempty_str,
     "diagnostics_enabled": _validate_bool,
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
+    "update_stale_seconds": _validate_int_range(60, 3600),
 }
 
 
@@ -292,15 +292,6 @@ def set_panel_timeout_seconds(seconds: int) -> bool:
 
 # ── Typed accessors: strings ──
 
-def theme() -> str:
-    _ensure_loaded()
-    return str(_cache.get("theme", "dark"))
-
-
-def set_theme(value: str) -> bool:
-    return set_setting("theme", value)
-
-
 def language() -> str:
     _ensure_loaded()
     return str(_cache.get("language", "en"))
@@ -308,3 +299,12 @@ def language() -> str:
 
 def set_language(value: str) -> bool:
     return set_setting("language", value)
+
+
+def update_stale_seconds() -> int:
+    _ensure_loaded()
+    return int(_cache.get("update_stale_seconds", 300))
+
+
+def set_update_stale_seconds(seconds: int) -> bool:
+    return set_setting("update_stale_seconds", seconds)

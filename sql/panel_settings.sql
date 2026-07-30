@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS panel_settings (
     max_deep_save_mb            integer      NOT NULL DEFAULT 50,
     delete_batch_size           integer      NOT NULL DEFAULT 100,
     log_cleanup_days           integer      NOT NULL DEFAULT 7,
+    update_stale_seconds       integer      NOT NULL DEFAULT 300,
     updated_at                 timestamptz  DEFAULT now()
 );
 

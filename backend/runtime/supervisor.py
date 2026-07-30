@@ -46,6 +46,8 @@ from backend.health import (
     set_helper_connected,
     set_last_rpc,
     set_last_update,
+    set_last_telethon_event,
+    get_last_telethon_event,
     set_heartbeat,
     increment_restart,
     set_last_rebuild_reason,
@@ -87,6 +89,7 @@ _BACKOFF_MAX = 300.0
 _BACKOFF_JITTER = 0.3
 _MAX_RECOVERY_ATTEMPTS = 5
 _HEARTBEAT_FAILURE_THRESHOLD = 3
+_UPDATE_STALE_DEFAULT = 300.0
 
 
 def _backoff(attempt: int) -> float:
@@ -260,8 +263,6 @@ class RuntimeSupervisor:
                 set_self_client(self.client)
                 set_helper_username(get_bot_username())
                 set_owner_id(self.owner_id)
-                configure_callback_trace(self.client, self.owner_id)
-                register_input_listener(self.client, self.owner_id)
                 set_helper_connected(True)
                 update_heartbeat_state(helper_connected=True)
                 guarded_create_task(
@@ -368,6 +369,7 @@ class RuntimeSupervisor:
             trace("SELF_DISCONNECTED", gen=self.client_generation, reason="run_until_disconnected_returned")
             trace("SELF_RUN_LOOP_EXITED", gen=self.client_generation)
             logger.warning("Self-client disconnected — watchdog will detect and recover")
+            break
 
     async def _watchdog_loop(self) -> None:
         while not self.shutdown_event.is_set():
@@ -416,6 +418,50 @@ class RuntimeSupervisor:
                     await self._trigger_recovery()
                 continue
 
+            # ── Update-staleness detection ──
+            #
+            # Telethon can silently stall: is_connected() returns True,
+            # get_me() succeeds, but the update-receive loop is no longer
+            # processing incoming updates. The heartbeat RPC alone cannot
+            # detect this. We check whether we've received ANY Telegram
+            # event recently. If not, the update loop is stalled.
+            try:
+                stale_threshold = settings_svc.update_stale_seconds()
+            except Exception:
+                stale_threshold = int(_UPDATE_STALE_DEFAULT)
+
+            last_event = get_last_telethon_event()
+            now = time.time()
+            if last_event > 0:
+                event_age = now - last_event
+                if event_age > stale_threshold:
+                    trace(
+                        "WATCHDOG_UPDATE_STALE",
+                        last_event_age=f"{event_age:.0f}s",
+                        threshold=f"{stale_threshold}s",
+                        gen=self.client_generation,
+                    )
+                    logger.warning(
+                        "WATCHDOG_UPDATE_STALE — no updates for %.0fs "
+                        "(threshold=%ds, gen=%d) — update loop stalled",
+                        event_age, stale_threshold, self.client_generation,
+                    )
+                    record_event(
+                        "runtime", "update_stale", event_age,
+                        "STALE", f"threshold={stale_threshold}s",
+                    )
+                    set_last_rebuild_reason(
+                        f"watchdog: update_stale ({event_age:.0f}s > {stale_threshold}s)"
+                    )
+                    self._consecutive_failures = _HEARTBEAT_FAILURE_THRESHOLD
+                    await self._trigger_recovery()
+                    continue
+
+            # ── Heartbeat RPC check ──
+            #
+            # Only run the RPC heartbeat if we've passed the staleness check.
+            # This catches the case where the connection is truly dead (RPC
+            # fails) vs. silently stalled (RPC works but no updates).
             t0 = time.monotonic()
             try:
                 await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
@@ -553,14 +599,8 @@ class RuntimeSupervisor:
                 trace("SELF_RECONNECTED", gen=self.client_generation)
                 logger.info("Recovery: new client ready (gen=%d)", self.client_generation)
 
-                logger.info("Recovery: reconnecting callback trace")
                 if self.helper_enabled:
                     set_self_client(self.client)
-                    configure_callback_trace(self.client, self.owner_id)
-
-                logger.info("Recovery: reconnecting input listeners")
-                if self.helper_enabled:
-                    register_input_listener(self.client, self.owner_id)
 
                 if self.helper_enabled:
                     logger.info("Recovery: restarting helper bot")
@@ -575,6 +615,11 @@ class RuntimeSupervisor:
                 self._run_task = guarded_create_task(
                     self._run_loop(), name="lifeos-run"
                 )
+
+                start_heartbeat()
+
+                set_last_update()
+                set_last_telethon_event()
 
                 self._recovery_attempts = 0
                 self._consecutive_failures = 0
@@ -615,7 +660,7 @@ class RuntimeSupervisor:
 
     async def _cancel_orphan_tasks(self) -> None:
         current = asyncio.current_task()
-        protected_names = {"lifeos-watchdog", "lifeos-web"}
+        protected_names = {"lifeos-watchdog", "lifeos-web", "lifeos-heartbeat"}
         to_cancel = []
         for task in asyncio.all_tasks():
             if task is current:

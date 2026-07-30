@@ -197,11 +197,11 @@ def _build_settings_body() -> str:
     pts = settings_service.panel_timeout_seconds()
     amp = settings_service.is_allow_multiple_panels()
     rep = settings_service.is_reuse_existing_panel()
-    th = settings_service.theme()
     lang = settings_service.language()
     de = settings_service.is_diagnostics_enabled()
     dbg = settings_service.is_debug_callbacks()
     oo = settings_service.is_owner_only()
+    uss = settings_service.update_stale_seconds()
     return (
         "**⚙️ LifeOS Settings**\n\n"
         f"Auto Close: `{'ON' if ac else 'OFF'}`\n"
@@ -212,11 +212,11 @@ def _build_settings_body() -> str:
         f"Panel Timeout: `{pts}s`\n"
         f"Allow Multiple Panels: `{'ON' if amp else 'OFF'}`\n"
         f"Reuse Existing Panel: `{'ON' if rep else 'OFF'}`\n"
-        f"Theme: `{th}`\n"
         f"Language: `{lang}`\n"
         f"Diagnostics: `{'ON' if de else 'OFF'}`\n"
         f"Debug Callbacks: `{'ON' if dbg else 'OFF'}`\n"
-        f"Owner Only: `{'ON' if oo else 'OFF'}`"
+        f"Owner Only: `{'ON' if oo else 'OFF'}`\n"
+        f"Update Stale Threshold: `{uss}s`"
     )
 
 
@@ -233,8 +233,8 @@ def _build_settings_buttons() -> list:
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
     builder.add_row("Set Log Retention (days)", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout (s)", "input:settings:panel_timeout_seconds")
-    builder.add_row("Set Theme", "input:settings:theme")
     builder.add_row("Set Language", "input:settings:language")
+    builder.add_row("Set Update Stale (s)", "input:settings:update_stale_seconds")
     return builder.build()
 
 
@@ -443,28 +443,6 @@ async def _settings_panel_timeout_handler(text, chat_id, msg_id, inline_chat_id,
             pass
 
 
-async def _settings_theme_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services import settings_service
-    from backend.helper.inline_engine import _self_client
-    text = text.strip()
-    if not text:
-        result = "⚠️ Theme cannot be empty."
-    else:
-        ok = settings_service.set_theme(text)
-        result = f"✅ Theme set to `{text}`" if ok else "⚠️ Invalid theme."
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("settings theme inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
-
-
 async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.services import settings_service
     from backend.helper.inline_engine import _self_client
@@ -480,6 +458,28 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
             logger.warning("settings language inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 60 and 3600."
+    else:
+        ok = settings_service.set_update_stale_seconds(int(text))
+        result = f"✅ Update stale threshold set to `{text}s`" if ok else "⚠️ Value must be between 60 and 3600."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings update_stale inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -521,13 +521,13 @@ def _register_help_panel() -> None:
         "handler": _settings_panel_timeout_handler,
         "prompt": "**Panel Timeout**\n\nEnter the panel timeout in seconds (30-86400):\n\n_Reply with the number below._",
     })
-    register_input("settings", "theme", {
-        "handler": _settings_theme_handler,
-        "prompt": "**Theme**\n\nEnter the theme name (e.g. dark, light):\n\n_Reply with the theme below._",
-    })
     register_input("settings", "language", {
         "handler": _settings_language_handler,
         "prompt": "**Language**\n\nEnter the language code (e.g. en, fa):\n\n_Reply with the language code below._",
+    })
+    register_input("settings", "update_stale_seconds", {
+        "handler": _settings_update_stale_handler,
+        "prompt": "**Update Stale Threshold**\n\nEnter the threshold in seconds (60-3600):\n\n_Reply with the number below._",
     })
 
 
