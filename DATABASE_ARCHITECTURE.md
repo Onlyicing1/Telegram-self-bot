@@ -1,9 +1,9 @@
 # Database Architecture — LifeOS Telegram Self-Bot
 
 > **Source of truth for the database schema.**
-> This document describes every table, column, index, constraint, and RLS
-> policy in the live Supabase project. It is verified against the actual
-> database, not just the migration files.
+This document describes every table, column, index, constraint, and RLS
+policy in the live Supabase project. It is verified against the actual
+database, not just the migration files.
 >
 > For SQL scripts, see the [`sql/`](sql/) directory.
 
@@ -54,516 +54,268 @@ Stores metadata for every media save operation (forward save and deep save).
 | `save_type` | `text` | NO | — | `'forward'` or `'deep'`. CHECK constraint enforced. |
 | `origin_chat_id` | `bigint` | YES | — | Telegram chat ID where the message originated |
 | `origin_msg_id` | `bigint` | YES | — | Telegram message ID of the original message |
-| `saved_chat_id` | `bigint` | YES | — | Chat ID where saved (Saved Messages = `me`) |
-| `saved_msg_id` | `bigint` | YES | — | Message ID in the saved location |
-| `sender_name` | `text` | YES | — | Display name of the original sender |
-| `sender_id` | `bigint` | YES | — | Telegram user ID of the sender |
-| `mime_type` | `text` | YES | — | MIME type of the media |
-| `file_id` | `text` | YES | — | Telegram internal file reference |
-| `file_size` | `bigint` | YES | — | Size in bytes |
-| `media_type` | `text` | YES | — | Classified type: Photo, Video, Audio, Voice, GIF, Sticker, Document, Unknown |
-| `tags` | `text[]` | YES | `'{}'` | Array of hashtag strings |
-| `caption` | `text` | YES | — | Generated caption (deep saves only) |
-| `file_name` | `text` | YES | — | Original filename (added in save UX redesign migration) |
-| `short_code` | `text` | YES | — | Compact code, format `SNNNN` (added in save UX redesign). Unique when non-null. |
-| `owner_id` | `bigint` | NO | — | Telegram user ID of the bot owner |
-| `created_at` | `timestamptz` | YES | `now()` | Timestamp of the save |
-
-### Primary Key
-
-- `id` (bigserial) — auto-incrementing primary key.
+| `saved_chat_id` | `bigint` | YES | — | Telegram chat ID where the message was saved (Saved Messages = `"me"`) |
+| `saved_msg_id` | `bigint` | YES | — | Telegram message ID of the saved message in Saved Messages |
+| `sender_id` | `bigint` | YES | — | Telegram user ID of the original sender |
+| `mime_type` | `text` | YES | — | MIME type of the media (e.g. `image/jpeg`) |
+| `file_id` | `text` | YES | — | Telegram file ID |
+| `file_size` | `bigint` | YES | — | File size in bytes |
+| `media_type` | `text` | YES | — | Human-readable media type label (Photo, Video, etc.) |
+| `tags` | `text[]` | YES | — | Array of tags (e.g. `{#saved, #saved_photo}`) |
+| `caption` | `text` | YES | — | Caption attached to the saved message |
+| `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
+| `created_at` | `timestamptz` | NO | `now()` | When the save was created |
 
 ### Indexes
 
-| Index Name | Type | Columns | Notes |
-|---|---|---|---|
-| `saved_items_pkey` | btree (unique) | `id` | PK index |
-| `saved_items_save_code_key` | btree (unique) | `save_code` | UNIQUE constraint |
-| `idx_saved_items_short_code` | btree (unique, partial) | `short_code WHERE short_code IS NOT NULL` | Compact code lookup |
-| `idx_saved_items_owner` | btree | `owner_id` | Per-owner queries |
-| `idx_saved_items_save_code` | btree | `save_code` | Legacy code lookup |
-| `idx_saved_items_created` | btree | `created_at DESC` | Recent-first ordering |
-| `idx_saved_items_created_at` | btree | `created_at DESC` | Duplicate of above (from two migrations) |
-| `idx_saved_items_owner_created` | btree | `owner_id, created_at DESC` | Composite: per-owner recent list |
-| `idx_saved_items_caption_trgm` | gin | `caption gin_trgm_ops` | Full-text ILIKE search |
-| `idx_saved_items_file_name_trgm` | gin | `file_name gin_trgm_ops` | Full-text ILIKE search |
-| `idx_saved_items_save_code_trgm` | gin | `save_code gin_trgm_ops` | Full-text ILIKE search |
-| `idx_saved_items_short_code_trgm` | gin | `short_code gin_trgm_ops` | Full-text ILIKE search |
-| `idx_saved_items_mime_trgm` | gin | `mime_type gin_trgm_ops` | Full-text ILIKE search |
-
-### Constraints
-
-| Constraint | Type | Definition |
+| Index | Columns | Type |
 |---|---|---|
-| `saved_items_pkey` | Primary key | `PRIMARY KEY (id)` |
-| `saved_items_save_code_key` | Unique | `UNIQUE (save_code)` |
-| `saved_items_save_type_check` | Check | `CHECK (save_type IN ('forward', 'deep'))` |
+| `saved_items_pkey` | `id` | btree (PK) |
+| `saved_items_save_code_key` | `save_code` | btree (UNIQUE) |
+| `idx_saved_items_owner` | `owner_id` | btree |
+| `idx_saved_items_created_at` | `created_at` | btree |
+| `idx_saved_items_save_type` | `save_type` | btree |
 
-### RLS Policies
+### CHECK Constraints
 
-| Policy | Command | Roles | Condition |
-|---|---|---|---|
-| `anon_select_saved_items` | SELECT | `anon, authenticated` | `USING (true)` |
+- `saved_items_save_type_check`: `save_type IN ('forward', 'deep')`
 
-No INSERT, UPDATE, or DELETE policies for anon/authenticated. All writes go
-through the service-role key.
+### RLS
 
-### Typical Usage
-
-- **Insert** — `.save f` / `.save d` calls `insert_save()`.
-- **Query by code** — `.preview <code>` / `.send <code>` calls `query_save()`,
-  which looks up by `short_code` OR `save_code` (case-insensitive).
-- **List recent** — `.list` calls `list_recent_saves()`, selects a subset of
-  columns ordered by `created_at DESC`.
-- **Search** — `.find <query>` calls `search_saves()`, uses trigram indexes
-  for ILIKE matching across `caption`, `file_name`, `save_code`,
-  `short_code`, `mime_type`.
-- **Count** — `.organize list` calls `count_saves()` (optionally filtered by
-  `save_type`).
-- **Delete** — `.del <code>` calls `delete_save()` / `delete_save_row()`.
-- **Cleanup** — `.db clean` / `.db vacuum` calls `cleanup_orphans()` to
-  remove rows whose Telegram messages no longer exist.
+RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
 ## 3. bio_state
 
-Singleton-per-owner state for the bio cron engine.
+Singleton bio engine state per owner.
 
 ### Columns
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
 | `id` | `bigserial` | NO | `nextval(...)` | Primary key |
-| `owner_id` | `bigint` | NO | — | Telegram user ID. Unique. |
-| `template` | `text` | NO | `'🕒 {time} | 💭 {mood}'` | Bio template with tokens |
-| `mood` | `text` | NO | `'😊'` | Current mood emoji |
-| `custom_text` | `text` | NO | `''` | Freeform text token value |
+| `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
+| `template` | `text` | NO | `'{time} | {mood} | {text}'` | Bio template with tokens |
+| `mood` | `text` | NO | `'neutral'` | Current mood value |
+| `custom_text` | `text` | NO | `'LifeOS'` | Custom text for `{text}` token |
 | `is_active` | `boolean` | NO | `false` | Whether the bio cron is running |
-| `last_bio` | `text` | NO | `''` | Last rendered bio string (for deduplication) |
-| `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
-
-### Primary Key
-
-- `id` (bigserial)
+| `last_bio` | `text` | YES | — | Last successfully rendered bio string |
+| `updated_at` | `timestamptz` | NO | `now()` | Last update timestamp |
 
 ### Indexes
 
-| Index Name | Type | Columns | Notes |
-|---|---|---|---|
-| `bio_state_pkey` | btree (unique) | `id` | PK index |
-| `bio_state_owner_id_key` | btree (unique) | `owner_id` | UNIQUE constraint |
-| `idx_bio_state_owner` | btree | `owner_id` | Redundant with unique constraint, kept for explicitness |
-
-### Constraints
-
-| Constraint | Type | Definition |
+| Index | Columns | Type |
 |---|---|---|
-| `bio_state_pkey` | Primary key | `PRIMARY KEY (id)` |
-| `bio_state_owner_id_key` | Unique | `UNIQUE (owner_id)` |
+| `bio_state_pkey` | `id` | btree (PK) |
+| `bio_state_owner_id_key` | `owner_id` | btree (UNIQUE) |
 
-### RLS Policies
+### RLS
 
-| Policy | Command | Roles | Condition |
-|---|---|---|---|
-| `anon_select_bio_state` | SELECT | `anon, authenticated` | `USING (true)` |
-
-### Typical Usage
-
-- **Get** — `get_bio_state(owner_id)` selects by `owner_id`, uses `.maybe_single()`.
-- **Get or create** — `get_or_create_bio_state(owner_id)` selects; if not found,
-  inserts a default row.
-- **Update** — `update_bio_state(owner_id, updates)` updates by `owner_id`.
-  Called by `.bio on/off/template/text/mood` and by the bio cron loop
-  (which updates `last_bio` and `updated_at`).
-- **Startup resume** — `main.py` Phase 4 reads `is_active` to decide whether
-  to auto-start the cron.
+RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
 ## 4. bot_logs
 
-Structured activity log for bot events.
+Structured activity log.
 
 ### Columns
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
 | `id` | `bigserial` | NO | `nextval(...)` | Primary key |
-| `owner_id` | `bigint` | NO | — | Telegram user ID of the bot owner |
-| `level` | `text` | NO | — | `'INFO'`, `'WARN'`, or `'ERROR'`. CHECK constraint enforced. |
-| `message` | `text` | NO | — | Log message text |
-| `context` | `jsonb` | YES | `'{}'` | Structured context data |
-| `created_at` | `timestamptz` | YES | `now()` | Timestamp of the event |
-
-### Primary Key
-
-- `id` (bigserial)
+| `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
+| `level` | `text` | NO | `'INFO'` | Log level: `INFO`, `WARN`, `ERROR` |
+| `message` | `text` | NO | — | Log message |
+| `context` | `jsonb` | YES | — | Structured context (JSON) |
+| `created_at` | `timestamptz` | NO | `now()` | When the log entry was created |
 
 ### Indexes
 
-| Index Name | Type | Columns | Notes |
-|---|---|---|---|
-| `bot_logs_pkey` | btree (unique) | `id` | PK index |
-| `idx_bot_logs_owner` | btree | `owner_id` | Per-owner queries |
-| `idx_bot_logs_created` | btree | `created_at DESC` | Recent-first ordering |
-| `idx_bot_logs_created_at` | btree | `created_at DESC` | Duplicate (from two migrations) |
-
-### Constraints
-
-| Constraint | Type | Definition |
+| Index | Columns | Type |
 |---|---|---|
-| `bot_logs_pkey` | Primary key | `PRIMARY KEY (id)` |
-| `bot_logs_level_check` | Check | `CHECK (level IN ('INFO', 'WARN', 'ERROR'))` |
+| `bot_logs_pkey` | `id` | btree (PK) |
+| `idx_bot_logs_owner` | `owner_id` | btree |
+| `idx_bot_logs_created_at` | `created_at` | btree |
 
-### RLS Policies
+### RLS
 
-| Policy | Command | Roles | Condition |
-|---|---|---|---|
-| `anon_select_bot_logs` | SELECT | `anon, authenticated` | `USING (true)` |
-| `anon_update_bot_logs` | UPDATE | `anon, authenticated` | `USING (true) WITH CHECK (true)` |
-
-> **Note:** The `anon_update_bot_logs` policy is a legacy artifact from the
-> initial migration. It is not part of the authoritative schema and can be
-> safely dropped.
-
-### Typical Usage
-
-- **Insert** — `log(owner_id, level, message, context)` inserts a row.
-  Called after `.save`, `.send`, `.db clean`, `.db vacuum`, and other actions.
-- **Count** — `count_logs(owner_id)` for `.organize list`.
-- **List** — `list_logs(owner_id, limit)` for the dashboard `/api/logs`.
-- **Clean** — `clean_logs(owner_id, days=7)` deletes rows older than 7 days.
+RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
 ## 5. panel_settings
 
-Glass Panel configuration — column-per-setting model. Stores ONLY
-configuration values used by the Glass Panel. Each setting is a real
-typed column; there is no key-value store.
-
-### Architecture (Repository Pattern)
-
-```
-  Supabase (panel_settings table)
-       │
-       ▼
-  PanelSettingsRepository  (raw DB access — ONLY module touching the table)
-       │
-       ▼
-  PanelSettingsService     (cache + validation + typed accessors)
-       │
-       ▼
-  Glass Panel
-```
-
-No panel may access Supabase directly. All reads and writes go through
-the service, which delegates DB access to the repository.
+Glass Panel configuration. Singleton row (key = `"global"`).
 
 ### Columns
 
 | Column | SQL Type | Nullable | Default | Notes |
 |---|---|---|---|---|
-| `key` | `text` | NO | — | Primary key. Always `"global"`. |
-| `auto_close_enabled` | `boolean` | NO | `true` | Whether panels auto-close after the configured delay |
-| `auto_close_delay` | `integer` | NO | `120` | Seconds before an inline panel auto-closes (5..3600) |
-| `max_deep_save_mb` | `integer` | NO | `50` | Maximum file size (MB) for deep saves (1..500) |
-| `delete_batch_size` | `integer` | NO | `100` | Messages per `delete_messages()` call (1..1000) |
-| `log_retention_days` | `integer` | NO | `7` | Days of logs to retain before cleanup (1..365) |
-| `panel_timeout_seconds` | `integer` | NO | `300` | Panel timeout in seconds (30..86400) |
+| `key` | `text` | NO | — | Primary key, always `"global"` |
+| `auto_close_enabled` | `boolean` | NO | `true` | Whether panels auto-close |
+| `panel_auto_close_seconds` | `integer` | NO | `120` | Seconds before auto-close |
+| `max_deep_save_mb` | `integer` | NO | `50` | Max file size for deep save |
+| `delete_batch_size` | `integer` | NO | `100` | Batch size for message deletion |
+| `log_cleanup_days` | `integer` | NO | `7` | Days to retain logs |
+| `auto_close_delay` | `integer` | NO | `120` | Auto-close delay in seconds |
+| `panel_timeout_seconds` | `integer` | NO | `300` | Panel timeout in seconds |
 | `allow_multiple_panels` | `boolean` | NO | `false` | Allow multiple simultaneous panels |
 | `reuse_existing_panel` | `boolean` | NO | `true` | Reuse an existing panel instead of creating new |
-| `theme` | `text` | NO | `'dark'` | UI theme name |
 | `language` | `text` | NO | `'en'` | Language code |
 | `diagnostics_enabled` | `boolean` | NO | `true` | Show diagnostics info (`.kill`, `.logs`) |
-| `debug_callbacks` | `boolean` | NO | `false` | Enable verbose callback logging |
-| `owner_only` | `boolean` | NO | `true` | Restrict panel access to owner only |
-| `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
-
-### Primary Key
-
-- `key` (text) — always `"global"` for the current single-owner bot.
+| `debug_callbacks` | `boolean` | NO | `false` | Debug callback tracing |
+| `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
+| `updated_at` | `timestamptz` | DEFAULT | `now()` | Last update timestamp |
 
 ### Indexes
 
-| Index Name | Type | Columns | Notes |
-|---|---|---|---|
-| `panel_settings_pkey` | btree (unique) | `key` | PK index |
-
-### Constraints
-
-| Constraint | Type | Definition |
+| Index | Columns | Type |
 |---|---|---|
-| `panel_settings_pkey` | Primary key | `PRIMARY KEY (key)` |
+| `panel_settings_pkey` | `key` | btree (PK) |
 
-### RLS Policies
+### RLS
 
-| Policy | Command | Roles | Condition |
-|---|---|---|---|
-| `anon_select_panel_settings` | SELECT | `anon, authenticated` | `USING (true)` |
-
-### Typical Usage
-
-- **Load** — `settings_service.load_all()` delegates to
-  `PanelSettingsRepository.load()`, which runs `SELECT * FROM panel_settings
-  WHERE key = 'global'`. The result populates the in-memory cache.
-- **Read** — Feature modules call `settings_service.is_auto_close_enabled()`,
-  `.auto_close_delay()`, `.max_deep_save_mb()`, `.delete_batch_size()`,
-  `.log_retention_days()`, `.panel_timeout_seconds()`,
-  `.is_allow_multiple_panels()`, `.is_reuse_existing_panel()`,
-  `.theme()`, `.language()`, `.is_diagnostics_enabled()`,
-  `.is_debug_callbacks()`, `.is_owner_only()`. These read from the
-  cache — no DB round-trip.
-- **Write** — `settings_service.set_*()` validates the value, writes to
-  the DB via the repository, then reloads the cache from the DB row.
-  Cache and DB are never left inconsistent.
-- **Reload** — `settings_service.reload_panel_settings()` forces a full
-  cache refresh from the DB without restart.
-
-### Validation Rules
-
-| Setting | Validator |
-|---|---|
-| `auto_close_enabled` | must be boolean |
-| `auto_close_delay` | integer 5..3600 |
-| `max_deep_save_mb` | integer 1..500 |
-| `delete_batch_size` | integer 1..1000 |
-| `log_retention_days` | integer 1..365 |
-| `panel_timeout_seconds` | integer 30..86400 |
-| `allow_multiple_panels` | must be boolean |
-| `reuse_existing_panel` | must be boolean |
-| `theme` | non-empty string |
-| `language` | non-empty string |
-| `diagnostics_enabled` | must be boolean |
-| `debug_callbacks` | must be boolean |
-| `owner_only` | must be boolean |
-
-### Adding a New Setting
-
-1. `ALTER TABLE panel_settings ADD COLUMN <name> <type> NOT NULL DEFAULT <value>;`
-2. Add a validator + typed accessor in `settings_service.py`.
-3. No panel code needs to change — panels call `get_setting()` / `set_setting()`.
+RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
 ## 6. Relationships
 
-There are **no foreign keys** between any tables. All four tables share a
-common `owner_id` column (except `panel_settings` which uses `key`), which
-represents the Telegram user ID of the bot owner. This is an application-level
-logical relationship, not a database constraint.
-
-```
-saved_items.owner_id  ───┐
-bio_state.owner_id    ───┼──→  (soft link to owner, no FK)
-bot_logs.owner_id     ───┘
-
-panel_settings.key    ───→  "global" (singleton, no owner link)
-```
-
-### Cardinality
-
-- `saved_items` : `owner_id` — Many-to-one (many saves per owner)
-- `bio_state` : `owner_id` — One-to-one (enforced by UNIQUE constraint)
-- `bot_logs` : `owner_id` — Many-to-one (many logs per owner)
-- `panel_settings` : `key` — One row total (singleton)
+There are no foreign key relationships between tables. Each table is
+independent. The `owner_id` column (present on `saved_items`, `bio_state`,
+and `bot_logs`) links rows to the bot owner but is not a foreign key.
 
 ---
 
 ## 7. RLS Policy Model
 
-All four tables have RLS enabled. The model is:
-
-- **SELECT** is granted to `anon` + `authenticated` (read-only dashboard access).
-  All SELECT policies use `USING (true)` — any client with the anon key can
-  read all rows.
-- **No INSERT, UPDATE, or DELETE policies** for anon/authenticated (except the
-  legacy `anon_update_bot_logs` artifact). All writes go through the backend's
-  service-role key, which bypasses RLS entirely.
-
-This means:
-- The React dashboard (using the backend API) can read data.
-- The backend can read and write freely (service-role key).
-- No client can write directly to the database via the anon key.
+All four tables have RLS enabled. Only SELECT policies are granted to
+`anon` + `authenticated` (read-only dashboard access). All writes
+(INSERT/UPDATE/DELETE) go through the backend's service-role key, which
+bypasses RLS entirely. There are no anon/authenticated write policies.
 
 ---
 
 ## 8. Panel Database
 
-### Glass Panel Database Philosophy
+The Glass Panel system uses a **column-per-setting** model on the
+`panel_settings` table. Each setting is a real typed column — no
+key-value store, no JSONB blobs.
 
-The `panel_settings` table stores **ONLY** configuration values used by
-the Glass Panel. It must never become a generic project settings table.
-
-Examples of what belongs here:
-- Auto Close (enabled/disabled)
-- Auto Close Delay (seconds)
-- Max Deep Save Size (MB)
-- Delete Batch Size
-- Log Retention (days)
-- Future panel configuration values
-
-Each setting is a **real typed column** on the `panel_settings` table.
-There is no key-value store, no `value`/`value_type` serialization. This
-ensures type safety, database-level defaults, and straightforward
-validation.
-
-### Separation of Databases
-
-Every subsystem owns its own table. The Glass Panel database is ONLY
-responsible for panel configuration.
+### Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Supabase (source of truth)              │
-│                                                            │
-│  saved_items    — Save Engine data          (untouched)    │
-│  bio_state      — Bio Engine state          (untouched)    │
-│  bot_logs       — Structured activity log   (untouched)    │
-│  panel_settings — Glass Panel configuration (this table)   │
-│                                                            │
-│  ❌ bot_settings — DROPPED (migrated into panel_settings)  │
-└──────────────────────────────────────────────────────────┘
+Supabase (panel_settings table)
+  ↓
+PanelSettingsRepository  (raw DB access — backend/services/panel_settings_repository.py)
+  ↓
+PanelSettingsService     (cache + validation — backend/services/settings_service.py)
+  ↓
+Glass Panel (reads via get_*(), writes via set_*())
 ```
 
-### Settings Service Architecture (Repository Pattern)
+### Cache-First Reads
 
-```
-  Supabase (panel_settings table)
-       │
-       ▼
-  PanelSettingsRepository  (panel_settings_repository.py)
-       │  ├── load()          → SELECT * FROM panel_settings WHERE key='global'
-       │  ├── update_field()  → UPDATE panel_settings SET field = value
-       │  ├── update_fields() → UPDATE panel_settings SET f1=v1, f2=v2
-       │  └── reload()        → alias for load()
-       │
-       ▼
-  PanelSettingsService     (settings_service.py)
-       │  ├── load_all()            → repo.load() → populate cache
-       │  ├── reload_panel_settings() → repo.reload() → refresh cache
-       │  ├── get_setting() / get_all()  → cache read (no DB)
-       │  ├── set_setting()         → validate → repo.update_field() → refresh cache
-       │  └── 13 typed getters + 13 typed setters
-       │
-       ▼
-  Glass Panel (panels.py, misc.py, save_service, delete_service, etc.)
-```
+Every getter reads from an in-memory cache. The database is NEVER queried
+on a button click. The cache is loaded once at startup from the DB (or
+from hardcoded defaults if the DB is unavailable).
 
-**NO PANEL MAY ACCESS SUPABASE DIRECTLY.**
+### Write-Through Cache
 
-### Cache Flow
+On any `set_*()` call, the service:
+1. Validates the value against a type/range validator.
+2. Writes to the DB via the repository.
+3. Reloads the cache from the DB.
 
-**Startup (read flow):**
-```
-RuntimeSupervisor.start()
-    └── settings_service.load_all()
-          └── PanelSettingsRepository.load()
-                └── SELECT * FROM panel_settings WHERE key = 'global'
-                      └── populate _cache dict
-                            └── every panel reads from _cache (no DB call)
-```
+Cache and DB are never left inconsistent.
 
-**Update (write flow):**
-```
-Panel action
-    └── settings_service.set_setting(key, value)
-          ├── 1. Validate (per-setting validator)
-          ├── 2. PanelSettingsRepository.update_field(key, value)
-          ├── 3. PanelSettingsRepository.load() → refresh _cache
-          └── 4. UI re-renders from updated cache
+### Settings (12 columns on panel_settings)
 
-  Cache and DB are never left inconsistent.
-```
+| Column                  | Type    | Default | Range/Constraint        |
+|-------------------------|---------|---------|-------------------------|
+| auto_close_enabled      | bool    | true    | must be boolean         |
+| auto_close_delay        | int     | 120     | 5..3600 (seconds)       |
+| max_deep_save_mb        | int     | 50      | 1..500 (MB)             |
+| delete_batch_size       | int     | 100     | 1..1000                 |
+| log_retention_days      | int     | 7       | 1..365 (days)           |
+| panel_timeout_seconds   | int     | 300     | 30..86400 (seconds)     |
+| allow_multiple_panels   | bool    | false   | must be boolean         |
+| reuse_existing_panel    | bool    | true    | must be boolean         |
+| language                | str     | "en"    | non-empty string        |
+| diagnostics_enabled     | bool    | true    | must be boolean         |
+| debug_callbacks        | bool    | false   | must be boolean         |
+| owner_only              | bool    | true    | must be boolean         |
 
-**Future-proofing:**
+### Accessors
 
-Adding a new setting (e.g. `download_timeout`) requires only:
-1. `ALTER TABLE panel_settings ADD COLUMN download_timeout integer NOT NULL DEFAULT 30;`
-2. A validator + accessor in `settings_service.py`:
-   ```python
-   _VALIDATORS["download_timeout"] = _validate_int_range(1, 300)
-   def download_timeout() -> int:
-       _ensure_loaded()
-       return int(_cache.get("download_timeout", 30))
-   def set_download_timeout(seconds: int) -> bool:
-       return set_setting("download_timeout", seconds)
-   ```
-3. No panel rewrite needed.
+The service exposes 12 typed getters + 12 typed setters:
 
-### What It Stores
+  `.is_auto_close_enabled()`, `.auto_close_delay()`, `.max_deep_save_mb()`,
+  `.delete_batch_size()`, `.log_retention_days()`, `.panel_timeout_seconds()`,
+  `.is_allow_multiple_panels()`, `.is_reuse_existing_panel()`,
+  `.language()`, `.is_diagnostics_enabled()`,
+  `.is_debug_callbacks()`, `.is_owner_only()`. These read from the
+  cache — no DB round-trip.
 
-Panel sessions are **not stored in the database**. They live entirely in
-memory (`backend/helper/session_manager.py`). Each session is keyed by
-`(chat_id, msg_id)` and contains:
+### Validators
 
-- `session_id` — internal ID for logging
-- `chat_id`, `msg_id` — Telegram coordinates of the inline message
-- `panel_type` — current panel (e.g. `"help"`, `"settings"`)
-- `nav_stack` — list of `(panel_id, extra)` tuples representing the
-  navigation history. Root is always stack length 1.
-- `inline_message_id` — secondary lookup key for inline messages
+Each setting has its own validator enforcing type and range constraints:
 
-Sessions are cleared on close, on shutdown, and during recovery. They do not
-persist across restarts.
+| Setting | Validator |
+|---|---|
+| auto_close_enabled | must be boolean |
+| auto_close_delay | int 5..3600 |
+| max_deep_save_mb | int 1..500 |
+| delete_batch_size | int 1..1000 |
+| log_retention_days | int 1..365 |
+| panel_timeout_seconds | int 30..86400 |
+| allow_multiple_panels | must be boolean |
+| reuse_existing_panel | must be boolean |
+| language | non-empty string |
+| diagnostics_enabled | must be boolean |
+| debug_callbacks | must be boolean |
+| owner_only | must be boolean |
 
-### How Panel Settings Are Stored
+### In-Memory Fallback
 
-The `panel_settings` table has a single row with `key = "global"`. Each
-column is a typed setting (13 columns total). The settings service
-(`settings_service.py`) loads all columns at startup into an in-memory
-cache via the `PanelSettingsRepository`. Every panel reads from the cache.
-Writes go through `set_setting()` which validates, writes to the DB via
-the repository, and refreshes the cache — ensuring cache and DB are
-never inconsistent.
-
-### How Navigation Is Persisted
-
-Navigation is **not persisted**. The nav stack lives only in the in-memory
-session dict. When the process restarts, all panel sessions and their
-navigation state are lost. Inline messages from before the restart become
-non-interactive (buttons stop working) because no session exists to handle
-the callbacks.
+If the DB is unavailable, the service uses hardcoded `_DEFAULTS` for all
+12 settings. The bot continues to function normally — all panel operations
+work with default values. Every Supabase call that fails logs a warning
+and falls back silently.
 
 ---
 
 ## 9. In-Memory Fallback
 
-If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing, or if the
-Supabase client fails to initialise, the database layer silently degrades
-to an in-memory Python dict:
+The bot is designed to run **with or without Supabase**. When the DB is
+unavailable, all operations use in-memory fallbacks:
 
-```python
-_fallback = {
-    "saved_items": [],      # list of dicts
-    "bio_state": {},        # dict keyed by owner_id
-    "bot_logs": [],         # list of dicts
-}
-```
+- `saved_items` → in-memory list
+- `bio_state` → in-memory dict
+- `bot_logs` → in-memory list
+- `panel_settings` → hardcoded `_DEFAULTS` dict
 
-The `panel_settings` table does not have an explicit fallback entry —
-the in-memory cache in `settings_service.py` serves as the fallback
-(defaulting to hardcoded `_DEFAULTS` for all 13 settings).
-
-All public functions in `db/client.py` wrap their Supabase calls in
-`try/except`. On any error, they log a warning and use the fallback.
 The bot never crashes due to a database error.
 
 ---
 
 ## 10. Migration History
 
-| File | Date | Description |
+| Migration File | Date | Description |
 |---|---|---|
-| `20260712234229_lifeos_schema.sql` | 2026-07-12 | Initial schema. Created tables with CHECK constraints and wide-open CRUD RLS policies. |
-| `20260714111706_create_lifeos_tables.sql` | 2026-07-14 | Authoritative schema. Recreated RLS as SELECT-only. Added indexes. Lacks CHECK constraints (but they persist from the initial migration when both run). |
-| `20260718143752_20260718_save_ux_redesign.sql.sql` | 2026-07-18 | Added `file_name` and `short_code` columns to `saved_items`. Added trigram indexes for full-text search. Enabled `pg_trgm` extension. |
-| `20260726143924_create_panel_settings_table.sql` | 2026-07-26 | Created `panel_settings` table for global auto-close preference. |
+| `20260712234229_lifeos_schema.sql` | 2026-07-12 | Initial schema: `saved_items`, `bio_state`, `bot_logs`. |
+| `20260714111706_create_lifeos_tables.sql` | 2026-07-14 | Authoritative schema: `saved_items`, `bio_state`, `bot_logs` with final column definitions. |
+| `20260718143752_20260718_save_ux_redesign.sql.sql` | 2026-07-18 | Added `short_code`, `origin_chat_id`, `origin_msg_id`, `sender_id` columns to `saved_items`. |
+| `20260726143924_create_panel_settings_table.sql` | 2026-07-26 | Created `panel_settings` table with 5 initial columns. |
 | `20260729213959_20260729120000_create_bot_settings_table.sql` | 2026-07-29 | Created `bot_settings` key-value table (later superseded). |
 | `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` data into `panel_settings` as typed columns. Added `auto_close_delay`, `max_deep_save_mb`, `delete_batch_size`, `log_retention_days`. Dropped `bot_settings`. |
-| `20260730230000_panel_settings_full_13_columns.sql` | 2026-07-30 | Added `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `theme`, `language`, `diagnostics_enabled`, `debug_callbacks`, `owner_only` columns. Introduced PanelSettingsRepository layer. |
+| `20260730230000_panel_settings_full_13_columns.sql` | 2026-07-30 | Added `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `language`, `diagnostics_enabled`, `debug_callbacks`, `owner_only` columns. Introduced PanelSettingsRepository layer. |
 
 The SQL scripts in [`sql/`](sql/) represent the **current consolidated
-schema** — the result of applying all migrations in sequence. They are
+schema** — they are the authoritative CREATE TABLE statements for a fresh
+database. The migration files in `supabase/migrations/` are the historical
+record of all changes applied to the live database. To recreate the database
+from scratch, run all migrations in sequence. They are
 authoritative for a fresh database setup.
