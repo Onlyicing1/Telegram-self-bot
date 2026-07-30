@@ -1,142 +1,83 @@
 """
-.preview <code> / .retrieve <code> / .r <code> — Show stored metadata.
-.send <code>                                 — Forward the saved asset.
+Retrieve — unified file-browser experience.
 
-Business logic lives in backend.services.retrieve_service.
+Commands:
+  .retrieve / .r / .files       — Opens Saved Items browser (default entry)
+  .preview <code>               — Text-command preview (shortcut)
+  .send <code>                  — Text-command retrieve (shortcut)
+
+Panel IDs (single deterministic workflow):
+  retrieve       — Main menu: Saved Items + Retrieve by Code
+  retrieve_saved — Paginated Saved Items browser
+  retrieve_item  — Item preview panel (full metadata + action buttons)
+  retrieve_code  — Manual code entry (secondary path)
+
+Actions:
+  retrieve_item     — Retrieve the file to current chat
+  retrieve_rename   — Rename the item (input prompt)
+  retrieve_move     — Move to a folder (input prompt)
+  retrieve_delete   — Delete the item (with confirmation)
+
+Inputs:
+  retrieve:code     — Manual save code entry
+  retrieve_item:rename — New filename
+  retrieve_item:move   — Folder name
 """
 import logging
 from datetime import datetime
+
 from telethon import events
+
 from backend.bot.handlers.guard import is_owner
 from backend.services import retrieve_service
+from backend.db import client as db_client
 from backend.helper import (
     InlinePanelBuilder,
     register_panel,
     register_inline_builder,
+    register_action,
     register_input,
     send_inline_panel,
     render,
     to_edit_buttons,
 )
-from backend.db import client as db_client
 from backend.helper.client import get_client
 
 logger = logging.getLogger(__name__)
 
-
-async def _preview_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client, _owner_id
-    result = await retrieve_service.do_preview(_self_client, _owner_id, text)
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("preview inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+_SAVED_PER_PAGE = 8
 
 
-async def _send_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client, _owner_id
-    result = await retrieve_service.do_send(_self_client, _owner_id, text, chat_id)
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("send inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+# ── Utility ──
+
+def _parse_extra_id(extra: str) -> str | None:
+    """Extract item short_code from extra string like 'id:SV-XXXXXX'."""
+    if extra.startswith("id:"):
+        return extra[3:]
+    return None
 
 
-async def _preview_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+# ── Panel: retrieve (main menu) ──
+
+async def _retrieve_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    total = db_client.count_saves(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("Enter Code", "input:preview:code")
-    return "Preview", "Enter a save code to preview:", builder.build()
+    builder.add_row(f"📋 Saved Items ({total})", "panel:retrieve_saved")
+    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
+    return "Retrieve", "Browse your saved files or retrieve by code.", builder.build()
 
 
-async def _preview_inline_builder(event, extra: str) -> list:
+async def _retrieve_inline_builder(event, extra: str) -> list:
+    from backend.helper.inline_engine import _owner_id
+    total = db_client.count_saves(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("Enter Code", "input:preview:code")
-    return [render("Preview", "Enter a save code to preview:", builder.build())]
+    builder.add_row(f"📋 Saved Items ({total})", "panel:retrieve_saved")
+    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
+    return [render("Retrieve", "Browse your saved files or retrieve by code.", builder.build())]
 
 
-async def _send_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    builder = InlinePanelBuilder()
-    builder.add_row("Enter Code", "input:send:code")
-    return "Send", "Enter a save code to forward to this chat:", builder.build()
-
-
-async def _send_inline_builder(event, extra: str) -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("Enter Code", "input:send:code")
-    return [render("Send", "Enter a save code to forward to this chat:", builder.build())]
-
-
-_SAVED_PER_PAGE = 10
-
-
-def _format_saved_date(created_at: str | None) -> str:
-    if not created_at:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return created_at[:16] if len(created_at) >= 16 else created_at
-
-
-def _save_mode_label(save_type: str | None) -> str:
-    if save_type == "forward":
-        return "Fast"
-    if save_type == "deep":
-        return "Deep"
-    return "—"
-
-
-def _file_type_label(item: dict) -> str:
-    media_type = item.get("media_type")
-    if media_type:
-        return media_type
-    mime_type = item.get("mime_type")
-    if mime_type:
-        return mime_type
-    return "—"
-
-
-def _build_saved_items_body(items: list, page: int, total_pages: int, total: int) -> str:
-    if not items:
-        return "**Saved Items**\n\n_No saved items found._"
-    lines = ["**Saved Items**", f"_{total} items · page {page}/{total_pages}_", ""]
-    for item in items:
-        code = item.get("short_code") or item.get("save_code") or "—"
-        mode = _save_mode_label(item.get("save_type"))
-        date = _format_saved_date(item.get("created_at"))
-        ftype = _file_type_label(item)
-        lines.append(f"`{code}` · {mode} · {date} · {ftype}")
-    return "\n".join(lines)
-
-
-def _build_saved_items_buttons(page: int, total_pages: int, total: int) -> list:
-    builder = InlinePanelBuilder()
-    if total > 0:
-        row = []
-        if page > 1:
-            row.append(("◀ Previous", f"panel:retrieve_saved:page:{page - 1}"))
-        row.append((f"{page}/{total_pages}", f"panel:retrieve_saved:page:{page}"))
-        if page < total_pages:
-            row.append(("▶ Next", f"panel:retrieve_saved:page:{page + 1}"))
-        builder.add_buttons(*row)
-    builder.add_buttons(("🏠 Home", "panel:_nav:home"), ("❌ Close", "panel:_nav:close"))
-    return builder.build()
-
+# ── Panel: retrieve_saved (paginated browser) ──
 
 async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
@@ -153,9 +94,33 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
         page = total_pages
         offset = (page - 1) * per_page
         items, total = db_client.list_saves(_owner_id, limit=per_page, offset=offset)
-    body = _build_saved_items_body(items, page, total_pages, total)
-    buttons = _build_saved_items_buttons(page, total_pages, total)
-    return "Saved Items", body, buttons
+
+    if not items:
+        return "Saved Items", "_No saved items found._\n\nSave something first with `.save`.", []
+
+    lines = [f"_{total} items · page {page}/{total_pages}_", ""]
+    for item in items:
+        lines.append(retrieve_service.format_list_item(item))
+
+    builder = InlinePanelBuilder()
+    for item in items:
+        code = item.get("short_code") or item.get("save_code")
+        if code:
+            icon = retrieve_service._type_icon(item)
+            name = retrieve_service._display_name(item)
+            if len(name) > 20:
+                name = name[:17] + "…"
+            builder.add_row(f"{icon} {name} · {code}", f"panel:retrieve_item:id:{code}")
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(("◀ Prev", f"panel:retrieve_saved:page:{page - 1}"))
+    nav_row.append((f"{page}/{total_pages}", "panel:_nav:noop"))
+    if page < total_pages:
+        nav_row.append(("Next ▶", f"panel:retrieve_saved:page:{page + 1}"))
+    builder.add_buttons(*nav_row)
+
+    return "Saved Items", "\n".join(lines), builder.build()
 
 
 async def _retrieve_saved_inline_builder(event, extra: str) -> list:
@@ -166,32 +131,182 @@ async def _retrieve_saved_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
+# ── Panel: retrieve_item (preview + actions) ──
+
+async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    code = _parse_extra_id(extra)
+    if not code:
+        return "Item", "Item not found.", []
+    row = db_client.query_save(code)
+    if not row:
+        return "Item", f"❌ No item found for `{code}`", []
+
+    body = retrieve_service.format_preview(row)
+    builder = InlinePanelBuilder()
+    builder.add_row("⬇ Retrieve", f"action:retrieve_item_exec:{code}")
+    builder.add_row("✏ Rename", f"input:retrieve_item:rename:{code}")
+    builder.add_row("📂 Move", f"input:retrieve_item:move:{code}")
+    builder.add_row("🗑 Delete", f"action:retrieve_item_delete:{code}")
+    return "Item Preview", body, builder.build()
+
+
+async def _retrieve_item_inline_builder(event, extra: str) -> list:
+    result = await _retrieve_item_panel_handler(event, extra)
+    if result is None:
+        return [render("Item", "Not found.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+# ── Panel: retrieve_code (manual entry) ──
+
+async def _retrieve_code_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    builder = InlinePanelBuilder()
+    builder.add_row("Enter Code", "input:retrieve:code")
+    return "Retrieve by Code", "Enter a save code to preview:", builder.build()
+
+
+async def _retrieve_code_inline_builder(event, extra: str) -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("Enter Code", "input:retrieve:code")
+    return [render("Retrieve by Code", "Enter a save code to preview:", builder.build())]
+
+
+# ── Actions ──
+
+async def _retrieve_item_exec_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    code = extra.strip()
+    if not code:
+        return "Retrieve", "❌ No code specified.", []
+    chat_id = getattr(event, "chat_id", None)
+    if chat_id is None:
+        return "Retrieve", "❌ Cannot determine target chat.", []
+    result = await retrieve_service.do_retrieve(_self_client, _owner_id, code, chat_id)
+    row = db_client.query_save(code)
+    if row:
+        return "Retrieve", result, _retrieve_item_buttons(code)
+    return "Retrieve", result, []
+
+
+def _retrieve_item_buttons(code: str) -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("⬇ Retrieve Again", f"action:retrieve_item_exec:{code}")
+    builder.add_row("‹ Back to Item", f"panel:retrieve_item:id:{code}")
+    return builder.build()
+
+
+async def _retrieve_item_delete_action(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    code = extra.strip()
+    if not code:
+        return "Delete", "❌ No code specified.", []
+    result = await retrieve_service.do_delete(_self_client, _owner_id, code)
+    builder = InlinePanelBuilder()
+    builder.add_row("‹ Back to Saved Items", "panel:retrieve_saved")
+    return "Delete", result, builder.build()
+
+
+# ── Input handlers ──
+
+async def _retrieve_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    result = await retrieve_service.do_preview(_self_client, _owner_id, text)
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("retrieve code inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _retrieve_rename_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.input_state import get_pending, clear_pending
+    pending = get_pending(_owner_id) or {}
+    code = pending.get("extra", "")
+    clear_pending(_owner_id)
+    text_stripped = text.strip()
+    if not text_stripped:
+        result = "⚠️ Filename cannot be empty."
+    elif not code:
+        result = "⚠️ No item selected."
+    else:
+        result = await retrieve_service.do_rename(_owner_id, code, text_stripped)
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("rename inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _retrieve_move_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.input_state import get_pending, clear_pending
+    pending = get_pending(_owner_id) or {}
+    code = pending.get("extra", "")
+    clear_pending(_owner_id)
+    text_stripped = text.strip()
+    if not code:
+        result = "⚠️ No item selected."
+    elif not text_stripped:
+        result = "⚠️ Folder name cannot be empty. Enter 'unfiled' to remove folder."
+    else:
+        folder = None if text_stripped.lower() == "unfiled" else text_stripped
+        result = await retrieve_service.do_move(_owner_id, code, folder)
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("move inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+# ── Registration ──
+
 def register(client, owner_id: int):
-    register_panel("preview", _preview_panel_handler)
-    register_panel("send", _send_panel_handler)
-    register_inline_builder("preview", _preview_inline_builder)
-    register_inline_builder("send", _send_inline_builder)
+    register_panel("retrieve", _retrieve_panel_handler)
     register_panel("retrieve_saved", _retrieve_saved_panel_handler)
+    register_panel("retrieve_item", _retrieve_item_panel_handler)
+    register_panel("retrieve_code", _retrieve_code_panel_handler)
+    register_inline_builder("retrieve", _retrieve_inline_builder)
     register_inline_builder("retrieve_saved", _retrieve_saved_inline_builder)
-    register_input("preview", "code", {
-        "handler": _preview_input_handler,
-        "prompt": "**Preview**\n\nEnter save code (e.g. S0001):\n\n_Reply with the code below._",
+    register_inline_builder("retrieve_item", _retrieve_item_inline_builder)
+    register_inline_builder("retrieve_code", _retrieve_code_inline_builder)
+    register_action("retrieve_item_exec", _retrieve_item_exec_action)
+    register_action("retrieve_item_delete", _retrieve_item_delete_action)
+    register_input("retrieve", "code", {
+        "handler": _retrieve_code_input_handler,
+        "prompt": "**Retrieve by Code**\n\nEnter save code (e.g. SV-XXXXXX):\n\n_Reply with the code below._",
     })
-    register_input("send", "code", {
-        "handler": _send_input_handler,
-        "prompt": "**Send**\n\nEnter save code (e.g. S0001):\n\n_Reply with the code below._",
+    register_input("retrieve_item", "rename", {
+        "handler": _retrieve_rename_input_handler,
+        "prompt": "**Rename Item**\n\nEnter the new filename:\n\n_Reply below._",
+    })
+    register_input("retrieve_item", "move", {
+        "handler": _retrieve_move_input_handler,
+        "prompt": "**Move Item**\n\nEnter the folder name (or 'unfiled' to remove):\n\n_Reply below._",
     })
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:preview|retrieve|r)\s+(\S+)$"))
-    async def preview(event):
-        if not is_owner(event, owner_id):
-            return
-        save_code = event.pattern_match.group(1).upper()
-        result = await retrieve_service.do_preview(client, owner_id, save_code)
-        await event.edit(result)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:preview|retrieve|r)$"))
-    async def preview_panel(event):
+    # .retrieve / .r / .files — opens the Saved Items browser by default
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:retrieve|r|files)$"))
+    async def retrieve_panel(event):
         if not is_owner(event, owner_id):
             return
         helper = get_client()
@@ -200,21 +315,32 @@ def register(client, owner_id: int):
             return
         try:
             await event.delete()
-            await send_inline_panel(client, event.chat_id, "preview")
+            await send_inline_panel(client, event.chat_id, "retrieve")
         except Exception as exc:
-            logger.warning("preview inline send failed: %s", exc)
+            logger.warning("retrieve inline send failed: %s", exc)
 
+    # .preview <code> — text shortcut, shows preview text
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:preview|retrieve|r)\s+(\S+)$"))
+    async def preview_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+        save_code = event.pattern_match.group(1).upper()
+        result = await retrieve_service.do_preview(client, owner_id, save_code)
+        await event.edit(result)
+
+    # .send <code> — text shortcut, retrieves file with metadata block
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.send\s+(\S+)$"))
     async def send_cmd(event):
         if not is_owner(event, owner_id):
             return
         save_code = event.pattern_match.group(1).upper()
-        result = await retrieve_service.do_send(client, owner_id, save_code, event.chat_id)
+        result = await retrieve_service.do_retrieve(client, owner_id, save_code, event.chat_id)
         if result.startswith("✅"):
             await event.delete()
         else:
             await event.edit(result)
 
+    # .send — opens the retrieve panel (alias for .retrieve)
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.send$"))
     async def send_panel(event):
         if not is_owner(event, owner_id):
@@ -225,6 +351,6 @@ def register(client, owner_id: int):
             return
         try:
             await event.delete()
-            await send_inline_panel(client, event.chat_id, "send")
+            await send_inline_panel(client, event.chat_id, "retrieve")
         except Exception as exc:
             logger.warning("send inline send failed: %s", exc)

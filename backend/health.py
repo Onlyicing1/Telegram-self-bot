@@ -8,7 +8,6 @@ Tracks:
   - last_rpc (last successful RPC call)
   - last_command (last owner command processed)
   - last_update (last Telethon update received)
-  - last_handler_dispatched (last handler that actually processed an event)
   - restart_count (Telethon reconnects)
   - task_states (managed task states)
   - supervisor_ok

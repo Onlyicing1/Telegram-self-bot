@@ -59,14 +59,15 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
             "`.ping` — PONG",
             "`.id` — Chat & Msg IDs",
             "`.health` — Health dashboard",
+            "`.save` — Save replied message",
         ],
     ),
     (
         "Retrieve",
         [
             "**Retrieve**\n",
+            "`.retrieve` · `.r` · `.files` — Browse saved items",
             "`.preview <code>` — Show metadata",
-            "`.r <code>` · `.retrieve <code>` — Alias",
             "`.send <code>` — Forward asset here",
         ],
     ),
@@ -149,15 +150,15 @@ def _general_body() -> str:
 def _retrieve_body() -> str:
     return (
         "**Retrieve**\n\n"
-        "Tap a button to preview, send, or browse saved items."
+        "Browse saved items in a file-manager view.\n"
+        "Tap any item to preview, retrieve, rename, move, or delete."
     )
 
 
 def _build_retrieve_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("👁 Preview Item", "panel:preview")
-    builder.add_row("📤 Send Item", "panel:send")
     builder.add_row("📋 Saved Items", "panel:retrieve_saved")
+    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
     return builder.build()
 
 

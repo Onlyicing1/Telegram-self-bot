@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS saved_items (
     tags             text[]       DEFAULT '{}',
     caption          text,
     file_name        text,
+    folder           text,
     short_code       text,
     owner_id         bigint       NOT NULL,
     created_at       timestamptz  DEFAULT now()
