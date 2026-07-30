@@ -44,6 +44,7 @@ from backend.helper.target_context import (
 )
 from backend.helper.panel_settings import (
     is_auto_close_enabled,
+    reload as reload_settings,
     set_auto_close_enabled,
     toggle_auto_close,
     load as load_settings,

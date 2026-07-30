@@ -157,7 +157,6 @@ class RuntimeSupervisor:
 
         settings_svc.load_all()
         logger.info("Panel settings loaded.")
-        logger.info("Panel settings loaded.")
 
         logger.info("[2/5] Building self-client")
         await self._build_and_register()
@@ -186,6 +185,7 @@ class RuntimeSupervisor:
         )
 
     async def _build_and_register(self) -> None:
+        """Build a fresh client, authorize, register handlers. Does not start run_until_disconnected."""
         self._transition(RuntimeState.CONNECTING)
         try:
             self.client = await build_client(
@@ -319,7 +319,10 @@ class RuntimeSupervisor:
         self._uvicorn_server = uvicorn.Server(config)
         await self._uvicorn_server.serve()
 
+    # ── Main run loop ──
+
     async def _run_loop(self) -> None:
+        """Run the self-client until disconnected. The watchdog handles recovery."""
         while not self.shutdown_event.is_set():
             client = self.client
             if client is None:
@@ -339,7 +342,16 @@ class RuntimeSupervisor:
             set_telethon_connected(False)
             logger.warning("Self-client disconnected — watchdog will detect and recover")
 
+    # ── Watchdog (runs forever, 30s, real RPC heartbeat) ──
+
     async def _watchdog_loop(self) -> None:
+        """Watchdog loop — runs forever.
+
+        Every 30 seconds, performs a REAL RPC (get_me) as the heartbeat.
+        Counts consecutive failures. After 3 consecutive failures,
+        triggers atomic recovery. Recovery is lock-protected so
+        there can never be duplicate recoveries.
+        """
         while not self.shutdown_event.is_set():
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
             if self.shutdown_event.is_set():
@@ -410,6 +422,12 @@ class RuntimeSupervisor:
                     await self._trigger_recovery()
 
     async def _trigger_recovery(self) -> None:
+        """Atomic recovery: stop everything, rebuild, restart everything.
+
+        Lock-protected — no duplicate recoveries possible.
+        On repeated failure: exponential backoff, then sys.exit(1).
+        The process NEVER stays alive in a broken state.
+        """
         if self.shutdown_event.is_set():
             return
 
@@ -439,6 +457,8 @@ class RuntimeSupervisor:
             )
             record_event("runtime", "recovery_start", 0, "ATTEMPT",
                          f"attempt={attempt}")
+
+            # ── Phase 1: Stop everything that depends on the self-client ──
 
             logger.info("Recovery: stopping bio cron")
             try:
@@ -480,10 +500,14 @@ class RuntimeSupervisor:
                 except (asyncio.TimeoutError, Exception):
                     logger.warning("Recovery: old client disconnect timed out")
 
+            # ── Phase 2: Wait with backoff ──
+
             await asyncio.sleep(delay)
 
             if self.shutdown_event.is_set():
                 return
+
+            # ── Phase 3: Build new client and re-register everything ──
 
             try:
                 logger.info("Recovery: building new client")
@@ -536,6 +560,11 @@ class RuntimeSupervisor:
                 set_task_state("lifeos-recovery", "FAILED")
 
     async def _verify_heartbeat(self) -> None:
+        """Verify the new client with a fresh RPC heartbeat.
+
+        Raises on failure so the caller (recovery) can catch it
+        and count it as a failed attempt.
+        """
         client = self.client
         if client is None:
             raise RuntimeError("No client after build")
@@ -549,6 +578,8 @@ class RuntimeSupervisor:
             raise RuntimeError(f"Heartbeat verification failed: {exc}") from exc
 
     async def _cancel_orphan_tasks(self) -> None:
+        """Cancel every asyncio task except the watchdog, the recovery task,
+        and the current task."""
         current = asyncio.current_task()
         protected_names = {"lifeos-watchdog", "lifeos-web"}
         to_cancel = []
@@ -567,6 +598,7 @@ class RuntimeSupervisor:
             await asyncio.gather(*to_cancel, return_exceptions=True)
 
     async def _stop_helper(self) -> None:
+        """Stop and disconnect the helper bot."""
         helper = self.helper_client
         self.helper_client = None
         if helper is not None:
@@ -578,6 +610,8 @@ class RuntimeSupervisor:
             await disconnect_helper()
         except Exception:
             pass
+
+    # ── Shutdown ──
 
     async def stop(self) -> None:
         logger.info("Shutdown initiated")
@@ -628,6 +662,8 @@ class RuntimeSupervisor:
 
         set_supervisor_ok(False)
         logger.info("LifeOS stopped cleanly.")
+
+    # ── Health snapshot ──
 
     def task_states(self) -> dict[str, str]:
         states = {}

@@ -72,7 +72,7 @@ def set_content(chat_id: int, msg_id: int, title: str, body: str, buttons: list)
 
 
 def _start_timer(self_client, chat_id: int, msg_id: int, entry: _PanelEntry) -> None:
-    duration = settings_service.panel_auto_close_seconds()
+    duration = settings_service.auto_close_delay()
     entry.expire_at = _now() + duration
     entry.task = asyncio.create_task(_timer_loop(self_client, chat_id, msg_id, duration))
 
