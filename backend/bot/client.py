@@ -18,6 +18,8 @@ import logging
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+from backend.runtime.tracer import trace, trace_exception
+
 logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT = 30
@@ -42,18 +44,24 @@ async def build_client(
         flood_sleep_threshold=60,
     )
 
-    await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+    except Exception as exc:
+        trace_exception("SELF_CONNECT_FAILED", exc)
+        raise
 
     authorized = await asyncio.wait_for(
         client.is_user_authorized(), timeout=_AUTHORIZE_TIMEOUT
     )
     if not authorized:
+        trace("SESSION_EXPIRED", reason="is_user_authorized=False")
         raise RuntimeError(
             "Telethon session is not authorized. "
             "Re-generate SESSION_STRING and update the environment variable."
         )
 
     me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
+    trace("SELF_CONNECTED", user=me.first_name, id=me.id)
     logger.info("Telethon connected as %s (id=%s)", me.first_name, me.id)
 
     return client

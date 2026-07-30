@@ -1,0 +1,73 @@
+"""
+Structured lifecycle event tracer.
+
+Every important runtime event is logged with a consistent, grep-friendly tag
+so Render logs can be searched by event type:
+
+    [TRACE] SELF_CONNECTED gen=1 user=Parham id=123456
+    [TRACE] SELF_DISCONNECTED gen=1 reason=run_until_disconnected_returned
+    [TRACE] SELF_RECONNECTING gen=1 attempt=1
+    [TRACE] WATCHDOG_CHECK self=connected helper=disconnected tasks=8 ...
+
+All trace events go through a single function so the format is uniform.
+"""
+import logging
+import traceback
+from datetime import datetime, timezone
+
+logger = logging.getLogger("backend.tracer")
+
+_TRACE_TAG = "[TRACE]"
+
+
+def trace(event: str, **fields) -> None:
+    parts = [event]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    logger.warning("%s %s", _TRACE_TAG, " ".join(parts))
+
+
+def trace_exception(event: str, exc: BaseException, **fields) -> None:
+    parts = [event]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    parts.append(f"exc_type={type(exc).__name__}")
+    parts.append(f"exc_repr={exc!r}")
+    logger.warning("%s %s", _TRACE_TAG, " ".join(parts))
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    for line in "".join(tb_lines).rstrip().splitlines():
+        logger.warning("%s   %s", _TRACE_TAG, line)
+
+
+def trace_task_crash(task_name: str, exc: BaseException, runtime_state: str = "") -> None:
+    trace_exception(
+        "TASK_CRASHED",
+        exc,
+        task=task_name,
+        runtime_state=runtime_state or "unknown",
+    )
+
+
+def trace_task_cancelled(task_name: str, runtime_state: str = "") -> None:
+    trace("TASK_CANCELLED", task=task_name, runtime_state=runtime_state or "unknown")
+
+
+def trace_handler_exception(handler_name: str, exc: BaseException, runtime_state: str = "") -> None:
+    trace_exception(
+        "HANDLER_EXCEPTION",
+        exc,
+        handler=handler_name,
+        runtime_state=runtime_state or "unknown",
+    )
+
+
+def trace_uncaught(exc: BaseException) -> None:
+    trace_exception("UNCAUGHT_EXCEPTION", exc)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
