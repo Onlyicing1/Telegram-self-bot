@@ -574,6 +574,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
+    builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
     return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
 
@@ -590,6 +591,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
+    builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
     return [render(
         "Context Panel",
@@ -816,6 +818,42 @@ async def _safe_edit(event, text: str) -> None:
             await event.reply(part)
 
 
+async def _context_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.input_state import clear_pending
+    from backend.services import save_service
+
+    owner_id = _owner_id
+    client = _self_client
+    clear_pending(owner_id)
+
+    link = text.strip()
+    if not link:
+        result = "⚠️ Link cannot be empty."
+    else:
+        progress_msg = None
+        if inline_chat_id and inline_msg_id:
+            try:
+                progress_msg = await client.get_messages(inline_chat_id, ids=inline_msg_id)
+            except Exception:
+                pass
+        result = await save_service.execute_link_save(
+            client, owner_id, link, _resolve_tz(), progress_msg=progress_msg,
+        )
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("context link save inline edit failed: %s", exc)
+    if client:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
 def register(client, owner_id: int):
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
     async def ping(event):
@@ -919,6 +957,10 @@ def register(client, owner_id: int):
         register_inline_builder("logs", _logs_inline_builder)
         register_inline_builder("context", _context_inline_builder)
         register_inline_builder("context_error", _context_error_inline_builder)
+        register_input("context", "link", {
+            "handler": _context_link_input_handler,
+            "prompt": "**Save by Link**\n\nSend a Telegram message link:\n`https://t.me/channel/123`\n`https://t.me/c/123/456`\n\n_Reply with the link below._",
+        })
         register_action("health_refresh", _health_refresh_action)
         register_action("logs_errors", _logs_errors_action)
         register_action("logs_50", _logs_50_action)
