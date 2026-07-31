@@ -64,7 +64,6 @@ from backend.helper.client import (
 )
 from backend.helper.panels import register_callback_handlers
 from backend.helper.client import register_helper_hooks
-from backend.helper.session_manager import clear_all_sessions
 from backend.helper.inline_engine import (
     register_inline_handler,
     set_self_client,
@@ -73,9 +72,8 @@ from backend.helper.inline_engine import (
 )
 from backend.helper.inline_sender import register_input_listener
 from backend.helper.callback_trace import configure as configure_callback_trace
+from backend.helper.lifecycle import configure_lifecycle, get_lifecycle
 from backend.services import settings_service as settings_svc
-from backend.helper.panel_timer import stop_all as stop_all_timers
-from backend.helper.input_state import clear_all as clear_all_pending
 from backend.helper.target_context import clear_all as clear_all_targets
 
 logger = logging.getLogger(__name__)
@@ -229,6 +227,7 @@ class RuntimeSupervisor:
 
         if self.helper_enabled:
             set_self_client(self.client)
+            configure_lifecycle(self.client, self.owner_id)
             configure_callback_trace(self.client, self.owner_id)
             register_input_listener(self.client, self.owner_id)
 
@@ -420,13 +419,6 @@ class RuntimeSupervisor:
                     await self._trigger_recovery()
                 continue
 
-            # ── Update-staleness detection ──
-            #
-            # Telethon can silently stall: is_connected() returns True,
-            # get_me() succeeds, but the update-receive loop is no longer
-            # processing incoming updates. The heartbeat RPC alone cannot
-            # detect this. We check whether we've received ANY Telegram
-            # event recently. If not, the update loop is stalled.
             try:
                 stale_threshold = settings_svc.update_stale_seconds()
             except Exception:
@@ -459,11 +451,6 @@ class RuntimeSupervisor:
                     await self._trigger_recovery()
                     continue
 
-            # ── Heartbeat RPC check ──
-            #
-            # Only run the RPC heartbeat if we've passed the staleness check.
-            # This catches the case where the connection is truly dead (RPC
-            # fails) vs. silently stalled (RPC works but no updates).
             t0 = time.monotonic()
             try:
                 await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
@@ -561,9 +548,7 @@ class RuntimeSupervisor:
             set_helper_connected(False)
 
             logger.info("Recovery: clearing inline panel state")
-            stop_all_timers()
-            clear_all_sessions()
-            clear_all_pending()
+            await get_lifecycle().shutdown_all()
             clear_all_targets()
 
             logger.info("Recovery: cancelling run task")
@@ -697,9 +682,7 @@ class RuntimeSupervisor:
         self._transition(RuntimeState.STOPPING)
         self.shutdown_event.set()
 
-        stop_all_timers()
-        clear_all_sessions()
-        clear_all_pending()
+        await get_lifecycle().shutdown_all()
         clear_all_targets()
 
         logger.info("Shutdown: stopping heartbeat")

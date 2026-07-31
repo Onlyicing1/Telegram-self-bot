@@ -37,6 +37,10 @@ from backend.helper.inline_engine import (
     set_helper_username,
     set_owner_id,
 )
+from backend.helper.lifecycle import (
+    get_lifecycle,
+    configure_lifecycle,
+)
 from backend.helper.target_context import (
     TargetContext,
     set_target,
