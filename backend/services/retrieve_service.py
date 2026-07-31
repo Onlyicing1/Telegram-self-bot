@@ -13,6 +13,7 @@ Unified workflow:
 """
 import asyncio
 import logging
+import traceback
 from datetime import datetime
 
 from backend.db import client as db_client
@@ -147,15 +148,44 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
+    origin_chat_id = row.get("origin_chat_id")
     if not saved_chat_id or not saved_msg_id:
         return "❌ Saved location data is missing for this entry."
 
+    logger.info("[RETRIEVE] save_code=%s", save_code)
+    logger.info("[RETRIEVE] origin_chat_id=%s", origin_chat_id)
+    logger.info("[RETRIEVE] saved_chat_id=%s", saved_chat_id)
+
+    try:
+        source_peer = await self_client.get_input_entity(saved_chat_id)
+        logger.info("[RETRIEVE] resolved origin peer OK")
+    except Exception as exc:
+        logger.error("[RETRIEVE] entity resolution FAILED for saved_chat_id=%s: %s", saved_chat_id, exc)
+        traceback.print_exc()
+        logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
+        record_event("retrieve", "get_input_entity", 0, "ERROR", f"saved_chat_id={saved_chat_id}: {exc}")
+        return f"❌ Could not resolve saved chat (id={saved_chat_id}): {exc}"
+
+    try:
+        dest_peer = await self_client.get_input_entity(target_chat)
+        logger.info("[RETRIEVE] resolved destination peer OK")
+    except Exception as exc:
+        logger.error("[RETRIEVE] entity resolution FAILED for target_chat=%s: %s", target_chat, exc)
+        traceback.print_exc()
+        logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
+        record_event("retrieve", "get_input_entity", 0, "ERROR", f"target_chat={target_chat}: {exc}")
+        return f"❌ Could not resolve destination chat (id={target_chat}): {exc}"
+
+    logger.info("[RETRIEVE] forwarding...")
     t1 = asyncio.get_event_loop().time()
     try:
-        messages = await self_client.forward_messages(target_chat, saved_msg_id, saved_chat_id)
+        messages = await self_client.forward_messages(dest_peer, saved_msg_id, source_peer)
         record_event("retrieve", "forward_messages", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+        logger.info("[RETRIEVE] forward completed")
     except Exception as exc:
         logger.error("retrieve forward failed: %s", exc)
+        traceback.print_exc()
+        logger.error("[RETRIEVE] failed IDs: saved_chat_id=%s target_chat=%s", saved_chat_id, target_chat)
         record_event("retrieve", "forward_messages", 0, "ERROR", str(exc))
         return f"❌ Forward failed: {exc}"
 
@@ -166,7 +196,7 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
 
     if fwd_msg and len(new_caption) <= 1024:
         try:
-            await self_client.edit_message(target_chat, fwd_msg.id, new_caption)
+            await self_client.edit_message(dest_peer, fwd_msg.id, new_caption)
         except Exception as exc:
             logger.warning("retrieve caption edit failed: %s", exc)
 
