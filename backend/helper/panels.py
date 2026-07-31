@@ -424,15 +424,26 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.exception("[CALLBACK] _handle_panel: handler '%s' FAILED: %s", panel_id, exc)
 
 
+def cleanup_panel_resources(chat_id: int, msg_id: int, owner_id: int) -> None:
+    """Release ALL resources for a panel: timer, session, render cache, input state.
+
+    This is the single, centralized cleanup function. Every panel teardown
+    path (close button, auto-close timeout, replacement, abandonment) MUST
+    call this to guarantee no resource leaks.
+    """
+    stop_timer(chat_id, msg_id)
+    clear_session(chat_id, msg_id)
+    _last_render.pop((chat_id, msg_id), None)
+    if owner_id:
+        clear_pending(owner_id)
+
+
 async def close_panel(event, chat_id: int, msg_id: int, owner_id: int) -> None:
     from backend.helper.inline_engine import get_self_client
 
     logger.info("[CLOSE] close_panel: chat_id=%s msg_id=%s", chat_id, msg_id)
 
-    clear_pending(owner_id)
-    stop_timer(chat_id, msg_id)
-    clear_session(chat_id, msg_id)
-    _last_render.pop((chat_id, msg_id), None)
+    cleanup_panel_resources(chat_id, msg_id, owner_id)
 
     closed_text = "✕ **Panel closed**"
 

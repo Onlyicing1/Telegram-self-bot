@@ -59,6 +59,27 @@ def find_session_by_chat(chat_id: int) -> dict | None:
     return None
 
 
+def find_all_sessions_by_chat(chat_id: int) -> list[dict]:
+    """Return ALL sessions for a chat, not just the first one."""
+    return [
+        session for (cid, _mid), session in _sessions.items()
+        if cid == chat_id
+    ]
+
+
+def destroy_all_sessions_for_chat(chat_id: int) -> list[tuple[int, int]]:
+    """Remove ALL sessions for a chat. Returns list of (chat_id, msg_id) destroyed."""
+    destroyed = []
+    for (cid, mid), session in list(_sessions.items()):
+        if cid == chat_id:
+            imid = session.get("inline_message_id", "")
+            if imid:
+                _inline_sessions.pop(imid, None)
+            _sessions.pop((cid, mid), None)
+            destroyed.append((cid, mid))
+    return destroyed
+
+
 def find_session_by_msg_id(msg_id: int) -> dict | None:
     for (_cid, mid), session in _sessions.items():
         if mid == msg_id:

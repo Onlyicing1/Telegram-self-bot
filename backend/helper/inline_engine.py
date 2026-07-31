@@ -55,6 +55,10 @@ def get_helper_username() -> str:
     return _helper_username
 
 
+def get_owner_id() -> int:
+    return _owner_id
+
+
 def _to_keyboard_button_rows(rows: list) -> list:
     """Convert any button rows (tuples OR TLObjects) into KeyboardButtonRow TLObjects."""
     return _to_inline_rows(rows) if rows else []

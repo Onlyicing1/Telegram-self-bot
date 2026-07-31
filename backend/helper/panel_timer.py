@@ -22,7 +22,7 @@ _COUNTDOWN_INTERVAL = 30
 
 
 class _PanelEntry:
-    __slots__ = ("expire_at", "task", "title", "body", "buttons")
+    __slots__ = ("expire_at", "task", "title", "body", "buttons", "owner_id")
 
     def __init__(self):
         self.expire_at: float = 0.0
@@ -30,6 +30,7 @@ class _PanelEntry:
         self.title: str = "LifeOS"
         self.body: str = ""
         self.buttons: list = []
+        self.owner_id: int = 0
 
 
 _panels: dict[str, _PanelEntry] = {}
@@ -47,14 +48,19 @@ def _now() -> float:
         return time.monotonic()
 
 
-def init_panel(self_client, chat_id: int, msg_id: int, title: str = "LifeOS", body: str = "", buttons: list = None) -> None:
-    """Register a panel and start its timer (only if auto-close is globally ON)."""
+def init_panel(self_client, chat_id: int, msg_id: int, title: str = "LifeOS", body: str = "", buttons: list = None, owner_id: int = 0) -> None:
+    """Register a panel and start its timer (only if auto-close is globally ON).
+
+    owner_id is needed so the timer's destroy() can clean up the correct
+    owner's pending input state.
+    """
     k = _key(chat_id, msg_id)
     _cancel_task(k)
     entry = _PanelEntry()
     entry.title = title
     entry.body = body
     entry.buttons = buttons or []
+    entry.owner_id = owner_id
     _panels[k] = entry
     if settings_service.is_auto_close_enabled():
         _start_timer(self_client, chat_id, msg_id, entry)
@@ -115,7 +121,7 @@ async def _timer_loop(self_client, chat_id: int, msg_id: int, duration: int) -> 
         entry = _panels.get(_key(chat_id, msg_id))
         if entry is None or not settings_service.is_auto_close_enabled():
             return
-        await destroy(self_client, chat_id, msg_id)
+        await destroy(self_client, chat_id, msg_id, entry.owner_id)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -139,23 +145,28 @@ async def _edit_countdown(self_client, chat_id: int, msg_id: int, seconds: int) 
         pass
 
 
-async def destroy(self_client, chat_id: int, msg_id: int) -> None:
-    """Auto-close entry point — calls the shared close_panel function.
+async def destroy(self_client, chat_id: int, msg_id: int, owner_id: int = 0) -> None:
+    """Auto-close entry point — calls the shared cleanup function.
 
-    This is the EXACT same code path as pressing the Close button.
-    No duplicate implementation.
+    Uses cleanup_panel_resources for complete resource release, then
+    edits the inline message to show the closed state.
     """
-    from backend.helper.panels import close_panel
-    from backend.helper.input_state import clear_all as clear_all_pending
+    from backend.helper.panels import cleanup_panel_resources
 
     k = _key(chat_id, msg_id)
     entry = _panels.pop(k, None)
     if entry:
         _cancel_entry_task(entry)
+        if not owner_id:
+            owner_id = entry.owner_id
 
-    clear_all_pending()
+    cleanup_panel_resources(chat_id, msg_id, owner_id)
 
-    await close_panel(None, chat_id, msg_id, 0)
+    closed_text = "✕ **Panel closed**"
+    try:
+        await self_client.edit_message(chat_id, msg_id, message=closed_text, buttons=[])
+    except Exception:
+        pass
 
 
 def stop_timer(chat_id: int, msg_id: int) -> None:
