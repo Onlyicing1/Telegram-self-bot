@@ -51,7 +51,7 @@ _SAVED_PER_PAGE = 8
 # ── Utility ──
 
 def _parse_extra_id(extra: str) -> str | None:
-    """Extract item short_code from extra string like 'id:SV-XXXXXX'."""
+    """Extract item save_code from extra string like 'id:SV-XXXXXX'."""
     if extra.startswith("id:"):
         return extra[3:]
     return None
@@ -104,7 +104,7 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
 
     builder = InlinePanelBuilder()
     for item in items:
-        code = item.get("short_code") or item.get("save_code")
+        code = item.get("save_code")
         if code:
             icon = retrieve_service._type_icon(item)
             name = retrieve_service._display_name(item)

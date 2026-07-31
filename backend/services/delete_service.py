@@ -67,7 +67,7 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
 
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
-    display = row.get("short_code") or row.get("save_code") or code
+    display = row.get("save_code") or code
 
     tg_deleted = False
     tg_error = None

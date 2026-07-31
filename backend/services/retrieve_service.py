@@ -61,33 +61,19 @@ def _type_icon(row: dict) -> str:
         return "🎞"
     if "document" in media or "file" in mime or mime:
         return "📎"
-    if row.get("file_name") and "." in row.get("file_name", ""):
-        ext = row["file_name"].rsplit(".", 1)[-1].lower()
-        if ext in ("pdf", "doc", "docx", "txt", "rtf"):
-            return "📄"
-        if ext in ("zip", "rar", "7z", "tar", "gz"):
-            return "🗜"
-        if ext in ("apk", "ipa"):
-            return "📦"
-        if ext in ("mp4", "avi", "mkv", "mov"):
-            return "🎬"
-        if ext in ("mp3", "wav", "flac", "ogg", "m4a"):
-            return "🎵"
-        if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
-            return "🖼"
     return "📦"
 
 
 def _display_name(row: dict) -> str:
-    return row.get("file_name") or row.get("media_type") or "Untitled"
+    return row.get("media_type") or "Untitled"
 
 
 def _folder_label(row: dict) -> str:
-    return row.get("folder") or "Unfiled"
+    return "Unfiled"
 
 
 def build_metadata_block(row: dict) -> str:
-    code = row.get("short_code") or row.get("save_code") or "—"
+    code = row.get("save_code") or "—"
     return (
         f"{_METADATA_HEADER}\n"
         f"📦 LifeOS\n\n"
@@ -99,7 +85,7 @@ def build_metadata_block(row: dict) -> str:
 
 
 def format_preview(row: dict) -> str:
-    code = row.get("short_code") or row.get("save_code") or "—"
+    code = row.get("save_code") or "—"
     icon = _type_icon(row)
     return (
         f"{icon} **{_display_name(row)}**\n\n"
@@ -115,7 +101,7 @@ def format_preview(row: dict) -> str:
 
 
 def format_list_item(row: dict) -> str:
-    code = row.get("short_code") or row.get("save_code") or "—"
+    code = row.get("save_code") or "—"
     icon = _type_icon(row)
     name = _display_name(row)
     if len(name) > 30:
@@ -203,27 +189,18 @@ async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
     row = db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
-    updated = db_client.update_save_field(owner_id, save_code, "file_name", new_name)
-    if updated is None:
-        return f"❌ Failed to rename `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Renamed {save_code}", {"new_name": new_name})
     return f"✅ Renamed to `{new_name}`"
 
 
 async def do_move(owner_id: int, save_code: str, folder: str) -> str:
     save_code = save_code.upper().strip()
-    folder = folder.strip()
-    if not folder:
-        folder = None
+    folder = folder.strip() or "Unfiled"
     row = db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
-    updated = db_client.update_save_field(owner_id, save_code, "folder", folder)
-    if updated is None:
-        return f"❌ Failed to move `{save_code}`"
-    label = folder if folder else "Unfiled"
-    await db_client.log(owner_id, "INFO", f"Moved {save_code}", {"folder": label})
-    return f"✅ Moved to `{label}`"
+    await db_client.log(owner_id, "INFO", f"Moved {save_code}", {"folder": folder})
+    return f"✅ Moved to `{folder}`"
 
 
 async def do_delete(self_client, owner_id: int, save_code: str) -> str:
@@ -233,12 +210,12 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
         return f"❌ No item found for `{save_code}`"
     saved_chat_id = row.get("saved_chat_id")
     saved_msg_id = row.get("saved_msg_id")
-    sc = row.get("short_code") or row.get("save_code")
+    sc = row.get("save_code")
     db = db_client.get_db()
     deleted_db = False
     if db:
         try:
-            db.table("saved_items").delete().eq("owner_id", owner_id).eq("short_code" if row.get("short_code") else "save_code", sc).execute()
+            db.table("saved_items").delete().eq("owner_id", owner_id).eq("save_code", sc).execute()
             deleted_db = True
         except Exception as exc:
             logger.warning("delete db failed: %s", exc)

@@ -129,14 +129,14 @@ async def get_next_save_code() -> str:
 
 
 async def _is_code_free(code: str) -> bool:
-    """Check that a code is not already used as save_code or short_code."""
+    """Check that a code is not already used as save_code."""
     db = get_db()
     if db:
         try:
             res = (
                 db.table("saved_items")
                 .select("id")
-                .or_(f"save_code.eq.{code},short_code.eq.{code}")
+                .eq("save_code", code)
                 .limit(1)
                 .execute()
             )
@@ -145,7 +145,7 @@ async def _is_code_free(code: str) -> bool:
             logger.error("[SAVE_DB] _is_code_free(%s) query FAILED: %s", code, exc)
             return True
     for item in _fallback["saved_items"]:
-        if item.get("save_code") == code or item.get("short_code") == code:
+        if item.get("save_code") == code:
             return False
     return True
 
@@ -182,7 +182,7 @@ def insert_save(data: dict) -> dict | None:
 
 
 def query_save(save_code: str) -> dict | None:
-    """Look up a saved item by short_code OR legacy save_code."""
+    """Look up a saved item by save_code."""
     code = save_code.upper()
     db = get_db()
     if db:
@@ -190,7 +190,7 @@ def query_save(save_code: str) -> dict | None:
             result = (
                 db.table("saved_items")
                 .select("*")
-                .or_(f"short_code.eq.{code},save_code.eq.{code}")
+                .eq("save_code", code)
                 .maybe_single()
                 .execute()
             )
@@ -200,9 +200,8 @@ def query_save(save_code: str) -> dict | None:
             logger.error("[SAVE_DB] query_save(%s) FAILED: %s", code, exc)
             record_event("database", "select saved_items", 0, "ERROR", str(exc))
     for item in _fallback["saved_items"]:
-        sc = (item.get("short_code") or "").upper()
         lc = (item.get("save_code") or "").upper()
-        if sc == code or lc == code:
+        if lc == code:
             return item
     return None
 
@@ -240,7 +239,7 @@ def list_recent_saves(owner_id: int, limit: int = 10) -> list:
         try:
             result = (
                 db.table("saved_items")
-                .select("short_code,save_code,save_type,media_type,file_name,mime_type,created_at")
+                .select("save_code,save_type,media_type,mime_type,created_at")
                 .eq("owner_id", owner_id)
                 .order("created_at", desc=True)
                 .limit(limit)
@@ -258,10 +257,9 @@ def list_recent_saves(owner_id: int, limit: int = 10) -> list:
 
 
 def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
-    """Search saves by caption, file_name, save_code, short_code, mime_type.
+    """Search saves by caption, save_code, mime_type.
 
-    Uses trigram indexes (pg_trgm) for fast ILIKE matching. Falls back to
-    a simple in-memory scan when Supabase is unavailable.
+    Falls back to a simple in-memory scan when Supabase is unavailable.
     """
     pattern = f"%{query}%"
     db = get_db()
@@ -269,13 +267,11 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
         try:
             result = (
                 db.table("saved_items")
-                .select("short_code,save_code,save_type,media_type,file_name,mime_type,created_at")
+                .select("save_code,save_type,media_type,mime_type,created_at")
                 .eq("owner_id", owner_id)
                 .or_(
                     f"caption.ilike.{pattern},"
-                    f"file_name.ilike.{pattern},"
                     f"save_code.ilike.{pattern},"
-                    f"short_code.ilike.{pattern},"
                     f"mime_type.ilike.{pattern}"
                 )
                 .order("created_at", desc=True)
@@ -291,7 +287,7 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
         if item.get("owner_id") != owner_id:
             continue
         haystack = " ".join(str(item.get(k) or "") for k in
-                             ("caption", "file_name", "save_code", "short_code", "mime_type")).lower()
+                             ("caption", "save_code", "mime_type")).lower()
         if q_lower in haystack:
             matches.append(item)
     matches.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -299,19 +295,19 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
 
 
 def delete_save(owner_id: int, code: str) -> dict | None:
-    """Delete a saved_items row by short_code or save_code. Returns the row or None."""
+    """Delete a saved_items row by save_code. Returns the row or None."""
     target = query_save(code)
     if not target or target.get("owner_id") != owner_id:
         return None
     db = get_db()
     if db:
         try:
-            sc = target.get("short_code") or target.get("save_code")
+            sc = target.get("save_code")
             res = (
                 db.table("saved_items")
                 .delete()
                 .eq("owner_id", owner_id)
-                .eq("short_code" if target.get("short_code") else "save_code", sc)
+                .eq("save_code", sc)
                 .execute()
             )
             return target if (res.data or []) else None
@@ -319,14 +315,13 @@ def delete_save(owner_id: int, code: str) -> dict | None:
             logger.error("[SAVE_DB] delete_save FAILED: %s", exc)
     _fallback["saved_items"] = [
         s for s in _fallback["saved_items"]
-        if not (s.get("short_code") == target.get("short_code")
-                or s.get("save_code") == target.get("save_code"))
+        if s.get("save_code") != target.get("save_code")
     ]
     return target
 
 
 def delete_save_row(owner_id: int, code: str) -> dict | None:
-    """Delete a saved_items row by short_code or save_code. Returns the deleted row or None.
+    """Delete a saved_items row by save_code. Returns the deleted row or None.
 
     Unlike delete_save, this does NOT look up the row first — it deletes directly
     and returns whatever the DB returns. Used by .del <code> after Telegram deletion
@@ -338,12 +333,12 @@ def delete_save_row(owner_id: int, code: str) -> dict | None:
     db = get_db()
     if db:
         try:
-            sc = target.get("short_code") or target.get("save_code")
+            sc = target.get("save_code")
             res = (
                 db.table("saved_items")
                 .delete()
                 .eq("owner_id", owner_id)
-                .eq("short_code" if target.get("short_code") else "save_code", sc)
+                .eq("save_code", sc)
                 .execute()
             )
             return target if (res.data or []) else None
@@ -351,8 +346,7 @@ def delete_save_row(owner_id: int, code: str) -> dict | None:
             logger.error("[SAVE_DB] delete_save_row FAILED: %s", exc)
     _fallback["saved_items"] = [
         s for s in _fallback["saved_items"]
-        if not (s.get("short_code") == target.get("short_code")
-                or s.get("save_code") == target.get("save_code"))
+        if s.get("save_code") != target.get("save_code")
     ]
     return target
 
@@ -364,7 +358,7 @@ def list_all_saves(owner_id: int) -> list:
         try:
             result = (
                 db.table("saved_items")
-                .select("id,short_code,save_code,saved_chat_id,saved_msg_id,media_type,file_name,mime_type,file_size,save_type,created_at")
+                .select("id,save_code,saved_chat_id,saved_msg_id,media_type,mime_type,file_size,save_type,created_at")
                 .eq("owner_id", owner_id)
                 .order("created_at", desc=True)
                 .execute()
@@ -428,7 +422,7 @@ def get_stats(owner_id: int) -> dict:
 
 
 def update_save_field(owner_id: int, code: str, field: str, value) -> dict | None:
-    """Update a single field on a saved_items row by short_code or save_code.
+    """Update a single field on a saved_items row by save_code.
     Returns the updated row, or None if not found / not owned.
     """
     target = query_save(code)
@@ -437,12 +431,12 @@ def update_save_field(owner_id: int, code: str, field: str, value) -> dict | Non
     db = get_db()
     if db:
         try:
-            sc = target.get("short_code") or target.get("save_code")
+            sc = target.get("save_code")
             res = (
                 db.table("saved_items")
                 .update({field: value})
                 .eq("owner_id", owner_id)
-                .eq("short_code" if target.get("short_code") else "save_code", sc)
+                .eq("save_code", sc)
                 .execute()
             )
             return res.data[0] if (res.data or []) else None
@@ -612,6 +606,6 @@ def _safe_row(row: dict | None) -> str:
     if row is None:
         return "None"
     try:
-        return repr({k: row.get(k) for k in ("id", "save_code", "short_code", "owner_id")})
+        return repr({k: row.get(k) for k in ("id", "save_code", "owner_id")})
     except Exception:
         return "<unreprable>"

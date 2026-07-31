@@ -42,21 +42,19 @@ def format_date(iso_str: str | None, tz_str: str) -> str:
 
 
 def format_list_entry(row: dict, tz_str: str) -> str:
-    code = row.get("short_code") or row.get("save_code") or "—"
+    code = row.get("save_code") or "—"
     ic = icon(row.get("media_type"))
-    name = row.get("file_name") or "—"
     mtype = row.get("media_type") or "Unknown"
     date_str = format_date(row.get("created_at"), tz_str)
-    return f"{ic} `{code}`\n   {name}\n   {mtype} · {date_str}"
+    return f"{ic} `{code}`\n   {mtype} · {date_str}"
 
 
 def format_find_entry(row: dict, tz_str: str) -> str:
-    code = row.get("short_code") or row.get("save_code") or "—"
+    code = row.get("save_code") or "—"
     ic = icon(row.get("media_type"))
-    name = row.get("file_name") or "—"
     mtype = row.get("media_type") or "Unknown"
     date_str = format_date(row.get("created_at"), tz_str)
-    return f"{ic} `{code}` — {name}\n   {mtype} · {date_str}"
+    return f"{ic} `{code}` — {mtype} · {date_str}"
 
 
 async def do_list(owner_id: int, limit: int, tz_str: str) -> str:

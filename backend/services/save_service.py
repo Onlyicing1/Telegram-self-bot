@@ -224,7 +224,6 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
 
         payload = {
             "save_code": save_code,
-            "short_code": save_code,
             "save_type": "forward",
             "origin_chat_id": origin_chat_id,
             "origin_msg_id": origin_msg_id,
@@ -236,7 +235,6 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             "file_id": file_id,
             "file_size": file_size,
             "media_type": media_type,
-            "file_name": file_name,
             "tags": tags,
             "caption": None,
             "owner_id": owner_id,
@@ -328,7 +326,6 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
 
         payload = {
             "save_code": save_code,
-            "short_code": save_code,
             "save_type": "deep",
             "origin_chat_id": origin_chat_id,
             "origin_msg_id": origin_msg_id,
@@ -340,7 +337,6 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             "file_id": file_id,
             "file_size": file_size,
             "media_type": media_type,
-            "file_name": file_name,
             "tags": tags,
             "caption": caption,
             "owner_id": owner_id,
