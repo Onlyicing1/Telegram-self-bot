@@ -86,17 +86,13 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
             client, owner_id, link, "UTC", progress_msg=progress_msg,
         )
 
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("link save inline edit failed: %s", exc)
+    logger.info("[LINK_SAVE] handler result: %s", result)
+
     if client:
         try:
             await client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[LINK_SAVE] delete trigger msg failed: %s", exc)
 
 
 def register(client, owner_id: int, tz_str: str) -> None:

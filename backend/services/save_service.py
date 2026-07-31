@@ -311,6 +311,7 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
         return "❌ Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
 
+    target_msg = None
     try:
         if chat_id:
             logger.info("[LINK_SAVE] fetching source message...")
@@ -320,17 +321,34 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
             entity = await client.get_entity(channel)
             logger.info("[LINK_SAVE] fetching source message...")
             target_msg = await client.get_messages(entity, ids=msg_id)
+        logger.info("[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
+                    getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None))
     except Exception as exc:
-        logger.error("[LINK_SAVE] resolve failed: %s", exc)
+        logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
         return f"❌ Could not resolve link: {exc}"
 
     if target_msg is None:
+        logger.warning("[LINK_SAVE] source message not found at link")
         return "❌ Message not found at that link."
+
+    try:
+        has_media = target_msg.media is not None
+        logger.info("[LINK_SAVE] media detected: has_media=%s media_type=%s",
+                    has_media, type(target_msg.media).__name__)
+    except Exception as exc:
+        logger.error("[LINK_SAVE] media detection failed: %s", exc, exc_info=True)
+        return f"❌ Media detection failed: {exc}"
 
     if not target_msg.media:
         return "❌ The linked message has no downloadable media."
 
-    save_code = await db_client.get_next_save_code()
+    try:
+        save_code = await db_client.get_next_save_code()
+        logger.info("[LINK_SAVE] save code generated: %s", save_code)
+    except Exception as exc:
+        logger.error("[LINK_SAVE] save code generation failed: %s", exc, exc_info=True)
+        return f"❌ Save code generation failed: {exc}"
+
     tz = _get_tz(tz_str)
     now = datetime.now(tz)
 
@@ -344,8 +362,9 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
                 getattr(sender, "last_name", "") or "",
             ]
             sender_name = " ".join(p for p in parts if p).strip() or str(sender_id)
-    except Exception:
-        pass
+        logger.info("[LINK_SAVE] sender resolved: name=%s id=%s", sender_name, sender_id)
+    except Exception as exc:
+        logger.error("[LINK_SAVE] sender resolution failed: %s", exc, exc_info=True)
 
     origin_chat_id = target_msg.chat_id
     origin_msg_id = target_msg.id
@@ -355,46 +374,62 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     file_name = None
     file_id = None
 
-    media = target_msg.media
-    if isinstance(media, MessageMediaDocument):
-        doc = media.document
-        mime_type = getattr(doc, "mime_type", None)
-        file_size = getattr(doc, "size", None)
-        file_name = extract_file_name(media)
-        file_id = str(getattr(doc, "id", ""))
-    elif isinstance(media, MessageMediaPhoto):
-        mime_type = "image/jpeg"
-        photo = media.photo
-        if hasattr(photo, "sizes") and photo.sizes:
-            file_size = getattr(photo.sizes[-1], "size", None)
-        file_id = str(getattr(photo, "id", ""))
+    try:
+        media = target_msg.media
+        if isinstance(media, MessageMediaDocument):
+            doc = media.document
+            mime_type = getattr(doc, "mime_type", None)
+            file_size = getattr(doc, "size", None)
+            file_name = extract_file_name(media)
+            file_id = str(getattr(doc, "id", ""))
+        elif isinstance(media, MessageMediaPhoto):
+            mime_type = "image/jpeg"
+            photo = media.photo
+            if hasattr(photo, "sizes") and photo.sizes:
+                file_size = getattr(photo.sizes[-1], "size", None)
+            file_id = str(getattr(photo, "id", ""))
+        logger.info("[LINK_SAVE] media metadata extracted: mime=%s size=%s file=%s file_id=%s",
+                    mime_type, file_size, file_name, file_id)
+    except Exception as exc:
+        logger.error("[LINK_SAVE] media metadata extraction failed: %s", exc, exc_info=True)
+        return f"❌ Media metadata extraction failed: {exc}"
 
     media_type = detect_media_type(mime_type)
     if not file_name:
         file_name = generate_filename(media, mime_type, save_code)
     tags = build_tags(media_type, now)
 
-    max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
-    if file_size and file_size > max_bytes:
-        mb = file_size / (1024 * 1024)
-        limit_mb = settings_service.max_deep_save_mb()
-        return (
-            f"⚠️ File is {mb:.1f} MB — exceeds the "
-            f"{limit_mb} MB deep-save limit."
-        )
+    try:
+        max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
+        if file_size and file_size > max_bytes:
+            mb = file_size / (1024 * 1024)
+            limit_mb = settings_service.max_deep_save_mb()
+            logger.warning("[LINK_SAVE] file too large: %s MB > %s MB limit", mb, limit_mb)
+            return (
+                f"⚠️ File is {mb:.1f} MB — exceeds the "
+                f"{limit_mb} MB deep-save limit."
+            )
+    except Exception as exc:
+        logger.error("[LINK_SAVE] size limit check failed: %s", exc, exc_info=True)
+        return f"❌ Size limit check failed: {exc}"
 
-    caption = build_caption(
-        save_code=save_code,
-        sender=sender_name,
-        chat_id=origin_chat_id,
-        msg_id=origin_msg_id,
-        dt=now,
-        media_type=media_type,
-        mime=mime_type,
-        file_size=file_size,
-        file_name=file_name,
-        tags=tags,
-    )
+    try:
+        caption = build_caption(
+            save_code=save_code,
+            sender=sender_name,
+            chat_id=origin_chat_id,
+            msg_id=origin_msg_id,
+            dt=now,
+            media_type=media_type,
+            mime=mime_type,
+            file_size=file_size,
+            file_name=file_name,
+            tags=tags,
+        )
+        logger.info("[LINK_SAVE] caption built")
+    except Exception as exc:
+        logger.error("[LINK_SAVE] caption build failed: %s", exc, exc_info=True)
+        return f"❌ Caption build failed: {exc}"
 
     buf = io.BytesIO()
     sent = None
@@ -414,15 +449,11 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         t0 = asyncio.get_event_loop().time()
         await client.download_media(target_msg, file=buf, progress_callback=_on_download)
         record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-
-        if progress_msg:
-            try:
-                await progress_msg.edit(dl_tracker.final())
-            except Exception:
-                pass
+        logger.info("[LINK_SAVE] download complete: %s bytes", buf.tell())
 
         buf_size = buf.tell()
         if buf_size == 0:
+            logger.error("[LINK_SAVE] download produced empty buffer")
             return "❌ Download produced an empty buffer."
 
         buf.seek(0)
@@ -449,21 +480,17 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
                 progress_callback=_on_upload,
             )
             record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+            logger.info("[LINK_SAVE] upload complete: saved_chat_id=%s saved_msg_id=%s",
+                        getattr(sent, "chat_id", None), getattr(sent, "id", None))
         except Exception as exc:
-            logger.error("[LINK_SAVE] upload failed: %s", exc)
+            logger.error("[LINK_SAVE] upload failed: %s", exc, exc_info=True)
             record_event("save", "send_file", 0, "ERROR", str(exc))
             return f"❌ Upload failed: {exc}"
-
-        if progress_msg:
-            try:
-                await progress_msg.edit(ul_tracker.final())
-            except Exception:
-                pass
 
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.error("[LINK_SAVE] download failed: %s", exc)
+        logger.error("[LINK_SAVE] download failed: %s", exc, exc_info=True)
         record_event("save", "download_media", 0, "ERROR", str(exc))
         return f"❌ Download failed: {exc}"
     finally:
@@ -490,21 +517,23 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         "owner_id": owner_id,
         "created_at": now.isoformat(),
     }
-    inserted = None
     try:
+        logger.info("[LINK_SAVE] database insert started: %s", save_code)
         inserted = db_client.insert_save(payload)
+        logger.info("[LINK_SAVE] database insert complete: %s inserted=%s", save_code, inserted is not None)
     except Exception as exc:
-        logger.error("[SAVE_DB] link deep insert_save raised: %s", exc, exc_info=True)
-    if inserted is None:
-        logger.error("[SAVE_DB] link deep insert returned None — row NOT in database")
-    else:
-        logger.info("[SAVE_DB] link deep insert_ok=True id=%s", inserted.get("id"))
+        logger.error("[LINK_SAVE] database insert failed: %s", exc, exc_info=True)
+        inserted = None
 
-    await db_client.log(owner_id, "INFO", f"Saved D {save_code} (link)", {
-        "save_code": save_code,
-        "origin_chat_id": origin_chat_id,
-        "origin_msg_id": origin_msg_id,
-    })
+    try:
+        await db_client.log(owner_id, "INFO", f"Saved D {save_code} (link)", {
+            "save_code": save_code,
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+        })
+    except Exception as exc:
+        logger.error("[LINK_SAVE] db log write failed: %s", exc, exc_info=True)
+
     logger.info("[LINK_SAVE] completed: %s", save_code)
     return build_confirmation(save_code, "d", media_type, file_name)
 
