@@ -2,12 +2,13 @@
 Database layer — Supabase if available, in-memory fallback otherwise.
 
 The singleton client is initialised on first access. If Supabase env
-vars are missing or the connection fails, all operations silently
-degrade to in-memory storage so the bot never crashes.
+vars are missing or the connection fails, all operations degrade to
+in-memory storage so the bot never crashes.
 
 Every public function wraps its Supabase call in try/except so that
 a network error, missing table, or DNS failure never propagates to
-the caller — the in-memory fallback is used instead.
+the caller — the in-memory fallback is used instead. Failures are
+logged loudly with [SAVE_DB] tags so no silent failures hide.
 """
 import asyncio
 import logging
@@ -44,7 +45,7 @@ def get_db():
     _initialised = True
 
     if not _check_available():
-        logger.warning("Supabase env vars not set — using in-memory fallback.")
+        logger.warning("[SAVE_DB] Supabase env vars not set — using in-memory fallback.")
         _available = False
         return None
 
@@ -55,10 +56,10 @@ def get_db():
             os.environ["SUPABASE_SERVICE_ROLE_KEY"],
         )
         _available = True
-        logger.info("Supabase client initialised.")
+        logger.info("[SAVE_DB] Supabase client initialised.")
         return _client
     except Exception as exc:
-        logger.warning("Supabase init failed (%s) — using in-memory fallback.", exc)
+        logger.error("[SAVE_DB] Supabase init FAILED (%s) — using in-memory fallback.", exc)
         _available = False
         return None
 
@@ -82,8 +83,8 @@ async def log(owner_id: int, level: str, message: str, context: dict | None = No
         else:
             entry["id"] = len(_fallback["bot_logs"]) + 1
             _fallback["bot_logs"].append(entry)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("[SAVE_DB] bot_logs insert FAILED: %s", exc)
 
 
 async def get_next_save_code() -> str:
@@ -96,18 +97,23 @@ async def get_next_save_code() -> str:
     """
     async with _save_code_lock:
         db = get_db()
+        if db is None:
+            logger.warning("[SAVE_DB] get_next_save_code: DB unavailable — using fallback counter.")
+            count = len(_fallback["saved_items"])
+            sequential = f"{_SHORT_CODE_PREFIX}{count + 1:0{_SHORT_CODE_NUM_LEN}d}"
+            return sequential
+
         count = 0
-        if db:
-            try:
-                result = db.table("saved_items").select("id", count="exact").execute()
-                count = result.count or 0
-            except Exception:
-                count = len(_fallback["saved_items"])
-        else:
+        try:
+            result = db.table("saved_items").select("id", count="exact").execute()
+            count = result.count or 0
+        except Exception as exc:
+            logger.error("[SAVE_DB] get_next_save_code count query FAILED: %s", exc)
             count = len(_fallback["saved_items"])
 
         sequential = f"{_SHORT_CODE_PREFIX}{count + 1:0{_SHORT_CODE_NUM_LEN}d}"
         if await _is_code_free(sequential):
+            logger.info("[SAVE_DB] get_next_save_code → %s (sequential)", sequential)
             return sequential
 
         for _ in range(50):
@@ -115,8 +121,10 @@ async def get_next_save_code() -> str:
                 random.choices(_SHORT_CODE_ALPHABET, k=4)
             )
             if await _is_code_free(rand_code):
+                logger.info("[SAVE_DB] get_next_save_code → %s (random)", rand_code)
                 return rand_code
 
+        logger.warning("[SAVE_DB] get_next_save_code: collision fallback → %s", sequential)
         return sequential
 
 
@@ -133,8 +141,9 @@ async def _is_code_free(code: str) -> bool:
                 .execute()
             )
             return not (res.data or [])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("[SAVE_DB] _is_code_free(%s) query FAILED: %s", code, exc)
+            return True
     for item in _fallback["saved_items"]:
         if item.get("save_code") == code or item.get("short_code") == code:
             return False
@@ -142,18 +151,34 @@ async def _is_code_free(code: str) -> bool:
 
 
 def insert_save(data: dict) -> dict | None:
+    """Insert a saved_items row. Logs the full payload + response with [SAVE_DB].
+
+    Returns the inserted row, or None on failure. Never raises.
+    """
     db = get_db()
-    if db:
-        try:
-            result = db.table("saved_items").insert(data).execute()
-            record_event("database", "insert saved_items", 0, "SUCCESS")
-            return result.data[0] if result.data else None
-        except Exception as exc:
-            logger.warning("Supabase insert_save failed (%s) — using fallback.", exc)
-            record_event("database", "insert saved_items", 0, "ERROR", str(exc))
-    data["id"] = len(_fallback["saved_items"]) + 1
-    _fallback["saved_items"].append(data)
-    return data
+    logger.info("[SAVE_DB] insert_save payload=%s", _safe_payload(data))
+    if db is None:
+        logger.warning("[SAVE_DB] insert_save: DB unavailable — storing in fallback.")
+        data["id"] = len(_fallback["saved_items"]) + 1
+        _fallback["saved_items"].append(data)
+        logger.info("[SAVE_DB] insert_save fallback_ok=True id=%s", data["id"])
+        return data
+
+    try:
+        result = db.table("saved_items").insert(data).execute()
+        inserted = result.data[0] if result.data else None
+        if inserted is None:
+            logger.error("[SAVE_DB] insert_save ERROR: insert() returned no data. response=%s", result)
+            record_event("database", "insert saved_items", 0, "ERROR", "insert returned no data")
+            return None
+        logger.info("[SAVE_DB] insert_save response=%s", _safe_row(inserted))
+        logger.info("[SAVE_DB] insert_ok=True id=%s", inserted.get("id"))
+        record_event("database", "insert saved_items", 0, "SUCCESS")
+        return inserted
+    except Exception as exc:
+        logger.error("[SAVE_DB] insert_save ERROR: %s", exc, exc_info=True)
+        record_event("database", "insert saved_items", 0, "ERROR", str(exc))
+        return None
 
 
 def query_save(save_code: str) -> dict | None:
@@ -172,7 +197,7 @@ def query_save(save_code: str) -> dict | None:
             record_event("database", "select saved_items", 0, "SUCCESS")
             return result.data
         except Exception as exc:
-            logger.warning("Supabase query_save failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] query_save(%s) FAILED: %s", code, exc)
             record_event("database", "select saved_items", 0, "ERROR", str(exc))
     for item in _fallback["saved_items"]:
         sc = (item.get("short_code") or "").upper()
@@ -202,7 +227,7 @@ def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, i
             )
             return result.data or [], count_res.count or 0
         except Exception as exc:
-            logger.warning("Supabase list_saves failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] list_saves FAILED: %s", exc)
     items = [s for s in _fallback["saved_items"] if s.get("owner_id") == owner_id]
     total = len(items)
     return items[offset:offset + limit], total
@@ -223,7 +248,7 @@ def list_recent_saves(owner_id: int, limit: int = 10) -> list:
             )
             return result.data or []
         except Exception as exc:
-            logger.warning("Supabase list_recent_saves failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] list_recent_saves FAILED: %s", exc)
     items = sorted(
         [s for s in _fallback["saved_items"] if s.get("owner_id") == owner_id],
         key=lambda x: x.get("created_at", ""),
@@ -259,7 +284,7 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
             )
             return result.data or []
         except Exception as exc:
-            logger.warning("Supabase search_saves failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] search_saves FAILED: %s", exc)
     q_lower = query.lower()
     matches = []
     for item in _fallback["saved_items"]:
@@ -291,7 +316,7 @@ def delete_save(owner_id: int, code: str) -> dict | None:
             )
             return target if (res.data or []) else None
         except Exception as exc:
-            logger.warning("Supabase delete_save failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] delete_save FAILED: %s", exc)
     _fallback["saved_items"] = [
         s for s in _fallback["saved_items"]
         if not (s.get("short_code") == target.get("short_code")
@@ -323,7 +348,7 @@ def delete_save_row(owner_id: int, code: str) -> dict | None:
             )
             return target if (res.data or []) else None
         except Exception as exc:
-            logger.warning("Supabase delete_save_row failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] delete_save_row FAILED: %s", exc)
     _fallback["saved_items"] = [
         s for s in _fallback["saved_items"]
         if not (s.get("short_code") == target.get("short_code")
@@ -346,7 +371,7 @@ def list_all_saves(owner_id: int) -> list:
             )
             return result.data or []
         except Exception as exc:
-            logger.warning("Supabase list_all_saves failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] list_all_saves FAILED: %s", exc)
     items = [s for s in _fallback["saved_items"] if s.get("owner_id") == owner_id]
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items
@@ -368,7 +393,7 @@ def cleanup_orphans(owner_id: int, orphan_ids: list[int]) -> int:
             )
             return len(res.data) if res.data else 0
         except Exception as exc:
-            logger.warning("Supabase cleanup_orphans failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] cleanup_orphans FAILED: %s", exc)
     before = len(_fallback["saved_items"])
     id_set = set(orphan_ids)
     _fallback["saved_items"] = [
@@ -422,7 +447,7 @@ def update_save_field(owner_id: int, code: str, field: str, value) -> dict | Non
             )
             return res.data[0] if (res.data or []) else None
         except Exception as exc:
-            logger.warning("Supabase update_save_field failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] update_save_field FAILED: %s", exc)
     target[field] = value
     return target
 
@@ -437,7 +462,7 @@ def count_saves(owner_id: int, save_type: str | None = None) -> int:
             result = q.execute()
             return result.count or 0
         except Exception as exc:
-            logger.warning("Supabase count_saves failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] count_saves FAILED: %s", exc)
     items = [s for s in _fallback["saved_items"] if s.get("owner_id") == owner_id]
     if save_type:
         items = [s for s in items if s.get("save_type") == save_type]
@@ -457,7 +482,7 @@ def get_bio_state(owner_id: int) -> dict | None:
             )
             return result.data
         except Exception as exc:
-            logger.warning("Supabase get_bio_state failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] get_bio_state FAILED: %s", exc)
     return _fallback["bio_state"].get(owner_id)
 
 
@@ -490,7 +515,7 @@ def get_or_create_bio_state(owner_id: int) -> dict:
             if result.data:
                 return result.data
         except Exception as exc:
-            logger.warning("Supabase get_or_create_bio_state failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] get_or_create_bio_state FAILED: %s", exc)
     _fallback["bio_state"][owner_id] = default
     return default
 
@@ -502,7 +527,7 @@ def update_bio_state(owner_id: int, updates: dict) -> None:
             db.table("bio_state").update(updates).eq("owner_id", owner_id).execute()
             return
         except Exception as exc:
-            logger.warning("Supabase update_bio_state failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] update_bio_state FAILED: %s", exc)
     state = _fallback["bio_state"].get(owner_id, {})
     state.update(updates)
     _fallback["bio_state"][owner_id] = state
@@ -520,7 +545,7 @@ def count_logs(owner_id: int) -> int:
             )
             return result.count or 0
         except Exception as exc:
-            logger.warning("Supabase count_logs failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] count_logs FAILED: %s", exc)
     return len([l for l in _fallback["bot_logs"] if l.get("owner_id") == owner_id])
 
 
@@ -538,7 +563,7 @@ def list_logs(owner_id: int, limit: int = 100) -> list:
             )
             return result.data or []
         except Exception as exc:
-            logger.warning("Supabase list_logs failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] list_logs FAILED: %s", exc)
     logs = [l for l in _fallback["bot_logs"] if l.get("owner_id") == owner_id]
     return logs[-limit:] if limit > 0 else logs
 
@@ -557,10 +582,36 @@ def clean_logs(owner_id: int, days: int = 7) -> int:
             )
             return len(result.data) if result.data else 0
         except Exception as exc:
-            logger.warning("Supabase clean_logs failed (%s) — using fallback.", exc)
+            logger.error("[SAVE_DB] clean_logs FAILED: %s", exc)
     before = len(_fallback["bot_logs"])
     _fallback["bot_logs"] = [
         l for l in _fallback["bot_logs"]
         if l.get("owner_id") != owner_id or l.get("created_at", "") >= cutoff
     ]
     return before - len(_fallback["bot_logs"])
+
+
+def _safe_payload(data: dict) -> str:
+    """Render a payload dict for logging, truncating long fields."""
+    try:
+        redacted = {}
+        for k, v in data.items():
+            if k == "caption" and isinstance(v, str) and len(v) > 80:
+                redacted[k] = v[:80] + "…"
+            elif k == "tags" and isinstance(v, list):
+                redacted[k] = v
+            else:
+                redacted[k] = v
+        return repr(redacted)
+    except Exception:
+        return "<unreprable>"
+
+
+def _safe_row(row: dict | None) -> str:
+    """Render an inserted row for logging."""
+    if row is None:
+        return "None"
+    try:
+        return repr({k: row.get(k) for k in ("id", "save_code", "short_code", "owner_id")})
+    except Exception:
+        return "<unreprable>"
