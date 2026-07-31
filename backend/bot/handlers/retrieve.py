@@ -180,7 +180,8 @@ async def _retrieve_item_exec_action(event, extra: str) -> tuple[str, str, list]
     if not code:
         return "Retrieve", "❌ No code specified.", []
     chat_id = getattr(event, "chat_id", None)
-    if chat_id is None:
+    if not chat_id:
+        logger.error("[RETRIEVE] invalid target chat from callback: chat_id=%r", chat_id)
         return "Retrieve", "❌ Cannot determine target chat.", []
     result = await retrieve_service.do_retrieve(_self_client, _owner_id, code, chat_id)
     row = db_client.query_save(code)
