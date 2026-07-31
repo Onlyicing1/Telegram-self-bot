@@ -7,7 +7,10 @@ No business logic exists in any handler module.
 import asyncio
 import io
 import logging
+import os
 import re
+import shutil
+import tempfile
 import time
 from datetime import datetime
 
@@ -228,12 +231,14 @@ def _render_progress(phase: str, received: int, total: int | None, elapsed: floa
     bar = _progress_bar(perc)
     total_str = _format_bytes(total) if total else "—"
     label = "Downloading..." if phase == "download" else "Uploading..."
+    speed = int(received / elapsed) if elapsed > 0 else 0
     return (
         f"{label}\n"
         f"{bar} {perc:.0f}%\n"
         f"{'Downloaded' if phase == 'download' else 'Uploaded'}:\n"
         f"{_format_bytes(received)} / {total_str}\n"
         f"Total Size:\n{total_str}\n"
+        f"Speed:\n{_format_bytes(speed)}/s\n"
         f"Elapsed:\n{_format_elapsed(elapsed)}"
     )
 
@@ -400,20 +405,6 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     tags = build_tags(media_type, now)
 
     try:
-        max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
-        if file_size and file_size > max_bytes:
-            mb = file_size / (1024 * 1024)
-            limit_mb = settings_service.max_deep_save_mb()
-            logger.warning("[LINK_SAVE] file too large: %s MB > %s MB limit", mb, limit_mb)
-            return (
-                f"⚠️ File is {mb:.1f} MB — exceeds the "
-                f"{limit_mb} MB deep-save limit."
-            )
-    except Exception as exc:
-        logger.error("[LINK_SAVE] size limit check failed: %s", exc, exc_info=True)
-        return f"❌ Size limit check failed: {exc}"
-
-    try:
         caption = build_caption(
             save_code=save_code,
             sender=sender_name,
@@ -431,10 +422,36 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         logger.error("[LINK_SAVE] caption build failed: %s", exc, exc_info=True)
         return f"❌ Caption build failed: {exc}"
 
-    buf = io.BytesIO()
+    from backend.helper.client import get_client as _get_helper
+
+    tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
+    tmp_path = os.path.join(tmp_dir, file_name)
     sent = None
     try:
-        logger.info("[LINK_SAVE] download started: %s", save_code)
+        download_client = client
+        download_msg = target_msg
+
+        helper = _get_helper()
+        if helper and helper.is_connected():
+            try:
+                logger.info("[LINK_SAVE] helper bot available, fetching message with helper...")
+                if chat_id:
+                    h_msg = await helper.get_messages(chat_id, ids=msg_id)
+                else:
+                    h_entity = await helper.get_entity(channel)
+                    h_msg = await helper.get_messages(h_entity, ids=msg_id)
+                if h_msg is not None:
+                    download_client = helper
+                    download_msg = h_msg
+                    logger.info("[LINK_SAVE] helper bot fetched message, will use helper for download")
+                else:
+                    logger.warning("[LINK_SAVE] helper bot returned None message, falling back to self")
+            except Exception as exc:
+                logger.warning("[LINK_SAVE] helper bot fetch failed, falling back to self: %s", exc, exc_info=True)
+        else:
+            logger.info("[LINK_SAVE] helper bot not available, using self account for download")
+
+        logger.info("[LINK_SAVE] download started: %s -> %s", save_code, tmp_path)
 
         dl_tracker = _ProgressTracker()
 
@@ -447,20 +464,21 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
                     pass
 
         t0 = asyncio.get_event_loop().time()
-        await client.download_media(target_msg, file=buf, progress_callback=_on_download)
+        result_path = await download_client.download_media(
+            download_msg, file=tmp_path, progress_callback=_on_download,
+        )
         record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        logger.info("[LINK_SAVE] download complete: %s bytes", buf.tell())
+        logger.info("[LINK_SAVE] download complete: path=%s", result_path)
 
-        buf_size = buf.tell()
-        if buf_size == 0:
-            logger.error("[LINK_SAVE] download produced empty buffer")
-            return "❌ Download produced an empty buffer."
+        if result_path is None or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            logger.error("[LINK_SAVE] download produced empty or missing file")
+            return "❌ Download produced an empty file."
 
-        buf.seek(0)
-        buf.name = file_name
+        actual_size = os.path.getsize(tmp_path)
+        logger.info("[LINK_SAVE] downloaded file size: %s bytes", actual_size)
 
         logger.info("[LINK_SAVE] upload started: %s", save_code)
-        ul_tracker = _UploadProgressTracker(file_size)
+        ul_tracker = _UploadProgressTracker(file_size or actual_size)
 
         def _on_upload(sent_bytes, total):
             text = ul_tracker.update(sent_bytes, total)
@@ -474,7 +492,7 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
             t1 = asyncio.get_event_loop().time()
             sent = await client.send_file(
                 "me",
-                buf,
+                tmp_path,
                 caption=caption,
                 force_document=False,
                 progress_callback=_on_upload,
@@ -494,7 +512,8 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         record_event("save", "download_media", 0, "ERROR", str(exc))
         return f"❌ Download failed: {exc}"
     finally:
-        buf.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info("[LINK_SAVE] temp file cleaned up: %s", tmp_path)
 
     saved_chat_id = sent.chat_id if sent else None
     saved_msg_id = sent.id if sent else None
