@@ -203,6 +203,12 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
         file_name = generate_filename(media, mime_type, save_code)
     tags = build_tags(media_type, now)
 
+    has_media = media is not None
+    logger.info(
+        "[SAVE] owner=%s mode=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
+        owner_id, mode, has_media, save_code, file_name, mime_type, file_size, file_id,
+    )
+
     if mode == "f":
         t0 = asyncio.get_event_loop().time()
         try:
@@ -216,29 +222,35 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             record_event("save", "forward_messages", 0, "ERROR", str(exc))
             return f"❌ Forward failed: {exc}"
 
+        payload = {
+            "save_code": save_code,
+            "short_code": save_code,
+            "save_type": "forward",
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+            "saved_chat_id": saved_chat_id,
+            "saved_msg_id": saved_msg_id,
+            "sender_name": sender_name,
+            "sender_id": sender_id,
+            "mime_type": mime_type,
+            "file_id": file_id,
+            "file_size": file_size,
+            "media_type": media_type,
+            "file_name": file_name,
+            "tags": tags,
+            "caption": None,
+            "owner_id": owner_id,
+            "created_at": now.isoformat(),
+        }
+        inserted = None
         try:
-            db_client.insert_save({
-                "save_code": save_code,
-                "short_code": save_code,
-                "save_type": "forward",
-                "origin_chat_id": origin_chat_id,
-                "origin_msg_id": origin_msg_id,
-                "saved_chat_id": saved_chat_id,
-                "saved_msg_id": saved_msg_id,
-                "sender_name": sender_name,
-                "sender_id": sender_id,
-                "mime_type": mime_type,
-                "file_id": file_id,
-                "file_size": file_size,
-                "media_type": media_type,
-                "file_name": file_name,
-                "tags": tags,
-                "caption": None,
-                "owner_id": owner_id,
-                "created_at": now.isoformat(),
-            })
+            inserted = db_client.insert_save(payload)
         except Exception as exc:
-            logger.warning("save DB insert failed: %s", exc)
+            logger.error("[SAVE_DB] forward insert_save raised: %s", exc, exc_info=True)
+        if inserted is None:
+            logger.error("[SAVE_DB] forward insert returned None — row NOT in database")
+        else:
+            logger.info("[SAVE_DB] forward insert_ok=True id=%s", inserted.get("id"))
 
         await db_client.log(owner_id, "INFO", f"Saved F {save_code}", {
             "save_code": save_code,
@@ -314,29 +326,35 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
         saved_chat_id = sent.chat_id if sent else None
         saved_msg_id = sent.id if sent else None
 
+        payload = {
+            "save_code": save_code,
+            "short_code": save_code,
+            "save_type": "deep",
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+            "saved_chat_id": saved_chat_id,
+            "saved_msg_id": saved_msg_id,
+            "sender_name": sender_name,
+            "sender_id": sender_id,
+            "mime_type": mime_type,
+            "file_id": file_id,
+            "file_size": file_size,
+            "media_type": media_type,
+            "file_name": file_name,
+            "tags": tags,
+            "caption": caption,
+            "owner_id": owner_id,
+            "created_at": now.isoformat(),
+        }
+        inserted = None
         try:
-            db_client.insert_save({
-                "save_code": save_code,
-                "short_code": save_code,
-                "save_type": "deep",
-                "origin_chat_id": origin_chat_id,
-                "origin_msg_id": origin_msg_id,
-                "saved_chat_id": saved_chat_id,
-                "saved_msg_id": saved_msg_id,
-                "sender_name": sender_name,
-                "sender_id": sender_id,
-                "mime_type": mime_type,
-                "file_id": file_id,
-                "file_size": file_size,
-                "media_type": media_type,
-                "file_name": file_name,
-                "tags": tags,
-                "caption": caption,
-                "owner_id": owner_id,
-                "created_at": now.isoformat(),
-            })
+            inserted = db_client.insert_save(payload)
         except Exception as exc:
-            logger.warning("save DB insert failed: %s", exc)
+            logger.error("[SAVE_DB] deep insert_save raised: %s", exc, exc_info=True)
+        if inserted is None:
+            logger.error("[SAVE_DB] deep insert returned None — row NOT in database")
+        else:
+            logger.info("[SAVE_DB] deep insert_ok=True id=%s", inserted.get("id"))
 
         await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
             "save_code": save_code,
