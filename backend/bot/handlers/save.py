@@ -17,6 +17,8 @@ from backend.helper import (
     InlinePanelBuilder,
     register_panel,
     register_inline_builder,
+    register_input,
+    register_action,
     send_inline_panel,
     render,
     TargetContext,
@@ -50,6 +52,7 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:exec:f")
     builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
+    builder.add_row("🔗 Save by Link", "input:save:link")
     return "Save Engine", "Choose a save mode:", builder.build()
 
 
@@ -57,12 +60,52 @@ async def _save_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:exec:f")
     builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
+    builder.add_row("🔗 Save by Link", "input:save:link")
     return [render("Save Engine", "Choose a save mode:", builder.build())]
+
+
+async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.input_state import get_pending, clear_pending
+
+    owner_id = _owner_id
+    client = _self_client
+    clear_pending(owner_id)
+
+    link = text.strip()
+    if not link:
+        result = "⚠️ Link cannot be empty."
+    else:
+        progress_msg = None
+        if inline_chat_id and inline_msg_id:
+            try:
+                progress_msg = await client.get_messages(inline_chat_id, ids=inline_msg_id)
+            except Exception:
+                pass
+        result = await save_service.execute_link_save(
+            client, owner_id, link, "UTC", progress_msg=progress_msg,
+        )
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("link save inline edit failed: %s", exc)
+    if client:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 def register(client, owner_id: int, tz_str: str) -> None:
     register_panel("save", _save_panel_handler)
     register_inline_builder("save", _save_inline_builder)
+    register_input("save", "link", {
+        "handler": _save_link_input_handler,
+        "prompt": "**Save by Link**\n\nSend a Telegram message link:\n`https://t.me/channel/123`\n`https://t.me/c/123/456`\n\n_Reply with the link below._",
+    })
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:save|s) (f|d)$"))
     async def save_cmd(event) -> None:
