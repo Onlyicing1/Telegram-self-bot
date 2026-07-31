@@ -24,11 +24,11 @@ from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
-_LINK_PATTERNS = [
-    re.compile(r"https?://t\.me/(\w+)/(\d+)"),
-    re.compile(r"https?://t\.me/c/(\d+)/(\d+)"),
-    re.compile(r"https?://t\.me/(\w+)/(\d+)/(\d+)"),
-]
+_LINK_RE = re.compile(
+    r"https?://(?:t|telegram)\.me/"
+    r"(?:c/(\d+)/(\d+)"        # private:  /c/<internal_chat>/<msg_id>
+    r"|(\w+)/(\d+))"           # username: /<username>/<msg_id>
+)
 
 _PROGRESS_INTERVAL = 120
 _PROGRESS_BAR_LEN = 10
@@ -169,19 +169,32 @@ def _unwrap_forward(result) -> object | None:
 
 
 def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
-    """Parse a t.me link into (channel_username, chat_id, msg_id).
+    """Parse a t.me / telegram.me link into (username, chat_id, msg_id).
+
+    For private "/c/" links:
+      https://t.me/c/3080318802/42  →  (None, -1003080318802, 42)
+    For username links:
+      https://t.me/somechannel/42    →  ("somechannel", 0, 42)
 
     Returns (None, 0, 0) if the link doesn't match any known pattern.
     """
-    link = link.strip()
-    for pat in _LINK_PATTERNS:
-        m = pat.match(link)
-        if m:
-            groups = m.groups()
-            if len(groups) == 3:
-                return groups[0], int(groups[1]), int(groups[2])
-            return groups[0], 0, int(groups[1])
-    return None, 0, 0
+    m = _LINK_RE.search(link.strip())
+    if not m:
+        return None, 0, 0
+
+    private_chat, private_msg = m.group(1), m.group(2)
+    username, username_msg = m.group(3), m.group(4)
+
+    if private_chat is not None:
+        chat_id = int(f"-100{private_chat}")
+        msg_id = int(private_msg)
+        logger.info("[LINK_SAVE] parsed type=private chat_id=%s msg_id=%s", chat_id, msg_id)
+        return None, chat_id, msg_id
+
+    chat_username = username
+    msg_id = int(username_msg)
+    logger.info("[LINK_SAVE] parsed type=username chat=%s msg_id=%s", chat_username, msg_id)
+    return chat_username, 0, msg_id
 
 
 def _format_bytes(n: int | None) -> str:
@@ -295,14 +308,18 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     logger.info("[LINK_SAVE] resolving link: %s", link)
     channel, chat_id, msg_id = parse_telegram_link(link)
     if not channel and not chat_id:
+        logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
         return "❌ Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
 
     try:
         if chat_id:
-            peer = int(f"-100{chat_id}")
+            logger.info("[LINK_SAVE] fetching source message...")
+            target_msg = await client.get_messages(chat_id, ids=msg_id)
         else:
-            peer = channel
-        target_msg = await client.get_messages(peer, ids=msg_id)
+            logger.info("[LINK_SAVE] resolving username '%s'...", channel)
+            entity = await client.get_entity(channel)
+            logger.info("[LINK_SAVE] fetching source message...")
+            target_msg = await client.get_messages(entity, ids=msg_id)
     except Exception as exc:
         logger.error("[LINK_SAVE] resolve failed: %s", exc)
         return f"❌ Could not resolve link: {exc}"
