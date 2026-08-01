@@ -26,27 +26,27 @@ from backend.helper.client import get_client
 logger = logging.getLogger(__name__)
 
 
-async def _bio_on_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
     return "Bio Engine", result, []
 
 
-async def _bio_off_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await bio_service.do_off(_owner_id)
     return "Bio Engine", result, []
 
 
-async def _bio_show_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _bio_show_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await bio_service.do_show(_owner_id, _resolve_tz())
     return "Bio Engine", result, []
 
 
-async def _bio_help_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _bio_help_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return "Bio Engine", bio_service._HELP, []
 
 

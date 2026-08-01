@@ -174,12 +174,11 @@ async def _retrieve_code_inline_builder(event, extra: str) -> list:
 
 # ── Actions ──
 
-async def _retrieve_item_exec_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _retrieve_item_exec_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     code = extra.strip()
     if not code:
         return "Retrieve", "❌ No code specified.", []
-    chat_id = getattr(event, "chat_id", None)
     if not chat_id:
         logger.error("[RETRIEVE] invalid target chat from callback: chat_id=%r", chat_id)
         return "Retrieve", "❌ Cannot determine target chat.", []
@@ -197,7 +196,7 @@ def _retrieve_item_buttons(code: str) -> list:
     return builder.build()
 
 
-async def _retrieve_item_delete_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _retrieve_item_delete_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     code = extra.strip()
     if not code:

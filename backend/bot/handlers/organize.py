@@ -23,13 +23,13 @@ from backend.helper.client import get_client
 logger = logging.getLogger(__name__)
 
 
-async def _organize_list_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _organize_list_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_list(_owner_id)
     return "Organizer", result, []
 
 
-async def _organize_clean_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _organize_clean_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_clean(_owner_id)
     return "Organizer", result, []
