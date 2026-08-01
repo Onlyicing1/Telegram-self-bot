@@ -33,6 +33,7 @@ from backend.runtime.tracer import trace, trace_exception
 from backend.runtime.task_guard import guarded_create_task, set_runtime_state_ref
 from backend.runtime.heartbeat import start_heartbeat, stop_heartbeat, update_state as update_heartbeat_state
 from backend.bio import engine as bio_engine
+from backend.username import engine as username_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
 from backend.db import client as db_client
@@ -181,6 +182,9 @@ class RuntimeSupervisor:
         logger.info("[4/5] Bio cron resume check")
         await self._resume_bio_cron()
 
+        logger.info("[4b/5] Username cron resume check")
+        await self._resume_username_cron()
+
         logger.info("[5/5] Starting web server on port %s", self.port)
         self._start_web_server()
 
@@ -249,6 +253,23 @@ class RuntimeSupervisor:
         except Exception as exc:
             logger.warning("[4/5] Bio cron resume check failed: %s", exc)
             set_bio_cron_ok(False)
+
+    async def _resume_username_cron(self) -> None:
+        try:
+            state = await db_client.get_username_state(self.owner_id)
+            if state and state.get("is_active"):
+                self._start_username_cron()
+                logger.info("[4b/5] Username cron resumed")
+            else:
+                logger.info("[4b/5] Username cron not active — skipping")
+        except Exception as exc:
+            logger.warning("[4b/5] Username cron resume check failed: %s", exc)
+
+    def _start_username_cron(self) -> None:
+        if self.client is None:
+            logger.warning("Cannot start username cron — no client")
+            return
+        username_engine.start_cron(self.client, self.owner_id, self.tz_str)
 
     def _start_bio_cron(self) -> None:
         if self.client is None:
@@ -562,6 +583,12 @@ class RuntimeSupervisor:
             logger.warning("Recovery: bio stop error: %s", exc)
         set_bio_cron_ok(False)
 
+        logger.info("Recovery: stopping username cron")
+        try:
+            await username_engine.stop_cron()
+        except Exception as exc:
+            logger.warning("Recovery: username stop error: %s", exc)
+
         logger.info("Recovery: stopping helper bot")
         await self._stop_helper()
         set_helper_connected(False)
@@ -614,6 +641,9 @@ class RuntimeSupervisor:
 
             logger.info("Recovery: resuming bio engine")
             await self._resume_bio_cron()
+
+            logger.info("Recovery: resuming username engine")
+            await self._resume_username_cron()
 
             logger.info("Recovery: verifying with fresh heartbeat")
             await self._verify_heartbeat()
@@ -716,6 +746,12 @@ class RuntimeSupervisor:
         except Exception:
             pass
         set_bio_cron_ok(False)
+
+        logger.info("Shutdown: stopping username cron")
+        try:
+            await username_engine.stop_cron()
+        except Exception:
+            pass
 
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
