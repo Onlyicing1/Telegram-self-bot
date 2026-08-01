@@ -16,7 +16,6 @@ from backend.helper import (
     register_action,
     send_inline_panel,
     render,
-    to_edit_buttons,
 )
 from backend.helper.client import get_client
 
@@ -26,13 +25,17 @@ logger = logging.getLogger(__name__)
 async def _organize_list_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_list(_owner_id)
-    return "Organizer", result, []
+    builder = InlinePanelBuilder()
+    builder.add_row("‹ Back to Organizer", "panel:organize")
+    return "Organizer", result, builder.build()
 
 
 async def _organize_clean_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_clean(_owner_id)
-    return "Organizer", result, []
+    builder = InlinePanelBuilder()
+    builder.add_row("‹ Back to Organizer", "panel:organize")
+    return "Organizer", result, builder.build()
 
 
 async def _organize_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
