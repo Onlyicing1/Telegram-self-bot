@@ -72,14 +72,13 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         ],
     ),
     (
-        "Organizer",
+        "Delete",
         [
-            "**Organizer**\n",
+            "**Delete**\n",
             "`.del <n>` — Delete last n messages",
             "`.del id <msgid>` — Delete from msgid",
             "`.del <code>` — Delete a saved item",
-            "`.organize list` — Data overview",
-            "`.organize clean` — Purge old logs",
+            "`.del` — Delete panel",
         ],
     ),
     (
@@ -162,20 +161,18 @@ def _build_retrieve_buttons() -> list:
     return builder.build()
 
 
-def _organizer_body() -> str:
+def _delete_body() -> str:
     return (
-        "**Organizer**\n\n"
+        "**Delete**\n\n"
         "Tap a button to perform an action."
     )
 
 
-def _build_organizer_buttons() -> list:
+def _build_delete_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete from Msg ID", "input:del:id")
+    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
     builder.add_row("🗑 Delete saved item", "input:del:code")
-    builder.add_row("📋 Data Overview", "action:organize_list")
-    builder.add_row("🧹 Clean old logs", "action:organize_clean")
     return builder.build()
 
 
@@ -192,7 +189,7 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
                 if idx == 1:
                     return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
                 if idx == 2:
-                    return _HELP_CATEGORIES[2][0], _organizer_body(), _build_organizer_buttons()
+                    return _HELP_CATEGORIES[2][0], _delete_body(), _build_delete_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -205,7 +202,7 @@ async def _help_inline_builder(event, extra: str) -> list:
     if extra.startswith("cat:1"):
         return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
     if extra.startswith("cat:2"):
-        return [render("Organizer", _organizer_body(), _build_organizer_buttons())]
+        return [render("Delete", _delete_body(), _build_delete_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
@@ -310,6 +307,7 @@ async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, st
 
 async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.target_context import get_target
 
     owner_id = _owner_id
     client = _self_client
@@ -344,6 +342,14 @@ async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str,
         f"**Current Chat ID:**\n`{chat_id_val}`\n\n"
         f"**Current Message ID:**\n`{msg_id_val}`"
     )
+
+    ctx = get_target(owner_id)
+    if ctx and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id:
+        body += (
+            f"\n\n**Replied Chat ID:**\n`{ctx.reply_chat_id}`\n\n"
+            f"**Replied Message ID:**\n`{ctx.reply_msg_id}`"
+        )
+
     return "Chat & Message IDs", body, _build_general_buttons()
 
 
@@ -597,6 +603,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
+    builder.add_row("🗑 Delete From...", "panel:delfrom")
     return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
 
 
@@ -614,6 +621,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
+    builder.add_row("🗑 Delete From...", "panel:delfrom")
     return [render(
         "Context Panel",
         f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
@@ -897,6 +905,7 @@ def register(client, owner_id: int):
             if reply:
                 lines.append(f"**Reply Msg ID:** `{reply.id}`")
                 lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
+                lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
             await event.edit("\n".join(lines))
         except Exception as exc:
             logger.warning("id_cmd failed: %s", exc)
