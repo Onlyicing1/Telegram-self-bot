@@ -33,6 +33,8 @@ from backend.runtime.tracer import trace, trace_exception
 from backend.runtime.task_guard import guarded_create_task, set_runtime_state_ref
 from backend.runtime.heartbeat import start_heartbeat, stop_heartbeat, update_state as update_heartbeat_state
 from backend.bio import engine as bio_engine
+from backend.username import engine as username_engine
+from backend.profile import scheduler as profile_scheduler
 from backend.bot.client import build_client
 from backend.bot.router import register_all
 from backend.db import client as db_client
@@ -178,8 +180,8 @@ class RuntimeSupervisor:
         else:
             logger.info("[3/5] Helper bot: no BOT_TOKEN — inline UI disabled")
 
-        logger.info("[4/5] Bio cron resume check")
-        await self._resume_bio_cron()
+        logger.info("[4/5] Bio + Username cron resume check")
+        await self._resume_engines()
 
         logger.info("[5/5] Starting web server on port %s", self.port)
         self._start_web_server()
@@ -234,10 +236,10 @@ class RuntimeSupervisor:
             configure_callback_trace(self.client, self.owner_id)
             register_input_listener(self.client, self.owner_id)
 
-    async def _resume_bio_cron(self) -> None:
+    async def _resume_engines(self) -> None:
         try:
-            state = await db_client.get_bio_state(self.owner_id)
-            if state and state.get("is_active"):
+            bio_state = await db_client.get_bio_state(self.owner_id)
+            if bio_state and bio_state.get("is_active"):
                 self._start_bio_cron()
                 logger.info("[4/5] Bio cron resumed")
             elif self.cfg.get("BIO_UPDATE_ENABLED"):
@@ -250,12 +252,28 @@ class RuntimeSupervisor:
             logger.warning("[4/5] Bio cron resume check failed: %s", exc)
             set_bio_cron_ok(False)
 
+        try:
+            uname_state = await db_client.get_username_state(self.owner_id)
+            if uname_state and uname_state.get("is_active"):
+                self._start_username_cron()
+                logger.info("[4/5] Username cron resumed")
+            else:
+                logger.info("[4/5] Username cron not active — skipping")
+        except Exception as exc:
+            logger.warning("[4/5] Username cron resume check failed: %s", exc)
+
     def _start_bio_cron(self) -> None:
         if self.client is None:
             logger.warning("Cannot start bio cron — no client")
             return
         bio_engine.start_cron(self.client, self.owner_id, self.tz_str)
         set_bio_cron_ok(True)
+
+    def _start_username_cron(self) -> None:
+        if self.client is None:
+            logger.warning("Cannot start username cron — no client")
+            return
+        username_engine.start_cron(self.client, self.owner_id, self.tz_str)
 
     async def _start_helper(self) -> None:
         try:
@@ -612,8 +630,8 @@ class RuntimeSupervisor:
                 logger.info("Recovery: restarting helper bot")
                 await self._start_helper()
 
-            logger.info("Recovery: resuming bio engine")
-            await self._resume_bio_cron()
+            logger.info("Recovery: resuming bio + username engines")
+            await self._resume_engines()
 
             logger.info("Recovery: verifying with fresh heartbeat")
             await self._verify_heartbeat()
@@ -666,7 +684,7 @@ class RuntimeSupervisor:
 
     async def _cancel_orphan_tasks(self) -> None:
         current = asyncio.current_task()
-        protected_names = {"lifeos-watchdog", "lifeos-web", "lifeos-heartbeat"}
+        protected_names = {"lifeos-watchdog", "lifeos-web", "lifeos-heartbeat", "lifeos-profile-scheduler"}
         to_cancel = []
         for task in asyncio.all_tasks():
             if task is current:
@@ -716,6 +734,18 @@ class RuntimeSupervisor:
         except Exception:
             pass
         set_bio_cron_ok(False)
+
+        logger.info("Shutdown: stopping username cron")
+        try:
+            await username_engine.stop_cron()
+        except Exception:
+            pass
+
+        logger.info("Shutdown: stopping profile scheduler")
+        try:
+            await profile_scheduler.stop()
+        except Exception:
+            pass
 
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
