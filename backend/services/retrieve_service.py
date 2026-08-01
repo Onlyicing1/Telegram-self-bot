@@ -21,8 +21,6 @@ from backend.diagnostics import record_event
 
 logger = logging.getLogger(__name__)
 
-_METADATA_HEADER = "━━━━━━━━━━━━━━"
-_METADATA_FOOTER = "━━━━━━━━━━━━━━"
 
 
 def _format_size(size_bytes) -> str:
@@ -69,50 +67,31 @@ def _display_name(row: dict) -> str:
     return row.get("media_type") or "Untitled"
 
 
-def _folder_label(row: dict) -> str:
-    return "Unfiled"
-
-
 def build_metadata_block(row: dict) -> str:
     code = row.get("save_code") or "—"
+    saved = _format_date(row.get("created_at"))
     return (
-        f"{_METADATA_HEADER}\n"
-        f"📦 LifeOS\n\n"
-        f"Code:\n{code}\n\n"
-        f"Folder:\n{_folder_label(row)}\n\n"
-        f"Saved:\n{_format_date(row.get('created_at'))}\n"
-        f"{_METADATA_FOOTER}"
+        f"**LifeOS** `{code}`\n"
+        f"**Saved** {saved}"
     )
 
 
 def format_preview(row: dict) -> str:
     code = row.get("save_code") or "—"
-    icon = _type_icon(row)
-    return (
-        f"{icon} **{_display_name(row)}**\n\n"
-        f"**Save Code:** `{code}`\n"
-        f"**Folder:** {_folder_label(row)}\n"
-        f"**Type:** {row.get('media_type') or '—'}\n"
-        f"**MIME:** `{row.get('mime_type') or '—'}`\n"
-        f"**Size:** {_format_size(row.get('file_size'))}\n"
-        f"**Saved:** {_format_date(row.get('created_at'))}\n"
-        f"**Sender:** {row.get('sender_name') or '—'}\n\n"
-        f"**Caption:**\n{row.get('caption') or '_No original caption_'}"
-    )
-
-
-def format_list_item(row: dict) -> str:
-    code = row.get("save_code") or "—"
-    icon = _type_icon(row)
     name = _display_name(row)
-    if len(name) > 30:
-        name = name[:27] + "…"
-    folder = _folder_label(row)
-    if len(folder) > 15:
-        folder = folder[:12] + "…"
-    ftype = row.get("media_type") or row.get("mime_type") or "—"
-    date = _format_date(row.get("created_at"))
-    return f"{icon} `{code}` · {name}\n   {folder} · {ftype} · {date}"
+    media_type = row.get("media_type") or "—"
+    mime = row.get("mime_type") or "—"
+    size = _format_size(row.get("file_size"))
+    sender = row.get("sender_name") or "—"
+    saved = _format_date(row.get("created_at"))
+    return (
+        f"**{name}** `{code}`\n\n"
+        f"**Type** {media_type}\n"
+        f"**Format** `{mime}`\n"
+        f"**Size** {size}\n"
+        f"**Sender** {sender}\n"
+        f"**Saved** {saved}"
+    )
 
 
 async def do_preview(self_client, owner_id: int, save_code: str) -> str:

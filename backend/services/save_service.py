@@ -128,21 +128,21 @@ def build_caption(
     file_name: str | None,
     tags: list[str],
 ) -> str:
-    size_str = f"{file_size / 1024:.1f} KB" if file_size else "—"
-    return (
-        f"━━━━━━━━━━━━━━\n"
-        f"📦 LifeOS\n\n"
-        f"Code:\n{save_code}\n\n"
-        f"Folder:\nUnfiled\n\n"
-        f"Saved:\n{dt.strftime('%Y-%m-%d %H:%M')}\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"🎙 Sender: {sender}\n"
-        f"🖼 Type: {media_type}\n"
-        f"🧾 MIME: {mime or '—'}\n"
-        f"📦 Size: {size_str}\n"
-        f"📁 File: {file_name or '—'}\n"
-        f"🏷 Tags: {' '.join(tags)}"
-    )
+    size_str = _format_bytes(file_size) if file_size else "—"
+    lines = [
+        f"**LifeOS** `{save_code}`",
+        "",
+        f"**Type** {media_type}",
+        f"**Size** {size_str}",
+        f"**Sender** {sender}",
+        f"**Saved** {dt.strftime('%Y-%m-%d %H:%M')}",
+    ]
+    if file_name and file_name != "—":
+        lines.append(f"**File** `{file_name}`")
+    if tags:
+        lines.append("")
+        lines.append(" ".join(tags))
+    return "\n".join(lines)
 
 
 def build_confirmation(
@@ -513,7 +513,7 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         return f"❌ Download failed: {exc}"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("[LINK_SAVE] temp file cleaned up: %s", tmp_path)
+        logger.info("[LINK_SAVE] temp file cleaned up: %s", tmp_dir)
 
     saved_chat_id = sent.chat_id if sent else None
     saved_msg_id = sent.id if sent else None

@@ -98,9 +98,7 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
     if not items:
         return "Saved Items", "_No saved items found._\n\nSave something first with `.save`.", []
 
-    lines = [f"_{total} items · page {page}/{total_pages}_", ""]
-    for item in items:
-        lines.append(retrieve_service.format_list_item(item))
+    body = f"_{total} items · page {page}/{total_pages}_"
 
     builder = InlinePanelBuilder()
     for item in items:
@@ -120,7 +118,7 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
         nav_row.append(("Next ▶", f"panel:retrieve_saved:page:{page + 1}"))
     builder.add_buttons(*nav_row)
 
-    return "Saved Items", "\n".join(lines), builder.build()
+    return "Saved Items", body, builder.build()
 
 
 async def _retrieve_saved_inline_builder(event, extra: str) -> list:
