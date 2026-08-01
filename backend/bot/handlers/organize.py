@@ -59,7 +59,7 @@ def register(client, owner_id: int):
     register_action("organize_list", _organize_list_action)
     register_action("organize_clean", _organize_clean_action)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s+(list|clean)$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s+(list|clean)\s*$"))
     async def organize(event):
         if not is_owner(event, owner_id):
             return
@@ -70,7 +70,7 @@ def register(client, owner_id: int):
             result = await organize_service.do_clean(owner_id)
         await event.edit(result)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s*$"))
     async def organize_panel(event):
         if not is_owner(event, owner_id):
             return
