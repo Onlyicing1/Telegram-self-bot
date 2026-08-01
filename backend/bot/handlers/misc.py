@@ -162,6 +162,23 @@ def _build_retrieve_buttons() -> list:
     return builder.build()
 
 
+def _organizer_body() -> str:
+    return (
+        "**Organizer**\n\n"
+        "Tap a button to perform an action."
+    )
+
+
+def _build_organizer_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🗑 Delete last N messages", "input:del:n")
+    builder.add_row("🗑 Delete from Msg ID", "input:del:id")
+    builder.add_row("🗑 Delete saved item", "input:del:code")
+    builder.add_row("📋 Data Overview", "action:organize_list")
+    builder.add_row("🧹 Clean old logs", "action:organize_clean")
+    return builder.build()
+
+
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -174,6 +191,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
                     return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
                 if idx == 1:
                     return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
+                if idx == 2:
+                    return _HELP_CATEGORIES[2][0], _organizer_body(), _build_organizer_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -185,6 +204,8 @@ async def _help_inline_builder(event, extra: str) -> list:
         return [render("General", _general_body(), _build_general_buttons())]
     if extra.startswith("cat:1"):
         return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
+    if extra.startswith("cat:2"):
+        return [render("Organizer", _organizer_body(), _build_organizer_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
