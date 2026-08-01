@@ -103,17 +103,17 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("Delete last N messages", "input:del:n")
-    builder.add_row("Delete from Msg ID", "panel:delfrom")
-    builder.add_row("Delete saved item by code", "input:del:code")
+    builder.add_row("🗑 Delete last N messages", "input:del:n")
+    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
+    builder.add_row("🗑 Delete saved item", "input:del:code")
     return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Delete last N messages", "input:del:n")
-    builder.add_row("Delete from Msg ID", "panel:delfrom")
-    builder.add_row("Delete saved item by code", "input:del:code")
+    builder.add_row("🗑 Delete last N messages", "input:del:n")
+    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
+    builder.add_row("🗑 Delete saved item", "input:del:code")
     return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
@@ -189,15 +189,24 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
         return "Delete From...", "No more messages.", []
 
     builder = InlinePanelBuilder()
-    for i, msg in enumerate(page_msgs):
-        num = _RECENT_PAGE_SIZE * page + i + 1
-        text_preview = (msg.text or msg.message or "")[:30].replace("\n", " ")
-        if len(msg.text or msg.message or "") > 30:
-            text_preview += "..."
-        btn_text = f"{_circled_num(num)} {text_preview}"
-        builder.add_row(btn_text, f"panel:delfrom:confirm:{msg.id}")
+    for i in range(0, len(page_msgs), 2):
+        pair = []
+        for j in range(2):
+            idx = i + j
+            if idx < len(page_msgs):
+                msg = page_msgs[idx]
+                num = _RECENT_PAGE_SIZE * page + idx + 1
+                raw_text = msg.text or msg.message or ""
+                text_preview = raw_text[:20].replace("\n", " ")
+                if len(raw_text) > 20:
+                    text_preview += "..."
+                btn_text = f"{_circled_num(num)} {text_preview}"
+                pair.append((btn_text, f"panel:delfrom:confirm:{msg.id}"))
+        if len(pair) == 2:
+            builder.add_buttons(*pair)
+        else:
+            builder.add_row(pair[0][0], pair[0][1])
 
-    nav_builder = InlinePanelBuilder()
     has_prev = page > 0
     has_next = len(page_msgs) == _RECENT_PAGE_SIZE
     nav_buttons = []
@@ -206,9 +215,9 @@ async def _delfrom_recent_page(event, page: int) -> tuple[str, str, list]:
     if has_next:
         nav_buttons.append(("Next ›", f"panel:delfrom:recent:{page + 1}"))
     if nav_buttons:
-        nav_builder.add_buttons(*nav_buttons)
+        builder.add_buttons(*nav_buttons)
 
-    return "Delete From...", f"Recent outgoing messages (page {page + 1}):", nav_builder.build()
+    return "Delete From...", f"Recent outgoing messages (page {page + 1}):", builder.build()
 
 
 async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
@@ -220,23 +229,13 @@ async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
 
 async def _delfrom_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
-    from backend.helper.target_context import get_target, set_target, TargetContext
+    from backend.helper.target_context import get_target
     from backend.helper.input_state import set_pending
-    import os
-    from zoneinfo import ZoneInfo
 
     owner_id = _owner_id
-    client = _self_client
     ctx = get_target(owner_id)
     if not ctx or ctx.kind != "reply":
         return "Delete From...", "⚠️ No reply context. Use `.panel` while replying to a message first.", []
-
-    tz_str = "UTC"
-    try:
-        tz_str = os.getenv("TZ", "Asia/Tehran")
-        ZoneInfo(tz_str)
-    except Exception:
-        tz_str = "UTC"
 
     prompt = "**Delete From — Reply Mode**\n\nReply to any message in this chat.\nAll outgoing messages from that point will be deleted.\n\n_Reply to a message now._"
 
@@ -250,12 +249,7 @@ async def _delfrom_reply_action(event, extra: str, chat_id: int) -> tuple[str, s
 
 
 async def _delfrom_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
-    from backend.helper.input_state import clear_pending, get_pending
-
-    pending = clear_pending(0)
-    if not pending:
-        return
+    from backend.helper.inline_engine import _self_client, _owner_id
 
     client = _self_client
     try:
