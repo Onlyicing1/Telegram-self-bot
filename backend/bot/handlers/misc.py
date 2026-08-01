@@ -72,16 +72,6 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         ],
     ),
     (
-        "Delete",
-        [
-            "**Delete**\n",
-            "`.del <n>` — Delete last n messages",
-            "`.del id <msgid>` — Delete from msgid",
-            "`.del <code>` — Delete a saved item",
-            "`.del` — Delete panel",
-        ],
-    ),
-    (
         "Bio Engine",
         [
             "**Bio Engine**\n",
@@ -161,21 +151,6 @@ def _build_retrieve_buttons() -> list:
     return builder.build()
 
 
-def _delete_body() -> str:
-    return (
-        "**Delete**\n\n"
-        "Tap a button to perform an action."
-    )
-
-
-def _build_delete_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
-    builder.add_row("🗑 Delete saved item", "input:del:code")
-    return builder.build()
-
-
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -188,8 +163,6 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
                     return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
                 if idx == 1:
                     return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
-                if idx == 2:
-                    return _HELP_CATEGORIES[2][0], _delete_body(), _build_delete_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -201,8 +174,6 @@ async def _help_inline_builder(event, extra: str) -> list:
         return [render("General", _general_body(), _build_general_buttons())]
     if extra.startswith("cat:1"):
         return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
-    if extra.startswith("cat:2"):
-        return [render("Delete", _delete_body(), _build_delete_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
@@ -603,7 +574,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
-    builder.add_row("🗑 Delete From...", "panel:delfrom")
+    builder.add_row("🗑 Delete", "panel:del")
     return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
 
 
@@ -621,7 +592,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
     builder.add_row("🔗 Save by Link", "input:context:link")
     builder.add_row("👁 Preview", "panel:context:exec:preview")
-    builder.add_row("🗑 Delete From...", "panel:delfrom")
+    builder.add_row("🗑 Delete", "panel:del")
     return [render(
         "Context Panel",
         f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
