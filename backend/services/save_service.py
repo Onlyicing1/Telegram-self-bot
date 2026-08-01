@@ -172,16 +172,28 @@ def _unwrap_forward(result) -> object | None:
 
 
 def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
+    """Parse a t.me / telegram.me link into (username, chat_id, msg_id).
+
+    For private "/c/" links:
+      https://t.me/c/3080318802/42  →  (None, -1003080318802, 42)
+    For username links:
+      https://t.me/somechannel/42    →  ("somechannel", 0, 42)
+
+    Returns (None, 0, 0) if the link doesn't match any known pattern.
+    """
     m = _LINK_RE.search(link.strip())
     if not m:
         return None, 0, 0
+
     private_chat, private_msg = m.group(1), m.group(2)
     username, username_msg = m.group(3), m.group(4)
+
     if private_chat is not None:
         chat_id = int(f"-100{private_chat}")
         msg_id = int(private_msg)
         logger.info("[LINK_SAVE] parsed type=private chat_id=%s msg_id=%s", chat_id, msg_id)
         return None, chat_id, msg_id
+
     chat_username = username
     msg_id = int(username_msg)
     logger.info("[LINK_SAVE] parsed type=username chat=%s msg_id=%s", chat_username, msg_id)
@@ -232,6 +244,8 @@ def _render_progress(phase: str, received: int, total: int | None, elapsed: floa
 
 
 class _ProgressTracker:
+    """Tracks real progress from Telethon callbacks, throttles edits to 2 min."""
+
     def __init__(self):
         self._received = 0
         self._total: int | None = None
@@ -260,6 +274,8 @@ class _ProgressTracker:
 
 
 class _UploadProgressTracker:
+    """Tracks upload progress, throttles edits to 2 min."""
+
     def __init__(self, total: int | None):
         self._total = total
         self._received = 0
@@ -288,6 +304,12 @@ class _UploadProgressTracker:
 
 
 async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progress_msg=None) -> str:
+    """Resolve a Telegram link, download the media, deep-save it.
+
+    Reuses execute_save's payload/insert logic.  If progress_msg is provided
+    (a Telethon message object), it is edited at most every 2 minutes with
+    real progress from Telethon's download/upload callbacks.
+    """
     logger.info("[LINK_SAVE] resolving link: %s", link)
     channel, chat_id, msg_id = parse_telegram_link(link)
     if not channel and not chat_id:
@@ -536,6 +558,7 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
 
 
 async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str) -> str:
+    """Execute a save operation and return a result string."""
     save_code = await db_client.get_next_save_code()
     tz = _get_tz(tz_str)
     now = datetime.now(tz)

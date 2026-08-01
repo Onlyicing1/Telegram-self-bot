@@ -22,6 +22,7 @@ from backend.diagnostics import record_event
 logger = logging.getLogger(__name__)
 
 
+
 def _format_size(size_bytes) -> str:
     if not size_bytes:
         return "—"
@@ -110,6 +111,8 @@ async def do_preview(self_client, owner_id: int, save_code: str) -> str:
 
 
 async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: int) -> str:
+    """Forward the saved media to target_chat and inject the metadata block
+    into the caption. If the media had no caption, one is generated."""
     save_code = save_code.upper().strip()
     t0 = asyncio.get_event_loop().time()
     try:
