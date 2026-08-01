@@ -14,24 +14,26 @@ database, not just the migration files.
 1. [Overview](#1-overview)
 2. [saved_items](#2-saved_items)
 3. [bio_state](#3-bio_state)
-4. [bot_logs](#4-bot_logs)
-5. [panel_settings](#5-panel_settings)
-6. [Relationships](#6-relationships)
-7. [RLS Policy Model](#7-rls-policy-model)
-8. [Panel Database](#8-panel-database)
-9. [In-Memory Fallback](#9-in-memory-fallback)
-10. [Migration History](#10-migration-history)
+4. [username_state](#4-username_state)
+5. [bot_logs](#5-bot_logs)
+6. [panel_settings](#6-panel_settings)
+7. [Relationships](#7-relationships)
+8. [RLS Policy Model](#8-rls-policy-model)
+9. [Panel Database](#9-panel-database)
+10. [In-Memory Fallback](#10-in-memory-fallback)
+11. [Migration History](#11-migration-history)
 
 ---
 
 ## 1. Overview
 
-The database contains **four tables** in the `public` schema:
+The database contains **five tables** in the `public` schema:
 
 | Table | Purpose | PK | Rows |
 |---|---|---|---|
 | `saved_items` | Media save records (forward + deep) | `id` (bigserial) | One per save |
 | `bio_state` | Bio cron engine state per owner | `id` (bigserial) | One per owner |
+| `username_state` | Username cron engine state per owner | `id` (bigserial) | One per owner |
 | `bot_logs` | Structured activity log | `id` (bigserial) | One per event |
 | `panel_settings` | Glass Panel configuration (column-per-setting) | `key` (text) | One row (`"global"`) |
 
@@ -116,7 +118,40 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
-## 4. bot_logs
+## 4. username_state
+
+Singleton username engine state per owner. Mirrors `bio_state` exactly
+in structure, but controls the Telegram `first_name` field instead of
+the `about` field. Completely independent from the Bio Engine.
+
+### Columns
+
+| Column | SQL Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | `bigserial` | NO | `nextval(...)` | Primary key |
+| `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
+| `template` | `text` | NO | `'{time} | {mood}'` | Username template with tokens |
+| `mood` | `text` | NO | `'😊'` | Current mood value |
+| `custom_text` | `text` | NO | `''` | Custom text for `{text}` token |
+| `is_active` | `boolean` | NO | `false` | Whether the username cron is running |
+| `last_name` | `text` | NO | `''` | Last successfully rendered username string |
+| `updated_at` | `timestamptz` | NO | `now()` | Last update timestamp |
+
+### Indexes
+
+| Index | Columns | Type |
+|---|---|---|
+| `username_state_pkey` | `id` | btree (PK) |
+| `username_state_owner_id_key` | `owner_id` | btree (UNIQUE) |
+| `idx_username_state_owner` | `owner_id` | btree |
+
+### RLS
+
+RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
+
+---
+
+## 5. bot_logs
 
 Structured activity log.
 
@@ -145,7 +180,7 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
-## 5. panel_settings
+## 6. panel_settings
 
 Glass Panel configuration. Singleton row (key = `"global"`).
 
@@ -181,24 +216,25 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 
 ---
 
-## 6. Relationships
+## 7. Relationships
 
 There are no foreign key relationships between tables. Each table is
 independent. The `owner_id` column (present on `saved_items`, `bio_state`,
-and `bot_logs`) links rows to the bot owner but is not a foreign key.
+`username_state`, and `bot_logs`) links rows to the bot owner but is not
+a foreign key.
 
 ---
 
-## 7. RLS Policy Model
+## 8. RLS Policy Model
 
-All four tables have RLS enabled. Only SELECT policies are granted to
+All five tables have RLS enabled. Only SELECT policies are granted to
 `anon` + `authenticated` (read-only dashboard access). All writes
 (INSERT/UPDATE/DELETE) go through the backend's service-role key, which
 bypasses RLS entirely. There are no anon/authenticated write policies.
 
 ---
 
-## 8. Panel Database
+## 9. Panel Database
 
 The Glass Panel system uses a **column-per-setting** model on the
 `panel_settings` table. Each setting is a real typed column — no
@@ -287,13 +323,14 @@ and falls back silently.
 
 ---
 
-## 9. In-Memory Fallback
+## 10. In-Memory Fallback
 
 The bot is designed to run **with or without Supabase**. When the DB is
 unavailable, all operations use in-memory fallbacks:
 
 - `saved_items` → in-memory list
 - `bio_state` → in-memory dict
+- `username_state` → in-memory dict
 - `bot_logs` → in-memory list
 - `panel_settings` → hardcoded `_DEFAULTS` dict
 
@@ -301,7 +338,7 @@ The bot never crashes due to a database error.
 
 ---
 
-## 10. Migration History
+## 11. Migration History
 
 | Migration File | Date | Description |
 |---|---|---|
@@ -312,6 +349,7 @@ The bot never crashes due to a database error.
 | `20260729213959_20260729120000_create_bot_settings_table.sql` | 2026-07-29 | Created `bot_settings` key-value table (later superseded). |
 | `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` data into `panel_settings` as typed columns. Added `auto_close_delay`, `max_deep_save_mb`, `delete_batch_size`, `log_retention_days`. Dropped `bot_settings`. |
 | `20260730230000_panel_settings_full_13_columns.sql` | 2026-07-30 | Added `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `language`, `diagnostics_enabled`, `debug_callbacks`, `owner_only` columns. Introduced PanelSettingsRepository layer. |
+| `20260801215007_create_username_state_table.sql` | 2026-08-01 | Created `username_state` table for the Username Engine. Mirrors `bio_state` structure but controls `first_name`. Independent persistence — Bio Engine data untouched. |
 
 The SQL scripts in [`sql/`](sql/) represent the **current consolidated
 schema** — they are the authoritative CREATE TABLE statements for a fresh
