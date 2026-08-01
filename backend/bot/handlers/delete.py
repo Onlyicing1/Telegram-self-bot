@@ -72,22 +72,6 @@ async def _del_id_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
             pass
 
 
-async def _del_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client, _owner_id
-    result = await delete_service.do_del_code(_self_client, _owner_id, text)
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("del code inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
-
-
 async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client
     from backend.helper.input_state import clear_pending
@@ -104,16 +88,14 @@ async def _del_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 async def _del_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
-    builder.add_row("🗑 Delete saved item", "input:del:code")
+    builder.add_row("🗑 Delete From...", "panel:delfrom")
     return "Delete", "Choose a deletion mode:", builder.build()
 
 
 async def _del_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("🗑 Delete last N messages", "input:del:n")
-    builder.add_row("🗑 Delete from Msg ID", "panel:delfrom")
-    builder.add_row("🗑 Delete saved item", "input:del:code")
+    builder.add_row("🗑 Delete From...", "panel:delfrom")
     return [render("Delete", "Choose a deletion mode:", builder.build())]
 
 
@@ -300,10 +282,6 @@ def register(client, owner_id: int):
     register_input("del", "id", {
         "handler": _del_id_input_handler,
         "prompt": "**Delete from Message ID**\n\nEnter the starting message ID:\n\n_Reply with the ID below._",
-    })
-    register_input("del", "code", {
-        "handler": _del_code_input_handler,
-        "prompt": "**Delete Saved Item**\n\nEnter the save code (e.g. S0001):\n\n_Reply with the code below._",
     })
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.del(?:\s+(.+))?$"))
