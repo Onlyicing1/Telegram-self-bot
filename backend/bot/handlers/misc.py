@@ -151,6 +151,15 @@ def _build_retrieve_buttons() -> list:
     return builder.build()
 
 
+def _build_bio_help_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🔧 Variables", "panel:biohelp:vars")
+    builder.add_row("📋 Commands", "panel:biohelp:cmds")
+    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
+    builder.add_row("📝 Example", "panel:biohelp:examples")
+    return builder.build()
+
+
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -163,6 +172,8 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
                     return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
                 if idx == 1:
                     return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
+                if idx == 2:
+                    return "Bio Engine", "Choose a section:", _build_bio_help_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -174,6 +185,8 @@ async def _help_inline_builder(event, extra: str) -> list:
         return [render("General", _general_body(), _build_general_buttons())]
     if extra.startswith("cat:1"):
         return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
+    if extra.startswith("cat:2"):
+        return [render("Bio Engine", "Choose a section:", _build_bio_help_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
@@ -548,7 +561,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     if has_target:
         body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
     else:
-        body = "No replied message selected.\n\n**Delete** is available.\n**Save** requires replying to a message first."
+        body = "Choose an action:"
 
     return "Context Panel", body, builder.build()
 
@@ -571,7 +584,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     if has_target:
         body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
     else:
-        body = "No replied message selected.\n\n**Delete** is available.\n**Save** requires replying to a message first."
+        body = "Choose an action:"
 
     return [render("Context Panel", body, builder.build())]
 
