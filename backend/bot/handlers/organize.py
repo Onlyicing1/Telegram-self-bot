@@ -16,6 +16,7 @@ from backend.helper import (
     register_action,
     send_inline_panel,
     render,
+    to_edit_buttons,
 )
 from backend.helper.client import get_client
 
@@ -25,17 +26,13 @@ logger = logging.getLogger(__name__)
 async def _organize_list_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_list(_owner_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("‹ Back to Organizer", "panel:organize")
-    return "Organizer", result, builder.build()
+    return "Organizer", result, []
 
 
 async def _organize_clean_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     result = await organize_service.do_clean(_owner_id)
-    builder = InlinePanelBuilder()
-    builder.add_row("‹ Back to Organizer", "panel:organize")
-    return "Organizer", result, builder.build()
+    return "Organizer", result, []
 
 
 async def _organize_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -59,7 +56,7 @@ def register(client, owner_id: int):
     register_action("organize_list", _organize_list_action)
     register_action("organize_clean", _organize_clean_action)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s+(list|clean)\s*$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s+(list|clean)$"))
     async def organize(event):
         if not is_owner(event, owner_id):
             return
@@ -70,7 +67,7 @@ def register(client, owner_id: int):
             result = await organize_service.do_clean(owner_id)
         await event.edit(result)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize\s*$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.organize$"))
     async def organize_panel(event):
         if not is_owner(event, owner_id):
             return
