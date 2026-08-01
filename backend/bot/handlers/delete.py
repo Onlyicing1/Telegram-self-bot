@@ -256,9 +256,18 @@ async def _delfrom_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inl
         reply_msg = await client.get_messages(chat_id, ids=msg_id)
         if reply_msg and reply_msg.reply_to_msg_id:
             target_id = reply_msg.reply_to_msg_id
-            result = await delete_service.do_del_id(client, chat_id, target_id)
+            target_msg = await client.get_messages(chat_id, ids=target_id)
+            if target_msg and not getattr(target_msg, "out", True):
+                result = "⚠️ The replied message is not your outgoing message. Only your own messages can be deleted."
+            else:
+                result = await delete_service.do_del_id(client, chat_id, target_id)
+        elif reply_msg:
+            if not getattr(reply_msg, "out", True):
+                result = "⚠️ Your message was not a reply. Please reply to a message to select the starting point."
+            else:
+                result = await delete_service.do_del_id(client, chat_id, msg_id)
         else:
-            result = "⚠️ Your message was not a reply. Please reply to a message to select the starting point."
+            result = "⚠️ Could not find your reply message. Please try again."
     except Exception as exc:
         result = f"❌ Delete failed: {exc}"
 

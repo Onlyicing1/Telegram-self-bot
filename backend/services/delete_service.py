@@ -37,7 +37,7 @@ async def do_del_id(client, chat_id, start_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
         msg_ids = []
-        async for msg in client.iter_messages(chat_id, min_id=start_id - 1):
+        async for msg in client.iter_messages(chat_id, min_id=start_id - 1, from_user="me"):
             msg_ids.append(msg.id)
             if len(msg_ids) >= settings_service.delete_batch_size():
                 await client.delete_messages(chat_id, msg_ids)
