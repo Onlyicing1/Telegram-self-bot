@@ -15,15 +15,18 @@ Inline Bio panels:
   panel:biohelp:cmd:show   — Show State page
   panel:biohelp:cmd:text   — Set Text page (input prompt)
   panel:biohelp:cmd:mood   — Set Mood page (input prompt)
-  panel:biohelp:builder    — Template Builder (insert variables, preview updates in-place)
+  panel:biohelp:builder    — Template Builder (sequential append)
   panel:biohelp:custom     — Custom Template mode (reply to apply)
 
-Every page gets Back + Home + Close auto-added by _finalize_panel.
-No text command list. No .bio syntax anywhere in the UI.
-No messages sent to Saved Messages.
+Template Builder is strictly sequential — every action appends to the
+END of the buffer. Nothing is ever reordered or overwritten. The buffer
+is stored server-side (in-memory dict keyed by owner_id) so callback_data
+stays short and never truncates.
+
+Actions use short callbacks: action:bio_builder_add:{token},
+action:bio_builder_space, action:bio_builder_clear, etc.
 """
 import logging
-import urllib.parse
 
 from telethon import events
 
@@ -50,20 +53,21 @@ _BIO_VARS = [
     ("{text}", "Custom freeform text", "Working"),
 ]
 
-_DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood}"
+_DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood"
+
+_builder_buffers: dict[int, str] = {}
 
 
-def _encode_buffer(buf: str) -> str:
-    return urllib.parse.quote(buf, safe="")
+def _get_buf(owner_id: int) -> str:
+    return _builder_buffers.get(owner_id, "")
 
 
-def _decode_buffer(encoded: str) -> str:
-    if not encoded:
-        return ""
-    try:
-        return urllib.parse.unquote(encoded)
-    except Exception:
-        return ""
+def _set_buf(owner_id: int, buf: str) -> None:
+    _builder_buffers[owner_id] = buf
+
+
+def _clear_buf(owner_id: int) -> None:
+    _builder_buffers.pop(owner_id, None)
 
 
 def _render_preview(buf: str) -> str:
@@ -138,6 +142,25 @@ def _build_commands_menu_buttons() -> list:
     return builder.build()
 
 
+def _build_builder_buttons() -> list:
+    builder = InlinePanelBuilder()
+    for var_token, _, _ in _BIO_VARS:
+        builder.add_row(f"+ {var_token}", f"action:bio_builder_add:{var_token}")
+    builder.add_row("␣ Space", "action:bio_builder_space")
+    builder.add_row("🗑 Clear", "action:bio_builder_clear")
+    builder.add_row("↩ Reset", "action:bio_builder_reset")
+    builder.add_row("✅ Apply Template", "action:bio_builder_apply")
+    builder.add_row("📝 Reply to Edit", "action:bio_reply_mode")
+    return builder.build()
+
+
+def _build_applied_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("👁 Show State", "panel:bio:state")
+    builder.add_row("🏗 Back to Builder", "panel:biohelp:builder")
+    return builder.build()
+
+
 async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if not extra or extra == "menu":
         return "Bio Engine", "Choose a section:", _build_bio_help_menu_buttons()
@@ -191,30 +214,16 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
         return "Bio Commands", "Unknown command.", _build_commands_menu_buttons()
 
-    if extra == "builder" or extra.startswith("builder:"):
-        buf_encoded = ""
-        if extra.startswith("builder:"):
-            buf_encoded = extra[8:]
-        buf = _decode_buffer(buf_encoded)
-
+    if extra == "builder":
+        from backend.helper.inline_engine import _owner_id
+        buf = _get_buf(_owner_id)
         body = (
             f"**Template Builder**\n\n"
             f"**Preview:**\n{_render_preview(buf)}\n\n"
-            f"Tap a variable to add it to the preview:"
+            f"Tap a variable to append it. Tap Space to add a space.\n"
+            f"Everything is appended in order — nothing is reordered."
         )
-
-        builder = InlinePanelBuilder()
-        for var_token, _, _ in _BIO_VARS:
-            new_buf = buf + var_token
-            encoded = _encode_buffer(new_buf)
-            builder.add_row(f"+ {var_token}", f"panel:biohelp:builder:{encoded}")
-
-        builder.add_row("🗑 Clear", "panel:biohelp:builder:")
-        builder.add_row("↩ Reset", f"panel:biohelp:builder:{_encode_buffer(_DEFAULT_TEMPLATE)}")
-        if buf:
-            builder.add_row("✅ Apply Template", f"action:bio_apply:{_encode_buffer(buf)}")
-        builder.add_row("📝 Reply to Edit", "action:bio_reply_mode")
-        return "Template Builder", body, builder.build()
+        return "Template Builder", body, _build_builder_buttons()
 
     if extra == "custom":
         return await _render_custom_template_panel(event)
@@ -285,7 +294,74 @@ async def _bio_custom_reply_handler(text, chat_id, msg_id, inline_chat_id, inlin
             pass
 
 
-# ── Actions ──
+# ── Builder actions (short callbacks, server-side buffer) ──
+
+async def _bio_builder_add_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    token = extra or ""
+    buf = _get_buf(_owner_id)
+    buf = buf + token
+    _set_buf(_owner_id, buf)
+    body = (
+        f"**Template Builder**\n\n"
+        f"**Preview:**\n{_render_preview(buf)}\n\n"
+        f"Tap a variable to append it. Tap Space to add a space.\n"
+        f"Everything is appended in order — nothing is reordered."
+    )
+    return "Template Builder", body, _build_builder_buttons()
+
+
+async def _bio_builder_space_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    buf = _get_buf(_owner_id)
+    buf = buf + " "
+    _set_buf(_owner_id, buf)
+    body = (
+        f"**Template Builder**\n\n"
+        f"**Preview:**\n{_render_preview(buf)}\n\n"
+        f"Tap a variable to append it. Tap Space to add a space.\n"
+        f"Everything is appended in order — nothing is reordered."
+    )
+    return "Template Builder", body, _build_builder_buttons()
+
+
+async def _bio_builder_clear_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    _clear_buf(_owner_id)
+    body = (
+        f"**Template Builder**\n\n"
+        f"**Preview:**\n{_render_preview('')}\n\n"
+        f"Tap a variable to append it. Tap Space to add a space.\n"
+        f"Everything is appended in order — nothing is reordered."
+    )
+    return "Template Builder", body, _build_builder_buttons()
+
+
+async def _bio_builder_reset_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    _set_buf(_owner_id, _DEFAULT_TEMPLATE)
+    buf = _DEFAULT_TEMPLATE
+    body = (
+        f"**Template Builder**\n\n"
+        f"**Preview:**\n{_render_preview(buf)}\n\n"
+        f"Tap a variable to append it. Tap Space to add a space.\n"
+        f"Everything is appended in order — nothing is reordered."
+    )
+    return "Template Builder", body, _build_builder_buttons()
+
+
+async def _bio_builder_apply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    buf = _get_buf(_owner_id)
+    if not buf:
+        return "Template Builder", "⚠️ Nothing to apply — build a template first.", _build_builder_buttons()
+    result = await bio_service.do_template(_owner_id, buf)
+    if not result.startswith("✅"):
+        return "Template Builder", result, _build_builder_buttons()
+    return "Template Applied", result, _build_applied_buttons()
+
+
+# ── Other actions ──
 
 async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
@@ -306,38 +382,8 @@ async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, li
     return "Bio Engine", result, builder.build()
 
 
-async def _bio_apply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-    decoded = _decode_buffer(extra)
-    if not decoded:
-        return "Template Builder", "⚠️ Nothing to apply — build a template first.", _build_builder_buttons("")
-
-    result = await bio_service.do_template(_owner_id, decoded)
-    if not result.startswith("✅"):
-        return "Template Builder", result, _build_builder_buttons(decoded)
-
-    builder = InlinePanelBuilder()
-    builder.add_row("👁 Show State", "panel:bio:state")
-    builder.add_row("🏗 Back to Builder", "panel:biohelp:builder")
-    return "Template Applied", result, builder.build()
-
-
 async def _bio_reply_mode_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return await _render_custom_template_panel(event)
-
-
-def _build_builder_buttons(buf: str) -> list:
-    builder = InlinePanelBuilder()
-    for var_token, _, _ in _BIO_VARS:
-        new_buf = buf + var_token
-        encoded = _encode_buffer(new_buf)
-        builder.add_row(f"+ {var_token}", f"panel:biohelp:builder:{encoded}")
-    builder.add_row("🗑 Clear", "panel:biohelp:builder:")
-    builder.add_row("↩ Reset", f"panel:biohelp:builder:{_encode_buffer(_DEFAULT_TEMPLATE)}")
-    if buf:
-        builder.add_row("✅ Apply Template", f"action:bio_apply:{_encode_buffer(buf)}")
-    builder.add_row("📝 Reply to Edit", "action:bio_reply_mode")
-    return builder.build()
 
 
 # ── Input handlers ──
@@ -384,8 +430,12 @@ def register(client, owner_id: int, tz_str: str):
     register_inline_builder("biohelp", _biohelp_inline_builder)
     register_action("bio_on", _bio_on_action)
     register_action("bio_off", _bio_off_action)
-    register_action("bio_apply", _bio_apply_action)
     register_action("bio_reply_mode", _bio_reply_mode_action)
+    register_action("bio_builder_add", _bio_builder_add_action)
+    register_action("bio_builder_space", _bio_builder_space_action)
+    register_action("bio_builder_clear", _bio_builder_clear_action)
+    register_action("bio_builder_reset", _bio_builder_reset_action)
+    register_action("bio_builder_apply", _bio_builder_apply_action)
     register_input("bio", "text", {
         "handler": _bio_text_input_handler,
         "prompt": "**Bio Text**\n\nEnter the new {text} value:\n\n_Reply with the text below._",
