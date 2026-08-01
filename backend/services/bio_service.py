@@ -12,22 +12,6 @@ from backend.diagnostics import record_event
 
 logger = logging.getLogger(__name__)
 
-_HELP = (
-    "**Bio Engine — Token Reference**\n\n"
-    "`{time}` — Current time (HH:MM)\n"
-    "`{mood}` — Current mood value\n"
-    "`{text}` — Custom freeform text\n\n"
-    "**Commands**\n"
-    "`.bio text <text>` — Set {text}\n"
-    "`.bio mood <mood>` — Set {mood}\n"
-    "`.bio on` — Start cron sync\n"
-    "`.bio off` — Stop cron sync\n"
-    "`.bio show` — Inspect state\n"
-    "`.bio template <tpl>` — Set template\n\n"
-    "**Example template**\n"
-    "`🕒 {time} | 💭 {mood} | 📝 {text}`"
-)
-
 
 async def do_on(client, owner_id: int, tz_str: str) -> str:
     try:
