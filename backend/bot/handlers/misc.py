@@ -75,13 +75,7 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         "Bio Engine",
         [
             "**Bio Engine**\n",
-            "`.bio help` — Token reference",
-            "`.bio on` — Start cron",
-            "`.bio off` — Stop cron",
-            "`.bio show` — Inspect state",
-            "`.bio template <tpl>` — Set template",
-            "`.bio text <text>` — Set {text}",
-            "`.bio mood <mood>` — Set {mood}",
+            "Fully inline — tap to navigate.",
         ],
     ),
     (
