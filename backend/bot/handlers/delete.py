@@ -4,7 +4,7 @@
 .del <code>      — Delete a saved item: Telegram message + DB row.
 .del             — Inline panel: choose deletion mode.
 
-Delete-From-Message methods (accessed via .panel context panel):
+Delete-From-Message methods:
   - Reply Mode: wait for reply, delete from replied message forward
   - Recent Messages: show recent outgoing messages as buttons
   - Manual Message ID: enter message ID manually
@@ -210,20 +210,18 @@ async def _delfrom_confirm(msg_id: int) -> tuple[str, str, list]:
 
 
 async def _delfrom_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _self_client, _owner_id
-    from backend.helper.target_context import get_target
+    from backend.helper.inline_engine import _owner_id
     from backend.helper.input_state import set_pending
 
     owner_id = _owner_id
-    ctx = get_target(owner_id)
-    if not ctx or ctx.kind != "reply":
-        return "Delete From...", "⚠️ No reply context. Use `.panel` while replying to a message first.", []
+    if not chat_id:
+        return "Delete From...", "⚠️ Could not determine the current chat. Please try again.", []
 
     prompt = "**Delete From — Reply Mode**\n\nReply to any message in this chat.\nAll outgoing messages from that point will be deleted.\n\n_Reply to a message now._"
 
     set_pending(
         owner_id, "delfrom_reply", _delfrom_reply_wait_handler,
-        ctx.reply_chat_id, prompt,
+        chat_id, prompt,
         inline_chat_id=chat_id,
         inline_msg_id=getattr(event, "message_id", 0) or 0,
     )
@@ -231,23 +229,18 @@ async def _delfrom_reply_action(event, extra: str, chat_id: int) -> tuple[str, s
 
 
 async def _delfrom_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.inline_engine import _self_client
 
     client = _self_client
     try:
         reply_msg = await client.get_messages(chat_id, ids=msg_id)
         if reply_msg and reply_msg.reply_to_msg_id:
             target_id = reply_msg.reply_to_msg_id
-            target_msg = await client.get_messages(chat_id, ids=target_id)
-            if target_msg and not getattr(target_msg, "out", True):
-                result = "⚠️ The replied message is not your outgoing message. Only your own messages can be deleted."
-            else:
-                result = await delete_service.do_del_id(client, chat_id, target_id)
+            result = await delete_service.do_del_id(client, chat_id, target_id)
+        elif reply_msg and getattr(reply_msg, "out", False):
+            result = await delete_service.do_del_id(client, chat_id, msg_id)
         elif reply_msg:
-            if not getattr(reply_msg, "out", True):
-                result = "⚠️ Your message was not a reply. Please reply to a message to select the starting point."
-            else:
-                result = await delete_service.do_del_id(client, chat_id, msg_id)
+            result = "⚠️ Your message was not a reply. Please reply to a message to select the starting point."
         else:
             result = "⚠️ Could not find your reply message. Please try again."
     except Exception as exc:
