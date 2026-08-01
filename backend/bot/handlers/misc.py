@@ -156,7 +156,6 @@ def _build_bio_help_buttons() -> list:
     builder.add_row("🔧 Variables", "panel:biohelp:vars")
     builder.add_row("📋 Commands", "panel:biohelp:cmds")
     builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
-    builder.add_row("📝 Example", "panel:biohelp:examples")
     return builder.build()
 
 
