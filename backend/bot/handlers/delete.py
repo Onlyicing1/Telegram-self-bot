@@ -283,7 +283,6 @@ def register(client, owner_id: int):
         "handler": _del_id_input_handler,
         "prompt": "**Delete from Message ID**\n\nEnter the starting message ID:\n\n_Reply with the ID below._",
     })
-
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.del(?:\s+(.+))?$"))
     async def del_cmd(event):
         if not is_owner(event, owner_id):
