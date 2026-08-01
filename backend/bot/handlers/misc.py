@@ -536,13 +536,21 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     owner_id = _owner_id
     ctx = get_target(owner_id)
 
-    if not ctx or ctx.kind != "reply":
-        return "Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", []
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Save", "panel:save")
+    if has_target:
+        builder.add_row("📦 Save", "panel:save")
+    else:
+        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
     builder.add_row("🗑 Delete", "panel:del")
-    return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
+
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "No replied message selected.\n\n**Delete** is available.\n**Save** requires replying to a message first."
+
+    return "Context Panel", body, builder.build()
 
 
 async def _context_inline_builder(event, extra: str) -> list:
@@ -551,29 +559,21 @@ async def _context_inline_builder(event, extra: str) -> list:
     owner_id = _owner_id
     ctx = get_target(owner_id)
 
-    if not ctx or ctx.kind != "reply":
-        return [render("Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", [])]
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Save", "panel:save")
+    if has_target:
+        builder.add_row("📦 Save", "panel:save")
+    else:
+        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
     builder.add_row("🗑 Delete", "panel:del")
-    return [render(
-        "Context Panel",
-        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
-        builder.build(),
-    )]
 
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "No replied message selected.\n\n**Delete** is available.\n**Save** requires replying to a message first."
 
-async def _context_error_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "Context Panel", "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.", []
-
-
-async def _context_error_inline_builder(event, extra: str) -> list:
-    return [render(
-        "Context Panel",
-        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
-        [],
-    )]
+    return [render("Context Panel", body, builder.build())]
 
 
 def _format_uptime(uptime_s):
@@ -836,31 +836,20 @@ def register(client, owner_id: int):
         if not is_owner(event, owner_id):
             return
 
-        reply = await event.message.get_reply_message()
-        if not reply:
-            helper = get_client()
-            if helper is None:
-                await event.edit("⚠️ Reply to a message first, then use `.panel`")
-                return
-            try:
-                await event.delete()
-                await send_inline_panel(client, event.chat_id, "context_error")
-            except Exception as exc:
-                logger.warning("panel error inline send failed: %s", exc)
-            return
-
         helper = get_client()
         if helper is None:
             await event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN).")
             return
 
-        set_target(owner_id, TargetContext(
-            owner_id=owner_id,
-            kind="reply",
-            reply_chat_id=reply.chat_id,
-            reply_msg_id=reply.id,
-            tz_str=_resolve_tz(),
-        ))
+        reply = await event.message.get_reply_message()
+        if reply:
+            set_target(owner_id, TargetContext(
+                owner_id=owner_id,
+                kind="reply",
+                reply_chat_id=reply.chat_id,
+                reply_msg_id=reply.id,
+                tz_str=_resolve_tz(),
+            ))
 
         try:
             success = await send_inline_panel(client, event.chat_id, "context")
@@ -878,14 +867,12 @@ def register(client, owner_id: int):
     try:
         _register_help_panel()
         register_panel("context", _context_panel_handler)
-        register_panel("context_error", _context_error_panel_handler)
         register_panel("health", _health_panel_handler)
         register_panel("logs", _logs_panel_handler)
         register_inline_builder("health", _health_inline_builder)
         register_inline_builder("kill", _kill_inline_builder)
         register_inline_builder("logs", _logs_inline_builder)
         register_inline_builder("context", _context_inline_builder)
-        register_inline_builder("context_error", _context_error_inline_builder)
         register_action("health_refresh", _health_refresh_action)
         register_action("logs_errors", _logs_errors_action)
         register_action("logs_50", _logs_50_action)
