@@ -35,7 +35,7 @@ async def health():
 @app.get("/api/saves")
 async def list_saves(limit: int = 50, offset: int = 0):
     try:
-        items, total = db_client.list_saves(_owner_id, limit=limit, offset=offset)
+        items, total = await db_client.list_saves(_owner_id, limit=limit, offset=offset)
         return {"items": items, "total": total}
     except Exception as exc:
         logger.error("api/saves error: %s", exc)
@@ -45,7 +45,7 @@ async def list_saves(limit: int = 50, offset: int = 0):
 @app.get("/api/saves/{save_code}")
 async def get_save(save_code: str):
     try:
-        row = db_client.query_save(save_code)
+        row = await db_client.query_save(save_code)
         if not row:
             raise HTTPException(status_code=404, detail="Not found")
         return row
@@ -59,7 +59,7 @@ async def get_save(save_code: str):
 @app.get("/api/bio")
 async def get_bio():
     try:
-        state = db_client.get_bio_state(_owner_id)
+        state = await db_client.get_bio_state(_owner_id)
         return state or {}
     except Exception as exc:
         logger.error("api/bio error: %s", exc)
@@ -78,7 +78,7 @@ async def get_settings():
 @app.get("/api/logs")
 async def get_logs(limit: int = 100):
     try:
-        logs = db_client.list_logs(_owner_id, limit=limit)
+        logs = await db_client.list_logs(_owner_id, limit=limit)
         return {"logs": logs}
     except Exception as exc:
         logger.error("api/logs error: %s", exc)

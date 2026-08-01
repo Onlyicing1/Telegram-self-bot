@@ -31,12 +31,12 @@ _HELP = (
 
 async def do_on(client, owner_id: int, tz_str: str) -> str:
     try:
-        db_client.update_bio_state(owner_id, {"is_active": True})
+        await db_client.update_bio_state(owner_id, {"is_active": True})
     except Exception as exc:
         return f"❌ DB error: {exc}"
     bio_engine.start_cron(client, owner_id, tz_str)
     record_event("bio", "cron on", 0, "SUCCESS")
-    state = db_client.get_or_create_bio_state(owner_id)
+    state = await db_client.get_or_create_bio_state(owner_id)
     preview = bio_engine.render_bio(
         state.get("template", "🕒 {time} | 💭 {mood}"),
         state.get("mood", "😊"),
@@ -48,7 +48,7 @@ async def do_on(client, owner_id: int, tz_str: str) -> str:
 
 async def do_off(owner_id: int) -> str:
     try:
-        db_client.update_bio_state(owner_id, {"is_active": False})
+        await db_client.update_bio_state(owner_id, {"is_active": False})
     except Exception as exc:
         return f"❌ DB error: {exc}"
     bio_engine.stop_cron()
@@ -57,7 +57,7 @@ async def do_off(owner_id: int) -> str:
 
 
 async def do_show(owner_id: int, tz_str: str) -> str:
-    state = db_client.get_or_create_bio_state(owner_id)
+    state = await db_client.get_or_create_bio_state(owner_id)
     now = bio_engine._get_tz(tz_str)
     now_dt = datetime.now(now)
     preview = bio_engine.render_bio(
@@ -83,7 +83,7 @@ async def do_template(owner_id: int, template: str) -> str:
     if not template:
         return "⚠️ Template cannot be empty."
     try:
-        db_client.update_bio_state(owner_id, {"template": template})
+        await db_client.update_bio_state(owner_id, {"template": template})
     except Exception as exc:
         return f"❌ DB error: {exc}"
     return f"✅ Template updated:\n`{template}`"
@@ -91,7 +91,7 @@ async def do_template(owner_id: int, template: str) -> str:
 
 async def do_text(owner_id: int, text: str) -> str:
     try:
-        db_client.update_bio_state(owner_id, {"custom_text": text})
+        await db_client.update_bio_state(owner_id, {"custom_text": text})
     except Exception as exc:
         return f"❌ DB error: {exc}"
     return f"✅ Text set to: `{text}`"
@@ -99,7 +99,7 @@ async def do_text(owner_id: int, text: str) -> str:
 
 async def do_mood(owner_id: int, mood: str) -> str:
     try:
-        db_client.update_bio_state(owner_id, {"mood": mood})
+        await db_client.update_bio_state(owner_id, {"mood": mood})
     except Exception as exc:
         return f"❌ DB error: {exc}"
     return f"✅ Mood set to: `{mood}`"

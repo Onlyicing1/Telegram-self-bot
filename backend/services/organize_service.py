@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 async def do_list(owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        total = db_client.count_saves(owner_id)
-        fwd = db_client.count_saves(owner_id, "forward")
-        deep = db_client.count_saves(owner_id, "deep")
-        logs = db_client.count_logs(owner_id)
-        bio = db_client.get_bio_state(owner_id)
+        total = await db_client.count_saves(owner_id)
+        fwd = await db_client.count_saves(owner_id, "forward")
+        deep = await db_client.count_saves(owner_id, "deep")
+        logs = await db_client.count_logs(owner_id)
+        bio = await db_client.get_bio_state(owner_id)
         record_event("organize", "list", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
 
         bio_status = "OFF"
@@ -52,7 +52,7 @@ async def do_clean(owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
         days = settings_service.log_retention_days()
-        deleted = db_client.clean_logs(owner_id, days=days)
+        deleted = await db_client.clean_logs(owner_id, days=days)
         record_event("organize", "clean", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return f"🧹 Cleaned `{deleted}` log entries older than {days} days."
     except Exception as exc:

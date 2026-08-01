@@ -60,7 +60,7 @@ def format_find_entry(row: dict, tz_str: str) -> str:
 async def do_list(owner_id: int, limit: int, tz_str: str) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        items = db_client.list_recent_saves(owner_id, limit=limit)
+        items = await db_client.list_recent_saves(owner_id, limit=limit)
         record_event("database", "list_recent_saves", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
         logger.error("list db error: %s", exc)
@@ -76,7 +76,7 @@ async def do_list(owner_id: int, limit: int, tz_str: str) -> str:
 async def do_find(owner_id: int, query: str, tz_str: str) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        items = db_client.search_saves(owner_id, query, limit=20)
+        items = await db_client.search_saves(owner_id, query, limit=20)
         record_event("database", "search_saves", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
         logger.error("find db error: %s", exc)
