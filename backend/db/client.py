@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 _client = None
 _available = False
-_fallback: dict = {"saved_items": [], "bio_state": {}, "bot_logs": []}
+_fallback: dict = {"saved_items": [], "bio_state": {}, "username_state": {}, "bot_logs": []}
 _save_code_lock = asyncio.Lock()
 _initialised = False
 
@@ -688,6 +688,104 @@ async def update_bio_state(owner_id: int, updates: dict) -> None:
         await _run_sync(_update_bio_state_sync, owner_id, updates)
     except Exception as exc:
         logger.error("[SAVE_DB] update_bio_state FAILED: %s", exc)
+
+
+# ── username_state ──
+
+def _get_username_state_sync(owner_id: int) -> dict | None:
+    db = get_db()
+    if db:
+        try:
+            result = (
+                db.table("username_state")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .maybe_single()
+                .execute()
+            )
+            if result.data:
+                return result.data
+        except Exception as exc:
+            logger.error("[SAVE_DB] get_username_state FAILED: %s", exc)
+    return _fallback["username_state"].get(owner_id)
+
+
+async def get_username_state(owner_id: int) -> dict | None:
+    try:
+        return await _run_sync(_get_username_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] get_username_state FAILED: %s", exc)
+        return _fallback["username_state"].get(owner_id)
+
+
+def _get_or_create_username_state_sync(owner_id: int) -> dict:
+    state = _get_username_state_sync(owner_id)
+    if state:
+        return state
+
+    default = {
+        "owner_id": owner_id,
+        "template": "🕒 {time}",
+        "mood": "😊",
+        "custom_text": "",
+        "is_active": False,
+        "last_username": "",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    db = get_db()
+    if db:
+        try:
+            db.table("username_state").insert(default).execute()
+            result = (
+                db.table("username_state")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .maybe_single()
+                .execute()
+            )
+            if result.data:
+                return result.data
+        except Exception as exc:
+            logger.error("[SAVE_DB] get_or_create_username_state FAILED: %s", exc)
+    _fallback["username_state"][owner_id] = default
+    return default
+
+
+async def get_or_create_username_state(owner_id: int) -> dict:
+    try:
+        return await _run_sync(_get_or_create_username_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] get_or_create_username_state FAILED: %s", exc)
+        return _fallback["username_state"].get(owner_id) or {
+            "owner_id": owner_id,
+            "template": "🕒 {time}",
+            "mood": "😊",
+            "custom_text": "",
+            "is_active": False,
+            "last_username": "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _update_username_state_sync(owner_id: int, updates: dict) -> None:
+    db = get_db()
+    if db:
+        try:
+            db.table("username_state").update(updates).eq("owner_id", owner_id).execute()
+            return
+        except Exception as exc:
+            logger.error("[SAVE_DB] update_username_state FAILED: %s", exc)
+    state = _fallback["username_state"].get(owner_id, {})
+    state.update(updates)
+    _fallback["username_state"][owner_id] = state
+
+
+async def update_username_state(owner_id: int, updates: dict) -> None:
+    try:
+        return await _run_sync(_update_username_state_sync, owner_id, updates)
+    except Exception as exc:
+        logger.error("[SAVE_DB] update_username_state FAILED: %s", exc)
 
 
 # ── bot_logs: reads/cleanup ──
