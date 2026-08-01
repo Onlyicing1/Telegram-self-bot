@@ -1,22 +1,27 @@
 """
-Permanent runtime diagnostics reporter.
+Permanent runtime diagnostics reporter — event-driven + periodic snapshot.
 
-Every 60 seconds:
-  1. Collects the latest 200 entries from a ring buffer that captures
-     trace events, record_event calls, and Python log output.
-  2. Builds a verbose TXT report with full runtime state, task dumps,
-     memory/CPU, loop latency, and complete untruncated tracebacks.
-  3. Uploads the report as a .txt file to Saved Messages ("me").
-  4. Deletes the previous diagnostics file so exactly one exists at
-     any time.
+Uploads a TXT report to Saved Messages ("me") when abnormal events occur,
+plus one forced snapshot every 10 minutes. Always keeps exactly one
+diagnostics TXT in Save Chat (deletes previous before uploading new).
 
-The ring buffer is fed by:
+Triggers (any of):
+  - exception / unhandled exception / crash
+  - reconnect start / finish
+  - runtime state change
+  - watchdog detects anything unusual
+  - self disconnect / helper disconnect
+  - supervisor restart
+  - timeout / floodwait / RPC failure / database failure
+  - any abnormal event
+
+The ring buffer (200 entries) is fed by:
   - backend.runtime.tracer.trace / trace_exception (monkey-patched)
   - backend.diagnostics.record_event (monkey-patched)
   - A logging.Handler attached to the root logger
 
-If Save Chat is unavailable the upload is retried next cycle.
 Never blocks the bot — all I/O is wrapped with timeouts.
+If Save Chat is temporarily unavailable, retry next cycle.
 """
 import asyncio
 import io
@@ -33,16 +38,47 @@ from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger("backend.diagnostics_reporter")
 
-_INTERVAL = 60.0
+_FORCED_INTERVAL = 600.0
 _RING_SIZE = 200
 _UPLOAD_TIMEOUT = 30.0
 _DELETE_TIMEOUT = 15.0
 _FILENAME = "lifeos_diagnostics_report.txt"
+_COOLDOWN = 5.0
 
 _ring: deque = deque(maxlen=_RING_SIZE)
 _task: asyncio.Task | None = None
 _client = None
 _started = False
+_last_upload_ts: float = 0.0
+_trigger_event: asyncio.Event | None = None
+
+_TRIGGER_TAGS = {
+    "RUNTIME_STATE_TRANSITION",
+    "WATCHDOG_HEARTBEAT_FAILED",
+    "WATCHDOG_UPDATE_STALE",
+    "WATCHDOG_RECOVERY_STARTED",
+    "WATCHDOG_RECOVERY_SUCCESS",
+    "WATCHDOG_RECOVERY_FAILED",
+    "WATCHDOG_PROCESS_EXIT",
+    "SELF_DISCONNECTED",
+    "SELF_RECONNECTED",
+    "SELF_REBUILDING",
+    "SELF_RUN_ERROR",
+    "SELF_RUN_LOOP_EXITED",
+    "SELF_BUILD_FAILED",
+    "HELPER_DISCONNECTED",
+    "HELPER_RECONNECTING",
+    "HELPER_RECONNECTED",
+    "HELPER_RECONNECT_FAILED",
+    "HELPER_RECONNECT_EXHAUSTED",
+    "HELPER_START_FAILED",
+    "SHUTDOWN_INITIATED",
+    "SHUTDOWN_COMPLETE",
+    "TASK_CRASHED",
+    "TASK_CANCELLED",
+    "HANDLER_EXCEPTION",
+    "UNCAUGHT_EXCEPTION",
+}
 
 
 # ── Ring buffer feed ──
@@ -64,6 +100,8 @@ def _push_trace(event: str, **fields) -> None:
         "tag": event,
         "text": " ".join(parts),
     })
+    if event in _TRIGGER_TAGS:
+        trigger()
 
 
 def _push_trace_exception(event: str, exc: BaseException, **fields) -> None:
@@ -83,6 +121,7 @@ def _push_trace_exception(event: str, exc: BaseException, **fields) -> None:
         "text": " ".join(parts),
         "traceback": tb_text,
     })
+    trigger()
 
 
 def _push_record_event(module: str, action: str, duration_ms: float, result: str, details: str | None = None) -> None:
@@ -92,6 +131,8 @@ def _push_record_event(module: str, action: str, duration_ms: float, result: str
         "tag": f"{module}.{action}",
         "text": f"module={module} action={action} duration={duration_ms}ms result={result}" + (f" details={details}" if details else ""),
     })
+    if result not in ("SUCCESS", None):
+        trigger()
 
 
 class _RingLogHandler(logging.Handler):
@@ -104,6 +145,8 @@ class _RingLogHandler(logging.Handler):
                 "text": f"{record.levelname} {record.name}: {record.getMessage()}",
                 "traceback": self.format(record) if record.exc_info else None,
             })
+            if record.levelno >= logging.ERROR:
+                trigger()
         except Exception:
             pass
 
@@ -153,6 +196,18 @@ def _uninstall_hooks() -> None:
     if _log_handler is not None:
         logging.getLogger().removeHandler(_log_handler)
         _log_handler = None
+
+
+# ── Trigger ──
+
+def trigger() -> None:
+    global _last_upload_ts, _trigger_event
+    if _trigger_event is None:
+        return
+    now = time.monotonic()
+    if now - _last_upload_ts < _COOLDOWN:
+        return
+    _trigger_event.set()
 
 
 # ── Report builder ──
@@ -318,7 +373,7 @@ def build_report() -> str:
     sections = [
         f"LifeOS Diagnostics Report",
         f"Generated: {now_str}",
-        f"Interval: {_INTERVAL}s",
+        f"Forced interval: {_FORCED_INTERVAL}s",
         f"Entries: {len(_ring)}/{_RING_SIZE}",
         "",
     ]
@@ -397,14 +452,20 @@ async def _upload_report(report_text: str) -> None:
         buf.close()
 
 
-# ── Main loop ──
+# ── Main loop: event-driven + forced periodic snapshot ──
 
 async def _reporter_loop() -> None:
-    global _started
+    global _started, _last_upload_ts, _trigger_event
     _started = True
-    logger.info("Diagnostics reporter started (interval=%ds)", int(_INTERVAL))
+    _trigger_event = asyncio.Event()
+    logger.info("Diagnostics reporter started (forced interval=%ds)", int(_FORCED_INTERVAL))
     while True:
-        await asyncio.sleep(_INTERVAL)
+        try:
+            await asyncio.wait_for(_trigger_event.wait(), timeout=_FORCED_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        _trigger_event.clear()
+        _last_upload_ts = time.monotonic()
         try:
             report = build_report()
             await _upload_report(report)
