@@ -86,15 +86,6 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         ],
     ),
     (
-        "Database",
-        [
-            "**Database**\n",
-            "`.db clean` — Remove orphan rows",
-            "`.db stats` — Database statistics",
-            "`.db vacuum` — Cleanup + optimize",
-        ],
-    ),
-    (
         "Diagnostics",
         [
             "**Diagnostics**\n",
@@ -569,6 +560,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     else:
         builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
     builder.add_row("🗑 Delete", "panel:del")
+    builder.add_row("🗄 Database", "panel:db")
 
     if has_target:
         body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
@@ -592,6 +584,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     else:
         builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
     builder.add_row("🗑 Delete", "panel:del")
+    builder.add_row("🗄 Database", "panel:db")
 
     if has_target:
         body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
