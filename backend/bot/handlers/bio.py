@@ -4,11 +4,21 @@ Bio command handler.
 Business logic lives in backend.services.bio_service.
 This handler is only the Telethon wiring + panel rendering.
 
-Inline Bio Help submenu (panel:biohelp:*):
-  vars       — Variable reference with Copy buttons
-  cmds       — Command reference with detail pages
-  builder    — Interactive Template Builder (live preview buffer)
-  examples   — Ready-made template examples with Copy buttons
+Inline Bio panels:
+  panel:bio           — Main menu (all buttons)
+  panel:bio:state     — Show State page
+  panel:bio:text      — Set Text page (input prompt)
+  panel:bio:mood      — Set Mood page (input prompt)
+
+  panel:biohelp:vars       — Variable reference
+  panel:biohelp:var:{tok}  — Single variable detail + copy
+  panel:biohelp:cmds       — Command reference (no Set Template)
+  panel:biohelp:cmd:{i}    — Single command detail
+  panel:biohelp:builder    — Template Builder (insert variables)
+  panel:biohelp:custom     — Custom Template mode (copy + reply)
+
+Every page gets Back + Home + Close auto-added by _finalize_panel.
+No page uses panel:_nav:noop in button data (that would suppress nav).
 """
 import logging
 import urllib.parse
@@ -26,7 +36,6 @@ from backend.helper import (
     register_input,
     send_inline_panel,
     render,
-    to_edit_buttons,
 )
 from backend.helper.client import get_client
 
@@ -45,14 +54,6 @@ _BIO_CMDS = [
     ("Enable Sync", "Start the bio cron — auto-updates every minute", ".bio on", ".bio on"),
     ("Disable Sync", "Stop the bio cron", ".bio off", ".bio off"),
     ("Show State", "Inspect current bio state (template, mood, text, preview)", ".bio show", ".bio show"),
-    ("Set Template", "Set the bio template string", ".bio template <tpl>", ".bio template 🕒 {time} | 💭 {mood}"),
-]
-
-_BIO_EXAMPLES = [
-    "🕒 {time}",
-    "🕒 {time} | 💭 {mood}",
-    "💭 {mood}\n📝 {text}",
-    "🕒 {time}\n💭 {mood}\n📝 {text}",
 ]
 
 _DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood}"
@@ -77,12 +78,59 @@ def _render_preview(buf: str) -> str:
     return f"`{buf}`"
 
 
+# ── Bio main panel ──
+
+def _build_bio_main_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("✅ Enable Sync", "action:bio_on")
+    builder.add_row("⏹ Disable Sync", "action:bio_off")
+    builder.add_row("👁 Show State", "panel:bio:state")
+    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
+    builder.add_row("💬 Set Text", "panel:bio:text")
+    builder.add_row("💭 Set Mood", "panel:bio:mood")
+    builder.add_row("🔧 Variables", "panel:biohelp:vars")
+    builder.add_row("📋 Commands", "panel:biohelp:cmds")
+    return builder.build()
+
+
+async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    if extra == "state":
+        from backend.helper.inline_engine import _owner_id
+        from backend.bot.handlers.misc import _resolve_tz
+        result = await bio_service.do_show(_owner_id, _resolve_tz())
+        return "Bio State", result, []
+
+    if extra == "text":
+        from backend.helper.inline_engine import _owner_id
+        state = await db_client.get_or_create_bio_state(_owner_id)
+        current = state.get("custom_text") or "—"
+        builder = InlinePanelBuilder()
+        builder.add_row("💬 Enter New Text", "input:bio:text")
+        return "Set Text", f"**Current text:** `{current}`", builder.build()
+
+    if extra == "mood":
+        from backend.helper.inline_engine import _owner_id
+        state = await db_client.get_or_create_bio_state(_owner_id)
+        current = state.get("mood") or "—"
+        builder = InlinePanelBuilder()
+        builder.add_row("💭 Enter New Mood", "input:bio:mood")
+        return "Set Mood", f"**Current mood:** `{current}`", builder.build()
+
+    return "Bio Engine", "Choose an action:", _build_bio_main_buttons()
+
+
+async def _bio_inline_builder(event, extra: str) -> list:
+    title, body, buttons = await _bio_panel_handler(event, extra)
+    return [render(title, body, buttons)]
+
+
+# ── Biohelp submenu ──
+
 def _build_bio_help_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("🔧 Variables", "panel:biohelp:vars")
     builder.add_row("📋 Commands", "panel:biohelp:cmds")
     builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
-    builder.add_row("📝 Example", "panel:biohelp:examples")
     return builder.build()
 
 
@@ -105,7 +153,6 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         body = f"**Variable:** `{token}`\n\n**Description:** {desc}\n\n**Example value:** `{example}`"
         builder = InlinePanelBuilder()
         builder.add_row("📋 Copy Variable", f"action:bio_copy:{token}")
-        builder.add_row("‹ Back to Variables", "panel:biohelp:vars")
         return "Bio Variable", body, builder.build()
 
     if extra == "cmds":
@@ -121,9 +168,7 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             if 0 <= idx < len(_BIO_CMDS):
                 name, purpose, syntax, example = _BIO_CMDS[idx]
                 body = f"**{name}**\n\n**Purpose:** {purpose}\n\n**Syntax:**\n`{syntax}`\n\n**Example:**\n`{example}`"
-                builder = InlinePanelBuilder()
-                builder.add_row("‹ Back to Commands", "panel:biohelp:cmds")
-                return "Bio Command", body, builder.build()
+                return "Bio Command", body, []
         return "Bio Commands", "Unknown command.", _build_bio_help_menu_buttons()
 
     if extra == "builder" or extra.startswith("builder:"):
@@ -140,32 +185,15 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             encoded = _encode_buffer(new_buf)
             builder.add_row(f"+ {var_token}", f"panel:biohelp:builder:{encoded}")
 
+        builder.add_row("📝 Custom Template", "panel:biohelp:custom")
         builder.add_row("🗑 Clear", "panel:biohelp:builder:")
         builder.add_row("↩ Reset", f"panel:biohelp:builder:{_encode_buffer(_DEFAULT_TEMPLATE)}")
-        builder.add_row("📋 Copy Template", f"action:bio_copy:{_encode_buffer(buf)}" if buf else "panel:_nav:noop")
+        if buf:
+            builder.add_row("📋 Copy Template", f"action:bio_copy:{_encode_buffer(buf)}")
         return "Template Builder", body, builder.build()
 
-    if extra == "examples":
-        builder = InlinePanelBuilder()
-        for i, ex in enumerate(_BIO_EXAMPLES):
-            label = ex.replace("\n", " ")
-            if len(label) > 30:
-                label = label[:30] + "..."
-            builder.add_row(label, f"panel:biohelp:ex:{i}")
-        return "Bio Examples", "Tap an example to see details:", builder.build()
-
-    if extra.startswith("ex:"):
-        idx_str = extra[3:]
-        if idx_str.isdigit():
-            idx = int(idx_str)
-            if 0 <= idx < len(_BIO_EXAMPLES):
-                ex = _BIO_EXAMPLES[idx]
-                body = f"**Example {idx + 1}:**\n\n`{ex}`"
-                builder = InlinePanelBuilder()
-                builder.add_row("📋 Copy", f"action:bio_copy:{_encode_buffer(ex)}")
-                builder.add_row("‹ Back to Examples", "panel:biohelp:examples")
-                return "Bio Example", body, builder.build()
-        return "Bio Examples", "Unknown example.", _build_bio_help_menu_buttons()
+    if extra == "custom":
+        return await _render_custom_template_panel(event)
 
     return "Bio Engine", "Choose a section:", _build_bio_help_menu_buttons()
 
@@ -175,60 +203,123 @@ async def _biohelp_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
-async def _bio_copy_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    if not extra:
-        return "Bio Engine", "Nothing to copy.", _build_bio_help_menu_buttons()
-    decoded = _decode_buffer(extra)
-    if not decoded:
-        return "Bio Engine", "Nothing to copy.", _build_bio_help_menu_buttons()
+# ── Custom Template mode ──
+
+_CUSTOM_BODY = (
+    "**Custom Template Mode**\n\n"
+    "1. Tap a variable to copy it\n"
+    "2. Write your template in any chat\n"
+    "3. Reply to THIS message with your template\n\n"
+    "Your reply will instantly become the active bio template."
+)
+
+
+def _build_custom_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("📋 {time}", "action:bio_copy_var:{time}")
+    builder.add_row("📋 {text}", "action:bio_copy_var:{text}")
+    builder.add_row("📋 {mood}", "action:bio_copy_var:{mood}")
+    builder.add_row("Cancel", "panel:biohelp:builder")
+    return builder.build()
+
+
+def _set_custom_pending(owner_id: int, chat_id: int, msg_id: int) -> None:
+    from backend.helper.input_state import set_pending
+    set_pending(
+        owner_id, "biohelp", _bio_custom_reply_handler,
+        chat_id, _CUSTOM_BODY,
+        inline_chat_id=chat_id,
+        inline_msg_id=msg_id,
+    )
+
+
+async def _render_custom_template_panel(event) -> tuple[str, str, list]:
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    chat_id = getattr(event, "chat_id", None) or 0
+    msg_id = getattr(event, "message_id", None) or 0
+
+    if chat_id and msg_id:
+        _set_custom_pending(owner_id, chat_id, msg_id)
+
+    return "Custom Template", _CUSTOM_BODY, _build_custom_buttons()
+
+
+async def _bio_copy_var_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+
+    token = extra.strip()
+    if not token:
+        return "Custom Template", "Nothing to copy.", _build_custom_buttons()
 
     try:
-        from backend.helper.inline_engine import _self_client, _owner_id
-        client = _self_client
-        owner_id = _owner_id
-        if client is not None:
-            await client.send_message("me", f"📋 Copied:\n`{decoded}`")
-            return "Bio Engine", f"✅ Copied to Saved Messages:\n`{decoded}`", _build_bio_help_menu_buttons()
+        if _self_client is not None:
+            await _self_client.send_message("me", f"📋 Copied: `{token}`")
     except Exception as exc:
-        logger.warning("bio copy failed: %s", exc)
-    return "Bio Engine", f"📋 Copy this:\n`{decoded}`", _build_bio_help_menu_buttons()
+        logger.warning("bio copy var failed: %s", exc)
+
+    owner_id = _owner_id
+    inline_chat_id = getattr(event, "chat_id", None) or chat_id or 0
+    inline_msg_id = getattr(event, "message_id", None) or 0
+
+    if inline_chat_id and inline_msg_id:
+        _set_custom_pending(owner_id, inline_chat_id, inline_msg_id)
+
+    body = f"✅ Copied `{token}` to Saved Messages\n\n{_CUSTOM_BODY}"
+    return "Custom Template", body, _build_custom_buttons()
 
 
-async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _self_client, _owner_id
-    from backend.bot.handlers.misc import _resolve_tz
-    result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
-    return "Bio Engine", result, _build_bio_help_menu_buttons()
-
-
-async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-    result = await bio_service.do_off(_owner_id)
-    return "Bio Engine", result, _build_bio_help_menu_buttons()
-
-
-async def _bio_show_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-    from backend.bot.handlers.misc import _resolve_tz
-    result = await bio_service.do_show(_owner_id, _resolve_tz())
-    return "Bio Engine", result, _build_bio_help_menu_buttons()
-
-
-async def _bio_template_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+async def _bio_custom_reply_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id, _self_client
+
     result = await bio_service.do_template(_owner_id, text)
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
-            logger.warning("bio template inline edit failed: %s", exc)
+            logger.warning("bio custom template reply edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
         except Exception:
             pass
 
+
+# ── Actions ──
+
+async def _bio_copy_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    if not extra:
+        return "Bio Engine", "Nothing to copy.", []
+    decoded = _decode_buffer(extra)
+    if not decoded:
+        return "Bio Engine", "Nothing to copy.", []
+
+    try:
+        from backend.helper.inline_engine import _self_client
+        if _self_client is not None:
+            await _self_client.send_message("me", f"📋 Copied:\n`{decoded}`")
+            return "Bio Engine", f"✅ Copied to Saved Messages:\n`{decoded}`", []
+    except Exception as exc:
+        logger.warning("bio copy failed: %s", exc)
+    return "Bio Engine", f"📋 Copy this:\n`{decoded}`", []
+
+
+async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.bot.handlers.misc import _resolve_tz
+    result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
+    return "Bio Engine", result, _build_bio_main_buttons()
+
+
+async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+    result = await bio_service.do_off(_owner_id)
+    return "Bio Engine", result, _build_bio_main_buttons()
+
+
+# ── Input handlers ──
 
 async def _bio_text_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _owner_id, _self_client
@@ -262,29 +353,7 @@ async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
             pass
 
 
-async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    builder = InlinePanelBuilder()
-    builder.add_row("✅ Bio ON", "action:bio_on")
-    builder.add_row("⏹ Bio OFF", "action:bio_off")
-    builder.add_row("👁 Show State", "action:bio_show")
-    builder.add_row("📝 Set Template", "input:bio:template")
-    builder.add_row("💬 Set Text", "input:bio:text")
-    builder.add_row("💭 Set Mood", "input:bio:mood")
-    builder.add_row("❓ Help", "panel:biohelp:menu")
-    return "Bio Engine", "Choose an action:", builder.build()
-
-
-async def _bio_inline_builder(event, extra: str) -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("✅ Bio ON", "action:bio_on")
-    builder.add_row("⏹ Bio OFF", "action:bio_off")
-    builder.add_row("👁 Show State", "action:bio_show")
-    builder.add_row("📝 Set Template", "input:bio:template")
-    builder.add_row("💬 Set Text", "input:bio:text")
-    builder.add_row("💭 Set Mood", "input:bio:mood")
-    builder.add_row("❓ Help", "panel:biohelp:menu")
-    return [render("Bio Engine", "Choose an action:", builder.build())]
-
+# ── Registration ──
 
 def register(client, owner_id: int, tz_str: str):
 
@@ -294,12 +363,8 @@ def register(client, owner_id: int, tz_str: str):
     register_inline_builder("biohelp", _biohelp_inline_builder)
     register_action("bio_on", _bio_on_action)
     register_action("bio_off", _bio_off_action)
-    register_action("bio_show", _bio_show_action)
     register_action("bio_copy", _bio_copy_action)
-    register_input("bio", "template", {
-        "handler": _bio_template_input_handler,
-        "prompt": "**Bio Template**\n\nEnter the new template (use {time}, {mood}, {text}):\n\n_Reply with the template below._",
-    })
+    register_action("bio_copy_var", _bio_copy_var_action)
     register_input("bio", "text", {
         "handler": _bio_text_input_handler,
         "prompt": "**Bio Text**\n\nEnter the new {text} value:\n\n_Reply with the text below._",
