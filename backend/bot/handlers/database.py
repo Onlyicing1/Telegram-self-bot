@@ -24,20 +24,20 @@ from backend.helper.client import get_client
 logger = logging.getLogger(__name__)
 
 
-async def _db_clean_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _db_clean_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await database_service.do_clean(_self_client, _owner_id)
     return "Database", result, []
 
 
-async def _db_stats_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _db_stats_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     from backend.bot.handlers.misc import _resolve_tz
     result = await database_service.do_stats(_owner_id, _resolve_tz())
     return "Database", result, []
 
 
-async def _db_vacuum_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _db_vacuum_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     result = await database_service.do_vacuum(_self_client, _owner_id)
     return "Database", result, []

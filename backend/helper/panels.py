@@ -101,7 +101,7 @@ def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]
 
 
 PanelHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[None]]
-ActionHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[str]]
+ActionHandler = Callable[[events.CallbackQuery.Event, str, int], Awaitable[str]]
 InputConfig = dict[str, Any]
 
 _panels: dict[str, PanelHandler] = {}
@@ -487,7 +487,7 @@ async def _handle_action(event, remainder: str, chat_id: int, msg_id: int, owner
     clear_pending(owner_id)
 
     try:
-        result = await handler(event, extra)
+        result = await handler(event, extra, chat_id)
         nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
         current_panel = nav[0] if nav else action_id
         await _render_and_edit(event, result, current_panel, chat_id, msg_id)
