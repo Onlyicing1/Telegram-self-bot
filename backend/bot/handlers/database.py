@@ -45,17 +45,17 @@ async def _db_vacuum_action(event, extra: str, chat_id: int) -> tuple[str, str, 
 
 async def _db_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("📊 Statistics", "action:db_stats")
     builder.add_row("🧹 Clean Orphans", "action:db_clean")
-    builder.add_row("⚙️ Vacuum", "action:db_vacuum")
+    builder.add_row("📊 Statistics", "action:db_stats")
+    builder.add_row("⚡ Optimize Database", "action:db_vacuum")
     return "Database", "Choose an action:", builder.build()
 
 
 async def _db_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("📊 Statistics", "action:db_stats")
     builder.add_row("🧹 Clean Orphans", "action:db_clean")
-    builder.add_row("⚙️ Vacuum", "action:db_vacuum")
+    builder.add_row("📊 Statistics", "action:db_stats")
+    builder.add_row("⚡ Optimize Database", "action:db_vacuum")
     return [render("Database", "Choose an action:", builder.build())]
 
 
