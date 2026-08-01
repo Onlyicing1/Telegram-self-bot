@@ -59,47 +59,30 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
             "`.ping` — PONG",
             "`.id` — Chat & Msg IDs",
             "`.health` — Health dashboard",
-        ],
-    ),
-    (
-        "Save Engine",
-        [
-            "**Save Engine**  _(reply to a message)_\n",
-            "`.save f` · `.s f` — Forward save",
-            "`.save d` · `.s d` — Deep save",
+            "`.save` — Save replied message",
         ],
     ),
     (
         "Retrieve",
         [
             "**Retrieve**\n",
+            "`.retrieve` · `.r` · `.files` — Browse saved items",
             "`.preview <code>` — Show metadata",
-            "`.r <code>` · `.retrieve <code>` — Alias",
             "`.send <code>` — Forward asset here",
-        ],
-    ),
-    (
-        "Organizer",
-        [
-            "**Organizer**\n",
-            "`.del <n>` — Delete last n messages",
-            "`.del id <msgid>` — Delete from msgid",
-            "`.del <code>` — Delete a saved item",
-            "`.organize list` — Data overview",
-            "`.organize clean` — Purge old logs",
         ],
     ),
     (
         "Bio Engine",
         [
             "**Bio Engine**\n",
-            "`.bio help` — Token reference",
-            "`.bio on` — Start cron",
-            "`.bio off` — Stop cron",
-            "`.bio show` — Inspect state",
-            "`.bio template <tpl>` — Set template",
-            "`.bio text <text>` — Set {text}",
-            "`.bio mood <mood>` — Set {mood}",
+            "Fully inline — tap to navigate.",
+        ],
+    ),
+    (
+        "Username Engine",
+        [
+            "**Username Engine**\n",
+            "Fully inline — tap to navigate.",
         ],
     ),
     (
@@ -133,7 +116,8 @@ def _build_main_menu_buttons() -> list:
             (cats[i][0], f"panel:help:cat:{i}"),
             (cats[i + 1][0], f"panel:help:cat:{i + 1}"),
         )
-    builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
+    if len(cats) % 2 == 1:
+        builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
     builder.add_row("⚙️ Settings", "panel:settings")
     return builder.build()
 
@@ -153,6 +137,37 @@ def _general_body() -> str:
     )
 
 
+def _retrieve_body() -> str:
+    return (
+        "**Retrieve**\n\n"
+        "Browse saved items in a file-manager view.\n"
+        "Tap any item to preview, retrieve, rename, move, or delete."
+    )
+
+
+def _build_retrieve_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("📋 Saved Items", "panel:retrieve_saved")
+    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
+    return builder.build()
+
+
+def _build_bio_help_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🔧 Variables", "panel:biohelp:vars")
+    builder.add_row("📋 Commands", "panel:biohelp:cmds")
+    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
+    return builder.build()
+
+
+def _build_username_help_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
+    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
+    builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
+    return builder.build()
+
+
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -163,6 +178,12 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
             if 0 <= idx < len(_HELP_CATEGORIES):
                 if idx == 0:
                     return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
+                if idx == 1:
+                    return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
+                if idx == 2:
+                    return "Bio Engine", "Choose a section:", _build_bio_help_buttons()
+                if idx == 3:
+                    return "Username Engine", "Choose a section:", _build_username_help_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -172,6 +193,12 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
 async def _help_inline_builder(event, extra: str) -> list:
     if extra.startswith("cat:0"):
         return [render("General", _general_body(), _build_general_buttons())]
+    if extra.startswith("cat:1"):
+        return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
+    if extra.startswith("cat:2"):
+        return [render("Bio Engine", "Choose a section:", _build_bio_help_buttons())]
+    if extra.startswith("cat:3"):
+        return [render("Username Engine", "Choose a section:", _build_username_help_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
@@ -185,11 +212,11 @@ def _build_settings_body() -> str:
     pts = settings_service.panel_timeout_seconds()
     amp = settings_service.is_allow_multiple_panels()
     rep = settings_service.is_reuse_existing_panel()
-    th = settings_service.theme()
     lang = settings_service.language()
     de = settings_service.is_diagnostics_enabled()
     dbg = settings_service.is_debug_callbacks()
     oo = settings_service.is_owner_only()
+    uss = settings_service.update_stale_seconds()
     return (
         "**⚙️ LifeOS Settings**\n\n"
         f"Auto Close: `{'ON' if ac else 'OFF'}`\n"
@@ -200,11 +227,11 @@ def _build_settings_body() -> str:
         f"Panel Timeout: `{pts}s`\n"
         f"Allow Multiple Panels: `{'ON' if amp else 'OFF'}`\n"
         f"Reuse Existing Panel: `{'ON' if rep else 'OFF'}`\n"
-        f"Theme: `{th}`\n"
         f"Language: `{lang}`\n"
         f"Diagnostics: `{'ON' if de else 'OFF'}`\n"
         f"Debug Callbacks: `{'ON' if dbg else 'OFF'}`\n"
-        f"Owner Only: `{'ON' if oo else 'OFF'}`"
+        f"Owner Only: `{'ON' if oo else 'OFF'}`\n"
+        f"Update Stale Threshold: `{uss}s`"
     )
 
 
@@ -221,8 +248,8 @@ def _build_settings_buttons() -> list:
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
     builder.add_row("Set Log Retention (days)", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout (s)", "input:settings:panel_timeout_seconds")
-    builder.add_row("Set Theme", "input:settings:theme")
     builder.add_row("Set Language", "input:settings:language")
+    builder.add_row("Set Update Stale (s)", "input:settings:update_stale_seconds")
     return builder.build()
 
 
@@ -234,48 +261,49 @@ async def _settings_inline_builder(event, extra: str) -> list:
     return [render("Settings", _build_settings_body(), _build_settings_buttons())]
 
 
-async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_autoclose_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.toggle_auto_close()
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_diagnostics_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_diagnostics_enabled(not settings_service.is_diagnostics_enabled())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_debug_callbacks_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_debug_callbacks_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_debug_callbacks(not settings_service.is_debug_callbacks())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_owner_only_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_owner_only_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_owner_only(not settings_service.is_owner_only())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_multiple_panels_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_multiple_panels_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_allow_multiple_panels(not settings_service.is_allow_multiple_panels())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_reuse_panel_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_reuse_panel_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_reuse_existing_panel(not settings_service.is_reuse_existing_panel())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _general_ping_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return "PONG", "", _build_general_buttons()
 
 
-async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.target_context import get_target
 
     owner_id = _owner_id
     client = _self_client
@@ -310,10 +338,18 @@ async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
         f"**Current Chat ID:**\n`{chat_id_val}`\n\n"
         f"**Current Message ID:**\n`{msg_id_val}`"
     )
+
+    ctx = get_target(owner_id)
+    if ctx and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id:
+        body += (
+            f"\n\n**Replied Chat ID:**\n`{ctx.reply_chat_id}`\n\n"
+            f"**Replied Message ID:**\n`{ctx.reply_msg_id}`"
+        )
+
     return "Chat & Message IDs", body, _build_general_buttons()
 
 
-async def _general_health_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_health_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
@@ -431,28 +467,6 @@ async def _settings_panel_timeout_handler(text, chat_id, msg_id, inline_chat_id,
             pass
 
 
-async def _settings_theme_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services import settings_service
-    from backend.helper.inline_engine import _self_client
-    text = text.strip()
-    if not text:
-        result = "⚠️ Theme cannot be empty."
-    else:
-        ok = settings_service.set_theme(text)
-        result = f"✅ Theme set to `{text}`" if ok else "⚠️ Invalid theme."
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("settings theme inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
-
-
 async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.services import settings_service
     from backend.helper.inline_engine import _self_client
@@ -468,6 +482,28 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
             logger.warning("settings language inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 60 and 3600."
+    else:
+        ok = settings_service.set_update_stale_seconds(int(text))
+        result = f"✅ Update stale threshold set to `{text}s`" if ok else "⚠️ Value must be between 60 and 3600."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings update_stale inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -509,13 +545,13 @@ def _register_help_panel() -> None:
         "handler": _settings_panel_timeout_handler,
         "prompt": "**Panel Timeout**\n\nEnter the panel timeout in seconds (30-86400):\n\n_Reply with the number below._",
     })
-    register_input("settings", "theme", {
-        "handler": _settings_theme_handler,
-        "prompt": "**Theme**\n\nEnter the theme name (e.g. dark, light):\n\n_Reply with the theme below._",
-    })
     register_input("settings", "language", {
         "handler": _settings_language_handler,
         "prompt": "**Language**\n\nEnter the language code (e.g. en, fa):\n\n_Reply with the language code below._",
+    })
+    register_input("settings", "update_stale_seconds", {
+        "handler": _settings_update_stale_handler,
+        "prompt": "**Update Stale Threshold**\n\nEnter the threshold in seconds (60-3600):\n\n_Reply with the number below._",
     })
 
 
@@ -525,44 +561,21 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     owner_id = _owner_id
     ctx = get_target(owner_id)
 
-    if not ctx or ctx.kind != "reply":
-        return "Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", []
-
-    if extra.startswith("exec:"):
-        action = extra[5:]
-        from backend.helper.inline_engine import _self_client
-        client = _self_client
-
-        if action == "save_f":
-            from backend.services import save_service
-            reply_msg = await ctx.resolve(client)
-            if reply_msg is None:
-                return "Context Panel", "Reply message no longer exists.", []
-            result = await save_service.execute_save(client, owner_id, reply_msg, "f", ctx.tz_str)
-            return "Save Engine", result, []
-
-        elif action == "save_d":
-            from backend.services import save_service
-            reply_msg = await ctx.resolve(client)
-            if reply_msg is None:
-                return "Context Panel", "Reply message no longer exists.", []
-            result = await save_service.execute_save(client, owner_id, reply_msg, "d", ctx.tz_str)
-            return "Save Engine", result, []
-
-        elif action == "preview":
-            from backend.helper.inline_engine import _self_client
-            from backend.services import retrieve_service
-            reply_msg = await ctx.resolve(_self_client)
-            if reply_msg is None:
-                return "Context Panel", "Reply message no longer exists.", []
-            result = await retrieve_service.do_preview(_self_client, owner_id, str(reply_msg.id))
-            return "Preview", result, []
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
-    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
-    builder.add_row("👁 Preview", "panel:context:exec:preview")
-    return "Context Panel", f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:", builder.build()
+    if has_target:
+        builder.add_row("📦 Save", "panel:save")
+    else:
+        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
+    builder.add_row("🗑 Delete", "panel:del")
+
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "Choose an action:"
+
+    return "Context Panel", body, builder.build()
 
 
 async def _context_inline_builder(event, extra: str) -> list:
@@ -571,39 +584,28 @@ async def _context_inline_builder(event, extra: str) -> list:
     owner_id = _owner_id
     ctx = get_target(owner_id)
 
-    if not ctx or ctx.kind != "reply":
-        return [render("Context Panel", "Reply context expired.\n\nUse `.panel` while replying to a message.", [])]
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Forward Save", "panel:context:exec:save_f")
-    builder.add_row("⬇️ Deep Save", "panel:context:exec:save_d")
-    builder.add_row("👁 Preview", "panel:context:exec:preview")
-    return [render(
-        "Context Panel",
-        f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:",
-        builder.build(),
-    )]
+    if has_target:
+        builder.add_row("📦 Save", "panel:save")
+    else:
+        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
+    builder.add_row("🗑 Delete", "panel:del")
 
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "Choose an action:"
 
-async def _context_error_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "Context Panel", "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.", []
-
-
-async def _context_error_inline_builder(event, extra: str) -> list:
-    return [render(
-        "Context Panel",
-        "No replied message found.\n\nReply to any message and use `.panel` to open its context panel.",
-        [],
-    )]
+    return [render("Context Panel", body, builder.build())]
 
 
 def _format_uptime(uptime_s):
     if uptime_s is None or uptime_s < 0:
         return "unknown"
     hours = int(uptime_s // 3600)
-    )
     minutes = int((uptime_s % 3600) // 60)
-    )
     if hours > 0:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
@@ -615,7 +617,6 @@ def _format_age(age_s):
     if age_s < 60:
         return f"{int(age_s)}s ago"
     m = int(age_s // 60)
-    )
     if m < 60:
         return f"{m}m ago"
     h = m // 60
@@ -721,7 +722,7 @@ async def _health_inline_builder(event, extra: str) -> list:
     return [render("Health Dashboard", report, builder.build())]
 
 
-async def _health_refresh_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
@@ -776,7 +777,7 @@ async def _logs_inline_builder(event, extra: str) -> list:
     return [render("Event Log", text, builder.build())]
 
 
-async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _logs_errors_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=20, errors_only=True)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
@@ -784,7 +785,7 @@ async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None
     return "Event Log", text, builder.build()
 
 
-async def _logs_50_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _logs_50_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=50, errors_only=False)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
@@ -828,6 +829,7 @@ def register(client, owner_id: int):
             if reply:
                 lines.append(f"**Reply Msg ID:** `{reply.id}`")
                 lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
+                lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
             await event.edit("\n".join(lines))
         except Exception as exc:
             logger.warning("id_cmd failed: %s", exc)
@@ -859,31 +861,20 @@ def register(client, owner_id: int):
         if not is_owner(event, owner_id):
             return
 
-        reply = await event.message.get_reply_message()
-        if not reply:
-            helper = get_client()
-            if helper is None:
-                await event.edit("⚠️ Reply to a message first, then use `.panel`")
-                return
-            try:
-                await event.delete()
-                await send_inline_panel(client, event.chat_id, "context_error")
-            except Exception as exc:
-                logger.warning("panel error inline send failed: %s", exc)
-            return
-
         helper = get_client()
         if helper is None:
             await event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN).")
             return
 
-        set_target(owner_id, TargetContext(
-            owner_id=owner_id,
-            kind="reply",
-            reply_chat_id=reply.chat_id,
-            reply_msg_id=reply.id,
-            tz_str=_resolve_tz(),
-        ))
+        reply = await event.message.get_reply_message()
+        if reply:
+            set_target(owner_id, TargetContext(
+                owner_id=owner_id,
+                kind="reply",
+                reply_chat_id=reply.chat_id,
+                reply_msg_id=reply.id,
+                tz_str=_resolve_tz(),
+            ))
 
         try:
             success = await send_inline_panel(client, event.chat_id, "context")
@@ -901,14 +892,12 @@ def register(client, owner_id: int):
     try:
         _register_help_panel()
         register_panel("context", _context_panel_handler)
-        register_panel("context_error", _context_error_panel_handler)
         register_panel("health", _health_panel_handler)
         register_panel("logs", _logs_panel_handler)
         register_inline_builder("health", _health_inline_builder)
         register_inline_builder("kill", _kill_inline_builder)
         register_inline_builder("logs", _logs_inline_builder)
         register_inline_builder("context", _context_inline_builder)
-        register_inline_builder("context_error", _context_error_inline_builder)
         register_action("health_refresh", _health_refresh_action)
         register_action("logs_errors", _logs_errors_action)
         register_action("logs_50", _logs_50_action)
