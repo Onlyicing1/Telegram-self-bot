@@ -256,13 +256,19 @@ class RuntimeSupervisor:
 
     async def _resume_username_cron(self) -> None:
         try:
-            state = await db_client.get_username_state(self.owner_id)
-            if state and state.get("is_active"):
+            logger.info("USERNAME_DB_LOADING owner_id=%s", self.owner_id)
+            state = await db_client.get_or_create_username_state(self.owner_id)
+            if state is None:
+                logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s — get_or_create returned None", self.owner_id)
+                return
+            logger.info("USERNAME_DB_READY owner_id=%s is_active=%s", self.owner_id, state.get("is_active"))
+            if state.get("is_active"):
                 self._start_username_cron()
                 logger.info("[4b/5] Username cron resumed")
             else:
                 logger.info("[4b/5] Username cron not active — skipping")
         except Exception as exc:
+            logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s exc=%s", self.owner_id, exc, exc_info=True)
             logger.warning("[4b/5] Username cron resume check failed: %s", exc)
 
     def _start_username_cron(self) -> None:
