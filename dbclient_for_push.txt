@@ -703,9 +703,13 @@ def _get_username_state_sync(owner_id: int) -> dict | None:
                 .maybe_single()
                 .execute()
             )
-            return result.data
+            if result.data:
+                return result.data
+            logger.info("USERNAME_DB_ROW_NOT_FOUND owner_id=%s", owner_id)
+            return None
         except Exception as exc:
             logger.error("[SAVE_DB] get_username_state FAILED: %s", exc)
+            return None
     return _fallback.get("username_state", {}).get(owner_id)
 
 
@@ -718,9 +722,14 @@ async def get_username_state(owner_id: int) -> dict | None:
 
 
 def _get_or_create_username_state_sync(owner_id: int) -> dict:
+    logger.info("USERNAME_DB_LOADING owner_id=%s", owner_id)
     state = _get_username_state_sync(owner_id)
     if state:
+        logger.info("USERNAME_DB_READY owner_id=%s (row exists)", owner_id)
         return state
+
+    logger.info("USERNAME_DB_ROW_NOT_FOUND owner_id=%s", owner_id)
+    logger.info("USERNAME_DB_CREATING_DEFAULT_ROW owner_id=%s", owner_id)
 
     default = {
         "owner_id": owner_id,
@@ -735,7 +744,15 @@ def _get_or_create_username_state_sync(owner_id: int) -> dict:
     db = get_db()
     if db:
         try:
-            db.table("username_state").insert(default).execute()
+            result = db.table("username_state").insert(default).execute()
+            if not result.data:
+                logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s — insert returned no data", owner_id)
+            else:
+                logger.info("USERNAME_DB_CREATED owner_id=%s row=%s", owner_id, result.data[0] if result.data else "None")
+        except Exception as exc:
+            logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s exc=%s", owner_id, exc, exc_info=True)
+            raise
+        try:
             result = (
                 db.table("username_state")
                 .select("*")
@@ -744,9 +761,14 @@ def _get_or_create_username_state_sync(owner_id: int) -> dict:
                 .execute()
             )
             if result.data:
+                logger.info("USERNAME_DB_READY owner_id=%s (row created and reloaded)", owner_id)
                 return result.data
+            logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s — row not found after insert", owner_id)
         except Exception as exc:
-            logger.error("[SAVE_DB] get_or_create_username_state FAILED: %s", exc)
+            logger.error("USERNAME_DB_CREATE_FAILED owner_id=%s exc=%s", owner_id, exc, exc_info=True)
+            raise
+    else:
+        logger.warning("USERNAME_DB_CREATE_FAILED owner_id=%s — no DB connection, using fallback", owner_id)
     if "username_state" not in _fallback:
         _fallback["username_state"] = {}
     _fallback["username_state"][owner_id] = default
