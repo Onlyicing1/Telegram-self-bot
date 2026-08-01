@@ -8,6 +8,7 @@ Business logic lives in backend.services.save_service.
 This handler is only the Telethon wiring + panel rendering.
 """
 import logging
+import os
 
 from telethon import events
 
@@ -31,37 +32,96 @@ logger = logging.getLogger(__name__)
 
 
 async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _self_client, _owner_id
-
-    client = _self_client
-    owner_id = _owner_id
-
-    if extra.startswith("exec:"):
+    if extra.startswith("type:"):
         mode = extra[5:]
-        ctx = get_target(owner_id)
-        if not ctx or ctx.kind != "reply":
-            return "Save Engine", "Reply context expired. Use `.save` while replying to a message.", []
-
-        reply_msg = await ctx.resolve(client)
-        if reply_msg is None:
-            return "Save Engine", "Reply message no longer exists.", []
-
-        result = await save_service.execute_save(client, owner_id, reply_msg, mode, ctx.tz_str)
-        return "Save Engine", result, []
+        builder = InlinePanelBuilder()
+        builder.add_row("Reply to a message", f"action:save_reply:{mode}")
+        builder.add_row("Save using a link", "input:save:link")
+        return "Save", "Choose a source:", builder.build()
 
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Forward Save", "panel:save:exec:f")
-    builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
-    builder.add_row("🔗 Save by Link", "input:save:link")
-    return "Save Engine", "Choose a save mode:", builder.build()
+    builder.add_row("📦 Forward Save", "panel:save:type:f")
+    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
+    return "Save", "Choose a save type:", builder.build()
 
 
 async def _save_inline_builder(event, extra: str) -> list:
+    if extra.startswith("type:"):
+        mode = extra[5:]
+        builder = InlinePanelBuilder()
+        builder.add_row("Reply to a message", f"action:save_reply:{mode}")
+        builder.add_row("Save using a link", "input:save:link")
+        return [render("Save", "Choose a source:", builder.build())]
+
     builder = InlinePanelBuilder()
-    builder.add_row("📦 Forward Save", "panel:save:exec:f")
-    builder.add_row("⬇️ Deep Save", "panel:save:exec:d")
-    builder.add_row("🔗 Save by Link", "input:save:link")
-    return [render("Save Engine", "Choose a save mode:", builder.build())]
+    builder.add_row("📦 Forward Save", "panel:save:type:f")
+    builder.add_row("⬇️ Deep Save", "panel:save:type:d")
+    return [render("Save", "Choose a save type:", builder.build())]
+
+
+async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.target_context import get_target
+    from backend.helper.input_state import set_pending
+
+    owner_id = _owner_id
+    mode = extra.strip() if extra else "f"
+    ctx = get_target(owner_id)
+    if not ctx or ctx.kind != "reply":
+        return "Save", "⚠️ No reply context. Use `.panel` while replying to a message first.", []
+
+    mode_label = "Forward" if mode == "f" else "Deep"
+    prompt = f"**Save — Reply Mode**\n\nReply to any message in this chat.\nThe replied message will be saved ({mode_label} Save).\n\n_Reply to a message now._"
+
+    set_pending(
+        owner_id, "save_reply", _save_reply_wait_handler,
+        ctx.reply_chat_id, prompt,
+        inline_chat_id=chat_id,
+        inline_msg_id=getattr(event, "message_id", 0) or 0,
+        extra=mode,
+    )
+    return "Save", "Waiting for your reply... Reply to any message to save it.", []
+
+
+async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.input_state import get_pending, clear_pending
+
+    owner_id = _owner_id
+    client = _self_client
+
+    pending = get_pending(owner_id) or {}
+    mode = pending.get("extra", "f")
+    clear_pending(owner_id)
+
+    try:
+        reply_msg = await client.get_messages(chat_id, ids=msg_id)
+        if reply_msg and reply_msg.reply_to_msg_id:
+            target_id = reply_msg.reply_to_msg_id
+            target_msg = await client.get_messages(chat_id, ids=target_id)
+            if target_msg is None:
+                result = "⚠️ The replied message no longer exists."
+            else:
+                result = await save_service.execute_save(client, owner_id, target_msg, mode, os.getenv("TZ", "Asia/Tehran"))
+        elif reply_msg:
+            result = "⚠️ Your message was not a reply. Please reply to a message to select what to save."
+        else:
+            result = "⚠️ Could not find your reply message. Please try again."
+    except Exception as exc:
+        result = f"❌ Save failed: {exc}"
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("save reply result edit failed: %s", exc)
+
+    if client:
+        try:
+            await client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -98,6 +158,7 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 def register(client, owner_id: int, tz_str: str) -> None:
     register_panel("save", _save_panel_handler)
     register_inline_builder("save", _save_inline_builder)
+    register_action("save_reply", _save_reply_action)
     register_input("save", "link", {
         "handler": _save_link_input_handler,
         "prompt": "**Save by Link**\n\nSend a Telegram message link:\n`https://t.me/channel/123`\n`https://t.me/c/123/456`\n\n_Reply with the link below._",
