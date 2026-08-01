@@ -2,7 +2,7 @@
 Bio command handler — fully inline, no text commands.
 
 Inline Bio panels:
-  panel:bio             — Main menu (all buttons)
+  panel:bio             — Main menu (all buttons, single sync toggle)
   panel:bio:state       — Show State page
   panel:bio:text        — Set Text page (input prompt)
   panel:bio:mood        — Set Mood page (input prompt)
@@ -10,8 +10,7 @@ Inline Bio panels:
   panel:biohelp:vars       — Variable reference
   panel:biohelp:var:{tok}  — Single variable detail
   panel:biohelp:cmds       — Commands menu (all buttons, no text syntax)
-  panel:biohelp:cmd:on     — Enable Sync page
-  panel:biohelp:cmd:off    — Disable Sync page
+  panel:biohelp:cmd:toggle — Sync toggle page
   panel:biohelp:cmd:show   — Show State page
   panel:biohelp:cmd:text   — Set Text page (input prompt)
   panel:biohelp:cmd:mood   — Set Mood page (input prompt)
@@ -74,10 +73,12 @@ def _render_preview(buf: str) -> str:
 
 # ── Bio main panel ──
 
-def _build_bio_main_buttons() -> list:
+def _build_bio_main_buttons(is_active: bool = False) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
+    if is_active:
+        builder.add_row("Sync: ON (tap to disable)", "action:bio_toggle")
+    else:
+        builder.add_row("Sync: OFF (tap to enable)", "action:bio_toggle")
     builder.add_row("👁 Show State", "panel:bio:state")
     builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
     builder.add_row("💬 Set Text", "panel:bio:text")
@@ -88,29 +89,29 @@ def _build_bio_main_buttons() -> list:
 
 
 async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+
+    state = await db_client.get_or_create_bio_state(_owner_id)
+    is_active = state.get("is_active", False)
+
     if extra == "state":
-        from backend.helper.inline_engine import _owner_id
         from backend.bot.handlers.misc import _resolve_tz
         result = await bio_service.do_show(_owner_id, _resolve_tz())
         return "Bio State", result, []
 
     if extra == "text":
-        from backend.helper.inline_engine import _owner_id
-        state = await db_client.get_or_create_bio_state(_owner_id)
         current = state.get("custom_text") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💬 Enter New Text", "input:bio:text")
         return "Set Text", f"**Current text:** `{current}`\n\nTap the button below, then reply with the new text value.", builder.build()
 
     if extra == "mood":
-        from backend.helper.inline_engine import _owner_id
-        state = await db_client.get_or_create_bio_state(_owner_id)
         current = state.get("mood") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💭 Enter New Mood", "input:bio:mood")
         return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
 
-    return "Bio Engine", "Choose an action:", _build_bio_main_buttons()
+    return "Bio Engine", "Choose an action:", _build_bio_main_buttons(is_active)
 
 
 async def _bio_inline_builder(event, extra: str) -> list:
@@ -132,8 +133,7 @@ def _build_commands_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("💬 Set Text", "panel:biohelp:cmd:text")
     builder.add_row("💭 Set Mood", "panel:biohelp:cmd:mood")
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
+    builder.add_row("🔄 Toggle Sync", "panel:biohelp:cmd:toggle")
     builder.add_row("👁 Show State", "panel:biohelp:cmd:show")
     return builder.build()
 
@@ -162,14 +162,18 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
 
     if extra.startswith("cmd:"):
         sub = extra[4:]
-        if sub == "on":
+        if sub == "toggle":
+            from backend.helper.inline_engine import _owner_id
+            state = await db_client.get_or_create_bio_state(_owner_id)
+            is_active = state.get("is_active", False)
+            label = "ON" if is_active else "OFF"
+            body = f"**Sync is currently {label}.**\n\nTap the button below to toggle."
             builder = InlinePanelBuilder()
-            builder.add_row("✅ Enable Now", "action:bio_on")
-            return "Enable Sync", "Start the bio cron — auto-updates your profile bio every minute.", builder.build()
-        if sub == "off":
-            builder = InlinePanelBuilder()
-            builder.add_row("⏹ Disable Now", "action:bio_off")
-            return "Disable Sync", "Stop the bio cron. Your bio will no longer auto-update.", builder.build()
+            if is_active:
+                builder.add_row("Sync: ON (tap to disable)", "action:bio_toggle")
+            else:
+                builder.add_row("Sync: OFF (tap to enable)", "action:bio_toggle")
+            return "Toggle Sync", body, builder.build()
         if sub == "show":
             from backend.helper.inline_engine import _owner_id
             from backend.bot.handlers.misc import _resolve_tz
@@ -287,21 +291,19 @@ async def _bio_custom_reply_handler(text, chat_id, msg_id, inline_chat_id, inlin
 
 # ── Actions ──
 
-async def _bio_on_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+async def _bio_toggle_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.bot.handlers.misc import _resolve_tz
-    result = await bio_service.do_on(_self_client, _owner_id, _resolve_tz())
-    builder = InlinePanelBuilder()
-    builder.add_row("⏹ Disable Sync", "panel:biohelp:cmd:off")
-    builder.add_row("👁 Show State", "panel:bio:state")
-    return "Bio Engine", result, builder.build()
+    result = await bio_service.do_toggle(_self_client, _owner_id, _resolve_tz())
 
+    state = await db_client.get_or_create_bio_state(_owner_id)
+    is_active = state.get("is_active", False)
 
-async def _bio_off_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _owner_id
-    result = await bio_service.do_off(_owner_id)
     builder = InlinePanelBuilder()
-    builder.add_row("✅ Enable Sync", "panel:biohelp:cmd:on")
+    if is_active:
+        builder.add_row("Sync: ON (tap to disable)", "action:bio_toggle")
+    else:
+        builder.add_row("Sync: OFF (tap to enable)", "action:bio_toggle")
     builder.add_row("👁 Show State", "panel:bio:state")
     return "Bio Engine", result, builder.build()
 
@@ -382,8 +384,7 @@ def register(client, owner_id: int, tz_str: str):
     register_panel("biohelp", _biohelp_panel_handler)
     register_inline_builder("bio", _bio_inline_builder)
     register_inline_builder("biohelp", _biohelp_inline_builder)
-    register_action("bio_on", _bio_on_action)
-    register_action("bio_off", _bio_off_action)
+    register_action("bio_toggle", _bio_toggle_action)
     register_action("bio_apply", _bio_apply_action)
     register_action("bio_reply_mode", _bio_reply_mode_action)
     register_input("bio", "text", {
@@ -437,6 +438,8 @@ def register(client, owner_id: int, tz_str: str):
                 result = await bio_service.do_on(client, owner_id, tz_str)
             elif sub == "off":
                 result = await bio_service.do_off(owner_id)
+            elif sub == "toggle":
+                result = await bio_service.do_toggle(client, owner_id, tz_str)
             elif sub == "show":
                 result = await bio_service.do_show(owner_id, tz_str)
             else:
