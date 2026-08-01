@@ -83,7 +83,7 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
         await asyncio.sleep(_seconds_to_next_minute(tz))
 
         try:
-            state = db_client.get_bio_state(owner_id)
+            state = await db_client.get_bio_state(owner_id)
 
             if not state or not state.get("is_active"):
                 trace("BIO_CRON_STOPPED", reason="is_active_false")
@@ -130,7 +130,7 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
                 record_event("bio", "UpdateProfileRequest", 0, "ERROR", str(api_exc))
                 continue
 
-            db_client.update_bio_state(owner_id, {
+            await db_client.update_bio_state(owner_id, {
                 "last_bio": new_bio,
                 "updated_at": datetime.now(tz).isoformat(),
             })

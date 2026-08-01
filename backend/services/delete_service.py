@@ -56,7 +56,7 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
     code = code.upper().strip()
     t0 = asyncio.get_event_loop().time()
     try:
-        row = db_client.query_save(code)
+        row = await db_client.query_save(code)
         record_event("database", "query_save", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
         logger.error("del save_code DB query failed: %s", exc)
@@ -84,7 +84,7 @@ async def do_del_code(client, owner_id: int, code: str) -> str:
     db_deleted = False
     db_error = None
     try:
-        removed = db_client.delete_save_row(owner_id, code)
+        removed = await db_client.delete_save_row(owner_id, code)
         db_deleted = removed is not None
     except Exception as exc:
         db_error = exc

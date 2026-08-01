@@ -5,10 +5,16 @@ The singleton client is initialised on first access. If Supabase env
 vars are missing or the connection fails, all operations degrade to
 in-memory storage so the bot never crashes.
 
-Every public function wraps its Supabase call in try/except so that
-a network error, missing table, or DNS failure never propagates to
-the caller — the in-memory fallback is used instead. Failures are
-logged loudly with [SAVE_DB] tags so no silent failures hide.
+CRITICAL: All public functions that touch Supabase are async and run
+the synchronous HTTP calls via asyncio.to_thread() with a bounded
+timeout. The supabase-py library uses httpx synchronously — calling
+db.table(...).execute() directly in an asyncio coroutine blocks the
+entire event loop until the HTTP response arrives. If the Supabase
+REST API is slow or the TCP connection stalls, the whole runtime
+freezes (no commands, no watchdog, no heartbeat, no bio updates).
+
+By running each DB operation in a thread with a timeout, the event
+loop stays responsive even when Supabase is slow or unreachable.
 """
 import asyncio
 import logging
@@ -30,6 +36,8 @@ _initialised = False
 _SHORT_CODE_PREFIX = "S"
 _SHORT_CODE_NUM_LEN = 4
 _SHORT_CODE_ALPHABET = string.ascii_uppercase + string.digits
+
+_DB_TIMEOUT = 10.0
 
 
 def _check_available() -> bool:
@@ -68,6 +76,25 @@ def is_available() -> bool:
     return _available
 
 
+async def _run_sync(fn, *args, **kwargs):
+    """Run a synchronous DB function in a thread with a timeout."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(fn, *args, **kwargs),
+        timeout=_DB_TIMEOUT,
+    )
+
+
+# ── bot_logs ──
+
+def _log_sync(entry: dict) -> None:
+    db = get_db()
+    if db:
+        db.table("bot_logs").insert(entry).execute()
+    else:
+        entry["id"] = len(_fallback["bot_logs"]) + 1
+        _fallback["bot_logs"].append(entry)
+
+
 async def log(owner_id: int, level: str, message: str, context: dict | None = None) -> None:
     try:
         entry = {
@@ -77,15 +104,12 @@ async def log(owner_id: int, level: str, message: str, context: dict | None = No
             "context": context or {},
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        db = get_db()
-        if db:
-            db.table("bot_logs").insert(entry).execute()
-        else:
-            entry["id"] = len(_fallback["bot_logs"]) + 1
-            _fallback["bot_logs"].append(entry)
+        await _run_sync(_log_sync, entry)
     except Exception as exc:
         logger.error("[SAVE_DB] bot_logs insert FAILED: %s", exc)
 
+
+# ── save codes ──
 
 async def get_next_save_code() -> str:
     """Generate a compact, human-readable save code (e.g. S391, A82).
@@ -105,8 +129,7 @@ async def get_next_save_code() -> str:
 
         count = 0
         try:
-            result = db.table("saved_items").select("id", count="exact").execute()
-            count = result.count or 0
+            count = await _run_sync(_count_saves_sync)
         except Exception as exc:
             logger.error("[SAVE_DB] get_next_save_code count query FAILED: %s", exc)
             count = len(_fallback["saved_items"])
@@ -128,19 +151,21 @@ async def get_next_save_code() -> str:
         return sequential
 
 
+def _count_saves_sync() -> int:
+    db = get_db()
+    if not db:
+        return len(_fallback["saved_items"])
+    result = db.table("saved_items").select("id", count="exact").execute()
+    return result.count or 0
+
+
 async def _is_code_free(code: str) -> bool:
     """Check that a code is not already used as save_code."""
     db = get_db()
     if db:
         try:
-            res = (
-                db.table("saved_items")
-                .select("id")
-                .eq("save_code", code)
-                .limit(1)
-                .execute()
-            )
-            return not (res.data or [])
+            res = await _run_sync(_is_code_free_sync, code)
+            return res
         except Exception as exc:
             logger.error("[SAVE_DB] _is_code_free(%s) query FAILED: %s", code, exc)
             return True
@@ -150,11 +175,23 @@ async def _is_code_free(code: str) -> bool:
     return True
 
 
-def insert_save(data: dict) -> dict | None:
-    """Insert a saved_items row. Logs the full payload + response with [SAVE_DB].
+def _is_code_free_sync(code: str) -> bool:
+    db = get_db()
+    if not db:
+        return True
+    res = (
+        db.table("saved_items")
+        .select("id")
+        .eq("save_code", code)
+        .limit(1)
+        .execute()
+    )
+    return not (res.data or [])
 
-    Returns the inserted row, or None on failure. Never raises.
-    """
+
+# ── saved_items: writes ──
+
+def _insert_save_sync(data: dict) -> dict | None:
     db = get_db()
     logger.info("[SAVE_DB] insert_save payload=%s", _safe_payload(data))
     if db is None:
@@ -181,8 +218,19 @@ def insert_save(data: dict) -> dict | None:
         return None
 
 
-def query_save(save_code: str) -> dict | None:
-    """Look up a saved item by save_code."""
+async def insert_save(data: dict) -> dict | None:
+    """Insert a saved_items row. Returns the inserted row, or None on failure. Never raises."""
+    try:
+        return await _run_sync(_insert_save_sync, data)
+    except Exception as exc:
+        logger.error("[SAVE_DB] insert_save FAILED: %s", exc)
+        record_event("database", "insert saved_items", 0, "ERROR", str(exc))
+        return None
+
+
+# ── saved_items: reads ──
+
+def _query_save_sync(save_code: str) -> dict | None:
     code = save_code.upper()
     db = get_db()
     if db:
@@ -206,7 +254,16 @@ def query_save(save_code: str) -> dict | None:
     return None
 
 
-def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, int]:
+async def query_save(save_code: str) -> dict | None:
+    """Look up a saved item by save_code."""
+    try:
+        return await _run_sync(_query_save_sync, save_code)
+    except Exception as exc:
+        logger.error("[SAVE_DB] query_save(%s) FAILED: %s", save_code, exc)
+        return None
+
+
+def _list_saves_sync(owner_id: int, limit: int, offset: int) -> tuple[list, int]:
     db = get_db()
     if db:
         try:
@@ -232,8 +289,16 @@ def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, i
     return items[offset:offset + limit], total
 
 
-def list_recent_saves(owner_id: int, limit: int = 10) -> list:
-    """Return recent saves for .list — uses idx_saved_items_owner_created."""
+async def list_saves(owner_id: int, limit: int = 50, offset: int = 0) -> tuple[list, int]:
+    try:
+        return await _run_sync(_list_saves_sync, owner_id, limit, offset)
+    except Exception as exc:
+        logger.error("[SAVE_DB] list_saves FAILED: %s", exc)
+        items = [s for s in _fallback["saved_items"] if s.get("owner_id") == owner_id]
+        return items[offset:offset + limit], len(items)
+
+
+def _list_recent_saves_sync(owner_id: int, limit: int) -> list:
     db = get_db()
     if db:
         try:
@@ -256,11 +321,16 @@ def list_recent_saves(owner_id: int, limit: int = 10) -> list:
     return items[:limit]
 
 
-def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
-    """Search saves by caption, save_code, mime_type.
+async def list_recent_saves(owner_id: int, limit: int = 10) -> list:
+    """Return recent saves for .list — uses idx_saved_items_owner_created."""
+    try:
+        return await _run_sync(_list_recent_saves_sync, owner_id, limit)
+    except Exception as exc:
+        logger.error("[SAVE_DB] list_recent_saves FAILED: %s", exc)
+        return []
 
-    Falls back to a simple in-memory scan when Supabase is unavailable.
-    """
+
+def _search_saves_sync(owner_id: int, query: str, limit: int) -> list:
     pattern = f"%{query}%"
     db = get_db()
     if db:
@@ -294,9 +364,19 @@ def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
     return matches[:limit]
 
 
-def delete_save(owner_id: int, code: str) -> dict | None:
-    """Delete a saved_items row by save_code. Returns the row or None."""
-    target = query_save(code)
+async def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
+    """Search saves by caption, save_code, mime_type."""
+    try:
+        return await _run_sync(_search_saves_sync, owner_id, query, limit)
+    except Exception as exc:
+        logger.error("[SAVE_DB] search_saves FAILED: %s", exc)
+        return []
+
+
+# ── saved_items: deletes ──
+
+def _delete_save_sync(owner_id: int, code: str) -> dict | None:
+    target = _query_save_sync(code)
     if not target or target.get("owner_id") != owner_id:
         return None
     db = get_db()
@@ -320,14 +400,17 @@ def delete_save(owner_id: int, code: str) -> dict | None:
     return target
 
 
-def delete_save_row(owner_id: int, code: str) -> dict | None:
-    """Delete a saved_items row by save_code. Returns the deleted row or None.
+async def delete_save(owner_id: int, code: str) -> dict | None:
+    """Delete a saved_items row by save_code. Returns the row or None."""
+    try:
+        return await _run_sync(_delete_save_sync, owner_id, code)
+    except Exception as exc:
+        logger.error("[SAVE_DB] delete_save FAILED: %s", exc)
+        return None
 
-    Unlike delete_save, this does NOT look up the row first — it deletes directly
-    and returns whatever the DB returns. Used by .del <code> after Telegram deletion
-    has already been attempted.
-    """
-    target = query_save(code)
+
+def _delete_save_row_sync(owner_id: int, code: str) -> dict | None:
+    target = _query_save_sync(code)
     if not target or target.get("owner_id") != owner_id:
         return None
     db = get_db()
@@ -351,8 +434,18 @@ def delete_save_row(owner_id: int, code: str) -> dict | None:
     return target
 
 
-def list_all_saves(owner_id: int) -> list:
-    """Return ALL saved items for an owner — used by cleanup and stats."""
+async def delete_save_row(owner_id: int, code: str) -> dict | None:
+    """Delete a saved_items row by save_code. Returns the deleted row or None."""
+    try:
+        return await _run_sync(_delete_save_row_sync, owner_id, code)
+    except Exception as exc:
+        logger.error("[SAVE_DB] delete_save_row FAILED: %s", exc)
+        return None
+
+
+# ── saved_items: bulk operations ──
+
+def _list_all_saves_sync(owner_id: int) -> list:
     db = get_db()
     if db:
         try:
@@ -371,8 +464,16 @@ def list_all_saves(owner_id: int) -> list:
     return items
 
 
-def cleanup_orphans(owner_id: int, orphan_ids: list[int]) -> int:
-    """Delete saved_items rows by ID. Returns count of deleted rows."""
+async def list_all_saves(owner_id: int) -> list:
+    """Return ALL saved items for an owner — used by cleanup and stats."""
+    try:
+        return await _run_sync(_list_all_saves_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] list_all_saves FAILED: %s", exc)
+        return []
+
+
+def _cleanup_orphans_sync(owner_id: int, orphan_ids: list[int]) -> int:
     if not orphan_ids:
         return 0
     db = get_db()
@@ -397,9 +498,22 @@ def cleanup_orphans(owner_id: int, orphan_ids: list[int]) -> int:
     return before - len(_fallback["saved_items"])
 
 
-def get_stats(owner_id: int) -> dict:
+async def cleanup_orphans(owner_id: int, orphan_ids: list[int]) -> int:
+    """Delete saved_items rows by ID. Returns count of deleted rows."""
+    if not orphan_ids:
+        return 0
+    try:
+        return await _run_sync(_cleanup_orphans_sync, owner_id, orphan_ids)
+    except Exception as exc:
+        logger.error("[SAVE_DB] cleanup_orphans FAILED: %s", exc)
+        return 0
+
+
+# ── saved_items: stats ──
+
+async def get_stats(owner_id: int) -> dict:
     """Return aggregate statistics for saved items."""
-    items = list_all_saves(owner_id)
+    items = await list_all_saves(owner_id)
     total = len(items)
 
     by_type: dict[str, int] = {}
@@ -421,11 +535,10 @@ def get_stats(owner_id: int) -> dict:
     }
 
 
-def update_save_field(owner_id: int, code: str, field: str, value) -> dict | None:
-    """Update a single field on a saved_items row by save_code.
-    Returns the updated row, or None if not found / not owned.
-    """
-    target = query_save(code)
+# ── saved_items: updates ──
+
+def _update_save_field_sync(owner_id: int, code: str, field: str, value) -> dict | None:
+    target = _query_save_sync(code)
     if not target or target.get("owner_id") != owner_id:
         return None
     db = get_db()
@@ -446,7 +559,16 @@ def update_save_field(owner_id: int, code: str, field: str, value) -> dict | Non
     return target
 
 
-def count_saves(owner_id: int, save_type: str | None = None) -> int:
+async def update_save_field(owner_id: int, code: str, field: str, value) -> dict | None:
+    """Update a single field on a saved_items row by save_code."""
+    try:
+        return await _run_sync(_update_save_field_sync, owner_id, code, field, value)
+    except Exception as exc:
+        logger.error("[SAVE_DB] update_save_field FAILED: %s", exc)
+        return None
+
+
+def _count_saves_with_filter_sync(owner_id: int, save_type: str | None) -> int:
     db = get_db()
     if db:
         try:
@@ -463,7 +585,17 @@ def count_saves(owner_id: int, save_type: str | None = None) -> int:
     return len(items)
 
 
-def get_bio_state(owner_id: int) -> dict | None:
+async def count_saves(owner_id: int, save_type: str | None = None) -> int:
+    try:
+        return await _run_sync(_count_saves_with_filter_sync, owner_id, save_type)
+    except Exception as exc:
+        logger.error("[SAVE_DB] count_saves FAILED: %s", exc)
+        return 0
+
+
+# ── bio_state ──
+
+def _get_bio_state_sync(owner_id: int) -> dict | None:
     db = get_db()
     if db:
         try:
@@ -480,8 +612,16 @@ def get_bio_state(owner_id: int) -> dict | None:
     return _fallback["bio_state"].get(owner_id)
 
 
-def get_or_create_bio_state(owner_id: int) -> dict:
-    state = get_bio_state(owner_id)
+async def get_bio_state(owner_id: int) -> dict | None:
+    try:
+        return await _run_sync(_get_bio_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] get_bio_state FAILED: %s", exc)
+        return _fallback["bio_state"].get(owner_id)
+
+
+def _get_or_create_bio_state_sync(owner_id: int) -> dict:
+    state = _get_bio_state_sync(owner_id)
     if state:
         return state
 
@@ -514,7 +654,23 @@ def get_or_create_bio_state(owner_id: int) -> dict:
     return default
 
 
-def update_bio_state(owner_id: int, updates: dict) -> None:
+async def get_or_create_bio_state(owner_id: int) -> dict:
+    try:
+        return await _run_sync(_get_or_create_bio_state_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] get_or_create_bio_state FAILED: %s", exc)
+        return _fallback["bio_state"].get(owner_id) or {
+            "owner_id": owner_id,
+            "template": "🕒 {time} | 💭 {mood}",
+            "mood": "😊",
+            "custom_text": "",
+            "is_active": False,
+            "last_bio": "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _update_bio_state_sync(owner_id: int, updates: dict) -> None:
     db = get_db()
     if db:
         try:
@@ -527,7 +683,16 @@ def update_bio_state(owner_id: int, updates: dict) -> None:
     _fallback["bio_state"][owner_id] = state
 
 
-def count_logs(owner_id: int) -> int:
+async def update_bio_state(owner_id: int, updates: dict) -> None:
+    try:
+        await _run_sync(_update_bio_state_sync, owner_id, updates)
+    except Exception as exc:
+        logger.error("[SAVE_DB] update_bio_state FAILED: %s", exc)
+
+
+# ── bot_logs: reads/cleanup ──
+
+def _count_logs_sync(owner_id: int) -> int:
     db = get_db()
     if db:
         try:
@@ -543,7 +708,15 @@ def count_logs(owner_id: int) -> int:
     return len([l for l in _fallback["bot_logs"] if l.get("owner_id") == owner_id])
 
 
-def list_logs(owner_id: int, limit: int = 100) -> list:
+async def count_logs(owner_id: int) -> int:
+    try:
+        return await _run_sync(_count_logs_sync, owner_id)
+    except Exception as exc:
+        logger.error("[SAVE_DB] count_logs FAILED: %s", exc)
+        return 0
+
+
+def _list_logs_sync(owner_id: int, limit: int) -> list:
     db = get_db()
     if db:
         try:
@@ -562,7 +735,15 @@ def list_logs(owner_id: int, limit: int = 100) -> list:
     return logs[-limit:] if limit > 0 else logs
 
 
-def clean_logs(owner_id: int, days: int = 7) -> int:
+async def list_logs(owner_id: int, limit: int = 100) -> list:
+    try:
+        return await _run_sync(_list_logs_sync, owner_id, limit)
+    except Exception as exc:
+        logger.error("[SAVE_DB] list_logs FAILED: %s", exc)
+        return []
+
+
+def _clean_logs_sync(owner_id: int, days: int) -> int:
     db = get_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     if db:
@@ -584,6 +765,16 @@ def clean_logs(owner_id: int, days: int = 7) -> int:
     ]
     return before - len(_fallback["bot_logs"])
 
+
+async def clean_logs(owner_id: int, days: int = 7) -> int:
+    try:
+        return await _run_sync(_clean_logs_sync, owner_id, days)
+    except Exception as exc:
+        logger.error("[SAVE_DB] clean_logs FAILED: %s", exc)
+        return 0
+
+
+# ── helpers ──
 
 def _safe_payload(data: dict) -> str:
     """Render a payload dict for logging, truncating long fields."""

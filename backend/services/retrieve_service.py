@@ -22,7 +22,6 @@ from backend.diagnostics import record_event
 logger = logging.getLogger(__name__)
 
 
-
 def _format_size(size_bytes) -> str:
     if not size_bytes:
         return "—"
@@ -98,7 +97,7 @@ async def do_preview(self_client, owner_id: int, save_code: str) -> str:
     save_code = save_code.upper().strip()
     t0 = asyncio.get_event_loop().time()
     try:
-        row = db_client.query_save(save_code)
+        row = await db_client.query_save(save_code)
         record_event("database", "query_save", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
         logger.error("preview db error: %s", exc)
@@ -111,12 +110,10 @@ async def do_preview(self_client, owner_id: int, save_code: str) -> str:
 
 
 async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: int) -> str:
-    """Forward the saved media to target_chat and inject the metadata block
-    into the caption. If the media had no caption, one is generated."""
     save_code = save_code.upper().strip()
     t0 = asyncio.get_event_loop().time()
     try:
-        row = db_client.query_save(save_code)
+        row = await db_client.query_save(save_code)
         record_event("database", "query_save", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
         logger.error("retrieve db error: %s", exc)
@@ -207,7 +204,7 @@ async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
     new_name = new_name.strip()
     if not new_name:
         return "⚠️ Filename cannot be empty."
-    row = db_client.query_save(save_code)
+    row = await db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Renamed {save_code}", {"new_name": new_name})
@@ -217,7 +214,7 @@ async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
 async def do_move(owner_id: int, save_code: str, folder: str) -> str:
     save_code = save_code.upper().strip()
     folder = folder.strip() or "Unfiled"
-    row = db_client.query_save(save_code)
+    row = await db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Moved {save_code}", {"folder": folder})
@@ -226,7 +223,7 @@ async def do_move(owner_id: int, save_code: str, folder: str) -> str:
 
 async def do_delete(self_client, owner_id: int, save_code: str) -> str:
     save_code = save_code.upper().strip()
-    row = db_client.query_save(save_code)
+    row = await db_client.query_save(save_code)
     if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
     saved_chat_id = row.get("saved_chat_id")
@@ -236,8 +233,8 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
     deleted_db = False
     if db:
         try:
-            db.table("saved_items").delete().eq("owner_id", owner_id).eq("save_code", sc).execute()
-            deleted_db = True
+            removed = await db_client.delete_save_row(owner_id, sc)
+            deleted_db = removed is not None
         except Exception as exc:
             logger.warning("delete db failed: %s", exc)
     if saved_chat_id and saved_msg_id:

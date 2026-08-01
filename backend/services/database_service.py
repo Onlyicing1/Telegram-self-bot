@@ -40,7 +40,7 @@ def format_date(iso_str: str | None, tz_str: str) -> str:
 
 
 async def find_orphans(client, owner_id: int) -> tuple[list[int], int]:
-    items = db_client.list_all_saves(owner_id)
+    items = await db_client.list_all_saves(owner_id)
     orphan_ids: list[int] = []
     for item in items:
         saved_chat_id = item.get("saved_chat_id")
@@ -61,7 +61,7 @@ async def do_clean(client, owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
         orphan_ids, total = await find_orphans(client, owner_id)
-        removed = db_client.cleanup_orphans(owner_id, orphan_ids)
+        removed = await db_client.cleanup_orphans(owner_id, orphan_ids)
         remaining = total - removed
         record_event("database", "clean orphans", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS", f"{removed}/{total}")
         await db_client.log(owner_id, "INFO", f"DB clean: removed {removed} orphans", {
@@ -82,7 +82,7 @@ async def do_clean(client, owner_id: int) -> str:
 async def do_stats(owner_id: int, tz_str: str) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
-        stats = db_client.get_stats(owner_id)
+        stats = await db_client.get_stats(owner_id)
         total = stats["total"]
         by_type = stats["by_type"]
         size_bytes = stats["size_estimate"]
@@ -121,7 +121,7 @@ async def do_vacuum(client, owner_id: int) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
         orphan_ids, total = await find_orphans(client, owner_id)
-        removed = db_client.cleanup_orphans(owner_id, orphan_ids)
+        removed = await db_client.cleanup_orphans(owner_id, orphan_ids)
         remaining = total - removed
         record_event("database", "vacuum", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS", f"{removed}/{total}")
         await db_client.log(owner_id, "INFO", f"DB vacuum: removed {removed} orphans", {

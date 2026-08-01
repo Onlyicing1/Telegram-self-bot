@@ -74,6 +74,8 @@ from backend.helper.inline_sender import register_input_listener
 from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper.lifecycle import configure_lifecycle, get_lifecycle
 from backend.services import settings_service as settings_svc
+from backend.runtime.diagnostics import start_diagnostics, stop_diagnostics
+
 from backend.helper.target_context import clear_all as clear_all_targets
 
 logger = logging.getLogger(__name__)
@@ -177,7 +179,7 @@ class RuntimeSupervisor:
             logger.info("[3/5] Helper bot: no BOT_TOKEN — inline UI disabled")
 
         logger.info("[4/5] Bio cron resume check")
-        self._resume_bio_cron()
+        await self._resume_bio_cron()
 
         logger.info("[5/5] Starting web server on port %s", self.port)
         self._start_web_server()
@@ -193,6 +195,7 @@ class RuntimeSupervisor:
             self._run_loop(), name="lifeos-run"
         )
         start_heartbeat()
+        start_diagnostics()
 
     async def _build_and_register(self) -> None:
         self._transition(RuntimeState.CONNECTING)
@@ -231,9 +234,9 @@ class RuntimeSupervisor:
             configure_callback_trace(self.client, self.owner_id)
             register_input_listener(self.client, self.owner_id)
 
-    def _resume_bio_cron(self) -> None:
+    async def _resume_bio_cron(self) -> None:
         try:
-            state = db_client.get_bio_state(self.owner_id)
+            state = await db_client.get_bio_state(self.owner_id)
             if state and state.get("is_active"):
                 self._start_bio_cron()
                 logger.info("[4/5] Bio cron resumed")
@@ -507,130 +510,146 @@ class RuntimeSupervisor:
         if self.shutdown_event.is_set():
             return
 
-        async with self._recovery_lock:
-            self._transition(RuntimeState.RECOVERING)
-            set_task_state("lifeos-recovery", "RUNNING")
-
-            self._recovery_attempts += 1
-            attempt = self._recovery_attempts
-
-            if attempt > _MAX_RECOVERY_ATTEMPTS:
-                trace("WATCHDOG_PROCESS_EXIT", reason="recovery_limit_exceeded", attempts=attempt)
-                logger.error(
-                    "WATCHDOG_PROCESS_EXIT — recovery limit exceeded "
-                    "(%d/%d attempts). Terminating process (exit code 1).",
-                    attempt, _MAX_RECOVERY_ATTEMPTS,
-                )
-                self._transition(RuntimeState.FAILED)
-                set_supervisor_ok(False)
-                set_task_state("lifeos-recovery", "FAILED")
-                self.shutdown_event.set()
-                sys.exit(1)
-
-            delay = _backoff(attempt)
-            trace("WATCHDOG_RECOVERY_STARTED", attempt=attempt, backoff_delay=f"{delay:.1f}s")
-            logger.warning(
-                "WATCHDOG_RECOVERY_STARTED — attempt %d/%d, backoff %.1fs",
-                attempt, _MAX_RECOVERY_ATTEMPTS, delay,
+        try:
+            acquired = await asyncio.wait_for(
+                self._recovery_lock.acquire(), timeout=30.0
             )
-            record_event("runtime", "recovery_start", 0, "ATTEMPT",
-                         f"attempt={attempt}")
-
-            logger.info("Recovery: stopping bio cron")
-            try:
-                await bio_engine.stop_cron()
-            except Exception as exc:
-                logger.warning("Recovery: bio stop error: %s", exc)
-            set_bio_cron_ok(False)
-
-            logger.info("Recovery: stopping helper bot")
-            await self._stop_helper()
-            set_helper_connected(False)
-
-            logger.info("Recovery: clearing inline panel state")
-            await get_lifecycle().shutdown_all()
-            clear_all_targets()
-
-            logger.info("Recovery: cancelling run task")
-            if self._run_task and not self._run_task.done():
-                self._run_task.cancel()
-                try:
-                    await asyncio.wait_for(self._run_task, timeout=5.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                    pass
-                self._run_task = None
-
-            logger.info("Recovery: cancelling all orphan tasks")
-            await self._cancel_orphan_tasks()
-
-            logger.info("Recovery: disposing dead client")
-            old_client = self.client
-            self.client = None
-            self._client_alive = False
-            set_telethon_connected(False)
-            if old_client is not None:
-                try:
-                    await asyncio.wait_for(old_client.disconnect(), timeout=10.0)
-                except (asyncio.TimeoutError, Exception):
-                    logger.warning("Recovery: old client disconnect timed out")
-
-            await asyncio.sleep(delay)
-
-            if self.shutdown_event.is_set():
+            if not acquired:
+                logger.warning("Recovery lock acquisition timed out (30s) — skipping")
                 return
+        except asyncio.TimeoutError:
+            logger.warning("Recovery lock acquisition timed out (30s) — skipping")
+            return
 
+        try:
+            await self._do_recovery()
+        finally:
+            self._recovery_lock.release()
+
+    async def _do_recovery(self) -> None:
+        self._transition(RuntimeState.RECOVERING)
+        set_task_state("lifeos-recovery", "RUNNING")
+
+        self._recovery_attempts += 1
+        attempt = self._recovery_attempts
+
+        if attempt > _MAX_RECOVERY_ATTEMPTS:
+            trace("WATCHDOG_PROCESS_EXIT", reason="recovery_limit_exceeded", attempts=attempt)
+            logger.error(
+                "WATCHDOG_PROCESS_EXIT — recovery limit exceeded "
+                "(%d/%d attempts). Terminating process (exit code 1).",
+                attempt, _MAX_RECOVERY_ATTEMPTS,
+            )
+            self._transition(RuntimeState.FAILED)
+            set_supervisor_ok(False)
+            set_task_state("lifeos-recovery", "FAILED")
+            self.shutdown_event.set()
+            sys.exit(1)
+
+        delay = _backoff(attempt)
+        trace("WATCHDOG_RECOVERY_STARTED", attempt=attempt, backoff_delay=f"{delay:.1f}s")
+        logger.warning(
+            "WATCHDOG_RECOVERY_STARTED — attempt %d/%d, backoff %.1fs",
+            attempt, _MAX_RECOVERY_ATTEMPTS, delay,
+        )
+        record_event("runtime", "recovery_start", 0, "ATTEMPT",
+                     f"attempt={attempt}")
+
+        logger.info("Recovery: stopping bio cron")
+        try:
+            await bio_engine.stop_cron()
+        except Exception as exc:
+            logger.warning("Recovery: bio stop error: %s", exc)
+        set_bio_cron_ok(False)
+
+        logger.info("Recovery: stopping helper bot")
+        await self._stop_helper()
+        set_helper_connected(False)
+
+        logger.info("Recovery: clearing inline panel state")
+        await get_lifecycle().shutdown_all()
+        clear_all_targets()
+
+        logger.info("Recovery: cancelling run task")
+        if self._run_task and not self._run_task.done():
+            self._run_task.cancel()
             try:
-                trace("SELF_REBUILDING", gen=self.client_generation + 1)
-                logger.info("Recovery: building new client")
-                await self._build_and_register()
-                trace("SELF_RECONNECTED", gen=self.client_generation)
-                logger.info("Recovery: new client ready (gen=%d)", self.client_generation)
+                await asyncio.wait_for(self._run_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            self._run_task = None
 
-                if self.helper_enabled:
-                    set_self_client(self.client)
+        logger.info("Recovery: cancelling all orphan tasks")
+        await self._cancel_orphan_tasks()
 
-                if self.helper_enabled:
-                    logger.info("Recovery: restarting helper bot")
-                    await self._start_helper()
+        logger.info("Recovery: disposing dead client")
+        old_client = self.client
+        self.client = None
+        self._client_alive = False
+        set_telethon_connected(False)
+        if old_client is not None:
+            try:
+                await asyncio.wait_for(old_client.disconnect(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Recovery: old client disconnect timed out")
 
-                logger.info("Recovery: resuming bio engine")
-                self._resume_bio_cron()
+        await asyncio.sleep(delay)
 
-                logger.info("Recovery: verifying with fresh heartbeat")
-                await self._verify_heartbeat()
+        if self.shutdown_event.is_set():
+            return
 
-                self._run_task = guarded_create_task(
-                    self._run_loop(), name="lifeos-run"
-                )
+        try:
+            trace("SELF_REBUILDING", gen=self.client_generation + 1)
+            logger.info("Recovery: building new client")
+            await self._build_and_register()
+            trace("SELF_RECONNECTED", gen=self.client_generation)
+            logger.info("Recovery: new client ready (gen=%d)", self.client_generation)
 
-                start_heartbeat()
+            if self.helper_enabled:
+                set_self_client(self.client)
 
-                set_last_update()
-                set_last_telethon_event()
+            if self.helper_enabled:
+                logger.info("Recovery: restarting helper bot")
+                await self._start_helper()
 
-                self._recovery_attempts = 0
-                self._consecutive_failures = 0
-                self._transition(RuntimeState.READY)
-                set_supervisor_ok(True)
-                set_task_state("lifeos-recovery", "DONE")
-                increment_restart()
-                trace("WATCHDOG_RECOVERY_SUCCESS", gen=self.client_generation)
-                logger.info(
-                    "WATCHDOG_RECOVERY_SUCCESS — system operational (gen=%d)",
-                    self.client_generation,
-                )
-                record_event("runtime", "recovery", 0, "SUCCESS",
-                             f"gen={self.client_generation}")
+            logger.info("Recovery: resuming bio engine")
+            await self._resume_bio_cron()
 
-            except Exception as exc:
-                trace_exception("WATCHDOG_RECOVERY_FAILED", exc, attempt=attempt)
-                logger.error(
-                    "WATCHDOG_RECOVERY_FAILED — attempt %d/%d: %s",
-                    attempt, _MAX_RECOVERY_ATTEMPTS, exc,
-                )
-                record_event("runtime", "recovery", 0, "ERROR", str(exc))
-                set_last_rebuild_reason(f"recovery_error: {exc}")
-                set_task_state("lifeos-recovery", "FAILED")
+            logger.info("Recovery: verifying with fresh heartbeat")
+            await self._verify_heartbeat()
+
+            self._run_task = guarded_create_task(
+                self._run_loop(), name="lifeos-run"
+            )
+
+            start_heartbeat()
+
+            set_last_update()
+            set_last_telethon_event()
+
+            self._recovery_attempts = 0
+            self._consecutive_failures = 0
+            self._transition(RuntimeState.READY)
+            set_supervisor_ok(True)
+            set_task_state("lifeos-recovery", "DONE")
+            increment_restart()
+            trace("WATCHDOG_RECOVERY_SUCCESS", gen=self.client_generation)
+            logger.info(
+                "WATCHDOG_RECOVERY_SUCCESS — system operational (gen=%d)",
+                self.client_generation,
+            )
+            record_event("runtime", "recovery", 0, "SUCCESS",
+                         f"gen={self.client_generation}")
+
+        except Exception as exc:
+            trace_exception("WATCHDOG_RECOVERY_FAILED", exc, attempt=attempt)
+            logger.error(
+                "WATCHDOG_RECOVERY_FAILED — attempt %d/%d: %s",
+                attempt, _MAX_RECOVERY_ATTEMPTS, exc,
+            )
+            record_event("runtime", "recovery", 0, "ERROR", str(exc))
+            set_last_rebuild_reason(f"recovery_error: {exc}")
+            set_task_state("lifeos-recovery", "FAILED")
 
     async def _verify_heartbeat(self) -> None:
         client = self.client
@@ -687,6 +706,9 @@ class RuntimeSupervisor:
 
         logger.info("Shutdown: stopping heartbeat")
         await stop_heartbeat()
+
+        logger.info("Shutdown: stopping diagnostics")
+        await stop_diagnostics()
 
         logger.info("Shutdown: stopping bio cron")
         try:

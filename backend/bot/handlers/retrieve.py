@@ -48,20 +48,15 @@ logger = logging.getLogger(__name__)
 _SAVED_PER_PAGE = 8
 
 
-# ── Utility ──
-
 def _parse_extra_id(extra: str) -> str | None:
-    """Extract item save_code from extra string like 'id:SV-XXXXXX'."""
     if extra.startswith("id:"):
         return extra[3:]
     return None
 
 
-# ── Panel: retrieve (main menu) ──
-
 async def _retrieve_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
-    total = db_client.count_saves(_owner_id)
+    total = await db_client.count_saves(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row(f"📋 Saved Items ({total})", "panel:retrieve_saved")
     builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
@@ -70,14 +65,12 @@ async def _retrieve_panel_handler(event, extra: str) -> tuple[str, str, list] | 
 
 async def _retrieve_inline_builder(event, extra: str) -> list:
     from backend.helper.inline_engine import _owner_id
-    total = db_client.count_saves(_owner_id)
+    total = await db_client.count_saves(_owner_id)
     builder = InlinePanelBuilder()
     builder.add_row(f"📋 Saved Items ({total})", "panel:retrieve_saved")
     builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
     return [render("Retrieve", "Browse your saved files or retrieve by code.", builder.build())]
 
-
-# ── Panel: retrieve_saved (paginated browser) ──
 
 async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
@@ -88,12 +81,12 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
             page = max(1, int(page_str))
     per_page = _SAVED_PER_PAGE
     offset = (page - 1) * per_page
-    items, total = db_client.list_saves(_owner_id, limit=per_page, offset=offset)
+    items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
     total_pages = max(1, (total + per_page - 1) // per_page)
     if page > total_pages:
         page = total_pages
         offset = (page - 1) * per_page
-        items, total = db_client.list_saves(_owner_id, limit=per_page, offset=offset)
+        items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
 
     if not items:
         return "Saved Items", "_No saved items found._\n\nSave something first with `.save`.", []
@@ -129,13 +122,11 @@ async def _retrieve_saved_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
-# ── Panel: retrieve_item (preview + actions) ──
-
 async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     code = _parse_extra_id(extra)
     if not code:
         return "Item", "Item not found.", []
-    row = db_client.query_save(code)
+    row = await db_client.query_save(code)
     if not row:
         return "Item", f"❌ No item found for `{code}`", []
 
@@ -156,8 +147,6 @@ async def _retrieve_item_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
-# ── Panel: retrieve_code (manual entry) ──
-
 async def _retrieve_code_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("Enter Code", "input:retrieve:code")
@@ -170,8 +159,6 @@ async def _retrieve_code_inline_builder(event, extra: str) -> list:
     return [render("Retrieve by Code", "Enter a save code to preview:", builder.build())]
 
 
-# ── Actions ──
-
 async def _retrieve_item_exec_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
     code = extra.strip()
@@ -181,7 +168,7 @@ async def _retrieve_item_exec_action(event, extra: str, chat_id: int) -> tuple[s
         logger.error("[RETRIEVE] invalid target chat from callback: chat_id=%r", chat_id)
         return "Retrieve", "❌ Cannot determine target chat.", []
     result = await retrieve_service.do_retrieve(_self_client, _owner_id, code, chat_id)
-    row = db_client.query_save(code)
+    row = await db_client.query_save(code)
     if row:
         return "Retrieve", result, _retrieve_item_buttons(code)
     return "Retrieve", result, []
@@ -204,8 +191,6 @@ async def _retrieve_item_delete_action(event, extra: str, chat_id: int) -> tuple
     builder.add_row("‹ Back to Saved Items", "panel:retrieve_saved")
     return "Delete", result, builder.build()
 
-
-# ── Input handlers ──
 
 async def _retrieve_code_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client, _owner_id
@@ -276,8 +261,6 @@ async def _retrieve_move_input_handler(text, chat_id, msg_id, inline_chat_id, in
             pass
 
 
-# ── Registration ──
-
 def register(client, owner_id: int):
     register_panel("retrieve", _retrieve_panel_handler)
     register_panel("retrieve_saved", _retrieve_saved_panel_handler)
@@ -302,7 +285,6 @@ def register(client, owner_id: int):
         "prompt": "**Move Item**\n\nEnter the folder name (or 'unfiled' to remove):\n\n_Reply below._",
     })
 
-    # .retrieve / .r / .files — opens the Saved Items browser by default
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:retrieve|r|files)$"))
     async def retrieve_panel(event):
         if not is_owner(event, owner_id):
@@ -317,7 +299,6 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("retrieve inline send failed: %s", exc)
 
-    # .preview <code> — text shortcut, shows preview text
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:preview|retrieve|r)\s+(\S+)$"))
     async def preview_cmd(event):
         if not is_owner(event, owner_id):
@@ -326,7 +307,6 @@ def register(client, owner_id: int):
         result = await retrieve_service.do_preview(client, owner_id, save_code)
         await event.edit(result)
 
-    # .send <code> — text shortcut, retrieves file with metadata block
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.send\s+(\S+)$"))
     async def send_cmd(event):
         if not is_owner(event, owner_id):
@@ -338,7 +318,6 @@ def register(client, owner_id: int):
         else:
             await event.edit(result)
 
-    # .send — opens the retrieve panel (alias for .retrieve)
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.send$"))
     async def send_panel(event):
         if not is_owner(event, owner_id):
