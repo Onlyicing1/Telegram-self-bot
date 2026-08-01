@@ -75,7 +75,6 @@ from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper.lifecycle import configure_lifecycle, get_lifecycle
 from backend.services import settings_service as settings_svc
 from backend.runtime.diagnostics import start_diagnostics, stop_diagnostics
-from backend.runtime.diagnostics_reporter import start as start_reporter, stop as stop_reporter
 
 from backend.helper.target_context import clear_all as clear_all_targets
 
@@ -197,7 +196,6 @@ class RuntimeSupervisor:
         )
         start_heartbeat()
         start_diagnostics()
-        start_reporter(self.client)
 
     async def _build_and_register(self) -> None:
         self._transition(RuntimeState.CONNECTING)
@@ -635,8 +633,6 @@ class RuntimeSupervisor:
             set_supervisor_ok(True)
             set_task_state("lifeos-recovery", "DONE")
             increment_restart()
-            import backend.runtime.diagnostics_reporter as _reporter_mod
-            _reporter_mod._client = self.client
             trace("WATCHDOG_RECOVERY_SUCCESS", gen=self.client_generation)
             logger.info(
                 "WATCHDOG_RECOVERY_SUCCESS — system operational (gen=%d)",
@@ -670,7 +666,7 @@ class RuntimeSupervisor:
 
     async def _cancel_orphan_tasks(self) -> None:
         current = asyncio.current_task()
-        protected_names = {"lifeos-watchdog", "lifeos-web", "lifeos-heartbeat", "lifeos-diagnostics-reporter"}
+        protected_names = {"lifeos-watchdog", "lifeos-web", "lifeos-heartbeat"}
         to_cancel = []
         for task in asyncio.all_tasks():
             if task is current:
@@ -713,9 +709,6 @@ class RuntimeSupervisor:
 
         logger.info("Shutdown: stopping diagnostics")
         await stop_diagnostics()
-
-        logger.info("Shutdown: stopping diagnostics reporter")
-        await stop_reporter()
 
         logger.info("Shutdown: stopping bio cron")
         try:
