@@ -13,7 +13,6 @@ Tracks:
   - supervisor_ok
   - helper_connected
   - bio_cron_ok
-  - username_cron_ok
   - client_generation
   - last_rebuild_reason
   - rpc_latency_ms
@@ -37,7 +36,6 @@ _runtime_state: str = "STARTING"
 _telethon_connected: bool = False
 _supervisor_ok: bool = False
 _bio_cron_ok: bool = False
-_username_cron_ok: bool = False
 _helper_connected: bool = False
 
 _restart_count: int = 0
@@ -97,11 +95,6 @@ def set_supervisor_ok(ok: bool) -> None:
 def set_bio_cron_ok(ok: bool) -> None:
     global _bio_cron_ok
     _bio_cron_ok = bool(ok)
-
-
-def set_username_cron_ok(ok: bool) -> None:
-    global _username_cron_ok
-    _username_cron_ok = bool(ok)
 
 
 def set_helper_connected(connected: bool) -> None:
@@ -263,7 +256,6 @@ def snapshot() -> dict:
         "supervisor_ok": _supervisor_ok,
         "helper_connected": _helper_connected,
         "bio_cron_ok": _bio_cron_ok,
-        "username_cron_ok": _username_cron_ok,
         "heartbeat_age_s": round(age, 2) if age >= 0 else None,
         "uptime_s": round(_uptime(), 1) if _uptime() >= 0 else None,
         "restart_count": _restart_count,

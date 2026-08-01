@@ -79,13 +79,6 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         ],
     ),
     (
-        "Username Engine",
-        [
-            "**Username Engine**\n",
-            "Fully inline — tap to navigate.",
-        ],
-    ),
-    (
         "Database",
         [
             "**Database**\n",
@@ -160,14 +153,6 @@ def _build_bio_help_buttons() -> list:
     return builder.build()
 
 
-def _build_username_help_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
-    builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
-    return builder.build()
-
-
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     if extra == "back":
         return "LifeOS Command Center", "", _build_main_menu_buttons()
@@ -182,8 +167,6 @@ async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None
                     return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
                 if idx == 2:
                     return "Bio Engine", "Choose a section:", _build_bio_help_buttons()
-                if idx == 3:
-                    return "Username Engine", "Choose a section:", _build_username_help_buttons()
                 _, lines = _HELP_CATEGORIES[idx]
                 body = "\n".join(lines)
                 return _HELP_CATEGORIES[idx][0], body, []
@@ -197,8 +180,6 @@ async def _help_inline_builder(event, extra: str) -> list:
         return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
     if extra.startswith("cat:2"):
         return [render("Bio Engine", "Choose a section:", _build_bio_help_buttons())]
-    if extra.startswith("cat:3"):
-        return [render("Username Engine", "Choose a section:", _build_username_help_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
 
 
