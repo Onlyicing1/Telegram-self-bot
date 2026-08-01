@@ -247,47 +247,47 @@ async def _settings_inline_builder(event, extra: str) -> list:
     return [render("Settings", _build_settings_body(), _build_settings_buttons())]
 
 
-async def _settings_toggle_autoclose_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_autoclose_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.toggle_auto_close()
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_diagnostics_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_diagnostics_enabled(not settings_service.is_diagnostics_enabled())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_debug_callbacks_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_debug_callbacks_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_debug_callbacks(not settings_service.is_debug_callbacks())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_owner_only_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_owner_only_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_owner_only(not settings_service.is_owner_only())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_multiple_panels_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_multiple_panels_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_allow_multiple_panels(not settings_service.is_allow_multiple_panels())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _settings_toggle_reuse_panel_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _settings_toggle_reuse_panel_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.set_reuse_existing_panel(not settings_service.is_reuse_existing_panel())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
-async def _general_ping_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     return "PONG", "", _build_general_buttons()
 
 
-async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
 
     owner_id = _owner_id
@@ -326,7 +326,7 @@ async def _general_id_action(event, extra: str) -> tuple[str, str, list] | None:
     return "Chat & Message IDs", body, _build_general_buttons()
 
 
-async def _general_health_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _general_health_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
@@ -733,7 +733,7 @@ async def _health_inline_builder(event, extra: str) -> list:
     return [render("Health Dashboard", report, builder.build())]
 
 
-async def _health_refresh_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     snap = health.snapshot()
     report = _build_health_report(snap)
     builder = InlinePanelBuilder()
@@ -788,7 +788,7 @@ async def _logs_inline_builder(event, extra: str) -> list:
     return [render("Event Log", text, builder.build())]
 
 
-async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _logs_errors_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=20, errors_only=True)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
@@ -796,7 +796,7 @@ async def _logs_errors_action(event, extra: str) -> tuple[str, str, list] | None
     return "Event Log", text, builder.build()
 
 
-async def _logs_50_action(event, extra: str) -> tuple[str, str, list] | None:
+async def _logs_50_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     events_list = diagnostics.filter_events(limit=50, errors_only=False)
     text = diagnostics.format_events(events_list)
     builder = InlinePanelBuilder()
