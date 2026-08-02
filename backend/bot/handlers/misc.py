@@ -148,8 +148,6 @@ def _build_username_help_buttons() -> list:
 
 
 async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    if extra == "back":
-        return "LifeOS Command Center", "", _build_main_menu_buttons()
     if extra.startswith("cat:"):
         idx_str = extra[4:]
         if idx_str.isdigit():
