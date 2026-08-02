@@ -130,16 +130,39 @@ class InlinePanelBuilder:
         return [list(row) for row in self._rows]
 
 
+PARENT_MAP: dict[str, str] = {
+    "save": "menu",
+    "del": "menu",
+    "delfrom": "del",
+    "profile": "menu",
+    "bio": "profile",
+    "biohelp": "bio",
+    "username": "profile",
+    "usernamehelp": "username",
+    "settings": "menu",
+    "db": "menu",
+    "help": "menu",
+    "retrieve": "menu",
+    "retrieve_saved": "retrieve",
+    "retrieve_item": "retrieve_saved",
+    "retrieve_code": "retrieve",
+    "context": "menu",
+    "health": "menu",
+}
+
+_NAV_ACTIONS = {"back", "home", "close"}
+
+
 def _add_close_button(builder: InlinePanelBuilder) -> None:
-    builder.add_row("✕ Close", "panel:_nav:close")
+    builder.add_row("❌ Close", "panel:_nav:close")
 
 
 def _add_nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("‹ Back", "panel:_nav:back"),
+        ("⬅ Back", "panel:_nav:back"),
         ("🏠 Home", "panel:_nav:home"),
     )
-    builder.add_row("✕ Close", "panel:_nav:close")
+    builder.add_row("❌ Close", "panel:_nav:close")
 
 
 def _has_nav_buttons(buttons: list) -> bool:
@@ -149,11 +172,14 @@ def _has_nav_buttons(buttons: list) -> bool:
                 data = getattr(btn, "data", None)
                 if data is None:
                     continue
+                decoded = ""
                 if isinstance(data, bytes):
-                    if b"panel:_nav:" in data:
-                        return True
+                    decoded = data.decode("utf-8", errors="replace")
                 elif isinstance(data, str):
-                    if "panel:_nav:" in data:
+                    decoded = data
+                if decoded.startswith("panel:_nav:"):
+                    action = decoded[len("panel:_nav:"):]
+                    if action in _NAV_ACTIONS:
                         return True
     return False
 
@@ -448,11 +474,18 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
 
     if action == "back":
         lifecycle = get_lifecycle()
+        nav = lifecycle.sessions.current_nav(chat_id, msg_id)
+        current = nav[0] if nav else "menu"
         prev = lifecycle.sessions.pop_nav(chat_id, msg_id)
         clear_pending(owner_id)
         if prev is None:
-            prev = ("menu", "")
+            parent = PARENT_MAP.get(current, "menu")
+            prev = (parent, "")
         prev_panel, prev_extra = prev
+        if prev_panel == current:
+            parent = PARENT_MAP.get(prev_panel, "menu")
+            prev = (parent, "")
+            prev_panel, prev_extra = prev
         logger.info("[CALLBACK] _handle_navigation: back → panel='%s' extra='%s'", prev_panel, prev_extra)
         handler = get_panel(prev_panel)
         if handler is None:
