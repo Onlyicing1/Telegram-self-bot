@@ -1,7 +1,6 @@
 """
 .ping    — Edit trigger with PONG (zero-spam policy).
 .id      — Chat ID + Message ID of the current context.
-.help    — Interactive inline help panel (via Inline Mode).
 .panel   — Context panel for the replied message.
 .health  — Full health dashboard (inline panel).
 .menu    — Mother Panel — the central navigation root of LifeOS.
@@ -50,56 +49,6 @@ def _resolve_tz() -> str:
 
 logger = logging.getLogger(__name__)
 
-_HELP_CATEGORIES: list[tuple[str, list[str]]] = [
-    (
-        "General",
-        [
-            "**General**\n",
-            "`.ping` — PONG",
-            "`.id` — Chat & Msg IDs",
-            "`.health` — Health dashboard",
-            "`.save` — Save replied message",
-        ],
-    ),
-    (
-        "Retrieve",
-        [
-            "**Retrieve**\n",
-            "`.retrieve` · `.r` · `.files` — Browse saved items",
-            "`.preview <code>` — Show metadata",
-            "`.send <code>` — Forward asset here",
-        ],
-    ),
-    (
-        "Bio Engine",
-        [
-            "**Bio Engine**\n",
-            "Fully inline — tap to navigate.",
-        ],
-    ),
-    (
-        "Username Engine",
-        [
-            "**Username Engine**\n",
-            "Fully inline — tap to navigate.",
-        ],
-    ),
-]
-
-
-def _build_main_menu_buttons() -> list:
-    builder = InlinePanelBuilder()
-    cats = _HELP_CATEGORIES
-    for i in range(0, len(cats) - 1, 2):
-        builder.add_buttons(
-            (cats[i][0], f"panel:help:cat:{i}"),
-            (cats[i + 1][0], f"panel:help:cat:{i + 1}"),
-        )
-    if len(cats) % 2 == 1:
-        builder.add_row(cats[-1][0], f"panel:help:cat:{len(cats) - 1}")
-    builder.add_row("⚙️ Settings", "panel:settings")
-    return builder.build()
-
 
 def _build_general_buttons() -> list:
     builder = InlinePanelBuilder()
@@ -109,91 +58,31 @@ def _build_general_buttons() -> list:
     return builder.build()
 
 
-def _general_body() -> str:
+async def _general_body() -> str:
     return (
         "**General**\n\n"
         "Tap a button to execute instantly."
     )
 
 
-def _retrieve_body() -> str:
-    return (
-        "**Retrieve**\n\n"
-        "Browse saved items in a file-manager view.\n"
-        "Tap any item to preview, retrieve, rename, move, or delete."
-    )
-
-
-def _build_retrieve_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("📋 Saved Items", "panel:retrieve_saved")
-    builder.add_row("🔍 Retrieve by Code", "panel:retrieve_code")
-    return builder.build()
-
-
-def _build_bio_help_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("🔧 Variables", "panel:biohelp:vars")
-    builder.add_row("📋 Commands", "panel:biohelp:cmds")
-    builder.add_row("🏗 Template Builder", "panel:biohelp:builder")
-    return builder.build()
-
-
-def _build_username_help_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("🔧 Variables", "panel:usernamehelp:vars")
-    builder.add_row("📋 Commands", "panel:usernamehelp:cmds")
-    builder.add_row("🏗 Template Builder", "panel:usernamehelp:builder")
-    return builder.build()
-
-
-async def _help_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    if extra.startswith("cat:"):
-        idx_str = extra[4:]
-        if idx_str.isdigit():
-            idx = int(idx_str)
-            if 0 <= idx < len(_HELP_CATEGORIES):
-                if idx == 0:
-                    return _HELP_CATEGORIES[0][0], _general_body(), _build_general_buttons()
-                if idx == 1:
-                    return _HELP_CATEGORIES[1][0], _retrieve_body(), _build_retrieve_buttons()
-                if idx == 2:
-                    return "Bio Engine", "Choose a section:", _build_bio_help_buttons()
-                if idx == 3:
-                    return "Username Engine", "Choose a section:", _build_username_help_buttons()
-                _, lines = _HELP_CATEGORIES[idx]
-                body = "\n".join(lines)
-                return _HELP_CATEGORIES[idx][0], body, []
-    return "LifeOS Command Center", "", _build_main_menu_buttons()
-
-
-async def _help_inline_builder(event, extra: str) -> list:
-    if extra.startswith("cat:0"):
-        return [render("General", _general_body(), _build_general_buttons())]
-    if extra.startswith("cat:1"):
-        return [render("Retrieve", _retrieve_body(), _build_retrieve_buttons())]
-    if extra.startswith("cat:2"):
-        return [render("Bio Engine", "Choose a section:", _build_bio_help_buttons())]
-    if extra.startswith("cat:3"):
-        return [render("Username Engine", "Choose a section:", _build_username_help_buttons())]
-    return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
-
-
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("📥 Save", "panel:save")
-    builder.add_row("🗑 Delete", "panel:del")
-    builder.add_row("👤 Profile", "panel:profile")
-    builder.add_row("⚙️ Settings", "panel:settings")
-    builder.add_row("🗄 Database", "panel:db")
-    builder.add_row("📖 Help", "panel:help")
-    return builder.build()
-
-
-def _build_profile_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("🧬 Bio", "panel:bio")
-    builder.add_row("👤 Username", "panel:username")
+    builder.add_buttons(
+        ("📥 Save", "panel:save"),
+        ("🗑 Delete", "panel:del"),
+    )
+    builder.add_buttons(
+        ("👤 Profile", "panel:profile"),
+        ("🗄 Database", "panel:db"),
+    )
+    builder.add_buttons(
+        ("📋 List", "panel:list"),
+        ("🔍 Find", "panel:find"),
+    )
+    builder.add_buttons(
+        ("🔧 General", "panel:general"),
+        ("⚙️ Settings", "panel:settings"),
+    )
     return builder.build()
 
 
@@ -205,12 +94,26 @@ async def _menu_inline_builder(event, extra: str) -> list:
     return [render("🏠 LifeOS", "Choose a category:", _build_menu_buttons())]
 
 
+async def _general_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "General", await _general_body(), _build_general_buttons()
+
+
+async def _general_inline_builder(event, extra: str) -> list:
+    return [render("General", await _general_body(), _build_general_buttons())]
+
+
 async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "👤 Profile", "Choose a section:", _build_profile_buttons()
+    builder = InlinePanelBuilder()
+    builder.add_row("🧬 Bio", "panel:bio")
+    builder.add_row("👤 Username", "panel:username")
+    return "👤 Profile", "Choose a section:", builder.build()
 
 
 async def _profile_inline_builder(event, extra: str) -> list:
-    return [render("👤 Profile", "Choose a section:", _build_profile_buttons())]
+    builder = InlinePanelBuilder()
+    builder.add_row("🧬 Bio", "panel:bio")
+    builder.add_row("👤 Username", "panel:username")
+    return [render("👤 Profile", "Choose a section:", builder.build())]
 
 
 def _build_settings_body() -> str:
@@ -540,11 +443,11 @@ async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, 
             pass
 
 
-def _register_help_panel() -> None:
-    register_panel("help", _help_panel_handler, parent="menu", title="LifeOS Command Center")
+def _register_panels() -> None:
     register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
-    register_inline_builder("help", _help_inline_builder)
     register_inline_builder("settings", _settings_inline_builder)
+    register_panel("general", _general_panel_handler, parent="menu", title="General")
+    register_inline_builder("general", _general_inline_builder)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
     register_action("settings_toggle_debug_callbacks", _settings_toggle_debug_callbacks_action)
     register_action("settings_toggle_owner_only", _settings_toggle_owner_only_action)
@@ -592,10 +495,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    if has_target:
-        builder.add_row("📦 Save", "panel:save")
-    else:
-        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
+    builder.add_row("📦 Save", "panel:save")
     builder.add_row("🗑 Delete", "panel:del")
     builder.add_row("🗄 Database", "panel:db")
 
@@ -616,10 +516,7 @@ async def _context_inline_builder(event, extra: str) -> list:
     has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
 
     builder = InlinePanelBuilder()
-    if has_target:
-        builder.add_row("📦 Save", "panel:save")
-    else:
-        builder.add_row("📦 Save (reply required)", "panel:_nav:noop")
+    builder.add_row("📦 Save", "panel:save")
     builder.add_row("🗑 Delete", "panel:del")
     builder.add_row("🗄 Database", "panel:db")
 
@@ -801,28 +698,6 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("id_cmd failed: %s", exc)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
-    async def help_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-
-        helper = get_client()
-        if helper is None:
-            text, _ = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
-            await event.edit(text)
-            return
-
-        try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, "help")
-        except Exception as exc:
-            logger.warning("help inline send failed: %s", exc)
-            try:
-                text, _ = render_edit("LifeOS Command Center", "", _build_main_menu_buttons())
-                await event.edit(text)
-            except Exception:
-                pass
-
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.panel$"))
     async def panel_cmd(event):
         if not is_owner(event, owner_id):
@@ -857,7 +732,7 @@ def register(client, owner_id: int):
                 pass
 
     try:
-        _register_help_panel()
+        _register_panels()
         register_panel("menu", _menu_panel_handler, parent="menu", title="🏠 LifeOS")
         register_inline_builder("menu", _menu_inline_builder)
         register_panel("profile", _profile_panel_handler, parent="menu", title="👤 Profile")
