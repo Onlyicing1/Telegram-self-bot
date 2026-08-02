@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 async def do_on(client, owner_id: int, tz_str: str) -> str:
     try:
+        await db_client.get_or_create_username_state(owner_id)
         await db_client.update_username_state(owner_id, {"is_active": True})
     except Exception as exc:
         return f"❌ DB error: {exc}"
