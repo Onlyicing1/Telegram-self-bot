@@ -36,7 +36,7 @@ from backend.runtime.task_guard import guarded_create_task
 logger = logging.getLogger("backend.heartbeat")
 
 _INTERVAL = 30.0
-_STALL_THRESHOLD = 120.0
+_STALL_THRESHOLD = 90.0
 _task: asyncio.Task | None = None
 
 _state_ref: dict = {
@@ -48,6 +48,13 @@ _state_ref: dict = {
     "update_queue_size": -1,
     "registered_handlers": -1,
 }
+
+_supervisor_ref = None
+
+
+def configure(supervisor) -> None:
+    global _supervisor_ref
+    _supervisor_ref = supervisor
 
 
 def update_state(**kwargs) -> None:
@@ -143,7 +150,7 @@ async def _heartbeat_loop() -> None:
             last_callback_age=last_callback_age,
         )
 
-        # ── Stall detection (trace only, never reconnect) ──
+        # ── Stall detection — trigger reconnect ──
         rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
 
         if last_update > 0 and (now - last_update) > _STALL_THRESHOLD:
@@ -157,10 +164,13 @@ async def _heartbeat_loop() -> None:
                 )
                 logger.warning(
                     "UPDATE_PIPELINE_STALLED — no updates for %s but RPC is healthy "
-                    "(last_rpc_age=%s, gen=%d)",
+                    "(last_rpc_age=%s, gen=%d) — triggering reconnect",
                     last_update_age, last_rpc_age,
                     _state_ref.get("client_generation", 0),
                 )
+                sup = _supervisor_ref
+                if sup is not None and not sup._recovery_lock.locked():
+                    guarded_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
         if last_update > 0 and last_event > 0 and (now - last_event) > _STALL_THRESHOLD:
             if (now - last_update) < _STALL_THRESHOLD:
@@ -173,10 +183,13 @@ async def _heartbeat_loop() -> None:
                 )
                 logger.warning(
                     "EVENT_DISPATCH_STALLED — updates arriving (%s) but no event "
-                    "dispatched for %s (gen=%d)",
+                    "dispatched for %s (gen=%d) — triggering reconnect",
                     last_update_age, last_event_age,
                     _state_ref.get("client_generation", 0),
                 )
+                sup = _supervisor_ref
+                if sup is not None and not sup._recovery_lock.locked():
+                    guarded_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
 
 def start_heartbeat() -> None:

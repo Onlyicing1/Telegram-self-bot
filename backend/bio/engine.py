@@ -95,6 +95,11 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
     record_event("bio", "start_cron", 0, "SUCCESS")
 
 
+def update_client(client) -> None:
+    """Swap the client after a rebuild without restarting the bio engine."""
+    profile_scheduler.update_client(client)
+
+
 async def stop_cron() -> None:
     """Stop the shared profile scheduler (which serves all engines)."""
     trace("BIO_CRON_STOP_REQUESTED")
