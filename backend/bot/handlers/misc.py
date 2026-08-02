@@ -196,17 +196,21 @@ def _build_settings_body() -> str:
     uss = settings_service.update_stale_seconds()
 
     def _state(on: bool) -> str:
-        return "🟢" if on else "🔴"
+        return "🟢" if on else "⚪"
 
-    return (
-        "**⚙️ Settings**\n\n"
-        f"{_state(ac)} Auto Close  ·  ⏳ `{acd}s`\n"
-        f"{_state(oo)} Owner Only  ·  {_state(dbg)} Debug\n"
-        f"{_state(rep)} Reuse Panel  ·  {_state(amp)} Multiple Panels\n"
-        f"📦 Deep Save `{mds}MB`  ·  🗑 Batch `{dbs}`\n"
-        f"📜 Log `{lrd}d`  ·  ⏱ Timeout `{pts}s`\n"
-        f"🌐 Language `{lang}`  ·  💓 Stale `{uss}s`"
-    )
+    def _pad(s: str, width: int = 13) -> str:
+        return s.ljust(width)
+
+    lines = [
+        f"{_state(ac)} {_pad('Auto Close')} ⏳ {acd}s",
+        f"{_state(oo)} {_pad('Owner Only')} 🌐 {lang.upper()}",
+        f"{_state(rep)} {_pad('Reuse Panel')} 💾 {mds} MB",
+        f"{_state(amp)} {_pad('Multi Panels')} 🗑 Batch {dbs}",
+        f"{_state(dbg)} {_pad('Debug')} 📅 {lrd} Days",
+        f"💓 {_pad('Update Rate')} {uss}s",
+    ]
+
+    return "**⚙️ Settings**\n\n" + "```\n" + "\n".join(lines) + "\n```"
 
 
 def _build_settings_buttons() -> list:
@@ -218,32 +222,35 @@ def _build_settings_buttons() -> list:
     rep = settings_service.is_reuse_existing_panel()
 
     def _toggle_label(prefix: str, on: bool) -> str:
-        return f"{'🟢' if on else '🔴'} {prefix}"
+        return f"{'🟢' if on else '⚪'}  {prefix}"
+
+    def _label(emoji: str, prefix: str) -> str:
+        return f"{emoji}  {prefix}"
 
     builder = InlinePanelBuilder()
     builder.add_buttons(
         (_toggle_label("Auto Close", ac), "action:settings_toggle_autoclose"),
-        (_toggle_label("Reuse Panel", rep), "action:settings_toggle_reuse_panel"),
+        (_label("👑", "Owner Only"), "action:settings_toggle_owner_only"),
     )
     builder.add_buttons(
-        (_toggle_label("Owner Only", oo), "action:settings_toggle_owner_only"),
-        (_toggle_label("Debug", dbg), "action:settings_toggle_debug_callbacks"),
+        (_label("♻️", "Reuse Panel"), "action:settings_toggle_reuse_panel"),
+        (_label("📂", "Multi Panels"), "action:settings_toggle_multiple_panels"),
     )
     builder.add_buttons(
-        (_toggle_label("Multi Panels", amp), "action:settings_toggle_multiple_panels"),
-        ("📦 Deep Save", "input:settings:max_deep_save_mb"),
+        (_label("🐞", "Debug"), "action:settings_toggle_debug_callbacks"),
+        (_label("🌐", "Language"), "input:settings:language"),
     )
     builder.add_buttons(
-        ("🗑 Delete Batch", "input:settings:delete_batch_size"),
-        ("🌐 Language", "input:settings:language"),
+        (_label("⏳", "Delay"), "input:settings:auto_close_delay"),
+        (_label("💾", "Deep Save"), "input:settings:max_deep_save_mb"),
     )
     builder.add_buttons(
-        ("⏳ Delay", "input:settings:auto_close_delay"),
-        ("⏱ Timeout", "input:settings:panel_timeout_seconds"),
+        (_label("🗑", "Delete Batch"), "input:settings:delete_batch_size"),
+        (_label("📅", "Retention"), "input:settings:log_retention_days"),
     )
     builder.add_buttons(
-        ("📜 Log Retention", "input:settings:log_retention_days"),
-        ("💓 Update Stale", "input:settings:update_stale_seconds"),
+        (_label("🕒", "Timeout"), "input:settings:panel_timeout_seconds"),
+        (_label("💓", "Update Rate"), "input:settings:update_stale_seconds"),
     )
     return builder.build()
 
