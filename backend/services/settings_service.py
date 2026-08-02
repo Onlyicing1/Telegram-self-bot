@@ -30,7 +30,7 @@ Architecture:
    - A default + validator + typed accessor here
    No panel code needs to change.
 
-## Settings (12 columns on panel_settings)
+## Settings (13 columns on panel_settings)
 
 | Column                  | Type    | Default | Range/Constraint        |
 |-------------------------|---------|---------|-------------------------|
@@ -43,7 +43,7 @@ Architecture:
 | allow_multiple_panels   | bool    | false   | must be boolean         |
 | reuse_existing_panel    | bool    | true    | must be boolean         |
 | language                | str     | "en"    | non-empty string        |
-| debug_callbacks         | bool    | false   | must be boolean         |
+| debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | update_stale_seconds    | int     | 300     | 60..3600 (seconds)      |
 """

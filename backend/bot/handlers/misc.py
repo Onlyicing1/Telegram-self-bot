@@ -194,37 +194,57 @@ def _build_settings_body() -> str:
     dbg = settings_service.is_debug_callbacks()
     oo = settings_service.is_owner_only()
     uss = settings_service.update_stale_seconds()
+
+    def _state(on: bool) -> str:
+        return "🟢" if on else "🔴"
+
     return (
-        "**⚙️ LifeOS Settings**\n\n"
-        f"Auto Close: `{'ON' if ac else 'OFF'}`\n"
-        f"Auto-Close Delay: `{acd}s`\n"
-        f"Max Deep Save: `{mds} MB`\n"
-        f"Delete Batch Size: `{dbs}`\n"
-        f"Log Retention: `{lrd} days`\n"
-        f"Panel Timeout: `{pts}s`\n"
-        f"Allow Multiple Panels: `{'ON' if amp else 'OFF'}`\n"
-        f"Reuse Existing Panel: `{'ON' if rep else 'OFF'}`\n"
-        f"Language: `{lang}`\n"
-        f"Debug Callbacks: `{'ON' if dbg else 'OFF'}`\n"
-        f"Owner Only: `{'ON' if oo else 'OFF'}`\n"
-        f"Update Stale Threshold: `{uss}s`"
+        "**⚙️ Settings**\n\n"
+        f"{_state(ac)} Auto Close  ·  ⏳ `{acd}s`\n"
+        f"{_state(oo)} Owner Only  ·  {_state(dbg)} Debug\n"
+        f"{_state(rep)} Reuse Panel  ·  {_state(amp)} Multiple Panels\n"
+        f"📦 Deep Save `{mds}MB`  ·  🗑 Batch `{dbs}`\n"
+        f"📜 Log `{lrd}d`  ·  ⏱ Timeout `{pts}s`\n"
+        f"🌐 Language `{lang}`  ·  💓 Stale `{uss}s`"
     )
 
 
 def _build_settings_buttons() -> list:
+    from backend.services import settings_service
+    ac = settings_service.is_auto_close_enabled()
+    dbg = settings_service.is_debug_callbacks()
+    oo = settings_service.is_owner_only()
+    amp = settings_service.is_allow_multiple_panels()
+    rep = settings_service.is_reuse_existing_panel()
+
+    def _toggle_label(prefix: str, on: bool) -> str:
+        return f"{'🟢' if on else '🔴'} {prefix}"
+
     builder = InlinePanelBuilder()
-    builder.add_row("Toggle Auto Close", "action:settings_toggle_autoclose")
-    builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks")
-    builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only")
-    builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels")
-    builder.add_row("Toggle Reuse Panel", "action:settings_toggle_reuse_panel")
-    builder.add_row("Set Auto-Close Delay", "input:settings:auto_close_delay")
-    builder.add_row("Set Max Deep Save (MB)", "input:settings:max_deep_save_mb")
-    builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
-    builder.add_row("Set Log Retention (days)", "input:settings:log_retention_days")
-    builder.add_row("Set Panel Timeout (s)", "input:settings:panel_timeout_seconds")
-    builder.add_row("Set Language", "input:settings:language")
-    builder.add_row("Set Update Stale (s)", "input:settings:update_stale_seconds")
+    builder.add_buttons(
+        (_toggle_label("Auto Close", ac), "action:settings_toggle_autoclose"),
+        (_toggle_label("Reuse Panel", rep), "action:settings_toggle_reuse_panel"),
+    )
+    builder.add_buttons(
+        (_toggle_label("Owner Only", oo), "action:settings_toggle_owner_only"),
+        (_toggle_label("Debug", dbg), "action:settings_toggle_debug_callbacks"),
+    )
+    builder.add_buttons(
+        (_toggle_label("Multi Panels", amp), "action:settings_toggle_multiple_panels"),
+        ("📦 Deep Save", "input:settings:max_deep_save_mb"),
+    )
+    builder.add_buttons(
+        ("🗑 Delete Batch", "input:settings:delete_batch_size"),
+        ("🌐 Language", "input:settings:language"),
+    )
+    builder.add_buttons(
+        ("⏳ Delay", "input:settings:auto_close_delay"),
+        ("⏱ Timeout", "input:settings:panel_timeout_seconds"),
+    )
+    builder.add_buttons(
+        ("📜 Log Retention", "input:settings:log_retention_days"),
+        ("💓 Update Stale", "input:settings:update_stale_seconds"),
+    )
     return builder.build()
 
 
