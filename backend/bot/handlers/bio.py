@@ -424,8 +424,8 @@ async def _bio_mood_input_handler(text, chat_id, msg_id, inline_chat_id, inline_
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("bio", _bio_panel_handler)
-    register_panel("biohelp", _biohelp_panel_handler)
+    register_panel("bio", _bio_panel_handler, parent="profile", title="🧬 Bio")
+    register_panel("biohelp", _biohelp_panel_handler, parent="bio", title="Bio Help")
     register_inline_builder("bio", _bio_inline_builder)
     register_inline_builder("biohelp", _biohelp_inline_builder)
     register_action("bio_on", _bio_on_action)
