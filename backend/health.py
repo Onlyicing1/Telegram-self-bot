@@ -56,6 +56,43 @@ _last_event_dispatch: float = 0.0
 
 _task_states: dict[str, str] = {}
 
+# ── Loop progress registry ──
+# Each forever-loop reports its last iteration timestamp + state.
+# The supervisor reads this to detect loops that are alive (task not done)
+# but not progressing (timestamp is stale).
+_loop_progress: dict[str, dict] = {}  # name -> {"last_tick": float, "state": str, "last_success": float}
+
+
+def tick_loop(name: str, state: str = "", success: bool = False) -> None:
+    """Called by every forever-loop on each iteration."""
+    now = time.time()
+    entry = _loop_progress.get(name, {})
+    entry["last_tick"] = now
+    if state:
+        entry["state"] = state
+    if success:
+        entry["last_success"] = now
+    _loop_progress[name] = entry
+
+
+def get_loop_progress(name: str) -> dict:
+    return _loop_progress.get(name, {})
+
+
+def get_all_loop_progress() -> dict[str, dict]:
+    return dict(_loop_progress)
+
+
+def get_stale_loops(threshold: float = 90.0) -> list[str]:
+    """Return names of loops whose last_tick is older than threshold seconds."""
+    now = time.time()
+    stale = []
+    for name, entry in _loop_progress.items():
+        last_tick = entry.get("last_tick", 0)
+        if last_tick > 0 and (now - last_tick) > threshold:
+            stale.append(name)
+    return stale
+
 
 def mark_started() -> None:
     global _started_at, _last_heartbeat
