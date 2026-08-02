@@ -116,6 +116,12 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
         await asyncio.sleep(_seconds_to_next_minute(tz))
 
         try:
+            from backend.health import tick_loop
+            tick_loop("lifeos-profile-scheduler", state="RUNNING")
+        except Exception:
+            pass
+
+        try:
             updates = await _collect_updates(owner_id, tz_str)
             if not updates:
                 continue
@@ -128,6 +134,11 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
                 )
                 record_event("profile", "UpdateProfileRequest", (time.monotonic() - t0) * 1000, "SUCCESS",
                               f"fields={list(updates.keys())}")
+                try:
+                    from backend.health import tick_loop
+                    tick_loop("lifeos-profile-scheduler", state="RUNNING", success=True)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 logger.warning("Profile API call timed out (%ds) — will retry next minute", _API_TIMEOUT)
                 record_event("profile", "UpdateProfileRequest", _API_TIMEOUT * 1000, "TIMEOUT")

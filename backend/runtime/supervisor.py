@@ -14,7 +14,11 @@ The supervisor guarantees:
   - Hard timeouts on every network operation
   - Exponential backoff on Telegram errors
   - Dead task detection and automatic recreation
+  - Stalled loop detection (alive but not progressing)
+  - Event-loop starvation detection
   - No callback exception poisons the dispatcher
+  - Every forever-loop is wrapped in immortal_create_task (never dies)
+  - Recovery never enters a dead state — infinite retry with backoff
 
 Mandatory log tags:
   KEEPALIVE_TIMEOUT
@@ -22,6 +26,11 @@ Mandatory log tags:
   CLIENT_REBUILD
   WATCHDOG_RECOVERY
   TASK_RESTART
+  LOOP_STALLED
+  EVENT_LOOP_STARVATION
+  CALLBACK_DISPATCH_STALLED
+  RECOVERY_SUCCESS
+  RECOVERY_FAILED
 """
 import asyncio
 import logging
@@ -34,7 +43,7 @@ from telethon import TelegramClient
 
 from backend.runtime.states import RuntimeState
 from backend.runtime.tracer import trace, trace_exception
-from backend.runtime.task_guard import guarded_create_task, set_runtime_state_ref
+from backend.runtime.task_guard import immortal_create_task, guarded_create_task, set_runtime_state_ref
 from backend.runtime.heartbeat import start_heartbeat, stop_heartbeat, update_state as update_heartbeat_state, configure as configure_heartbeat
 from backend.runtime.keepalive import start_keepalive, stop_keepalive, configure as configure_keepalive
 from backend.bio import engine as bio_engine
@@ -56,6 +65,7 @@ from backend.health import (
     get_last_telethon_event,
     get_last_event_dispatch,
     get_last_rpc,
+    get_last_callback,
     set_heartbeat,
     increment_restart,
     set_last_rebuild_reason,
@@ -64,6 +74,9 @@ from backend.health import (
     set_rpc_latency,
     update_heartbeat,
     check_stale,
+    tick_loop,
+    get_stale_loops,
+    get_all_loop_progress,
 )
 from backend.helper.client import (
     build_helper,
@@ -100,7 +113,8 @@ _MAX_RECOVERY_ATTEMPTS = 5
 _HEARTBEAT_FAILURE_THRESHOLD = 3
 _UPDATE_STALE_DEFAULT = 90.0
 _RECONNECT_FAILURES_BEFORE_REBUILD = 2
-_UPDATE_IDLE_DEFAULT = 90.0
+_LOOP_STALE_THRESHOLD = 90.0
+_LOOP_STARVATION_MS = 5000.0
 
 _CRITICAL_TASKS = (
     "lifeos-watchdog",
@@ -108,6 +122,7 @@ _CRITICAL_TASKS = (
     "lifeos-keepalive",
     "lifeos-profile-scheduler",
     "lifeos-helper",
+    "lifeos-run",
 )
 
 
@@ -129,6 +144,7 @@ class RuntimeSupervisor:
         "_client_alive", "_consecutive_failures",
         "_reconnect_failures",
         "_task_supervisor_task",
+        "_last_watchdog_tick",
     )
 
     def __init__(self, cfg: dict):
@@ -159,6 +175,7 @@ class RuntimeSupervisor:
         self._client_alive: bool = False
         self._consecutive_failures: int = 0
         self._reconnect_failures: int = 0
+        self._last_watchdog_tick: float = 0.0
 
     def _transition(self, new_state: RuntimeState) -> None:
         if self.state == new_state:
@@ -170,8 +187,6 @@ class RuntimeSupervisor:
         set_runtime_state_ref(str(new_state))
         update_heartbeat_state(runtime_state=str(new_state))
         trace("RUNTIME_STATE_TRANSITION", old=old, new=new_state)
-
-    # ── Startup ──
 
     async def start(self) -> None:
         mark_started()
@@ -216,16 +231,16 @@ class RuntimeSupervisor:
 
         configure_keepalive(self)
         configure_heartbeat(self)
-        self._watchdog_task = guarded_create_task(
+        self._watchdog_task = immortal_create_task(
             self._watchdog_loop(), name="lifeos-watchdog"
         )
-        self._run_task = guarded_create_task(
+        self._run_task = immortal_create_task(
             self._run_loop(), name="lifeos-run"
         )
         start_keepalive()
         start_heartbeat()
         start_diagnostics()
-        self._task_supervisor_task = guarded_create_task(
+        self._task_supervisor_task = immortal_create_task(
             self._task_supervisor_loop(), name="lifeos-task-supervisor"
         )
 
@@ -325,7 +340,7 @@ class RuntimeSupervisor:
                 set_owner_id(self.owner_id)
                 set_helper_connected(True)
                 update_heartbeat_state(helper_connected=True)
-                guarded_create_task(
+                immortal_create_task(
                     self._supervise_helper(), name="lifeos-helper"
                 )
                 logger.info("[3/5] Helper bot online — Inline Mode enabled")
@@ -340,6 +355,11 @@ class RuntimeSupervisor:
         helper = self.helper_client
         if helper is None:
             return
+        try:
+            from backend.health import tick_loop
+            tick_loop("lifeos-helper", state="RUNNING", success=True)
+        except Exception:
+            pass
         try:
             await helper.run_until_disconnected()
         except asyncio.CancelledError:
@@ -413,6 +433,11 @@ class RuntimeSupervisor:
                 await asyncio.sleep(1)
                 continue
             try:
+                from backend.health import tick_loop
+                tick_loop("lifeos-run", state="RUNNING", success=True)
+            except Exception:
+                pass
+            try:
                 await client.run_until_disconnected()
             except asyncio.CancelledError:
                 raise
@@ -431,10 +456,7 @@ class RuntimeSupervisor:
             logger.warning("Self-client disconnected — watchdog will detect and recover")
             break
 
-    # ── Reconnect (layer 1: cheapest recovery) ──
-
     async def _reconnect_client(self) -> bool:
-        """Disconnect and reconnect the existing client. Returns True on success."""
         client = self.client
         if client is None:
             return False
@@ -471,14 +493,7 @@ class RuntimeSupervisor:
 
         return False
 
-    # ── Rebuild (layer 2: new client, keep engines running) ──
-
     async def _rebuild_client(self) -> bool:
-        """Build a brand new Telethon client, re-register handlers, swap into engines.
-
-        Does NOT restart bio/username engines — only swaps the client reference.
-        Runtime state stays READY.
-        """
         trace("CLIENT_REBUILD", gen=self.client_generation + 1)
         logger.warning("CLIENT_REBUILD — building new client (gen=%d -> %d)",
                         self.client_generation, self.client_generation + 1)
@@ -536,7 +551,7 @@ class RuntimeSupervisor:
         bio_engine.update_client(self.client)
         username_engine.update_client(self.client)
 
-        self._run_task = guarded_create_task(
+        self._run_task = immortal_create_task(
             self._run_loop(), name="lifeos-run"
         )
 
@@ -544,10 +559,7 @@ class RuntimeSupervisor:
         logger.info("CLIENT_REBUILT — new client ready (gen=%d)", self.client_generation)
         return True
 
-    # ── Trigger recovery (entry point for watchdog/keepalive) ──
-
     async def _trigger_reconnect(self) -> None:
-        """Lightweight: try reconnect first, escalate to rebuild if needed."""
         if self.shutdown_event.is_set():
             return
 
@@ -564,6 +576,7 @@ class RuntimeSupervisor:
             success = await self._reconnect_client()
             if success:
                 self._reconnect_failures = 0
+                trace("RECOVERY_SUCCESS", action="reconnect", gen=self.client_generation)
                 return
 
             self._reconnect_failures += 1
@@ -576,13 +589,13 @@ class RuntimeSupervisor:
                 rebuild_ok = await self._rebuild_client()
                 if rebuild_ok:
                     self._reconnect_failures = 0
+                    trace("RECOVERY_SUCCESS", action="rebuild", gen=self.client_generation)
                 else:
-                    await self._trigger_full_recovery()
+                    await self._do_full_recovery()
         finally:
             self._recovery_lock.release()
 
     async def _trigger_full_recovery(self) -> None:
-        """Full recovery: rebuild + restart helper + resume cron engines."""
         if self.shutdown_event.is_set():
             return
 
@@ -601,7 +614,6 @@ class RuntimeSupervisor:
             self._recovery_lock.release()
 
     async def _trigger_recovery(self) -> None:
-        """Decide between reconnect and full recovery based on context."""
         await self._trigger_reconnect()
 
     async def _do_full_recovery(self) -> None:
@@ -689,7 +701,7 @@ class RuntimeSupervisor:
             logger.info("Recovery: verifying with fresh heartbeat")
             await self._verify_heartbeat()
 
-            self._run_task = guarded_create_task(
+            self._run_task = immortal_create_task(
                 self._run_loop(), name="lifeos-run"
             )
 
@@ -705,18 +717,18 @@ class RuntimeSupervisor:
             set_supervisor_ok(True)
             set_task_state("lifeos-recovery", "DONE")
             increment_restart()
-            trace("WATCHDOG_RECOVERY_SUCCESS", gen=self.client_generation)
+            trace("RECOVERY_SUCCESS", action="full", gen=self.client_generation)
             logger.info(
-                "WATCHDOG_RECOVERY_SUCCESS — system operational (gen=%d)",
+                "RECOVERY_SUCCESS — system operational (gen=%d)",
                 self.client_generation,
             )
             record_event("runtime", "recovery", 0, "SUCCESS",
                          f"gen={self.client_generation}")
 
         except Exception as exc:
-            trace_exception("WATCHDOG_RECOVERY_FAILED", exc, attempt=attempt)
+            trace_exception("RECOVERY_FAILED", exc, attempt=attempt)
             logger.error(
-                "WATCHDOG_RECOVERY_FAILED — attempt %d/%d: %s",
+                "RECOVERY_FAILED — attempt %d/%d: %s",
                 attempt, _MAX_RECOVERY_ATTEMPTS, exc,
             )
             record_event("runtime", "recovery", 0, "ERROR", str(exc))
@@ -770,13 +782,26 @@ class RuntimeSupervisor:
         except Exception:
             pass
 
-    # ── Upgraded watchdog ──
-
     async def _watchdog_loop(self) -> None:
+        logger.info("Watchdog started (interval=%ds)", int(_HEARTBEAT_INTERVAL))
         while not self.shutdown_event.is_set():
+            t0 = time.monotonic()
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
-            if self.shutdown_event.is_set():
-                return
+            loop_latency = (time.monotonic() - t0 - _HEARTBEAT_INTERVAL) * 1000
+
+            tick_loop("lifeos-watchdog", state="RUNNING", success=True)
+            self._last_watchdog_tick = time.time()
+
+            if loop_latency > _LOOP_STARVATION_MS:
+                trace(
+                    "EVENT_LOOP_STARVATION",
+                    source="watchdog",
+                    loop_latency_ms=f"{loop_latency:.1f}",
+                )
+                logger.error(
+                    "EVENT_LOOP_STARVATION — watchdog loop latency %.1fms. Blocking code suspected.",
+                    loop_latency,
+                )
 
             try:
                 update_heartbeat()
@@ -788,6 +813,29 @@ class RuntimeSupervisor:
 
             if self._recovery_lock.locked():
                 trace("WATCHDOG_CHECK", status="recovery_in_progress")
+                continue
+
+            stale_loops = get_stale_loops(_LOOP_STALE_THRESHOLD)
+            if stale_loops:
+                trace("LOOP_STALLED", loops=",".join(stale_loops), threshold=f"{_LOOP_STALE_THRESHOLD:.0f}s")
+                logger.warning(
+                    "LOOP_STALLED — loops not progressing for >%ds: %s",
+                    int(_LOOP_STALE_THRESHOLD), ", ".join(stale_loops),
+                )
+                for name in stale_loops:
+                    if name == "lifeos-heartbeat":
+                        logger.warning("LOOP_STALLED — heartbeat stalled, restarting")
+                        start_heartbeat()
+                    elif name == "lifeos-keepalive":
+                        logger.warning("LOOP_STALLED — keepalive stalled, restarting")
+                        start_keepalive()
+                    elif name == "lifeos-profile-scheduler":
+                        if self.client:
+                            logger.warning("LOOP_STALLED — profile scheduler stalled, restarting")
+                            bio_engine.start_cron(self.client, self.owner_id, self.tz_str)
+                            username_engine.start_cron(self.client, self.owner_id, self.tz_str)
+                set_last_rebuild_reason(f"watchdog: loop_stalled ({','.join(stale_loops)})")
+                await self._trigger_reconnect()
                 continue
 
             client = self.client
@@ -821,10 +869,12 @@ class RuntimeSupervisor:
             last_event_ts = get_last_telethon_event()
             last_dispatch_ts = get_last_event_dispatch()
             last_rpc_ts = get_last_rpc()
+            last_callback_ts = get_last_callback()
 
             update_idle = (now - last_event_ts) if last_event_ts > 0 else 0
             dispatch_idle = (now - last_dispatch_ts) if last_dispatch_ts > 0 else 0
             rpc_age = (now - last_rpc_ts) if last_rpc_ts > 0 else 0
+            callback_idle = (now - last_callback_ts) if last_callback_ts > 0 else 0
 
             if last_event_ts > 0 and update_idle > stale_threshold:
                 if rpc_age < stale_threshold:
@@ -850,18 +900,36 @@ class RuntimeSupervisor:
             if last_dispatch_ts > 0 and dispatch_idle > stale_threshold:
                 if update_idle < stale_threshold:
                     trace(
-                        "WATCHDOG_EVENT_DISPATCH_STALLED",
+                        "EVENT_DISPATCH_STALLED",
                         last_event_age=f"{update_idle:.0f}s",
                         last_dispatch_age=f"{dispatch_idle:.0f}s",
                         gen=self.client_generation,
                     )
                     logger.warning(
-                        "WATCHDOG_EVENT_DISPATCH_STALLED — updates arriving "
+                        "EVENT_DISPATCH_STALLED — updates arriving "
                         "but no event dispatched for %.0fs (gen=%d)",
                         dispatch_idle, self.client_generation,
                     )
                     set_last_rebuild_reason(
                         f"watchdog: event_dispatch_stalled ({dispatch_idle:.0f}s)"
+                    )
+                    await self._trigger_reconnect()
+                    continue
+
+            if last_callback_ts > 0 and callback_idle > stale_threshold:
+                if rpc_age < stale_threshold:
+                    trace(
+                        "CALLBACK_DISPATCH_STALLED",
+                        last_callback_age=f"{callback_idle:.0f}s",
+                        threshold=f"{stale_threshold}s",
+                        gen=self.client_generation,
+                    )
+                    logger.warning(
+                        "CALLBACK_DISPATCH_STALLED — no callbacks for %.0fs (gen=%d)",
+                        callback_idle, self.client_generation,
+                    )
+                    set_last_rebuild_reason(
+                        f"watchdog: callback_dispatch_stalled ({callback_idle:.0f}s)"
                     )
                     await self._trigger_reconnect()
                     continue
@@ -910,10 +978,7 @@ class RuntimeSupervisor:
                     logger.warning("WATCHDOG_RECOVERY — heartbeat failures")
                     await self._trigger_reconnect()
 
-    # ── Dead task detector + task supervisor ──
-
     async def _task_supervisor_loop(self) -> None:
-        """Monitor critical tasks and recreate them if they exit."""
         logger.info("Task supervisor started")
         while not self.shutdown_event.is_set():
             await asyncio.sleep(15)
@@ -921,13 +986,15 @@ class RuntimeSupervisor:
             if self.shutdown_event.is_set():
                 return
 
+            tick_loop("lifeos-task-supervisor", state="RUNNING", success=True)
+
             for name in _CRITICAL_TASKS:
                 task = self._find_task_by_name(name)
                 if task is None or task.done():
                     if name == "lifeos-watchdog" and not self.shutdown_event.is_set():
                         trace("TASK_RESTART", task=name, reason="exited")
                         logger.warning("TASK_RESTART — recreating %s", name)
-                        self._watchdog_task = guarded_create_task(
+                        self._watchdog_task = immortal_create_task(
                             self._watchdog_loop(), name="lifeos-watchdog"
                         )
                     elif name == "lifeos-heartbeat" and not self.shutdown_event.is_set():
@@ -949,17 +1016,21 @@ class RuntimeSupervisor:
                             if not self.helper_client.is_connected():
                                 trace("TASK_RESTART", task=name, reason="exited")
                                 logger.warning("TASK_RESTART — recreating %s", name)
-                                guarded_create_task(
+                                immortal_create_task(
                                     self._supervise_helper(), name="lifeos-helper"
                                 )
+                    elif name == "lifeos-run" and not self.shutdown_event.is_set():
+                        trace("TASK_RESTART", task=name, reason="exited")
+                        logger.warning("TASK_RESTART — recreating %s", name)
+                        self._run_task = immortal_create_task(
+                            self._run_loop(), name="lifeos-run"
+                        )
 
     def _find_task_by_name(self, name: str) -> asyncio.Task | None:
         for task in asyncio.all_tasks():
             if task.get_name() == name:
                 return task
         return None
-
-    # ── Shutdown ──
 
     async def stop(self) -> None:
         trace("SHUTDOWN_INITIATED")

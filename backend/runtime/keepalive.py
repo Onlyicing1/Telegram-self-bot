@@ -4,14 +4,18 @@ RPC Keepalive — lightweight health probe every 60 seconds.
 Executes a tiny RPC (get_me) with a bounded timeout. If the RPC times out
 or fails, the keepalive triggers a reconnect via the supervisor's
 recovery mechanism. It never blocks the event loop indefinitely.
+
+Loop instrumentation:
+  - Reports progress via tick_loop("lifeos-keepalive")
+  - Wrapped in immortal_create_task so it never dies from an exception
 """
 import asyncio
 import logging
 import time
 
 from backend.runtime.tracer import trace, trace_exception
-from backend.runtime.task_guard import guarded_create_task
-from backend.health import set_last_rpc, set_rpc_latency
+from backend.runtime.task_guard import immortal_create_task
+from backend.health import set_last_rpc, set_rpc_latency, tick_loop
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,8 @@ async def _keepalive_loop() -> None:
         if sup is None or sup.shutdown_event.is_set():
             return
 
+        tick_loop("lifeos-keepalive", state="RUNNING")
+
         client = sup.client
         if client is None or not sup._client_alive:
             continue
@@ -48,6 +54,7 @@ async def _keepalive_loop() -> None:
             latency_ms = (time.monotonic() - t0) * 1000
             set_last_rpc()
             set_rpc_latency(latency_ms)
+            tick_loop("lifeos-keepalive", state="RUNNING", success=True)
             trace("KEEPALIVE_OK", latency_ms=f"{latency_ms:.1f}", gen=sup.client_generation)
         except asyncio.CancelledError:
             raise
@@ -67,7 +74,7 @@ def start_keepalive() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = guarded_create_task(_keepalive_loop(), name="lifeos-keepalive")
+    _task = immortal_create_task(_keepalive_loop(), name="lifeos-keepalive")
 
 
 async def stop_keepalive() -> None:

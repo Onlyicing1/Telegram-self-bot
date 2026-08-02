@@ -300,6 +300,12 @@ def register_callback_handlers(client, owner_id: int) -> None:
     @client.on(events.CallbackQuery())
     async def _callback_router(event):
         from backend.services import settings_service
+        from backend.health import set_last_callback
+
+        try:
+            set_last_callback()
+        except Exception:
+            pass
 
         chat_id, msg_id, inline_msg_id = resolve_callback_message(event)
         data_raw = event.data
