@@ -42,6 +42,7 @@ async def _save_panel_handler(event, extra: str) -> tuple[str, str, list] | None
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:type:f")
     builder.add_row("⬇️ Deep Save", "panel:save:type:d")
+    builder.add_row("🔍 Retrieve", "panel:retrieve")
     return "Save", "Choose a save type:", builder.build()
 
 
@@ -56,26 +57,26 @@ async def _save_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
     builder.add_row("📦 Forward Save", "panel:save:type:f")
     builder.add_row("⬇️ Deep Save", "panel:save:type:d")
+    builder.add_row("🔍 Retrieve", "panel:retrieve")
     return [render("Save", "Choose a save type:", builder.build())]
 
 
 async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _self_client, _owner_id
-    from backend.helper.target_context import get_target
     from backend.helper.input_state import set_pending
 
     owner_id = _owner_id
     mode = extra.strip() if extra else "f"
-    ctx = get_target(owner_id)
-    if not ctx or ctx.kind != "reply":
-        return "Save", "⚠️ No reply context. Use `.panel` while replying to a message first.", []
+
+    if not chat_id:
+        return "Save", "⚠️ Could not determine the current chat. Please try again.", []
 
     mode_label = "Forward" if mode == "f" else "Deep"
     prompt = f"**Save — Reply Mode**\n\nReply to any message in this chat.\nThe replied message will be saved ({mode_label} Save).\n\n_Reply to a message now._"
 
     set_pending(
         owner_id, "save_reply", _save_reply_wait_handler,
-        ctx.reply_chat_id, prompt,
+        chat_id, prompt,
         inline_chat_id=chat_id,
         inline_msg_id=getattr(event, "message_id", 0) or 0,
         extra=mode,
