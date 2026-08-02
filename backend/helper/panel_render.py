@@ -30,7 +30,7 @@ def _normalize_button(btn) -> types.KeyboardButtonCallback:
     if hasattr(btn, "text") and hasattr(btn, "url"):
         return Button.url(btn.text, btn.url)
     text = str(getattr(btn, "text", btn))
-    return Button.inline(text, "panel:help:close")
+    return Button.inline(text, "panel:_nav:close")
 
 
 def _normalize_row(row) -> list:

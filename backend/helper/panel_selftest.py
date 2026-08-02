@@ -15,7 +15,7 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     lifecycle = get_lifecycle()
 
     # 1. callback registered
-    close_panel = get_panel("help")
+    close_panel = get_panel("menu")
     callback_ok = close_panel is not None
     report.append(f"Callback ......... {'OK' if callback_ok else 'FAIL'}")
     if not callback_ok:
@@ -32,7 +32,7 @@ async def run_selftest(self_client, helper_client, owner_id: int) -> str:
     trigger_ok = False
     trigger_reason = ""
     try:
-        success, msg_chat_id, msg_id = await lifecycle.create_panel(owner_id, "help")
+        success, msg_chat_id, msg_id = await lifecycle.create_panel(owner_id, "menu")
         trigger_ok = success and msg_id > 0
         if not trigger_ok:
             trigger_reason = "create_panel returned success=False or msg_id=0"
