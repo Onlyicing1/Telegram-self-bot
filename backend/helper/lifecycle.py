@@ -300,35 +300,20 @@ class PanelLifecycleManager:
 
         if edit_message:
             closed_text = "✕ **Panel closed**"
-            edited = False
             if event is not None:
                 try:
                     await event.edit(closed_text, buttons=[])
-                    edited = True
                 except Exception as exc:
                     logger.debug("[LIFECYCLE] cleanup event.edit: %s", exc)
-            if not edited and self._self_client is not None and chat_id and msg_id:
+            elif self._self_client is not None and chat_id and msg_id:
                 try:
                     await self._self_client.edit_message(
                         chat_id, msg_id, message=closed_text, buttons=[]
                     )
-                    edited = True
                 except Exception as exc:
                     logger.debug("[LIFECYCLE] cleanup edit_message: %s", exc)
 
-            if edited and self._self_client is not None and chat_id and msg_id:
-                asyncio.get_event_loop().call_later(
-                    2.5,
-                    lambda: asyncio.ensure_future(self._delayed_delete(chat_id, msg_id)),
-                )
-
         logger.info("[LIFECYCLE] CLEANUP chat=%s msg=%s", chat_id, msg_id)
-
-    async def _delayed_delete(self, chat_id: int, msg_id: int) -> None:
-        try:
-            await self._self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
 
     # ── Shutdown ──
 
