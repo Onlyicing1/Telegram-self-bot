@@ -279,7 +279,7 @@ async def _retrieve_move_input_handler(text, chat_id, msg_id, inline_chat_id, in
 # ── Registration ──
 
 def register(client, owner_id: int):
-    register_panel("retrieve", _retrieve_panel_handler, parent="menu", title="🔍 Retrieve")
+    register_panel("retrieve", _retrieve_panel_handler, parent="save", title="🔍 Retrieve")
     register_panel("retrieve_saved", _retrieve_saved_panel_handler, parent="retrieve", title="Saved Items")
     register_panel("retrieve_item", _retrieve_item_panel_handler, parent="retrieve_saved", title="Item Detail")
     register_panel("retrieve_code", _retrieve_code_panel_handler, parent="retrieve", title="Retrieve by Code")
