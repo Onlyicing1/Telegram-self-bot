@@ -300,15 +300,19 @@ class RuntimeSupervisor:
             configure_callback_trace(self.client, self.owner_id)
             register_input_listener(self.client, self.owner_id)
 
+        bio_engine.update_client(self.client)
+        username_engine.update_client(self.client)
+
     async def _resume_bio_cron(self) -> None:
         try:
-            state = await db_client.get_bio_state(self.owner_id)
-            if state and state.get("is_active"):
+            state = await db_client.get_or_create_bio_state(self.owner_id)
+            if state.get("is_active"):
                 self._start_bio_cron()
-                logger.info("[4/5] Bio cron resumed")
+                logger.info("[4/5] Bio cron resumed (is_active=true in DB)")
             elif self.cfg.get("BIO_UPDATE_ENABLED"):
+                await db_client.update_bio_state(self.owner_id, {"is_active": True})
                 self._start_bio_cron()
-                logger.info("[4/5] Bio cron started (BIO_UPDATE_ENABLED=true)")
+                logger.info("[4/5] Bio cron started (BIO_UPDATE_ENABLED=true, persisted)")
             else:
                 logger.info("[4/5] Bio cron not active — skipping")
             set_bio_cron_ok(bio_engine.is_running())
@@ -966,6 +970,10 @@ class RuntimeSupervisor:
         protected_names = {
             "lifeos-watchdog", "lifeos-web", "lifeos-heartbeat",
             "lifeos-keepalive", "lifeos-task-supervisor",
+            "lifeos-profile-scheduler", "lifeos-tg-supervisor",
+            "lifeos-diagnostics", "lifeos-failsafe",
+            "lifeos-helper-supervisor", "lifeos-helper-watchdog",
+            "lifeos-helper", "lifeos-run",
         }
         to_cancel = []
         for task in asyncio.all_tasks():
@@ -973,6 +981,8 @@ class RuntimeSupervisor:
                 continue
             name = task.get_name()
             if name in protected_names:
+                continue
+            if name.startswith("lifeos-panel-timer-"):
                 continue
             if task.done():
                 continue
