@@ -34,6 +34,14 @@ from backend.helper.panel_timer import PanelTimerManager
 logger = logging.getLogger(__name__)
 
 
+async def _delayed_delete(client, chat_id: int, msg_id: int, delay: float = 2.5) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await client.delete_messages(chat_id, [msg_id])
+    except Exception:
+        pass
+
+
 class PanelState(Enum):
     IDLE = auto()
     CREATING = auto()
@@ -300,9 +308,11 @@ class PanelLifecycleManager:
 
         if edit_message:
             closed_text = "✕ **Panel closed**"
+            edited = False
             if event is not None:
                 try:
                     await event.edit(closed_text, buttons=[])
+                    edited = True
                 except Exception as exc:
                     logger.debug("[LIFECYCLE] cleanup event.edit: %s", exc)
             elif self._self_client is not None and chat_id and msg_id:
@@ -310,8 +320,12 @@ class PanelLifecycleManager:
                     await self._self_client.edit_message(
                         chat_id, msg_id, message=closed_text, buttons=[]
                     )
+                    edited = True
                 except Exception as exc:
                     logger.debug("[LIFECYCLE] cleanup edit_message: %s", exc)
+
+            if edited and self._self_client is not None and chat_id and msg_id:
+                asyncio.create_task(_delayed_delete(self._self_client, chat_id, msg_id))
 
         logger.info("[LIFECYCLE] CLEANUP chat=%s msg=%s", chat_id, msg_id)
 
