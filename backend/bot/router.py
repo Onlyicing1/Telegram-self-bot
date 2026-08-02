@@ -7,8 +7,10 @@ registration, the error is logged and the remaining handlers still register.
 Runtime hooks are registered before command handlers so the supervisor can
 track last_update timestamps from incoming Telegram events.
 """
+import asyncio
 import logging
 import sys
+import time
 import traceback
 
 from telethon import events
@@ -18,6 +20,8 @@ from backend.runtime.tracer import trace_handler_exception
 
 logger = logging.getLogger(__name__)
 
+_HANDLER_TIMEOUT = 30.0
+
 
 def register_runtime_hooks(client) -> None:
     """Register runtime event hooks before command handlers.
@@ -25,6 +29,20 @@ def register_runtime_hooks(client) -> None:
     These hooks track last_update timestamps for health telemetry.
     They must be registered first so they fire before any command handler.
     """
+    @client.on(events.NewMessage(outgoing=True))
+    async def _runtime_command_trace(event):
+        from backend.health import set_last_update, set_last_telethon_event, set_last_event_dispatch
+        raw = event.raw_text or ""
+        if not raw.startswith("."):
+            return
+        try:
+            set_last_update()
+            set_last_telethon_event()
+            set_last_event_dispatch()
+        except Exception:
+            pass
+        logger.info("COMMAND_RECEIVED '%s' chat=%s msg=%s", raw[:80], event.chat_id, event.message.id)
+
     @client.on(events.NewMessage())
     async def _runtime_update_hook(event):
         from backend.health import set_last_update, set_last_telethon_event, set_last_event_dispatch
