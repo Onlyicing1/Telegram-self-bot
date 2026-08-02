@@ -541,8 +541,8 @@ async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, 
 
 
 def _register_help_panel() -> None:
-    register_panel("help", _help_panel_handler)
-    register_panel("settings", _settings_panel_handler)
+    register_panel("help", _help_panel_handler, parent="menu", title="LifeOS Command Center")
+    register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
     register_inline_builder("help", _help_inline_builder)
     register_inline_builder("settings", _settings_inline_builder)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
@@ -858,12 +858,12 @@ def register(client, owner_id: int):
 
     try:
         _register_help_panel()
-        register_panel("menu", _menu_panel_handler)
+        register_panel("menu", _menu_panel_handler, parent="menu", title="🏠 LifeOS")
         register_inline_builder("menu", _menu_inline_builder)
-        register_panel("profile", _profile_panel_handler)
+        register_panel("profile", _profile_panel_handler, parent="menu", title="👤 Profile")
         register_inline_builder("profile", _profile_inline_builder)
-        register_panel("context", _context_panel_handler)
-        register_panel("health", _health_panel_handler)
+        register_panel("context", _context_panel_handler, parent="menu", title="Context Panel")
+        register_panel("health", _health_panel_handler, parent="menu", title="Health Dashboard")
         register_inline_builder("health", _health_inline_builder)
         register_inline_builder("context", _context_inline_builder)
         register_action("health_refresh", _health_refresh_action)
