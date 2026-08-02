@@ -20,6 +20,7 @@ from backend.bot.handlers.guard import is_owner
 from backend.helper.context import truncate_callback_data
 from backend.helper.input_state import set_pending, clear_pending, get_pending
 from backend.helper.lifecycle import get_lifecycle
+from backend.helper.panel_registry import registry as get_registry
 from backend.helper.session_manager import Session
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,6 @@ PanelHandler = Callable[[events.CallbackQuery.Event, str], Awaitable[None]]
 ActionHandler = Callable[[events.CallbackQuery.Event, str, int], Awaitable[str]]
 InputConfig = dict[str, Any]
 
-_panels: dict[str, PanelHandler] = {}
 _actions: dict[str, ActionHandler] = {}
 _inputs: dict[str, dict[str, InputConfig]] = {}
 
@@ -129,26 +129,6 @@ class InlinePanelBuilder:
     def build(self) -> list[list[Any]]:
         return [list(row) for row in self._rows]
 
-
-PARENT_MAP: dict[str, str] = {
-    "save": "menu",
-    "del": "menu",
-    "delfrom": "del",
-    "profile": "menu",
-    "bio": "profile",
-    "biohelp": "bio",
-    "username": "profile",
-    "usernamehelp": "username",
-    "settings": "menu",
-    "db": "menu",
-    "help": "menu",
-    "retrieve": "menu",
-    "retrieve_saved": "retrieve",
-    "retrieve_item": "retrieve_saved",
-    "retrieve_code": "retrieve",
-    "context": "menu",
-    "health": "menu",
-}
 
 _NAV_ACTIONS = {"back", "home", "close"}
 
@@ -212,13 +192,17 @@ def _finalize_panel(
     return title, body, builder.build()
 
 
-def register_panel(panel_id: str, handler: PanelHandler) -> None:
-    _panels[panel_id] = handler
-    logger.info("[PANEL] Registered: id='%s' (total=%d)", panel_id, len(_panels))
+def register_panel(
+    panel_id: str,
+    handler: PanelHandler,
+    parent: str = "menu",
+    title: str = "",
+) -> None:
+    get_registry().register(panel_id, handler, parent=parent, title=title)
 
 
 def get_panel(panel_id: str) -> PanelHandler | None:
-    return _panels.get(panel_id)
+    return get_registry().get_handler(panel_id)
 
 
 def register_action(action_id: str, handler: ActionHandler) -> None:
@@ -424,7 +408,7 @@ async def _handle_panel(event, remainder: str, chat_id: int, msg_id: int, owner_
         logger.warning(
             "[CALLBACK] _handle_panel: NO HANDLER for panel_id='%s' — "
             "registered panels: %s",
-            panel_id, list(_panels.keys()),
+            panel_id, get_registry().all_ids(),
         )
         return
 
@@ -479,11 +463,11 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         prev = lifecycle.sessions.pop_nav(chat_id, msg_id)
         clear_pending(owner_id)
         if prev is None:
-            parent = PARENT_MAP.get(current, "menu")
+            parent = get_registry().get_parent(current)
             prev = (parent, "")
         prev_panel, prev_extra = prev
         if prev_panel == current:
-            parent = PARENT_MAP.get(prev_panel, "menu")
+            parent = get_registry().get_parent(prev_panel)
             prev = (parent, "")
             prev_panel, prev_extra = prev
         logger.info("[CALLBACK] _handle_navigation: back → panel='%s' extra='%s'", prev_panel, prev_extra)
