@@ -826,3 +826,5 @@ def register(client, owner_id: int):
             _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
         except Exception as exc:
             logger.warning("health inline send failed: %s", exc)
+
+
