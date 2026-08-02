@@ -238,7 +238,7 @@ def _extract_render_result(result) -> tuple[str, str, list]:
         elif len(result) == 2:
             return result[0], result[1], []
         else:
-            return (result[0] if result else ""), (result[1] if len(result) > 1 else ""), (result[2] if len(result) > 2 else "")
+            return (result[0] if result else ""), (result[1] if len(result) > 1 else ""), (result[2] if len(result) > 2 else [])
     return str(result), "", []
 
 
@@ -432,15 +432,15 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
 
     if action == "home":
         lifecycle = get_lifecycle()
-        lifecycle.sessions.reset_nav(chat_id, msg_id, "help", "")
+        lifecycle.sessions.reset_nav(chat_id, msg_id, "menu", "")
         clear_pending(owner_id)
-        handler = get_panel("help")
+        handler = get_panel("menu")
         if handler is None:
-            logger.warning("[CALLBACK] _handle_navigation: no 'help' panel registered")
+            logger.warning("[CALLBACK] _handle_navigation: no 'menu' panel registered")
             return
         try:
             result = await handler(event, "")
-            await _render_and_edit(event, result, "help", chat_id, msg_id)
+            await _render_and_edit(event, result, "menu", chat_id, msg_id)
             logger.info("[CALLBACK] _handle_navigation: home COMPLETE")
         except Exception as exc:
             logger.exception("[CALLBACK] _handle_navigation: home FAILED: %s", exc)
@@ -451,14 +451,14 @@ async def _handle_navigation(event, action: str, chat_id: int, msg_id: int, owne
         prev = lifecycle.sessions.pop_nav(chat_id, msg_id)
         clear_pending(owner_id)
         if prev is None:
-            prev = ("help", "")
+            prev = ("menu", "")
         prev_panel, prev_extra = prev
         logger.info("[CALLBACK] _handle_navigation: back → panel='%s' extra='%s'", prev_panel, prev_extra)
         handler = get_panel(prev_panel)
         if handler is None:
-            prev_panel = "help"
+            prev_panel = "menu"
             prev_extra = ""
-            handler = get_panel("help")
+            handler = get_panel("menu")
         if handler is None:
             logger.warning("[CALLBACK] _handle_navigation: back — no handler for '%s'", prev_panel)
             return

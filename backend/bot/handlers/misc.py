@@ -4,6 +4,7 @@
 .help    — Interactive inline help panel (via Inline Mode).
 .panel   — Context panel for the replied message.
 .health  — Full health dashboard (inline panel).
+.menu    — Mother Panel — the central navigation root of LifeOS.
 Falls back to plain-text edit-in-place when the helper bot is not available.
 """
 import asyncio
@@ -178,6 +179,40 @@ async def _help_inline_builder(event, extra: str) -> list:
     if extra.startswith("cat:3"):
         return [render("Username Engine", "Choose a section:", _build_username_help_buttons())]
     return [render("LifeOS Command Center", "", _build_main_menu_buttons())]
+
+
+def _build_menu_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("📥 Save", "panel:save")
+    builder.add_row("🗑 Delete", "panel:del")
+    builder.add_row("👤 Profile", "panel:profile")
+    builder.add_row("⚙️ Settings", "panel:settings")
+    builder.add_row("🗄 Database", "panel:db")
+    builder.add_row("📖 Help", "panel:help")
+    return builder.build()
+
+
+def _build_profile_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🧬 Bio", "panel:bio")
+    builder.add_row("👤 Username", "panel:username")
+    return builder.build()
+
+
+async def _menu_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "🏠 LifeOS", "Choose a category:", _build_menu_buttons()
+
+
+async def _menu_inline_builder(event, extra: str) -> list:
+    return [render("🏠 LifeOS", "Choose a category:", _build_menu_buttons())]
+
+
+async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "👤 Profile", "Choose a section:", _build_profile_buttons()
+
+
+async def _profile_inline_builder(event, extra: str) -> list:
+    return [render("👤 Profile", "Choose a section:", _build_profile_buttons())]
 
 
 def _build_settings_body() -> str:
@@ -825,6 +860,10 @@ def register(client, owner_id: int):
 
     try:
         _register_help_panel()
+        register_panel("menu", _menu_panel_handler)
+        register_inline_builder("menu", _menu_inline_builder)
+        register_panel("profile", _profile_panel_handler)
+        register_inline_builder("profile", _profile_inline_builder)
         register_panel("context", _context_panel_handler)
         register_panel("health", _health_panel_handler)
         register_inline_builder("health", _health_inline_builder)
@@ -832,6 +871,28 @@ def register(client, owner_id: int):
         register_action("health_refresh", _health_refresh_action)
     except Exception as exc:
         logger.warning("Inline builder registration failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.menu$"))
+    async def menu_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        helper = get_client()
+        if helper is None:
+            text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+            await event.edit(text)
+            return
+
+        try:
+            await event.delete()
+            await send_inline_panel(client, event.chat_id, "menu")
+        except Exception as exc:
+            logger.warning("menu inline send failed: %s", exc)
+            try:
+                text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+                await event.edit(text)
+            except Exception:
+                pass
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
     async def health_cmd(event):
