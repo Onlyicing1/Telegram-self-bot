@@ -88,10 +88,22 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
 
     helper = get_client()
     if helper and chat_id:
+        msg_id = getattr(event, "message_id", 0) or 0
+        if msg_id:
+            try:
+                await helper.edit_message(chat_id, msg_id, wait_text, buttons=[])
+            except Exception as exc:
+                logger.warning("save reply wait edit failed: %s", exc)
+        else:
+            try:
+                await event.edit(wait_text, buttons=[])
+            except Exception as exc:
+                logger.warning("save reply wait event edit failed: %s", exc)
+    else:
         try:
-            await helper.edit_message(chat_id, getattr(event, "message_id", 0) or 0, wait_text, buttons=[])
+            await event.edit(wait_text, buttons=[])
         except Exception as exc:
-            logger.warning("save reply wait edit failed: %s", exc)
+            logger.warning("save reply wait event edit failed: %s", exc)
 
     return None
 
