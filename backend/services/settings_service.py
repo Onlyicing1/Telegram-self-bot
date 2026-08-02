@@ -30,7 +30,7 @@ Architecture:
    - A default + validator + typed accessor here
    No panel code needs to change.
 
-## Settings (13 columns on panel_settings)
+## Settings (12 columns on panel_settings)
 
 | Column                  | Type    | Default | Range/Constraint        |
 |-------------------------|---------|---------|-------------------------|
@@ -43,8 +43,7 @@ Architecture:
 | allow_multiple_panels   | bool    | false   | must be boolean         |
 | reuse_existing_panel    | bool    | true    | must be boolean         |
 | language                | str     | "en"    | non-empty string        |
-| diagnostics_enabled     | bool    | true    | must be boolean         |
-| debug_callbacks        | bool    | false   | must be boolean         |
+| debug_callbacks         | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | update_stale_seconds    | int     | 300     | 60..3600 (seconds)      |
 """
@@ -65,7 +64,6 @@ _DEFAULTS: dict[str, Any] = {
     "allow_multiple_panels": False,
     "reuse_existing_panel": True,
     "language": "en",
-    "diagnostics_enabled": True,
     "debug_callbacks": False,
     "owner_only": True,
     "update_stale_seconds": 300,
@@ -105,7 +103,6 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "allow_multiple_panels": _validate_bool,
     "reuse_existing_panel": _validate_bool,
     "language": _validate_nonempty_str,
-    "diagnostics_enabled": _validate_bool,
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
     "update_stale_seconds": _validate_int_range(60, 3600),
@@ -214,15 +211,6 @@ def is_reuse_existing_panel() -> bool:
 
 def set_reuse_existing_panel(value: bool) -> bool:
     return set_setting("reuse_existing_panel", bool(value))
-
-
-def is_diagnostics_enabled() -> bool:
-    _ensure_loaded()
-    return bool(_cache.get("diagnostics_enabled", True))
-
-
-def set_diagnostics_enabled(value: bool) -> bool:
-    return set_setting("diagnostics_enabled", bool(value))
 
 
 def is_debug_callbacks() -> bool:

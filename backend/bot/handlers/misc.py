@@ -4,9 +4,6 @@
 .help    — Interactive inline help panel (via Inline Mode).
 .panel   — Context panel for the replied message.
 .health  — Full health dashboard (inline panel).
-.kill    — Diagnostic snapshot + stalled-task recovery (inline panel).
-.logs    — View recent diagnostic events (inline panel).
-
 Falls back to plain-text edit-in-place when the helper bot is not available.
 """
 import asyncio
@@ -17,7 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telethon import events
 
-from backend import diagnostics, health
+from backend import health
+from backend import diagnostics as _diag_runtime
 from backend.bio import engine as bio_engine
 from backend.bot.handlers.guard import is_owner
 from backend.db import client as db_client
@@ -83,17 +81,6 @@ _HELP_CATEGORIES: list[tuple[str, list[str]]] = [
         [
             "**Username Engine**\n",
             "Fully inline — tap to navigate.",
-        ],
-    ),
-    (
-        "Diagnostics",
-        [
-            "**Diagnostics**\n",
-            "`.kill` — Snapshot + recovery",
-            "`.logs` — Recent events (last 20)",
-            "`.logs 50` — Last 50 events",
-            "`.logs errors` — Errors only",
-            "`.logs module <m>` — Filter by module",
         ],
     ),
 ]
@@ -204,7 +191,6 @@ def _build_settings_body() -> str:
     amp = settings_service.is_allow_multiple_panels()
     rep = settings_service.is_reuse_existing_panel()
     lang = settings_service.language()
-    de = settings_service.is_diagnostics_enabled()
     dbg = settings_service.is_debug_callbacks()
     oo = settings_service.is_owner_only()
     uss = settings_service.update_stale_seconds()
@@ -219,7 +205,6 @@ def _build_settings_body() -> str:
         f"Allow Multiple Panels: `{'ON' if amp else 'OFF'}`\n"
         f"Reuse Existing Panel: `{'ON' if rep else 'OFF'}`\n"
         f"Language: `{lang}`\n"
-        f"Diagnostics: `{'ON' if de else 'OFF'}`\n"
         f"Debug Callbacks: `{'ON' if dbg else 'OFF'}`\n"
         f"Owner Only: `{'ON' if oo else 'OFF'}`\n"
         f"Update Stale Threshold: `{uss}s`"
@@ -229,7 +214,6 @@ def _build_settings_body() -> str:
 def _build_settings_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_row("Toggle Auto Close", "action:settings_toggle_autoclose")
-    builder.add_row("Toggle Diagnostics", "action:settings_toggle_diagnostics")
     builder.add_row("Toggle Debug Callbacks", "action:settings_toggle_debug_callbacks")
     builder.add_row("Toggle Owner Only", "action:settings_toggle_owner_only")
     builder.add_row("Toggle Multiple Panels", "action:settings_toggle_multiple_panels")
@@ -255,12 +239,6 @@ async def _settings_inline_builder(event, extra: str) -> list:
 async def _settings_toggle_autoclose_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     settings_service.toggle_auto_close()
-    return "Settings", _build_settings_body(), _build_settings_buttons()
-
-
-async def _settings_toggle_diagnostics_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services import settings_service
-    settings_service.set_diagnostics_enabled(not settings_service.is_diagnostics_enabled())
     return "Settings", _build_settings_body(), _build_settings_buttons()
 
 
@@ -508,7 +486,6 @@ def _register_help_panel() -> None:
     register_inline_builder("help", _help_inline_builder)
     register_inline_builder("settings", _settings_inline_builder)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
-    register_action("settings_toggle_diagnostics", _settings_toggle_diagnostics_action)
     register_action("settings_toggle_debug_callbacks", _settings_toggle_debug_callbacks_action)
     register_action("settings_toggle_owner_only", _settings_toggle_owner_only_action)
     register_action("settings_toggle_multiple_panels", _settings_toggle_multiple_panels_action)
@@ -723,76 +700,13 @@ async def _health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, 
     return "Health Dashboard", report, builder.build()
 
 
-async def _kill_inline_builder(event, extra: str) -> list:
-    snap = health.snapshot()
-    self_client = _get_self_client()
-    report = diagnostics.build_diagnostic_report(
-        self_client, bio_engine, db_client, snap
-    )
-    recovery = await diagnostics.recover_stalled(
-        self_client, 0, _resolve_tz(), bio_engine, db_client
-    )
-    full_text = report + recovery
-    return [render("Diagnostics", full_text, [])]
-
-
-async def _logs_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    limit = 20
-    if extra and extra.isdigit():
-        limit = min(int(extra), 500)
-    elif extra == "errors":
-        limit = 20
-    events_list = diagnostics.filter_events(
-        limit=limit,
-        errors_only=(extra == "errors"),
-    )
-    text = diagnostics.format_events(events_list)
-    builder = InlinePanelBuilder()
-    builder.add_row("Errors Only", "action:logs_errors")
-    builder.add_row("Last 50", "action:logs_50")
-    return "Event Log", text, builder.build()
-
-
-async def _logs_inline_builder(event, extra: str) -> list:
-    limit = 20
-    if extra and extra.isdigit():
-        limit = min(int(extra), 500)
-    elif extra == "errors":
-        limit = 20
-    events_list = diagnostics.filter_events(
-        limit=limit,
-        errors_only=(extra == "errors"),
-    )
-    text = diagnostics.format_events(events_list)
-    builder = InlinePanelBuilder()
-    builder.add_row("Errors Only", "action:logs_errors")
-    builder.add_row("Last 50", "action:logs_50")
-    return [render("Event Log", text, builder.build())]
-
-
-async def _logs_errors_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    events_list = diagnostics.filter_events(limit=20, errors_only=True)
-    text = diagnostics.format_events(events_list)
-    builder = InlinePanelBuilder()
-    builder.add_row("Last 50", "action:logs_50")
-    return "Event Log", text, builder.build()
-
-
-async def _logs_50_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    events_list = diagnostics.filter_events(limit=50, errors_only=False)
-    text = diagnostics.format_events(events_list)
-    builder = InlinePanelBuilder()
-    builder.add_row("Errors Only", "action:logs_errors")
-    return "Event Log", text, builder.build()
-
-
 def _get_self_client():
     from backend.helper.inline_engine import _self_client
     return _self_client
 
 
 async def _safe_edit(event, text: str) -> None:
-    parts = diagnostics.split_message(text)
+    parts = _diag_runtime.split_message(text)
     for i, part in enumerate(parts):
         if i == 0:
             await event.edit(part)
@@ -886,14 +800,9 @@ def register(client, owner_id: int):
         _register_help_panel()
         register_panel("context", _context_panel_handler)
         register_panel("health", _health_panel_handler)
-        register_panel("logs", _logs_panel_handler)
         register_inline_builder("health", _health_inline_builder)
-        register_inline_builder("kill", _kill_inline_builder)
-        register_inline_builder("logs", _logs_inline_builder)
         register_inline_builder("context", _context_inline_builder)
         register_action("health_refresh", _health_refresh_action)
-        register_action("logs_errors", _logs_errors_action)
-        register_action("logs_50", _logs_50_action)
     except Exception as exc:
         logger.warning("Inline builder registration failed: %s", exc)
 
@@ -907,90 +816,13 @@ def register(client, owner_id: int):
                 snap = health.snapshot()
                 report = _build_health_report(snap)
                 await _safe_edit(event, report)
-                diagnostics.record_event("health", "snapshot", 0, "SUCCESS")
+                _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
             except Exception as exc:
                 logger.warning("health_cmd failed: %s", exc)
             return
         try:
             await event.delete()
             await send_inline_panel(client, event.chat_id, "health")
-            diagnostics.record_event("health", "snapshot", 0, "SUCCESS")
+            _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
         except Exception as exc:
             logger.warning("health inline send failed: %s", exc)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.kill$"))
-    async def kill_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        from backend.services import settings_service
-        if not settings_service.is_diagnostics_enabled():
-            await event.edit("⚠️ Diagnostics are disabled. Enable them in Settings.")
-            return
-        helper = get_client()
-        if helper is None:
-            try:
-                await event.edit("⏳ Collecting diagnostics...")
-                snap = health.snapshot()
-                report = diagnostics.build_diagnostic_report(
-                    client, bio_engine, db_client, snap
-                )
-                recovery = await diagnostics.recover_stalled(
-                    client, owner_id, _resolve_tz(), bio_engine, db_client
-                )
-                await _safe_edit(event, report + recovery)
-                diagnostics.record_event("diagnostics", "kill", 0, "SUCCESS")
-            except Exception as exc:
-                logger.warning("kill_cmd failed: %s", exc)
-            return
-        try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, "kill")
-            diagnostics.record_event("diagnostics", "kill", 0, "SUCCESS")
-        except Exception as exc:
-            logger.warning("kill inline send failed: %s", exc)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.logs(?:\s+(.+))?$"))
-    async def logs_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        from backend.services import settings_service
-        if not settings_service.is_diagnostics_enabled():
-            await event.edit("⚠️ Diagnostics are disabled. Enable them in Settings.")
-            return
-
-        arg = (event.pattern_match.group(1) or "").strip()
-        query = "logs"
-        if arg:
-            if arg.lower() == "errors":
-                query = "logs:errors"
-            elif arg.lower().startswith("module "):
-                query = "logs"
-            elif arg.isdigit():
-                query = f"logs:{arg}"
-
-        helper = get_client()
-        if helper is None:
-            limit = 20
-            errors_only = False
-            if arg:
-                if arg.lower() == "errors":
-                    errors_only = True
-                elif arg.lower().startswith("module "):
-                    pass
-                elif arg.isdigit():
-                    limit = min(int(arg), 500)
-            try:
-                events_list = diagnostics.filter_events(
-                    limit=limit, errors_only=errors_only
-                )
-                text = diagnostics.format_events(events_list)
-                await _safe_edit(event, text)
-            except Exception as exc:
-                logger.warning("logs_cmd failed: %s", exc)
-            return
-
-        try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, query)
-        except Exception as exc:
-            logger.warning("logs inline send failed: %s", exc)
