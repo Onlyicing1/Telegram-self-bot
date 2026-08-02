@@ -65,23 +65,57 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
     from backend.helper.inline_engine import _self_client, _owner_id
     from backend.helper.input_state import set_pending
 
-    owner_id = _owner_id
-    mode = extra.strip() if extra else "f"
+    logger.info("REPLY_CALLBACK_ENTER action=save_reply extra=%s chat_id=%s", extra, chat_id)
 
-    if not chat_id:
-        return "Save", "⚠️ Could not determine the current chat. Please try again.", []
+    try:
+        owner_id = _owner_id
+        mode = extra.strip() if extra else "f"
 
-    mode_label = "Forward" if mode == "f" else "Deep"
-    prompt = f"**Save — Reply Mode**\n\nReply to any message in this chat.\nThe replied message will be saved ({mode_label} Save).\n\n_Reply to a message now._"
+        if not chat_id:
+            logger.warning("REPLY_CALLBACK_EXIT reason=no_chat_id")
+            return "Save", "⚠️ Could not determine the current chat. Please try again.", []
 
-    set_pending(
-        owner_id, "save_reply", _save_reply_wait_handler,
-        chat_id, prompt,
-        inline_chat_id=chat_id,
-        inline_msg_id=getattr(event, "message_id", 0) or 0,
-        extra=mode,
-    )
-    return "Save", "Waiting for your reply... Reply to any message to save it.", []
+        mode_label = "Forward" if mode == "f" else "Deep"
+        wait_text = (
+            f"**Save — Reply Mode**\n\n"
+            f"Waiting for your reply...\n"
+            f"Reply to any message to save it ({mode_label} Save)."
+        )
+
+        set_pending(
+            owner_id, "save_reply", _save_reply_wait_handler,
+            chat_id, wait_text,
+            inline_chat_id=chat_id,
+            inline_msg_id=getattr(event, "message_id", 0) or 0,
+            extra=mode,
+        )
+
+        helper = get_client()
+        if helper and chat_id:
+            msg_id = getattr(event, "message_id", 0) or 0
+            if msg_id:
+                try:
+                    await helper.edit_message(chat_id, msg_id, wait_text, buttons=[])
+                    logger.info("REPLY_CALLBACK_EXIT reason=ok panel_edited")
+                except Exception as exc:
+                    logger.warning("REPLY_CALLBACK_EXIT reason=edit_failed error=%s", exc)
+            else:
+                try:
+                    await event.edit(wait_text, buttons=[])
+                    logger.info("REPLY_CALLBACK_EXIT reason=ok event_edited")
+                except Exception as exc:
+                    logger.warning("REPLY_CALLBACK_EXIT reason=event_edit_failed error=%s", exc)
+        else:
+            try:
+                await event.edit(wait_text, buttons=[])
+                logger.info("REPLY_CALLBACK_EXIT reason=ok event_edited_no_helper")
+            except Exception as exc:
+                logger.warning("REPLY_CALLBACK_EXIT reason=event_edit_failed_no_helper error=%s", exc)
+
+        return None
+    except Exception as exc:
+        logger.exception("REPLY_CALLBACK_EXCEPTION error=%s", exc)
+        raise
 
 
 async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -114,7 +148,7 @@ async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
         except Exception as exc:
             logger.warning("save reply result edit failed: %s", exc)
 
