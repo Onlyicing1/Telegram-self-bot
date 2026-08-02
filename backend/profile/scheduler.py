@@ -85,6 +85,12 @@ def _set_client(client) -> None:
     _client = client
 
 
+def update_client(client) -> None:
+    """Swap the client reference after a rebuild — no restart needed."""
+    global _client
+    _client = client
+
+
 async def _collect_updates(owner_id: int, tz_str: str) -> dict[str, str]:
     """Call every registered updater and merge their results."""
     merged: dict[str, str] = {}
@@ -184,6 +190,11 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
     )
     trace("PROFILE_CRON_START_REQUESTED")
     record_event("profile", "start_cron", 0, "SUCCESS")
+
+
+def update_client(client) -> None:
+    """Swap the client after a rebuild without restarting the scheduler."""
+    _set_client(client)
 
 
 async def stop_cron() -> None:
