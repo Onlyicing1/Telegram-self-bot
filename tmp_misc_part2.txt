@@ -1,0 +1,258 @@
+e_s is None or uptime_s < 0:
+        return "unknown"
+    hours = int(uptime_s // 3600)
+    minutes = int((uptime_s % 3600) // 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _format_age(age_s):
+    if age_s is None:
+        return "—"
+    if age_s < 60:
+        return f"{int(age_s)}s ago"
+    m = int(age_s // 60)
+    if m < 60:
+        return f"{m}m ago"
+    h = m // 60
+    return f"{h}h {m % 60}m ago"
+
+
+def _indicator(ok):
+    return "🟢" if ok else "🔴"
+
+
+def _build_health_report(snap):
+    process_ok = snap.get("process_alive", False)
+    telegram_ok = snap.get("telethon_connected", False)
+    supervisor_ok = snap.get("supervisor_ok", False)
+    bio_cron_ok = snap.get("bio_cron_ok", False)
+    watchdog_ok = snap.get("watchdog_ok", False)
+    heartbeat_age = snap.get("heartbeat_age_s")
+    uptime_s = snap.get("uptime_s")
+    restart_count = snap.get("restart_count", 0)
+    last_watchdog = snap.get("last_watchdog_check_s")
+    last_tg_event = snap.get("last_telethon_event_s")
+    last_bio = snap.get("last_bio_update_s")
+    status = snap.get("status", "unknown")
+
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        mem_mb = usage.ru_maxrss / 1024
+        cpu_s = usage.ru_utime + usage.ru_stime
+    except Exception:
+        mem_mb = None
+        cpu_s = None
+
+    try:
+        all_tasks = asyncio.all_tasks()
+        running = sum(1 for t in all_tasks if not t.done())
+    except Exception:
+        running = None
+
+    db_ok = db_client.is_available()
+
+    if heartbeat_age is not None and heartbeat_age <= 15.0:
+        hb_status = "OK"
+    elif heartbeat_age is not None:
+        hb_status = "WARNING"
+    else:
+        hb_status = "ERROR"
+
+    lines = ["🩺 **LifeOS Health Dashboard**", ""]
+
+    lines.append(f"{_indicator(process_ok)} **Process**: {'Alive' if process_ok else 'Dead'}")
+    if mem_mb is not None:
+        lines.append(f"   • Memory: `{mem_mb:.1f} MB`")
+    if cpu_s is not None:
+        lines.append(f"   • CPU: `{cpu_s:.2f}s`")
+
+    lines.append(f"{_indicator(telegram_ok)} **Telegram**: {'Connected' if telegram_ok else 'Disconnected'}")
+    lines.append(f"   • Last event: {_format_age(last_tg_event)}")
+
+    lines.append(f"{_indicator(supervisor_ok)} **Supervisor**: {'Running' if supervisor_ok else 'Stopped'}")
+
+    lines.append(f"{_indicator(watchdog_ok)} **Watchdog**: {'Running' if watchdog_ok else 'Stopped'}")
+    lines.append(f"   • Last check: {_format_age(last_watchdog)}")
+
+    lines.append(f"{_indicator(bio_cron_ok)} **Bio Cron**: {'Running' if bio_cron_ok else 'Stopped'}")
+    lines.append(f"   • Last update: {_format_age(last_bio)}")
+
+    hb_icon = "🟢" if hb_status == "OK" else ("🟡" if hb_status == "WARNING" else "🔴")
+    lines.append(f"{hb_icon} **Heartbeat**: {hb_status}")
+    if heartbeat_age is not None:
+        lines.append(f"   • Age: `{int(heartbeat_age)}s`")
+
+    lines.append(f"{'🟢' if restart_count == 0 else '🟡'} **Restarts**: `{restart_count}`")
+
+    if running is not None:
+        lines.append(f"{'🟢' if running < 20 else '🟡'} **Running Tasks**: `{running}`")
+
+    lines.append(f"{_indicator(db_ok)} **Database**: {'Available' if db_ok else 'Fallback'}")
+
+    lines.append(f"{'🟢' if uptime_s and uptime_s > 0 else '🔴'} **Uptime**: `{_format_uptime(uptime_s)}`")
+
+    lines.append("")
+    if status == "ok":
+        lines.append("_Everything looks healthy._")
+    else:
+        lines.append("_⚠️ Issues detected — needs attention._")
+
+    return "\n".join(lines)
+
+
+async def _health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+async def _health_inline_builder(event, extra: str) -> list:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return [render("Health Dashboard", report, builder.build())]
+
+
+async def _health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+def _get_self_client():
+    from backend.helper.inline_engine import _self_client
+    return _self_client
+
+
+async def _safe_edit(event, text: str) -> None:
+    parts = _diag_runtime.split_message(text)
+    for i, part in enumerate(parts):
+        if i == 0:
+            await event.edit(part)
+        else:
+            await event.reply(part)
+
+
+def register(client, owner_id: int):
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
+    async def ping(event):
+        if not is_owner(event, owner_id):
+            return
+        try:
+            await rpc_await(event.edit("PONG"), timeout=_RPC_T, label="ping.edit")
+        except Exception as exc:
+            logger.warning("ping edit failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.id$"))
+    async def id_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+        try:
+            chat_id = event.chat_id
+            msg_id = event.message.id
+            reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="id.get_reply")
+            lines = [f"**Chat ID:** `{chat_id}`", f"**Msg ID:** `{msg_id}`"]
+            if reply:
+                lines.append(f"**Reply Msg ID:** `{reply.id}`")
+                lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
+                lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
+            await rpc_await(event.edit("\n".join(lines)), timeout=_RPC_T, label="id.edit")
+        except Exception as exc:
+            logger.warning("id_cmd failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.panel$"))
+    async def panel_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        helper = get_client()
+        if helper is None:
+            await rpc_await(event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN)."), timeout=_RPC_T, label="panel.no_helper")
+            return
+
+        reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="panel.get_reply")
+        if reply:
+            set_target(owner_id, TargetContext(
+                owner_id=owner_id,
+                kind="reply",
+                reply_chat_id=reply.chat_id,
+                reply_msg_id=reply.id,
+                tz_str=_resolve_tz(),
+            ))
+
+        try:
+            success = await rpc_await(send_inline_panel(client, event.chat_id, "context"), timeout=_RPC_T, label="panel.send_inline")
+            if success:
+                await rpc_await(event.delete(), timeout=_RPC_T, label="panel.delete")
+            else:
+                await rpc_await(event.edit("⚠️ Panel failed to open. Check logs."), timeout=_RPC_T, label="panel.fail_edit")
+        except Exception as exc:
+            logger.warning("panel inline send failed: %s", exc)
+            try:
+                await rpc_await(event.edit(f"⚠️ Panel failed: {exc}"), timeout=_RPC_T, label="panel.err_edit")
+            except Exception:
+                pass
+
+    try:
+        _register_panels()
+        register_panel("menu", _menu_panel_handler, parent="menu", title="🏠 LifeOS")
+        register_inline_builder("menu", _menu_inline_builder)
+        register_panel("profile", _profile_panel_handler, parent="menu", title="👤 Profile")
+        register_inline_builder("profile", _profile_inline_builder)
+        register_panel("context", _context_panel_handler, parent="menu", title="Context Panel")
+        register_panel("health", _health_panel_handler, parent="menu", title="Health Dashboard")
+        register_inline_builder("health", _health_inline_builder)
+        register_inline_builder("context", _context_inline_builder)
+        register_action("health_refresh", _health_refresh_action)
+    except Exception as exc:
+        logger.warning("Inline builder registration failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.menu$"))
+    async def menu_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        helper = get_client()
+        if helper is None:
+            text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+            await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.no_helper_edit")
+            return
+
+        try:
+            await rpc_await(event.delete(), timeout=_RPC_T, label="menu.delete")
+            await rpc_await(send_inline_panel(client, event.chat_id, "menu"), timeout=_RPC_T, label="menu.send_inline")
+        except Exception as exc:
+            logger.warning("menu inline send failed: %s", exc)
+            try:
+                text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+                await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.fallback_edit")
+            except Exception:
+                pass
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
+    async def health_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+        helper = get_client()
+        if helper is None:
+            try:
+                snap = health.snapshot()
+                report = _build_health_report(snap)
+                await rpc_await(_safe_edit(event, report), timeout=_RPC_T, label="health.no_helper_edit")
+                _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
+            except Exception as exc:
+                logger.warning("health_cmd failed: %s", exc)
+            return
+        try:
+            await rpc_await(event.delete(), timeout=_RPC_T, label="health.delete")
+            await rpc_await(send_inline_panel(client, event.chat_id, "health"), timeout=_RPC_T, label="health.send_inline")
+            _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
+        except Exception as exc:
+            logger.warning("health inline send failed: %s", exc)

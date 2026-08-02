@@ -1,0 +1,792 @@
+"""
+.ping    — Edit trigger with PONG (zero-spam policy).
+.id      — Chat ID + Message ID of the current context.
+.panel   — Context panel for the replied message.
+.health  — Full health dashboard (inline panel).
+.menu    — Mother Panel — the central navigation root of LifeOS.
+Falls back to plain-text edit-in-place when the helper bot is not available.
+"""
+import asyncio
+import logging
+import os
+import resource
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from telethon import events
+
+from backend import health
+from backend import diagnostics as _diag_runtime
+from backend.bio import engine as bio_engine
+from backend.bot.handlers.guard import is_owner
+from backend.db import client as db_client
+from backend.helper import (
+    InlinePanelBuilder,
+    register_panel,
+    register_inline_builder,
+    register_action,
+    register_input,
+    send_inline_panel,
+    render,
+    render_edit,
+    to_edit_buttons,
+    TargetContext,
+    set_target,
+    get_target,
+    is_auto_close_enabled,
+    toggle_auto_close,
+)
+from backend.helper.client import get_client
+from backend.helper.rpc_timeout import rpc_await
+
+_RPC_T = 30.0
+
+
+def _resolve_tz() -> str:
+    try:
+        tz_str = os.getenv("TZ", "Asia/Tehran")
+        ZoneInfo(tz_str)
+        return tz_str
+    except (ZoneInfoNotFoundError, Exception):
+        return "UTC"
+
+
+logger = logging.getLogger(__name__)
+
+
+def _build_general_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🏓 Ping", "action:general_ping")
+    builder.add_row("🆔 Chat & Msg IDs", "action:general_id")
+    builder.add_row("🩺 Health Dashboard", "action:general_health")
+    return builder.build()
+
+
+async def _general_body() -> str:
+    return (
+        "**General**\n\n"
+        "Tap a button to execute instantly."
+    )
+
+
+def _build_menu_buttons() -> list:
+    builder = InlinePanelBuilder()
+    builder.add_buttons(
+        ("📥 Save", "panel:save"),
+        ("🗑 Delete", "panel:del"),
+    )
+    builder.add_buttons(
+        ("👤 Profile", "panel:profile"),
+        ("🗄 Database", "panel:db"),
+    )
+    builder.add_buttons(
+        ("📋 List", "panel:list"),
+        ("🔍 Find", "panel:find"),
+    )
+    builder.add_buttons(
+        ("🔧 General", "panel:general"),
+        ("⚙️ Settings", "panel:settings"),
+    )
+    return builder.build()
+
+
+async def _menu_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "🏠 LifeOS", "Choose a category:", _build_menu_buttons()
+
+
+async def _menu_inline_builder(event, extra: str) -> list:
+    return [render("🏠 LifeOS", "Choose a category:", _build_menu_buttons())]
+
+
+async def _general_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "General", await _general_body(), _build_general_buttons()
+
+
+async def _general_inline_builder(event, extra: str) -> list:
+    return [render("General", await _general_body(), _build_general_buttons())]
+
+
+async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    builder = InlinePanelBuilder()
+    builder.add_row("🧬 Bio", "panel:bio")
+    builder.add_row("👤 Username", "panel:username")
+    return "👤 Profile", "Choose a section:", builder.build()
+
+
+async def _profile_inline_builder(event, extra: str) -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("🧬 Bio", "panel:bio")
+    builder.add_row("👤 Username", "panel:username")
+    return [render("👤 Profile", "Choose a section:", builder.build())]
+
+
+def _build_settings_body() -> str:
+    from backend.services import settings_service
+    ac = settings_service.is_auto_close_enabled()
+    acd = settings_service.auto_close_delay()
+    mds = settings_service.max_deep_save_mb()
+    dbs = settings_service.delete_batch_size()
+    lrd = settings_service.log_retention_days()
+    pts = settings_service.panel_timeout_seconds()
+    amp = settings_service.is_allow_multiple_panels()
+    rep = settings_service.is_reuse_existing_panel()
+    lang = settings_service.language()
+    dbg = settings_service.is_debug_callbacks()
+    oo = settings_service.is_owner_only()
+    uss = settings_service.update_stale_seconds()
+
+    def _state(on: bool) -> str:
+        return "🟢" if on else "⚪"
+
+    def _pad(s: str, width: int = 13) -> str:
+        return s.ljust(width)
+
+    lines = [
+        f"{_state(ac)} {_pad('Auto Close')} ⏳ {acd}s",
+        f"{_state(oo)} {_pad('Owner Only')} 🌐 {lang.upper()}",
+        f"{_state(rep)} {_pad('Reuse Panel')} 💾 {mds} MB",
+        f"{_state(amp)} {_pad('Multi Panels')} 🗑 Batch {dbs}",
+        f"{_state(dbg)} {_pad('Debug')} 📅 {lrd} Days",
+        f"💓 {_pad('Update Rate')} {uss}s",
+    ]
+
+    return "**⚙️ Settings**\n\n" + "```\n" + "\n".join(lines) + "\n```"
+
+
+def _build_settings_buttons() -> list:
+    from backend.services import settings_service
+    ac = settings_service.is_auto_close_enabled()
+    dbg = settings_service.is_debug_callbacks()
+    oo = settings_service.is_owner_only()
+    amp = settings_service.is_allow_multiple_panels()
+    rep = settings_service.is_reuse_existing_panel()
+
+    def _toggle_label(prefix: str, on: bool) -> str:
+        return f"{'🟢' if on else '⚪'}  {prefix}"
+
+    def _label(emoji: str, prefix: str) -> str:
+        return f"{emoji}  {prefix}"
+
+    builder = InlinePanelBuilder()
+    builder.add_buttons(
+        (_toggle_label("Auto Close", ac), "action:settings_toggle_autoclose"),
+        (_label("👑", "Owner Only"), "action:settings_toggle_owner_only"),
+    )
+    builder.add_buttons(
+        (_label("♻️", "Reuse Panel"), "action:settings_toggle_reuse_panel"),
+        (_label("📂", "Multi Panels"), "action:settings_toggle_multiple_panels"),
+    )
+    builder.add_buttons(
+        (_label("🐞", "Debug"), "action:settings_toggle_debug_callbacks"),
+        (_label("🌐", "Language"), "input:settings:language"),
+    )
+    builder.add_buttons(
+        (_label("⏳", "Delay"), "input:settings:auto_close_delay"),
+        (_label("💾", "Deep Save"), "input:settings:max_deep_save_mb"),
+    )
+    builder.add_buttons(
+        (_label("🗑", "Delete Batch"), "input:settings:delete_batch_size"),
+        (_label("📅", "Retention"), "input:settings:log_retention_days"),
+    )
+    builder.add_buttons(
+        (_label("🕒", "Timeout"), "input:settings:panel_timeout_seconds"),
+        (_label("💓", "Update Rate"), "input:settings:update_stale_seconds"),
+    )
+    return builder.build()
+
+
+async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_inline_builder(event, extra: str) -> list:
+    return [render("Settings", _build_settings_body(), _build_settings_buttons())]
+
+
+async def _settings_toggle_autoclose_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.toggle_auto_close()
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_debug_callbacks_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_debug_callbacks(not settings_service.is_debug_callbacks())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_owner_only_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_owner_only(not settings_service.is_owner_only())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_multiple_panels_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_allow_multiple_panels(not settings_service.is_allow_multiple_panels())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _settings_toggle_reuse_panel_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    settings_service.set_reuse_existing_panel(not settings_service.is_reuse_existing_panel())
+    return "Settings", _build_settings_body(), _build_settings_buttons()
+
+
+async def _general_ping_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    return "PONG", "", _build_general_buttons()
+
+
+async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.target_context import get_target
+
+    owner_id = _owner_id
+    client = _self_client
+
+    your_id = "N/A"
+    if client is not None:
+        try:
+            me = await client.get_me()
+            your_id = str(me.id)
+        except Exception:
+            pass
+    elif owner_id:
+        your_id = str(owner_id)
+
+    chat_id_val = "N/A"
+    msg_id_val = "N/A"
+    try:
+        cid = getattr(event, "chat_id", None)
+        if cid is not None:
+            chat_id_val = str(cid)
+    except Exception:
+        pass
+    try:
+        mid = getattr(event, "message_id", None)
+        if mid is not None:
+            msg_id_val = str(mid)
+    except Exception:
+        pass
+
+    body = (
+        f"**Your ID:**\n`{your_id}`\n\n"
+        f"**Current Chat ID:**\n`{chat_id_val}`\n\n"
+        f"**Current Message ID:**\n`{msg_id_val}`"
+    )
+
+    ctx = get_target(owner_id)
+    if ctx and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id:
+        body += (
+            f"\n\n**Replied Chat ID:**\n`{ctx.reply_chat_id}`\n\n"
+            f"**Replied Message ID:**\n`{ctx.reply_msg_id}`"
+        )
+
+    return "Chat & Message IDs", body, _build_general_buttons()
+
+
+async def _general_health_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+async def _settings_auto_close_delay_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 5 and 3600."
+    else:
+        ok = settings_service.set_auto_close_delay(int(text))
+        result = f"✅ Auto-close delay set to `{text}s`" if ok else "⚠️ Value must be between 5 and 3600."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings auto_close_delay inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_max_deep_save_mb_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 500."
+    else:
+        ok = settings_service.set_max_deep_save_mb(int(text))
+        result = f"✅ Max deep save set to `{text} MB`" if ok else "⚠️ Value must be between 1 and 500."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings max_deep_save_mb inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_delete_batch_size_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 1000."
+    else:
+        ok = settings_service.set_delete_batch_size(int(text))
+        result = f"✅ Delete batch size set to `{text}`" if ok else "⚠️ Value must be between 1 and 1000."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings delete_batch_size inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_log_cleanup_days_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 1 and 365."
+    else:
+        ok = settings_service.set_log_retention_days(int(text))
+        result = f"✅ Log retention set to `{text} days`" if ok else "⚠️ Value must be between 1 and 365."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings log_retention_days inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_panel_timeout_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 30 and 86400."
+    else:
+        ok = settings_service.set_panel_timeout_seconds(int(text))
+        result = f"✅ Panel timeout set to `{text}s`" if ok else "⚠️ Value must be between 30 and 86400."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings panel_timeout inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text:
+        result = "⚠️ Language cannot be empty."
+    else:
+        ok = settings_service.set_language(text)
+        result = f"✅ Language set to `{text}`" if ok else "⚠️ Invalid language."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings language inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "⚠️ Please enter a number between 60 and 3600."
+    else:
+        ok = settings_service.set_update_stale_seconds(int(text))
+        result = f"✅ Update stale threshold set to `{text}s`" if ok else "⚠️ Value must be between 60 and 3600."
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings update_stale inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+def _register_panels() -> None:
+    register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
+    register_inline_builder("settings", _settings_inline_builder)
+    register_panel("general", _general_panel_handler, parent="menu", title="General")
+    register_inline_builder("general", _general_inline_builder)
+    register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
+    register_action("settings_toggle_debug_callbacks", _settings_toggle_debug_callbacks_action)
+    register_action("settings_toggle_owner_only", _settings_toggle_owner_only_action)
+    register_action("settings_toggle_multiple_panels", _settings_toggle_multiple_panels_action)
+    register_action("settings_toggle_reuse_panel", _settings_toggle_reuse_panel_action)
+    register_action("general_ping", _general_ping_action)
+    register_action("general_id", _general_id_action)
+    register_action("general_health", _general_health_action)
+    register_input("settings", "auto_close_delay", {
+        "handler": _settings_auto_close_delay_handler,
+        "prompt": "**Auto-Close Delay**\n\nEnter the delay in seconds (5-3600):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "max_deep_save_mb", {
+        "handler": _settings_max_deep_save_mb_handler,
+        "prompt": "**Max Deep Save Size**\n\nEnter the maximum file size in MB (1-500):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "delete_batch_size", {
+        "handler": _settings_delete_batch_size_handler,
+        "prompt": "**Delete Batch Size**\n\nEnter the batch size for message deletion (1-1000):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "log_retention_days", {
+        "handler": _settings_log_cleanup_days_handler,
+        "prompt": "**Log Retention**\n\nEnter the number of days to retain logs (1-365):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "panel_timeout_seconds", {
+        "handler": _settings_panel_timeout_handler,
+        "prompt": "**Panel Timeout**\n\nEnter the panel timeout in seconds (30-86400):\n\n_Reply with the number below._",
+    })
+    register_input("settings", "language", {
+        "handler": _settings_language_handler,
+        "prompt": "**Language**\n\nEnter the language code (e.g. en, fa):\n\n_Reply with the language code below._",
+    })
+    register_input("settings", "update_stale_seconds", {
+        "handler": _settings_update_stale_handler,
+        "prompt": "**Update Stale Threshold**\n\nEnter the threshold in seconds (60-3600):\n\n_Reply with the number below._",
+    })
+
+
+async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
+
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Save", "panel:save")
+    builder.add_row("🗑 Delete", "panel:del")
+    builder.add_row("🗄 Database", "panel:db")
+
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "Choose an action:"
+
+    return "Context Panel", body, builder.build()
+
+
+async def _context_inline_builder(event, extra: str) -> list:
+    from backend.helper.inline_engine import _owner_id
+
+    owner_id = _owner_id
+    ctx = get_target(owner_id)
+
+    has_target = ctx is not None and ctx.kind == "reply" and ctx.reply_chat_id and ctx.reply_msg_id
+
+    builder = InlinePanelBuilder()
+    builder.add_row("📦 Save", "panel:save")
+    builder.add_row("🗑 Delete", "panel:del")
+    builder.add_row("🗄 Database", "panel:db")
+
+    if has_target:
+        body = f"**Chat:** `{ctx.reply_chat_id}`\n**Message:** `{ctx.reply_msg_id}`\n\nChoose an action:"
+    else:
+        body = "Choose an action:"
+
+    return [render("Context Panel", body, builder.build())]
+
+
+def _format_uptime(uptime_s):
+    if uptime_s is None or uptime_s < 0:
+        return "unknown"
+    hours = int(uptime_s // 3600)
+    minutes = int((uptime_s % 3600) // 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _format_age(age_s):
+    if age_s is None:
+        return "—"
+    if age_s < 60:
+        return f"{int(age_s)}s ago"
+    m = int(age_s // 60)
+    if m < 60:
+        return f"{m}m ago"
+    h = m // 60
+    return f"{h}h {m % 60}m ago"
+
+
+def _indicator(ok):
+    return "🟢" if ok else "🔴"
+
+
+def _build_health_report(snap):
+    process_ok = snap.get("process_alive", False)
+    telegram_ok = snap.get("telethon_connected", False)
+    supervisor_ok = snap.get("supervisor_ok", False)
+    bio_cron_ok = snap.get("bio_cron_ok", False)
+    watchdog_ok = snap.get("watchdog_ok", False)
+    heartbeat_age = snap.get("heartbeat_age_s")
+    uptime_s = snap.get("uptime_s")
+    restart_count = snap.get("restart_count", 0)
+    last_watchdog = snap.get("last_watchdog_check_s")
+    last_tg_event = snap.get("last_telethon_event_s")
+    last_bio = snap.get("last_bio_update_s")
+    status = snap.get("status", "unknown")
+
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        mem_mb = usage.ru_maxrss / 1024
+        cpu_s = usage.ru_utime + usage.ru_stime
+    except Exception:
+        mem_mb = None
+        cpu_s = None
+
+    try:
+        all_tasks = asyncio.all_tasks()
+        running = sum(1 for t in all_tasks if not t.done())
+    except Exception:
+        running = None
+
+    db_ok = db_client.is_available()
+
+    if heartbeat_age is not None and heartbeat_age <= 15.0:
+        hb_status = "OK"
+    elif heartbeat_age is not None:
+        hb_status = "WARNING"
+    else:
+        hb_status = "ERROR"
+
+    lines = ["🩺 **LifeOS Health Dashboard**", ""]
+
+    lines.append(f"{_indicator(process_ok)} **Process**: {'Alive' if process_ok else 'Dead'}")
+    if mem_mb is not None:
+        lines.append(f"   • Memory: `{mem_mb:.1f} MB`")
+    if cpu_s is not None:
+        lines.append(f"   • CPU: `{cpu_s:.2f}s`")
+
+    lines.append(f"{_indicator(telegram_ok)} **Telegram**: {'Connected' if telegram_ok else 'Disconnected'}")
+    lines.append(f"   • Last event: {_format_age(last_tg_event)}")
+
+    lines.append(f"{_indicator(supervisor_ok)} **Supervisor**: {'Running' if supervisor_ok else 'Stopped'}")
+
+    lines.append(f"{_indicator(watchdog_ok)} **Watchdog**: {'Running' if watchdog_ok else 'Stopped'}")
+    lines.append(f"   • Last check: {_format_age(last_watchdog)}")
+
+    lines.append(f"{_indicator(bio_cron_ok)} **Bio Cron**: {'Running' if bio_cron_ok else 'Stopped'}")
+    lines.append(f"   • Last update: {_format_age(last_bio)}")
+
+    hb_icon = "🟢" if hb_status == "OK" else ("🟡" if hb_status == "WARNING" else "🔴")
+    lines.append(f"{hb_icon} **Heartbeat**: {hb_status}")
+    if heartbeat_age is not None:
+        lines.append(f"   • Age: `{int(heartbeat_age)}s`")
+
+    lines.append(f"{'🟢' if restart_count == 0 else '🟡'} **Restarts**: `{restart_count}`")
+
+    if running is not None:
+        lines.append(f"{'🟢' if running < 20 else '🟡'} **Running Tasks**: `{running}`")
+
+    lines.append(f"{_indicator(db_ok)} **Database**: {'Available' if db_ok else 'Fallback'}")
+
+    lines.append(f"{'🟢' if uptime_s and uptime_s > 0 else '🔴'} **Uptime**: `{_format_uptime(uptime_s)}`")
+
+    lines.append("")
+    if status == "ok":
+        lines.append("_Everything looks healthy._")
+    else:
+        lines.append("_⚠️ Issues detected — needs attention._")
+
+    return "\n".join(lines)
+
+
+async def _health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+async def _health_inline_builder(event, extra: str) -> list:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return [render("Health Dashboard", report, builder.build())]
+
+
+async def _health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    snap = health.snapshot()
+    report = _build_health_report(snap)
+    builder = InlinePanelBuilder()
+    builder.add_row("Refresh", "action:health_refresh")
+    return "Health Dashboard", report, builder.build()
+
+
+def _get_self_client():
+    from backend.helper.inline_engine import _self_client
+    return _self_client
+
+
+async def _safe_edit(event, text: str) -> None:
+    parts = _diag_runtime.split_message(text)
+    for i, part in enumerate(parts):
+        if i == 0:
+            await event.edit(part)
+        else:
+            await event.reply(part)
+
+
+def register(client, owner_id: int):
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
+    async def ping(event):
+        if not is_owner(event, owner_id):
+            return
+        try:
+            await rpc_await(event.edit("PONG"), timeout=_RPC_T, label="ping.edit")
+        except Exception as exc:
+            logger.warning("ping edit failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.id$"))
+    async def id_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+        try:
+            chat_id = event.chat_id
+            msg_id = event.message.id
+            reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="id.get_reply")
+            lines = [f"**Chat ID:** `{chat_id}`", f"**Msg ID:** `{msg_id}`"]
+            if reply:
+                lines.append(f"**Reply Msg ID:** `{reply.id}`")
+                lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
+                lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
+            await rpc_await(event.edit("\n".join(lines)), timeout=_RPC_T, label="id.edit")
+        except Exception as exc:
+            logger.warning("id_cmd failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.panel$"))
+    async def panel_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        helper = get_client()
+        if helper is None:
+            await rpc_await(event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN)."), timeout=_RPC_T, label="panel.no_helper")
+            return
+
+        reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="panel.get_reply")
+        if reply:
+            set_target(owner_id, TargetContext(
+                owner_id=owner_id,
+                kind="reply",
+                reply_chat_id=reply.chat_id,
+                reply_msg_id=reply.id,
+                tz_str=_resolve_tz(),
+            ))
+
+        try:
+            success = await rpc_await(send_inline_panel(client, event.chat_id, "context"), timeout=_RPC_T, label="panel.send_inline")
+            if success:
+                await rpc_await(event.delete(), timeout=_RPC_T, label="panel.delete")
+            else:
+                await rpc_await(event.edit("⚠️ Panel failed to open. Check logs."), timeout=_RPC_T, label="panel.fail_edit")
+        except Exception as exc:
+            logger.warning("panel inline send failed: %s", exc)
+            try:
+                await rpc_await(event.edit(f"⚠️ Panel failed: {exc}"), timeout=_RPC_T, label="panel.err_edit")
+            except Exception:
+                pass
+
+    try:
+        _register_panels()
+        register_panel("menu", _menu_panel_handler, parent="menu", title="🏠 LifeOS")
+        register_inline_builder("menu", _menu_inline_builder)
+        register_panel("profile", _profile_panel_handler, parent="menu", title="👤 Profile")
+        register_inline_builder("profile", _profile_inline_builder)
+        register_panel("context", _context_panel_handler, parent="menu", title="Context Panel")
+        register_panel("health", _health_panel_handler, parent="menu", title="Health Dashboard")
+        register_inline_builder("health", _health_inline_builder)
+        register_inline_builder("context", _context_inline_builder)
+        register_action("health_refresh", _health_refresh_action)
+    except Exception as exc:
+        logger.warning("Inline builder registration failed: %s", exc)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.menu$"))
+    async def menu_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+
+        helper = get_client()
+        if helper is None:
+            text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+            await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.no_helper_edit")
+            return
+
+        try:
+            await rpc_await(event.delete(), timeout=_RPC_T, label="menu.delete")
+            await rpc_await(send_inline_panel(client, event.chat_id, "menu"), timeout=_RPC_T, label="menu.send_inline")
+        except Exception as exc:
+            logger.warning("menu inline send failed: %s", exc)
+            try:
+                text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+                await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.fallback_edit")
+            except Exception:
+                pass
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
+    async def health_cmd(event):
+        if not is_owner(event, owner_id):
+            return
+        helper = get_client()
+        if helper is None:
+            try:
+                snap = health.snapshot()
+                report = _build_health_report(snap)
+                await rpc_await(_safe_edit(event, report), timeout=_RPC_T, label="health.no_helper_edit")
+                _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
+            except Exception as exc:
+                logger.warning("health_cmd failed: %s", exc)
+            return
+        try:
+            await rpc_await(event.delete(), timeout=_RPC_T, label="health.delete")
+            await rpc_await(send_inline_panel(client, event.chat_id, "health"), timeout=_RPC_T, label="health.send_inline")
+            _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
+        except Exception as exc:
+            logger.warning("health inline send failed: %s", exc)
