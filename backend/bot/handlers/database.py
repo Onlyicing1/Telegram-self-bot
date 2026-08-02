@@ -61,7 +61,7 @@ async def _db_inline_builder(event, extra: str) -> list:
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("db", _db_panel_handler)
+    register_panel("db", _db_panel_handler, parent="menu", title="🗄 Database")
     register_inline_builder("db", _db_inline_builder)
     register_action("db_clean", _db_clean_action)
     register_action("db_stats", _db_stats_action)

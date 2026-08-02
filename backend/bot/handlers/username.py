@@ -421,8 +421,8 @@ async def _username_mood_input_handler(text, chat_id, msg_id, inline_chat_id, in
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("username", _username_panel_handler)
-    register_panel("usernamehelp", _usernamehelp_panel_handler)
+    register_panel("username", _username_panel_handler, parent="profile", title="👤 Username")
+    register_panel("usernamehelp", _usernamehelp_panel_handler, parent="username", title="Username Help")
     register_inline_builder("username", _username_inline_builder)
     register_inline_builder("usernamehelp", _usernamehelp_inline_builder)
     register_action("username_on", _username_on_action)

@@ -77,8 +77,8 @@ async def _find_inline_builder(event, extra: str) -> list:
 
 def register(client, owner_id: int, tz_str: str):
 
-    register_panel("list", _list_panel_handler)
-    register_panel("find", _find_panel_handler)
+    register_panel("list", _list_panel_handler, parent="menu", title="📋 List")
+    register_panel("find", _find_panel_handler, parent="menu", title="🔍 Find")
     register_inline_builder("list", _list_inline_builder)
     register_inline_builder("find", _find_inline_builder)
     register_input("find", "query", {

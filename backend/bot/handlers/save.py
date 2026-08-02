@@ -156,7 +156,7 @@ async def _save_link_input_handler(text, chat_id, msg_id, inline_chat_id, inline
 
 
 def register(client, owner_id: int, tz_str: str) -> None:
-    register_panel("save", _save_panel_handler)
+    register_panel("save", _save_panel_handler, parent="menu", title="📥 Save")
     register_inline_builder("save", _save_inline_builder)
     register_action("save_reply", _save_reply_action)
     register_input("save", "link", {

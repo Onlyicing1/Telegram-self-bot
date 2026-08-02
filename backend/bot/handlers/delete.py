@@ -263,8 +263,8 @@ def _circled_num(n: int) -> str:
 
 
 def register(client, owner_id: int):
-    register_panel("del", _del_panel_handler)
-    register_panel("delfrom", _delfrom_panel_handler)
+    register_panel("del", _del_panel_handler, parent="menu", title="🗑 Delete")
+    register_panel("delfrom", _delfrom_panel_handler, parent="del", title="Delete from Message")
     register_inline_builder("del", _del_inline_builder)
     register_inline_builder("delfrom", _delfrom_inline_builder)
     register_action("delfrom_reply", _delfrom_reply_action)
