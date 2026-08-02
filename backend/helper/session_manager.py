@@ -148,7 +148,7 @@ class SessionManager:
             return None
         return session.nav_stack[-1]
 
-    def reset_nav(self, chat_id: int, msg_id: int, panel_id: str = "help", extra: str = "") -> None:
+    def reset_nav(self, chat_id: int, msg_id: int, panel_id: str = "menu", extra: str = "") -> None:
         session = self.get(chat_id, msg_id)
         if session is None:
             self.create(chat_id, msg_id, panel_id, extra)
@@ -229,7 +229,7 @@ def pop_nav(chat_id: int, msg_id: int) -> tuple[str, str] | None:
     return _manager.pop_nav(chat_id, msg_id)
 
 
-def reset_nav(chat_id: int, msg_id: int, panel_id: str = "help", extra: str = "") -> None:
+def reset_nav(chat_id: int, msg_id: int, panel_id: str = "menu", extra: str = "") -> None:
     _manager.reset_nav(chat_id, msg_id, panel_id, extra)
 
 
