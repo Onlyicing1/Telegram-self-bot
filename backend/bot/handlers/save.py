@@ -62,7 +62,7 @@ async def _save_inline_builder(event, extra: str) -> list:
 
 
 async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.helper.inline_engine import _self_client, _owner_id
+    from backend.helper.inline_engine import _owner_id
     from backend.helper.input_state import set_pending
 
     owner_id = _owner_id
@@ -86,26 +86,7 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
         extra=mode,
     )
 
-    helper = get_client()
-    if helper and chat_id:
-        msg_id = getattr(event, "message_id", 0) or 0
-        if msg_id:
-            try:
-                await helper.edit_message(chat_id, msg_id, wait_text, buttons=[])
-            except Exception as exc:
-                logger.warning("save reply wait edit failed: %s", exc)
-        else:
-            try:
-                await event.edit(wait_text, buttons=[])
-            except Exception as exc:
-                logger.warning("save reply wait event edit failed: %s", exc)
-    else:
-        try:
-            await event.edit(wait_text, buttons=[])
-        except Exception as exc:
-            logger.warning("save reply wait event edit failed: %s", exc)
-
-    return None
+    return "Save", wait_text, []
 
 
 async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
