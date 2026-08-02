@@ -76,6 +76,10 @@ def _build_menu_buttons() -> list:
         ("🗄 Database", "panel:db"),
     )
     builder.add_buttons(
+        ("📋 List", "panel:list"),
+        ("🔍 Find", "panel:find"),
+    )
+    builder.add_buttons(
         ("🔧 General", "panel:general"),
         ("⚙️ Settings", "panel:settings"),
     )

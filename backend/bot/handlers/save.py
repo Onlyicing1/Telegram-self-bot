@@ -72,28 +72,16 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
         return "Save", "⚠️ Could not determine the current chat. Please try again.", []
 
     mode_label = "Forward" if mode == "f" else "Deep"
-    wait_text = (
-        f"**Save — Reply Mode**\n\n"
-        f"Waiting for your reply...\n"
-        f"Reply to any message to save it ({mode_label} Save)."
-    )
+    prompt = f"**Save — Reply Mode**\n\nReply to any message in this chat.\nThe replied message will be saved ({mode_label} Save).\n\n_Reply to a message now._"
 
     set_pending(
         owner_id, "save_reply", _save_reply_wait_handler,
-        chat_id, wait_text,
+        chat_id, prompt,
         inline_chat_id=chat_id,
         inline_msg_id=getattr(event, "message_id", 0) or 0,
         extra=mode,
     )
-
-    helper = get_client()
-    if helper and chat_id:
-        try:
-            await helper.edit_message(chat_id, getattr(event, "message_id", 0) or 0, wait_text, buttons=[])
-        except Exception as exc:
-            logger.warning("save reply wait edit failed: %s", exc)
-
-    return None
+    return "Save", "Waiting for your reply... Reply to any message to save it.", []
 
 
 async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -126,7 +114,7 @@ async def _save_reply_wait_handler(text, chat_id, msg_id, inline_chat_id, inline
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
             logger.warning("save reply result edit failed: %s", exc)
 
