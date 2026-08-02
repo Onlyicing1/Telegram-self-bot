@@ -54,7 +54,9 @@ def configure(supervisor) -> None:
 
 def _get_heartbeat_ts() -> float:
     try:
+        from backend.health import _heartbeat_age, _started_at
         import backend.health as _h
+        # Compute the actual heartbeat timestamp from age
         age = _h._heartbeat_age()
         if age < 0:
             return 0.0
@@ -82,6 +84,7 @@ def _all_frozen() -> bool:
     _prev_rpc = rpc
     _prev_dispatch = dsp
 
+    # All must be non-zero (initialized) AND none changed
     all_initialized = hb > 0 and upd > 0 and rpc > 0 and dsp > 0
     none_changed = not (hb_changed or upd_changed or rpc_changed or dsp_changed)
 
@@ -94,6 +97,7 @@ async def _failsafe_loop() -> None:
     logger.info("Failsafe monitor started (interval=%ds, threshold=%ds)",
                 int(_CHECK_INTERVAL), int(_FREEZE_THRESHOLD))
 
+    # Give the runtime time to boot before checking
     await asyncio.sleep(30.0)
 
     while True:
@@ -101,6 +105,7 @@ async def _failsafe_loop() -> None:
         await asyncio.sleep(_CHECK_INTERVAL)
         loop_latency = (time.monotonic() - t0 - _CHECK_INTERVAL) * 1000
 
+        # If the loop itself took way too long, the event loop was blocked
         if loop_latency > 5000:
             trace("FAILSAFE_LOOP_STARVATION", latency_ms=f"{loop_latency:.1f}")
             logger.error(
@@ -115,6 +120,7 @@ async def _failsafe_loop() -> None:
         if sup.shutdown_event.is_set():
             return
 
+        # Skip if recovery is already in progress or in cooldown
         try:
             if sup._recovery_lock.locked():
                 _frozen_since = 0.0

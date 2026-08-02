@@ -19,25 +19,18 @@ The supervisor guarantees:
   - No callback exception poisons the dispatcher
   - Every forever-loop is wrapped in immortal_create_task (never dies)
   - Recovery never enters a dead state — infinite retry with backoff
-  - Recovery cooldown prevents endless recovery loops
-  - Failsafe monitor triggers hard reset when all signals freeze
-  - Never calls sys.exit / os.exit / quit — only rebuilds runtime
 
 Mandatory log tags:
   KEEPALIVE_TIMEOUT
   CLIENT_RECONNECT
   CLIENT_REBUILD
-  CLIENT_REBUILD_OK
-  CLIENT_REBUILD_FAILED
   WATCHDOG_RECOVERY
   TASK_RESTART
   LOOP_STALLED
   EVENT_LOOP_STARVATION
   CALLBACK_DISPATCH_STALLED
-  RECOVERY_START
   RECOVERY_SUCCESS
   RECOVERY_FAILED
-  RUNTIME_RECOVERED
 """
 import asyncio
 import logging
