@@ -19,23 +19,29 @@ The supervisor guarantees:
   - No callback exception poisons the dispatcher
   - Every forever-loop is wrapped in immortal_create_task (never dies)
   - Recovery never enters a dead state — infinite retry with backoff
+  - Recovery cooldown prevents endless recovery loops
+  - Failsafe monitor triggers hard reset when all signals freeze
+  - Never calls sys.exit / os.exit / quit — only rebuilds runtime
 
 Mandatory log tags:
   KEEPALIVE_TIMEOUT
   CLIENT_RECONNECT
   CLIENT_REBUILD
+  CLIENT_REBUILD_OK
+  CLIENT_REBUILD_FAILED
   WATCHDOG_RECOVERY
   TASK_RESTART
   LOOP_STALLED
   EVENT_LOOP_STARVATION
   CALLBACK_DISPATCH_STALLED
+  RECOVERY_START
   RECOVERY_SUCCESS
   RECOVERY_FAILED
+  RUNTIME_RECOVERED
 """
 import asyncio
 import logging
 import random
-import sys
 import time
 from typing import Any
 
@@ -46,6 +52,7 @@ from backend.runtime.tracer import trace, trace_exception
 from backend.runtime.task_guard import immortal_create_task, guarded_create_task, set_runtime_state_ref
 from backend.runtime.heartbeat import start_heartbeat, stop_heartbeat, update_state as update_heartbeat_state, configure as configure_heartbeat
 from backend.runtime.keepalive import start_keepalive, stop_keepalive, configure as configure_keepalive
+from backend.runtime.failsafe import start_failsafe, stop_failsafe, configure as configure_failsafe
 from backend.bio import engine as bio_engine
 from backend.username import engine as username_engine
 from backend.bot.client import build_client
@@ -115,6 +122,10 @@ _UPDATE_STALE_DEFAULT = 90.0
 _RECONNECT_FAILURES_BEFORE_REBUILD = 2
 _LOOP_STALE_THRESHOLD = 90.0
 _LOOP_STARVATION_MS = 5000.0
+_RECONNECT_TIMEOUT = 30.0
+_REBUILD_TIMEOUT = 45.0
+_REGISTER_TIMEOUT = 30.0
+_RECOVERY_COOLDOWN = 180.0
 
 _CRITICAL_TASKS = (
     "lifeos-watchdog",
@@ -145,6 +156,7 @@ class RuntimeSupervisor:
         "_reconnect_failures",
         "_task_supervisor_task",
         "_last_watchdog_tick",
+        "_recovery_cooldown_until",
     )
 
     def __init__(self, cfg: dict):
@@ -176,6 +188,10 @@ class RuntimeSupervisor:
         self._consecutive_failures: int = 0
         self._reconnect_failures: int = 0
         self._last_watchdog_tick: float = 0.0
+        self._recovery_cooldown_until: float = 0.0
+
+    def _in_recovery_cooldown(self) -> bool:
+        return time.time() < self._recovery_cooldown_until
 
     def _transition(self, new_state: RuntimeState) -> None:
         if self.state == new_state:
@@ -231,6 +247,7 @@ class RuntimeSupervisor:
 
         configure_keepalive(self)
         configure_heartbeat(self)
+        configure_failsafe(self)
         self._watchdog_task = immortal_create_task(
             self._watchdog_loop(), name="lifeos-watchdog"
         )
@@ -239,6 +256,7 @@ class RuntimeSupervisor:
         )
         start_keepalive()
         start_heartbeat()
+        start_failsafe()
         start_diagnostics()
         self._task_supervisor_task = immortal_create_task(
             self._task_supervisor_loop(), name="lifeos-task-supervisor"
@@ -513,8 +531,9 @@ class RuntimeSupervisor:
         await asyncio.sleep(1)
 
         try:
-            new_client = await build_client(
-                self.api_id, self.api_hash, self.session_string
+            new_client = await asyncio.wait_for(
+                build_client(self.api_id, self.api_hash, self.session_string),
+                timeout=_REBUILD_TIMEOUT,
             )
             self.client = new_client
             self.client_generation += 1
@@ -530,13 +549,34 @@ class RuntimeSupervisor:
             )
             record_event("runtime", "rebuild_client", 0, "SUCCESS",
                          f"gen={self.client_generation}")
+        except asyncio.TimeoutError:
+            trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="timeout")
+            logger.error("CLIENT_REBUILD_FAILED: build timed out after %ds", int(_REBUILD_TIMEOUT))
+            record_event("runtime", "rebuild_client", 0, "ERROR", "timeout")
+            return False
         except Exception as exc:
             trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation)
             logger.error("CLIENT_REBUILD_FAILED: %s", exc)
             record_event("runtime", "rebuild_client", 0, "ERROR", str(exc))
             return False
 
-        register_all(self.client, self.owner_id, self.tz_str)
+        try:
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, register_all, self.client, self.owner_id, self.tz_str
+                ),
+                timeout=_REGISTER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="register_timeout")
+            logger.error("CLIENT_REBUILD_FAILED: handler registration timed out after %ds", int(_REGISTER_TIMEOUT))
+            record_event("runtime", "register_handlers", 0, "ERROR", "timeout")
+            return False
+        except Exception as exc:
+            trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation, reason="register_error")
+            logger.error("CLIENT_REBUILD_FAILED: handler registration error: %s", exc)
+            return False
+
         set_last_update()
         set_last_telethon_event()
         record_event("runtime", "register_handlers", 0, "SUCCESS",
@@ -555,12 +595,14 @@ class RuntimeSupervisor:
             self._run_loop(), name="lifeos-run"
         )
 
-        trace("CLIENT_REBUILT", gen=self.client_generation)
-        logger.info("CLIENT_REBUILT — new client ready (gen=%d)", self.client_generation)
+        trace("CLIENT_REBUILD_OK", gen=self.client_generation)
+        logger.info("CLIENT_REBUILD_OK — new client ready (gen=%d)", self.client_generation)
         return True
 
     async def _trigger_reconnect(self) -> None:
         if self.shutdown_event.is_set():
+            return
+        if self._in_recovery_cooldown():
             return
 
         try:
@@ -573,10 +615,14 @@ class RuntimeSupervisor:
             return
 
         try:
-            success = await self._reconnect_client()
+            success = await asyncio.wait_for(
+                self._reconnect_client(), timeout=_RECONNECT_TIMEOUT,
+            )
             if success:
                 self._reconnect_failures = 0
+                self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
                 trace("RECOVERY_SUCCESS", action="reconnect", gen=self.client_generation)
+                logger.info("RUNTIME_RECOVERED — reconnect succeeded (gen=%d)", self.client_generation)
                 return
 
             self._reconnect_failures += 1
@@ -589,14 +635,20 @@ class RuntimeSupervisor:
                 rebuild_ok = await self._rebuild_client()
                 if rebuild_ok:
                     self._reconnect_failures = 0
+                    self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
                     trace("RECOVERY_SUCCESS", action="rebuild", gen=self.client_generation)
+                    logger.info("RUNTIME_RECOVERED — rebuild succeeded (gen=%d)", self.client_generation)
                 else:
                     await self._do_full_recovery()
+        except asyncio.TimeoutError:
+            logger.warning("Reconnect timed out after %ds", int(_RECONNECT_TIMEOUT))
         finally:
             self._recovery_lock.release()
 
     async def _trigger_full_recovery(self) -> None:
         if self.shutdown_event.is_set():
+            return
+        if self._in_recovery_cooldown():
             return
 
         try:
@@ -620,24 +672,14 @@ class RuntimeSupervisor:
         self._recovery_attempts += 1
         attempt = self._recovery_attempts
 
-        if attempt > _MAX_RECOVERY_ATTEMPTS:
-            trace("WATCHDOG_PROCESS_EXIT", reason="recovery_limit_exceeded", attempts=attempt)
-            logger.error(
-                "WATCHDOG_PROCESS_EXIT — recovery limit exceeded "
-                "(%d/%d attempts). Terminating process (exit code 1).",
-                attempt, _MAX_RECOVERY_ATTEMPTS,
-            )
-            self._transition(RuntimeState.FAILED)
-            set_supervisor_ok(False)
-            set_task_state("lifeos-recovery", "FAILED")
-            self.shutdown_event.set()
-            sys.exit(1)
+        trace("RECOVERY_START", attempt=attempt)
+        logger.warning("RECOVERY_START — attempt %d", attempt)
 
         delay = _backoff(attempt)
         trace("WATCHDOG_RECOVERY", attempt=attempt, backoff_delay=f"{delay:.1f}s")
         logger.warning(
-            "WATCHDOG_RECOVERY — attempt %d/%d, backoff %.1fs",
-            attempt, _MAX_RECOVERY_ATTEMPTS, delay,
+            "WATCHDOG_RECOVERY — attempt %d, backoff %.1fs",
+            attempt, delay,
         )
         record_event("runtime", "recovery_start", 0, "ATTEMPT",
                      f"attempt={attempt}")
@@ -713,27 +755,198 @@ class RuntimeSupervisor:
             self._recovery_attempts = 0
             self._consecutive_failures = 0
             self._reconnect_failures = 0
+            self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
             self._transition(RuntimeState.READY)
             set_supervisor_ok(True)
             set_task_state("lifeos-recovery", "DONE")
             increment_restart()
             trace("RECOVERY_SUCCESS", action="full", gen=self.client_generation)
-            logger.info(
-                "RECOVERY_SUCCESS — system operational (gen=%d)",
-                self.client_generation,
-            )
+            logger.info("RUNTIME_RECOVERED — system operational (gen=%d)",
+                        self.client_generation)
             record_event("runtime", "recovery", 0, "SUCCESS",
                          f"gen={self.client_generation}")
 
         except Exception as exc:
             trace_exception("RECOVERY_FAILED", exc, attempt=attempt)
             logger.error(
-                "RECOVERY_FAILED — attempt %d/%d: %s",
-                attempt, _MAX_RECOVERY_ATTEMPTS, exc,
+                "RECOVERY_FAILED — attempt %d: %s",
+                attempt, exc,
             )
             record_event("runtime", "recovery", 0, "ERROR", str(exc))
             set_last_rebuild_reason(f"recovery_error: {exc}")
             set_task_state("lifeos-recovery", "FAILED")
+            self._recovery_lock.release()
+            immortal_create_task(self._retry_full_recovery(), name="lifeos-recovery-retry")
+            return
+
+    async def _retry_full_recovery(self) -> None:
+        await asyncio.sleep(30.0)
+        if self.shutdown_event.is_set():
+            return
+        await self._trigger_full_recovery()
+
+    async def _hard_reset_runtime(self) -> None:
+        """Last-line failsafe: destroy everything Telethon-related and rebuild.
+
+        Called by the failsafe monitor when all signals are frozen.
+        Bypasses the normal watchdog/heartbeat chain entirely.
+        Never kills the process — only rebuilds the Telegram runtime.
+        Preserves: settings, bio state, username state, scheduler, DB connections.
+        """
+        if self.shutdown_event.is_set():
+            return
+        if self._in_recovery_cooldown():
+            return
+
+        try:
+            acquired = await asyncio.wait_for(
+                self._recovery_lock.acquire(), timeout=10.0,
+            )
+            if not acquired:
+                return
+        except asyncio.TimeoutError:
+            return
+
+        try:
+            trace("RECOVERY_START", reason="failsafe_hard_reset")
+            logger.error("RECOVERY_START — failsafe hard reset triggered")
+
+            trace("CLIENT_REBUILD", gen=self.client_generation + 1, reason="failsafe")
+            logger.warning("CLIENT_REBUILD — failsafe destroying all Telethon tasks")
+
+            await self._stop_helper()
+            set_helper_connected(False)
+
+            await get_lifecycle().shutdown_all()
+            clear_all_targets()
+
+            if self._run_task and not self._run_task.done():
+                self._run_task.cancel()
+                try:
+                    await asyncio.wait_for(self._run_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+                self._run_task = None
+
+            await self._cancel_orphan_tasks()
+
+            old_client = self.client
+            self.client = None
+            self._client_alive = False
+            set_telethon_connected(False)
+            update_heartbeat_state(self_connected=False)
+            if old_client is not None:
+                try:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=10.0)
+                except (asyncio.TimeoutError, Exception):
+                    logger.warning("Failsafe: old client disconnect timed out")
+
+            await asyncio.sleep(2)
+
+            if self.shutdown_event.is_set():
+                return
+
+            try:
+                new_client = await asyncio.wait_for(
+                    build_client(self.api_id, self.api_hash, self.session_string),
+                    timeout=_REBUILD_TIMEOUT,
+                )
+                self.client = new_client
+                self.client_generation += 1
+                set_client_generation(self.client_generation)
+                set_telethon_connected(True)
+                self._client_alive = True
+                self._consecutive_failures = 0
+                self._reconnect_failures = 0
+                update_heartbeat_state(
+                    self_connected=True,
+                    client_generation=self.client_generation,
+                    _client_ref=self.client,
+                )
+                trace("CLIENT_REBUILD_OK", gen=self.client_generation, reason="failsafe")
+                logger.info("CLIENT_REBUILD_OK — failsafe new client ready (gen=%d)", self.client_generation)
+            except asyncio.TimeoutError:
+                trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="failsafe_timeout")
+                logger.error("CLIENT_REBUILD_FAILED — failsafe build timed out")
+                self._recovery_lock.release()
+                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                return
+            except Exception as exc:
+                trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation, reason="failsafe")
+                logger.error("CLIENT_REBUILD_FAILED — failsafe: %s", exc)
+                self._recovery_lock.release()
+                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                return
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, register_all, self.client, self.owner_id, self.tz_str
+                    ),
+                    timeout=_REGISTER_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="failsafe_register_timeout")
+                logger.error("CLIENT_REBUILD_FAILED — failsafe registration timed out")
+                self._recovery_lock.release()
+                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                return
+            except Exception as exc:
+                trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation, reason="failsafe_register")
+                logger.error("CLIENT_REBUILD_FAILED — failsafe registration error: %s", exc)
+                self._recovery_lock.release()
+                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                return
+
+            set_last_update()
+            set_last_telethon_event()
+
+            if self.helper_enabled:
+                set_self_client(self.client)
+                configure_lifecycle(self.client, self.owner_id)
+                configure_callback_trace(self.client, self.owner_id)
+                register_input_listener(self.client, self.owner_id)
+
+            bio_engine.update_client(self.client)
+            username_engine.update_client(self.client)
+
+            self._run_task = immortal_create_task(
+                self._run_loop(), name="lifeos-run"
+            )
+
+            await self._resume_bio_cron()
+            await self._resume_username_cron()
+
+            try:
+                await self._verify_heartbeat()
+            except Exception:
+                pass
+
+            if self.helper_enabled:
+                await self._start_helper()
+
+            self._recovery_attempts = 0
+            self._consecutive_failures = 0
+            self._reconnect_failures = 0
+            self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
+            self._transition(RuntimeState.READY)
+            set_supervisor_ok(True)
+            set_task_state("lifeos-recovery", "DONE")
+            increment_restart()
+            trace("RECOVERY_SUCCESS", action="failsafe", gen=self.client_generation)
+            logger.info("RUNTIME_RECOVERED — failsafe recovery complete (gen=%d)",
+                        self.client_generation)
+            record_event("runtime", "recovery", 0, "SUCCESS",
+                         f"gen={self.client_generation},reason=failsafe")
+        except Exception as exc:
+            trace_exception("RECOVERY_FAILED", exc, reason="failsafe")
+            logger.error("RECOVERY_FAILED — failsafe: %s", exc)
+            self._recovery_lock.release()
+            immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+            return
+        finally:
+            if self._recovery_lock.locked():
+                self._recovery_lock.release()
 
     async def _verify_heartbeat(self) -> None:
         client = self.client
@@ -1040,6 +1253,9 @@ class RuntimeSupervisor:
 
         await get_lifecycle().shutdown_all()
         clear_all_targets()
+
+        logger.info("Shutdown: stopping failsafe")
+        await stop_failsafe()
 
         logger.info("Shutdown: stopping keepalive")
         await stop_keepalive()
