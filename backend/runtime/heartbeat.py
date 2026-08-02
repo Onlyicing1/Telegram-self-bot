@@ -1,26 +1,18 @@
 """
 Runtime heartbeat — comprehensive system snapshot every 30 seconds.
 
-Logs a single structured line containing:
-  - Runtime State
-  - Self client connected status
-  - Helper client connected status
-  - Pending asyncio task count
-  - Event loop latency (measured via sleep drift)
-  - Memory (RSS)
-  - Client generation
-  - Last RPC latency
-  - Active Telethon update queue size (if available)
-  - Number of registered handlers
-  - last_update_age — age of last incoming Telegram update
-  - last_event_age — age of last dispatched event
-  - last_rpc_age — age of last successful RPC
-  - last_command_age — age of last handled owner command
-  - last_callback_age — age of last callback query
+Logs a single structured line containing runtime state, connection status,
+task count, event loop latency, memory, client generation, RPC latency,
+update queue size, handler count, and age tracking for all critical events.
 
 Stall detection:
   - If updates stop arriving while RPC is still healthy → UPDATE_PIPELINE_STALLED
   - If dispatcher stops processing updates → EVENT_DISPATCH_STALLED
+  - If event loop latency exceeds threshold → EVENT_LOOP_STARVATION
+
+Loop instrumentation:
+  - Reports its own progress via tick_loop("lifeos-heartbeat")
+  - If the heartbeat itself can't run on schedule, the supervisor detects it
 
 The heartbeat is separate from the watchdog RPC check — it runs on its own
 timer and never blocks or interferes with recovery.
@@ -31,12 +23,14 @@ import resource
 import time
 
 from backend.runtime.tracer import trace
-from backend.runtime.task_guard import guarded_create_task
+from backend.runtime.task_guard import immortal_create_task
+from backend.health import tick_loop, get_stale_loops
 
 logger = logging.getLogger("backend.heartbeat")
 
 _INTERVAL = 30.0
 _STALL_THRESHOLD = 90.0
+_LOOP_STARVATION_MS = 5000.0
 _task: asyncio.Task | None = None
 
 _state_ref: dict = {
@@ -62,7 +56,6 @@ def update_state(**kwargs) -> None:
 
 
 def _count_handlers(client) -> int:
-    """Count registered event handlers on a Telethon client."""
     try:
         if client is None:
             return 0
@@ -73,7 +66,6 @@ def _count_handlers(client) -> int:
 
 
 def _get_update_queue_size(client) -> int:
-    """Get the Telethon update queue size if available."""
     try:
         if client is None:
             return -1
@@ -93,6 +85,20 @@ async def _heartbeat_loop() -> None:
         await asyncio.sleep(_INTERVAL)
         loop_latency = (time.monotonic() - t0 - _INTERVAL) * 1000
 
+        tick_loop("lifeos-heartbeat", state="RUNNING", success=True)
+
+        if loop_latency > _LOOP_STARVATION_MS:
+            trace(
+                "EVENT_LOOP_STARVATION",
+                loop_latency_ms=f"{loop_latency:.1f}",
+                threshold_ms=f"{_LOOP_STARVATION_MS:.0f}",
+            )
+            logger.error(
+                "EVENT_LOOP_STARVATION — loop latency %.1fms exceeds %.0fms threshold. "
+                "Blocking code suspected.",
+                loop_latency, _LOOP_STARVATION_MS,
+            )
+
         try:
             tasks = asyncio.all_tasks()
             pending = sum(1 for t in tasks if not t.done())
@@ -109,7 +115,6 @@ async def _heartbeat_loop() -> None:
         handler_count = _count_handlers(client) if client else _state_ref.get("registered_handlers", -1)
         queue_size = _get_update_queue_size(client) if client else _state_ref.get("update_queue_size", -1)
 
-        # ── Age tracking ──
         from backend.health import (
             get_last_telethon_event,
             get_last_event_dispatch,
@@ -150,7 +155,6 @@ async def _heartbeat_loop() -> None:
             last_callback_age=last_callback_age,
         )
 
-        # ── Stall detection — trigger reconnect ──
         rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
 
         if last_update > 0 and (now - last_update) > _STALL_THRESHOLD:
@@ -170,7 +174,7 @@ async def _heartbeat_loop() -> None:
                 )
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
-                    guarded_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
         if last_update > 0 and last_event > 0 and (now - last_event) > _STALL_THRESHOLD:
             if (now - last_update) < _STALL_THRESHOLD:
@@ -189,14 +193,31 @@ async def _heartbeat_loop() -> None:
                 )
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
-                    guarded_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+
+        if last_callback > 0 and (now - last_callback) > _STALL_THRESHOLD:
+            if rpc_healthy:
+                trace(
+                    "CALLBACK_DISPATCH_STALLED",
+                    last_callback_age=last_callback_age,
+                    threshold=f"{_STALL_THRESHOLD:.0f}s",
+                    gen=_state_ref.get("client_generation", 0),
+                )
+                logger.warning(
+                    "CALLBACK_DISPATCH_STALLED — no callbacks for %s (gen=%d) — triggering reconnect",
+                    last_callback_age,
+                    _state_ref.get("client_generation", 0),
+                )
+                sup = _supervisor_ref
+                if sup is not None and not sup._recovery_lock.locked():
+                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
 
 def start_heartbeat() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = guarded_create_task(_heartbeat_loop(), name="lifeos-heartbeat")
+    _task = immortal_create_task(_heartbeat_loop(), name="lifeos-heartbeat")
 
 
 async def stop_heartbeat() -> None:
