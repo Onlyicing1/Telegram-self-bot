@@ -15,7 +15,7 @@ import traceback
 
 from telethon import events
 
-from backend.bot.handlers import misc, save, retrieve, delete, organize, bio, discover, database, username
+from backend.bot.handlers import misc, save, retrieve, delete, organize, bio, discover, database, username, ai
 from backend.runtime.tracer import trace_handler_exception
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("discover", lambda: discover.register(client, owner_id, tz_str)),
         ("database", lambda: database.register(client, owner_id, tz_str)),
         ("username", lambda: username.register(client, owner_id, tz_str)),
+        ("ai", lambda: ai.register(client, owner_id)),
     ]
 
     for name, fn in handlers:
