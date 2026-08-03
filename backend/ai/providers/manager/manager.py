@@ -24,6 +24,11 @@ The manager also exposes:
   - ``provider_health(name)``  → health dict
   - ``metrics_snapshot()``     → all provider metrics
   - ``capabilities(name)``     → ProviderCapabilities for a provider
+  - ``get_provider_config(name)`` → ProviderConfig for a provider
+  - ``update_provider_config(name, field, value)`` → update + validate
+  - ``reset_provider_config(name)`` → reset to defaults
+  - ``validate_provider(name)`` → ValidationResult
+  - ``export_configs()``       → all configs as dicts
 
 The manager never crashes. Every exception is caught and converted
 into a fallback response.
@@ -34,8 +39,10 @@ import logging
 import time
 from typing import Any, Iterator
 
+from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.exceptions import ProviderUnavailable
+from backend.ai.providers.manager.config_manager import ProviderConfigManager
 from backend.ai.providers.manager.metrics import ProviderMetricsRegistry
 from backend.ai.providers.registry.registry import ProviderRegistry
 
@@ -49,11 +56,12 @@ class ProviderManager:
     All other layers call ``manager.chat()``.
     """
 
-    __slots__ = ("_registry", "_metrics")
+    __slots__ = ("_registry", "_metrics", "_config_mgr")
 
     def __init__(self, registry: ProviderRegistry | None = None) -> None:
         self._registry = registry or ProviderRegistry()
         self._metrics = ProviderMetricsRegistry()
+        self._config_mgr = ProviderConfigManager()
         self._ensure_dummy_fallback()
 
     # ── Public API ──
@@ -150,6 +158,32 @@ class ProviderManager:
     @property
     def registry(self) -> ProviderRegistry:
         return self._registry
+
+    @property
+    def config_manager(self) -> ProviderConfigManager:
+        return self._config_mgr
+
+    def get_provider_config(self, name: str | None = None) -> ProviderConfig:
+        """Return the ProviderConfig for a provider (active if name is None)."""
+        if name is None:
+            return self._config_mgr.get_active_config()
+        return self._config_mgr.get_config(name)
+
+    def update_provider_config(self, name: str, field: str, value: Any) -> Any:
+        """Update a provider config field. Returns the ValidationResult."""
+        return self._config_mgr.update(name, field, value)
+
+    def reset_provider_config(self, name: str) -> ProviderConfig:
+        """Reset a provider's config to factory defaults."""
+        return self._config_mgr.reset(name)
+
+    def validate_provider(self, name: str) -> Any:
+        """Validate a provider's config. Returns ValidationResult."""
+        return self._config_mgr.validate(name)
+
+    def export_configs(self) -> dict[str, dict[str, Any]]:
+        """Export all provider configs as dicts."""
+        return self._config_mgr.export()
 
     # ── Internal ──
 
