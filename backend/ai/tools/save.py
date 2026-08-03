@@ -63,7 +63,7 @@ class SaveTool(Tool):
 
         try:
             result = await save_service.execute_save(
-                context.client, context.owner_id, reply_msg, mode, context.tz_str
+                context.telegram.client, context.owner_id, reply_msg, mode, context.tz_str
             )
             return ToolResult(success=True, message=result, data={"mode": mode})
         except Exception as exc:

@@ -108,7 +108,10 @@ def create_default_registry(context: ToolContext) -> ToolRegistry:
     """Factory: build a registry pre-populated with all built-in tools.
 
     This is called once at startup by the runtime supervisor. Every
-tool receives the same ``ToolContext`` (client, owner_id, tz_str).
+tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
+
+    If ``context.telegram`` is None but ``context.client`` is set, a
+    ``TelegramAPI`` facade is constructed automatically.
 
     To add a new tool:
         1. Write a tool class in a new file under backend/ai/tools/.
@@ -130,6 +133,16 @@ tool receives the same ``ToolContext`` (client, owner_id, tz_str).
     from backend.ai.tools.retrieve import SearchTool, ListSavesTool
     from backend.ai.tools.settings import SettingsGetTool, SettingsSetTool
     from backend.ai.tools.organize import OrganizeListTool, OrganizeCleanTool
+
+    if context.telegram is None and context.client is not None:
+        from backend.telegram_api import TelegramAPI
+        context = ToolContext(
+            telegram=TelegramAPI(context.client),
+            owner_id=context.owner_id,
+            tz_str=context.tz_str,
+            client=context.client,
+            extra=context.extra,
+        )
 
     registry = ToolRegistry()
 
