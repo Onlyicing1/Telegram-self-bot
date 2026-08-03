@@ -1,0 +1,143 @@
+"""
+Provider config defaults — factory defaults for every supported provider.
+
+Each entry produces a ``ProviderConfig`` with sensible defaults. The
+``ProviderConfigManager`` uses these on ``load()`` and ``reset()``.
+
+To add a new provider:
+  1. Add an entry to ``_PROVIDER_DEFAULTS`` below.
+  2. Add the provider class to ``_PROVIDER_CLASSES`` in ``factory.py``.
+  3. Done.
+"""
+from __future__ import annotations
+
+from backend.ai.providers.base.config import ProviderConfig
+
+
+def _dummy_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="dummy",
+        base_url="",
+        api_key="",
+        default_model="dummy-1",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=30,
+        retry_count=3,
+        enabled=True,
+    )
+
+
+def _gemini_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="gemini",
+        base_url="",
+        api_key="",
+        default_model="gemini-2.0-flash",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=8192,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _openai_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="openai",
+        base_url="https://api.openai.com/v1",
+        api_key="",
+        default_model="gpt-4o",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _claude_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="claude",
+        base_url="https://api.anthropic.com/v1",
+        api_key="",
+        default_model="claude-sonnet-4-20250514",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=8192,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _glm_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="glm",
+        base_url="https://open.bigmodel.cn/api/paas/v4",
+        api_key="",
+        default_model="glm-4-flash",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _openrouter_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="",
+        default_model="openrouter/auto",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _custom_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="custom",
+        base_url="",
+        api_key="",
+        default_model="",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=30,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+_PROVIDER_DEFAULTS: dict[str, callable] = {
+    "dummy": _dummy_default,
+    "gemini": _gemini_default,
+    "openai": _openai_default,
+    "claude": _claude_default,
+    "glm": _glm_default,
+    "openrouter": _openrouter_default,
+    "custom": _custom_default,
+}
+
+
+def get_provider_default(name: str) -> ProviderConfig:
+    """Return a fresh ProviderConfig with defaults for the named provider."""
+    factory = _PROVIDER_DEFAULTS.get(name)
+    if factory is None:
+        return ProviderConfig(provider_name=name)
+    return factory()
+
+
+def list_provider_names() -> list[str]:
+    """Return all provider names that have defaults."""
+    return list(_PROVIDER_DEFAULTS.keys())
