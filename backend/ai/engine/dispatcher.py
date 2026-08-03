@@ -177,6 +177,14 @@ class Dispatcher:
         history_items = self._conversation.get_history(
             owner_id=request.owner_id, n=20
         )
+        from backend.ai.conversation.history import HistoryEntry
+        history_entries: list[HistoryEntry] = []
+        for item in history_items:
+            history_entries.append(HistoryEntry(
+                role=item.role,
+                content=item.content,
+                tool_name=item.role if item.role == "tool" else "",
+            ))
         return ContextBuilder().build(
             session=self._adapt_session(session),
             user_text=request.user_message,
@@ -191,7 +199,7 @@ class Dispatcher:
                 total_responses=self._metrics.successful_executions,
                 turn_count=len(history_items),
             ),
-            history=[],
+            history=history_entries,
         )
 
     def _adapt_session(self, session: Any) -> Any:
