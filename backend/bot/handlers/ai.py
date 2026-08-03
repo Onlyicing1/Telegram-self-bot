@@ -3,6 +3,7 @@ AI Menu — the Telegram-facing AI control panel.
 
 Inspection-only for most pages; the Settings page is fully interactive
 with toggle buttons for booleans and reply-mode input for numerics.
+The Provider page now supports switching between registered providers.
 All changes go through the process-wide ConfigManager singleton so
 every subsequent snapshot reflects the new state immediately.
 
@@ -111,14 +112,14 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
 
     if engine is not None:
         try:
-            registry = engine.provider_registry
-            provider = registry.default_provider()
-            provider_name = provider.name
-            provider_version = provider.provider_version()
-            health = provider.health()
+            mgr = engine.provider_manager
+            active = mgr.get_active()
+            provider_name = active.name
+            provider_version = active.provider_version()
+            health = active.health()
             provider_status = _status_badge(health.get("healthy", False))
-            provider_enabled = provider.is_enabled
-            provider_count = len(registry.list())
+            provider_enabled = active.is_enabled
+            provider_count = len(mgr.list_providers())
         except Exception as exc:
             logger.warning("AI provider panel: %s", exc)
             provider_status = f"FAIL: {exc}"
@@ -131,21 +132,51 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
         f"**Enabled:** {'YES' if provider_enabled else 'NO'}",
         f"**Provider Count:** {provider_count}",
         "",
-        "**Future Providers:**",
+        "_Tap a provider below to switch._",
     ]
-    for fp in _FUTURE_PROVIDERS:
-        lines.append(f"  • {fp} — _disabled_")
 
     warning = _warning_block(provider_status)
     if warning:
         lines.append(warning)
 
-    return "AI · Provider", "\n".join(lines), []
+    return "AI · Provider", "\n".join(lines), _build_provider_buttons()
 
 
 async def _ai_provider_inline_builder(event, extra: str) -> list:
     title, body, buttons = await _ai_provider_panel_handler(event, extra)
     return [render(title, body, buttons)]
+
+
+def _build_provider_buttons() -> list:
+    """Build provider switch buttons — one row per registered provider."""
+    engine = _get_engine()
+    builder = InlinePanelBuilder()
+    if engine is not None:
+        try:
+            mgr = engine.provider_manager
+            active_name = mgr.get_active_name()
+            for name in mgr.list_providers():
+                label = f"{'→ ' if name == active_name else ''}{name}"
+                builder.add_row(label, f"action:ai_switch_provider:{name}")
+        except Exception:
+            pass
+    return builder.build()
+
+
+async def _ai_switch_provider_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Switch the active provider. ``extra`` is the provider name."""
+    engine = _get_engine()
+    if engine is None:
+        return "AI · Provider", "**Error:** engine not available", []
+    target = extra.strip()
+    if not target:
+        return "AI · Provider", "**Error:** no provider specified", _build_provider_buttons()
+    ok = engine.provider_manager.switch_provider(target)
+    if ok:
+        logger.info("AI provider switched to '%s'", target)
+    else:
+        logger.warning("AI provider switch to '%s' failed", target)
+    return await _ai_provider_panel_handler(event, extra)
 
 
 # ── Panel: Model ──
@@ -560,7 +591,8 @@ def register(client, owner_id: int) -> None:
             })
 
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
+        register_action("ai_switch_provider", _ai_switch_provider_action)
 
-        logger.info("AI panels registered OK (interactive settings)")
+        logger.info("AI panels registered OK (interactive settings + provider switching)")
     except Exception as exc:
         logger.error("AI panel registration FAILED: %s", exc)
