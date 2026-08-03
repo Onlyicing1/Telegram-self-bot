@@ -67,29 +67,3 @@ def register(client, owner_id: int, tz_str: str):
     register_action("db_stats", _db_stats_action)
     register_action("db_vacuum", _db_vacuum_action)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.db\s+(clean|stats|vacuum)$"))
-    async def db_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        action = event.pattern_match.group(1)
-        if action == "clean":
-            result = await database_service.do_clean(client, owner_id)
-        elif action == "stats":
-            result = await database_service.do_stats(owner_id, tz_str)
-        elif action == "vacuum":
-            result = await database_service.do_vacuum(client, owner_id)
-        await event.edit(result)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.db$"))
-    async def db_panel(event):
-        if not is_owner(event, owner_id):
-            return
-        helper = get_client()
-        if helper is None:
-            await event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN).")
-            return
-        try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, "db")
-        except Exception as exc:
-            logger.warning("db inline send failed: %s", exc)
