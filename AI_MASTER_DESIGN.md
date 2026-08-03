@@ -35,6 +35,8 @@
 25. [Expanded Conversation Context](#25-expanded-conversation-context)
 26. [Expanded Token Budget](#26-expanded-token-budget)
 27. [Expanded Failure Recovery](#27-expanded-failure-recovery)
+28. [Resource Budget](#28-resource-budget)
+29. [Deterministic Runtime Rules](#29-deterministic-runtime-rules)
 
 ---
 
@@ -2139,12 +2141,209 @@ When a tool triggers a Telegram FloodWait:
 
 ---
 
+## 28. Resource Budget
+
+> **Authority:** Permanent. Every AI subsystem, tool, scheduler, and background worker must operate inside these budgets. No feature may exceed them. If a feature cannot fit within these limits, the feature must be redesigned — not the budget.
+
+The LifeOS runtime is a single Python process running on Render Free Tier with a Telethon self-client, an optional helper bot, a uvicorn web server, and (future) an AI core. Every subsystem shares the same CPU, RAM, Telegram API quota, and Render free-tier limits. The budgets below are the hard ceiling for the AI subsystem — the portion of resources the AI may consume without starving the existing deterministic runtime.
+
+### 28.1 CPU Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| AI Core inference loop | ≤ 5% sustained | Inference is mostly I/O-bound (waiting for LLM API responses). CPU spikes only during prompt assembly and response parsing. |
+| Tool execution | ≤ 10% per tool invocation | Tools must complete in < 2 seconds wall-clock. CPU-heavy tools must yield to the event loop with `asyncio.sleep(0)` between chunks. |
+| Memory retrieval / scoring | ≤ 3% sustained | Memory search runs in-process; must use indexed lookups, not linear scans. |
+| Total AI CPU footprint | ≤ 15% sustained | The remaining 85% is reserved for Telethon event processing, web server, watchdog, heartbeat, and profile scheduler. |
+
+**Rule:** The AI must never peg a CPU core. If inference or tool execution is CPU-bound, it must run in a thread executor with a timeout and must not block the event loop.
+
+### 28.2 RAM Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| AI Core state (conversation, memory cache) | ≤ 50 MB | Conversation context is capped by the Token Budget. Memory cache holds the working set only. |
+| Tool Layer state | ≤ 10 MB | Tools are stateless between calls. No tool may hold large buffers. |
+| Prompt assembly buffers | ≤ 5 MB | Prompts are built, sent, and discarded. No prompt history is held in RAM. |
+| LLM response streaming buffer | ≤ 2 MB per response | Responses are streamed and processed incrementally. |
+| Total AI RAM footprint | ≤ 70 MB | The process total must stay under 512 MB (Render Free Tier limit). The AI gets at most 70 MB of that. |
+
+**Rule:** The AI must never hold a full conversation history in RAM. Only the working window (defined by the Token Budget) is in memory. Older turns are persisted to Supabase and retrieved on demand.
+
+### 28.3 Telegram API Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| AI-initiated API calls | ≤ 20 calls/hour | Messages sent by the AI, profile updates, fetch operations. This is on top of the existing bio/username cron budget. |
+| AI-initiated FloodWait risk | ≤ 1 per hour | If the AI hits a FloodWait, it must back off and log it. Repeated FloodWaits trigger a cooldown. |
+| AI read operations (fetch messages, get entity) | ≤ 60 calls/hour | Read operations are cheaper but still count against the Telegram rate limit. |
+| Total AI Telegram footprint | ≤ 80 calls/hour | Combined read + write. The existing runtime (watchdog heartbeat, bio/username cron, helper bot) already uses ~40 calls/hour. The AI must not push the total past 120 calls/hour. |
+
+**Rule:** The AI must never send messages in a loop. Every send must be deliberate, logged, and rate-limited. The AI must prefer responding to user-initiated events over polling.
+
+### 28.4 Render Free Tier Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| Process memory | ≤ 512 MB total | The entire LifeOS process — Telethon, web server, AI, all subsystems — must fit in 512 MB. |
+| CPU | 0.1 vCPU (shared) | Render Free Tier provides a shared CPU. The AI must not monopolize it. |
+| Uptime | 15 min inactivity spin-down | The web server and Telethon keepalive already prevent spin-down. The AI must not interfere with keepalive. |
+| Cold start budget | 1 cold start per deploy | The AI must not cause unnecessary restarts. No feature may crash the process or trigger OOM. |
+| Background workers | ≤ 3 AI-owned workers | The AI may have at most: (1) the inference loop, (2) the memory compaction worker, (3) the scheduler tick. No more. |
+
+**Rule:** The AI must never cause the process to exceed 512 MB. If memory pressure is detected, the AI must shed caches first, then refuse new requests. The AI must never trigger an OOM kill.
+
+### 28.5 Tool Execution Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| Max tools per conversation turn | 5 | A single user message may trigger at most 5 tool calls. If more are needed, the AI must ask the user for confirmation. |
+| Max tool wall-clock time | 10 seconds per tool | Tools must complete in under 10 seconds. Tools that exceed this must be split or made async. |
+| Max concurrent tool executions | 1 | Tools are sequential within a conversation turn. No parallel tool execution. |
+| Tool retry budget | 2 retries per tool | A tool may retry twice on failure. After that, the tool returns an error to the AI Core. |
+| Tool memory per invocation | ≤ 5 MB | Tools must not hold large data structures between calls. |
+
+**Rule:** Tools must be cheap, fast, and deterministic. A tool that cannot meet these budgets must be redesigned or removed.
+
+### 28.6 Prompt Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| System prompt | ≤ 2,000 tokens | The base system prompt including personality, rules, and tool definitions. |
+| Conversation context window | ≤ 4,000 tokens | The rolling window of recent conversation turns. |
+| Memory injection | ≤ 1,000 tokens | Relevant memories injected into the prompt. |
+| Tool result injection | ≤ 1,500 tokens | Results from tool calls within the current turn. |
+| Total prompt per turn | ≤ 8,500 tokens | The sum of all prompt components. This must never exceed the model's context window. |
+| Max output tokens per turn | ≤ 1,000 tokens | AI responses are concise. Long responses must be split into multiple messages. |
+
+**Rule:** The prompt budget is enforced by the Prompt System (Section 7). If the prompt exceeds the budget, the oldest conversation turns and least relevant memories are trimmed first. The system prompt is never trimmed.
+
+### 28.7 Memory Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| Total memories in Supabase | Unlimited | Supabase storage is cheap. The AI may create as many memory rows as needed. |
+| Working memory cache (RAM) | ≤ 1,000 entries | Only the most recent and highest-scoring memories are held in RAM. |
+| Memory compaction interval | Every 100 conversation turns | Compaction merges similar memories and archives old ones. |
+| Memory retrieval per turn | ≤ 20 results | Only the top 20 most relevant memories are retrieved per conversation turn. |
+| Memory row size | ≤ 2 KB per row | Each memory entry (content + metadata) must be under 2 KB. |
+
+**Rule:** Memory is persistent in Supabase and ephemeral in RAM. The AI must never hold the full memory store in RAM. Retrieval must use indexed queries, not full-table scans.
+
+### 28.8 Concurrent Task Budget
+
+| Component | Budget | Notes |
+|---|---|---|
+| Active AI conversations | 1 | The AI processes one conversation at a time. Requests are queued. |
+| Background AI workers | ≤ 3 | (1) inference loop, (2) memory compaction, (3) scheduler tick. |
+| Pending tool executions | ≤ 1 | Tools are sequential. No parallel tools within a turn. |
+| Scheduled AI tasks | ≤ 10 | The scheduler may have at most 10 pending AI-initiated tasks. |
+| Total AI asyncio tasks | ≤ 15 | The sum of all AI-owned asyncio tasks. This is on top of the existing runtime's ~20 tasks. |
+
+**Rule:** The AI must never spawn unbounded asyncio tasks. Every AI task must be tracked, supervised, and cancellable. No AI task may outlive the conversation that created it (except the 3 permanent workers).
+
+### 28.9 Prohibited Runtime Behaviors
+
+The AI MUST NEVER:
+
+- **Spawn duplicate schedulers.** There is exactly one scheduler. The AI may schedule tasks through it, but must never create a second scheduler instance.
+- **Spawn duplicate watchdogs.** There is exactly one watchdog loop. The AI must never create its own watchdog.
+- **Spawn duplicate heartbeat loops.** There is exactly one heartbeat loop. The AI must never create its own heartbeat.
+- **Spawn duplicate profile schedulers.** There is exactly one profile scheduler (shared by Bio and Username engines). The AI must never create another.
+- **Spawn duplicate Telethon clients.** There is exactly one self-client and one optional helper client. The AI must never build its own Telethon client.
+- **Create unnecessary background workers.** The AI gets at most 3 permanent workers. No feature may add more without explicit approval.
+- **Launch uncontrolled parallel tasks.** Tools are sequential. Inference is single-threaded. No feature may spawn parallel asyncio tasks without supervision.
+- **Create infinite retry loops.** Every retry must have a maximum count and exponential backoff. After exhausting retries, the feature must fail gracefully and log the error.
+- **Waste Render resources.** The AI must not cause unnecessary CPU spikes, memory leaks, or cold starts. Every resource the AI consumes must be justified.
+- **Increase Telegram API traffic unnecessarily.** The AI must not poll Telegram for updates, send redundant messages, or make redundant API calls. Every Telegram API call must be deliberate and logged.
+
+**Rule:** The AI must always prefer deterministic reuse over new runtime objects. If an existing scheduler, client, or loop can do the job, the AI must use it — not create a new one.
+
+---
+
+## 29. Deterministic Runtime Rules
+
+> **Authority:** Permanent and non-negotiable. These rules are the architectural laws of the LifeOS runtime. Every future AI, contributor, or developer must obey them. No feature, no plugin, no tool, and no AI module may violate any rule in this section. Violations are bugs.
+
+These rules exist because the LifeOS runtime is a single-process, single-event-loop, resource-constrained system. Duplicate objects, unbounded tasks, and hidden state cause silent failures that are extremely difficult to diagnose. The rules below prevent that class of bugs entirely.
+
+### 29.1 Singleton Guarantees
+
+1. **One Telethon client only.** The self-client is built once by the RuntimeSupervisor and reused. No other module may build a Telethon client.
+2. **One optional helper client only.** The helper bot (if enabled) is built once and reused. No other module may build a helper client.
+3. **One scheduler only.** The AI scheduler is a singleton. All scheduled tasks go through it.
+4. **One watchdog only.** The watchdog loop is a singleton. No module may create its own watchdog.
+5. **One heartbeat only.** The heartbeat loop is a singleton. No module may create its own heartbeat.
+6. **One keepalive only.** The keepalive loop is a singleton. No module may create its own keepalive.
+7. **One failsafe monitor only.** The failsafe monitor is a singleton. No module may create its own failsafe.
+8. **One runtime supervisor only.** The RuntimeSupervisor is the single owner of the runtime lifecycle. No module may create a second supervisor.
+9. **One profile scheduler only.** The profile scheduler (shared by Bio and Username engines) is a singleton. No module may create another.
+10. **One task supervisor only.** The task supervisor loop is a singleton. No module may create another.
+11. **One diagnostics loop only.** The diagnostics loop is a singleton. No module may create another.
+12. **One web server only.** The uvicorn web server is a singleton. No module may start a second server.
+
+### 29.2 No Duplication Rules
+
+13. **No duplicated handlers.** Every Telethon event handler is registered exactly once. Re-registration on rebuild replaces, not duplicates.
+14. **No duplicated callback routers.** Helper bot callback handlers are registered exactly once. Re-registration on rebuild replaces, not duplicates.
+15. **No duplicated loops.** Every `while True` or `asyncio.create_task` loop must be registered in the task supervisor and must have a unique name. No two tasks may share the same name.
+16. **No duplicated polling.** No module may poll Telegram, Supabase, or any external service in a loop that duplicates an existing poller.
+17. **No duplicated inline engines.** The inline query engine is a singleton. No module may create a second inline engine.
+
+### 29.3 State and Recovery Rules
+
+18. **No hidden runtime state.** All runtime state must be stored in one of: (a) a `RuntimeSupervisor` field, (b) the `backend.health` module, or (c) Supabase. No module may hold runtime-critical state in a private global variable that is not recoverable.
+19. **Runtime state must always be recoverable.** After a rebuild, the runtime must return to READY state with all settings, bio/username state, and panel settings intact. No state may be lost on rebuild.
+20. **All failures must be recoverable.** No failure may put the runtime in a dead state. The failsafe monitor must always be able to trigger a hard reset.
+21. **Everything must be restart-safe.** Every module must support being started, stopped, and started again without side effects. No module may assume it is started only once.
+22. **Database is the source of truth.** Bio state, username state, panel settings, bot settings, saved items, and AI memories are all persisted in Supabase. No module may treat RAM as the source of truth for persistent data.
+23. **ENV is the source of configuration.** All configuration comes from environment variables. No module may hardcode configuration values. No module may read configuration from a file that is not `.env`.
+24. **Recovery must always happen before rebuild.** The recovery ladder is: reconnect → rebuild → full recovery. No step may be skipped.
+25. **Rebuild must always happen before restart.** A rebuild creates a new client. A restart creates a new process. The process must never restart without a rebuild attempt first.
+26. **All failures must be logged with a trace tag.** Every error, recovery, and state transition must be logged with a mandatory trace tag (see Section 24). Silent failures are bugs.
+
+### 29.4 Architecture Boundary Rules
+
+27. **No feature may bypass the Tool Layer.** The AI Core talks to the runtime exclusively through tools. No AI module may import Telethon, Supabase, or runtime internals directly.
+28. **No feature may directly mutate another subsystem.** The AI may not stop the bio cron, restart the watchdog, or modify the helper bot directly. It must go through the Tool Layer, which calls the subsystem's public API.
+29. **UI must never own business logic.** The web dashboard displays state and sends commands. It does not make decisions. All business logic lives in services and tools.
+30. **AI must never modify runtime state directly.** The AI may request actions through tools. It may not set `RuntimeState`, cancel tasks, or modify the supervisor's fields.
+31. **Every tool must expose a deterministic contract.** A tool's name, parameters, return type, and side effects must be documented and stable. No tool may have undocumented behavior.
+32. **No circular dependencies.** Module A may not import module B if module B imports module A. Use dependency injection or a shared interface.
+33. **No feature may import across subsystem boundaries.** The AI subsystem may not import from `backend.bio`, `backend.username`, `backend.helper`, or `backend.runtime` directly. It goes through the Tool Layer.
+
+### 29.5 Execution Rules
+
+34. **No blocking operations inside the event loop.** All I/O must be `async`. CPU-bound work must run in a thread executor with a timeout. No `time.sleep`, no `requests.get`, no synchronous database calls inside the event loop.
+35. **Background tasks must always be supervised.** Every `asyncio.create_task` must be wrapped in `immortal_create_task` or `guarded_create_task`. No bare `asyncio.create_task` calls.
+36. **Every task must have a name.** Every asyncio task must be created with a unique `name=` parameter. Anonymous tasks are bugs.
+37. **Every task must be cancellable.** Every background task must handle `asyncio.CancelledError` and clean up resources on cancellation.
+38. **No infinite retry loops.** Every retry loop must have a maximum attempt count and exponential backoff. After exhaustion, the loop must fail gracefully.
+39. **No unbounded queues.** Every `asyncio.Queue` must have a `maxsize`. An unbounded queue is a memory leak.
+40. **No fire-and-forget tasks.** Every task must be awaited or supervised. No task may be created and never referenced.
+
+### 29.6 Design Philosophy Rules
+
+41. **Simplicity is preferred over cleverness.** A simple solution that works is always better than a clever solution that might break. If a feature requires complex logic to be correct, the feature is too complex.
+42. **Explicit is preferred over implicit.** Every behavior must be visible in the code. No magic, no metaprogramming, no dynamic imports that hide what the code does.
+43. **Fail loud, fail early.** Errors must be raised, not swallowed. A swallowed error is a future bug. The only exception is cleanup code in `finally` blocks.
+44. **No silent failures.** Every `except` block must log the exception. Empty `except: pass` is a bug.
+45. **Every new feature must justify its resource cost.** Before adding a feature, estimate its CPU, RAM, API, and task footprint. If it exceeds the Resource Budget (Section 28), it must be redesigned.
+46. **Every new module must state its singleton status.** A new module must declare whether it is a singleton or stateless. If it is a singleton, it must use the singleton pattern enforced by the runtime.
+47. **Every new background loop must be approved.** No new `while True` loop may be added without explicit architectural review. The loop must be registered in the task supervisor and must have a shutdown check.
+48. **The runtime is a single process.** No feature may spawn a subprocess, a thread pool (beyond the default executor), or a separate event loop. Everything runs in the main asyncio event loop.
+49. **The runtime is a single event loop.** No feature may create a new event loop with `asyncio.new_event_loop()` or `asyncio.run()`. The main event loop is owned by the RuntimeSupervisor.
+50. **These rules apply to the AI equally.** The AI subsystem is not exempt from any rule in this section. The AI must obey the same architectural laws as the deterministic runtime.
+
+---
+
 ## Document Version
 
 | Version | Date | Author | Notes |
 |---|---|---|---|
 | V1 Draft | 2026-08-03 | AI Agent | Initial draft. Not final. Only `Onlyicing1` may edit. |
 | V1.1 Draft | 2026-08-03 | AI Agent | Extended: Platform Constraints, Render Free Constraints, Permission Layer, Runtime State Machine, Expanded Conversation Context, Expanded Token Budget, Expanded Failure Recovery, expanded Tool System. |
+| V1.2 Draft | 2026-08-03 | AI Agent | Extended: Resource Budget (Section 28) and Deterministic Runtime Rules (Section 29). |
 
 ---
 
