@@ -1,95 +1,82 @@
 """
 Provider Layer — concrete AI provider implementations.
 
-This package is the first layer that knows AI providers exist. It
-receives ``PromptPackage`` objects (from the Prompt Builder Layer) and
-routes them to concrete provider classes.
+This package is the first layer that knows AI providers exist. The
+``ProviderManager`` is the sole public entry point for the rest of
+the system. The Conversation Manager, Dispatcher, and Prompt
+Builder never reference a provider by name — they call
+``ProviderManager.chat()``.
 
-Currently, every provider returns ``NOT_IMPLEMENTED`` or
-``AI_DISABLED``. No HTTP request, no SDK, no API call, no network I/O.
-This package defines the architecture only.
+Architecture::
 
-Public API::
-
-    from backend.ai.providers import (
-        BaseProvider,
-        ProviderConfig,
-        ProviderResponse,
-        ProviderRegistry,
-        ProviderFactory,
-        DummyProvider,
-        GeminiProvider,
-        OpenAIProvider,
-        OpenRouterProvider,
-        NOT_IMPLEMENTED,
-        AI_DISABLED,
-        ProviderNotFound,
-        ProviderInitializationError,
-        ProviderExecutionError,
-        ProviderUnavailable,
-        ProviderConfigurationError,
-    )
-
-Provider hierarchy::
-
-    BaseProvider (abstract)
-        ├── GeminiProvider      → returns NOT_IMPLEMENTED
-        ├── OpenAIProvider      → returns NOT_IMPLEMENTED
-        ├── OpenRouterProvider  → returns NOT_IMPLEMENTED
-        └── DummyProvider       → returns AI_DISABLED (default)
+    backend/ai/providers/
+        __init__.py          ← public exports
+        base/                ← abstract contract
+            __init__.py
+            contract.py      ← BaseProvider, ProviderResponse
+            capabilities.py  ← ProviderCapabilities
+            config.py        ← ProviderConfig
+            exceptions.py    ← ProviderError hierarchy
+        dummy/               ← always-on fallback
+            __init__.py
+            provider.py      ← DummyProvider
+        registry/            ← provider storage
+            __init__.py
+            registry.py      ← ProviderRegistry
+        manager/             ← routing + fallback + metrics
+            __init__.py
+            manager.py       ← ProviderManager
+            metrics.py       ← ProviderMetrics, ProviderMetricsRegistry
+        factory.py           ← ProviderFactory (creates registry + manager)
+        gemini.py             ← stub (NOT_IMPLEMENTED)
+        openai.py             ← stub (NOT_IMPLEMENTED)
+        openrouter.py         ← stub (NOT_IMPLEMENTED)
 
 Adding a new provider (for future developers):
-  1. Create ``backend/ai/providers/<name>.py``.
-  2. Define a class inheriting from ``BaseProvider``.
-  3. Set ``PROVIDER_NAME`` to a unique string.
-  4. Set ``PROVIDER_VERSION``.
-  5. Implement all abstract methods:
-       initialize(), shutdown(), health(), generate(),
-       estimate_tokens(), provider_name(), provider_version()
+  1. Create ``backend/ai/providers/<name>/`` with a ``provider.py``
+     containing a class inheriting from ``BaseProvider``.
+  2. Set ``PROVIDER_NAME`` to a unique string.
+  3. Set ``PROVIDER_VERSION``.
+  4. Implement all abstract methods (initialize, shutdown, chat,
+     count_tokens, health).
+  5. Override ``capabilities`` to declare feature support.
   6. Add the class to ``_PROVIDER_CLASSES`` in ``factory.py``.
   7. Import and export it in ``__init__.py``.
-  8. Done. The factory, registry, and all callers work automatically.
-
-Future execution flow::
-
-    User
-      ↓
-    Conversation
-      ↓
-    Prompt Builder  →  PromptPackage
-      ↓
-    Provider Factory  →  ProviderRegistry
-      ↓
-    Gemini / OpenAI / OpenRouter / Dummy
-      ↓
-    ProviderResponse
+  8. Done. Factory, registry, manager, and all callers work automatically.
 """
-from backend.ai.providers.base import (
+from backend.ai.providers.base.capabilities import ProviderCapabilities
+from backend.ai.providers.base.config import ProviderConfig
+from backend.ai.providers.base.contract import (
     AI_DISABLED,
     NOT_IMPLEMENTED,
     BaseProvider,
-    ProviderConfig,
     ProviderResponse,
 )
-from backend.ai.providers.dummy import DummyProvider
-from backend.ai.providers.exceptions import (
+from backend.ai.providers.base.exceptions import (
     ProviderConfigurationError,
     ProviderExecutionError,
     ProviderInitializationError,
     ProviderNotFound,
     ProviderUnavailable,
 )
+from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.factory import ProviderFactory
 from backend.ai.providers.gemini import GeminiProvider
+from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.manager.metrics import (
+    ProviderMetrics,
+    ProviderMetricsRegistry,
+)
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
-from backend.ai.providers.registry import ProviderRegistry
+from backend.ai.providers.registry.registry import ProviderRegistry
 
 __all__ = [
     # Base
     "BaseProvider",
     "ProviderConfig",
     "ProviderResponse",
+    "ProviderCapabilities",
     "NOT_IMPLEMENTED",
     "AI_DISABLED",
     # Exceptions
@@ -98,8 +85,11 @@ __all__ = [
     "ProviderExecutionError",
     "ProviderUnavailable",
     "ProviderConfigurationError",
-    # Registry & Factory
+    # Registry & Manager
     "ProviderRegistry",
+    "ProviderManager",
+    "ProviderMetrics",
+    "ProviderMetricsRegistry",
     "ProviderFactory",
     # Concrete providers
     "DummyProvider",
