@@ -21,9 +21,12 @@ from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider
 from backend.ai.providers.base.defaults import get_provider_default, list_provider_names
 from backend.ai.providers.base.exceptions import ProviderNotFound
+from backend.ai.providers.cerebras import CerebrasProvider
 from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.gemini import GeminiProvider
+from backend.ai.providers.groq import GroqProvider
 from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.mistral import MistralProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
 from backend.ai.providers.registry.registry import ProviderRegistry
@@ -35,6 +38,9 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "gemini": GeminiProvider,
     "openai": OpenAIProvider,
     "openrouter": OpenRouterProvider,
+    "cerebras": CerebrasProvider,
+    "mistral": MistralProvider,
+    "groq": GroqProvider,
 }
 
 

@@ -34,6 +34,9 @@ Architecture::
         gemini.py             ← stub (NOT_IMPLEMENTED)
         openai.py             ← stub (NOT_IMPLEMENTED)
         openrouter.py         ← stub (NOT_IMPLEMENTED)
+        cerebras.py           ← stub (NOT_IMPLEMENTED)
+        mistral.py            ← stub (NOT_IMPLEMENTED)
+        groq.py               ← stub (NOT_IMPLEMENTED)
 
 Adding a new provider (for future developers):
   1. Create ``backend/ai/providers/<name>/`` with a ``provider.py``
@@ -69,9 +72,11 @@ from backend.ai.providers.base.validation import (
     ValidationResult,
     validate_provider_config,
 )
+from backend.ai.providers.cerebras import CerebrasProvider
 from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.factory import ProviderFactory
 from backend.ai.providers.gemini import GeminiProvider
+from backend.ai.providers.groq import GroqProvider
 from backend.ai.providers.manager.config_manager import (
     ProviderConfigManager,
     get_provider_config_manager,
@@ -81,6 +86,7 @@ from backend.ai.providers.manager.metrics import (
     ProviderMetrics,
     ProviderMetricsRegistry,
 )
+from backend.ai.providers.mistral import MistralProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
 from backend.ai.providers.registry.registry import ProviderRegistry
@@ -119,4 +125,7 @@ __all__ = [
     "GeminiProvider",
     "OpenAIProvider",
     "OpenRouterProvider",
+    "CerebrasProvider",
+    "MistralProvider",
+    "GroqProvider",
 ]

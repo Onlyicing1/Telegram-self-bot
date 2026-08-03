@@ -104,6 +104,51 @@ def _openrouter_default() -> ProviderConfig:
     )
 
 
+def _cerebras_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="cerebras",
+        base_url="https://api.cerebras.ai/v1",
+        api_key="",
+        default_model="llama-3.3-70b",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _mistral_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="mistral",
+        base_url="https://api.mistral.ai/v1",
+        api_key="",
+        default_model="mistral-large-latest",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _groq_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="groq",
+        base_url="https://api.groq.com/openai/v1",
+        api_key="",
+        default_model="llama-3.3-70b-versatile",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
 def _custom_default() -> ProviderConfig:
     return ProviderConfig(
         provider_name="custom",
@@ -127,6 +172,9 @@ _PROVIDER_DEFAULTS: dict[str, callable] = {
     "glm": _glm_default,
     "openrouter": _openrouter_default,
     "custom": _custom_default,
+    "cerebras": _cerebras_default,
+    "mistral": _mistral_default,
+    "groq": _groq_default,
 }
 
 
