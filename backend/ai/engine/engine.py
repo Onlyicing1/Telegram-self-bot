@@ -32,7 +32,8 @@ from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.providers.factory import ProviderFactory
-from backend.ai.providers.registry import ProviderRegistry
+from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
 
@@ -49,6 +50,7 @@ class Engine:
     __slots__ = (
         "_conversation",
         "_prompt_builder",
+        "_provider_manager",
         "_providers",
         "_dispatcher",
         "_hooks",
@@ -59,25 +61,33 @@ class Engine:
         self,
         conversation: ConversationManager | None = None,
         prompt_builder: PromptBuilder | None = None,
-        providers: ProviderRegistry | None = None,
+        providers: ProviderRegistry | ProviderManager | None = None,
         hooks: EngineHooks | None = None,
     ) -> None:
         self._conversation = conversation or ConversationManager()
         self._prompt_builder = prompt_builder or PromptBuilder()
-        self._providers = providers or ProviderFactory.create_registry()
+        if providers is None:
+            self._provider_manager = ProviderFactory.create_manager()
+            self._providers = self._provider_manager.registry
+        elif isinstance(providers, ProviderManager):
+            self._provider_manager = providers
+            self._providers = providers.registry
+        else:
+            self._provider_manager = ProviderManager(providers)
+            self._providers = providers
         self._hooks = hooks or NOOP_HOOKS
         self._metrics = EngineMetrics()
         self._dispatcher = Dispatcher(
             conversation=self._conversation,
             prompt_builder=self._prompt_builder,
-            providers=self._providers,
+            providers=self._provider_manager,
             hooks=self._hooks,
             metrics=self._metrics,
         )
         logger.info(
             "Engine initialized (provider=%s, providers=%s)",
-            self._providers.default_provider().name,
-            self._providers.list(),
+            self._provider_manager.get_active_name(),
+            self._provider_manager.list_providers(),
         )
 
     # ── Public API ──
@@ -93,7 +103,7 @@ class Engine:
     def engine_health(self) -> str:
         """Return ``"READY"`` or ``"FAILED: <reason>"``."""
         try:
-            provider = self._providers.default_provider()
+            provider = self._provider_manager.get_active()
             health = provider.health()
             if not health.get("healthy", False):
                 return f"FAILED: provider {provider.name} unhealthy"
@@ -116,6 +126,10 @@ class Engine:
     @property
     def provider_registry(self) -> ProviderRegistry:
         return self._providers
+
+    @property
+    def provider_manager(self) -> ProviderManager:
+        return self._provider_manager
 
 
 # ── Module-level convenience ──

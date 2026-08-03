@@ -6,7 +6,7 @@ layer in the exact, fixed order:
 
     1. Conversation Runtime  → ConversationContext
     2. Prompt Builder        → PromptPackage
-    3. Provider Factory      → active Provider
+    3. Provider Manager      → active Provider name
     4. Provider              → ProviderResponse
     5. Conversation Update   → history + tokens recorded
     6. Result                → EngineResult
@@ -18,7 +18,7 @@ propagates an uncaught exception.
 The dispatcher measures wall-clock latency for the whole run, invokes
 hooks at each lifecycle point, and records metrics. It owns no state
 of its own beyond what is injected (conversation manager, prompt
-builder, provider registry, hooks, metrics).
+builder, provider manager, hooks, metrics).
 """
 from __future__ import annotations
 
@@ -31,7 +31,8 @@ from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.providers.base import ProviderResponse
-from backend.ai.providers.registry import ProviderRegistry
+from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
 
@@ -45,6 +46,7 @@ class Dispatcher:
         "_conversation",
         "_prompt_builder",
         "_providers",
+        "_provider_manager",
         "_hooks",
         "_metrics",
     )
@@ -53,13 +55,18 @@ class Dispatcher:
         self,
         conversation: ConversationManager,
         prompt_builder: PromptBuilder,
-        providers: ProviderRegistry,
+        providers: ProviderRegistry | ProviderManager,
         hooks: EngineHooks | None = None,
         metrics: EngineMetrics | None = None,
     ) -> None:
         self._conversation = conversation
         self._prompt_builder = prompt_builder
-        self._providers = providers
+        if isinstance(providers, ProviderManager):
+            self._provider_manager = providers
+            self._providers = providers.registry
+        else:
+            self._provider_manager = ProviderManager(providers)
+            self._providers = providers
         self._hooks = hooks or NOOP_HOOKS
         self._metrics = metrics or EngineMetrics()
 
@@ -99,16 +106,17 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "prompt_builder", start, errors, metadata)
 
-        # ── Stage 3: Provider Factory ──
+        # ── Stage 3: Provider Manager ──
         try:
-            provider = self._providers.default_provider()
-            metadata["stages"].append("provider_factory")
+            provider_name = self._provider_manager.get_active_name()
+            metadata["stages"].append("provider_manager")
         except Exception as exc:  # noqa: BLE001
-            return self._fail(exc, "provider_factory", start, errors, metadata)
+            return self._fail(exc, "provider_manager", start, errors, metadata)
 
         # ── Stage 4: Provider ──
         try:
-            response: ProviderResponse = provider.generate(prompt_package)
+            messages = self._build_messages(prompt_package)
+            response: ProviderResponse = self._provider_manager.chat(messages)
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
@@ -133,8 +141,8 @@ class Dispatcher:
 
         result = EngineResult(
             success=bool(response.success),
-            provider=provider.name,
-            model=provider.config.model or provider.name,
+            provider=response.provider_name or provider_name,
+            model=self._provider_manager.get_active().config.model or response.provider_name or provider_name,
             latency=latency,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -161,6 +169,21 @@ class Dispatcher:
         return result
 
     # ── internal ──
+
+    def _build_messages(self, prompt_package: Any) -> list[dict[str, Any]]:
+        """Convert a PromptPackage into a messages list for ProviderManager.chat()."""
+        messages: list[dict[str, Any]] = []
+        if prompt_package.system_prompt:
+            messages.append({"role": "system", "content": prompt_package.system_prompt})
+        if prompt_package.runtime_context:
+            messages.append({"role": "system", "content": prompt_package.runtime_context})
+        if prompt_package.conversation_context:
+            messages.append({"role": "system", "content": prompt_package.conversation_context})
+        if prompt_package.tool_context:
+            messages.append({"role": "system", "content": prompt_package.tool_context})
+        if prompt_package.user_input:
+            messages.append({"role": "user", "content": prompt_package.user_input})
+        return messages
 
     def _build_context(self, request: AIRequest, session: Any) -> Any:
         """Build a ConversationContext from the runtime session + request.
