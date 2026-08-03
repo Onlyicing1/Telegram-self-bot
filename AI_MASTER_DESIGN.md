@@ -28,6 +28,13 @@
 18. [Non Goals](#18-non-goals)
 19. [Design Principles](#19-design-principles)
 20. [Future Ideas](#20-future-ideas)
+21. [Platform Constraints](#21-platform-constraints)
+22. [Render Free Constraints](#22-render-free-constraints)
+23. [Permission Layer](#23-permission-layer)
+24. [Runtime State Machine](#24-runtime-state-machine)
+25. [Expanded Conversation Context](#25-expanded-conversation-context)
+26. [Expanded Token Budget](#26-expanded-token-budget)
+27. [Expanded Failure Recovery](#27-expanded-failure-recovery)
 
 ---
 
@@ -152,7 +159,7 @@ The runtime supervisor, watchdog, failsafe, and keepalive systems do not know ab
 │  │      │ │      │ │      │ │ name │ │      │ │      │  │
 │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘  │
 │              ┌──────────────────────┐                    │
-│              │  Future Plugins      │                    │
+│  │              │  Future Plugins      │                    │
 │              └──────────────────────┘                    │
 └──────────────────────┬──────────────────────────────────┘
                        │
@@ -484,18 +491,61 @@ AI Core receives ToolResult, formats response for owner
 - Tools return structured errors. The AI translates them into human-readable responses.
 - Tools are idempotent where possible. Calling `bio_on` twice is safe.
 
-### 6.6 Future Tools
+### 6.6 Complete Tool Inventory — Every Feature Must Be a Tool
 
-| Tool | Purpose |
-|---|---|
-| `calendar_create` | Create a calendar event |
-| `calendar_list` | List upcoming events |
-| `tag_save` | Add tags to a saved item |
-| `folder_move` | Move saved items to a folder |
-| `notify` | Send a delayed notification |
-| `summarize` | Summarize a long message or document |
-| `translate` | Translate text between languages |
-| `web_search` | Search the web and return results |
+The AI MUST never manipulate modules directly. Every feature the bot offers must be exposed as a tool. If a feature cannot be expressed as a tool, the AI cannot access it. This is the single rule that keeps the AI layer clean.
+
+| Tool | Wraps | Parameters | Permission Level |
+|---|---|---|---|
+| `save` | `save_service.execute_save` | `message_id, mode` | Read + Write |
+| `delete` | `delete_service.do_del_n` / `do_del_id` | `count` or `message_id` | Dangerous |
+| `bio_set_template` | `bio_service.do_template` | `template` | Read + Write |
+| `bio_on` | `bio_service.do_on` | none | Read + Write |
+| `bio_off` | `bio_service.do_off` | none | Read + Write |
+| `bio_show` | `bio_service.do_show` | none | Read Only |
+| `username_set_template` | `username_service.do_template` | `template` | Read + Write |
+| `username_on` | `username_service.do_on` | none | Read + Write |
+| `username_off` | `username_service.do_off` | none | Read + Write |
+| `username_show` | `username_service.do_show` | none | Read Only |
+| `db_stats` | `database_service.do_stats` | none | Read Only |
+| `db_clean` | `database_service.do_clean` | none | Dangerous |
+| `search` | `discover_service.do_find` | `query` | Read Only |
+| `list_saves` | `discover_service.do_list` | `limit` | Read Only |
+| `settings_get` | `settings_service.get_setting` | `key` | Read Only |
+| `settings_set` | `settings_service.set_setting` | `key, value` | Admin Only |
+| `panel_navigate` | `inline_engine.open_panel` | `panel_id` | Read + Write |
+| `panel_back` | `inline_engine.back` | none | Read + Write |
+| `organize_list` | `organize_service.do_list` | none | Read Only |
+| `organize_clean` | `organize_service.do_clean` | none | Dangerous |
+
+### 6.7 Panel Tool
+
+The AI can navigate the menu on behalf of the owner. This is done through the Panel Tool, which calls the inline engine to open a specific panel. The AI never builds inline keyboards itself — it asks the Panel Tool to open a panel by ID, and the inline engine renders it.
+
+This means the AI can say: "I've opened the Bio Settings panel for you. Use the buttons to configure your bio template." The owner then interacts with the panel directly, no AI needed for subsequent button presses.
+
+### 6.8 Settings Tool
+
+The AI can read and write bot settings through the Settings Tool. Read operations (getting a setting value) are Read Only. Write operations (setting a value) are Admin Only — the AI must ask the owner for confirmation before changing any setting.
+
+### 6.9 Future AI Tools
+
+| Tool | Purpose | Permission |
+|---|---|---|
+| `calendar_create` | Create a calendar event | Read + Write |
+| `calendar_list` | List upcoming events | Read Only |
+| `tag_save` | Add tags to a saved item | Read + Write |
+| `folder_move` | Move saved items to a folder | Read + Write |
+| `notify` | Send a delayed notification | Read + Write |
+| `summarize` | Summarize a long message or document | Read Only |
+| `translate` | Translate text between languages | Read Only |
+| `web_search` | Search the web and return results | Read Only |
+| `task_create` | Create a scheduled AI task | Read + Write |
+| `task_list` | List scheduled tasks | Read Only |
+| `task_cancel` | Cancel a scheduled task | Dangerous |
+| `automation_create` | Create an event-driven automation | Read + Write |
+| `automation_list` | List automations | Read Only |
+| `automation_toggle` | Pause or resume an automation | Read + Write |
 
 ---
 
@@ -559,6 +609,8 @@ The last N messages from the current session (after summarization). Each message
 {role: "assistant", content: "Bio template set to {time}"}
 ```
 
+The Conversation Context also includes runtime context — see [Section 25: Expanded Conversation Context](#25-expanded-conversation-context) for the full list of runtime state included in every prompt.
+
 ### 7.5 Memory Context
 
 Relevant memories from past sessions:
@@ -606,12 +658,16 @@ When the prompt exceeds the model's context window, elements are dropped in this
 
 1. Long memory summaries (drop oldest first)
 2. Conversation history (summarize older messages)
-3. Context (drop recent activity, keep time + target)
+3. Context — recent activity (drop activity, keep time + target)
 4. Developer prompt (drop activity details, keep timezone)
-5. System prompt (never dropped)
-6. Tool schemas (never dropped — the AI must know its capabilities)
-7. Current user message (never dropped)
-8. Output rules (never dropped)
+5. Persistent memory (drop oldest entries first, keep preferences)
+6. Personality prompt (drop addon, keep default tone)
+7. System prompt (never dropped)
+8. Tool schemas (never dropped — the AI must know its capabilities)
+9. Current user message (never dropped)
+10. Output rules (never dropped)
+
+See [Section 26: Expanded Token Budget](#26-expanded-token-budget) for the detailed token budget breakdown and eviction strategy.
 
 ---
 
@@ -1145,6 +1201,8 @@ If still failing:
 
 The AI module is designed to fail gracefully. Every error path returns a human-readable message and keeps the bot running. The runtime watchdog monitors the AI module's health. If the AI module crashes repeatedly, the watchdog can disable it and notify the owner: "AI has been disabled due to repeated errors. Use the menu to re-enable."
 
+See [Section 27: Expanded Failure Recovery](#27-expanded-failure-recovery) for the full graceful degradation matrix.
+
 ---
 
 ## 16. UI Integration
@@ -1375,11 +1433,718 @@ Instead of keyword search over saved items, the AI could perform semantic search
 
 ---
 
+## 21. Platform Constraints
+
+The AI architecture MUST work within Telegram's platform limitations. No feature may be designed that violates these constraints. Everything described in this document must be realistically implementable using the Telegram MTProto API via Telethon.
+
+### 21.1 Telegram Rate Limits and FloodWait
+
+Telegram enforces strict rate limits on API calls. When a client exceeds these limits, Telegram returns a `FloodWaitError` with a `seconds` value — the client must wait that many seconds before retrying.
+
+**Implications for AI:**
+- The AI cannot send messages faster than Telegram allows. If the AI triggers a FloodWait, the tool must catch the error and return it to the AI Core as a `ToolResult(success=False, message="Telegram rate limit: must wait N seconds")`.
+- The AI must never retry a tool that returned a FloodWait error. It must inform the owner and wait.
+- The existing `flood_sleep_threshold=60` setting in Telethon auto-sleeps for FloodWait responses up to 60 seconds. FloodWait responses longer than 60 seconds are raised as exceptions and must be caught by the tool.
+- The AI's rate limiter (10 requests per minute) operates independently of Telegram's rate limits. Even if the AI's own limiter allows a request, Telegram may still FloodWait.
+
+### 21.2 Username Update Limits
+
+Telegram allows username changes, but with restrictions:
+- A username can only be changed to an available name.
+- Rapid username changes trigger FloodWait.
+- There is a cooldown period after changing a username before it can be changed again.
+- Usernames must be 5-32 characters, alphanumeric + underscores, must start with a letter.
+
+**Implications for AI:**
+- The `username_set_template` tool must respect Telegram's cooldown. If a FloodWait is returned, the tool reports it and the AI informs the owner.
+- The AI must never attempt to force a username change. If Telegram rejects it, the tool returns the error.
+- The username engine's existing cron loop already handles this — the AI tool wraps it, it does not bypass it.
+
+### 21.3 Bio Update Limits
+
+Telegram profile bio ("about" field) has these constraints:
+- Maximum 70 characters (Telegram limit, not configurable).
+- Bio updates are rate-limited. Rapid updates trigger FloodWait.
+- The bio engine already handles this with minute-boundary cron timing and deduplication.
+
+**Implications for AI:**
+- The `bio_set_template` tool must validate that the rendered template will not exceed 70 characters. If it will, the tool returns an error before any API call is made.
+- The AI must never attempt to bypass the bio engine's cron loop. Setting the template through the AI tool updates the template in the database; the cron loop renders and applies it at the next minute boundary.
+- The AI must never call `client.edit_profile()` directly.
+
+### 21.4 Message Edit Limits
+
+Telegram allows editing messages, but:
+- A message can only be edited within 48 hours of sending (for non-channel messages).
+- Edits are rate-limited.
+- The bot's existing edit-first policy edits the triggering message in place.
+
+**Implications for AI:**
+- AI responses are displayed by editing the panel message, not by sending new messages. The inline engine handles this — the AI never calls `event.edit()` directly.
+- If a panel message is older than 48 hours and cannot be edited, the inline engine sends a new message instead. The AI does not need to handle this case.
+
+### 21.5 Callback Query Limits
+
+Inline button presses generate callback queries. Telegram limits:
+- Answering callback queries: must be answered within ~10 seconds or Telegram shows an error to the user.
+- Rate of callback queries: rapid button mashing can trigger FloodWait.
+
+**Implications for AI:**
+- When the owner presses a button in the AI panel, the inline engine must acknowledge the callback query immediately (within 2 seconds), then process the AI request asynchronously. The panel shows "Thinking..." while the AI processes.
+- The AI must never block the callback query response. The inline engine answers the callback first, then calls the AI Core.
+
+### 21.6 Message Length Limits
+
+- Telegram messages: maximum 4096 characters per message.
+- Captions (for media): maximum 1024 characters.
+- Inline keyboard: maximum 100 buttons per message (practical limit is lower for usability).
+
+**Implications for AI:**
+- The Response Formatter must truncate AI responses to 4096 characters. If the response is longer, it is split across multiple panel messages (the inline engine handles pagination).
+- The AI's output rule "keep responses under 500 characters" is a soft limit for readability, not a hard platform limit.
+- Tool schemas in the prompt must be compact. With 20+ tools, schemas can consume significant tokens. The Prompt Builder compresses schemas to name + description + parameters only.
+
+### 21.7 Inline Keyboard Limitations
+
+- Maximum 100 buttons per message.
+- Buttons are arranged in rows. Each row can have 1-8 buttons.
+- Button text: maximum 64 characters.
+- Callback data: maximum 64 bytes.
+- No nested menus — all navigation is done by editing the message and replacing the keyboard.
+- No dynamic button content — buttons are static once sent (until the message is edited).
+
+**Implications for AI:**
+- The AI never builds keyboards. The Panel Tool calls the inline engine, which manages button layout.
+- The AI cannot create "hidden" buttons or dynamic UI elements. Every button is visible and static until the panel is re-rendered.
+- Panel IDs and action codes must fit within 64 bytes of callback data. The inline engine already handles this with compact encoding.
+
+### 21.8 Session Limitations
+
+- The bot uses a `StringSession` — no file-based session, no interactive login.
+- The session string encodes the auth key. If it is invalidated (e.g., password change, logout from another device), the bot cannot reconnect.
+- Only one active session is needed (the bot operates one account).
+
+**Implications for AI:**
+- If the Telethon session is invalidated, the AI cannot function. The runtime detects this and the AI panel shows: "Telegram session is invalid. The bot needs to be re-authorized."
+- The AI must never attempt to re-create a session. Session management is a runtime responsibility.
+- The AI must never store session strings or auth keys in memory, prompts, or database.
+
+### 21.9 MTProto Behaviour
+
+- Telegram uses MTProto, a custom protocol with its own encryption and connection management.
+- Connections can drop silently. Telethon's `auto_reconnect=True` handles this.
+- During reconnection, some events may be missed.
+- Long-running API calls (e.g., downloading large media) can time out at the MTProto layer.
+
+**Implications for AI:**
+- The AI must assume that any Telegram API call can fail, timeout, or return unexpected results. Every tool wraps its service call in try/except.
+- If a reconnection happens during an AI request, the tool must retry once. If it fails again, the tool returns an error to the AI Core.
+- The AI must never hold a reference to a Telethon client object. Tools receive the client through the service layer, not directly.
+
+### 21.10 No Client-Side Clipboard Access
+
+Telegram clients do not expose clipboard access to bots or self-bots. There is no API to read or write the device clipboard.
+
+**Implications for AI:**
+- The AI cannot copy text to the owner's clipboard.
+- The AI cannot paste from the owner's clipboard.
+- Any feature that would require clipboard access is impossible and must not be proposed.
+
+### 21.11 No Autocomplete System
+
+Telegram does not provide an autocomplete API for bots or self-bots. There is no way to suggest text completions as the owner types.
+
+**Implications for AI:**
+- The AI cannot offer autocomplete suggestions as the owner types a message.
+- The AI cannot pre-fill input fields.
+- The only input mechanism is: the owner types a full message, sends it, and the AI processes it after the fact.
+- Any feature that would require real-time typing suggestions is impossible and must not be proposed.
+
+### 21.12 No Hidden Menus
+
+Telegram inline keyboards are fully visible. There is no API to hide buttons, show tooltips, or create context menus. All buttons are always visible to the user.
+
+**Implications for AI:**
+- The AI cannot create hidden or context-sensitive menus. Every available action must be a visible button.
+- Progressive disclosure is achieved by navigating between panels (editing the message with a new keyboard), not by hiding buttons within a single panel.
+- The AI cannot show or hide buttons based on hover, focus, or other interaction states.
+
+### 21.13 No Unsupported Telegram API Features
+
+The AI must only use Telegram API features that are available through Telethon. Any feature that requires:
+- Undocumented API calls
+- Modified Telegram client
+- Root access or jailbreak
+- Browser-only APIs (WebRTC, WebSockets to Telegram)
+- Telegram Desktop-specific features
+
+...is impossible and must not be proposed.
+
+**Implications for AI:**
+- The AI is constrained to what Telethon exposes. If Telethon does not support a feature, the AI cannot use it.
+- The AI must never attempt to call raw MTProto methods that are not wrapped by Telethon.
+- The AI must never depend on a specific Telegram client version or feature flag.
+
+---
+
+## 22. Render Free Constraints
+
+The bot runs on Render's Free plan. The AI architecture MUST work within these constraints. No feature may require paid infrastructure.
+
+### 22.1 Single Process
+
+Render Free runs a single web service process. There are no background workers, no separate worker dynos, no multi-process architectures.
+
+**Implications for AI:**
+- The AI Core, agent loop, automation engine, and all tools run in the same asyncio event loop as Telethon and the FastAPI web server.
+- The AI must never spawn subprocesses or threads. Everything is cooperative async.
+- If the AI needs to do heavy computation (e.g., summarization), it yields control with `asyncio.sleep(0)` periodically to avoid blocking the event loop.
+- The agent loop and automation engine are asyncio tasks, not separate processes.
+
+### 22.2 Limited RAM
+
+Render Free provides approximately 512 MB of RAM. The Python process, Telethon, FastAPI, and the AI module all share this allocation.
+
+**Implications for AI:**
+- The AI must not load large models into memory. All LLM inference happens via external API calls (OpenAI, Anthropic). No local model inference.
+- Conversation history in RAM is capped at 4000 tokens (~16 KB of text). When exceeded, summarization compresses it.
+- The `ai_memory` cache in RAM is limited to the top 5 entries. The full memory set lives in Supabase.
+- Deep save buffers (BytesIO) are capped at 50 MB and closed immediately after use.
+- The AI must never hold references to large objects (media files, full message histories) in memory across requests.
+
+### 22.3 Sleeping Instances
+
+Render Free services sleep after 15 minutes of inactivity. When a request arrives, the service wakes up (cold start).
+
+**Implications for AI:**
+- When the service is sleeping, the AI is also sleeping. The agent loop and automation engine do not run during sleep.
+- The AI must not assume continuous uptime. Scheduled tasks may be delayed if the service was sleeping.
+- The keepalive system (existing) sends periodic health checks to prevent sleeping during active use. But if the owner is inactive for 15+ minutes, the service will sleep.
+- On wake, the AI module re-initializes: loads persistent memory from Supabase, checks for due tasks, resumes the agent loop. This is transparent to the owner.
+
+### 22.4 Cold Starts
+
+When a sleeping Render Free service wakes, it takes several seconds to start. During this time:
+- The Python process restarts.
+- Telethon reconnects.
+- The FastAPI server starts.
+- The AI module initializes.
+
+**Implications for AI:**
+- The first AI request after a cold start may take 10-15 seconds longer than usual. The inline engine shows "Reconnecting..." during this time.
+- The AI must not timeout during cold starts. The total request timeout (90 seconds) accounts for this.
+- The AI module's initialization is lightweight: load persistent memory (1 DB query), register tools (in-memory), start agent loop (1 asyncio task). No heavy computation at startup.
+- If Supabase is unavailable during cold start, the AI falls back to in-memory defaults and continues.
+
+### 22.5 No Background Workers Outside Process
+
+Render Free does not support separate worker processes. All work happens in the web service process.
+
+**Implications for AI:**
+- The agent loop is an asyncio task within the main process, not a separate worker.
+- Automation evaluation happens in the main process's event loop.
+- There is no task queue external to the process. The `ai_tasks` table in Supabase serves as the persistent queue.
+- If the process restarts, in-flight tasks are lost. The agent loop picks up due tasks on the next tick.
+
+### 22.6 No Redis
+
+Render Free does not include Redis. There is no managed Redis instance.
+
+**Implications for AI:**
+- The AI must not use Redis for caching, queuing, or pub/sub.
+- Caching is done in-process (Python dicts with TTL).
+- Task queuing is done via the Supabase `ai_tasks` table.
+- Rate limiting is tracked in-process (dict of timestamps).
+- If the process restarts, in-process caches are cleared. This is acceptable — caches are for performance, not correctness.
+
+### 22.7 No Celery
+
+Render Free does not support Celery or any distributed task queue framework.
+
+**Implications for AI:**
+- All scheduled and asynchronous work is done via asyncio tasks within the single process.
+- The agent loop is a single `while True` asyncio task.
+- There is no task distribution across workers. One task at a time, in one process.
+
+### 22.8 No Paid Services
+
+The bot must run entirely on free infrastructure. No paid services are required.
+
+**Implications for AI:**
+- The LLM API (OpenAI, Anthropic) is the one external paid service. The owner provides their own API key. The bot itself does not pay for AI.
+- Supabase free tier is sufficient (500 MB database, 50,000 monthly API requests).
+- Render Free tier is sufficient (single process, 512 MB RAM, sleep after inactivity).
+- The AI must not require any paid monitoring, logging, or analytics services.
+- If the owner does not provide an LLM API key, the AI is disabled. All other bot features continue to work.
+
+### 22.9 No External Queue
+
+There is no external message queue (RabbitMQ, SQS, Kafka). All queuing is internal.
+
+**Implications for AI:**
+- The `ai_tasks` table in Supabase is the task queue. The agent loop polls it every 30 seconds.
+- There is no push-based task distribution. The agent loop pulls tasks.
+- If multiple tasks are due simultaneously, they are executed sequentially (one at a time), not in parallel.
+
+### 22.10 Limited CPU
+
+Render Free provides shared CPU resources. CPU-intensive operations can slow down the entire process.
+
+**Implications for AI:**
+- The AI must not perform CPU-intensive operations locally. Text summarization, embedding generation, and model inference all happen via external API calls.
+- JSON parsing, prompt assembly, and response formatting are lightweight and acceptable.
+- The AI must never mine cryptocurrency, hash large datasets, or perform local ML inference.
+
+### 22.11 Storage Limitations
+
+Render Free has ephemeral filesystem storage. Files written to disk are lost on restart.
+
+**Implications for AI:**
+- The AI must not write to local files. All persistent data goes to Supabase.
+- The AI must not cache data on disk. All caches are in-process (RAM).
+- Deep save buffers (BytesIO) are in RAM, never written to disk.
+- The built React dashboard (`dist/`) is an exception — it is part of the deployment artifact, not runtime data.
+
+### 22.12 Stateless Deployments
+
+Each Render Free deployment starts from a clean state. There is no persistent local environment.
+
+**Implications for AI:**
+- The AI module must be stateless across restarts. All state is in Supabase or environment variables.
+- On restart, the AI module initializes from scratch: load persistent memory, register tools, start agent loop.
+- In-flight conversations are lost on restart. The owner must start a new conversation. Past conversations are in the database and can be viewed in the history panel.
+
+### 22.13 Restart Behaviour
+
+Render may restart the service for various reasons: deploy, health check failure, resource limits, platform maintenance.
+
+**Implications for AI:**
+- On restart, the shutdown sequence cancels the agent loop and automation engine cleanly.
+- On restart, the startup sequence re-initializes the AI module. Due tasks are picked up by the agent loop.
+- The AI must not attempt to resume in-flight conversations after a restart. They are lost.
+- The AI must not hold locks or semaphores across restarts. The `asyncio.Lock` for save codes is re-created on startup.
+- The watchdog system (existing) monitors the AI module. If it fails to start, the watchdog disables AI and notifies the owner.
+
+---
+
+## 23. Permission Layer
+
+Every tool has a permission level. The AI must respect these levels when calling tools. Permission levels are not user roles (the bot is single-owner) — they are safety classifications that determine whether the AI can call a tool autonomously or must ask the owner for confirmation first.
+
+### 23.1 Permission Levels
+
+| Level | Description | AI Can Call Autonomously? |
+|---|---|---|
+| **Read Only** | Reads data, no side effects | Yes |
+| **Read + Write** | Modifies non-destructive state | Yes |
+| **Dangerous** | Destructive or irreversible | No — must ask owner first |
+| **Admin Only** | Changes bot configuration | No — must ask owner first |
+| **Confirmation Required** | Always requires confirmation regardless of level | No |
+
+### 23.2 How Permissions Work
+
+When the AI receives a tool call from the model, it checks the tool's permission level:
+
+1. **Read Only** — The AI calls the tool immediately. No confirmation needed. Examples: `bio_show`, `db_stats`, `search`, `list_saves`.
+
+2. **Read + Write** — The AI calls the tool immediately. The action modifies state but is not destructive. Examples: `save`, `bio_on`, `bio_off`, `bio_set_template`, `username_on`, `username_off`.
+
+3. **Dangerous** — The AI does NOT call the tool. It responds to the owner: "This will permanently delete N messages. Do you want to proceed?" The owner must confirm before the AI calls the tool. Examples: `delete`, `db_clean`, `organize_clean`, `task_cancel`.
+
+4. **Admin Only** — The AI does NOT call the tool. It responds to the owner: "This changes a bot setting. Do you want to change [key] to [value]?" The owner must confirm. Examples: `settings_set`.
+
+5. **Confirmation Required** — Regardless of the tool's base level, some tools are always marked as requiring confirmation. This is an override flag. If set, the AI always asks first.
+
+### 23.3 Permission Enforcement
+
+Permissions are enforced by the AI Core, not by the tools themselves. The tool registry stores the permission level alongside each tool. When the model returns a tool call:
+
+```
+tool = tool_registry.get(tool_name)
+if tool.permission_level in ("Dangerous", "Admin Only", "Confirmation Required"):
+    if not owner_confirmed:
+        return ask_owner_for_confirmation(tool, arguments)
+    
+result = await tool.execute(**arguments)
+```
+
+### 23.4 Confirmation Flow
+
+When the AI needs confirmation:
+
+1. The AI responds: "This action will [description]. Do you want to proceed?"
+2. The inline engine renders two buttons: **Confirm** and **Cancel**.
+3. If the owner presses **Confirm**, the AI calls the tool.
+4. If the owner presses **Cancel**, the AI responds: "Action cancelled."
+5. If the owner does not respond within 60 seconds, the confirmation expires. The AI responds: "Confirmation timed out. Please try again if needed."
+
+### 23.5 Tool Permission Table
+
+| Tool | Permission Level | Reason |
+|---|---|---|
+| `save` | Read + Write | Non-destructive, creates a new saved item |
+| `delete` | Dangerous | Permanently deletes messages |
+| `bio_set_template` | Read + Write | Changes bio template, non-destructive |
+| `bio_on` / `bio_off` | Read + Write | Toggles engine state |
+| `bio_show` | Read Only | Displays state only |
+| `username_set_template` | Read + Write | Changes username template |
+| `username_on` / `username_off` | Read + Write | Toggles engine state |
+| `username_show` | Read Only | Displays state only |
+| `db_stats` | Read Only | Displays statistics |
+| `db_clean` | Dangerous | Permanently deletes database rows |
+| `search` | Read Only | Queries saved items |
+| `list_saves` | Read Only | Lists saved items |
+| `settings_get` | Read Only | Reads a setting value |
+| `settings_set` | Admin Only | Changes bot configuration |
+| `panel_navigate` | Read + Write | Opens a different panel |
+| `panel_back` | Read + Write | Returns to previous panel |
+| `organize_list` | Read Only | Displays overview |
+| `organize_clean` | Dangerous | Permanently deletes old logs |
+| `task_create` | Read + Write | Creates a scheduled task |
+| `task_list` | Read Only | Lists tasks |
+| `task_cancel` | Dangerous | Cancels a scheduled task |
+| `automation_create` | Read + Write | Creates an automation |
+| `automation_list` | Read Only | Lists automations |
+| `automation_toggle` | Read + Write | Pauses or resumes an automation |
+
+---
+
+## 24. Runtime State Machine
+
+The AI module operates as a finite state machine. At any given moment, the AI is in exactly one state. Transitions are deterministic and driven by events (owner input, tool results, timeouts, errors).
+
+### 24.1 States
+
+```
+┌─────────────────────────────────────────────────┐
+│                AI Runtime States                  │
+├─────────────────────────────────────────────────┤
+│                                                  │
+│  ┌────────┐    owner sends     ┌───────────┐     │
+│  │  Idle  │ ──────────────────→ │ Listening │     │
+│  │        │     text input      │           │     │
+│  └────────┘                     └─────┬─────┘     │
+│      ↑                                │           │
+│      │ response sent                  ▼           │
+│      │                    ┌────────────────┐     │
+│      │                    │   Thinking     │     │
+│      │                    │ (model call)   │     │
+│      │                    └───────┬────────┘     │
+│      │                            │              │
+│      │                    model returns          │
+│      │                            │              │
+│      │              ┌─────────────┴──────────┐  │
+│      │              │                        │  │
+│      │              ▼                        ▼  │
+│      │     ┌──────────────┐     ┌──────────────┐│
+│      │     │ Executing    │     │ Waiting User ││
+│      │     │ Tool         │     │ (confirm)    ││
+│      │     └──────┬───────┘     └──────┬───────┘│
+│      │            │                    │        │
+│      │     tool result          user confirms  │
+│      │            │                    │        │
+│      │            ▼                    ▼        │
+│      │     ┌──────────────┐     ┌──────────────┐│
+│      └─────│   Recovering │     │ Executing    ││
+│            │ (if error)   │     │ Tool         ││
+│            └──────┬───────┘     └──────────────┘│
+│                   │                              │
+│            error recovered                      │
+│                   │                              │
+│                   ↓                              │
+│              ┌────────┐                           │
+│              │  Idle  │                           │
+│              └────────┘                           │
+│                                                  │
+│  ┌──────────┐                                     │
+│  │ Disabled │ ← watchdog disables AI             │
+│  └──────────┘   or no API key configured          │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+### 24.2 State Definitions
+
+| State | Description | Transitions To |
+|---|---|---|
+| **Idle** | AI is ready, no active request. The panel shows the main AI menu. | Listening (owner sends text) |
+| **Listening** | Owner has sent text input. The panel shows "Thinking...". The AI Core is building the prompt. | Thinking (prompt built, model call started) |
+| **Thinking** | The model API call is in flight. Waiting for the LLM to return a response. | Executing Tool (model returned a tool call), Idle (model returned text only), Recovering (model error) |
+| **Executing Tool** | A tool is being executed. The tool is calling its underlying service. | Idle (tool completed, response sent), Recovering (tool error), Waiting User (dangerous tool needs confirmation) |
+| **Waiting User** | The AI has asked for confirmation before a dangerous/admin action. The panel shows Confirm/Cancel buttons. | Executing Tool (owner confirms), Idle (owner cancels), Idle (60s timeout) |
+| **Recovering** | An error occurred (model timeout, tool failure, network error). The AI is retrying or falling back. | Idle (recovered or fallback message sent), Disabled (repeated failures) |
+| **Disabled** | AI is turned off (no API key, watchdog disabled it, or owner toggled it off). The panel shows a disabled message. | Idle (owner re-enables from settings) |
+
+### 24.3 Transition Rules
+
+1. **Idle → Listening**: Triggered by owner sending text in the AI panel.
+2. **Listening → Thinking**: Triggered by the Prompt Builder completing the prompt and the Model Provider starting the API call.
+3. **Thinking → Executing Tool**: Triggered by the model returning a tool call.
+4. **Thinking → Idle**: Triggered by the model returning text only (no tool call). The text is displayed and the AI returns to Idle.
+5. **Thinking → Recovering**: Triggered by a model error (timeout, 500, network failure).
+6. **Executing Tool → Idle**: Triggered by the tool returning a successful result. The response is displayed.
+7. **Executing Tool → Recovering**: Triggered by a tool error (timeout, exception).
+8. **Executing Tool → Waiting User**: Triggered by a dangerous/admin tool requiring confirmation.
+9. **Waiting User → Executing Tool**: Triggered by the owner pressing Confirm.
+10. **Waiting User → Idle**: Triggered by the owner pressing Cancel or 60-second timeout.
+11. **Recovering → Idle**: Triggered by successful retry or fallback message sent.
+12. **Recovering → Disabled**: Triggered by 3 consecutive recovery failures. Watchdog disables AI.
+13. **Disabled → Idle**: Triggered by owner re-enabling AI from the settings panel.
+
+### 24.4 State Persistence
+
+The current state is stored in RAM only. It is not persisted to the database. On restart, the AI always starts in **Idle** state. In-flight requests are lost — the owner must re-send their message.
+
+The state machine is a single enum variable in the AI Core:
+
+```python
+class AIState(Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    EXECUTING_TOOL = "executing_tool"
+    WAITING_USER = "waiting_user"
+    RECOVERING = "recovering"
+    DISABLED = "disabled"
+```
+
+### 24.5 Concurrency
+
+Only one state transition can happen at a time. The AI Core uses an `asyncio.Lock` to serialize state transitions. If the owner sends a second message while the AI is in **Thinking** or **Executing Tool**, the second message is queued and processed after the first completes.
+
+The agent loop and automation engine operate independently of the state machine. They have their own state (`agent_running`, `automation_active`) and do not interfere with the conversational AI state.
+
+---
+
+## 25. Expanded Conversation Context
+
+The Conversation Context (Section 7.4) must include runtime context so the model understands the owner's current situation. This is not just chat history — it is the full state of the bot at the moment the owner sends a message.
+
+### 25.1 Runtime Context Fields
+
+Every prompt includes these runtime context fields:
+
+| Field | Source | Example | Purpose |
+|---|---|---|---|
+| Current Menu | `inline_engine.current_menu` | "main" | Tells the AI which top-level menu the owner is in |
+| Current Panel | `inline_engine.current_panel` | "ai:new" | Tells the AI which panel is currently displayed |
+| Current Category | `inline_engine.current_category` | "ai" | Tells the AI which feature category is active |
+| Reply Context | `event.reply_to_msg_id` + fetched message metadata | "Replying to: photo from @user in channel X" | Gives the AI context about what message the owner replied to |
+| Pending Action | `inline_engine.pending_action` | "confirm_delete:5" | Tells the AI if there is an unresolved action waiting for input |
+| Current User Settings | `settings_service.get_all()` | "bio=on, username=off, save_mode=forward" | Gives the AI the owner's current configuration |
+| Timezone | `config.TZ` | "Asia/Tehran" | Ensures the AI uses the correct time zone |
+| Language | `settings_service.get("language")` | "English" | Ensures the AI responds in the owner's language |
+| Conversation Memory | `conversation_manager.get_recent(10)` | Last 10 messages from this session | Gives the AI conversational continuity |
+
+### 25.2 Why Runtime Context Matters
+
+Without runtime context, the AI would not know:
+- Whether the owner is in the AI panel or another panel (e.g., Bio Settings).
+- Whether the owner replied to a specific message (and which one).
+- Whether there is a pending confirmation dialog.
+- What the owner's current settings are.
+- What time zone the owner is in.
+
+This context is critical for the AI to give relevant responses. For example:
+
+- If the owner says "Save this", the AI needs to know what "this" refers to. The Reply Context provides the message ID and metadata.
+- If the owner says "Turn it off", the AI needs to know what "it" is. The Current Panel tells the AI whether the owner is looking at Bio Settings or Username Settings.
+- If the owner says "Change my settings", the AI needs to know the current settings to suggest changes.
+
+### 25.3 Context Assembly
+
+The Context Builder assembles runtime context into a compact text block in the Developer Prompt:
+
+```
+[Runtime Context]
+Menu: main
+Panel: ai:new
+Category: ai
+Reply: None
+Pending Action: None
+Settings: bio=on, username=off, save_mode=forward, ai_personality=default
+Timezone: Asia/Tehran
+Language: English
+Current Time: 2026-08-03 14:30
+```
+
+This block is always included in the prompt, even if the conversation history is trimmed. It is high priority — it is dropped only after long memory and conversation history have been trimmed.
+
+### 25.4 Reply Context Detail
+
+When the owner replies to a message while in the AI panel, the Context Builder fetches:
+- The replied message's ID.
+- The sender's name and ID.
+- The chat name and ID.
+- The message's media type (if any).
+- The message's text (truncated to 200 characters).
+- The message's timestamp.
+
+This is included in the prompt as:
+
+```
+[Reply Context]
+Message ID: 12345
+Sender: @design_inspiration (channel)
+Chat: Design Inspiration (-1001234567890)
+Media: Photo
+Text: Check out this new design trend...
+Timestamp: 2026-08-03 14:25
+```
+
+The AI uses this to understand references like "save this", "delete that", or "who sent this?".
+
+---
+
+## 26. Expanded Token Budget
+
+The token budget is the maximum number of tokens the prompt can consume. Every element in the prompt has a token cost. When the total exceeds the budget, elements are evicted in priority order.
+
+### 26.1 Token Budget Allocation
+
+Default budget: **8000 tokens** (suitable for GPT-4o-mini, configurable via `AI_MAX_TOKENS`).
+
+| Element | Typical Token Cost | Priority | Can Be Evicted? |
+|---|---|---|---|
+| System Prompt | ~200 | 7 (highest) | Never |
+| Tool Schemas | ~800 | 6 | Never |
+| Output Rules | ~100 | 8 | Never |
+| Current User Message | ~50-500 | 9 | Never |
+| Developer Prompt (runtime context) | ~150 | 5 | Drop activity details first, keep timezone |
+| Persistent Memory | ~200 | 4 | Drop oldest entries first |
+| Personality Prompt | ~50 | 3 | Drop addon, keep default tone |
+| Long Memory (summarized) | ~300 | 1 (lowest) | Drop oldest first |
+| Conversation History | ~500-3000 | 2 | Summarize older messages |
+
+### 26.2 Eviction Strategy
+
+When the total prompt exceeds the token budget:
+
+**Step 1 — Evict Long Memory:**
+- Drop the oldest long memory summaries first.
+- Keep at most 2 summaries (down from 5).
+- If still over budget, drop all long memory.
+
+**Step 2 — Summarize Conversation History:**
+- If conversation history exceeds 2000 tokens, summarize the oldest 60% into a compact summary.
+- The summary replaces the old messages in the prompt.
+- The full history remains in the database.
+
+**Step 3 — Trim Developer Prompt:**
+- Drop recent activity details (last 5 saves, bio state).
+- Keep timezone, language, and current time.
+- Keep current panel and reply context (critical for understanding).
+
+**Step 4 — Trim Persistent Memory:**
+- Drop oldest persistent memory entries first.
+- Keep owner preferences (timezone, language, default save mode).
+- Keep explicit instructions ("never delete without asking").
+
+**Step 5 — Drop Personality Addon:**
+- Drop the personality-specific prompt addon.
+- Keep the default system prompt tone.
+- The AI reverts to the default personality for this request.
+
+**Step 6 — Never Evict:**
+- System Prompt — the AI must always know its role.
+- Tool Schemas — the AI must always know its capabilities.
+- Output Rules — the AI must always know how to format responses.
+- Current User Message — the AI must always process the owner's request.
+
+### 26.3 Token Estimation
+
+Token counts are estimated, not exact. The AI Core uses a simple heuristic:
+- 1 token ≈ 4 characters of English text.
+- 1 token ≈ 2 characters of non-English text (for Persian/Farsi content).
+
+This estimation is conservative — it overestimates tokens to avoid sending prompts that exceed the model's context window. If the model API returns an error indicating the prompt is too long, the AI Core re-trims the prompt more aggressively and retries.
+
+### 26.4 Budget Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `AI_MAX_TOKENS` | 8000 | Maximum tokens per prompt |
+| `AI_SUMMARIZE_THRESHOLD` | 4000 | Token count that triggers conversation summarization |
+| `AI_MAX_LONG_MEMORY` | 5 | Maximum long memory entries in prompt |
+| `AI_MAX_PERSISTENT_MEMORY` | 500 | Maximum tokens for persistent memory |
+| `AI_MAX_RESPONSE_LENGTH` | 500 | Soft limit on AI response length (characters) |
+
+---
+
+## 27. Expanded Failure Recovery
+
+The AI must handle every failure mode gracefully. No failure should crash the bot, lose data, or leave the owner without feedback. This section expands on Section 15 with the full degradation matrix.
+
+### 27.1 Failure Modes and Responses
+
+| Failure | Detection | AI Response | Bot State |
+|---|---|---|---|
+| Model timeout (>30s) | `asyncio.timeout` | "The AI is taking too long to respond. Please try again." | Running, AI in Idle |
+| Provider unavailable (500/502/503) | HTTP status code | Retry 3x with backoff, then "AI service is temporarily unavailable." | Running, AI in Idle |
+| Provider rate limit (429) | HTTP 429 + Retry-After header | Sleep for Retry-After seconds, retry once. If still failing: "AI rate limit reached. Please wait a moment." | Running, AI in Idle |
+| Authentication error (401/403) | HTTP status code | "AI authentication failed. Check that the API key is configured correctly." | Running, AI in Disabled |
+| Database unavailable | Supabase query exception | Fall back to in-memory storage. "Memory features are temporarily limited." | Running, AI degraded |
+| Tool failure | Tool returns `success=False` | Relay tool error message to owner. "The save failed: [error message]." | Running, AI in Idle |
+| Tool timeout (>60s) | `asyncio.timeout` | "This action is taking too long. I've stopped it. Please try again or use the menu." | Running, AI in Idle |
+| Network failure | `aiohttp.ClientError` or `socket.error` | Retry 3x with backoff. If still failing: "I can't reach the AI service. This might be a network issue." | Running, AI in Idle |
+| Invalid model response | JSON parse error or missing fields | Retry once with stricter rules. If still invalid: "I had trouble processing that. Could you rephrase?" | Running, AI in Idle |
+| Render restart | Process restart | AI re-initializes from persisted state. In-flight conversations are lost. | Running, AI in Idle |
+| Telegram FloodWait | `FloodWaitError` from Telethon | "Telegram rate limit: must wait N seconds." Do not retry. | Running, AI in Idle |
+| Telegram session invalid | `client.is_user_authorized() == False` | "Telegram session is invalid. The bot needs to be re-authorized." | Running, AI in Disabled |
+| Repeated AI failures | Watchdog counter > 3 | Watchdog disables AI. "AI has been disabled due to repeated errors. Use the menu to re-enable." | Running, AI in Disabled |
+| Out of memory | `MemoryError` or high RAM usage | AI module is disabled. "AI has been disabled to conserve memory. Other features continue to work." | Running, AI in Disabled |
+
+### 27.2 Graceful Degradation Levels
+
+The AI degrades in levels. Each level removes functionality but keeps the bot running:
+
+**Level 0 — Full AI:** All features available. Model, memory, tools, agent, automation all functional.
+
+**Level 1 — No Memory:** Model and tools work, but long memory and persistent memory are unavailable (Supabase down). The AI does not recall past conversations. Conversation history for the current session is in RAM.
+
+**Level 2 — No Tools:** Model works, but tools are unavailable (service layer down). The AI can converse but cannot perform actions. It responds: "I can talk, but I can't perform actions right now. Please use the menu directly."
+
+**Level 3 — No Agent:** Conversational AI works, but the agent loop and automation engine are disabled (repeated task failures). Scheduled tasks do not run. The owner is notified.
+
+**Level 4 — No AI:** The AI module is completely disabled (no API key, repeated failures, or owner toggled it off). The panel shows: "AI is disabled. Use the menu to manage your bot." All deterministic menu features continue to work.
+
+### 27.3 Render Restart Recovery
+
+When Render restarts the service:
+
+1. Python process starts, loads environment.
+2. Config validation runs (required env vars checked).
+3. Telethon client connects and authorizes.
+4. FastAPI server starts.
+5. AI module initializes:
+   - Load persistent memory from Supabase (1 query).
+   - Register tools (in-memory, instant).
+   - Set state to `Idle`.
+   - Start agent loop (1 asyncio task).
+   - Start automation engine (1 asyncio task).
+6. AI is ready. The owner can open the AI panel and start a conversation.
+
+In-flight conversations from before the restart are lost. The owner must start a new conversation. Past conversations are in the `ai_conversations` table and can be viewed in the history panel.
+
+### 27.4 Telegram FloodWait Recovery
+
+When a tool triggers a Telegram FloodWait:
+
+1. The tool catches `FloodWaitError`.
+2. The tool returns `ToolResult(success=False, message="Telegram rate limit: must wait N seconds")`.
+3. The AI Core receives the error and responds to the owner: "Telegram says I need to wait N seconds before doing that. Please try again in a moment."
+4. The AI does NOT retry the tool.
+5. The AI does NOT sleep — it returns to Idle state and can process other requests.
+6. If the FloodWait is for a bio/username cron update, the existing cron loop handles it (sleeps for the FloodWait duration + 1 second).
+
+---
+
 ## Document Version
 
 | Version | Date | Author | Notes |
 |---|---|---|---|
 | V1 Draft | 2026-08-03 | AI Agent | Initial draft. Not final. Only `Onlyicing1` may edit. |
+| V1.1 Draft | 2026-08-03 | AI Agent | Extended: Platform Constraints, Render Free Constraints, Permission Layer, Runtime State Machine, Expanded Conversation Context, Expanded Token Budget, Expanded Failure Recovery, expanded Tool System. |
 
 ---
 
