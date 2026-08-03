@@ -1,48 +1,21 @@
 """
-DummyProvider — the default provider. Does nothing.
+DummyProvider — the always-on, zero-dependency default provider.
 
-This provider is the safe fallback for the entire system. It is
-registered as the default in ``ProviderRegistry`` and activated by
-default in ``ProviderFactory``. Every request that routes through the
-Provider Layer hits the DummyProvider, which returns a deterministic
-``AI_DISABLED`` response.
+The DummyProvider never makes any network call. It exists so the rest
+of the system can wire through the Provider Layer without any external
+API. It returns a deterministic, successful response with fixed token
+usage, allowing the full pipeline to be tested end-to-end.
 
-This guarantees zero behavior change: no network call, no model, no
-API key, no environment variable. The bot continues to operate exactly
-as it did before the Provider Layer was introduced.
-
-The DummyProvider returns a deterministic response with usage data
-so the pipeline and inspector can exercise the full path without any
-external dependency::
-
-    {
-        "success": false,
-        "provider": "dummy",
-        "text": "AI_DISABLED",
-        "usage": {
-            "prompt_tokens": 420,
-            "completion_tokens": 18
-        }
-    }
-
-Future: when a real provider is configured and enabled, the factory
-will switch the active provider away from Dummy. Until then, everything
-routes here.
+The response text is ``DUMMY_TEXT`` (``"AI pipeline operational."``).
+``success`` is ``True`` so downstream layers (conversation update,
+metrics) see a real successful execution.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from backend.ai.prompt.builder import PromptPackage
-from backend.ai.providers.base import (
-    AI_DISABLED,
-    BaseProvider,
-    ProviderConfig,
-    ProviderResponse,
-)
-
-PROVIDER_NAME = "dummy"
-PROVIDER_VERSION = "1.0.0"
+from backend.ai.providers.base import BaseProvider, ProviderConfig, ProviderResponse
 
 DUMMY_TEXT = "AI pipeline operational."
 DUMMY_PROMPT_TOKENS = 420
@@ -50,39 +23,21 @@ DUMMY_COMPLETION_TOKENS = 18
 
 
 class DummyProvider(BaseProvider):
-    """The no-op default provider.
+    """Deterministic, always-healthy provider for testing and fallback."""
 
-    Returns a deterministic ``AI_DISABLED`` response for every request.
-    No side effects, no I/O, no state. This is the provider the system
-    routes through when no real provider is configured.
-
-    The response includes deterministic usage data so downstream
-    layers (pipeline, inspector) can exercise the full path without
-    any external dependency.
-    """
-
-    PROVIDER_NAME = PROVIDER_NAME
-    PROVIDER_VERSION = PROVIDER_VERSION
+    PROVIDER_NAME = "dummy"
+    PROVIDER_VERSION = "1.0.0"
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
-        if config is None:
-            config = ProviderConfig(name=PROVIDER_NAME, enabled=True)
         super().__init__(config)
 
     def initialize(self) -> None:
-        """No-op initialization. Nothing to load or connect."""
         pass
 
     def shutdown(self) -> None:
-        """No-op shutdown. Nothing to release."""
         pass
 
     def health(self) -> dict[str, Any]:
-        """Return a deterministic health-check dict.
-
-        The DummyProvider is always healthy — it has no external
-        dependencies.
-        """
         return {
             "healthy": True,
             "provider": self.name,
@@ -91,19 +46,10 @@ class DummyProvider(BaseProvider):
         }
 
     def generate(self, prompt_package: PromptPackage) -> ProviderResponse:
-        """Return a deterministic ``AI_DISABLED`` response.
-
-        The DummyProvider never makes any request. It exists solely to
-        provide a safe, predictable default so the rest of the system
-        can wire through the Provider Layer without any behavior change.
-
-        The response includes deterministic usage data for downstream
-        token-budget tracking.
-        """
         return ProviderResponse(
-            text=AI_DISABLED,
+            text=DUMMY_TEXT,
             provider_name=self.name,
-            success=False,
+            success=True,
             usage={
                 "prompt_tokens": DUMMY_PROMPT_TOKENS,
                 "completion_tokens": DUMMY_COMPLETION_TOKENS,
@@ -115,20 +61,13 @@ class DummyProvider(BaseProvider):
         )
 
     def estimate_tokens(self, prompt_package: PromptPackage) -> int:
-        """Return a deterministic token estimate.
-
-        Uses the prompt package's own estimate if available, otherwise
-        returns the fixed dummy estimate.
-        """
         try:
             return prompt_package.estimated_tokens.estimated_total
         except Exception:
             return DUMMY_PROMPT_TOKENS + DUMMY_COMPLETION_TOKENS
 
     def provider_name(self) -> str:
-        """Return the provider's unique name."""
         return self.name
 
     def provider_version(self) -> str:
-        """Return the provider's version string."""
         return self.PROVIDER_VERSION
