@@ -1,8 +1,4 @@
 """
-.ping    — Edit trigger with PONG (zero-spam policy).
-.id      — Chat ID + Message ID of the current context.
-.panel   — Context panel for the replied message.
-.health  — Full health dashboard (inline panel).
 .menu    — Mother Panel — the central navigation root of LifeOS.
 Falls back to plain-text edit-in-place when the helper bot is not available.
 """
@@ -55,9 +51,9 @@ logger = logging.getLogger(__name__)
 
 def _build_general_buttons() -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🏓 Ping", "action:general_ping")
-    builder.add_row("🆔 Chat & Msg IDs", "action:general_id")
-    builder.add_row("🩺 Health Dashboard", "action:general_health")
+    builder.add_row("Ping", "action:general_ping")
+    builder.add_row("Chat & Msg IDs", "action:general_id")
+    builder.add_row("Health Dashboard", "action:general_health")
     return builder.build()
 
 
@@ -71,26 +67,26 @@ async def _general_body() -> str:
 def _build_menu_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("📥 Save", "panel:save"),
-        ("🗑 Delete", "panel:del"),
+        ("Save", "panel:save"),
+        ("Delete", "panel:del"),
     )
     builder.add_buttons(
-        ("👤 Profile", "panel:profile"),
-        ("🗄 Database", "panel:db"),
+        ("Profile", "panel:profile"),
+        ("Database", "panel:db"),
     )
     builder.add_buttons(
-        ("🔧 General", "panel:general"),
-        ("⚙️ Settings", "panel:settings"),
+        ("General", "panel:general"),
+        ("Settings", "panel:settings"),
     )
     return builder.build()
 
 
 async def _menu_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "🏠 LifeOS", "Choose a category:", _build_menu_buttons()
+    return "LifeOS", "Choose a category:", _build_menu_buttons()
 
 
 async def _menu_inline_builder(event, extra: str) -> list:
-    return [render("🏠 LifeOS", "Choose a category:", _build_menu_buttons())]
+    return [render("LifeOS", "Choose a category:", _build_menu_buttons())]
 
 
 async def _general_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -103,16 +99,16 @@ async def _general_inline_builder(event, extra: str) -> list:
 
 async def _profile_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
-    builder.add_row("🧬 Bio", "panel:bio")
-    builder.add_row("👤 Username", "panel:username")
-    return "👤 Profile", "Choose a section:", builder.build()
+    builder.add_row("Bio", "panel:bio")
+    builder.add_row("Username", "panel:username")
+    return "Profile", "Choose a section:", builder.build()
 
 
 async def _profile_inline_builder(event, extra: str) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("🧬 Bio", "panel:bio")
-    builder.add_row("👤 Username", "panel:username")
-    return [render("👤 Profile", "Choose a section:", builder.build())]
+    builder.add_row("Bio", "panel:bio")
+    builder.add_row("Username", "panel:username")
+    return [render("Profile", "Choose a section:", builder.build())]
 
 
 def _build_settings_body() -> str:
@@ -131,20 +127,20 @@ def _build_settings_body() -> str:
     uss = settings_service.update_stale_seconds()
 
     def _state(on: bool) -> str:
-        return "🟢" if on else "⚪"
+        return "ON" if on else "OFF"
 
     lines = [
-        f"**Auto-close:** {_state(ac)} (`{acd}s`)",
-        f"**Max deep save:** `{mds} MB`",
-        f"**Delete batch:** `{dbs}`",
-        f"**Log retention:** `{lrd} days`",
-        f"**Panel timeout:** `{pts}s`",
+        f"**Auto-close:** {_state(ac)} ({acd}s)",
+        f"**Max deep save:** {mds} MB",
+        f"**Delete batch:** {dbs}",
+        f"**Log retention:** {lrd} days",
+        f"**Panel timeout:** {pts}s",
         f"**Multiple panels:** {_state(amp)}",
         f"**Reuse panel:** {_state(rep)}",
-        f"**Language:** `{lang}`",
+        f"**Language:** {lang}",
         f"**Debug callbacks:** {_state(dbg)}",
         f"**Owner only:** {_state(oo)}",
-        f"**Update stale:** `{uss}s`",
+        f"**Update stale:** {uss}s",
     ]
     return "\n".join(lines)
 
@@ -162,40 +158,40 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Log Retention", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
     builder.add_row("Set Update Stale", "input:settings:update_stale_seconds")
-    return "⚙️ Settings", await _build_settings_body(), builder.build()
+    return "Settings", await _build_settings_body(), builder.build()
 
 
 async def _settings_inline_builder(event, extra: str) -> list:
-    return [render("⚙️ Settings", await _build_settings_body(), [])]
+    return [render("Settings", await _build_settings_body(), [])]
 
 
 async def _settings_toggle_autoclose_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     new_val = toggle_auto_close()
-    return "Settings", f"Auto-close is now {'🟢 ON' if new_val else '⚪ OFF'}", []
+    return "Settings", f"Auto-close is now {'ON' if new_val else 'OFF'}", []
 
 
 async def _settings_toggle_debug_callbacks_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     new_val = settings_service.toggle_debug_callbacks()
-    return "Settings", f"Debug callbacks is now {'🟢 ON' if new_val else '⚪ OFF'}", []
+    return "Settings", f"Debug callbacks is now {'ON' if new_val else 'OFF'}", []
 
 
 async def _settings_toggle_owner_only_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     new_val = settings_service.toggle_owner_only()
-    return "Settings", f"Owner only is now {'🟢 ON' if new_val else '⚪ OFF'}", []
+    return "Settings", f"Owner only is now {'ON' if new_val else 'OFF'}", []
 
 
 async def _settings_toggle_multiple_panels_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     new_val = settings_service.toggle_allow_multiple_panels()
-    return "Settings", f"Multiple panels is now {'🟢 ON' if new_val else '⚪ OFF'}", []
+    return "Settings", f"Multiple panels is now {'ON' if new_val else 'OFF'}", []
 
 
 async def _settings_toggle_reuse_panel_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services import settings_service
     new_val = settings_service.toggle_reuse_existing_panel()
-    return "Settings", f"Reuse panel is now {'🟢 ON' if new_val else '⚪ OFF'}", []
+    return "Settings", f"Reuse panel is now {'ON' if new_val else 'OFF'}", []
 
 
 async def _settings_auto_close_delay_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
@@ -203,10 +199,10 @@ async def _settings_auto_close_delay_handler(text, chat_id, msg_id, inline_chat_
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 5 and 3600."
+        result = "Please enter a number between 5 and 3600."
     else:
         ok = settings_service.set_auto_close_delay(int(text))
-        result = f"✅ Auto-close delay set to `{text}s`" if ok else "⚠️ Value must be between 5 and 3600."
+        result = f"Auto-close delay set to {text}s" if ok else "Value must be between 5 and 3600."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -225,10 +221,10 @@ async def _settings_max_deep_save_mb_handler(text, chat_id, msg_id, inline_chat_
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 1 and 500."
+        result = "Please enter a number between 1 and 500."
     else:
         ok = settings_service.set_max_deep_save_mb(int(text))
-        result = f"✅ Max deep save set to `{text} MB`" if ok else "⚠️ Value must be between 1 and 500."
+        result = f"Max deep save set to {text} MB" if ok else "Value must be between 1 and 500."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -247,10 +243,10 @@ async def _settings_delete_batch_size_handler(text, chat_id, msg_id, inline_chat
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 1 and 100."
+        result = "Please enter a number between 1 and 100."
     else:
         ok = settings_service.set_delete_batch_size(int(text))
-        result = f"✅ Delete batch size set to `{text}`" if ok else "⚠️ Value must be between 1 and 100."
+        result = f"Delete batch size set to {text}" if ok else "Value must be between 1 and 100."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -269,10 +265,10 @@ async def _settings_log_retention_handler(text, chat_id, msg_id, inline_chat_id,
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 1 and 365."
+        result = "Please enter a number between 1 and 365."
     else:
         ok = settings_service.set_log_retention_days(int(text))
-        result = f"✅ Log retention set to `{text} days`" if ok else "⚠️ Value must be between 1 and 365."
+        result = f"Log retention set to {text} days" if ok else "Value must be between 1 and 365."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -291,10 +287,10 @@ async def _settings_panel_timeout_handler(text, chat_id, msg_id, inline_chat_id,
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 30 and 3600."
+        result = "Please enter a number between 30 and 3600."
     else:
         ok = settings_service.set_panel_timeout_seconds(int(text))
-        result = f"✅ Panel timeout set to `{text}s`" if ok else "⚠️ Value must be between 30 and 3600."
+        result = f"Panel timeout set to {text}s" if ok else "Value must be between 30 and 3600."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -313,10 +309,10 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text:
-        result = "⚠️ Language cannot be empty."
+        result = "Language cannot be empty."
     else:
         ok = settings_service.set_language(text)
-        result = f"✅ Language set to `{text}`" if ok else "⚠️ Invalid language."
+        result = f"Language set to {text}" if ok else "Invalid language."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -335,10 +331,10 @@ async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, 
     from backend.helper.inline_engine import _self_client
     text = text.strip()
     if not text.isdigit():
-        result = "⚠️ Please enter a number between 60 and 3600."
+        result = "Please enter a number between 60 and 3600."
     else:
         ok = settings_service.set_update_stale_seconds(int(text))
-        result = f"✅ Update stale threshold set to `{text}s`" if ok else "⚠️ Value must be between 60 and 3600."
+        result = f"Update stale threshold set to {text}s" if ok else "Value must be between 60 and 3600."
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
@@ -417,8 +413,7 @@ async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str,
                 except Exception:
                     pass
     except Exception as exc:
-        body_lines.append(f"⚠️ Error: {exc}")
-
+        body_lines.append(f"Error: {exc}")
     return "Chat & Message IDs", "\n".join(body_lines), _build_general_buttons()
 
 
@@ -450,7 +445,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         pass
     ctx = get_target(owner_id)
     if ctx is None or ctx.kind != "reply":
-        return "Context Panel", "No replied message context. Use `.panel` while replying to a message.", []
+        return "Context panel", "No replied message context.", []
     body_lines = []
     try:
         reply = await client.get_messages(ctx.reply_chat_id, ids=ctx.reply_msg_id)
@@ -478,10 +473,10 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             if file_name:
                 body_lines.append(f"**File:** `{file_name}`")
     except Exception as exc:
-        body_lines.append(f"⚠️ Error: {exc}")
+        body_lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row("📥 Save (Forward)", "action:save_reply:f")
-    builder.add_row("⬇️ Save (Deep)", "action:save_reply:d")
+    builder.add_row("Save (Forward)", "action:save_reply:f")
+    builder.add_row("Save (Deep)", "action:save_reply:d")
     return "Context Panel", "\n".join(body_lines), builder.build()
 
 
@@ -510,7 +505,7 @@ async def _health_inline_builder(event, extra: str) -> list:
 
 
 def _indicator(ok: bool) -> str:
-    return "🟢" if ok else "🔴"
+    return "OK" if ok else "FAIL"
 
 
 def _format_age(ts: float) -> str:
@@ -529,17 +524,17 @@ def _build_health_report(snap: dict) -> str:
     lines = ["**Health Dashboard**\n"]
     telegram_ok = snap.get("telegram_connected", False)
     lines.append(f"{_indicator(telegram_ok)} **Telegram**: {'Connected' if telegram_ok else 'Disconnected'}")
-    lines.append(f"   • Last event: {_format_age(snap.get('last_telethon_event', 0))}")
-    lines.append(f"   • Last update: {_format_age(snap.get('last_update', 0))}")
-    lines.append(f"   • Last dispatch: {_format_age(snap.get('last_event_dispatch', 0))}")
-    lines.append(f"   • Last RPC: {_format_age(snap.get('last_rpc', 0))}")
-    lines.append(f"   • Last callback: {_format_age(snap.get('last_callback', 0))}")
-    lines.append(f"   • Last heartbeat: {_format_age(snap.get('last_heartbeat', 0))}")
+    lines.append(f"   Last event: {_format_age(snap.get('last_telethon_event', 0))}")
+    lines.append(f"   Last update: {_format_age(snap.get('last_update', 0))}")
+    lines.append(f"   Last dispatch: {_format_age(snap.get('last_event_dispatch', 0))}")
+    lines.append(f"   Last RPC: {_format_age(snap.get('last_rpc', 0))}")
+    lines.append(f"   Last callback: {_format_age(snap.get('last_callback', 0))}")
+    lines.append(f"   Last heartbeat: {_format_age(snap.get('last_heartbeat', 0))}")
     lines.append("")
     supervisor_ok = snap.get("supervisor_running", False)
     lines.append(f"{_indicator(supervisor_ok)} **Supervisor**: {'Running' if supervisor_ok else 'Stopped'}")
-    lines.append(f"   • State: `{snap.get('runtime_state', 'unknown')}`")
-    lines.append(f"   • Recovery cooldown: `{snap.get('recovery_cooldown', False)}`")
+    lines.append(f"   State: {snap.get('runtime_state', 'unknown')}")
+    lines.append(f"   Recovery cooldown: {snap.get('recovery_cooldown', False)}")
     lines.append("")
     watchdog_ok = snap.get("watchdog_running", False)
     lines.append(f"{_indicator(watchdog_ok)} **Watchdog**: {'Running' if watchdog_ok else 'Stopped'}")
@@ -559,21 +554,18 @@ def _build_health_report(snap: dict) -> str:
     panel_count = snap.get("active_panels", 0)
     session_count = snap.get("session_count", 0)
     timer_count = snap.get("timer_count", 0)
-    lines.append(f"**Panels**: `{panel_count}` active, `{session_count}` sessions, `{timer_count}` timers")
+    lines.append(f"**Panels**: {panel_count} active, {session_count} sessions, {timer_count} timers")
     lines.append("")
     event_count = snap.get("event_count", 0)
     error_count = snap.get("error_count", 0)
     avg_ms = snap.get("avg_event_ms", 0)
-    lines.append(f"**Events**: `{event_count}` total, `{error_count}` errors, avg `{avg_ms:.1f}ms`")
+    lines.append(f"**Events**: {event_count} total, {error_count} errors, avg {avg_ms:.1f}ms")
     lines.append("")
     mem_mb = snap.get("memory_mb", 0)
-    lines.append(f"**Memory**: `{mem_mb:.1f} MB`")
+    lines.append(f"**Memory**: {mem_mb:.1f} MB")
     cpu_s = snap.get("cpu_seconds", None)
     if cpu_s is not None:
-        lines.append(f"   • CPU: `{cpu_s:.2f}s`")
-
-    lines.append(f"{_indicator(telegram_ok)} **Telegram**: {'Connected' if telegram_ok else 'Disconnected'}")
-    lines.append(f"   • Last event: {_format_age(snap.get('last_telethon_event', 0))}")
+        lines.append(f"   CPU: {cpu_s:.2f}s")
     return "\n".join(lines)
 
 
@@ -587,70 +579,11 @@ async def _safe_edit(event, text: str) -> None:
 
 
 def register(client, owner_id: int):
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ping$"))
-    async def ping(event):
-        if not is_owner(event, owner_id):
-            return
-        try:
-            await rpc_await(event.edit("PONG"), timeout=_RPC_T, label="ping.edit")
-        except Exception as exc:
-            logger.warning("ping edit failed: %s", exc)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.id$"))
-    async def id_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        try:
-            chat_id = event.chat_id
-            msg_id = event.message.id
-            reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="id.get_reply")
-            lines = [f"**Chat ID:** `{chat_id}`", f"**Msg ID:** `{msg_id}`"]
-            if reply:
-                lines.append(f"**Reply Msg ID:** `{reply.id}`")
-                lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
-                lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
-            await rpc_await(event.edit("\n".join(lines)), timeout=_RPC_T, label="id.edit")
-        except Exception as exc:
-            logger.warning("id_cmd failed: %s", exc)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.panel$"))
-    async def panel_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-
-        helper = get_client()
-        if helper is None:
-            await rpc_await(event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN)."), timeout=_RPC_T, label="panel.no_helper")
-            return
-
-        reply = await rpc_await(event.message.get_reply_message(), timeout=_RPC_T, label="panel.get_reply")
-        if reply:
-            set_target(owner_id, TargetContext(
-                owner_id=owner_id,
-                kind="reply",
-                reply_chat_id=reply.chat_id,
-                reply_msg_id=reply.id,
-                tz_str=_resolve_tz(),
-            ))
-
-        try:
-            success = await rpc_await(send_inline_panel(client, event.chat_id, "context"), timeout=_RPC_T, label="panel.send_inline")
-            if success:
-                await rpc_await(event.delete(), timeout=_RPC_T, label="panel.delete")
-            else:
-                await rpc_await(event.edit("⚠️ Panel failed to open. Check logs."), timeout=_RPC_T, label="panel.fail_edit")
-        except Exception as exc:
-            logger.warning("panel inline send failed: %s", exc)
-            try:
-                await rpc_await(event.edit(f"⚠️ Panel failed: {exc}"), timeout=_RPC_T, label="panel.err_edit")
-            except Exception:
-                pass
-
     try:
         _register_panels()
-        register_panel("menu", _menu_panel_handler, parent="menu", title="🏠 LifeOS")
+        register_panel("menu", _menu_panel_handler, parent="menu", title="LifeOS")
         register_inline_builder("menu", _menu_inline_builder)
-        register_panel("profile", _profile_panel_handler, parent="menu", title="👤 Profile")
+        register_panel("profile", _profile_panel_handler, parent="menu", title="Profile")
         register_inline_builder("profile", _profile_inline_builder)
         register_panel("context", _context_panel_handler, parent="menu", title="Context Panel")
         register_panel("health", _health_panel_handler, parent="menu", title="Health Dashboard")
@@ -667,7 +600,7 @@ def register(client, owner_id: int):
 
         helper = get_client()
         if helper is None:
-            text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+            text, _ = render_edit("LifeOS", "Choose a category:", _build_menu_buttons())
             await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.no_helper_edit")
             return
 
@@ -677,28 +610,7 @@ def register(client, owner_id: int):
         except Exception as exc:
             logger.warning("menu inline send failed: %s", exc)
             try:
-                text, _ = render_edit("🏠 LifeOS", "Choose a category:", _build_menu_buttons())
+                text, _ = render_edit("LifeOS", "Choose a category:", _build_menu_buttons())
                 await rpc_await(event.edit(text), timeout=_RPC_T, label="menu.fallback_edit")
             except Exception:
                 pass
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.health$"))
-    async def health_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        helper = get_client()
-        if helper is None:
-            try:
-                snap = health.snapshot()
-                report = _build_health_report(snap)
-                await rpc_await(_safe_edit(event, report), timeout=_RPC_T, label="health.no_helper_edit")
-                _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
-            except Exception as exc:
-                logger.warning("health_cmd failed: %s", exc)
-            return
-        try:
-            await rpc_await(event.delete(), timeout=_RPC_T, label="health.delete")
-            await rpc_await(send_inline_panel(client, event.chat_id, "health"), timeout=_RPC_T, label="health.send_inline")
-            _diag_runtime.record_event("health", "snapshot", 0, "SUCCESS")
-        except Exception as exc:
-            logger.warning("health inline send failed: %s", exc)
