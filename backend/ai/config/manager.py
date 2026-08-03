@@ -193,3 +193,19 @@ class ConfigManager:
     def as_dict(self) -> dict[str, Any]:
         """Return the current config as a plain dict."""
         return self._config.as_dict()
+
+
+_default_manager: ConfigManager | None = None
+
+
+def get_config_manager() -> ConfigManager:
+    """Return the process-wide default ConfigManager instance.
+
+    Constructs it on first call. This is the single ConfigManager —
+    all runtime mutations go through this instance so changes persist
+    for the process lifetime and every snapshot reflects the latest state.
+    """
+    global _default_manager
+    if _default_manager is None:
+        _default_manager = ConfigManager()
+    return _default_manager
