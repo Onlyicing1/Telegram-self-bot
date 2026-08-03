@@ -5,18 +5,27 @@ This is the Provider Layer: the first layer that knows AI providers exist.
 It receives a ``PromptPackage`` (produced by the Prompt Builder Layer) and
 returns a ``ProviderResponse``.
 
-Every concrete provider inherits from ``BaseProvider`` and implements
-``generate(prompt_package)``. Currently, every provider returns
-``NOT_IMPLEMENTED`` or ``AI_DISABLED`` — no HTTP request, no SDK, no API
-call, no network I/O whatsoever. This file defines the architecture only.
+Every concrete provider inherits from ``BaseProvider`` and implements the
+full provider contract:
+
+    initialize()        — start the provider (load SDK, test connection)
+    shutdown()          — release resources (close connections)
+    health()            — return a health-check dict
+    generate()          — process a PromptPackage, return a ProviderResponse
+    estimate_tokens()   — estimate token count for a PromptPackage
+    provider_name()     — return the provider's unique name
+    provider_version()  — return the provider's version string
+
+Currently, no provider makes any network call. All concrete
+implementations return ``NOT_IMPLEMENTED`` or ``AI_DISABLED``.
 
 Provider contract (for future developers adding a new provider):
   1. Subclass ``BaseProvider``.
-  2. Set the class-level ``name`` attribute to a unique identifier.
-  3. Override ``generate(prompt_package)`` to return a ``ProviderResponse``.
-  4. Register the provider with ``ProviderRegistry`` (or let the factory
-     build it from configuration).
-  5. No other file needs to change. The factory and registry handle the rest.
+  2. Set the class-level ``PROVIDER_NAME`` attribute to a unique identifier.
+  3. Set the class-level ``PROVIDER_VERSION`` attribute.
+  4. Implement all abstract methods.
+  5. Add the class to ``_PROVIDER_CLASSES`` in ``factory.py``.
+  6. No other file needs to change. The factory and registry handle the rest.
 
 Architecture (from AI_MASTER_DESIGN.md §4.5)::
 
@@ -119,13 +128,18 @@ class BaseProvider(ABC):
     """Abstract base class for all AI providers.
 
     Every concrete provider (Gemini, OpenAI, OpenRouter, Dummy, etc.)
-    inherits from this class. The class provides:
-      - A ``name`` property identifying the provider.
-      - A ``config`` attribute holding provider configuration.
-      - A single abstract method ``generate(prompt_package)`` that
-        subclasses override.
+    inherits from this class. The class defines the full provider
+    contract that subclasses must implement:
 
-    The ``generate`` method is the ONLY public method. It receives a
+      - ``initialize()``        — start the provider
+      - ``shutdown()``          — release resources
+      - ``health()``            — return health-check dict
+      - ``generate()``          — process a PromptPackage
+      - ``estimate_tokens()``   — estimate token count
+      - ``provider_name()``     — return the provider name
+      - ``provider_version()``  — return the provider version
+
+    The ``generate`` method is the primary entry point. It receives a
     ``PromptPackage`` (the output of the Prompt Builder Layer) and
     returns a ``ProviderResponse``.
 
@@ -134,6 +148,9 @@ class BaseProvider(ABC):
     """
 
     __slots__ = ("_config",)
+
+    PROVIDER_NAME: str = ""
+    PROVIDER_VERSION: str = "0.0.0"
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         self._config: ProviderConfig = config or ProviderConfig()
@@ -145,7 +162,7 @@ class BaseProvider(ABC):
         Defaults to the class-level ``PROVIDER_NAME`` attribute.
         Subclasses must set ``PROVIDER_NAME``.
         """
-        return self.PROVIDER_NAME  # type: ignore[attr-defined]
+        return self.PROVIDER_NAME
 
     @property
     def config(self) -> ProviderConfig:
@@ -158,10 +175,45 @@ class BaseProvider(ABC):
         return self._config.enabled
 
     @abstractmethod
+    def initialize(self) -> None:
+        """Start the provider.
+
+        Called once before the provider is used. Future real providers
+        will load SDKs, test connections, and validate credentials here.
+
+        Raises:
+            ``ProviderInitializationError`` if startup fails.
+        """
+        ...
+
+    @abstractmethod
+    def shutdown(self) -> None:
+        """Release all resources.
+
+        Called when the provider is being removed or the system is
+        shutting down. Must be safe to call even if ``initialize()``
+        was never called or failed.
+        """
+        ...
+
+    @abstractmethod
+    def health(self) -> dict[str, Any]:
+        """Return a health-check dict.
+
+        Contains at minimum:
+            ``"healthy"``: bool
+            ``"provider"``: str
+
+        Future real providers will also include latency, model status,
+        rate-limit info, etc.
+        """
+        ...
+
+    @abstractmethod
     def generate(self, prompt_package: PromptPackage) -> ProviderResponse:
         """Process a ``PromptPackage`` and return a ``ProviderResponse``.
 
-        This is the ONLY public method. Subclasses must implement it.
+        This is the primary entry point. Subclasses must implement it.
 
         Contract:
           - Receives an immutable ``PromptPackage``.
@@ -171,6 +223,36 @@ class BaseProvider(ABC):
 
         Currently all implementations return ``NOT_IMPLEMENTED`` or
         ``AI_DISABLED``.
+        """
+        ...
+
+    @abstractmethod
+    def estimate_tokens(self, prompt_package: PromptPackage) -> int:
+        """Estimate the total token count for a ``PromptPackage``.
+
+        Returns the estimated number of tokens (input + output) that
+        this provider would consume if ``generate()`` were called with
+        the same package. This is used for budgeting and prompt-size
+        display — not for billing.
+
+        The DummyProvider returns a deterministic estimate based on
+        the prompt package's own estimate.
+        """
+        ...
+
+    @abstractmethod
+    def provider_name(self) -> str:
+        """Return the provider's unique name (e.g. ``"dummy"``, ``"gemini"``).
+
+        This is the canonical accessor — ``name`` property delegates here.
+        """
+        ...
+
+    @abstractmethod
+    def provider_version(self) -> str:
+        """Return the provider's version string (e.g. ``"1.0.0"``).
+
+        Used for diagnostics and logging.
         """
         ...
 

@@ -18,6 +18,8 @@ Currently, every provider returns ``NOT_IMPLEMENTED`` or
 ``AI_DISABLED``. The factory does not enable any provider. It only
 builds the architecture so future configuration can flip providers on.
 
+Unknown provider names raise ``ProviderNotFound`` (not ``ValueError``).
+
 Future example::
 
     config = {
@@ -43,6 +45,7 @@ from typing import Any, Dict, Type
 
 from backend.ai.providers.base import BaseProvider, ProviderConfig
 from backend.ai.providers.dummy import DummyProvider
+from backend.ai.providers.exceptions import ProviderNotFound
 from backend.ai.providers.gemini import GeminiProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
@@ -50,10 +53,6 @@ from backend.ai.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
 
-# ── Provider name → class mapping ──
-# This is the ONLY place that maps a string name to a concrete class.
-# Adding a new provider means: (1) create the provider file, (2) add
-# one entry here. Nothing else changes.
 _PROVIDER_CLASSES: Dict[str, Type[BaseProvider]] = {
     "dummy": DummyProvider,
     "gemini": GeminiProvider,
@@ -68,6 +67,8 @@ class ProviderFactory:
     Stateless. No globals. Receives configuration, returns constructed
     objects. The factory never makes network calls — it only instantiates
     provider classes.
+
+    Unknown provider names raise ``ProviderNotFound``.
     """
 
     __slots__ = ()
@@ -93,11 +94,11 @@ class ProviderFactory:
             A concrete ``BaseProvider`` instance.
 
         Raises:
-            ``ValueError`` if the name is not a known provider.
+            ``ProviderNotFound`` if the name is not a known provider.
         """
         cls = _PROVIDER_CLASSES.get(name)
         if cls is None:
-            raise ValueError(
+            raise ProviderNotFound(
                 f"Unknown provider '{name}'. "
                 f"Available: {list(_PROVIDER_CLASSES.keys())}"
             )
@@ -138,7 +139,6 @@ class ProviderFactory:
         """
         registry = ProviderRegistry()
 
-        # Always register the DummyProvider first and set it as default.
         dummy = DummyProvider()
         registry.register(dummy)
         registry.set_default(dummy.name)
@@ -168,7 +168,7 @@ class ProviderFactory:
                     provider_name, provider_config
                 )
                 registry.register(provider)
-            except ValueError as exc:
+            except ProviderNotFound as exc:
                 logger.warning(
                     "ProviderFactory: could not create provider '%s': %s",
                     provider_name,

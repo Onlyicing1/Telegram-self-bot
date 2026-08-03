@@ -12,16 +12,23 @@ The registry supports:
   - ``unregister(name)``         — remove a provider by name.
   - ``list()``                   — list all registered provider names.
   - ``get(name)``                — retrieve a provider by name.
+  - ``has(name)``                — check whether a provider is registered.
   - ``default_provider()``       — return the default provider (Dummy).
+  - ``set_default(name)``        — set the default provider by name.
+  - ``metadata(name)``           — return provider metadata dict.
+  - ``is_empty()``                — True if no providers registered.
 
 No globals, no singletons. The registry is constructed once and
 injected wherever needed. The DummyProvider is pre-registered as the
 default so the system always has a safe fallback.
+
+Duplicate registration is prevented: if a provider with the same name
+already exists, a warning is logged and the new provider is rejected.
 """
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from backend.ai.providers.base import BaseProvider
 
@@ -35,12 +42,18 @@ class ProviderRegistry:
     has the DummyProvider pre-registered under the name ``"dummy"`` so
     that ``default_provider()`` never returns ``None``.
 
+    Duplicate registrations are prevented: if a provider with the same
+    name already exists, a warning is logged and the new provider is
+    rejected. Use ``unregister()`` first if you need to replace a
+    provider.
+
     Usage::
 
         registry = ProviderRegistry()
         registry.register(GeminiProvider(config))
         registry.list()               # ["dummy", "gemini"]
         provider = registry.get("gemini")
+        metadata = registry.metadata("gemini")
     """
 
     __slots__ = ("_providers", "_default_name")
@@ -49,23 +62,32 @@ class ProviderRegistry:
         self._providers: Dict[str, BaseProvider] = {}
         self._default_name: str = ""
 
-    def register(self, provider: BaseProvider) -> None:
+    def register(self, provider: BaseProvider) -> bool:
         """Register a provider instance by its ``name`` property.
 
-        If a provider with the same name already exists, it is
-        overwritten with a warning.
+        If a provider with the same name already exists, a warning is
+        logged and the new provider is rejected (returns ``False``).
+        The default provider (``"dummy"``) cannot be overwritten this
+        way — use ``unregister()`` first.
+
+        Returns:
+            ``True`` if the provider was registered, ``False`` if a
+            provider with the same name already exists.
         """
         name = provider.name
         if name in self._providers:
             logger.warning(
-                "ProviderRegistry: overwriting existing provider '%s'", name
+                "ProviderRegistry: duplicate registration '%s' rejected",
+                name,
             )
+            return False
         self._providers[name] = provider
         logger.info(
             "ProviderRegistry: registered '%s' (total=%d)",
             name,
             len(self._providers),
         )
+        return True
 
     def unregister(self, name: str) -> bool:
         """Remove a provider by name.
@@ -140,6 +162,27 @@ class ProviderRegistry:
         self._default_name = name
         logger.info("ProviderRegistry: default provider set to '%s'", name)
         return True
+
+    def metadata(self, name: str) -> dict[str, Any]:
+        """Return a metadata dict for the named provider.
+
+        Returns an empty dict if the provider is not found.
+
+        Metadata includes:
+            ``"name"``:     provider name
+            ``"version"``:  provider version
+            ``"enabled"``: whether the provider is enabled
+            ``"healthy"``: result of ``health()`` check
+        """
+        provider = self._providers.get(name)
+        if provider is None:
+            return {}
+        return {
+            "name": provider.name,
+            "version": provider.provider_version(),
+            "enabled": provider.is_enabled,
+            "healthy": provider.health().get("healthy", False),
+        }
 
     def is_empty(self) -> bool:
         """True if no providers are registered (excluding the default)."""
