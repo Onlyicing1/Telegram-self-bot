@@ -17,6 +17,7 @@ from typing import Any, Iterator
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.base.defaults import get_provider_default
 
 DUMMY_TEXT = "AI pipeline operational."
 DUMMY_PROMPT_TOKENS = 420
@@ -35,6 +36,8 @@ class DummyProvider(BaseProvider):
     PROVIDER_VERSION = "1.0.0"
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
+        if config is None:
+            config = get_provider_default("dummy")
         super().__init__(config)
 
     @property
