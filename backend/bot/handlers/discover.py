@@ -86,36 +86,3 @@ def register(client, owner_id: int, tz_str: str):
         "prompt": "**Search**\n\nEnter search text (filename, caption, code, or MIME):\n\n_Reply below._",
     })
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.list(?:\s+(\d+))?$"))
-    async def list_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        n_str = event.pattern_match.group(1)
-        limit = int(n_str) if n_str else 10
-        if limit < 1 or limit > 50:
-            await event.edit("⚠️ Use a number between 1 and 50.")
-            return
-        result = await discover_service.do_list(owner_id, limit, tz_str)
-        await event.edit(result)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.find\s+(.+)$"))
-    async def find_cmd(event):
-        if not is_owner(event, owner_id):
-            return
-        query = event.pattern_match.group(1).strip()
-        result = await discover_service.do_find(owner_id, query, tz_str)
-        await event.edit(result)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.find$"))
-    async def find_panel(event):
-        if not is_owner(event, owner_id):
-            return
-        helper = get_client()
-        if helper is None:
-            await event.edit("⚠️ Inline mode requires the helper bot (BOT_TOKEN).")
-            return
-        try:
-            await event.delete()
-            await send_inline_panel(client, event.chat_id, "find")
-        except Exception as exc:
-            logger.warning("find inline send failed: %s", exc)
