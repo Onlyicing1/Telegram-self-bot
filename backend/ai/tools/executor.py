@@ -1,0 +1,213 @@
+"""
+ToolExecutor — executes tool calls from provider responses.
+
+When a provider returns ``tool_calls`` in its ``ProviderResponse``, the
+ToolExecutor is responsible for:
+
+  1. Looking up each tool in the ToolRegistry.
+  2. Checking permission level (DANGEROUS/ADMIN_ONLY require confirmation).
+  3. Executing the tool with the provided arguments.
+  4. Recording the result in tool history.
+  5. Returning a list of ``ToolExecutionResult`` objects.
+
+The executor is the SOLE component that calls ``tool.execute()``. The
+Engine and Dispatcher never call tools directly.
+
+Safety:
+  - READ_ONLY and READ_WRITE tools execute automatically.
+  - DANGEROUS, ADMIN_ONLY, and CONFIRMATION_REQUIRED tools return a
+    "confirmation required" result instead of executing. The caller
+    (Engine) must surface this to the owner for confirmation.
+  - Unknown tools return an error result.
+  - Every execution is wrapped in try/except — the executor never raises.
+"""
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from backend.ai.tools.base import PermissionLevel, ToolResult
+from backend.ai.tools.context import ToolContext
+from backend.ai.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+MAX_TOOLS_PER_TURN = 5
+TOOL_TIMEOUT_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    """The result of a single tool execution within a turn."""
+    tool_name: str
+    success: bool
+    message: str
+    data: dict[str, Any] = field(default_factory=dict)
+    latency_ms: float = 0.0
+    needs_confirmation: bool = False
+    error: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "tool_name": self.tool_name,
+            "success": self.success,
+            "message": self.message,
+            "data": dict(self.data),
+            "latency_ms": self.latency_ms,
+            "needs_confirmation": self.needs_confirmation,
+            "error": self.error,
+        }
+
+
+class ToolExecutor:
+    """Executes tool calls from provider responses.
+
+    The executor is the sole component that calls ``tool.execute()``.
+    It enforces permission levels, rate limits, and error handling.
+    """
+
+    __slots__ = ("_registry", "_context", "_history_repo")
+
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        context: ToolContext,
+        history_repo: Any | None = None,
+    ) -> None:
+        self._registry = registry
+        self._context = context
+        self._history_repo = history_repo
+
+    def execute_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        owner_id: int = 0,
+        session_id: str = "",
+    ) -> list[ToolExecutionResult]:
+        """Execute a batch of tool calls from a provider response.
+
+        Enforces MAX_TOOLS_PER_TURN. Tools requiring confirmation are
+        returned as "needs_confirmation" without executing.
+        """
+        results: list[ToolExecutionResult] = []
+
+        for i, call in enumerate(tool_calls):
+            if i >= MAX_TOOLS_PER_TURN:
+                logger.warning("ToolExecutor: hit max %d tools per turn, skipping remaining", MAX_TOOLS_PER_TURN)
+                results.append(ToolExecutionResult(
+                    tool_name="(overflow)",
+                    success=False,
+                    message="Tool call limit reached for this turn.",
+                    error="max_tools_exceeded",
+                ))
+                break
+
+            result = self._execute_single(call, owner_id, session_id)
+            results.append(result)
+
+        return results
+
+    def _execute_single(
+        self,
+        call: dict[str, Any],
+        owner_id: int,
+        session_id: str,
+    ) -> ToolExecutionResult:
+        """Execute a single tool call. Never raises."""
+        tool_name = call.get("name", "") or call.get("tool", "")
+        arguments = call.get("arguments", {}) or call.get("parameters", {})
+
+        if not tool_name:
+            return ToolExecutionResult(
+                tool_name="(unknown)",
+                success=False,
+                message="Tool call missing 'name' field.",
+                error="missing_name",
+            )
+
+        tool = self._registry.get(tool_name)
+        if tool is None:
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool '{tool_name}' is not registered.",
+                error="not_found",
+            )
+
+        if not self._is_auto_executable(tool):
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool '{tool_name}' requires owner confirmation.",
+                needs_confirmation=True,
+            )
+
+        start = time.perf_counter()
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            tool_result: ToolResult = loop.run_until_complete(
+                asyncio.wait_for(
+                    tool.execute(self._context, arguments),
+                    timeout=TOOL_TIMEOUT_SECONDS,
+                )
+            )
+            latency_ms = (time.perf_counter() - start) * 1000
+
+            self._record_history(owner_id, session_id, tool_name, arguments, tool_result, latency_ms)
+
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=tool_result.success,
+                message=tool_result.message,
+                data=tool_result.data,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - start) * 1000
+            error_msg = f"{type(exc).__name__}: {exc}"
+            logger.warning("ToolExecutor: tool '%s' failed: %s", tool_name, exc)
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool execution error: {error_msg}",
+                latency_ms=latency_ms,
+                error=error_msg,
+            )
+
+    def _is_auto_executable(self, tool: Any) -> bool:
+        """Check if a tool can execute without owner confirmation."""
+        level = tool.permission_level
+        return level in (PermissionLevel.READ_ONLY, PermissionLevel.READ_WRITE)
+
+    def _record_history(
+        self,
+        owner_id: int,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+        latency_ms: float,
+    ) -> None:
+        """Record a tool execution in history (if repository available)."""
+        if self._history_repo is None:
+            return
+        try:
+            from backend.ai.database.tool_history_repository import ToolHistoryRecord
+            record = ToolHistoryRecord(
+                id=str(uuid.uuid4()),
+                owner_id=owner_id,
+                session_id=session_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                result_success=result.success,
+                result_message=result.message,
+                result_data=result.data,
+                latency_ms=latency_ms,
+            )
+            self._history_repo.create(record)
+        except Exception as exc:
+            logger.warning("ToolExecutor: failed to record history: %s", exc)
