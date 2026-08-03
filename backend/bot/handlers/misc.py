@@ -78,6 +78,7 @@ def _build_menu_buttons() -> list:
         ("General", "panel:general"),
         ("Settings", "panel:settings"),
     )
+    builder.add_row("🧠 AI", "panel:ai")
     return builder.build()
 
 
@@ -467,7 +468,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         body_lines.append(f"**Has media:** {'Yes' if has_media else 'No'}")
         if has_media:
             from backend.services.save_service import detect_media_type, extract_file_name
-            media_type = detect_media_type(getattr(reply.media, "document", None) and getattr(reply.media.document, "mime_type", None) or "")
+            media_type = detect_media_type(getattr(reply.media, "document", None) and getattr(reply.media.document, "mime_type", "") or "")
             body_lines.append(f"**Media type:** {media_type}")
             file_name = extract_file_name(reply.media)
             if file_name:
