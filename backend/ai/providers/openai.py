@@ -12,6 +12,7 @@ from typing import Any
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.base.defaults import get_provider_default
 
 PROVIDER_NAME = "openai"
 PROVIDER_VERSION = "0.0.0"
@@ -25,7 +26,7 @@ class OpenAIProvider(BaseProvider):
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         if config is None:
-            config = ProviderConfig(name=PROVIDER_NAME)
+            config = get_provider_default(PROVIDER_NAME)
         super().__init__(config)
 
     @property

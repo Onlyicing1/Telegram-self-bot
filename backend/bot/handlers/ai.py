@@ -3,7 +3,8 @@ AI Menu — the Telegram-facing AI control panel.
 
 Inspection-only for most pages; the Settings page is fully interactive
 with toggle buttons for booleans and reply-mode input for numerics.
-The Provider page now supports switching between registered providers.
+The Provider page supports switching between registered providers.
+The Settings page reads/writes ProviderConfig through ProviderConfigManager.
 All changes go through the process-wide ConfigManager singleton so
 every subsequent snapshot reflects the new state immediately.
 
@@ -43,6 +44,11 @@ def _get_engine():
 def _get_config_manager():
     from backend.ai.config.manager import get_config_manager
     return get_config_manager()
+
+
+def _get_provider_config_manager():
+    from backend.ai.providers.manager.config_manager import get_provider_config_manager
+    return get_provider_config_manager()
 
 
 def _status_badge(ok: bool) -> str:
@@ -341,10 +347,32 @@ _NUMERIC_PARSERS = {
     "tool_budget": int,
 }
 
+# ── Provider config fields (read/written through ProviderConfigManager) ──
+
+_PROVIDER_TEXT_FIELDS = [
+    "api_key",
+    "base_url",
+    "default_model",
+]
+
+_PROVIDER_TEXT_LABELS = {
+    "api_key": "🔑 API Key",
+    "base_url": "🌐 Base URL",
+    "default_model": "🤖 Default Model",
+}
+
+_PROVIDER_TEXT_PROMPTS = {
+    "api_key": "**API Key**\n\nEnter the API key for this provider:\n\n_Reply below._",
+    "base_url": "**Base URL**\n\nEnter the base URL for this provider:\n\n_Reply below._",
+    "default_model": "**Default Model**\n\nEnter the default model name:\n\n_Reply below._",
+}
+
 
 def _build_settings_buttons() -> list:
     mgr = _get_config_manager()
     snap = mgr.snapshot()
+    pcm = _get_provider_config_manager()
+    pconfig = pcm.get_active_config()
     builder = InlinePanelBuilder()
 
     builder.add_row(
@@ -358,23 +386,33 @@ def _build_settings_buttons() -> list:
     )
 
     builder.add_buttons(
-        (f"{_NUMERIC_LABELS['temperature']}: {snap.temperature}", "input:ai_settings:temperature"),
-        (f"{_NUMERIC_LABELS['top_p']}: {snap.top_p}", "input:ai_settings:top_p"),
-    )
-
-    builder.add_buttons(
-        (f"{_NUMERIC_LABELS['max_tokens']}: {snap.max_tokens}", "input:ai_settings:max_tokens"),
-        (f"{_NUMERIC_LABELS['timeout']}: {snap.timeout}s", "input:ai_settings:timeout"),
-    )
-
-    builder.add_buttons(
-        (f"{_NUMERIC_LABELS['retry_count']}: {snap.retry_count}", "input:ai_settings:retry_count"),
-        (f"{_NUMERIC_LABELS['history_budget']}: {snap.history_budget}", "input:ai_settings:history_budget"),
+        (f"{_PROVIDER_TEXT_LABELS['api_key']}: {'✅' if pconfig.api_key else '❌'}", "input:ai_provider_config:api_key"),
+        (f"{_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url[:20] + '…' if len(pconfig.base_url) > 20 else pconfig.base_url or '—'}", "input:ai_provider_config:base_url"),
     )
 
     builder.add_row(
-        f"{_NUMERIC_LABELS['tool_budget']}: {snap.tool_budget}",
-        "input:ai_settings:tool_budget",
+        f"{_PROVIDER_TEXT_LABELS['default_model']}: {pconfig.default_model or '—'}",
+        "input:ai_provider_config:default_model",
+    )
+
+    builder.add_buttons(
+        (f"{_NUMERIC_LABELS['temperature']}: {pconfig.temperature}", "input:ai_provider_config:temperature"),
+        (f"{_NUMERIC_LABELS['top_p']}: {pconfig.top_p}", "input:ai_provider_config:top_p"),
+    )
+
+    builder.add_buttons(
+        (f"{_NUMERIC_LABELS['max_tokens']}: {pconfig.max_tokens}", "input:ai_provider_config:max_tokens"),
+        (f"{_NUMERIC_LABELS['timeout']}: {pconfig.timeout}s", "input:ai_provider_config:timeout"),
+    )
+
+    builder.add_row(
+        f"{_NUMERIC_LABELS['retry_count']}: {pconfig.retry_count}",
+        "input:ai_provider_config:retry_count",
+    )
+
+    builder.add_buttons(
+        (f"{_NUMERIC_LABELS['history_budget']}: {snap.history_budget}", "input:ai_settings:history_budget"),
+        (f"{_NUMERIC_LABELS['tool_budget']}: {snap.tool_budget}", "input:ai_settings:tool_budget"),
     )
 
     for field in ("streaming_enabled", "vision_enabled", "reasoning_enabled", "developer_mode"):
@@ -384,21 +422,32 @@ def _build_settings_buttons() -> list:
             f"action:ai_toggle_{field}",
         )
 
+    builder.add_row("Reset Provider Config", "action:ai_reset_provider_config")
+
     return builder.build()
 
 
 def _build_settings_body() -> str:
     mgr = _get_config_manager()
     snap = mgr.snapshot()
+    pcm = _get_provider_config_manager()
+    active_name = pcm.active_name
+    pconfig = pcm.get_active_config()
     lines = ["**AI Settings**\n"]
     lines.append(f"**Provider:** {snap.provider}")
     lines.append(f"**Model:** {snap.model}")
     lines.append(f"**Enabled:** {snap.enabled}")
-    lines.append(f"**Temperature:** {snap.temperature}")
-    lines.append(f"**Top P:** {snap.top_p}")
-    lines.append(f"**Max Tokens:** {snap.max_tokens}")
-    lines.append(f"**Timeout:** {snap.timeout}s")
-    lines.append(f"**Retry Count:** {snap.retry_count}")
+    lines.append("")
+    lines.append(f"**Provider Config ({active_name}):**")
+    lines.append(f"  • {_PROVIDER_TEXT_LABELS['api_key']}: {'✅ set' if pconfig.api_key else '❌ missing'}")
+    lines.append(f"  • {_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url or '—'}")
+    lines.append(f"  • {_PROVIDER_TEXT_LABELS['default_model']}: {pconfig.default_model or '—'}")
+    lines.append(f"  • {_NUMERIC_LABELS['temperature']}: {pconfig.temperature}")
+    lines.append(f"  • {_NUMERIC_LABELS['top_p']}: {pconfig.top_p}")
+    lines.append(f"  • {_NUMERIC_LABELS['max_tokens']}: {pconfig.max_tokens}")
+    lines.append(f"  • {_NUMERIC_LABELS['timeout']}: {pconfig.timeout}s")
+    lines.append(f"  • {_NUMERIC_LABELS['retry_count']}: {pconfig.retry_count}")
+    lines.append("")
     lines.append(f"**History Budget:** {snap.history_budget} tokens")
     lines.append(f"**Tool Budget:** {snap.tool_budget} tokens")
     lines.append(f"**Streaming:** {snap.streaming_enabled}")
@@ -484,6 +533,109 @@ def _make_input_handler(field: str):
 
 for _field in _NUMERIC_FIELDS:
     globals()[f"_ai_input_{_field}"] = _make_input_handler(_field)
+
+
+# ── Provider config input handlers (text fields via ProviderConfigManager) ──
+
+
+def _make_provider_config_input_handler(field: str):
+    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+        from backend.helper.inline_engine import _self_client
+
+        text = text.strip()
+        pcm = _get_provider_config_manager()
+        active_name = pcm.active_name
+
+        result = pcm.update(active_name, field, text)
+        if result.valid:
+            msg = f"✅ {_PROVIDER_TEXT_LABELS[field]} set"
+            logger.info("AI provider config: set %s.%s", active_name, field)
+        else:
+            errors = "; ".join(e.message for e in result.errors)
+            msg = f"❌ {errors}"
+
+        helper = _self_client
+        if helper and inline_chat_id and inline_msg_id:
+            from backend.helper import render_edit, to_edit_buttons
+            body = _build_settings_body()
+            buttons = _build_settings_buttons()
+            edit_text, edit_buttons = render_edit("AI · Settings", f"{msg}\n\n{body}", buttons)
+            try:
+                await helper.edit_message(inline_chat_id, inline_msg_id, edit_text)
+            except Exception as exc:
+                logger.warning("AI provider config input edit failed: %s", exc)
+
+        if _self_client:
+            try:
+                await _self_client.delete_messages(chat_id, [msg_id])
+            except Exception:
+                pass
+
+    return _handler
+
+
+for _field in _PROVIDER_TEXT_FIELDS:
+    globals()[f"_ai_provider_config_input_{_field}"] = _make_provider_config_input_handler(_field)
+
+
+# ── Provider config numeric input handlers ──
+
+
+def _make_provider_config_numeric_handler(field: str):
+    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+        from backend.helper.inline_engine import _self_client
+
+        text = text.strip()
+        pcm = _get_provider_config_manager()
+        active_name = pcm.active_name
+
+        parser = _NUMERIC_PARSERS.get(field, str)
+        try:
+            value = parser(text)
+        except (ValueError, TypeError):
+            msg = f"❌ Invalid number: `{text}`"
+        else:
+            result = pcm.update(active_name, field, value)
+            if result.valid:
+                msg = f"✅ {_NUMERIC_LABELS[field]} set to {value}"
+                logger.info("AI provider config: set %s.%s → %s", active_name, field, value)
+            else:
+                errors = "; ".join(e.message for e in result.errors)
+                msg = f"❌ {errors}"
+
+        helper = _self_client
+        if helper and inline_chat_id and inline_msg_id:
+            from backend.helper import render_edit, to_edit_buttons
+            body = _build_settings_body()
+            buttons = _build_settings_buttons()
+            edit_text, edit_buttons = render_edit("AI · Settings", f"{msg}\n\n{body}", buttons)
+            try:
+                await helper.edit_message(inline_chat_id, inline_msg_id, edit_text)
+            except Exception as exc:
+                logger.warning("AI provider config numeric edit failed: %s", exc)
+
+        if _self_client:
+            try:
+                await _self_client.delete_messages(chat_id, [msg_id])
+            except Exception:
+                pass
+
+    return _handler
+
+
+for _field in ("temperature", "top_p", "max_tokens", "timeout", "retry_count"):
+    globals()[f"_ai_provider_config_input_{_field}"] = _make_provider_config_numeric_handler(_field)
+
+
+# ── Reset provider config action ──
+
+
+async def _ai_reset_provider_config_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    pcm = _get_provider_config_manager()
+    active_name = pcm.active_name
+    pcm.reset(active_name)
+    logger.info("AI settings: reset provider config for '%s'", active_name)
+    return "AI · Settings", _build_settings_body(), _build_settings_buttons()
 
 
 # ── Panel: Diagnostics ──
@@ -590,9 +742,22 @@ def register(client, owner_id: int) -> None:
                 "prompt": _NUMERIC_PROMPTS[field],
             })
 
+        for field in _PROVIDER_TEXT_FIELDS:
+            register_input("ai_provider_config", field, {
+                "handler": globals()[f"_ai_provider_config_input_{field}"],
+                "prompt": _PROVIDER_TEXT_PROMPTS[field],
+            })
+
+        for field in ("temperature", "top_p", "max_tokens", "timeout", "retry_count"):
+            register_input("ai_provider_config", field, {
+                "handler": globals()[f"_ai_provider_config_input_{field}"],
+                "prompt": _NUMERIC_PROMPTS[field],
+            })
+
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_action("ai_switch_provider", _ai_switch_provider_action)
+        register_action("ai_reset_provider_config", _ai_reset_provider_config_action)
 
-        logger.info("AI panels registered OK (interactive settings + provider switching)")
+        logger.info("AI panels registered OK (interactive settings + provider config + provider switching)")
     except Exception as exc:
         logger.error("AI panel registration FAILED: %s", exc)
