@@ -43,13 +43,13 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "groq": GroqProvider,
 }
 
-_ENV_KEY_MAP: dict[str, str] = {
-    "gemini": "AI_GEMINI_API_KEY",
-    "openai": "AI_OPENAI_API_KEY",
-    "openrouter": "AI_OPENROUTER_API_KEY",
-    "cerebras": "AI_CEREBRAS_API_KEY",
-    "mistral": "AI_MISTRAL_API_KEY",
-    "groq": "AI_GROQ_API_KEY",
+_ENV_KEY_MAP: dict[str, list[str]] = {
+    "gemini": ["AI_GEMINI_API_KEY", "GEMINI_API_KEY"],
+    "openai": ["AI_OPENAI_API_KEY", "OPENAI_API_KEY"],
+    "openrouter": ["AI_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"],
+    "cerebras": ["AI_CEREBRAS_API_KEY", "CEREBRAS_API_KEY"],
+    "mistral": ["AI_MISTRAL_API_KEY", "MISTRAL_API_KEY"],
+    "groq": ["AI_GROQ_API_KEY", "GROQ_API_KEY"],
 }
 
 _ENV_MODEL_MAP: dict[str, str] = {
@@ -98,8 +98,15 @@ class ProviderFactory:
         registry.register(dummy)
         registry.set_fallback(dummy.name)
 
-        for provider_name, env_key in _ENV_KEY_MAP.items():
-            api_key = os.getenv(env_key, "").strip()
+        for provider_name, env_keys in _ENV_KEY_MAP.items():
+            api_key = ""
+            used_env_key = ""
+            for ek in env_keys:
+                val = os.getenv(ek, "").strip()
+                if val:
+                    api_key = val
+                    used_env_key = ek
+                    break
             if not api_key:
                 continue
 
@@ -122,7 +129,7 @@ class ProviderFactory:
             try:
                 provider = ProviderFactory.create_provider(provider_name, provider_config)
                 registry.register(provider)
-                logger.info("ProviderFactory: auto-loaded '%s' from %s", provider_name, env_key)
+                logger.info("ProviderFactory: auto-loaded '%s' from %s", provider_name, used_env_key)
             except ProviderNotFound as exc:
                 logger.warning("ProviderFactory: could not create '%s': %s", provider_name, exc)
 

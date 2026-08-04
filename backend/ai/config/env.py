@@ -7,44 +7,53 @@ API keys, model names, and provider names all come from environment
 variables with sensible defaults (empty string / disabled).
 
 Environment variables (all optional — AI is off by default):
-    AI_ENABLED              → "true"/"false" (default: false)
-    AI_PROVIDER             → provider name (default: "dummy")
-    AI_MODEL                → model name (default: provider-specific)
-    AI_TEMPERATURE          → float (default: 1.0)
-    AI_TOP_P                → float (default: 1.0)
-    AI_MAX_TOKENS           → int (default: 4096)
-    AI_TIMEOUT              → int seconds (default: 30)
-    AI_RETRY_COUNT          → int (default: 3)
+    AI_ENABLED                → "true"/"false" (default: false)
+    AI_PROVIDER               → provider name (default: "dummy")
+    AI_MODEL                  → model name (default: provider-specific)
+    AI_TEMPERATURE            → float (default: 1.0)
+    AI_TOP_P                  → float (default: 1.0)
+    AI_MAX_TOKENS             → int (default: 4096)
+    AI_TIMEOUT                → int seconds (default: 30)
+    AI_RETRY_COUNT            → int (default: 3)
 
     # Per-provider API keys (empty = not configured)
-    AI_GEMINI_API_KEY       → Gemini API key
-    AI_OPENAI_API_KEY       → OpenAI API key
-    AI_OPENROUTER_API_KEY   → OpenRouter API key
-    AI_CLAUDE_API_KEY       → Anthropic/Claude API key
-    AI_GLM_API_KEY          → GLM/ChatGLM API key
-    AI_GROQ_API_KEY         → Groq API key
-    AI_CEREBRAS_API_KEY     → Cerebras API key
-    AI_MISTRAL_API_KEY      → Mistral API key
+    # Both AI_*_API_KEY and bare *_API_KEY forms are accepted.
+    AI_GEMINI_API_KEY         → Gemini API key
+    GEMINI_API_KEY            → Gemini API key (alternative)
+    AI_OPENAI_API_KEY         → OpenAI API key
+    OPENAI_API_KEY            → OpenAI API key (alternative)
+    AI_OPENROUTER_API_KEY     → OpenRouter API key
+    OPENROUTER_API_KEY        → OpenRouter API key (alternative)
+    AI_CLAUDE_API_KEY         → Anthropic/Claude API key
+    CLAUDE_API_KEY            → Anthropic/Claude API key (alternative)
+    AI_GLM_API_KEY            → GLM/ChatGLM API key
+    GLM_API_KEY               → GLM/ChatGLM API key (alternative)
+    AI_GROQ_API_KEY           → Groq API key
+    GROQ_API_KEY              → Groq API key (alternative)
+    AI_CEREBRAS_API_KEY       → Cerebras API key
+    CEREBRAS_API_KEY          → Cerebras API key (alternative)
+    AI_MISTRAL_API_KEY        → Mistral API key
+    MISTRAL_API_KEY           → Mistral API key (alternative)
 
     # Per-provider model overrides (empty = use provider default)
-    AI_GEMINI_MODEL         → Gemini model name
-    AI_OPENAI_MODEL         → OpenAI model name
-    AI_OPENROUTER_MODEL     → OpenRouter model name
-    AI_CLAUDE_MODEL         → Claude model name
-    AI_GLM_MODEL            → GLM model name
-    AI_GROQ_MODEL           → Groq model name
-    AI_CEREBRAS_MODEL       → Cerebras model name
-    AI_MISTRAL_MODEL        → Mistral model name
+    AI_GEMINI_MODEL           → Gemini model name
+    AI_OPENAI_MODEL           → OpenAI model name
+    AI_OPENROUTER_MODEL       → OpenRouter model name
+    AI_CLAUDE_MODEL           → Claude model name
+    AI_GLM_MODEL              → GLM model name
+    AI_GROQ_MODEL             → Groq model name
+    AI_CEREBRAS_MODEL         → Cerebras model name
+    AI_MISTRAL_MODEL          → Mistral model name
 
     # Per-provider base URL overrides (empty = use provider default)
-    AI_OPENAI_BASE_URL      → OpenAI-compatible base URL
-    AI_OPENROUTER_BASE_URL  → OpenRouter base URL
+    AI_OPENAI_BASE_URL        → OpenAI-compatible base URL
+    AI_OPENROUTER_BASE_URL    → OpenRouter base URL
 
     # Memory settings
     AI_MEMORY_RETENTION_DAYS → int (default: 90)
 
     # Fallback chain (comma-separated provider names, tried in order)
-    AI_PROVIDER_FALLBACK    → e.g. "gemini,openai,openrouter" (default: "")
+    AI_PROVIDER_FALLBACK      → e.g. "gemini,openai,openrouter" (default: "")
 """
 from __future__ import annotations
 
@@ -128,72 +137,74 @@ def load_provider_env_configs() -> dict[str, dict[str, Any]]:
 
     Returns a dict mapping provider name → config dict with keys:
     api_key, default_model, base_url, enabled.
+
+    Both AI_*_API_KEY and bare *_API_KEY env vars are checked.
     """
     configs: dict[str, dict[str, Any]] = {}
 
-    gemini_key = os.getenv("AI_GEMINI_API_KEY", "")
+    gemini_key = os.getenv("AI_GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
     if gemini_key:
         configs["gemini"] = {
             "api_key": gemini_key,
-            "default_model": os.getenv("AI_GEMINI_MODEL", ""),
+            "default_model": os.getenv("AI_GEMINI_MODEL", "") or os.getenv("GEMINI_MODEL", ""),
             "enabled": True,
         }
 
-    openai_key = os.getenv("AI_OPENAI_API_KEY", "")
+    openai_key = os.getenv("AI_OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
     if openai_key:
         configs["openai"] = {
             "api_key": openai_key,
-            "default_model": os.getenv("AI_OPENAI_MODEL", ""),
-            "base_url": os.getenv("AI_OPENAI_BASE_URL", ""),
+            "default_model": os.getenv("AI_OPENAI_MODEL", "") or os.getenv("OPENAI_MODEL", ""),
+            "base_url": os.getenv("AI_OPENAI_BASE_URL", "") or os.getenv("OPENAI_BASE_URL", ""),
             "enabled": True,
         }
 
-    openrouter_key = os.getenv("AI_OPENROUTER_API_KEY", "")
+    openrouter_key = os.getenv("AI_OPENROUTER_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
     if openrouter_key:
         configs["openrouter"] = {
             "api_key": openrouter_key,
-            "default_model": os.getenv("AI_OPENROUTER_MODEL", ""),
-            "base_url": os.getenv("AI_OPENROUTER_BASE_URL", ""),
+            "default_model": os.getenv("AI_OPENROUTER_MODEL", "") or os.getenv("OPENROUTER_MODEL", ""),
+            "base_url": os.getenv("AI_OPENROUTER_BASE_URL", "") or os.getenv("OPENROUTER_BASE_URL", ""),
             "enabled": True,
         }
 
-    claude_key = os.getenv("AI_CLAUDE_API_KEY", "")
+    claude_key = os.getenv("AI_CLAUDE_API_KEY", "") or os.getenv("CLAUDE_API_KEY", "")
     if claude_key:
         configs["claude"] = {
             "api_key": claude_key,
-            "default_model": os.getenv("AI_CLAUDE_MODEL", ""),
+            "default_model": os.getenv("AI_CLAUDE_MODEL", "") or os.getenv("CLAUDE_MODEL", ""),
             "enabled": True,
         }
 
-    glm_key = os.getenv("AI_GLM_API_KEY", "")
+    glm_key = os.getenv("AI_GLM_API_KEY", "") or os.getenv("GLM_API_KEY", "")
     if glm_key:
         configs["glm"] = {
             "api_key": glm_key,
-            "default_model": os.getenv("AI_GLM_MODEL", ""),
+            "default_model": os.getenv("AI_GLM_MODEL", "") or os.getenv("GLM_MODEL", ""),
             "enabled": True,
         }
 
-    groq_key = os.getenv("AI_GROQ_API_KEY", "")
+    groq_key = os.getenv("AI_GROQ_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
     if groq_key:
         configs["groq"] = {
             "api_key": groq_key,
-            "default_model": os.getenv("AI_GROQ_MODEL", ""),
+            "default_model": os.getenv("AI_GROQ_MODEL", "") or os.getenv("GROQ_MODEL", ""),
             "enabled": True,
         }
 
-    cerebras_key = os.getenv("AI_CEREBRAS_API_KEY", "")
+    cerebras_key = os.getenv("AI_CEREBRAS_API_KEY", "") or os.getenv("CEREBRAS_API_KEY", "")
     if cerebras_key:
         configs["cerebras"] = {
             "api_key": cerebras_key,
-            "default_model": os.getenv("AI_CEREBRAS_MODEL", ""),
+            "default_model": os.getenv("AI_CEREBRAS_MODEL", "") or os.getenv("CEREBRAS_MODEL", ""),
             "enabled": True,
         }
 
-    mistral_key = os.getenv("AI_MISTRAL_API_KEY", "")
+    mistral_key = os.getenv("AI_MISTRAL_API_KEY", "") or os.getenv("MISTRAL_API_KEY", "")
     if mistral_key:
         configs["mistral"] = {
             "api_key": mistral_key,
-            "default_model": os.getenv("AI_MISTRAL_MODEL", ""),
+            "default_model": os.getenv("AI_MISTRAL_MODEL", "") or os.getenv("MISTRAL_MODEL", ""),
             "enabled": True,
         }
 
