@@ -26,6 +26,7 @@ import logging
 import os
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 _REQUIRED_ENV = ("API_ID", "API_HASH", "SESSION_STRING", "BOT_OWNER_ID")
 _REQUIRED_AI_TABLES = ("ai_sessions", "ai_messages", "ai_memories", "ai_tool_history")
 _CORE_TABLES = ("saved_items", "bio_state", "bot_logs", "username_state", "panel_settings")
+
+_SCHEMA = "public"
 
 
 @dataclass
@@ -88,11 +91,62 @@ def _check_supabase(cfg: dict) -> CheckResult:
         if db is None:
             return CheckResult("supabase", "WARNING", False,
                                "Supabase client init failed — in-memory fallback")
-        db.table("bot_logs").select("id").limit(1).execute()
+        db.table("bot_logs").select("*").limit(1).execute()
         return CheckResult("supabase", "WARNING", True, "Supabase reachable")
     except Exception as exc:
         return CheckResult("supabase", "WARNING", False,
                            f"Supabase unreachable: {exc} — in-memory fallback")
+
+
+def _is_table_not_found_error(exc: BaseException) -> bool:
+    """Return True only when the error specifically indicates the table does not exist."""
+    exc_msg = str(exc).lower()
+    if "could not find the table" in exc_msg:
+        return True
+    if "pgrst205" in exc_msg:
+        return True
+    if "relation" in exc_msg and "does not exist" in exc_msg:
+        return True
+    if "404" in exc_msg and "not found" in exc_msg:
+        return True
+    return False
+
+
+def _probe_table(db: Any, table: str) -> tuple[bool, str]:
+    """Probe a single table for existence.
+
+    Returns (exists, detail_message).
+    - (True, "ok") when the table exists and is queryable.
+    - (False, "missing: <reason>") when the table genuinely does not exist.
+    - (True, "probe_error: <exc_class>: <exc_msg>") when the table may exist
+      but the probe failed for another reason (timeout, network, permission,
+      parsing, etc.). The caller treats this as "exists" because we cannot
+      confirm the table is missing.
+    """
+    query_desc = f'SELECT * FROM {_SCHEMA}.{table} LIMIT 1 (via db.table("{table}").select("*").limit(1).execute())'
+    logger.info("[STARTUP CHECK] schema=%s table=%s query=%s", _SCHEMA, table, query_desc)
+
+    try:
+        result = db.table(table).select("*").limit(1).execute()
+        raw_type = type(result).__name__
+        raw_len = len(result.data) if hasattr(result, "data") and result.data else 0
+        parsed = result.data if hasattr(result, "data") else None
+        logger.info(
+            "[STARTUP CHECK] table=%s raw_response_type=%s raw_response_len=%s parsed_result=%s",
+            table, raw_type, raw_len, parsed,
+        )
+        return True, "ok"
+    except Exception as exc:
+        exc_class = type(exc).__name__
+        exc_msg = str(exc)
+        tb_loc = traceback.format_exc().strip().split("\n")[-2] if traceback.format_exc().strip() else ""
+        logger.error(
+            "[STARTUP CHECK] table=%s FAILED exception_class=%s exception_message=%s traceback_location=%s",
+            table, exc_class, exc_msg, tb_loc,
+        )
+        if _is_table_not_found_error(exc):
+            return False, f"missing: {exc_class}: {exc_msg}"
+        return True, f"probe_error: {exc_class}: {exc_msg}"
 
 
 def _check_ai_tables(cfg: dict) -> CheckResult:
@@ -105,17 +159,29 @@ def _check_ai_tables(cfg: dict) -> CheckResult:
         if db is None:
             return CheckResult("ai_tables", "WARNING", True, "Skipped — no DB")
         missing = []
+        errors = []
         for table in _REQUIRED_AI_TABLES:
-            try:
-                db.table(table).select("id").limit(1).execute()
-            except Exception:
+            exists, detail = _probe_table(db, table)
+            if not exists:
                 missing.append(table)
+            elif detail.startswith("probe_error:"):
+                errors.append(f"{table}: {detail}")
         if missing:
             return CheckResult("ai_tables", "WARNING", False,
                                f"Missing AI tables: {', '.join(missing)} — AI uses in-memory")
+        if errors:
+            return CheckResult("ai_tables", "WARNING", True,
+                               f"All AI tables present (with probe errors: {'; '.join(errors)})")
         return CheckResult("ai_tables", "WARNING", True, "All AI tables present")
     except Exception as exc:
-        return CheckResult("ai_tables", "WARNING", False, f"Check failed: {exc}")
+        exc_class = type(exc).__name__
+        exc_msg = str(exc)
+        tb_loc = traceback.format_exc().strip().split("\n")[-2] if traceback.format_exc().strip() else ""
+        logger.error(
+            "[STARTUP CHECK] ai_tables check FAILED exception_class=%s exception_message=%s traceback_location=%s",
+            exc_class, exc_msg, tb_loc,
+        )
+        return CheckResult("ai_tables", "WARNING", False, f"Check failed: {exc_class}: {exc_msg}")
 
 
 def _check_core_tables(cfg: dict) -> CheckResult:
@@ -127,17 +193,28 @@ def _check_core_tables(cfg: dict) -> CheckResult:
         if db is None:
             return CheckResult("core_tables", "WARNING", True, "Skipped — no DB")
         missing = []
+        errors = []
         for table in _CORE_TABLES:
-            try:
-                db.table(table).select("id").limit(1).execute()
-            except Exception:
+            exists, detail = _probe_table(db, table)
+            if not exists:
                 missing.append(table)
+            elif detail.startswith("probe_error:"):
+                errors.append(f"{table}: {detail}")
         if missing:
             return CheckResult("core_tables", "CRITICAL", False,
                                f"Missing core tables: {', '.join(missing)}")
+        if errors:
+            logger.warning("[STARTUP CHECK] core_tables probe errors: %s", '; '.join(errors))
         return CheckResult("core_tables", "CRITICAL", True, "All core tables present")
     except Exception as exc:
-        return CheckResult("core_tables", "WARNING", False, f"Check failed: {exc}")
+        exc_class = type(exc).__name__
+        exc_msg = str(exc)
+        tb_loc = traceback.format_exc().strip().split("\n")[-2] if traceback.format_exc().strip() else ""
+        logger.error(
+            "[STARTUP CHECK] core_tables check FAILED exception_class=%s exception_message=%s traceback_location=%s",
+            exc_class, exc_msg, tb_loc,
+        )
+        return CheckResult("core_tables", "WARNING", False, f"Check failed: {exc_class}: {exc_msg}")
 
 
 def _check_ai_providers(cfg: dict) -> CheckResult:
