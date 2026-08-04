@@ -56,13 +56,15 @@ class ProviderManager:
     All other layers call ``manager.chat()``.
     """
 
-    __slots__ = ("_registry", "_metrics", "_config_mgr")
+    __slots__ = ("_registry", "_metrics", "_config_mgr", "_fallback_chain")
 
     def __init__(self, registry: ProviderRegistry | None = None) -> None:
         self._registry = registry or ProviderRegistry()
         self._metrics = ProviderMetricsRegistry()
         self._config_mgr = ProviderConfigManager()
+        self._fallback_chain: list[str] = []
         self._ensure_dummy_fallback()
+        self._load_env_fallback_chain()
 
     # ── Public API ──
 
@@ -81,7 +83,7 @@ class ProviderManager:
             error_msg = f"{type(exc).__name__}: {exc}"
             self._metrics.record(provider_name, latency=latency, error=error_msg)
             logger.warning("ProviderManager: '%s' crashed during chat: %s", provider_name, exc)
-            return await self._fallback(messages, **kwargs)
+            return await self._try_fallback_chain(messages, **kwargs)
 
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
@@ -245,3 +247,33 @@ class ProviderManager:
             dummy = DummyProvider()
             self._registry.register(dummy)
         self._registry.set_fallback("dummy")
+
+    def _load_env_fallback_chain(self) -> None:
+        import os
+        chain_str = os.getenv("AI_PROVIDER_FALLBACK", "")
+        if chain_str:
+            self._fallback_chain = [p.strip() for p in chain_str.split(",") if p.strip()]
+            logger.info("ProviderManager: fallback chain = %s", self._fallback_chain)
+
+    async def _try_fallback_chain(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+        """Try each provider in the fallback chain before falling back to dummy."""
+        for name in self._fallback_chain:
+            if not self._registry.has(name):
+                continue
+            provider = self._registry.get(name)
+            try:
+                h = provider.health()
+                if not h.get("healthy", False):
+                    continue
+                start = time.perf_counter()
+                response = await provider.chat(messages, **kwargs)
+                latency = time.perf_counter() - start
+                self._metrics.record(name, latency=latency, error="")
+                logger.info("ProviderManager: fallback chain succeeded with '%s'", name)
+                return response
+            except Exception as exc:
+                latency = time.perf_counter() - start if 'start' in dir() else 0.0
+                self._metrics.record(name, latency=latency, error=str(exc))
+                logger.warning("ProviderManager: fallback chain provider '%s' failed: %s", name, exc)
+                continue
+        return await self._fallback(messages, **kwargs)

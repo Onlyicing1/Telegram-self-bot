@@ -209,10 +209,14 @@ class ConversationManager:
         item = session.add_message(role=role, content=content)
         self._trim_if_needed(session)
         from backend.ai import persistence
-        asyncio.ensure_future(persistence.add_message(
-            session.session_id, owner_id, role, content,
-            token_count=item.estimated_tokens,
-        ))
+        from backend.runtime.task_guard import guarded_create_task
+        guarded_create_task(
+            persistence.add_message(
+                session.session_id, owner_id, role, content,
+                token_count=item.estimated_tokens,
+            ),
+            name=f"lifeos-ai-persist-{role}",
+        )
         return item
 
     def _require_session(self, owner_id: int) -> RuntimeSession:
