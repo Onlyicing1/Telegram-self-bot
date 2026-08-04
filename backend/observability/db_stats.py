@@ -51,6 +51,8 @@ def database_statistics(owner_id: int = 0) -> dict[str, Any]:
             "permanent_memories": permanent_count,
             "tool_history_size": tool_history_count,
             "provider_stats": provider_stats,
+            "database_latency_ms": _measure_db_latency(),
+            "slow_queries": _extract_slow_queries(),
         }
     except Exception as exc:
         return {"available": False, "error": str(exc)}
@@ -78,8 +80,51 @@ def _safe_provider_stats(repo: Any, owner_id: int) -> list[dict[str, Any]]:
         return []
 
 
+def _measure_db_latency() -> float | None:
+    """Measure a quick DB round-trip latency in milliseconds.
+
+    Uses the diagnostics event ring to find the most recent DB operation
+    duration. Returns None if no DB events have been recorded.
+    """
+    try:
+        from backend.diagnostics import get_events
+        events = get_events()
+        for e in reversed(events):
+            if e.get("module") == "database" and e.get("duration_ms", 0) > 0:
+                return round(e["duration_ms"], 1)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_slow_queries(threshold_ms: float = 500.0) -> list[dict[str, Any]]:
+    """Extract slow database operations from the diagnostics ring.
+
+    Returns operations with duration_ms above the threshold, newest first.
+    """
+    try:
+        from backend.diagnostics import get_events
+        events = get_events()
+        slow = [
+            {
+                "module": e.get("module", ""),
+                "action": e.get("action", ""),
+                "duration_ms": e.get("duration_ms", 0),
+                "result": e.get("result", ""),
+                "details": e.get("details", ""),
+            }
+            for e in events
+            if e.get("module") == "database"
+            and isinstance(e.get("duration_ms"), (int, float))
+            and e["duration_ms"] >= threshold_ms
+        ]
+        slow.sort(key=lambda x: x["duration_ms"], reverse=True)
+        return slow[:10]
+    except Exception:
+        return []
+
+
 def validate_repositories() -> dict[str, bool]:
-    """Verify each repository is reachable and responsive."""
     from backend.ai.database.manager import get_repository_manager
 
     try:
