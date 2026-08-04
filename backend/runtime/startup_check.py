@@ -65,11 +65,12 @@ class StartupReport:
 
 
 def _check_env_vars(cfg: dict) -> CheckResult:
-    missing = [k for k in _REQUIRED_ENV if not cfg.get(k)]
+    missing = [k for k in _REQUIRED_ENV if not cfg.get(k) and not cfg.get(k.replace("BOT_", ""))]
     if missing:
         return CheckResult("env_vars", "CRITICAL", False,
                             f"Missing required env vars: {', '.join(missing)}")
-    if not isinstance(cfg.get("OWNER_ID"), int) or cfg["OWNER_ID"] <= 0:
+    owner_id = cfg.get("OWNER_ID") or cfg.get("BOT_OWNER_ID")
+    if not isinstance(owner_id, int) or owner_id <= 0:
         return CheckResult("env_vars", "CRITICAL", False,
                             "BOT_OWNER_ID must be a positive integer")
     return CheckResult("env_vars", "CRITICAL", True, "All required env vars present")

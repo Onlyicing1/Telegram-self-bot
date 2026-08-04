@@ -8,7 +8,9 @@ retry/backoff/timeout code scattered across handlers and services.
 Usage:
     from backend.runtime.tg_retry import tg_rpc
     result = await tg_rpc(client.send_message(chat_id, "hello"), label="send_message")
-    result = await tg_rpc(client.get_me(), label="get_me")
+
+    # For retryable calls, pass a factory so each attempt gets a fresh coroutine:
+    result = await tg_rpc(lambda: client.get_me(), label="get_me")
 
 Behavior:
   - Bounded timeout (default 30s, configurable)
@@ -16,13 +18,18 @@ Behavior:
   - Other transient errors: exponential backoff with jitter
   - CancelledError: always re-raised (cooperative cancellation)
   - Never silently swallows errors — raises on final failure
+
+  Accepts either a bare coroutine (single-attempt, no retry possible since
+coroutines cannot be reused) or a zero-arg factory callable that returns
+a fresh coroutine each retry attempt.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar, Union
 
 from telethon.errors import FloodWaitError
 
@@ -44,7 +51,7 @@ def _backoff_delay(attempt: int) -> float:
 
 
 async def tg_rpc(
-    coro: Awaitable[_T],
+    coro_or_factory: Union[Awaitable[_T], Callable[[], Awaitable[_T]]],
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     max_retries: int = _DEFAULT_MAX_RETRIES,
@@ -53,10 +60,13 @@ async def tg_rpc(
     """Execute a Telegram RPC call with retry, backoff, and timeout.
 
     Args:
-        coro:        The coroutine to execute.
-        timeout:      Per-attempt timeout in seconds.
-        max_retries:  Maximum number of retry attempts (total = max_retries + 1).
-        label:        Human-readable label for logging.
+        coro_or_factory:  A coroutine to execute, OR a zero-arg callable
+                          that returns a fresh coroutine. A factory is
+                          required for retry to work (coroutines cannot
+                          be awaited more than once).
+        timeout:          Per-attempt timeout in seconds.
+        max_retries:      Maximum number of retry attempts (total = max_retries + 1).
+        label:            Human-readable label for logging.
 
     Returns:
         The result of the coroutine.
@@ -65,15 +75,22 @@ async def tg_rpc(
         The last exception if all retries are exhausted.
         asyncio.CancelledError is always re-raised immediately.
     """
+    is_factory = callable(coro_or_factory) and not inspect.iscoroutine(coro_or_factory)
+
+    def _get_coro() -> Awaitable[_T]:
+        if is_factory:
+            return coro_or_factory()  # type: ignore[misc]
+        return coro_or_factory  # type: ignore[return-value]
+
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
-            return await asyncio.wait_for(coro, timeout=timeout)
+            return await asyncio.wait_for(_get_coro(), timeout=timeout)
         except asyncio.CancelledError:
             raise
         except FloodWaitError as fwe:
             last_exc = fwe
-            if attempt < max_retries:
+            if attempt < max_retries and is_factory:
                 wait = fwe.seconds + 1
                 logger.warning("TG_RPC FloodWait %ds (label=%s, attempt %d/%d) — sleeping",
                                wait, label, attempt + 1, max_retries + 1)
@@ -83,7 +100,7 @@ async def tg_rpc(
             raise
         except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
             last_exc = exc
-            if attempt < max_retries:
+            if attempt < max_retries and is_factory:
                 delay = _backoff_delay(attempt)
                 logger.warning("TG_RPC transient error (label=%s, attempt %d/%d): %s — retrying in %.1fs",
                                label, attempt + 1, max_retries + 1, type(exc).__name__, delay)
@@ -94,7 +111,7 @@ async def tg_rpc(
             raise
         except Exception as exc:
             last_exc = exc
-            if attempt < max_retries:
+            if attempt < max_retries and is_factory:
                 delay = _backoff_delay(attempt)
                 logger.warning("TG_RPC error (label=%s, attempt %d/%d): %s — retrying in %.1fs",
                                label, attempt + 1, max_retries + 1, type(exc).__name__, delay)
