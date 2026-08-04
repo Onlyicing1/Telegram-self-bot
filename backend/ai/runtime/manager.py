@@ -23,6 +23,7 @@ Configuration (constructor):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -207,6 +208,11 @@ class ConversationManager:
             session = self._registry.create_session(owner_id=owner_id)
         item = session.add_message(role=role, content=content)
         self._trim_if_needed(session)
+        from backend.ai import persistence
+        asyncio.ensure_future(persistence.add_message(
+            session.session_id, owner_id, role, content,
+            token_count=item.estimated_tokens,
+        ))
         return item
 
     def _require_session(self, owner_id: int) -> RuntimeSession:

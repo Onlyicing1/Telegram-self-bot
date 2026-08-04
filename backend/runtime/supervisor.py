@@ -216,6 +216,24 @@ class RuntimeSupervisor:
         settings_svc.load_all()
         logger.info("Panel settings loaded.")
 
+        logger.info("[1b/5] Initializing AI engine")
+        try:
+            from backend.ai.config.env import apply_env_to_config_manager, apply_env_to_provider_configs
+            from backend.ai.config.manager import get_config_manager
+            from backend.ai.providers.manager.config_manager import get_provider_config_manager
+            cm = get_config_manager()
+            apply_env_to_config_manager(cm)
+            pcm = get_provider_config_manager()
+            apply_env_to_provider_configs(pcm)
+            pcm.load(cm)
+            from backend.ai.engine.engine import get_engine
+            engine = get_engine()
+            from backend.bot.handlers.ai_cmd import configure as configure_ai_cmd
+            configure_ai_cmd(engine, self.owner_id, self.tz_str)
+            logger.info("[1b/5] AI engine initialized (provider=%s)", engine.provider_manager.get_active_name())
+        except Exception as exc:
+            logger.warning("[1b/5] AI engine init failed: %s", exc)
+
         logger.info("[2/5] Building self-client")
         await self._build_and_register()
 

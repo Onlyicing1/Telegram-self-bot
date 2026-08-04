@@ -66,13 +66,13 @@ class ProviderManager:
 
     # ── Public API ──
 
-    def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         """Send a chat request to the active provider. Never raises."""
         provider = self._get_healthy_provider()
         provider_name = provider.name
         start = time.perf_counter()
         try:
-            response = provider.chat(messages, **kwargs)
+            response = await provider.chat(messages, **kwargs)
             latency = time.perf_counter() - start
             self._metrics.record(provider_name, latency=latency, error="")
             return response
@@ -81,7 +81,7 @@ class ProviderManager:
             error_msg = f"{type(exc).__name__}: {exc}"
             self._metrics.record(provider_name, latency=latency, error=error_msg)
             logger.warning("ProviderManager: '%s' crashed during chat: %s", provider_name, exc)
-            return self._fallback(messages, **kwargs)
+            return await self._fallback(messages, **kwargs)
 
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
@@ -199,10 +199,10 @@ class ProviderManager:
         logger.warning("ProviderManager: active provider '%s' unhealthy, falling back", provider.name)
         return self._registry.get_fallback()
 
-    def _fallback(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+    async def _fallback(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         fallback = self._registry.get_fallback()
         try:
-            return fallback.chat(messages, **kwargs)
+            return await fallback.chat(messages, **kwargs)
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK CRASHED: %s", exc)
             return ProviderResponse(

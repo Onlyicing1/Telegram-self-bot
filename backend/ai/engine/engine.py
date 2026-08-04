@@ -92,13 +92,13 @@ class Engine:
 
     # ── Public API ──
 
-    def execute(self, user_request: AIRequest) -> EngineResult:
+    async def execute(self, user_request: AIRequest) -> EngineResult:
         """Execute a request through the full AI pipeline.
 
         This is the ONLY public execution method. Returns an immutable
         ``EngineResult``. Never raises.
         """
-        return self._dispatcher.dispatch(user_request)
+        return await self._dispatcher.dispatch(user_request)
 
     def engine_health(self) -> str:
         """Return ``"READY"`` or ``"FAILED: <reason>"``."""

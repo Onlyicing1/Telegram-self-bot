@@ -1,71 +1,33 @@
 """
-OpenRouterProvider — OpenRouter adapter (architecture only).
+OpenRouterProvider — OpenRouter adapter (real implementation).
 
-Returns ``NOT_IMPLEMENTED`` for every request. No HTTP request, no
-SDK, no API key. When a real implementation is added, only this file
-changes.
+OpenRouter uses the OpenAI-compatible chat completions API format.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
-from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.defaults import get_provider_default
-
-PROVIDER_NAME = "openrouter"
-PROVIDER_VERSION = "0.0.0"
+from backend.ai.providers.openai_compat import OpenAICompatProvider
 
 
-class OpenRouterProvider(BaseProvider):
-    """OpenRouter provider (not yet implemented)."""
+class OpenRouterProvider(OpenAICompatProvider):
+    """OpenRouter provider via OpenAI-compatible API."""
 
-    PROVIDER_NAME = PROVIDER_NAME
-    PROVIDER_VERSION = PROVIDER_VERSION
+    PROVIDER_NAME = "openrouter"
+    PROVIDER_VERSION = "1.0.0"
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         if config is None:
-            config = get_provider_default(PROVIDER_NAME)
+            config = get_provider_default("openrouter")
         super().__init__(config)
 
     @property
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             supports_streaming=True,
-            supports_images=False,
-            supports_reasoning=False,
             supports_tools=True,
             supports_json=True,
             supports_function_call=True,
             supports_long_context=True,
         )
-
-    def initialize(self) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
-
-    def health(self) -> dict[str, Any]:
-        return {
-            "healthy": False,
-            "provider": self.name,
-            "version": self.PROVIDER_VERSION,
-            "enabled": self.is_enabled,
-            "reason": "not implemented",
-        }
-
-    def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
-        return self._not_implemented_response()
-
-    def count_tokens(self, text: str) -> int:
-        if not text:
-            return 0
-        return max(1, len(text) // 4)
-
-    def provider_name(self) -> str:
-        return self.name
-
-    def provider_version(self) -> str:
-        return self.PROVIDER_VERSION

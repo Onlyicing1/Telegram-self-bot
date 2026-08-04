@@ -1,25 +1,25 @@
 """
 ProviderFactory — creates and wires providers from configuration.
 
-The factory is the single place that knows which provider classes
-exist. It builds a ``ProviderRegistry``, pre-registers the dummy
-fallback, optionally creates and registers additional providers
-based on config, and returns a fully wired ``ProviderManager``.
+The factory auto-detects which providers have API keys configured in
+the environment variables and registers them automatically. The dummy
+provider is always registered as the fallback.
 
 Future providers are added by:
-  1. Creating a ``backend/ai/providers/<name>/`` package.
-  2. Adding the class to ``_PROVIDER_CLASSES`` below.
-  3. Adding defaults to ``base/defaults.py``.
+  1. Creating a backend/ai/providers/<name>/ package or <name>.py file.
+  2. Adding the class to _PROVIDER_CLASSES below.
+  3. Adding defaults to base/defaults.py.
   4. Done.
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Type
 
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider
-from backend.ai.providers.base.defaults import get_provider_default, list_provider_names
+from backend.ai.providers.base.defaults import get_provider_default
 from backend.ai.providers.base.exceptions import ProviderNotFound
 from backend.ai.providers.cerebras import CerebrasProvider
 from backend.ai.providers.dummy.provider import DummyProvider
@@ -41,6 +41,29 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "cerebras": CerebrasProvider,
     "mistral": MistralProvider,
     "groq": GroqProvider,
+}
+
+_ENV_KEY_MAP: dict[str, str] = {
+    "gemini": "AI_GEMINI_API_KEY",
+    "openai": "AI_OPENAI_API_KEY",
+    "openrouter": "AI_OPENROUTER_API_KEY",
+    "cerebras": "AI_CEREBRAS_API_KEY",
+    "mistral": "AI_MISTRAL_API_KEY",
+    "groq": "AI_GROQ_API_KEY",
+}
+
+_ENV_MODEL_MAP: dict[str, str] = {
+    "gemini": "AI_GEMINI_MODEL",
+    "openai": "AI_OPENAI_MODEL",
+    "openrouter": "AI_OPENROUTER_MODEL",
+    "cerebras": "AI_CEREBRAS_MODEL",
+    "mistral": "AI_MISTRAL_MODEL",
+    "groq": "AI_GROQ_MODEL",
+}
+
+_ENV_BASE_URL_MAP: dict[str, str] = {
+    "openai": "AI_OPENAI_BASE_URL",
+    "openrouter": "AI_OPENROUTER_BASE_URL",
 }
 
 
@@ -69,37 +92,48 @@ class ProviderFactory:
     @staticmethod
     def create_registry(config: dict[str, Any] | None = None) -> ProviderRegistry:
         registry = ProviderRegistry()
+
         dummy_config = get_provider_default("dummy")
         dummy = DummyProvider(dummy_config)
         registry.register(dummy)
         registry.set_fallback(dummy.name)
 
-        if config is None:
-            logger.info("ProviderFactory: created registry with default only (dummy)")
-            return registry
+        for provider_name, env_key in _ENV_KEY_MAP.items():
+            api_key = os.getenv(env_key, "").strip()
+            if not api_key:
+                continue
 
-        provider_name = config.get("provider", "")
-        if provider_name and provider_name != "dummy":
-            provider_config = ProviderConfig(
-                provider_name=provider_name,
-                base_url=config.get("base_url", ""),
-                api_key=config.get("api_key", ""),
-                default_model=config.get("model", ""),
-                temperature=config.get("temperature", 1.0),
-                top_p=config.get("top_p", 1.0),
-                max_tokens=config.get("max_output_tokens", 4096),
-                timeout=config.get("timeout", 30),
-                retry_count=config.get("retry_count", 3),
-                enabled=config.get("enabled", False),
-                extra=config.get("extra", {}),
-            )
+            provider_config = get_provider_default(provider_name)
+            provider_config.api_key = api_key
+            provider_config.enabled = True
+
+            model_env = _ENV_MODEL_MAP.get(provider_name)
+            if model_env:
+                model = os.getenv(model_env, "").strip()
+                if model:
+                    provider_config.default_model = model
+
+            base_url_env = _ENV_BASE_URL_MAP.get(provider_name)
+            if base_url_env:
+                base_url = os.getenv(base_url_env, "").strip()
+                if base_url:
+                    provider_config.base_url = base_url
+
             try:
                 provider = ProviderFactory.create_provider(provider_name, provider_config)
                 registry.register(provider)
+                logger.info("ProviderFactory: auto-loaded '%s' from %s", provider_name, env_key)
             except ProviderNotFound as exc:
-                logger.warning("ProviderFactory: could not create provider '%s': %s", provider_name, exc)
+                logger.warning("ProviderFactory: could not create '%s': %s", provider_name, exc)
 
-        logger.info("ProviderFactory: created registry with providers %s", registry.list())
+        active = os.getenv("AI_PROVIDER", "dummy").strip()
+        if active and active != "dummy" and registry.has(active):
+            registry.switch_provider(active)
+        elif active == "dummy":
+            registry.switch_provider("dummy")
+
+        logger.info("ProviderFactory: registry ready (providers=%s, active=%s)",
+                     registry.list(), registry.active_name)
         return registry
 
     @staticmethod
@@ -107,7 +141,7 @@ class ProviderFactory:
         registry = ProviderFactory.create_registry(config)
         manager = ProviderManager(registry)
         logger.info(
-            "ProviderFactory: created manager (active='%s', providers=%s)",
+            "ProviderFactory: manager ready (active='%s', providers=%s)",
             manager.get_active_name(),
             manager.list_providers(),
         )
