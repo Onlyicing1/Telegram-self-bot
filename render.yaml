@@ -27,3 +27,31 @@ services:
         value: "false"
       - key: LOG_LEVEL
         value: INFO
+      - key: AI_ENABLED
+        value: "true"
+      - key: AI_PROVIDER
+        sync: false
+      - key: AI_GEMINI_API_KEY
+        sync: false
+      - key: AI_OPENAI_API_KEY
+        sync: false
+      - key: AI_OPENROUTER_API_KEY
+        sync: false
+      - key: AI_GROQ_API_KEY
+        sync: false
+      - key: AI_CEREBRAS_API_KEY
+        sync: false
+      - key: AI_MISTRAL_API_KEY
+        sync: false
+      - key: AI_GEMINI_MODEL
+        sync: false
+      - key: AI_OPENAI_MODEL
+        sync: false
+      - key: AI_OPENROUTER_MODEL
+        sync: false
+      - key: AI_GROQ_MODEL
+        sync: false
+      - key: AI_CEREBRAS_MODEL
+        sync: false
+      - key: AI_MISTRAL_MODEL
+        sync: false

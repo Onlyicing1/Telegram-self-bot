@@ -23,6 +23,7 @@ Safety:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -81,7 +82,7 @@ class ToolExecutor:
         self._context = context
         self._history_repo = history_repo
 
-    def execute_calls(
+    async def execute_calls(
         self,
         tool_calls: list[dict[str, Any]],
         owner_id: int = 0,
@@ -105,12 +106,12 @@ class ToolExecutor:
                 ))
                 break
 
-            result = self._execute_single(call, owner_id, session_id)
+            result = await self._execute_single(call, owner_id, session_id)
             results.append(result)
 
         return results
 
-    def _execute_single(
+    async def _execute_single(
         self,
         call: dict[str, Any],
         owner_id: int,
@@ -147,17 +148,19 @@ class ToolExecutor:
 
         start = time.perf_counter()
         try:
-            import asyncio
-            loop = asyncio.get_event_loop()
-            tool_result: ToolResult = loop.run_until_complete(
-                asyncio.wait_for(
-                    tool.execute(self._context, arguments),
-                    timeout=TOOL_TIMEOUT_SECONDS,
-                )
+            tool_result: ToolResult = await asyncio.wait_for(
+                tool.execute(self._context, arguments),
+                timeout=TOOL_TIMEOUT_SECONDS,
             )
             latency_ms = (time.perf_counter() - start) * 1000
 
             self._record_history(owner_id, session_id, tool_name, arguments, tool_result, latency_ms)
+
+            from backend.ai import persistence
+            asyncio.ensure_future(persistence.record_tool_call(
+                owner_id, session_id, tool_name, arguments,
+                tool_result.success, tool_result.message, latency_ms,
+            ))
 
             return ToolExecutionResult(
                 tool_name=tool_name,
@@ -165,6 +168,16 @@ class ToolExecutor:
                 message=tool_result.message,
                 data=tool_result.data,
                 latency_ms=latency_ms,
+            )
+        except asyncio.TimeoutError:
+            latency_ms = (time.perf_counter() - start) * 1000
+            logger.warning("ToolExecutor: tool '%s' timed out", tool_name)
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool '{tool_name}' timed out.",
+                latency_ms=latency_ms,
+                error="timeout",
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000

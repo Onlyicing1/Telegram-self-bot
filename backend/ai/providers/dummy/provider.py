@@ -66,7 +66,7 @@ class DummyProvider(BaseProvider):
             "enabled": self.is_enabled,
         }
 
-    def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         return ProviderResponse(
             text=DUMMY_TEXT,
             provider_name=self.name,

@@ -74,7 +74,7 @@ class Dispatcher:
     def metrics(self) -> EngineMetrics:
         return self._metrics
 
-    def dispatch(self, request: AIRequest) -> EngineResult:
+    async def dispatch(self, request: AIRequest) -> EngineResult:
         """Execute ``request`` through the full pipeline. Never raises."""
         start = time.perf_counter()
         warnings: list[str] = []
@@ -116,7 +116,7 @@ class Dispatcher:
         # ── Stage 4: Provider ──
         try:
             messages = self._build_messages(prompt_package)
-            response: ProviderResponse = self._provider_manager.chat(messages)
+            response: ProviderResponse = await self._provider_manager.chat(messages)
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
