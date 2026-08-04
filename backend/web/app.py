@@ -29,7 +29,8 @@ def set_owner_id(owner_id: int) -> None:
 
 @app.get("/health")
 async def health():
-    return health_snapshot()
+    from backend.runtime.health_check import unified_snapshot
+    return unified_snapshot()
 
 
 @app.get("/api/saves")

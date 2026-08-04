@@ -96,6 +96,11 @@ class PromptBuilder:
     def build(self, context: ConversationContext) -> PromptPackage:
         """Assemble an immutable ``PromptPackage`` from a conversation context.
 
+        Enforces the token budget: if the estimated total exceeds the
+        configured max, history entries are trimmed from the oldest
+        until the budget is satisfied. The system rules, user message,
+        and output instructions are always preserved.
+
         Args:
             context: The ``ConversationContext`` produced by the Conversation Layer.
 
@@ -103,10 +108,12 @@ class PromptBuilder:
             A frozen ``PromptPackage`` with all sections in fixed order.
         """
         sections = self._render_sections(context)
-        budget = compute_budget(
-            sections,
-            language=context.language,
-        )
+        budget = compute_budget(sections, language=context.language)
+
+        if not budget.within_budget:
+            sections = self._trim_to_budget(context, sections)
+
+        budget = compute_budget(sections, language=context.language)
 
         package = PromptPackage(
             system_prompt=self._merge_system(sections),
@@ -242,3 +249,45 @@ class PromptBuilder:
         if ctx.tool.last_tool_result:
             return f"[Tool Results]\n{ctx.tool.last_tool_result}"
         return ""
+
+    def _trim_to_budget(
+        self,
+        ctx: ConversationContext,
+        sections: dict[PromptSection, str],
+    ) -> dict[PromptSection, str]:
+        """Trim history entries until the prompt fits within the token budget.
+
+        Preserves system rules, platform constraints, runtime rules,
+        user message, and output instructions. Only the conversation
+        state section (which contains history) is trimmed.
+        """
+        from backend.ai.prompt.budget import compute_budget, DEFAULT_MAX_TOTAL_TOKENS
+
+        history = list(ctx.history)
+        while history and not compute_budget(sections, language=ctx.language).within_budget:
+            history.pop(0)
+            trimmed_ctx = ConversationContext(
+                session_id=ctx.session_id,
+                owner_id=ctx.owner_id,
+                chat_id=ctx.chat_id,
+                message_id=ctx.message_id,
+                state=ctx.state,
+                current_menu=ctx.current_menu,
+                current_panel=ctx.current_panel,
+                current_category=ctx.current_category,
+                current_flow=ctx.current_flow,
+                pending_action=ctx.pending_action,
+                language=ctx.language,
+                timezone=ctx.timezone,
+                current_time=ctx.current_time,
+                user_text=ctx.user_text,
+                reply=ctx.reply,
+                tool=ctx.tool,
+                settings=ctx.settings,
+                runtime=ctx.runtime,
+                history=history,
+                created_at=ctx.created_at,
+            )
+            sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(trimmed_ctx)
+
+        return sections

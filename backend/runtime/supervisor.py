@@ -96,6 +96,7 @@ from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper.lifecycle import configure_lifecycle, get_lifecycle
 from backend.services import settings_service as settings_svc
 from backend.runtime.diagnostics import start_diagnostics, stop_diagnostics
+from backend.runtime.memory_cleanup import start_memory_cleanup, stop_memory_cleanup
 
 from backend.helper.target_context import clear_all as clear_all_targets
 
@@ -202,6 +203,14 @@ class RuntimeSupervisor:
         set_supervisor_ok(True)
         self._transition(RuntimeState.STARTING)
 
+        from backend.runtime.startup_check import run_startup_checks
+        report = run_startup_checks(self.cfg)
+        if not report.ok:
+            logger.error("[STARTUP] Critical checks failed — aborting startup")
+            self._transition(RuntimeState.FAILED)
+            self.shutdown_event.set()
+            return
+
         logger.info("[1/5] Database warm-up")
         db = db_client.get_db()
         if db:
@@ -269,6 +278,7 @@ class RuntimeSupervisor:
         start_heartbeat()
         start_failsafe()
         start_diagnostics()
+        start_memory_cleanup()
         self._task_supervisor_task = immortal_create_task(
             self._task_supervisor_loop(), name="lifeos-task-supervisor"
         )
@@ -1286,6 +1296,9 @@ class RuntimeSupervisor:
 
         logger.info("Shutdown: stopping diagnostics")
         await stop_diagnostics()
+
+        logger.info("Shutdown: stopping memory cleanup")
+        await stop_memory_cleanup()
 
         logger.info("Shutdown: stopping task supervisor")
         if self._task_supervisor_task and not self._task_supervisor_task.done():
