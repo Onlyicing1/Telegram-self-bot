@@ -33,6 +33,49 @@ async def health():
     return unified_snapshot()
 
 
+@app.get("/api/status")
+async def api_status():
+    from backend.observability.runtime_status import runtime_status
+    return runtime_status()
+
+
+@app.get("/api/ai/stats")
+async def api_ai_stats():
+    from backend.observability.ai_stats import ai_statistics
+    return ai_statistics()
+
+
+@app.get("/api/db/stats")
+async def api_db_stats():
+    from backend.observability.db_stats import database_statistics
+    return database_statistics(owner_id=_owner_id)
+
+
+@app.get("/api/health/snapshot")
+async def api_health_snapshot():
+    from backend.observability.health_snapshot import health_snapshot
+    return health_snapshot()
+
+
+@app.get("/api/performance")
+async def api_performance():
+    from backend.observability.performance import performance_report
+    return performance_report(owner_id=_owner_id)
+
+
+@app.get("/api/diagnostics/events")
+async def api_diagnostics_events(limit: int = 50, module: str | None = None, errors_only: bool = False):
+    from backend.diagnostics import filter_events
+    events = filter_events(limit=limit, module=module, errors_only=errors_only)
+    return {"events": events, "count": len(events)}
+
+
+@app.get("/api/maintenance")
+async def api_maintenance_report():
+    from backend.observability.maintenance import run_all_maintenance
+    return run_all_maintenance()
+
+
 @app.get("/api/saves")
 async def list_saves(limit: int = 50, offset: int = 0):
     try:
