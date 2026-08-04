@@ -44,6 +44,44 @@ def _pending_tasks() -> int:
         return 0
 
 
+def _ai_status() -> dict[str, Any]:
+    try:
+        from backend.ai.engine.engine import get_engine
+        engine = get_engine()
+        return {
+            "available": True,
+            "engine_health": engine.engine_health(),
+            "active_provider": engine.provider_manager.get_active_name(),
+            "active_model": _get_active_model(engine.provider_manager),
+            "provider_count": len(engine.provider_manager.list_providers()),
+            "total_requests": engine.metrics_snapshot().get("total_executions", 0),
+        }
+    except Exception:
+        return {"available": False}
+
+
+def _get_active_model(provider_mgr: Any) -> str:
+    try:
+        config = provider_mgr.get_provider_config()
+        return config.model if config and config.model else ""
+    except Exception:
+        return ""
+
+
+def _queue_sizes() -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    try:
+        from backend.helper.inline_engine import _self_client
+        client = _self_client
+        if client is not None and hasattr(client, "_updates"):
+            upd = client._updates
+            if hasattr(upd, "_pending"):
+                sizes["telegram_updates"] = len(upd._pending)
+    except Exception:
+        pass
+    return sizes
+
+
 def runtime_status() -> dict[str, Any]:
     """Return a runtime status snapshot.
 
@@ -51,6 +89,7 @@ def runtime_status() -> dict[str, Any]:
       - backend.health.snapshot()  (Telegram, supervisor, workers)
       - backend.health.get_all_loop_progress()  (background loops)
       - resource module  (memory, CPU)
+      - backend.ai.engine  (AI status, active provider/model)
     """
     from backend.health import snapshot as health_snap, get_all_loop_progress
 
@@ -80,4 +119,6 @@ def runtime_status() -> dict[str, Any]:
         "rpc_latency_ms": snap.get("rpc_latency_ms"),
         "last_rpc_s": snap.get("last_rpc_s"),
         "last_command_s": snap.get("last_command_s"),
+        "ai_status": _ai_status(),
+        "queue_sizes": _queue_sizes(),
     }

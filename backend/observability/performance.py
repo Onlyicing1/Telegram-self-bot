@@ -48,9 +48,11 @@ def performance_report(owner_id: int = 0) -> dict[str, Any]:
         "slowest_operations": slow_ops,
         "most_expensive_providers": most_expensive_providers,
         "memory_mb": runtime.get("memory_mb", 0),
+        "memory_growth_mb": _memory_growth(),
         "cpu_time_s": runtime.get("cpu_time_s", 0),
         "pending_tasks": runtime.get("pending_tasks", 0),
         "background_loops": runtime.get("background_loops", {}),
+        "background_loops_health": _loop_health_summary(runtime.get("background_loops", {})),
         "watchdog_ok": runtime.get("watchdog_ok", False),
         "recent_errors": len(error_events),
         "total_ai_requests": metrics.get("total_executions", 0),
@@ -86,3 +88,30 @@ def _rank_providers_by_latency(provider_metrics: dict[str, dict[str, Any]]) -> l
         })
     ranked.sort(key=lambda p: p.get("average_latency", 0), reverse=True)
     return ranked
+
+
+_prev_memory_mb: float = 0.0
+
+
+def _memory_growth() -> float:
+    """Compute memory growth since the last performance report sample."""
+    global _prev_memory_mb
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        growth = round(rss - _prev_memory_mb, 2) if _prev_memory_mb > 0 else 0.0
+        _prev_memory_mb = rss
+        return growth
+    except Exception:
+        return 0.0
+
+
+def _loop_health_summary(loops: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Summarize background loop health from loop progress data."""
+    total = len(loops)
+    running = sum(1 for v in loops.values() if v.get("state") == "RUNNING")
+    return {
+        "total_loops": total,
+        "running_loops": running,
+        "all_healthy": total > 0 and running == total,
+    }

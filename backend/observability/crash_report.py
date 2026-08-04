@@ -54,11 +54,17 @@ def generate_crash_report(
         "runtime_state": snap.get("runtime_state", "unknown"),
         "active_provider": active_provider,
         "active_session": active_session,
+        "memory_summary": {
+            "memory_mb": runtime.get("memory_mb", 0),
+            "cpu_time_s": runtime.get("cpu_time_s", 0),
+            "pending_tasks": runtime.get("pending_tasks", 0),
+        },
         "memory_mb": runtime.get("memory_mb", 0),
         "pending_tasks": runtime.get("pending_tasks", 0),
         "uptime_s": snap.get("uptime_s"),
         "restart_count": snap.get("restart_count", 0),
         "client_generation": snap.get("client_generation", 0),
+        "ai_status": runtime.get("ai_status", {}),
     }
 
 
@@ -78,6 +84,12 @@ def format_crash_report(report: dict[str, Any]) -> str:
         f"Uptime (s):      {report.get('uptime_s')}",
         f"Restart Count:   {report.get('restart_count', 0)}",
         f"Client Gen:      {report.get('client_generation', 0)}",
+        f"",
+        f"--- Memory Summary ---",
+        f"Memory (MB):     {report.get('memory_summary', {}).get('memory_mb', 0)}",
+        f"CPU Time (s):    {report.get('memory_summary', {}).get('cpu_time_s', 0)}",
+        f"Pending Tasks:   {report.get('memory_summary', {}).get('pending_tasks', 0)}",
+        f"AI Status:       {report.get('ai_status', {})}",
         f"",
         f"--- Stack Trace ---",
         report.get("stack_trace", ""),

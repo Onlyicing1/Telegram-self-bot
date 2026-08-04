@@ -100,6 +100,39 @@ def run_all_maintenance() -> dict[str, Any]:
     return {
         "cleanup_expired_memory": cleanup_expired_memory(),
         "cleanup_old_diagnostics": cleanup_old_diagnostics(),
+        "cleanup_old_statistics": cleanup_old_statistics(),
         "validate_repositories": validate_repositories(),
         "validate_runtime_state": validate_runtime_state(),
     }
+
+
+def cleanup_old_statistics() -> dict[str, Any]:
+    """Reset stale AI engine metrics to prevent unbounded growth.
+
+    The EngineMetrics object accumulates in RAM. This safely resets it
+    when the total execution count exceeds a threshold. Non-destructive —
+    only resets aggregate counters, never touches sessions or memory.
+    """
+    _RESET_THRESHOLD = 10000
+    try:
+        from backend.ai.engine.engine import get_engine
+        engine = get_engine()
+        snap = engine.metrics_snapshot()
+        total = snap.get("total_executions", 0)
+        if total > _RESET_THRESHOLD:
+            engine._metrics.reset()
+            return {
+                "action": "cleanup_old_statistics",
+                "reset": True,
+                "previous_total": total,
+                "ok": True,
+            }
+        return {
+            "action": "cleanup_old_statistics",
+            "reset": False,
+            "current_total": total,
+            "threshold": _RESET_THRESHOLD,
+            "ok": True,
+        }
+    except Exception as exc:
+        return {"action": "cleanup_old_statistics", "ok": False, "error": str(exc)}
