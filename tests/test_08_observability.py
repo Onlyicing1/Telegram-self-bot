@@ -161,3 +161,82 @@ async def test_tool_usage_frequency():
     from backend.observability.ai_stats import tool_usage_frequency
     freq = tool_usage_frequency(owner_id=1)
     assert isinstance(freq, dict)
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_includes_ai_status():
+    from backend.observability.runtime_status import runtime_status
+    status = runtime_status()
+    assert "ai_status" in status
+    assert "available" in status["ai_status"]
+    assert "queue_sizes" in status
+
+
+@pytest.mark.asyncio
+async def test_ai_statistics_includes_cost_and_model_usage():
+    from backend.observability.ai_stats import ai_statistics
+    stats = ai_statistics()
+    assert "cost_estimation" in stats
+    assert "estimated_cost_usd" in stats["cost_estimation"]
+    assert "model_usage" in stats
+    assert "tool_usage" in stats
+
+
+@pytest.mark.asyncio
+async def test_database_statistics_includes_latency():
+    from backend.observability.db_stats import database_statistics
+    stats = database_statistics()
+    assert "database_latency_ms" in stats
+    assert "slow_queries" in stats
+    assert isinstance(stats["slow_queries"], list)
+
+
+@pytest.mark.asyncio
+async def test_crash_report_includes_memory_summary():
+    from backend.observability.crash_report import generate_crash_report
+    exc = ValueError("Test crash")
+    report = generate_crash_report(
+        component="test_component",
+        exc=exc,
+        active_provider="dummy",
+        active_session="sess-test",
+    )
+    assert "memory_summary" in report
+    assert "memory_mb" in report["memory_summary"]
+    assert "cpu_time_s" in report["memory_summary"]
+    assert "pending_tasks" in report["memory_summary"]
+    assert "ai_status" in report
+
+
+@pytest.mark.asyncio
+async def test_performance_report_includes_memory_growth():
+    from backend.observability.performance import performance_report
+    report = performance_report()
+    assert "memory_growth_mb" in report
+    assert "background_loops_health" in report
+    assert "total_loops" in report["background_loops_health"]
+
+
+@pytest.mark.asyncio
+async def test_maintenance_includes_cleanup_old_statistics():
+    from backend.observability.maintenance import run_all_maintenance, cleanup_old_statistics
+    result = run_all_maintenance()
+    assert "cleanup_old_statistics" in result
+    direct = cleanup_old_statistics()
+    assert direct["action"] == "cleanup_old_statistics"
+    assert direct["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_duplicated_health_checks():
+    """Verify health_check and observability don't duplicate checks."""
+    from backend.runtime.health_check import unified_snapshot, _CHECKS
+    from backend.observability.health_snapshot import health_snapshot
+
+    base = unified_snapshot()
+    extended = health_snapshot()
+
+    # The extended snapshot should contain the same checks dict
+    assert base["checks"] == extended["checks"]
+    # No new health check functions should have been added
+    assert len(_CHECKS) == 7
