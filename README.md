@@ -1,253 +1,620 @@
 # LifeOS — Telegram Self-Bot
 
-A production-grade **Telegram self-bot** (userbot) that turns your own Telegram account into a personal operating system. Save anything, search instantly, automate your profile bio and username, and keep your data organized — all through an interactive inline-button UI driven by a single headless Python process.
+A production-grade **Telegram self-bot** (userbot) that turns your own
+Telegram account into a personal operating system. Save anything, search
+instantly, automate your profile bio and username, and keep your data
+organized — all through an interactive inline-button UI driven by a
+single headless Python process.
 
-Built on **Telethon** + **Supabase** + **FastAPI** + **React**, deployed on **Render**.
+Built on **Telethon** + **Supabase** + **FastAPI** + **React**, deployed
+on **Render**.
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
+1. [Project Overview](#project-overview)
 2. [Architecture](#architecture)
-3. [Features](#features)
-   - [Inline Glass UI](#inline-glass-ui)
-   - [Save System](#save-system)
-   - [Delete System](#delete-system)
-   - [Bio Engine](#bio-engine)
-   - [Username Engine](#username-engine)
-   - [Scheduler](#scheduler)
-   - [Runtime Supervisor](#runtime-supervisor)
-   - [Watchdog](#watchdog)
-   - [Diagnostics](#diagnostics)
-   - [Helper Bot](#helper-bot)
-   - [Supabase Support](#supabase-support)
-   - [Render Deployment](#render-deployment)
-4. [Database](#database)
-5. [Quick Start](#quick-start)
-6. [Environment Variables](#environment-variables)
-7. [Helper Bot Setup](#helper-bot-setup)
-8. [Commands](#commands)
-9. [Troubleshooting](#troubleshooting)
+3. [Directory Structure](#directory-structure)
+4. [AI Architecture](#ai-architecture)
+5. [Database Architecture](#database-architecture)
+6. [How AI Works](#how-ai-works)
+7. [How Providers Work](#how-providers-work)
+8. [How Memory Works](#how-memory-works)
+9. [How Tracing Works](#how-tracing-works)
+10. [How Background Workers Work](#how-background-workers-work)
+11. [How Supabase Is Organized](#how-supabase-is-organized)
+12. [How Deployment Works](#how-deployment-works)
+13. [Environment Variables](#environment-variables)
+14. [Render Deployment](#render-deployment)
+15. [Supabase Setup](#supabase-setup)
+16. [Development Workflow](#development-workflow)
+17. [Repository Philosophy](#repository-philosophy)
+18. [Features](#features)
+19. [Commands](#commands)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Overview
+## Project Overview
 
-LifeOS is a **self-bot** — it operates *your own* Telegram account via Telethon's `StringSession`. There is no separate bot account for commands. You type commands (`.save`, `.bio`, `.help`) in any chat, and the bot edits your message in-place with the result. Zero spam, zero new messages.
+LifeOS is a **self-bot** — it operates *your own* Telegram account via
+Telethon's `StringSession`. There is no separate bot account for commands.
+You type commands (`.save`, `.bio`, `.help`) in any chat, and the bot
+edits your message in-place with the result. Zero spam, zero new messages.
 
-When a helper bot token is configured, the full **Inline Glass UI** becomes available — interactive inline-button panels for every feature, replacing plain-text commands with a tap-to-navigate interface.
+When a helper bot token is configured, the full **Inline Glass UI**
+becomes available — interactive inline-button panels for every feature.
 
 ### Key Highlights
 
 - **Headless** — runs as a single `asyncio` process, no interactive login.
-- **Self-healing** — a runtime supervisor with watchdog automatically detects disconnections and rebuilds the client.
-- **Resilient** — degrades gracefully when Supabase is unavailable (in-memory fallback).
-- **Zero-spam** — all command responses edit the triggering message in-place.
-- **Owner-only** — every command and callback is gated by a single permission check.
+- **Self-healing** — runtime supervisor with watchdog detects
+  disconnections and rebuilds the client automatically.
+- **Resilient** — degrades gracefully when Supabase is unavailable
+  (in-memory fallback for every table).
+- **Zero-spam** — all command responses edit the triggering message
+  in-place.
+- **Owner-only** — every command and callback is gated by a single
+  permission check.
+- **AI-ready** — a complete nested engine architecture with provider
+  abstraction, memory tiers, and tool execution, activated by
+  environment variables.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    backend/main.py                            │
-│                  (asyncio entry point)                        │
-│                                                              │
-│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────┐   │
-│  │  Telethon     │  │  FastAPI      │  │  Profile         │   │
-│  │  Self-Client  │  │  Web Server   │  │  Scheduler       │   │
-│  │  (StringSess) │  │  (Uvicorn)    │  │  (asyncio task)  │   │
-│  └──────┬────────┘  └──────┬────────┘  └────────┬─────────┘   │
-│         │                  │                    │             │
-│  ┌──────┴────────┐  ┌──────┴────────┐  ┌───────┴──────────┐   │
-│  │  Bot Handlers  │  │  Web Routes   │  │  Bio Engine       │   │
-│  │  (commands)    │  │  (/health,    │  │  Username Engine  │   │
-│  │                │  │   /api/*)     │  │  (updaters)       │   │
-│  └──────┬────────┘  └───────────────┘  └──────────────────┘   │
-│         │                                                    │
-│  ┌──────┴──────────────────────────────────────────────────┐ │
-│  │              Services Layer                               │ │
-│  │  save_service, retrieve_service, delete_service,         │ │
-│  │  bio_service, username_service, settings_service,        │ │
-│  │  database_service, discover_service                      │ │
-│  └──────┬──────────────────────────────────────────────────┘ │
-│         │                                                    │
-│  ┌──────┴───────┐  ┌───────────────┐  ┌──────────────────┐   │
-│  │  DB Client    │  │  Helper Bot   │  │  Runtime          │   │
-│  │  (Supabase)   │  │  (Telethon)   │  │  Supervisor       │   │
-│  └───────────────┘  └───────────────┘  └──────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      backend/main.py                              │
+│                    (asyncio entry point)                          │
+│                                                                  │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────────┐   │
+│  │  Telethon     │  │  FastAPI      │  │  Profile Scheduler   │   │
+│  │  Self-Client  │  │  Web Server   │  │  (asyncio task)      │   │
+│  │  (StringSess) │  │  (Uvicorn)    │  │                      │   │
+│  └──────┬────────┘  └──────┬────────┘  └─────────┬────────────┘   │
+│         │                  │                     │                │
+│  ┌──────┴────────┐  ┌──────┴────────┐  ┌────────┴────────────┐   │
+│  │  Bot Handlers  │  │  Web Routes   │  │  Bio Engine          │   │
+│  │  (commands +   │  │  (/health,    │  │  Username Engine     │   │
+│  │   AI handler)  │  │   /api/*)     │  │  (updaters)          │   │
+│  └──────┬────────┘  └───────────────┘  └──────────────────────┘   │
+│         │                                                        │
+│  ┌──────┴──────────────────────────────────────────────────────┐ │
+│  │                   Services Layer                              │ │
+│  │  save, retrieve, delete, discover, organize,                  │ │
+│  │  bio, username, settings, database                            │ │
+│  └──────┬──────────────────────────────────────────────────────┘ │
+│         │                                                        │
+│  ┌──────┴───────┐  ┌───────────────┐  ┌──────────────────────┐   │
+│  │  DB Client    │  │  Helper Bot   │  │  Runtime Supervisor   │   │
+│  │  (Supabase)   │  │  (Telethon)   │  │  + Watchdog           │   │
+│  └───────────────┘  └───────────────┘  └──────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────────┐│
+│  │                   AI Subsystem (backend/ai/)                  ││
+│  │  Engine → Dispatcher → Prompt Builder → Provider Manager      ││
+│  │  Memory (short/long/permanent) · Tools · Config               ││
+│  └──────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-The entire application runs as a single Python `asyncio` process. Telethon, Uvicorn, the profile scheduler, the watchdog, and the heartbeat all share one event loop. No threads, no multiprocessing.
+The entire application runs as a single Python `asyncio` process.
+Telethon, Uvicorn, the profile scheduler, the watchdog, and the
+heartbeat all share one event loop. No threads, no multiprocessing.
 
 ---
 
-## Features
+## Directory Structure
 
-### Inline Glass UI
-
-The Glass Panel system provides interactive inline-button panels for all commands and settings. It replaces the old plain-text command interface with a tap-to-navigate experience.
-
-- **Panel types**: Help menu, Context panel, Settings, Health dashboard, Diagnostics, Logs, Save, Retrieve, Database, Discover, Bio Engine, Username Engine.
-- **Navigation**: hierarchical Back / Home / Close navigation with session tracking per chat.
-- **Auto-close**: panels automatically close after a configurable timeout (default 120 seconds).
-- **Input mode**: panels that need user input (save codes, bio text, settings values) transition to an input state and listen for the owner's next message.
-- **Template builder**: visual sequential template builder for Bio and Username engines — tap variables to append them in order.
-- **Fallback**: when no helper bot is configured, all commands fall back to plain-text edit-in-place mode.
-
-### Save System
-
-The Save Engine provides two modes for preserving media to Saved Messages with full metadata:
-
-- **Forward save** (`.save f`) — forwards the replied message to Saved Messages instantly using Telegram's native forward API. No download required.
-- **Deep save** (`.save d`) — downloads the media, re-uploads to Saved Messages with a rich caption (sender, chat ID, message ID, timestamp, media type, MIME, size, filename, tags). Enforces a configurable file size limit (default 50 MB).
-- **Link save** — save media from a Telegram message link (`https://t.me/channel/123` or `https://t.me/c/123/456`).
-- **Metadata persistence** — every save records full metadata in the `saved_items` Supabase table: save code, type, origin/saved chat and message IDs, sender info, MIME type, file ID, file size, media type, tags, caption, and timestamp.
-- **Save codes** — compact, human-readable codes (e.g. `S0001`) generated atomically with collision detection.
-
-### Delete System
-
-Multi-mode message deletion with batch processing:
-
-- **Delete last N** (`.del <n>`) — deletes the last N outgoing messages in the current chat (1–500 range).
-- **Delete from message ID** (`.del id <msgid>`) — deletes all outgoing messages from a given message ID forward.
-- **Delete by save code** (`.del <code>`) — deletes a saved item's Telegram message and its database row in one operation.
-- **Reply mode** — reply to any message to select it as the deletion starting point.
-- **Recent messages browser** — paginated inline list of recent outgoing messages for visual selection.
-- **Batch deletion** — deletes in configurable batch sizes (default 100) to avoid hitting Telegram API limits.
-
-### Bio Engine
-
-A timezone-synchronized cron that rewrites your Telegram profile bio ("about" field) every minute using a template with `{time}`, `{mood}`, and `{text}` tokens.
-
-- Fires exactly at each minute boundary (not a fixed interval).
-- Deduplicates — skips the API call when the bio string hasn't changed.
-- Handles `FloodWaitError` by sleeping the exact wait time.
-- Never terminates on recoverable errors — retries on the next tick.
-- Self-stopping — if `is_active` becomes `False` in the database, the loop exits on the next tick.
-- Fully inline — configure template, mood, text, and on/off state through the Glass UI.
-- State persisted in the `bio_state` Supabase table (one row per owner).
-
-### Username Engine
-
-Mirrors the Bio Engine exactly, but controls the Telegram `first_name` field instead of the `about` field.
-
-- Completely independent from the Bio Engine — each registers a separate updater.
-- Never shares runtime state with the Bio Engine.
-- Same template tokens: `{time}`, `{mood}`, `{text}`.
-- Same deduplication, flood-wait handling, and self-stopping behavior.
-- State persisted in the `username_state` Supabase table (one row per owner).
-- Fully inline configuration through the Glass UI.
-
-### Scheduler
-
-A shared **Profile Scheduler** (`backend/profile/scheduler.py`) fires once per minute at `HH:MM:00` and calls all registered profile updaters in a single pass.
-
-- Both the Bio Engine and Username Engine register updaters with the scheduler.
-- The scheduler collects each engine's desired profile fields and sends a **single** `UpdateProfileRequest` to Telegram per minute — never more.
-- Adding a new profile engine is as simple as calling `register_updater`.
-- Exponential backoff with jitter on crashes; automatic restart.
-- Bounded API timeouts (30 seconds) to prevent event-loop stalls.
-
-### Runtime Supervisor
-
-The `RuntimeSupervisor` (`backend/runtime/supervisor.py`) is the self-healing core that owns every runtime coroutine.
-
-- **FSM states**: STARTING → CONNECTING → AUTHORIZING → REGISTERING → READY → DEGRADED → RECOVERING → REBUILDING → STOPPING → FAILED.
-- **Atomic recovery**: lock-protected, single execution. Recovery sequence: stop cron engines → stop helper → clear panel state → cancel orphan tasks → dispose dead client → rebuild → re-register handlers → resume cron engines → verify with heartbeat.
-- **Limited retries**: exponential backoff with jitter. After 5 failed recovery attempts, the process exits with code 1 so Render restarts it automatically.
-- **Exactly one active self-client** at all times — a new client is only created after the old one is fully disposed.
-- **Signal handling**: SIGTERM/SIGINT triggers deterministic shutdown of all tasks, cron engines, helper bot, and self-client.
-
-### Watchdog
-
-A dedicated watchdog task runs every 30 seconds and performs a real RPC (`get_me`) as the heartbeat.
-
-- 3 consecutive heartbeat failures → client declared dead → recovery triggered.
-- **Update staleness detection**: if no Telegram updates arrive for a configurable threshold (default 300 seconds) while RPC is still healthy, the update-receive loop is declared stalled and the client is rebuilt.
-- Separately tracks heartbeat age, last RPC latency, last command, last update, last callback, and last event dispatch.
-- The watchdog never interferes with recovery in progress — it skips checks while the recovery lock is held.
-
-### Diagnostics
-
-Comprehensive diagnostics for debugging and monitoring:
-
-- **Event log** (`.logs`) — in-memory circular buffer of 500 events with module, action, duration, result, and details. Filterable by errors only or by module.
-- **Diagnostic snapshot** (`.kill`) — full system snapshot: process info, runtime state, Telethon status, helper status, supervisor task states, bio engine, database, event loop tasks with stack traces, and recent events. Includes stalled-task recovery.
-- **Asyncio task diagnostics** — dumps all running tasks with coroutine names, await points, awaited objects, and elapsed waiting times every 60 seconds. Detects event-loop stalls, deadlocks, task starvation, and slow event handlers.
-- **Runtime heartbeat** — structured system snapshot every 30 seconds with memory, CPU, task count, event loop latency, update queue size, and age tracking for all critical timestamps.
-
-### Helper Bot
-
-A **separate** Telethon client that operates a real bot account (via `BOT_TOKEN`). It enables the full Inline Glass UI.
-
-- **Inline buttons** — the Glass Panel system uses inline keyboard buttons, which require a real bot account (self-bots cannot send inline buttons).
-- **Callback handling** — processes button presses via callback queries with session management, navigation stacks, and input-state tracking.
-- **Panel lifecycle** — a `PanelLifecycleManager` owns all panel resources (sessions, timers, render caches, input state) with a single cleanup path for every exit route.
-- **Optional** — if `BOT_TOKEN` is not set, the bot falls back to plain-text edit-in-place mode for all commands.
-- **Auto-reconnect** — the helper bot supervisor reconnects with exponential backoff. After repeated failures, it marks the helper as permanently failed and stops retrying.
-
-### Supabase Support
-
-Supabase is the optional but recommended persistence layer. The bot is designed to run **with or without it**.
-
-- **When available**: all data persists across restarts. The backend uses the service-role key, which bypasses RLS for all writes.
-- **When unavailable**: all operations degrade to in-memory storage. The bot continues to function normally — every command works. Data does not persist across restarts.
-- **Tables**: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`.
-- **RLS**: enabled on all tables. Only SELECT is granted to `anon` + `authenticated` (read-only dashboard access). No write policies for anon/authenticated.
-- **Threaded DB calls**: all Supabase operations run in a thread with a bounded timeout (10 seconds) via `asyncio.to_thread()`, so the event loop never blocks on slow or stalled HTTP responses.
-- **Settings service**: panel configuration is stored as typed columns on the `panel_settings` table with a cache-first read, write-through cache architecture, and per-setting validators.
-
-### Render Deployment
-
-The bot is designed for Render's Free tier and deploys as a single web service.
-
-- **Procfile**: `web: python -m backend.main` — the start command.
-- **Health check**: the FastAPI server exposes `/health` which returns the runtime health snapshot.
-- **Environment variables**: all secrets are provided via Render's environment variable dashboard. The `render.yaml` Blueprint defines the service and all env vars.
-- **Auto-restart**: if the runtime supervisor exhausts recovery attempts, it calls `sys.exit(1)` so Render restarts the process.
-- **Dashboard**: the React dashboard is built with Vite and served by FastAPI from `dist/` if present. It polls the API every 30 seconds.
+```
+lifeos/
+├── backend/                    # Python backend (single asyncio process)
+│   ├── main.py                 # Entry point — starts everything
+│   ├── config.py               # Env var loader (required + optional)
+│   ├── diagnostics.py          # In-memory event log (500-entry buffer)
+│   ├── health.py               # Health snapshot builder
+│   │
+│   ├── bot/                    # Telegram self-bot layer
+│   │   ├── client.py           # Telethon StringSession client
+│   │   ├── router.py           # Command router (all . commands)
+│   │   └── handlers/           # Per-feature command handlers
+│   │       ├── ai_cmd.py       # .ai command handler
+│   │       ├── ai.py           # AI Glass Panel (settings, provider, etc.)
+│   │       ├── bio.py          # .bio command + panel
+│   │       ├── database.py     # .db command + panel
+│   │       ├── delete.py       # .del command + panel
+│   │       ├── discover.py     # .list, .find commands
+│   │       ├── guard.py        # Owner-only permission check
+│   │       ├── misc.py         # .ping, .id, .help, .health, .kill
+│   │       ├── organize.py     # LifeOS status panel
+│   │       ├── retrieve.py     # .retrieve, .preview, .send
+│   │       ├── save.py         # .save command + panel
+│   │       └── username.py     # .username command + panel
+│   │
+│   ├── services/               # Business logic (between handlers and DB)
+│   │   ├── save_service.py
+│   │   ├── retrieve_service.py
+│   │   ├── delete_service.py
+│   │   ├── discover_service.py
+│   │   ├── organize_service.py
+│   │   ├── bio_service.py
+│   │   ├── username_service.py
+│   │   ├── database_service.py
+│   │   ├── settings_service.py          # Panel settings (cache + validation)
+│   │   └── panel_settings_repository.py # Raw DB access for panel_settings
+│   │
+│   ├── db/                     # Supabase client + CRUD
+│   │   └── client.py           # Singleton client, threaded calls, fallback
+│   │
+│   ├── bio/                    # Bio cron engine
+│   │   └── engine.py           # Template rendering + scheduler registration
+│   │
+│   ├── username/               # Username cron engine
+│   │   └── engine.py           # Template rendering + scheduler registration
+│   │
+│   ├── profile/                # Shared profile scheduler
+│   │   └── scheduler.py        # Per-minute cron, merges all updaters
+│   │
+│   ├── runtime/                # Self-healing runtime
+│   │   ├── supervisor.py       # FSM-based recovery (10 states)
+│   │   ├── watchdog.py         # 30s heartbeat + update staleness
+│   │   ├── heartbeat.py        # Structured system snapshot
+│   │   ├── tracer.py           # @trace decorator for event logging
+│   │   ├── task_guard.py       # Cancelable task wrapper
+│   │   ├── managed_task.py     # Supervised task lifecycle
+│   │   ├── failsafe.py         # Crash boundary
+│   │   ├── keepalive.py        # Keep-alive pings
+│   │   └── states.py           # Runtime FSM state enum
+│   │
+│   ├── helper/                 # Helper bot + Glass Panel UI
+│   │   ├── client.py           # Helper bot Telethon client
+│   │   ├── panels.py           # Panel rendering + lifecycle
+│   │   ├── panel_render.py     # Inline message rendering
+│   │   ├── panel_registry.py   # Panel type registration
+│   │   ├── panel_settings.py   # Settings panel
+│   │   ├── panel_selftest.py   # Self-test panel
+│   │   ├── panel_timer.py      # Auto-close timer
+│   │   ├── callback_trace.py   # Callback tracing
+│   │   ├── inline_engine.py    # Inline query engine
+│   │   ├── inline_sender.py    # Inline result sender
+│   │   ├── input_state.py      # Input mode state machine
+│   │   ├── session_manager.py  # Per-chat panel sessions
+│   │   ├── lifecycle.py        # Panel lifecycle manager
+│   │   ├── pagination.py       # Paginated list rendering
+│   │   ├── target_context.py   # Reply target resolution
+│   │   ├── context.py          # Helper context types
+│   │   ├── rpc_timeout.py      # RPC timeout guard
+│   │   └── watchdog.py         # Helper bot watchdog
+│   │
+│   ├── telegram_api/           # Telegram API wrappers
+│   │   ├── api.py              # High-level API
+│   │   ├── messages.py         # Message operations
+│   │   ├── media.py            # Media operations
+│   │   ├── profile.py          # Profile operations
+│   │   ├── entities.py         # Entity types
+│   │   ├── exceptions.py       # API exceptions
+│   │   └── _helpers.py         # Internal helpers
+│   │
+│   ├── web/                    # FastAPI web server
+│   │   └── app.py              # Health check + dashboard API + SPA
+│   │
+│   └── ai/                     # AI subsystem (see AI Architecture below)
+│       ├── __init__.py         # Public exports: Engine, AIRequest
+│       ├── persistence.py      # Supabase persistence for AI tables
+│       ├── engine/             # Execution engine
+│       ├── providers/          # LLM provider abstraction
+│       ├── conversation/       # Conversation context + history
+│       ├── session/            # AIRequest (input type)
+│       ├── prompt/             # Prompt building + budget
+│       ├── memory/             # Three-tier memory
+│       ├── tools/              # Tool registry + executor
+│       ├── config/             # AI configuration + ENV loading
+│       ├── runtime/            # In-memory conversation state
+│       └── database/           # Repository interfaces for AI tables
+│
+├── src/                        # React dashboard (Vite + TypeScript)
+├── sql/                        # Consolidated SQL scripts (5 core tables)
+├── render.yaml                 # Render Blueprint
+├── AI_MASTER_DESIGN.md         # AI architecture spec
+├── DATABASE_ARCHITECTURE.md    # Complete database schema reference
+├── AGENTS.md                   # Agent guidelines
+└── package.json                # Frontend build config
+```
 
 ---
 
-## Database
+## AI Architecture
 
-Five tables in the `public` schema:
+The AI subsystem (`backend/ai/`) is a complete nested engine
+architecture for conversational AI. It is **not wired into the main bot
+startup by default** — it activates when `AI_ENABLED=true` and a provider
+API key is configured. Without an API key, the DummyProvider returns a
+deterministic placeholder.
+
+### Single Entry Point
+
+The **Engine** (`backend/ai/engine/engine.py`) is the ONLY public entry
+point for AI execution:
+
+```python
+from backend.ai import get_engine, AIRequest
+
+engine = get_engine()
+result = await engine.execute(AIRequest(
+    session_id="owner-123",
+    user_message="Hello",
+    owner_id=123,
+))
+```
+
+### Execution Pipeline
+
+```
+AIRequest (immutable input)
+    │
+    ▼
+Engine — the ONLY public entry point
+    │
+    ├── Dispatcher — 6-stage execution spine
+    │     1. Conversation Runtime — get/create session, add user message
+    │     2. Prompt Builder — system prompt + context + memory + budget
+    │     3. Provider Manager — route to active provider, fallback chain
+    │     4. Provider — call the LLM (or dummy)
+    │     5. Conversation Update — add assistant response to history
+    │     6. Result — build EngineResult with tokens, latency, warnings
+    │
+    └── EngineResult (immutable output)
+```
+
+### Layers
+
+| Layer | Package | Responsibility |
+|---|---|---|
+| Engine | `engine/` | Public entry point, hooks, metrics |
+| Dispatcher | `engine/dispatcher.py` | 6-stage execution spine |
+| Providers | `providers/` | LLM abstraction, routing, fallback, metrics |
+| Conversation | `conversation/` | Context assembly, history, state machine |
+| Session | `session/` | `AIRequest` input type |
+| Prompt | `prompt/` | System prompt, budget estimation, formatting |
+| Memory | `memory/` | Short, long, permanent memory tiers |
+| Tools | `tools/` | Tool registry, executor, context |
+| Config | `config/` | ConfigManager, ENV loading, validation |
+| Runtime | `runtime/` | In-memory conversation state, token estimation |
+| Database | `database/` | Repository interfaces (in-memory fallbacks) |
+| Persistence | `persistence.py` | Supabase persistence for AI tables |
+
+See [AI_MASTER_DESIGN.md](AI_MASTER_DESIGN.md) for the full specification.
+
+---
+
+## Database Architecture
+
+The database has **10 tables** in Supabase's `public` schema — 5 core
+tables and 5 AI tables. All tables have RLS enabled. The backend uses
+the service-role key (bypasses RLS). The frontend reads via the backend
+API — it never touches Supabase directly.
+
+### Core Tables (migrations applied)
 
 | Table | Purpose |
 |---|---|
-| `saved_items` | Media save records (forward + deep) with full metadata |
-| `bio_state` | Singleton-per-owner bio engine state — template, mood, text, is_active |
-| `username_state` | Singleton-per-owner username engine state — template, mood, text, is_active |
-| `bot_logs` | Structured activity log — level, message, JSONB context |
-| `panel_settings` | Glass Panel configuration — 13 typed columns (auto-close, limits, diagnostics, etc.) |
+| `saved_items` | Media save records with full metadata |
+| `bio_state` | Bio cron engine state (singleton per owner) |
+| `username_state` | Username cron engine state (singleton per owner) |
+| `bot_logs` | Structured activity log |
+| `panel_settings` | Glass Panel configuration (12 typed columns) |
 
-The Bio Engine and Username Engine have **completely independent persistence** — separate tables, separate state, separate updaters. They never share runtime state. The only coupling is that the shared Profile Scheduler merges their outputs into a single `UpdateProfileRequest` API call per minute.
+### AI Tables (migrations not yet applied)
 
-All tables have RLS enabled. SELECT is granted to `anon` + `authenticated` (dashboard reads). All writes use the service-role key, which bypasses RLS.
+| Table | Purpose |
+|---|---|
+| `ai_sessions` | AI conversation session metadata |
+| `ai_messages` | Individual AI messages |
+| `ai_memories` | Three-tier memory (short, long, permanent) |
+| `ai_tool_history` | Log of every tool call |
+| `ai_provider_stats` | Per-provider aggregate statistics |
 
-For the full schema reference, see [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md).
+The AI subsystem currently operates entirely in-memory. When migrations
+are added, the tables should match the schema in
+[DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md).
+
+For the complete schema reference (every column, type, index,
+constraint, and RLS policy), see
+[DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md).
 
 ---
 
-## Quick Start
+## How AI Works
+
+1. The owner sends `.ai <message>` in any chat.
+2. The `ai_cmd.py` handler builds an `AIRequest` and calls
+   `engine.execute(request)`.
+3. The Engine delegates to the Dispatcher, which runs 6 stages:
+   - Gets or creates a conversation session for the owner
+   - Builds the prompt (system prompt + conversation history + memory)
+   - Routes to the active provider (with fallback chain)
+   - Calls the provider's `chat()` method
+   - Updates the conversation history with the response
+   - Returns an `EngineResult`
+4. The handler edits the triggering message with the AI response.
+5. If the provider returned tool calls, the ToolExecutor runs them
+   (READ_ONLY and READ_WRITE auto-execute; DANGEROUS and ADMIN_ONLY
+   require owner confirmation).
+
+Without an API key, the DummyProvider returns a deterministic
+placeholder — no network calls are ever made.
+
+---
+
+## How Providers Work
+
+The provider layer (`backend/ai/providers/`) abstracts LLM providers
+behind a single interface. The rest of the system never references a
+provider by name — it calls `ProviderManager.chat()`.
+
+### Provider Registry
+
+All providers are registered in a `ProviderRegistry`. The
+`ProviderManager` routes requests to the active provider and handles
+fallback.
+
+### Available Providers
+
+| Provider | Status | Notes |
+|---|---|---|
+| `dummy` | Active (default) | Deterministic placeholder, no network |
+| `gemini` | Real implementation | Google Gemini API |
+| `openai` | Real implementation | OpenAI GPT, supports custom base URLs |
+| `openrouter` | Real implementation | OpenRouter (100+ models via one API) |
+| `cerebras` | Real implementation | Cerebras inference (OpenAI-compatible) |
+| `groq` | Real implementation | Groq inference (OpenAI-compatible) |
+| `mistral` | Real implementation | Mistral AI (OpenAI-compatible) |
+
+All providers except `dummy` subclass `OpenAICompatProvider`, which
+implements the OpenAI-compatible chat completions API via `httpx` with
+retry, exponential backoff, and usage parsing.
+
+### Configuration
+
+Providers are configured via environment variables (`AI_*` prefix).
+See [Environment Variables](#environment-variables) below.
+
+### Adding a New Provider
+
+1. Create `backend/ai/providers/<name>.py` with a class inheriting from
+   `OpenAICompatProvider` (or `BaseProvider` for non-OpenAI-compatible).
+2. Set `PROVIDER_NAME` and `PROVIDER_VERSION`.
+3. Add defaults to `base/defaults.py`.
+4. Add the class to `_PROVIDER_CLASSES` in `factory.py`.
+5. Import and export it in `providers/__init__.py`.
+
+---
+
+## How Memory Works
+
+The memory system (`backend/ai/memory/`) implements a three-tier
+architecture:
+
+| Tier | Retention | Storage | Purpose |
+|---|---|---|---|
+| Short | Per-request (RAM only) | `ShortMemory` | Scratch pad for the current turn |
+| Long | 90 days | `ai_memories` table | Cross-session summaries |
+| Permanent | Never expires | `ai_memories` table | Always-in-prompt facts |
+
+The `MemoryManager` owns all three tiers and provides a single
+`retrieve_for_prompt()` method that returns text blocks for the Prompt
+Builder. Permanent memory is always injected. Long memory is filtered by
+relevance and importance. Short memory is cleared after each turn.
+
+When Supabase is unavailable, memories use in-memory fallbacks (data is
+lost on restart).
+
+---
+
+## How Tracing Works
+
+The `backend/runtime/tracer.py` module provides a `@trace` decorator
+and `trace()` function that record events into the in-memory
+`diagnostics.py` circular buffer (500 entries). Every traced event
+captures:
+
+- Module name
+- Action
+- Duration
+- Result (SUCCESS / FAILED / ERROR)
+- Details (error message or summary)
+
+Events are visible via the `.logs` command and the `.kill` diagnostic
+snapshot. The tracer never blocks — it writes to an in-memory list.
+
+---
+
+## How Background Workers Work
+
+The bot runs several supervised background tasks, all sharing the single
+event loop:
+
+| Worker | Module | Schedule | Purpose |
+|---|---|---|---|
+| Profile Scheduler | `profile/scheduler.py` | Every minute at `HH:MM:00` | Merges bio + username updaters into one `UpdateProfileRequest` |
+| Watchdog | `runtime/watchdog.py` | Every 30 seconds | Heartbeat RPC + update staleness detection |
+| Heartbeat | `runtime/heartbeat.py` | Every 30 seconds | Structured system snapshot (memory, CPU, tasks) |
+| Task Diagnostics | `runtime/supervisor.py` | Every 60 seconds | Dumps all asyncio tasks with stack traces |
+| Panel Timers | `helper/panel_timer.py` | Per-panel (default 120s) | Auto-close idle panels |
+
+All workers are supervised by the `RuntimeSupervisor`, which uses a
+10-state FSM (STARTING → CONNECTING → ... → READY → DEGRADED →
+RECOVERING → ...). On crash, the supervisor performs atomic recovery:
+stop cron engines → stop helper → clear panels → cancel orphans →
+dispose dead client → rebuild → re-register handlers → resume cron.
+After 5 failed recovery attempts, the process exits with code 1 so
+Render restarts it.
+
+---
+
+## How Supabase Is Organized
+
+- **Schema**: `public` (default)
+- **Client**: `backend/db/client.py` — singleton, initialized on first
+  access. Uses `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`.
+- **Threading**: All Supabase calls run in a worker thread via
+  `asyncio.to_thread()` with a 10-second timeout. The event loop never
+  blocks on HTTP.
+- **Fallback**: When Supabase is unavailable (missing env vars or
+  connection failure), every operation degrades to in-memory storage.
+  The bot never crashes.
+- **RLS**: Enabled on all tables. SELECT granted to `anon` +
+  `authenticated` (read-only dashboard). All writes use the service-role
+  key, which bypasses RLS.
+- **Panel Settings**: Uses a column-per-setting model (12 typed columns)
+  with a cache-first read, write-through cache architecture.
+
+---
+
+## How Deployment Works
+
+The bot deploys as a **single web service** on Render:
+
+1. **Start command**: `python -m backend.main`
+2. **Health check**: FastAPI exposes `/health` → Render probes this
+3. **Auto-restart**: If the supervisor exhausts recovery attempts, it
+   calls `sys.exit(1)` so Render restarts the process
+4. **Dashboard**: React dashboard built with Vite, served by FastAPI
+   from `dist/` if present
+5. **Environment**: All secrets provided via Render's env var dashboard
+   (or `render.yaml` Blueprint)
+
+---
+
+## Environment Variables
+
+### Required
+
+| Variable | Type | Description |
+|---|---|---|
+| `API_ID` | int | Telegram API ID from my.telegram.org |
+| `API_HASH` | str | Telegram API Hash from my.telegram.org |
+| `SESSION_STRING` | str | Telethon StringSession (generated offline) |
+| `BOT_OWNER_ID` | int | Telegram numeric user ID of the bot owner |
+
+### Optional — Core
+
+| Variable | Default | Description |
+|---|---|---|
+| `BOT_TOKEN` | `""` | Helper bot token for Inline Glass UI |
+| `SUPABASE_URL` | `""` | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | `""` | Supabase service role key |
+| `TZ` | `Asia/Tehran` | Timezone for bio/username engines |
+| `PORT` | `8000` | Web server port |
+| `BIO_UPDATE_ENABLED` | `false` | Auto-start bio cron on boot |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+
+### Optional — AI
+
+All AI variables are optional. AI is off by default.
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_ENABLED` | `false` | Enable the AI subsystem |
+| `AI_PROVIDER` | `dummy` | Active provider name |
+| `AI_MODEL` | provider default | Model name |
+| `AI_TEMPERATURE` | `1.0` | Sampling temperature |
+| `AI_TOP_P` | `1.0` | Nucleus sampling |
+| `AI_MAX_TOKENS` | `4096` | Max output tokens |
+| `AI_TIMEOUT` | `30` | Request timeout (seconds) |
+| `AI_RETRY_COUNT` | `3` | Retry count on failure |
+| `AI_PROVIDER_FALLBACK` | `""` | Comma-separated fallback chain |
+| `AI_MEMORY_RETENTION_DAYS` | `90` | Long memory retention |
+
+### Optional — AI Provider Keys
+
+| Variable | Description |
+|---|---|
+| `AI_GEMINI_API_KEY` | Gemini API key |
+| `AI_OPENAI_API_KEY` | OpenAI API key |
+| `AI_OPENROUTER_API_KEY` | OpenRouter API key |
+| `AI_GROQ_API_KEY` | Groq API key |
+| `AI_CEREBRAS_API_KEY` | Cerebras API key |
+| `AI_MISTRAL_API_KEY` | Mistral API key |
+
+### Optional — AI Provider Model Overrides
+
+| Variable | Description |
+|---|---|
+| `AI_GEMINI_MODEL` | Gemini model name |
+| `AI_OPENAI_MODEL` | OpenAI model name |
+| `AI_OPENROUTER_MODEL` | OpenRouter model name |
+| `AI_GROQ_MODEL` | Groq model name |
+| `AI_CEREBRAS_MODEL` | Cerebras model name |
+| `AI_MISTRAL_MODEL` | Mistral model name |
+
+---
+
+## Render Deployment
+
+The bot is designed for Render's Free tier and deploys as a single web
+service.
+
+1. **Create a new web service** on Render from this repository.
+2. **Set the start command**: `python -m backend.main`
+3. **Set the health check path**: `/health`
+4. **Add environment variables** (see above) via Render's dashboard or
+   `render.yaml` Blueprint.
+5. **Deploy** — Render builds and starts the process.
+
+If the runtime supervisor exhausts recovery attempts, it calls
+`sys.exit(1)` so Render restarts the process automatically.
+
+The `render.yaml` Blueprint in the repository defines the service and
+all environment variables. Import it on Render for one-click setup.
+
+---
+
+## Supabase Setup
+
+Supabase is optional but recommended for persistence across restarts.
+
+1. **Create a Supabase project** at [supabase.com](https://supabase.com).
+2. **Run the SQL scripts** in the `sql/` directory via the Supabase SQL
+   editor. These create the 5 core tables with all columns, indexes,
+   and RLS policies.
+3. **Copy the project URL** and **service role key** from
+   Settings → API.
+4. **Set environment variables**:
+   ```
+   SUPABASE_URL=https://your-project.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+   ```
+5. **AI tables**: The 5 AI tables (`ai_sessions`, `ai_messages`,
+   `ai_memories`, `ai_tool_history`, `ai_provider_stats`) do not yet
+   have migrations. The AI subsystem operates in-memory until
+   migrations are applied. See [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)
+   for the exact schema.
+
+The bot works without Supabase — all operations fall back to in-memory
+storage. Data does not persist across restarts when Supabase is
+unavailable.
+
+---
+
+## Development Workflow
 
 ### Prerequisites
 
 - Python 3.11+
 - Node.js 18+ (for dashboard build)
 - A Telegram account with API credentials
-- A Supabase project (optional — bot works without it)
+- A Supabase project (optional)
 - A Telegram bot token from BotFather (optional — for Inline Glass UI)
 
 ### 1. Clone and Install
 
 ```bash
-git clone <repo-url>
-cd lifeos
+git clone https://github.com/Onlyicing1/Telegram-self-bot.git
+cd Telegram-self-bot
 pip install -r backend/requirements.txt
 npm install
 ```
@@ -278,7 +645,7 @@ API_ID=12345
 API_HASH=your_api_hash
 SESSION_STRING=your_session_string
 BOT_OWNER_ID=123456789
-BOT_TOKEN=your_bot_token          # Optional — for Inline Glass UI
+BOT_TOKEN=your_bot_token          # Optional
 SUPABASE_URL=your_supabase_url    # Optional
 SUPABASE_SERVICE_ROLE_KEY=your_key # Optional
 TZ=Asia/Tehran
@@ -300,48 +667,93 @@ The built dashboard is served by FastAPI at `/`.
 
 ---
 
-## Environment Variables
+## Repository Philosophy
 
-### Required
-
-| Variable | Type | Description |
-|---|---|---|
-| `API_ID` | int | Telegram API ID from my.telegram.org |
-| `API_HASH` | str | Telegram API Hash from my.telegram.org |
-| `SESSION_STRING` | str | Telethon StringSession (generated offline) |
-| `BOT_OWNER_ID` | int | Telegram numeric user ID of the bot owner |
-
-### Optional
-
-| Variable | Default | Description |
-|---|---|---|
-| `BOT_TOKEN` | `""` | Helper bot token for Inline Glass UI |
-| `SUPABASE_URL` | `""` | Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | `""` | Supabase service role key |
-| `DATABASE_URL` | `""` | PostgreSQL connection string (unused) |
-| `TZ` | `Asia/Tehran` | Timezone for bio/username engines and timestamps |
-| `PORT` | `8000` | Web server port |
-| `BIO_UPDATE_ENABLED` | `false` | Auto-start bio cron on boot |
-| `LOG_LEVEL` | `INFO` | Python logging level |
+- **Single source of truth**: `DATABASE_ARCHITECTURE.md` is the only
+  document needed to rebuild the complete Supabase schema.
+  `AI_MASTER_DESIGN.md` is the only document needed to understand the
+  AI architecture.
+- **No dead code**: Every file has a reason to exist. Unused modules are
+  deleted, not commented out.
+- **One architecture**: There is one AI execution path (Engine →
+  Dispatcher → Provider). No duplicate session managers, state
+  machines, or persistence layers.
+- **Graceful degradation**: The bot works with or without Supabase, with
+  or without a helper bot, with or without AI providers. Every external
+  dependency has a fallback.
+- **Single event loop**: No threads, no multiprocessing. All I/O is
+  async. Supabase calls are threaded internally via `asyncio.to_thread`
+  with bounded timeouts.
+- **Owner-only**: Every command and callback is gated by a single
+  permission check. No public access to any feature.
+- **Self-documenting**: Every public module has a docstring explaining
+  its responsibility, dependencies, and what it should NOT do.
 
 ---
 
-## Helper Bot Setup
+## Features
 
-The Inline Glass UI requires a **separate** Telegram bot account:
+### Inline Glass UI
 
-1. Create a new bot via [@BotFather](https://t.me/BotFather).
-2. Copy the bot token.
-3. Set `BOT_TOKEN` in your environment.
-4. Start the bot — the helper bot connects automatically and inline panels become available.
+Interactive inline-button panels for all commands and settings.
+Replaces plain-text commands with a tap-to-navigate experience.
+Requires `BOT_TOKEN` (helper bot).
 
-Without `BOT_TOKEN`, all commands fall back to plain-text edit-in-place mode.
+### Save System
+
+- **Forward save** (`.save f`) — forwards to Saved Messages instantly
+- **Deep save** (`.save d`) — download + re-upload with rich caption
+- **Link save** — save from a Telegram message link
+- **Metadata persistence** — full metadata in `saved_items` table
+- **Save codes** — compact codes (e.g. `S0001`)
+
+### Delete System
+
+- Delete last N messages, from a message ID, or by save code
+- Batch deletion with configurable batch size
+- Recent messages browser for visual selection
+
+### Bio Engine
+
+Timezone-synchronized cron that rewrites your Telegram bio every minute
+using `{time}`, `{mood}`, `{text}` template tokens. State persisted in
+`bio_state` table.
+
+### Username Engine
+
+Mirrors the Bio Engine but controls the `first_name` field. Completely
+independent — separate table, separate updater, separate state.
+
+### Scheduler
+
+Shared per-minute profile scheduler that merges all profile updaters
+into a single `UpdateProfileRequest` API call per minute.
+
+### Runtime Supervisor
+
+FSM-based self-healing core with 10 states, atomic recovery, and
+limited retries. Signal handling for deterministic shutdown.
+
+### Watchdog
+
+30-second heartbeat with update staleness detection. 3 consecutive
+failures → client declared dead → recovery triggered.
+
+### Diagnostics
+
+Event log (`.logs`), diagnostic snapshot (`.kill`), asyncio task
+diagnostics, and runtime heartbeat.
+
+### AI Assistant
+
+`.ai <message>` command with full conversation context, memory, and
+tool execution. See [AI Architecture](#ai-architecture) above.
 
 ---
 
 ## Commands
 
-All commands use the `.` prefix. Commands only fire on outgoing messages (sent from the owner's own account).
+All commands use the `.` prefix. Only fire on outgoing messages.
 
 ### Utility
 
@@ -349,13 +761,12 @@ All commands use the `.` prefix. Commands only fire on outgoing messages (sent f
 |---|---|
 | `.ping` | PONG |
 | `.id` | Chat & Message IDs |
-| `.help` | Interactive help panel (Inline Glass UI) |
+| `.help` | Interactive help panel |
 | `.panel` | Context panel for replied message |
 | `.health` | Health dashboard |
 | `.kill` | Diagnostic snapshot + recovery |
 | `.logs` | Event log viewer |
-| `.logs 50` | Last 50 events |
-| `.logs errors` | Errors only |
+| `.ai <message>` | AI assistant |
 
 ### Save Engine
 
@@ -369,11 +780,11 @@ All commands use the `.` prefix. Commands only fire on outgoing messages (sent f
 
 | Command | Description |
 |---|---|
-| `.retrieve` / `.r` / `.files` | Browse saved items (Inline Glass UI) |
+| `.retrieve` / `.r` / `.files` | Browse saved items |
 | `.preview <code>` | Show metadata for a saved item |
 | `.send <code>` | Forward saved asset to current chat |
-| `.list [n]` | Show recent saved items (default 10) |
-| `.find <text>` | Search saved items by code, filename, caption, or MIME |
+| `.list [n]` | Show recent saved items |
+| `.find <text>` | Search saved items |
 
 ### Delete
 
@@ -381,16 +792,15 @@ All commands use the `.` prefix. Commands only fire on outgoing messages (sent f
 |---|---|
 | `.del <n>` | Delete last N outgoing messages |
 | `.del id <msgid>` | Delete from message ID forward |
-| `.del <code>` | Delete a saved item (Telegram message + DB row) |
-| `.del` | Delete panel (Inline Glass UI) |
+| `.del <code>` | Delete a saved item |
+| `.del` | Delete panel |
 
 ### Bio Engine
 
 | Command | Description |
 |---|---|
-| `.bio` | Bio engine panel (Inline Glass UI) |
-| `.bio on` | Start bio cron |
-| `.bio off` | Stop bio cron |
+| `.bio` | Bio engine panel |
+| `.bio on` / `.bio off` | Start / stop bio cron |
 | `.bio show` | Show bio state |
 | `.bio template <tpl>` | Set bio template |
 | `.bio text <text>` | Set {text} token |
@@ -400,19 +810,16 @@ All commands use the `.` prefix. Commands only fire on outgoing messages (sent f
 
 | Command | Description |
 |---|---|
-| `.username` | Username engine panel (Inline Glass UI) |
-| `.username on` | Start username cron |
-| `.username off` | Stop username cron |
+| `.username` | Username engine panel |
+| `.username on` / `.username off` | Start / stop username cron |
 | `.username show` | Show username state |
 | `.username template <tpl>` | Set username template |
-| `.username text <text>` | Set {text} token |
-| `.username mood <mood>` | Set {mood} token |
 
 ### Database
 
 | Command | Description |
 |---|---|
-| `.db` | Database panel (Inline Glass UI) |
+| `.db` | Database panel |
 | `.db clean` | Remove orphan rows |
 | `.db stats` | Database statistics |
 | `.db vacuum` | Cleanup + optimize |
@@ -423,34 +830,41 @@ All commands use the `.` prefix. Commands only fire on outgoing messages (sent f
 
 ### Bot won't start
 
-- Check that all required env vars are set (`API_ID`, `API_HASH`, `SESSION_STRING`, `BOT_OWNER_ID`).
+- Check required env vars (`API_ID`, `API_HASH`, `SESSION_STRING`,
+  `BOT_OWNER_ID`).
 - Check that the session string is valid (regenerate if needed).
-- Check logs for connection errors.
 
 ### Panels not working
 
-- Ensure `BOT_TOKEN` is set — the Inline Glass UI requires the helper bot.
+- Ensure `BOT_TOKEN` is set — the Inline Glass UI requires the helper
+  bot.
 - Without `BOT_TOKEN`, commands fall back to plain-text edit-in-place.
 
 ### Bio or Username engine not updating
 
 - Check that the engine is active (`.bio show` or `.username show`).
-- Check that the template contains at least one token (`{time}`, `{mood}`, `{text}`).
-- Check that the shared Profile Scheduler is running (visible in `.health`).
-- Check for `FloodWaitError` in logs — Telegram may be rate-limiting profile updates.
+- Check that the template contains at least one token.
+- Check the shared Profile Scheduler is running (visible in `.health`).
+- Check for `FloodWaitError` in logs.
 
 ### Database errors
 
 - The bot works without Supabase — all operations fall back to in-memory.
-- Check that `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set correctly.
-- Check that all migrations have been applied.
+- Check `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are correct.
+- Check that all migrations have been applied (see `sql/` directory).
 
 ### Client keeps disconnecting
 
-- The watchdog automatically detects disconnections and rebuilds the client.
-- Check `.health` for the restart count and last rebuild reason.
+- The watchdog automatically detects disconnections and rebuilds.
+- Check `.health` for restart count and last rebuild reason.
 - Check `.kill` for a full diagnostic snapshot.
-- If recovery fails repeatedly, the process exits and Render restarts it.
+
+### AI not responding
+
+- Check `AI_ENABLED=true` is set.
+- Check that a provider API key is configured (e.g. `AI_OPENAI_API_KEY`).
+- Without an API key, the DummyProvider returns a placeholder.
+- Check `.health` for the AI engine status.
 
 ---
 
