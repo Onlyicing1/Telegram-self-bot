@@ -1,12 +1,11 @@
 """
 AI Menu — the Telegram-facing AI control panel.
 
-Inspection-only for most pages; the Settings page is fully interactive
-with toggle buttons for booleans and reply-mode input for numerics.
-The Provider page supports switching between registered providers.
-The Settings page reads/writes ProviderConfig through ProviderConfigManager.
-All changes go through the process-wide ConfigManager singleton so
-every subsequent snapshot reflects the new state immediately.
+The main panel shows the current provider, model, status, and last
+initialization result. Settings is the single control center for all
+configuration (provider, model, temperature, max tokens, memory,
+conversation, context budget). Diagnostics remains available for
+owner/developer usage.
 
 No database. No persistence. No text commands. Everything is glass
 buttons that edit the existing menu message in-place.
@@ -25,8 +24,6 @@ from backend.helper import (
 )
 
 logger = logging.getLogger(__name__)
-
-_FUTURE_PROVIDERS = ["Gemini", "OpenAI", "GLM", "Claude"]
 
 
 # ── Engine / Config access ──
@@ -64,232 +61,81 @@ def _warning_block(text: str) -> str:
     return "\n\n⚠ **Warning:**\n" + "\n".join(failures)
 
 
+def _get_provider_info() -> dict:
+    """Return current provider name, model, status, and init error."""
+    info: dict = {
+        "provider": "Unknown",
+        "model": "—",
+        "status": "UNKNOWN",
+        "init_error": "",
+        "is_dummy": True,
+        "is_fallback": False,
+    }
+    engine = _get_engine()
+    if engine is None:
+        info["status"] = "FAIL: no engine"
+        return info
+    try:
+        mgr = engine.provider_manager
+        active = mgr.get_active()
+        info["provider"] = active.name
+        info["is_dummy"] = active.name == "dummy"
+        info["is_fallback"] = active.name == mgr.registry.fallback_name and not info["is_dummy"]
+        health = active.health()
+        healthy = health.get("healthy", False)
+        info["status"] = _status_badge(healthy)
+        if not healthy:
+            reason = health.get("reason", "")
+            if reason:
+                info["init_error"] = str(reason)
+        try:
+            pconfig = mgr.get_provider_config(active.name)
+            info["model"] = pconfig.default_model or "—"
+        except Exception:
+            pass
+    except Exception as exc:
+        info["status"] = f"FAIL: {exc}"
+        info["init_error"] = str(exc)
+    return info
+
+
 # ── Panel: AI Control Panel (main) ──
 
 
 def _build_ai_main_buttons() -> list:
     builder = InlinePanelBuilder()
     builder.add_buttons(
-        ("Provider", "panel:ai_provider"),
-        ("Model", "panel:ai_model"),
-    )
-    builder.add_buttons(
-        ("Conversation", "panel:ai_conversation"),
-        ("Memory", "panel:ai_memory"),
-    )
-    builder.add_buttons(
-        ("Settings", "panel:ai_settings"),
-        ("Diagnostics", "panel:ai_diagnostics"),
+        ("⚙️ Settings", "panel:ai_settings"),
+        ("🔧 Diagnostics", "panel:ai_diagnostics"),
     )
     return builder.build()
+
+
+def _build_ai_main_body() -> str:
+    info = _get_provider_info()
+    lines = ["**🧠 AI Control Panel**\n"]
+    lines.append(f"**Provider:** {info['provider']}")
+    lines.append(f"**Model:** {info['model']}")
+    lines.append(f"**Status:** {info['status']}")
+    if info["init_error"]:
+        lines.append(f"**Last Error:** {info['init_error']}")
+    if info["is_dummy"]:
+        lines.append("")
+        lines.append("_⚠ Dummy provider active — no real provider configured._")
+    lines.append("")
+    lines.append("_Tap Settings to configure provider, model, and options._")
+    return "\n".join(lines)
 
 
 async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    body = (
-        "**Provider:** Dummy\n"
-        "**Model:** dummy-1\n"
-        "**Status:** READY\n"
-        "\n"
-        "_Settings page is now interactive._"
-    )
-    return "🧠 AI Control Panel", body, _build_ai_main_buttons()
+    return "🧠 AI Control Panel", _build_ai_main_body(), _build_ai_main_buttons()
 
 
 async def _ai_main_inline_builder(event, extra: str) -> list:
-    return [render("🧠 AI Control Panel", (
-        "**Provider:** Dummy\n"
-        "**Model:** dummy-1\n"
-        "**Status:** READY\n"
-        "\n"
-        "_Settings page is now interactive._"
-    ), _build_ai_main_buttons())]
+    return [render("🧠 AI Control Panel", _build_ai_main_body(), _build_ai_main_buttons())]
 
 
-# ── Panel: Provider ──
-
-
-async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    engine = _get_engine()
-    provider_name = "Unknown"
-    provider_version = "..."
-    provider_status = "UNKNOWN"
-    provider_count = 0
-    provider_enabled = False
-
-    if engine is not None:
-        try:
-            mgr = engine.provider_manager
-            active = mgr.get_active()
-            provider_name = active.name
-            provider_version = active.provider_version()
-            health = active.health()
-            provider_status = _status_badge(health.get("healthy", False))
-            provider_enabled = active.is_enabled
-            provider_count = len(mgr.list_providers())
-        except Exception as exc:
-            logger.warning("AI provider panel: %s", exc)
-            provider_status = f"FAIL: {exc}"
-
-    lines = [
-        "**Provider Page**\n",
-        f"**Current Provider:** {provider_name}",
-        f"**Version:** {provider_version}",
-        f"**Status:** {provider_status}",
-        f"**Enabled:** {'YES' if provider_enabled else 'NO'}",
-        f"**Provider Count:** {provider_count}",
-        "",
-        "_Tap a provider below to switch._",
-    ]
-
-    warning = _warning_block(provider_status)
-    if warning:
-        lines.append(warning)
-
-    return "AI · Provider", "\n".join(lines), _build_provider_buttons()
-
-
-async def _ai_provider_inline_builder(event, extra: str) -> list:
-    title, body, buttons = await _ai_provider_panel_handler(event, extra)
-    return [render(title, body, buttons)]
-
-
-def _build_provider_buttons() -> list:
-    """Build provider switch buttons — one row per registered provider."""
-    engine = _get_engine()
-    builder = InlinePanelBuilder()
-    if engine is not None:
-        try:
-            mgr = engine.provider_manager
-            active_name = mgr.get_active_name()
-            for name in mgr.list_providers():
-                label = f"{'→ ' if name == active_name else ''}{name}"
-                builder.add_row(label, f"action:ai_switch_provider:{name}")
-        except Exception:
-            pass
-    return builder.build()
-
-
-async def _ai_switch_provider_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Switch the active provider. ``extra`` is the provider name."""
-    engine = _get_engine()
-    if engine is None:
-        return "AI · Provider", "**Error:** engine not available", []
-    target = extra.strip()
-    if not target:
-        return "AI · Provider", "**Error:** no provider specified", _build_provider_buttons()
-    ok = engine.provider_manager.switch_provider(target)
-    if ok:
-        logger.info("AI provider switched to '%s'", target)
-    else:
-        logger.warning("AI provider switch to '%s' failed", target)
-    return await _ai_provider_panel_handler(event, extra)
-
-
-# ── Panel: Model ──
-
-
-async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    mgr = _get_config_manager()
-    snap = mgr.snapshot()
-    lines = [
-        "**Model Page**\n",
-        f"**Current Model:** {snap.model}",
-        f"**Max Tokens:** {snap.max_tokens}",
-        f"**Temperature:** {snap.temperature}",
-        f"**Top P:** {snap.top_p}",
-        "",
-        "_Read-only — Dummy model until real providers exist._",
-    ]
-    return "AI · Model", "\n".join(lines), []
-
-
-async def _ai_model_inline_builder(event, extra: str) -> list:
-    title, body, buttons = await _ai_model_panel_handler(event, extra)
-    return [render(title, body, buttons)]
-
-
-# ── Panel: Conversation ──
-
-
-async def _ai_conversation_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    engine = _get_engine()
-    session_id = "—"
-    conv_state = "Idle"
-    message_count = 0
-    estimated_tokens = 0
-    last_activity = "—"
-    history_size = 0
-
-    if engine is not None:
-        try:
-            conv_mgr = engine.conversation_manager
-            sessions = conv_mgr.list_sessions()
-            if sessions:
-                session = sessions[0]
-                session_id = session.session_id
-                conv_state = "Active"
-                history = session.conversation_history.all_items()
-                message_count = len(history)
-                history_size = session.conversation_history.size()
-                estimated_tokens = session.token_estimate
-                last_activity = session.last_activity.strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                conv_state = "Idle (no active session)"
-        except Exception as exc:
-            logger.warning("AI conversation panel: %s", exc)
-            conv_state = f"FAIL: {exc}"
-
-    lines = [
-        "**Conversation Page**\n",
-        f"**Conversation State:** {conv_state}",
-        f"**Session ID:** `{session_id}`",
-        f"**Messages:** {message_count}",
-        f"**Estimated Tokens:** {estimated_tokens}",
-        f"**Last Activity:** {last_activity}",
-        f"**History Size:** {history_size}",
-        "",
-        "_Read-only._",
-    ]
-    warning = _warning_block(conv_state)
-    if warning:
-        lines.append(warning)
-
-    return "AI · Conversation", "\n".join(lines), []
-
-
-async def _ai_conversation_inline_builder(event, extra: str) -> list:
-    title, body, buttons = await _ai_conversation_panel_handler(event, extra)
-    return [render(title, body, buttons)]
-
-
-# ── Panel: Memory ──
-
-
-async def _ai_memory_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    lines = [
-        "**Memory Page**\n",
-        "**Conversation Memory:** Active (RAM-only)",
-        "**Session Memory:** Active (RAM-only)",
-        "**Long Memory:** Not configured",
-        "**Persistent Memory:** Disabled",
-        "",
-        "**Current Status:**",
-        "  • Conversation Memory — _bounded, in-memory_",
-        "  • Session Memory — _runtime state, in-memory_",
-        "  • Long Memory — _no vector store_",
-        "  • Persistent Memory — _no database_",
-        "",
-        "_Read-only._",
-    ]
-    return "AI · Memory", "\n".join(lines), []
-
-
-async def _ai_memory_inline_builder(event, extra: str) -> list:
-    title, body, buttons = await _ai_memory_panel_handler(event, extra)
-    return [render(title, body, buttons)]
-
-
-# ── Panel: Settings (interactive) ──
+# ── Panel: Settings (unified control center) ──
 
 _TOGGLE_FIELDS = [
     "enabled",
@@ -347,8 +193,6 @@ _NUMERIC_PARSERS = {
     "tool_budget": int,
 }
 
-# ── Provider config fields (read/written through ProviderConfigManager) ──
-
 _PROVIDER_TEXT_FIELDS = [
     "api_key",
     "base_url",
@@ -375,24 +219,23 @@ def _build_settings_buttons() -> list:
     pconfig = pcm.get_active_config()
     builder = InlinePanelBuilder()
 
+    builder.add_buttons(
+        ("⬅ Back", "panel:ai"),
+    )
+
     builder.add_row(
         f"{_TOGGLE_LABELS['enabled']}: {'ON' if snap.enabled else 'OFF'}",
         "action:ai_toggle_enabled",
     )
 
     builder.add_buttons(
-        ("🧠 Provider", "panel:ai_provider"),
-        (f"🤖 Model: {snap.model}", "panel:ai_model"),
+        (f"🧠 Provider: {snap.provider}", "action:ai_provider_cycle"),
+        (f"🤖 Model: {pconfig.default_model or '—'}", "input:ai_provider_config:default_model"),
     )
 
     builder.add_buttons(
         (f"{_PROVIDER_TEXT_LABELS['api_key']}: {'✅' if pconfig.api_key else '❌'}", "input:ai_provider_config:api_key"),
         (f"{_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url[:20] + '…' if len(pconfig.base_url) > 20 else pconfig.base_url or '—'}", "input:ai_provider_config:base_url"),
-    )
-
-    builder.add_row(
-        f"{_PROVIDER_TEXT_LABELS['default_model']}: {pconfig.default_model or '—'}",
-        "input:ai_provider_config:default_model",
     )
 
     builder.add_buttons(
@@ -433,12 +276,19 @@ def _build_settings_body() -> str:
     pcm = _get_provider_config_manager()
     active_name = pcm.active_name
     pconfig = pcm.get_active_config()
-    lines = ["**AI Settings**\n"]
-    lines.append(f"**Provider:** {snap.provider}")
-    lines.append(f"**Model:** {snap.model}")
-    lines.append(f"**Enabled:** {snap.enabled}")
+    info = _get_provider_info()
+
+    lines = ["**⚙️ AI Settings**\n"]
+
+    lines.append("**Provider Status**")
+    lines.append(f"  • Provider: {info['provider']}")
+    lines.append(f"  • Model: {info['model']}")
+    lines.append(f"  • Status: {info['status']}")
+    if info["init_error"]:
+        lines.append(f"  • Error: {info['init_error']}")
     lines.append("")
-    lines.append(f"**Provider Config ({active_name}):**")
+
+    lines.append(f"**Active Config ({active_name})**")
     lines.append(f"  • {_PROVIDER_TEXT_LABELS['api_key']}: {'✅ set' if pconfig.api_key else '❌ missing'}")
     lines.append(f"  • {_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url or '—'}")
     lines.append(f"  • {_PROVIDER_TEXT_LABELS['default_model']}: {pconfig.default_model or '—'}")
@@ -448,14 +298,17 @@ def _build_settings_body() -> str:
     lines.append(f"  • {_NUMERIC_LABELS['timeout']}: {pconfig.timeout}s")
     lines.append(f"  • {_NUMERIC_LABELS['retry_count']}: {pconfig.retry_count}")
     lines.append("")
-    lines.append(f"**History Budget:** {snap.history_budget} tokens")
-    lines.append(f"**Tool Budget:** {snap.tool_budget} tokens")
-    lines.append(f"**Streaming:** {snap.streaming_enabled}")
-    lines.append(f"**Vision:** {snap.vision_enabled}")
-    lines.append(f"**Reasoning:** {snap.reasoning_enabled}")
-    lines.append(f"**Developer Mode:** {snap.developer_mode}")
+
+    lines.append("**Conversation & Memory**")
+    lines.append(f"  • {_NUMERIC_LABELS['history_budget']}: {snap.history_budget} tokens")
+    lines.append(f"  • {_NUMERIC_LABELS['tool_budget']}: {snap.tool_budget} tokens")
+    lines.append(f"  • {_TOGGLE_LABELS['streaming_enabled']}: {'ON' if snap.streaming_enabled else 'OFF'}")
+    lines.append(f"  • {_TOGGLE_LABELS['vision_enabled']}: {'ON' if snap.vision_enabled else 'OFF'}")
+    lines.append(f"  • {_TOGGLE_LABELS['reasoning_enabled']}: {'ON' if snap.reasoning_enabled else 'OFF'}")
+    lines.append(f"  • {_TOGGLE_LABELS['developer_mode']}: {'ON' if snap.developer_mode else 'OFF'}")
     lines.append("")
-    lines.append("_Tap toggles to flip • Tap values to edit._")
+
+    lines.append("_Tap toggles to flip • Tap values to edit • Tap Provider to cycle._")
     return "\n".join(lines)
 
 
@@ -465,6 +318,33 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
 
 async def _ai_settings_inline_builder(event, extra: str) -> list:
     return [render("AI · Settings", _build_settings_body(), _build_settings_buttons())]
+
+
+# ── Provider cycle action ──
+
+
+async def _ai_provider_cycle_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Cycle to the next registered provider."""
+    engine = _get_engine()
+    if engine is None:
+        return "AI · Settings", "**Error:** engine not available", _build_settings_buttons()
+    mgr = engine.provider_manager
+    providers = mgr.list_providers()
+    if len(providers) <= 1:
+        return "AI · Settings", _build_settings_body(), _build_settings_buttons()
+    current = mgr.get_active_name()
+    try:
+        idx = providers.index(current)
+    except ValueError:
+        idx = -1
+    next_idx = (idx + 1) % len(providers)
+    next_name = providers[next_idx]
+    ok = mgr.switch_provider(next_name)
+    if ok:
+        logger.info("AI provider cycled to '%s'", next_name)
+    else:
+        logger.warning("AI provider cycle to '%s' failed", next_name)
+    return "AI · Settings", _build_settings_body(), _build_settings_buttons()
 
 
 # ── Toggle actions ──
@@ -691,6 +571,9 @@ def _build_diagnostics_body() -> str:
 
 def _build_ai_diagnostics_buttons() -> list:
     builder = InlinePanelBuilder()
+    builder.add_buttons(
+        ("⬅ Back", "panel:ai"),
+    )
     builder.add_row("Refresh", "action:ai_diagnostics_refresh")
     return builder.build()
 
@@ -714,18 +597,6 @@ def register(client, owner_id: int) -> None:
     try:
         register_panel("ai", _ai_main_panel_handler, parent="menu", title="🧠 AI")
         register_inline_builder("ai", _ai_main_inline_builder)
-
-        register_panel("ai_provider", _ai_provider_panel_handler, parent="ai", title="AI · Provider")
-        register_inline_builder("ai_provider", _ai_provider_inline_builder)
-
-        register_panel("ai_model", _ai_model_panel_handler, parent="ai", title="AI · Model")
-        register_inline_builder("ai_model", _ai_model_inline_builder)
-
-        register_panel("ai_conversation", _ai_conversation_panel_handler, parent="ai", title="AI · Conversation")
-        register_inline_builder("ai_conversation", _ai_conversation_inline_builder)
-
-        register_panel("ai_memory", _ai_memory_panel_handler, parent="ai", title="AI · Memory")
-        register_inline_builder("ai_memory", _ai_memory_inline_builder)
 
         register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="AI · Settings")
         register_inline_builder("ai_settings", _ai_settings_inline_builder)
@@ -755,9 +626,9 @@ def register(client, owner_id: int) -> None:
             })
 
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
-        register_action("ai_switch_provider", _ai_switch_provider_action)
+        register_action("ai_provider_cycle", _ai_provider_cycle_action)
         register_action("ai_reset_provider_config", _ai_reset_provider_config_action)
 
-        logger.info("AI panels registered OK (interactive settings + provider config + provider switching)")
+        logger.info("AI panels registered OK (unified settings + diagnostics)")
     except Exception as exc:
         logger.error("AI panel registration FAILED: %s", exc)
