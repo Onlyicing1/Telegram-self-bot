@@ -186,7 +186,7 @@ class UsernameOnTool(Tool):
         from backend.services import username_service
 
         try:
-            result = await username_service.do_on(context.client, context.owner_id, context.tz_str)
+            result = await username_service.do_on(context.telegram.client, context.owner_id, context.tz_str)
             return ToolResult(success=True, message=result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username on failed: {exc}")

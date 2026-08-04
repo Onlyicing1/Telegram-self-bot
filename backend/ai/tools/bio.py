@@ -186,7 +186,7 @@ class BioOnTool(Tool):
         from backend.services import bio_service
 
         try:
-            result = await bio_service.do_on(context.client, context.owner_id, context.tz_str)
+            result = await bio_service.do_on(context.telegram.client, context.owner_id, context.tz_str)
             return ToolResult(success=True, message=result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Bio on failed: {exc}")

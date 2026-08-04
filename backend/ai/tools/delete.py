@@ -63,7 +63,7 @@ class DeleteTool(Tool):
             return ToolResult(success=False, message="No chat context for deletion.")
 
         try:
-            result = await delete_service.do_del_n(context.client, chat_id, count)
+            result = await delete_service.do_del_n(context.telegram.client, chat_id, count)
             return ToolResult(success=True, message=result, data={"count": count})
         except Exception as exc:
             return ToolResult(success=False, message=f"Delete failed: {exc}")
@@ -119,7 +119,7 @@ class DeleteByIdTool(Tool):
             return ToolResult(success=False, message="No chat context for deletion.")
 
         try:
-            result = await delete_service.do_del_id(context.client, chat_id, message_id)
+            result = await delete_service.do_del_id(context.telegram.client, chat_id, message_id)
             return ToolResult(success=True, message=result, data={"message_id": message_id})
         except Exception as exc:
             return ToolResult(success=False, message=f"Delete by ID failed: {exc}")
