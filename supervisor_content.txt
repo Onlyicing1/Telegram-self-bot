@@ -927,3 +927,5 @@ class RuntimeSupervisor:
             record_runtime_event("SHUTDOWN_COMPLETE", "stop() finished")
         except Exception:
             pass
+
+(exit 0, 8ms)
