@@ -27,6 +27,7 @@ _GET_ME_TIMEOUT = 15
 
 _client: TelegramClient | None = None
 _bot_username: str = ""
+_bot_id: int = 0
 
 
 def is_available() -> bool:
@@ -37,13 +38,17 @@ def get_bot_username() -> str:
     return _bot_username
 
 
+def get_bot_id() -> int:
+    return _bot_id
+
+
 async def build_helper(bot_token: str) -> TelegramClient | None:
     """Create and connect the helper bot client.
 
     Returns the connected TelegramClient or None if no token is set.
     Raises RuntimeError if the token is set but invalid.
     """
-    global _client, _bot_username
+    global _client, _bot_username, _bot_id
 
     if not bot_token:
         logger.info("Helper bot: no BOT_TOKEN set — inline UI disabled")
@@ -73,6 +78,7 @@ async def build_helper(bot_token: str) -> TelegramClient | None:
         )
         me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
         _bot_username = (me.username or "").lstrip("@")
+        _bot_id = me.id
         trace("HELPER_CONNECTED", username=_bot_username, id=me.id)
         logger.info("Helper bot connected: @%s (id=%s)", me.username, me.id)
     except Exception as exc:
@@ -91,7 +97,9 @@ async def build_helper(bot_token: str) -> TelegramClient | None:
 
 
 async def disconnect_helper() -> None:
-    global _client
+    global _client, _bot_username, _bot_id
+    _bot_username = ""
+    _bot_id = 0
     if _client is not None:
         trace("HELPER_DISCONNECTED", reason="disconnect_helper_called")
         try:
