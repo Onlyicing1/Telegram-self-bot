@@ -19,7 +19,7 @@ always the DummyProvider — no HTTP, no SDK, no external API.
 Failure handling:
     Any exception inside any layer is caught by the dispatcher and
     converted into ``EngineResult(success=False)``. The engine never
-    crashes and never propagates uncaught exceptions.
+crashes and never propagates uncaught exceptions.
 """
 from __future__ import annotations
 
