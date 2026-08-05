@@ -92,7 +92,7 @@ class RuntimeSupervisor:
     __slots__ = (
         "cfg", "api_id", "api_hash", "session_string", "owner_id", "tz_str",
         "bot_token", "helper_enabled", "state", "client", "helper_client",
-        "client_generation", "shutdown_event", "_run_task",
+        "client_generation", "shutdown_event", "_run_task", "_web_task",
         "_consecutive_failures", "_reconnect_failures", "_recovery_attempts",
         "_recovery_lock", "_recovery_cooldown_until", "_last_watchdog_tick",
         "_client_alive",
@@ -113,6 +113,7 @@ class RuntimeSupervisor:
         self.client_generation = 0
         self.shutdown_event = asyncio.Event()
         self._run_task: asyncio.Task | None = None
+        self._web_task: asyncio.Task | None = None
         self._consecutive_failures = 0
         self._reconnect_failures = 0
         self._recovery_attempts = 0
@@ -196,6 +197,8 @@ class RuntimeSupervisor:
         self._transition(RuntimeState.READY)
         set_supervisor_ok(True)
         set_restart_count(0)
+
+        self._start_web_server()
 
         start_heartbeat()
         start_keepalive()
@@ -660,7 +663,7 @@ class RuntimeSupervisor:
     async def _cancel_orphan_tasks(self) -> None:
         current = asyncio.current_task()
         protected_names = {
-            "lifeos-watchdog", "lifeos-web", "lifeos-heartbeat",
+            "lifeos-watchdog", "lifeos-web", "lifeos-web-server", "lifeos-heartbeat",
             "lifeos-keepalive", "lifeos-task-supervisor",
             "lifeos-profile-scheduler", "lifeos-tg-supervisor",
             "lifeos-diagnostics", "lifeos-failsafe",
@@ -683,6 +686,41 @@ class RuntimeSupervisor:
             task.cancel()
         if to_cancel:
             await asyncio.gather(*to_cancel, return_exceptions=True)
+
+    def _start_web_server(self) -> None:
+        if self._web_task is not None and not self._web_task.done():
+            return
+        import os
+        import uvicorn
+        from backend.web.app import app, set_owner_id
+
+        set_owner_id(self.owner_id)
+        port = int(os.environ.get("PORT", self.cfg.get("PORT", 8000)))
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        self._web_task = immortal_create_task(
+            lambda: server.serve(),
+            name="lifeos-web-server",
+        )
+        trace("WEB_SERVER_STARTING", host="0.0.0.0", port=port)
+        logger.info("Web server starting on 0.0.0.0:%d", port)
+
+    async def _stop_web_server(self) -> None:
+        if self._web_task is None:
+            return
+        if not self._web_task.done():
+            self._web_task.cancel()
+            try:
+                await asyncio.wait_for(self._web_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        self._web_task = None
 
     async def _stop_helper(self) -> None:
         helper = self.helper_client
@@ -862,6 +900,8 @@ class RuntimeSupervisor:
                 await asyncio.wait_for(self._run_task, timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+
+        await self._stop_web_server()
 
         await self._stop_helper()
 
