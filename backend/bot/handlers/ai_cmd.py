@@ -1,5 +1,13 @@
 """
-.ai <text> — AI conversation handler.
+.ai <text> — DEPRECATED AI conversation handler.
+
+This handler is kept for backward compatibility only. The primary
+AI activation method is now the trigger-based system in
+``backend.bot.handlers.ai_trigger``.
+
+When the owner sends `.ai <message>`, the handler still works but
+the trigger system is the default. Users should configure trigger
+words via the AI Settings panel.
 
 Wires the AI Engine to Telegram. When the owner sends .ai <message>,
 the handler:

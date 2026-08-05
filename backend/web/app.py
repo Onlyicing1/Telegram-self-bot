@@ -154,6 +154,17 @@ async def api_ai_config():
     return config
 
 
+@app.post("/api/ai/triggers")
+async def api_ai_update_triggers(body: dict):
+    from backend.ai.config_store import update_triggers
+    trigger_en = body.get("trigger_en", "")
+    trigger_fa = body.get("trigger_fa", "")
+    success, message = await update_triggers(_owner_id, trigger_en, trigger_fa)
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+    return {"success": success, "message": message}
+
+
 def mount_static():
     if _DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")

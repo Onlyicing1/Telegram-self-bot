@@ -28,6 +28,8 @@ _DEFAULTS: dict[str, Any] = {
     "system_prompt": "",
     "history_budget": 4000,
     "is_configured": False,
+    "trigger_en": "",
+    "trigger_fa": "",
 }
 
 _fallback_config: dict[int, dict[str, Any]] = {}
@@ -89,6 +91,8 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "system_prompt": config.get("system_prompt", ""),
             "history_budget": config.get("history_budget", 4000),
             "is_configured": config.get("is_configured", False),
+            "trigger_en": config.get("trigger_en", "") or None,
+            "trigger_fa": config.get("trigger_fa", "") or None,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if existing and existing.data:
@@ -151,3 +155,82 @@ async def is_configured(owner_id: int) -> bool:
     """Check if the user has completed the setup wizard."""
     config = await get_config(owner_id)
     return config.get("is_configured", False)
+
+
+def validate_triggers(trigger_en: str, trigger_fa: str) -> tuple[bool, str]:
+    """Validate trigger word configuration.
+
+    Rules:
+      - Both fields are optional individually.
+      - At least one must be non-empty.
+      - The two values must not be identical (case-insensitive).
+      - Triggers must be single words (no spaces).
+
+    Returns (is_valid, error_message).
+    """
+    en = (trigger_en or "").strip()
+    fa = (trigger_fa or "").strip()
+
+    if not en and not fa:
+        return False, "At least one trigger word is required."
+
+    if en and " " in en:
+        return False, "English trigger must be a single word (no spaces)."
+
+    if fa and " " in fa:
+        return False, "Persian trigger must be a single word (no spaces)."
+
+    if en and fa and en.lower() == fa.lower():
+        return False, "English and Persian triggers must be different values."
+
+    return True, ""
+
+
+async def update_triggers(owner_id: int, trigger_en: str, trigger_fa: str) -> tuple[bool, str]:
+    """Update trigger words with validation.
+
+    Returns (success, message).
+    """
+    is_valid, error = validate_triggers(trigger_en, trigger_fa)
+    if not is_valid:
+        return False, error
+
+    config = await get_config(owner_id)
+    config["trigger_en"] = (trigger_en or "").strip()
+    config["trigger_fa"] = (trigger_fa or "").strip()
+    ok = await save_config(owner_id, config)
+    if ok:
+        return True, "✅ Triggers updated."
+    return False, "❌ Failed to save triggers."
+
+
+async def get_triggers(owner_id: int) -> dict[str, str]:
+    """Return the configured trigger words for an owner."""
+    config = await get_config(owner_id)
+    return {
+        "trigger_en": config.get("trigger_en", "") or "",
+        "trigger_fa": config.get("trigger_fa", "") or "",
+    }
+
+
+def match_trigger(first_word: str, trigger_en: str, trigger_fa: str) -> bool:
+    """Check if the first word of a message matches either trigger.
+
+    Rules:
+      - English trigger: case-insensitive comparison.
+      - Persian trigger: exact comparison.
+      - Empty triggers never match.
+    """
+    if not first_word:
+        return False
+
+    en = (trigger_en or "").strip()
+    fa = (trigger_fa or "").strip()
+
+    if en and first_word.lower() == en.lower():
+        return True
+
+    if fa and first_word == fa:
+        return True
+
+    return False
