@@ -35,6 +35,9 @@ from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
+from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.registry import ToolRegistry, create_default_registry
+from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,8 @@ class Dispatcher:
         "_provider_manager",
         "_hooks",
         "_metrics",
+        "_tool_registry",
+        "_tool_executor",
     )
 
     def __init__(
@@ -58,6 +63,8 @@ class Dispatcher:
         providers: ProviderRegistry | ProviderManager,
         hooks: EngineHooks | None = None,
         metrics: EngineMetrics | None = None,
+        tool_registry: ToolRegistry | None = None,
+        tool_executor: ToolExecutor | None = None,
     ) -> None:
         self._conversation = conversation
         self._prompt_builder = prompt_builder
@@ -69,6 +76,8 @@ class Dispatcher:
             self._providers = providers
         self._hooks = hooks or NOOP_HOOKS
         self._metrics = metrics or EngineMetrics()
+        self._tool_registry = tool_registry
+        self._tool_executor = tool_executor
 
     @property
     def metrics(self) -> EngineMetrics:
@@ -101,6 +110,12 @@ class Dispatcher:
         # ── Stage 2: Prompt Builder ──
         try:
             prompt_package = self._prompt_builder.build(self._build_context(request, session))
+            # Inject tool schemas into the prompt if a registry is available
+            if self._tool_registry and not self._tool_registry.is_empty():
+                tool_schemas = self._tool_registry.list_schemas()
+                tool_block = self._render_tool_schemas(tool_schemas)
+                if tool_block:
+                    prompt_package = self._inject_tool_schemas(prompt_package, tool_block)
             safe_call(self._hooks, "after_prompt", prompt_package)
             metadata["stages"].append("prompt_builder")
         except Exception as exc:  # noqa: BLE001
@@ -121,6 +136,28 @@ class Dispatcher:
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider", start, errors, metadata)
+
+        # ── Stage 4b: Tool Execution ──
+        tool_results: list[dict[str, Any]] = []
+        if response.tool_calls and self._tool_executor:
+            try:
+                exec_results = await self._tool_executor.execute_calls(
+                    response.tool_calls,
+                    owner_id=request.owner_id,
+                    session_id=request.session_id,
+                )
+                for er in exec_results:
+                    tool_results.append(er.as_dict())
+                    if er.success:
+                        self._conversation.add_tool_result(
+                            owner_id=request.owner_id,
+                            tool_name=er.tool_name,
+                            result=er.message,
+                        )
+                metadata["tool_results"] = tool_results
+                metadata["stages"].append("tool_execution")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"tool_execution: {exc}")
 
         # ── Stage 5: Conversation Update ──
         try:
@@ -170,6 +207,35 @@ class Dispatcher:
 
     # ── internal ──
 
+    def _render_tool_schemas(self, schemas: list[dict[str, Any]]) -> str:
+        """Render tool schemas into a compact text block for the prompt."""
+        if not schemas:
+            return ""
+        lines = ["[Available Tools]"]
+        for s in schemas:
+            params = s.get("parameters", {})
+            param_str = ""
+            if isinstance(params, dict):
+                props = params.get("properties", {})
+                if props:
+                    parts = []
+                    for pname, pinfo in props.items():
+                        ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
+                        parts.append(f"{pname}({ptype})")
+                    param_str = ", ".join(parts)
+            safe_badge = "safe" if s.get("safe") else "needs-confirm"
+            lines.append(
+                f"  - {s['name']}({param_str}) — {s['description']} [{safe_badge}]"
+            )
+        return "\n".join(lines)
+
+    def _inject_tool_schemas(self, package: Any, tool_block: str) -> Any:
+        """Return a new PromptPackage with the tool context enriched."""
+        from dataclasses import replace
+        existing = package.tool_context or ""
+        merged = f"{existing}\n\n{tool_block}" if existing else tool_block
+        return replace(package, tool_context=merged)
+
     def _build_messages(self, prompt_package: Any) -> list[dict[str, Any]]:
         """Convert a PromptPackage into a messages list for ProviderManager.chat()."""
         messages: list[dict[str, Any]] = []
@@ -209,7 +275,7 @@ class Dispatcher:
                 tool_name=item.role if item.role == "tool" else "",
             ))
         return ContextBuilder().build(
-            session=self._adapt_session(session),
+            session=self._adapt_session(session, request),
             user_text=request.user_message,
             message_id=request.message_id,
             current_menu="main",
@@ -225,7 +291,7 @@ class Dispatcher:
             history=history_entries,
         )
 
-    def _adapt_session(self, session: Any) -> Any:
+    def _adapt_session(self, session: Any, request: AIRequest | None = None) -> Any:
         """Adapt a RuntimeSession to the ConversationSession shape the
         ContextBuilder expects. We build a lightweight stand-in with
         the attributes ContextBuilder reads."""
@@ -239,21 +305,21 @@ class Dispatcher:
                 "current_tool", "last_tool",
             )
 
-            def __init__(self, s: Any) -> None:
+            def __init__(self, s: Any, req: AIRequest | None = None) -> None:
                 self.session_id = s.session_id
                 self.owner_id = s.owner_id
-                self.chat_id = 0
+                self.chat_id = req.chat_id if req else 0
                 self.state = ConversationState.IDLE
                 self.current_panel = ""
                 self.current_category = ""
                 self.current_flow = ""
                 self.pending_action = ""
-                self.language = "English"
-                self.timezone = "UTC"
+                self.language = req.language if req else "English"
+                self.timezone = req.timezone if req else "UTC"
                 self.current_tool = ""
                 self.last_tool = ""
 
-        return _SessionView(session)
+        return _SessionView(session, request)
 
     def _fail(
         self,

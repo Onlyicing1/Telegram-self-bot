@@ -154,7 +154,7 @@ async def _failsafe_loop() -> None:
                     _frozen_since = 0.0
                     try:
                         immortal_create_task(
-                            sup._hard_reset_runtime(),
+                            sup._hard_reset_runtime,
                             name="lifeos-failsafe-reset",
                         )
                     except Exception as exc:
