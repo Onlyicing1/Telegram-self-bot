@@ -3,10 +3,12 @@
 
 Wires the AI Engine to Telegram. When the owner sends .ai <message>,
 the handler:
-  1. Gets or creates an AI session for the owner
-  2. Builds an AIRequest with the user's message
-  3. Executes the request through the full AI pipeline
-  4. Edits the triggering message with the AI response
+  1. Restores the saved provider/model from DB (auto-restore)
+  2. Gets or creates an AI session for the owner
+  3. Builds an AIRequest with the user's message
+  4. Executes the request through the full AI pipeline
+  5. Edits the triggering message with the AI response
+  6. Records request latency in DB
 
 The AI works immediately after deployment if an API key is configured.
 Without an API key, the dummy provider returns a placeholder response.
@@ -48,6 +50,36 @@ def _get_engine():
         return None
 
 
+async def _restore_config(owner_id: int) -> None:
+    """Restore saved provider/model from DB and apply to the engine."""
+    try:
+        from backend.ai.config_store import get_config
+        config = await get_config(owner_id)
+        provider = config.get("provider", "")
+        model = config.get("model", "")
+
+        if provider:
+            engine = _get_engine()
+            if engine and engine.provider_manager.registry.has(provider):
+                engine.provider_manager.switch_provider(provider)
+                if model:
+                    pconfig = engine.provider_manager.get_provider_config(provider)
+                    pconfig.default_model = model
+
+        temperature = config.get("temperature", 1.0)
+        max_tokens = config.get("max_tokens", 4096)
+        if engine:
+            try:
+                engine.conversation_manager.set_system_prompt(
+                    owner_id,
+                    config.get("system_prompt", "") or "You are LifeOS Assistant.",
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("AI handler: config restore failed: %s", exc)
+
+
 def register(client, owner_id: int, tz_str: str):
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai(?:\s+(.+))?$"))
@@ -80,6 +112,8 @@ def register(client, owner_id: int, tz_str: str):
                 pass
             return
 
+        await _restore_config(owner_id)
+
         from backend.ai.session.request import AIRequest
 
         session_id = f"owner-{owner_id}"
@@ -101,6 +135,13 @@ def register(client, owner_id: int, tz_str: str):
             result = await engine.execute(request)
             record_event("ai", "execute", 0, "SUCCESS" if result.success else "FAILED",
                          f"provider={result.provider}")
+
+            if result.success:
+                try:
+                    from backend.ai.config_store import record_request
+                    await record_request(owner_id, result.latency * 1000)
+                except Exception:
+                    pass
 
             if result.success and result.response:
                 response_text = result.response

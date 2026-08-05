@@ -150,6 +150,22 @@ class GeminiProvider(BaseProvider):
 
         return ProviderResponse(text="Failed after retries.", provider_name=self.name, success=False)
 
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Fetch available models from the Gemini API."""
+        if not self._config.api_key or not self._config.enabled:
+            return []
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=self._config.timeout)
+        url = f"{_GEMINI_BASE}/models?key={self._config.api_key}&pageSize=100"
+        try:
+            resp = await self._http_client.get(url)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data.get("models", [])
+        except Exception:
+            return []
+
     def count_tokens(self, text: str) -> int:
         if not text:
             return 0

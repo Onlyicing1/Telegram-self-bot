@@ -168,6 +168,28 @@ class OpenAICompatProvider(BaseProvider):
             metadata={"reason": "vision not implemented"},
         )
 
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Fetch available models from the provider's /models endpoint."""
+        if not self._config.api_key or not self._config.enabled:
+            return []
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=self._config.timeout,
+                headers={
+                    "Authorization": f"Bearer {self._config.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        url = f"{self._config.base_url}/models"
+        try:
+            resp = await self._http_client.get(url)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data.get("data", [])
+        except Exception:
+            return []
+
     def count_tokens(self, text: str) -> int:
         if not text:
             return 0
