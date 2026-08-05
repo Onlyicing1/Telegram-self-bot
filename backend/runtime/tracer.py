@@ -64,6 +64,11 @@ def trace_task_crash(task_name: str, exc: BaseException, runtime_state: str = ""
         task=task_name,
         runtime_state=runtime_state or "unknown",
     )
+    try:
+        from backend.runtime.crash_diagnostics import capture_task_exception
+        capture_task_exception(task_name, exc)
+    except Exception:
+        pass
 
 
 def trace_task_cancelled(task_name: str, runtime_state: str = "") -> None:
@@ -81,6 +86,11 @@ def trace_handler_exception(handler_name: str, exc: BaseException, runtime_state
 
 def trace_uncaught(exc: BaseException) -> None:
     trace_exception("UNCAUGHT_EXCEPTION", exc)
+    try:
+        from backend.runtime.crash_diagnostics import record_exception
+        record_exception(exc, source="trace_uncaught")
+    except Exception:
+        pass
 
 
 def now_iso() -> str:

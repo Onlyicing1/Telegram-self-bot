@@ -42,6 +42,14 @@ def _get_runtime_state() -> str:
     return _runtime_state_ref["state"]
 
 
+def _record_crash(task_name: str, exc: BaseException) -> None:
+    try:
+        from backend.runtime.crash_diagnostics import capture_task_exception
+        capture_task_exception(task_name, exc)
+    except Exception:
+        pass
+
+
 def guarded_create_task(
     coro: "asyncio.coroutines",
     name: str,
@@ -58,6 +66,7 @@ def guarded_create_task(
             return None
         except Exception as exc:
             trace_task_crash(name, exc, _get_runtime_state())
+            _record_crash(name, exc)
             logger.exception("Task '%s' crashed:", name)
             raise
         finally:
@@ -75,7 +84,7 @@ def immortal_create_task(
 ) -> asyncio.Task:
     """Wrap a coroutine *factory* so the task NEVER dies from an exception.
 
-    The factory must be a zero-argument callable that returns a fresh
+    The factory must be a zero-arg callable that returns a fresh
     coroutine.  On crash the wrapper logs the exception, sleeps with
     exponential backoff, and calls the factory again to produce a new
     coroutine.  CancelledError is always re-raised (cooperative
@@ -117,6 +126,7 @@ def immortal_create_task(
                 jitter = random.uniform(-0.3, 0.3) * base
                 delay = max(1.0, base + jitter)
                 trace_task_crash(name, exc, _get_runtime_state())
+                _record_crash(name, exc)
                 trace("IMMORTAL_RESTART", task=name, attempt=attempt, backoff=f"{delay:.1f}s")
                 logger.exception("IMMORTAL — task '%s' crashed (attempt %d), restarting in %.1fs:", name, attempt, delay)
                 await asyncio.sleep(delay)
