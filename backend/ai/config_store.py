@@ -1,9 +1,10 @@
 """
-AI Config Store — persists user AI configuration in Supabase.
+AI Config Store — persists user AI configuration.
 
 Stores the user's selected provider, model, temperature, max_tokens,
-and other settings in the `ai_config` table. Restored automatically
-after restart.
+and other settings. Uses Supabase when available, with an in-memory
+fallback so the AI config survives across callbacks even when the
+database is unreachable.
 
 All operations are async and use asyncio.to_thread with bounded
 timeouts, matching the pattern in backend/db/client.py.
@@ -29,6 +30,8 @@ _DEFAULTS: dict[str, Any] = {
     "is_configured": False,
 }
 
+_fallback_config: dict[int, dict[str, Any]] = {}
+
 
 def _get_db():
     from backend.db.client import get_db
@@ -45,13 +48,14 @@ async def _run_sync(fn, *args, **kwargs):
 def _get_config_sync(owner_id: int) -> dict[str, Any] | None:
     db = _get_db()
     if not db:
-        return None
+        logger.info("[AI_CONFIG] DB unavailable — using fallback for owner_id=%s", owner_id)
+        return _fallback_config.get(owner_id)
     try:
         result = db.table("ai_config").select("*").eq("owner_id", owner_id).maybe_single().execute()
         return result.data if result else None
     except Exception as exc:
-        logger.warning("ai_config get failed: %s", exc)
-        return None
+        logger.warning("[AI_CONFIG] DB get failed for owner_id=%s: %s — using fallback", owner_id, exc)
+        return _fallback_config.get(owner_id)
 
 
 async def get_config(owner_id: int) -> dict[str, Any]:
@@ -59,16 +63,21 @@ async def get_config(owner_id: int) -> dict[str, Any]:
     try:
         row = await _run_sync(_get_config_sync, owner_id)
         if row:
-            return {k: row.get(k, v) for k, v in _DEFAULTS.items()}
+            merged = {k: row.get(k, v) for k, v in _DEFAULTS.items()}
+            logger.info("[AI_CONFIG] get_config OK owner_id=%s provider='%s' model='%s'", owner_id, merged.get("provider", ""), merged.get("model", ""))
+            return merged
     except Exception as exc:
-        logger.warning("get_config failed: %s", exc)
+        logger.warning("[AI_CONFIG] get_config failed for owner_id=%s: %s", owner_id, exc)
+    logger.info("[AI_CONFIG] get_config → defaults owner_id=%s", owner_id)
     return dict(_DEFAULTS)
 
 
 def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
     db = _get_db()
     if not db:
-        return False
+        logger.info("[AI_CONFIG] DB unavailable — saving to fallback owner_id=%s provider='%s'", owner_id, config.get("provider", ""))
+        _fallback_config[owner_id] = dict(config)
+        return True
     try:
         existing = db.table("ai_config").select("id").eq("owner_id", owner_id).maybe_single().execute()
         payload = {
@@ -87,10 +96,13 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
         else:
             payload["created_at"] = datetime.now(timezone.utc).isoformat()
             db.table("ai_config").insert(payload).execute()
+        _fallback_config[owner_id] = dict(config)
+        logger.info("[AI_CONFIG] save_config OK owner_id=%s provider='%s' model='%s'", owner_id, payload["provider"], payload["model"])
         return True
     except Exception as exc:
-        logger.warning("ai_config save failed: %s", exc)
-        return False
+        logger.warning("[AI_CONFIG] DB save failed for owner_id=%s: %s — saving to fallback", owner_id, exc)
+        _fallback_config[owner_id] = dict(config)
+        return True
 
 
 async def save_config(owner_id: int, config: dict[str, Any]) -> bool:
@@ -98,8 +110,9 @@ async def save_config(owner_id: int, config: dict[str, Any]) -> bool:
     try:
         return await _run_sync(_save_config_sync, owner_id, config)
     except Exception as exc:
-        logger.warning("save_config failed: %s", exc)
-        return False
+        logger.warning("[AI_CONFIG] save_config failed for owner_id=%s: %s — saving to fallback", owner_id, exc)
+        _fallback_config[owner_id] = dict(config)
+        return True
 
 
 async def update_provider(owner_id: int, provider: str, model: str = "") -> bool:
@@ -128,21 +141,10 @@ async def update_setting(owner_id: int, key: str, value: Any) -> bool:
 
 async def record_request(owner_id: int, latency_ms: float) -> bool:
     """Record a successful request with its latency."""
-    db = _get_db()
-    if not db:
-        return False
-    try:
-        def _update():
-            db.table("ai_config").update({
-                "last_request_at": datetime.now(timezone.utc).isoformat(),
-                "last_latency_ms": latency_ms,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("owner_id", owner_id).execute()
-        await _run_sync(_update)
-        return True
-    except Exception as exc:
-        logger.warning("record_request failed: %s", exc)
-        return False
+    config = await get_config(owner_id)
+    config["last_request_at"] = datetime.now(timezone.utc).isoformat()
+    config["last_latency_ms"] = latency_ms
+    return await save_config(owner_id, config)
 
 
 async def is_configured(owner_id: int) -> bool:
