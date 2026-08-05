@@ -154,7 +154,7 @@ async def _failsafe_loop() -> None:
                     _frozen_since = 0.0
                     try:
                         immortal_create_task(
-                            sup._hard_reset_runtime(),
+                            sup._hard_reset_runtime,
                             name="lifeos-failsafe-reset",
                         )
                     except Exception as exc:
@@ -170,7 +170,7 @@ def start_failsafe() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = immortal_create_task(_failsafe_loop(), name="lifeos-failsafe")
+    _task = immortal_create_task(_failsafe_loop, name="lifeos-failsafe")
 
 
 async def stop_failsafe() -> None:

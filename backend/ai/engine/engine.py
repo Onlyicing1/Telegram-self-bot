@@ -36,6 +36,8 @@ from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
+from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,8 @@ class Engine:
         "_dispatcher",
         "_hooks",
         "_metrics",
+        "_tool_registry",
+        "_tool_executor",
     )
 
     def __init__(
@@ -63,6 +67,7 @@ class Engine:
         prompt_builder: PromptBuilder | None = None,
         providers: ProviderRegistry | ProviderManager | None = None,
         hooks: EngineHooks | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self._conversation = conversation or ConversationManager()
         self._prompt_builder = prompt_builder or PromptBuilder()
@@ -77,12 +82,20 @@ class Engine:
             self._providers = providers
         self._hooks = hooks or NOOP_HOOKS
         self._metrics = EngineMetrics()
+        self._tool_registry = tool_registry
+        self._tool_executor: ToolExecutor | None = None
+        if tool_registry is not None:
+            from backend.ai.tools.context import ToolContext
+            ctx = ToolContext(telegram=None, owner_id=0, tz_str="UTC")
+            self._tool_executor = ToolExecutor(tool_registry, ctx)
         self._dispatcher = Dispatcher(
             conversation=self._conversation,
             prompt_builder=self._prompt_builder,
             providers=self._provider_manager,
             hooks=self._hooks,
             metrics=self._metrics,
+            tool_registry=self._tool_registry,
+            tool_executor=self._tool_executor,
         )
         logger.info(
             "Engine initialized (provider=%s, providers=%s)",
@@ -130,6 +143,16 @@ class Engine:
     @property
     def provider_manager(self) -> ProviderManager:
         return self._provider_manager
+
+    @property
+    def tool_registry(self) -> ToolRegistry | None:
+        return self._tool_registry
+
+    def attach_tools(self, registry: ToolRegistry, owner_id: int = 0, tz_str: str = "UTC") -> None:
+        """Attach or replace the tool registry and executor at runtime."""
+        from backend.ai.tools.context import ToolContext
+        self._tool_registry = registry
+        self._tool_executor = ToolExecutor(registry, ToolContext(telegram=None, owner_id=owner_id, tz_str=tz_str))
 
 
 # ── Module-level convenience ──

@@ -80,7 +80,21 @@ async def main() -> None:
     supervisor = RuntimeSupervisor(cfg)
     supervisor_placeholder[0] = supervisor
 
-    await supervisor.start()
+    startup_attempts = 0
+    while True:
+        startup_attempts += 1
+        try:
+            await supervisor.start()
+            break
+        except Exception as exc:
+            trace_exception("STARTUP_FAILED", exc, attempt=startup_attempts)
+            logger.error("Startup attempt %d failed: %s", startup_attempts, exc)
+            if startup_attempts >= 5:
+                logger.error("Startup failed after %d attempts — exiting so Render restarts", startup_attempts)
+                sys.exit(1)
+            delay = min(30.0, 2.0 * (2 ** startup_attempts))
+            logger.info("Retrying startup in %.1fs...", delay)
+            await asyncio.sleep(delay)
 
     await supervisor.shutdown_event.wait()
 

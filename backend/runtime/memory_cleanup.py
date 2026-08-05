@@ -58,7 +58,7 @@ def start_memory_cleanup() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = immortal_create_task(_cleanup_loop(), name="lifeos-memory-cleanup")
+    _task = immortal_create_task(_cleanup_loop, name="lifeos-memory-cleanup")
 
 
 async def stop_memory_cleanup() -> None:

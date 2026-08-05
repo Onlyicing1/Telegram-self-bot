@@ -29,7 +29,7 @@ import traceback
 from collections import deque
 
 from backend.runtime.tracer import trace
-from backend.runtime.task_guard import guarded_create_task
+from backend.runtime.task_guard import immortal_create_task
 
 logger = logging.getLogger("backend.diagnostics_loop")
 
@@ -368,8 +368,8 @@ def start_diagnostics() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = guarded_create_task(
-        _diagnostics_loop(), name="lifeos-diagnostics"
+    _task = immortal_create_task(
+        _diagnostics_loop, name="lifeos-diagnostics"
     )
 
 
