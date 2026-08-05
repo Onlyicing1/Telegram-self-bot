@@ -122,7 +122,9 @@ lifeos/
 │   │   ├── router.py           # Command router (all . commands)
 │   │   └── handlers/           # Per-feature command handlers
 │   │       ├── ai_cmd.py       # .ai command handler
-│   │       ├── ai.py           # AI Glass Panel (settings, provider, etc.)
+│   │       ├── ai.py           # AI Glass Panel (settings, provider, triggers, etc.)
+│   │       ├── ai_cmd.py     # .ai command handler (DEPRECATED — use triggers)
+│   │       ├── ai_trigger.py # Trigger-based AI activation (default method)
 │   │       ├── bio.py          # .bio command + panel
 │   │       ├── database.py     # .db command + panel
 │   │       ├── delete.py       # .del command + panel
@@ -329,20 +331,106 @@ constraint, and RLS policy), see
 
 ## How AI Works
 
-1. The owner sends `.ai <message>` in any chat.
-2. The `ai_cmd.py` handler builds an `AIRequest` and calls
-   `engine.execute(request)`.
-3. The Engine delegates to the Dispatcher, which runs 6 stages:
+AI conversations are activated by **trigger words**, not commands.
+Each user configures an English trigger and/or a Persian trigger via
+the AI Settings panel or the dashboard. When the owner sends an
+outgoing message whose **first word** matches either trigger, the AI
+subsystem activates automatically.
+
+### Trigger System
+
+Each user can configure two trigger words:
+
+| Trigger | Matching | Example |
+|---|---|---|
+| English | Case-insensitive | `Nova` |
+| Persian | Exact match | `نوا` |
+
+**Rules:**
+- Both fields are optional individually.
+- At least one must be set before AI can be activated.
+- The two values must not be identical.
+- Triggers must be single words (no spaces).
+- The first word of each outgoing message is checked against the triggers.
+- When a trigger matches, the trigger word is **removed** from the
+  message before it is sent to the provider.
+- Messages starting with `.` (dot commands) are always skipped.
+
+**Example — English trigger `Nova`:**
+
+```
+Nova summarize this
+```
+
+Provider receives: `summarize this`
+
+**Example — Persian trigger `نوا`:**
+
+```
+نوا این متن را خلاصه کن
+```
+
+Provider receives: `این متن را خلاصه کن`
+
+No automatic transliteration. No guessing. The user explicitly
+defines both values.
+
+### Conversation Flow
+
+```
+Message
+  ↓
+First word == English Trigger (case-insensitive)
+  OR
+First word == Persian Trigger (exact)
+  ↓
+Remove trigger from message
+  ↓
+Load Provider (from Supabase config)
+  ↓
+Load Model (from Supabase config)
+  ↓
+Send request through AI pipeline
+  ↓
+Edit triggering message with response
+```
+
+### Execution Pipeline
+
+1. The trigger handler (`ai_trigger.py`) detects a trigger match.
+2. It restores the saved provider/model from Supabase.
+3. It builds an `AIRequest` with the stripped message.
+4. The Engine delegates to the Dispatcher, which runs 6 stages:
    - Gets or creates a conversation session for the owner
    - Builds the prompt (system prompt + conversation history + memory)
    - Routes to the active provider (with fallback chain)
    - Calls the provider's `chat()` method
    - Updates the conversation history with the response
    - Returns an `EngineResult`
-4. The handler edits the triggering message with the AI response.
-5. If the provider returned tool calls, the ToolExecutor runs them
+5. The handler edits the triggering message with the AI response.
+6. If the provider returned tool calls, the ToolExecutor runs them
    (READ_ONLY and READ_WRITE auto-execute; DANGEROUS and ADMIN_ONLY
    require owner confirmation).
+
+### Backward Compatibility
+
+The old `.ai <message>` command is deprecated but still works. Users
+should migrate to the trigger system. The trigger system is the default
+activation method.
+
+### Provider Selection
+
+Providers are selected via the AI Settings panel. Available providers
+are auto-detected from environment variables. The selected provider
+and model are persisted in the `ai_config` Supabase table and restored
+on each trigger activation.
+
+### Model Selection
+
+Models are fetched live from the provider's API. When a provider is
+selected, the model list is automatically downloaded and the first
+available model is set as default. Users can change the model at any
+time via the AI panel.
 
 Without an API key, the DummyProvider returns a deterministic
 placeholder — no network calls are ever made.
@@ -588,10 +676,9 @@ Supabase is optional but recommended for persistence across restarts.
    SUPABASE_URL=https://your-project.supabase.co
    SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
    ```
-5. **AI tables**: The 5 AI tables (`ai_sessions`, `ai_messages`,
-   `ai_memories`, `ai_tool_history`, `ai_provider_stats`) do not yet
-   have migrations. The AI subsystem operates in-memory until
-   migrations are applied. See [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)
+5. **AI tables**: The AI tables (`ai_sessions`, `ai_messages`,
+   `ai_memories`, `ai_tool_history`, `ai_config`) have migrations
+   applied via Supabase. See [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)
    for the exact schema.
 
 The bot works without Supabase — all operations fall back to in-memory
@@ -746,8 +833,9 @@ diagnostics, and runtime heartbeat.
 
 ### AI Assistant
 
-`.ai <message>` command with full conversation context, memory, and
-tool execution. See [AI Architecture](#ai-architecture) above.
+Trigger-word-based activation with full conversation context, memory,
+and tool execution. Configure triggers in the AI Settings panel or
+the web dashboard. See [How AI Works](#how-ai-works) above.
 
 ---
 
@@ -766,7 +854,7 @@ All commands use the `.` prefix. Only fire on outgoing messages.
 | `.health` | Health dashboard |
 | `.kill` | Diagnostic snapshot + recovery |
 | `.logs` | Event log viewer |
-| `.ai <message>` | AI assistant |
+| `.ai <message>` | AI assistant (deprecated — use trigger words) |
 
 ### Save Engine
 
@@ -863,8 +951,11 @@ All commands use the `.` prefix. Only fire on outgoing messages.
 
 - Check `AI_ENABLED=true` is set.
 - Check that a provider API key is configured (e.g. `AI_OPENAI_API_KEY`).
+- Check that at least one trigger word is configured (English or Persian).
 - Without an API key, the DummyProvider returns a placeholder.
+- Without trigger words, AI will not activate.
 - Check `.health` for the AI engine status.
+- The old `.ai` command still works as a fallback (deprecated).
 
 ---
 
