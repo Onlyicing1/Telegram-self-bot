@@ -51,7 +51,7 @@ from backend.username import engine as username_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
 from backend.helper.client import build_helper, disconnect_helper, register_helper_hooks, get_client as get_helper_client
-from backend.helper.inline_engine import set_self_client, set_helper_username, set_owner_id
+from backend.helper.inline_engine import set_self_client, set_helper_username, set_helper_id, set_owner_id
 from backend.helper.lifecycle import get_lifecycle, configure_lifecycle
 from backend.helper.target_context import clear_all as clear_all_targets
 from backend.helper.callback_trace import configure as configure_callback_trace
@@ -254,11 +254,25 @@ class RuntimeSupervisor:
                 self.helper_client = helper
                 set_helper_connected(True)
                 register_helper_hooks(helper)
+
+                from backend.helper.client import get_bot_username, get_bot_id
+                bot_username = get_bot_username()
+                bot_id = get_bot_id()
+                set_helper_username(bot_username)
+                set_helper_id(bot_id)
+                if not bot_username:
+                    logger.warning(
+                        "Helper bot has no public @username (id=%s) — "
+                        "inline panels will fail until a username is set "
+                        "via BotFather or Telegram settings",
+                        bot_id,
+                    )
+
                 from backend.helper.inline_engine import register_inline_handler
                 register_inline_handler(helper, self.owner_id)
                 from backend.helper.panels import register_callback_handlers
                 register_callback_handlers(helper, self.owner_id)
-                trace("HELPER_STARTED")
+                trace("HELPER_STARTED", username=bot_username, bot_id=bot_id)
         except Exception as exc:
             trace_exception("HELPER_START_FAILED", exc)
             logger.error("Helper bot start failed: %s", exc)
@@ -673,6 +687,8 @@ class RuntimeSupervisor:
     async def _stop_helper(self) -> None:
         helper = self.helper_client
         self.helper_client = None
+        set_helper_username("")
+        set_helper_id(0)
         if helper is not None:
             try:
                 await asyncio.wait_for(helper.disconnect(), timeout=10.0)
