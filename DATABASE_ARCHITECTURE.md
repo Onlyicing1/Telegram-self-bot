@@ -54,6 +54,7 @@ core LifeOS bot and 5 for the AI subsystem.
 | `ai_memories` | Three-tier memory (short, long, permanent) | `id` (bigserial) | `ai/persistence.py`, `ai/database/memory_repository.py` |
 | `ai_tool_history` | Log of every tool call the AI made | `id` (bigserial) | `ai/persistence.py`, `ai/database/tool_history_repository.py` |
 | `ai_provider_stats` | Per-provider aggregate statistics | `(provider_name, owner_id)` | `ai/database/provider_stats_repository.py` |
+| `ai_config` | Per-owner AI configuration (provider, model, triggers, settings) | `id` (bigserial) | `ai/config_store.py` |
 
 All access goes through the Supabase PostgREST API via the `supabase-py`
 client. The backend uses the **service-role key**, which bypasses RLS.
@@ -572,10 +573,13 @@ The bot never crashes due to a database error.
 | `20260730220000_panel_settings_column_model.sql` | 2026-07-30 | Migrated `bot_settings` into `panel_settings` as typed columns. Dropped `bot_settings`. |
 | `20260730230000_panel_settings_full_13_columns.sql` | 2026-07-30 | Added remaining `panel_settings` columns. |
 | `20260801215007_create_username_state_table.sql` | 2026-08-01 | Created `username_state` table. |
+| `20260804145402_create_ai_tables.sql` | 2026-08-04 | Created AI tables: `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`. |
+| `20260805120000_create_ai_config_table.sql` | 2026-08-05 | Created `ai_config` table with provider, model, temperature, max_tokens, system_prompt, history_budget, is_configured. |
+| `20260805130000_add_ai_trigger_columns.sql` | 2026-08-05 | Added `trigger_en` and `trigger_fa` columns to `ai_config` for trigger-based AI activation. |
 
 ### Missing migrations (AI tables)
 
-The following 5 AI tables are referenced by the code but do **not** have
+The following AI tables are referenced by the code but do **not** have
 migrations applied to the live database. The AI subsystem currently
 operates entirely in-memory. When migrations are added, they should
 create the tables exactly as described in §7–§10 above:
@@ -585,6 +589,46 @@ create the tables exactly as described in §7–§10 above:
 3. `ai_memories` — three-tier memory
 4. `ai_tool_history` — tool call log
 5. `ai_provider_stats` — per-provider aggregate statistics
+6. `ai_config` — per-owner AI configuration (provider, model, triggers)
+
+The `ai_config` table is created by migration
+`20260805120000_create_ai_config_table.sql` and later had trigger
+columns added by `20260805130000_add_ai_trigger_columns.sql`.
+Its complete schema:
+
+| Column | SQL Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | `bigserial` | NO | `nextval(...)` | Primary key |
+| `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
+| `provider` | `text` | NO | `''` | Active provider name (e.g. `gemini`, `openai`, `dummy`) |
+| `model` | `text` | NO | `''` | Active model name |
+| `temperature` | `double precision` | NO | `1.0` | Sampling temperature [0.0, 2.0] |
+| `max_tokens` | `integer` | NO | `4096` | Max output tokens |
+| `system_prompt` | `text` | NO | `''` | Custom system prompt (empty = default) |
+| `history_budget` | `integer` | NO | `4000` | Context budget in tokens |
+| `is_configured` | `boolean` | NO | `false` | Whether the user completed setup |
+| `trigger_en` | `text` | YES | `NULL` | English trigger word (case-insensitive matching) |
+| `trigger_fa` | `text` | YES | `NULL` | Persian trigger word (exact matching) |
+| `created_at` | `timestamptz` | YES | `now()` | When the config row was created |
+| `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
+
+**Trigger validation rules (enforced in application code):**
+- Both `trigger_en` and `trigger_fa` are optional individually.
+- At least one must be non-empty before AI can be activated.
+- The two values must not be identical (case-insensitive comparison).
+- Triggers must be single words (no spaces).
+- `trigger_en` matching is case-insensitive.
+- `trigger_fa` matching is exact (no case folding).
+- When a trigger matches, the trigger word is stripped from the
+  message before being sent to the provider.
+
+**RLS:** Enabled. Only SELECT is granted to `anon` + `authenticated`.
+All writes go through the backend service-role key.
+
+**Repository:** `backend/ai/config_store.py` — `get_config`,
+`save_config`, `update_provider`, `update_model`, `update_setting`,
+`record_request`, `is_configured`, `validate_triggers`,
+`update_triggers`, `get_triggers`, `match_trigger`.
 
 The `ai_provider_stats` table is defined in the repository interface
 (`backend/ai/database/provider_stats_repository.py`) but not yet
