@@ -74,7 +74,7 @@ def start_keepalive() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = immortal_create_task(_keepalive_loop(), name="lifeos-keepalive")
+    _task = immortal_create_task(_keepalive_loop, name="lifeos-keepalive")
 
 
 async def stop_keepalive() -> None:

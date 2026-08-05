@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field
@@ -277,7 +276,7 @@ def run_startup_checks(cfg: dict) -> StartupReport:
         logger.log(level, "[STARTUP CHECK] %s: %s — %s", r.severity, r.name, r.message)
 
     if report.failures:
-        logger.error("[STARTUP CHECK] %d CRITICAL failure(s) — aborting:", len(report.failures))
+        logger.error("[STARTUP CHECK] %d CRITICAL failure(s) — will retry:", len(report.failures))
         for f in report.failures:
             logger.error("  ✗ %s: %s", f.name, f.message)
     else:

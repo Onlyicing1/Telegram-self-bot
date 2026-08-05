@@ -170,7 +170,7 @@ def start_failsafe() -> None:
     global _task
     if _task and not _task.done():
         return
-    _task = immortal_create_task(_failsafe_loop(), name="lifeos-failsafe")
+    _task = immortal_create_task(_failsafe_loop, name="lifeos-failsafe")
 
 
 async def stop_failsafe() -> None:

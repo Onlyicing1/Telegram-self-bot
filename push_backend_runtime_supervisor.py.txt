@@ -128,6 +128,9 @@ _CRITICAL_TASKS = (
     "lifeos-profile-scheduler",
     "lifeos-helper",
     "lifeos-run",
+    "lifeos-diagnostics",
+    "lifeos-memory-cleanup",
+    "lifeos-task-supervisor",
 )
 
 
@@ -246,7 +249,22 @@ class RuntimeSupervisor:
             logger.warning("[1b/5] AI engine init failed: %s", exc)
 
         logger.info("[2/5] Building self-client")
-        await self._build_and_register()
+        build_ok = False
+        for attempt in range(1, 4):
+            try:
+                await self._build_and_register()
+                build_ok = True
+                break
+            except Exception as exc:
+                trace_exception("STARTUP_BUILD_FAILED", exc, attempt=attempt)
+                logger.error("[2/5] Build attempt %d failed: %s", attempt, exc)
+                if attempt < 3:
+                    delay = _backoff(attempt)
+                    logger.info("[2/5] Retrying build in %.1fs...", delay)
+                    await asyncio.sleep(delay)
+        if not build_ok:
+            logger.error("[2/5] All build attempts failed — entering degraded mode, watchdog will retry")
+            self._transition(RuntimeState.DEGRADED)
 
         if self.helper_enabled:
             logger.info("[3/5] Starting helper bot")
@@ -271,10 +289,10 @@ class RuntimeSupervisor:
         configure_heartbeat(self)
         configure_failsafe(self)
         self._watchdog_task = immortal_create_task(
-            self._watchdog_loop(), name="lifeos-watchdog"
+            self._watchdog_loop, name="lifeos-watchdog"
         )
         self._run_task = immortal_create_task(
-            self._run_loop(), name="lifeos-run"
+            self._run_loop, name="lifeos-run"
         )
         start_keepalive()
         start_heartbeat()
@@ -282,7 +300,7 @@ class RuntimeSupervisor:
         start_diagnostics()
         start_memory_cleanup()
         self._task_supervisor_task = immortal_create_task(
-            self._task_supervisor_loop(), name="lifeos-task-supervisor"
+            self._task_supervisor_loop, name="lifeos-task-supervisor"
         )
 
     async def _build_and_register(self) -> None:
@@ -308,7 +326,6 @@ class RuntimeSupervisor:
             trace_exception("SELF_BUILD_FAILED", exc, gen=self.client_generation)
             logger.error("Failed to build client: %s", exc)
             record_event("runtime", "build_client", 0, "ERROR", str(exc))
-            self._transition(RuntimeState.FAILED)
             raise
 
         self._transition(RuntimeState.REGISTERING)
@@ -386,7 +403,7 @@ class RuntimeSupervisor:
                 set_helper_connected(True)
                 update_heartbeat_state(helper_connected=True)
                 immortal_create_task(
-                    self._supervise_helper(), name="lifeos-helper"
+                    self._supervise_helper, name="lifeos-helper"
                 )
                 logger.info("[3/5] Helper bot online — Inline Mode enabled")
         except Exception as exc:
@@ -421,7 +438,7 @@ class RuntimeSupervisor:
 
     async def _reconnect_helper(self) -> None:
         attempts = 0
-        while attempts < 5 and not self.shutdown_event.is_set():
+        while not self.shutdown_event.is_set():
             attempts += 1
             delay = _backoff(attempts)
             trace("HELPER_RECONNECTING", attempt=attempts, delay=f"{delay:.1f}s")
@@ -447,11 +464,6 @@ class RuntimeSupervisor:
             except Exception as exc:
                 trace_exception("HELPER_RECONNECT_FAILED", exc, attempt=attempts)
                 logger.warning("Helper reconnect failed: %s", exc)
-        if not self.shutdown_event.is_set():
-            trace("HELPER_RECONNECT_EXHAUSTED", attempts=attempts)
-            logger.warning("Helper reconnect exhausted — giving up")
-            set_helper_connected(False)
-            update_heartbeat_state(helper_connected=False)
 
     def _start_web_server(self) -> None:
         guarded_create_task(self._run_web(), name="lifeos-web")
@@ -497,9 +509,9 @@ class RuntimeSupervisor:
             set_telethon_connected(False)
             update_heartbeat_state(self_connected=False)
             trace("SELF_DISCONNECTED", gen=self.client_generation, reason="run_until_disconnected_returned")
-            trace("SELF_RUN_LOOP_EXITED", gen=self.client_generation)
             logger.warning("Self-client disconnected — watchdog will detect and recover")
-            break
+            await asyncio.sleep(2)
+            continue
 
     async def _reconnect_client(self) -> bool:
         client = self.client
@@ -619,7 +631,7 @@ class RuntimeSupervisor:
         username_engine.update_client(self.client)
 
         self._run_task = immortal_create_task(
-            self._run_loop(), name="lifeos-run"
+            self._run_loop, name="lifeos-run"
         )
 
         trace("CLIENT_REBUILD_OK", gen=self.client_generation)
@@ -771,7 +783,7 @@ class RuntimeSupervisor:
             await self._verify_heartbeat()
 
             self._run_task = immortal_create_task(
-                self._run_loop(), name="lifeos-run"
+                self._run_loop, name="lifeos-run"
             )
 
             start_heartbeat()
@@ -802,8 +814,7 @@ class RuntimeSupervisor:
             record_event("runtime", "recovery", 0, "ERROR", str(exc))
             set_last_rebuild_reason(f"recovery_error: {exc}")
             set_task_state("lifeos-recovery", "FAILED")
-            self._recovery_lock.release()
-            immortal_create_task(self._retry_full_recovery(), name="lifeos-recovery-retry")
+            immortal_create_task(self._retry_full_recovery, name="lifeos-recovery-retry")
             return
 
     async def _retry_full_recovery(self) -> None:
@@ -896,13 +907,12 @@ class RuntimeSupervisor:
                 trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="failsafe_timeout")
                 logger.error("CLIENT_REBUILD_FAILED — failsafe build timed out")
                 self._recovery_lock.release()
-                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                immortal_create_task(self._retry_full_recovery, name="lifeos-failsafe-retry")
                 return
             except Exception as exc:
                 trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation, reason="failsafe")
                 logger.error("CLIENT_REBUILD_FAILED — failsafe: %s", exc)
-                self._recovery_lock.release()
-                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                immortal_create_task(self._retry_full_recovery, name="lifeos-failsafe-retry")
                 return
 
             try:
@@ -916,13 +926,12 @@ class RuntimeSupervisor:
                 trace("CLIENT_REBUILD_FAILED", gen=self.client_generation, reason="failsafe_register_timeout")
                 logger.error("CLIENT_REBUILD_FAILED — failsafe registration timed out")
                 self._recovery_lock.release()
-                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                immortal_create_task(self._retry_full_recovery, name="lifeos-failsafe-retry")
                 return
             except Exception as exc:
                 trace_exception("CLIENT_REBUILD_FAILED", exc, gen=self.client_generation, reason="failsafe_register")
                 logger.error("CLIENT_REBUILD_FAILED — failsafe registration error: %s", exc)
-                self._recovery_lock.release()
-                immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+                immortal_create_task(self._retry_full_recovery, name="lifeos-failsafe-retry")
                 return
 
             set_last_update()
@@ -938,7 +947,7 @@ class RuntimeSupervisor:
             username_engine.update_client(self.client)
 
             self._run_task = immortal_create_task(
-                self._run_loop(), name="lifeos-run"
+                self._run_loop, name="lifeos-run"
             )
 
             await self._resume_bio_cron()
@@ -968,8 +977,7 @@ class RuntimeSupervisor:
         except Exception as exc:
             trace_exception("RECOVERY_FAILED", exc, reason="failsafe")
             logger.error("RECOVERY_FAILED — failsafe: %s", exc)
-            self._recovery_lock.release()
-            immortal_create_task(self._retry_full_recovery(), name="lifeos-failsafe-retry")
+            immortal_create_task(self._retry_full_recovery, name="lifeos-failsafe-retry")
             return
         finally:
             if self._recovery_lock.locked():
@@ -1054,6 +1062,19 @@ class RuntimeSupervisor:
                 check_stale()
                 set_heartbeat()
                 set_task_state("lifeos-watchdog", "RUNNING")
+            except Exception:
+                pass
+
+            try:
+                import os
+                mem_rss = int(open(f"/proc/{os.getpid()}/status").read().split("VmRSS:")[1].split()[0]) * 1024
+                if mem_rss > 400 * 1024 * 1024:
+                    trace("MEMORY_PRESSURE", rss_bytes=mem_rss, threshold="400MB")
+                    logger.warning("MEMORY_PRESSURE — RSS=%dMB, triggering cleanup", mem_rss // (1024 * 1024))
+                    import gc
+                    collected = gc.collect()
+                    trace("MEMORY_CLEANUP", collected=collected, rss_after="unknown")
+                    logger.info("MEMORY_CLEANUP — gc.collect() freed %d objects", collected)
             except Exception:
                 pass
 
@@ -1241,7 +1262,7 @@ class RuntimeSupervisor:
                         trace("TASK_RESTART", task=name, reason="exited")
                         logger.warning("TASK_RESTART — recreating %s", name)
                         self._watchdog_task = immortal_create_task(
-                            self._watchdog_loop(), name="lifeos-watchdog"
+                            self._watchdog_loop, name="lifeos-watchdog"
                         )
                     elif name == "lifeos-heartbeat" and not self.shutdown_event.is_set():
                         trace("TASK_RESTART", task=name, reason="exited")
@@ -1263,13 +1284,27 @@ class RuntimeSupervisor:
                                 trace("TASK_RESTART", task=name, reason="exited")
                                 logger.warning("TASK_RESTART — recreating %s", name)
                                 immortal_create_task(
-                                    self._supervise_helper(), name="lifeos-helper"
+                                    self._supervise_helper, name="lifeos-helper"
                                 )
                     elif name == "lifeos-run" and not self.shutdown_event.is_set():
                         trace("TASK_RESTART", task=name, reason="exited")
                         logger.warning("TASK_RESTART — recreating %s", name)
                         self._run_task = immortal_create_task(
-                            self._run_loop(), name="lifeos-run"
+                            self._run_loop, name="lifeos-run"
+                        )
+                    elif name == "lifeos-diagnostics" and not self.shutdown_event.is_set():
+                        trace("TASK_RESTART", task=name, reason="exited")
+                        logger.warning("TASK_RESTART — recreating %s", name)
+                        start_diagnostics()
+                    elif name == "lifeos-memory-cleanup" and not self.shutdown_event.is_set():
+                        trace("TASK_RESTART", task=name, reason="exited")
+                        logger.warning("TASK_RESTART — recreating %s", name)
+                        start_memory_cleanup()
+                    elif name == "lifeos-task-supervisor" and not self.shutdown_event.is_set():
+                        trace("TASK_RESTART", task=name, reason="exited")
+                        logger.warning("TASK_RESTART — recreating %s", name)
+                        self._task_supervisor_task = immortal_create_task(
+                            self._task_supervisor_loop, name="lifeos-task-supervisor"
                         )
 
     def _find_task_by_name(self, name: str) -> asyncio.Task | None:
