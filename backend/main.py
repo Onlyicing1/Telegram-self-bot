@@ -1,12 +1,21 @@
 """
-LifeOS — deterministic entry point.
+LifeOS — deterministic entry point with full crash diagnostics.
 
 Everything starts through the RuntimeSupervisor, which owns every runtime
 coroutine: self-client run loop, heartbeat, helper bot, bio cron, web server.
 
+Crash diagnostics:
+  - Global exception hooks (sys.excepthook, threading.excepthook, asyncio loop)
+  - Signal capture (SIGTERM, SIGINT, SIGABRT, SIGQUIT)
+  - SystemExit / KeyboardInterrupt / GeneratorExit capture
+  - Last-exception ring buffer (100 exceptions, 100 warnings, 100 events)
+  - Crash snapshot dumped before every process exit
+  - PROCESS_EXIT_REASON trace before every exit — no silent exits
+
 Startup:
   1. Config validation (hard-exit on missing required vars)
-  2. RuntimeSupervisor.start() — connects, authorizes, registers,
+  2. Crash diagnostics installed (signal handlers, exception hooks, atexit)
+  3. RuntimeSupervisor.start() — connects, authorizes, registers,
      starts helper, bio cron, web server, heartbeat, run loop
 
 Shutdown (SIGTERM/SIGINT):
@@ -14,14 +23,11 @@ Shutdown (SIGTERM/SIGINT):
   bio cron, helper, and self-client.
 
 If recovery fails repeatedly, the supervisor calls sys.exit(1) so
-Render's platform restarts the process automatically.
-
-Global exception handlers:
-  - sys.excepthook — catches uncaught synchronous exceptions
-  - loop.set_exception_handler — catches uncaught asyncio exceptions
-  Both route through the tracer so nothing disappears silently.
+Render's platform restarts the process automatically. Before that exit,
+the crash diagnostics module dumps the full crash snapshot.
 """
 import asyncio
+import atexit
 import logging
 import signal
 import sys
@@ -31,6 +37,16 @@ import backend.config as cfg_module
 from backend.runtime.supervisor import RuntimeSupervisor
 from backend.runtime.tracer import trace, trace_exception, trace_uncaught
 from backend.runtime.task_guard import guarded_create_task
+from backend.runtime.crash_diagnostics import (
+    install_all as install_crash_diagnostics,
+    record_exit_reason,
+    dump_crash_snapshot,
+    dump_buffers,
+    record_exception,
+    record_runtime_event,
+    capture_signal,
+    uptime_s,
+)
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -42,39 +58,34 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-
-def _global_excepthook(exc_type, exc_value, exc_tb):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-        return
-    trace_uncaught(exc_value)
-    logger.error("UNCAUGHT synchronous exception:")
-    traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stdout)
+supervisor_placeholder: list = [None]
 
 
-def _async_exception_handler(loop, context):
-    exc = context.get("exception")
-    if exc is not None:
-        trace_exception("UNCAUGHT_EXCEPTION", exc, source="asyncio_loop")
-    else:
-        msg = context.get("message", "unknown async error")
-        trace("UNCAUGHT_EXCEPTION", source="asyncio_loop", message=msg)
-    logger.error("UNCAUGHT async exception: %s", context)
-    loop.default_exception_handler(context)
+def _atexit_handler() -> None:
+    from backend.runtime.crash_diagnostics import exit_reason_is_set, get_exit_reason
+    if not exit_reason_is_set():
+        record_exit_reason("UNKNOWN", "atexit called without prior exit reason")
+    dump_buffers()
+    trace("PROCESS_TERMINATING", exit_reason=get_exit_reason(), uptime=f"{uptime_s()}s")
 
 
 async def main() -> None:
     cfg = cfg_module.load()
 
     loop = asyncio.get_running_loop()
-    loop.set_exception_handler(_async_exception_handler)
+
+    install_crash_diagnostics()
+    atexit.register(_atexit_handler)
+
+    from backend.runtime.crash_diagnostics import _async_loop_exception_handler
+    loop.set_exception_handler(_async_loop_exception_handler)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, lambda: guarded_create_task(
-                _handle_signal(supervisor_placeholder[0]), name="lifeos-signal-handler"
+            loop.add_signal_handler(sig, lambda s=sig: guarded_create_task(
+                _handle_signal(supervisor_placeholder[0], s), name="lifeos-signal-handler"
             ))
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
 
     supervisor = RuntimeSupervisor(cfg)
@@ -88,8 +99,11 @@ async def main() -> None:
             break
         except Exception as exc:
             trace_exception("STARTUP_FAILED", exc, attempt=startup_attempts)
+            record_exception(exc, source=f"startup_attempt_{startup_attempts}")
             logger.error("Startup attempt %d failed: %s", startup_attempts, exc)
             if startup_attempts >= 5:
+                record_exit_reason("STARTUP_FAILED", f"attempt {startup_attempts}: {exc}")
+                dump_crash_snapshot(reason=f"startup_failed:{type(exc).__name__}")
                 logger.error("Startup failed after %d attempts — exiting so Render restarts", startup_attempts)
                 sys.exit(1)
             delay = min(30.0, 2.0 * (2 ** startup_attempts))
@@ -100,18 +114,54 @@ async def main() -> None:
 
     await supervisor.stop()
 
+    record_exit_reason("CLEAN_SHUTDOWN", "supervisor.stop() completed")
     logger.info("LifeOS stopped cleanly.")
 
 
-supervisor_placeholder: list = [None]
+async def _handle_signal(supervisor, signum: int) -> None:
+    sig_name = _signal_name(signum)
+    trace("SIGNAL_RECEIVED", signal=sig_name, signum=signum, uptime=f"{uptime_s()}s")
+    record_runtime_event("SIGNAL_RECEIVED", f"{sig_name} (signum={signum})")
 
-
-async def _handle_signal(supervisor):
     if supervisor is not None:
         supervisor.shutdown_event.set()
-    trace("SHUTDOWN_SIGNAL", signal="SIGTERM/SIGINT")
+
+
+def _signal_name(signum: int) -> str:
+    names = {
+        signal.SIGTERM: "SIGTERM",
+        signal.SIGINT: "SIGINT",
+        signal.SIGABRT: "SIGABRT",
+    }
+    if hasattr(signal, "SIGQUIT"):
+        names[signal.SIGQUIT] = "SIGQUIT"
+    return names.get(signum, f"SIGNAL_{signum}")
 
 
 if __name__ == "__main__":
-    sys.excepthook = _global_excepthook
-    asyncio.run(main())
+    install_crash_diagnostics()
+    atexit.register(_atexit_handler)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        record_exit_reason("KEYBOARD_INTERRUPT", "KeyboardInterrupt at top level")
+        dump_crash_snapshot(reason="KeyboardInterrupt")
+        sys.exit(130)
+    except SystemExit:
+        if not _exit_reason_already_set():
+            record_exit_reason("SYSTEM_EXIT", "SystemExit at top level")
+        dump_crash_snapshot(reason="SystemExit")
+        raise
+    except BaseException as exc:
+        record_exit_reason("UNHANDLED_EXCEPTION", f"{type(exc).__name__}: {exc}")
+        record_exception(exc, source="main_baseException")
+        dump_crash_snapshot(reason=f"unhandled:{type(exc).__name__}")
+        trace_exception("RUNTIME_ABORT", exc)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stdout)
+        sys.exit(1)
+
+
+def _exit_reason_already_set() -> bool:
+    from backend.runtime.crash_diagnostics import exit_reason_is_set
+    return exit_reason_is_set()
