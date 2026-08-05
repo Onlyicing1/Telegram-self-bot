@@ -25,7 +25,7 @@ import logging
 import time
 
 from backend.runtime.tracer import trace
-from backend.runtime.task_guard import immortal_create_task
+from backend.runtime.task_guard import immortal_create_task, guarded_create_task
 from backend.health import (
     get_last_telethon_event,
     get_last_rpc,
@@ -153,8 +153,8 @@ async def _failsafe_loop() -> None:
                     )
                     _frozen_since = 0.0
                     try:
-                        immortal_create_task(
-                            sup._hard_reset_runtime,
+                        guarded_create_task(
+                            sup._hard_reset_runtime(),
                             name="lifeos-failsafe-reset",
                         )
                     except Exception as exc:
