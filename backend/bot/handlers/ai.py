@@ -322,7 +322,19 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
         lines.append(f"**System Prompt:** Custom ✅")
     else:
         lines.append(f"**System Prompt:** Default")
+
+    trigger_en = config.get("trigger_en", "") or ""
+    trigger_fa = config.get("trigger_fa", "") or ""
+    lines.append("")
+    lines.append("**Triggers:**")
+    lines.append(f"  English: `{trigger_en or '—'}`")
+    lines.append(f"  Persian: `{trigger_fa or '—'}`")
+    if not trigger_en and not trigger_fa:
+        lines.append("  ⚠️ Set at least one trigger to enable AI.")
+
     builder = InlinePanelBuilder()
+    builder.add_row("🔤 Set English Trigger", "input:ai_settings:trigger_en")
+    builder.add_row("🇮🇷 Set Persian Trigger", "input:ai_settings:trigger_fa")
     builder.add_row("🌡 Temperature", "input:ai_settings:temperature")
     builder.add_row("📦 Max Tokens", "input:ai_settings:max_tokens")
     builder.add_row("📝 Context Budget", "input:ai_settings:history_budget")
@@ -479,6 +491,8 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
     config = await _get_saved_config(owner_id)
     provider = config.get("provider", "")
     model = config.get("model", "")
+    trigger_en = config.get("trigger_en", "") or ""
+    trigger_fa = config.get("trigger_fa", "") or ""
     if not provider:
         return "🧠 AI", "⚠️ No provider configured.\n\nTap **Provider** to select one.", [
             [InlinePanelBuilder().add_row("🔄 Select Provider", "panel:ai_provider").build()[0][0]],
@@ -489,12 +503,29 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
             [InlinePanelBuilder().add_row("🤖 Select Model", "panel:ai_model").build()[0][0]],
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
+    if not trigger_en and not trigger_fa:
+        return "🧠 AI", (
+            "⚠️ No trigger words configured.\n\n"
+            "Tap **Settings** to set your trigger words.\n"
+            "You need at least one trigger to start chatting."
+        ), [
+            [InlinePanelBuilder().add_row("⚙️ Set Triggers", "panel:ai_settings").build()[0][0]],
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
+        ]
+    trigger_display = []
+    if trigger_en:
+        trigger_display.append(f"**English:** `{trigger_en}`")
+    if trigger_fa:
+        trigger_display.append(f"**Persian:** `{trigger_fa}`")
+    triggers = "\n".join(trigger_display)
     return "🧠 AI", (
         f"✅ **Ready to chat!**\n\n"
         f"**Provider:** {provider.title()}\n"
-        f"**Model:** {model}\n\n"
-        f"Send `.ai <message>` to start talking.\n"
-        f"Example: `.ai Hello, how are you?`"
+        f"**Model:** {model}\n"
+        f"**Triggers:**\n{triggers}\n\n"
+        f"Send a message starting with your trigger word.\n"
+        f"Example: `{trigger_en or trigger_fa} Hello, how are you?`\n\n"
+        f"_The trigger word is removed before sending to the AI._"
     ), []
 
 
@@ -582,6 +613,72 @@ async def _ai_history_budget_input(text, chat_id, msg_id, inline_chat_id, inline
             pass
 
 
+async def _ai_trigger_en_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    text_stripped = text.strip()
+    if text_stripped.lower() == "clear":
+        from backend.ai.config_store import update_setting
+        await update_setting(owner_id, "trigger_en", "")
+        result = "✅ English trigger cleared."
+    elif " " in text_stripped:
+        result = "❌ Trigger must be a single word (no spaces)."
+    else:
+        config = await _get_saved_config(owner_id)
+        existing_fa = config.get("trigger_fa", "") or ""
+        if text_stripped and existing_fa and text_stripped.lower() == existing_fa.lower():
+            result = "❌ English trigger must differ from Persian trigger."
+        else:
+            from backend.ai.config_store import update_setting
+            await update_setting(owner_id, "trigger_en", text_stripped)
+            result = f"✅ English trigger set to: `{text_stripped}`" if text_stripped else "✅ English trigger cleared."
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _ai_trigger_fa_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    text_stripped = text.strip()
+    if text_stripped.lower() == "clear":
+        from backend.ai.config_store import update_setting
+        await update_setting(owner_id, "trigger_fa", "")
+        result = "✅ Persian trigger cleared."
+    elif " " in text_stripped:
+        result = "❌ Trigger must be a single word (no spaces)."
+    else:
+        config = await _get_saved_config(owner_id)
+        existing_en = config.get("trigger_en", "") or ""
+        if text_stripped and existing_en and text_stripped.lower() == existing_en.lower():
+            result = "❌ Persian trigger must differ from English trigger."
+        else:
+            from backend.ai.config_store import update_setting
+            await update_setting(owner_id, "trigger_fa", text_stripped)
+            result = f"✅ Persian trigger set to: `{text_stripped}`" if text_stripped else "✅ Persian trigger cleared."
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
 async def _ai_system_prompt_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client
     owner_id = await _get_owner_id()
@@ -625,6 +722,14 @@ def register(client, owner_id: int) -> None:
         register_action("ai_start_chat", _ai_start_chat_action)
         register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
+        register_input("ai_settings", "trigger_en", {
+            "handler": _ai_trigger_en_input,
+            "prompt": "**🔤 English Trigger**\n\nEnter a single trigger word (case-insensitive):\nOr send 'clear' to remove.\n\n_Reply below._",
+        })
+        register_input("ai_settings", "trigger_fa", {
+            "handler": _ai_trigger_fa_input,
+            "prompt": "**🇮🇷 Persian Trigger**\n\nEnter a single trigger word (exact match):\nOr send 'clear' to remove.\n\n_Reply below._",
+        })
         register_input("ai_settings", "temperature", {
             "handler": _ai_temperature_input,
             "prompt": "**🌡 Temperature**\n\nEnter value (0.0 – 2.0):\n\n_Reply below._",
