@@ -14,7 +14,7 @@ import logging
 import time
 
 from backend.runtime.tracer import trace, trace_exception
-from backend.runtime.task_guard import immortal_create_task
+from backend.runtime.task_guard import immortal_create_task, guarded_create_task
 from backend.health import set_last_rpc, set_rpc_latency, tick_loop
 
 logger = logging.getLogger(__name__)
@@ -62,12 +62,14 @@ async def _keepalive_loop() -> None:
             trace("KEEPALIVE_TIMEOUT", gen=sup.client_generation)
             logger.warning("KEEPALIVE_TIMEOUT — RPC timed out after %ds (gen=%d)", _RPC_TIMEOUT, sup.client_generation)
             sup._consecutive_failures += 1
-            await sup._trigger_reconnect()
+            if not sup._recovery_lock.locked():
+                guarded_create_task(sup._trigger_reconnect(), name="lifeos-keepalive-recovery")
         except Exception as exc:
             trace_exception("KEEPALIVE_FAILED", exc, gen=sup.client_generation)
             logger.warning("KEEPALIVE_FAILED — %s (gen=%d)", type(exc).__name__, sup.client_generation)
             sup._consecutive_failures += 1
-            await sup._trigger_reconnect()
+            if not sup._recovery_lock.locked():
+                guarded_create_task(sup._trigger_reconnect(), name="lifeos-keepalive-recovery")
 
 
 def start_keepalive() -> None:
