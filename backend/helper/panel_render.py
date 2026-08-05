@@ -29,13 +29,15 @@ def _normalize_button(btn) -> types.KeyboardButtonCallback:
         return btn
     if hasattr(btn, "text") and hasattr(btn, "url"):
         return Button.url(btn.text, btn.url)
-    text = str(getattr(btn, "text", btn))
-    return Button.inline(text, "panel:_nav:close")
+    text = getattr(btn, "text", None)
+    if not text:
+        text = "Button"
+    return Button.inline(str(text), "panel:_nav:close")
 
 
 def _normalize_row(row) -> list:
     if isinstance(row, types.KeyboardButtonRow):
-        return row
+        return [_normalize_button(b) for b in row.buttons]
     if isinstance(row, list):
         return [_normalize_button(b) for b in row]
     return [_normalize_button(row)]
@@ -46,11 +48,7 @@ def to_edit_buttons(buttons: list) -> list:
         return []
     result = []
     for row in buttons:
-        normalized = _normalize_row(row)
-        if isinstance(normalized, types.KeyboardButtonRow):
-            result.append(normalized.buttons)
-        else:
-            result.append(normalized)
+        result.append(_normalize_row(row))
     return result
 
 
@@ -59,11 +57,7 @@ def _to_inline_rows(buttons: list) -> list:
         return []
     rows = []
     for row in buttons:
-        normalized = _normalize_row(row)
-        if isinstance(normalized, types.KeyboardButtonRow):
-            rows.append(normalized)
-        else:
-            rows.append(types.KeyboardButtonRow(buttons=normalized))
+        rows.append(types.KeyboardButtonRow(buttons=_normalize_row(row)))
     return rows
 
 
