@@ -51,13 +51,12 @@ from backend.username import engine as username_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
 from backend.helper.client import build_helper, disconnect_helper, register_helper_hooks, get_client as get_helper_client
-from backend.helper.inline_engine import set_self_client, set_helper_username, set_owner_id, configure_lifecycle, configure_callback_trace, register_input_listener
-from backend.helper.lifecycle import get_lifecycle
+from backend.helper.inline_engine import set_self_client, set_helper_username, set_owner_id
+from backend.helper.lifecycle import get_lifecycle, configure_lifecycle
 from backend.helper.target_context import clear_all as clear_all_targets
 from backend.helper.callback_trace import configure as configure_callback_trace
 from backend.helper import panels as panels_module
 from backend.helper.inline_sender import register_input_listener
-from backend.helper.client import register_helper_hooks
 from backend.profile import scheduler as profile_scheduler
 from backend.diagnostics import record_event
 from backend.health import (
