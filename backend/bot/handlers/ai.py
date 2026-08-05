@@ -1,17 +1,28 @@
 """
-AI Menu — the Telegram-facing AI control panel.
+AI Panel — simplified, user-friendly AI configuration.
 
-The main panel shows the current provider, model, status, and last
-initialization result. Settings is the single control center for all
-configuration (provider, model, temperature, max tokens, memory,
-conversation, context budget). Diagnostics remains available for
-owner/developer usage.
+The user never needs to know:
+  - Provider names
+  - ENV variable names
+  - API key formats
+  - Model names
 
-No database. No persistence. No text commands. Everything is glass
-buttons that edit the existing menu message in-place.
+Everything is discovered automatically. The panel flow is:
+
+  AI → Provider (auto-detected) → Model (auto-listed) → Chat
+
+Panels:
+  ai             — Main panel (status + quick actions)
+  ai_provider    — Provider selection (only available ones shown)
+  ai_model       — Model selection (auto-fetched from provider API)
+  ai_wizard      — Setup wizard (shown when no provider is configured)
+  ai_settings    — Simple settings (temperature, max_tokens, system prompt)
+  ai_status      — Status screen (provider, model, connected, latency)
+  ai_diagnostics — Diagnostics (owner/developer only)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from backend.helper import (
@@ -26,609 +37,575 @@ from backend.helper import (
 logger = logging.getLogger(__name__)
 
 
-# ── Engine / Config access ──
-
-
 def _get_engine():
     try:
         from backend.ai.engine.engine import get_engine
         return get_engine()
-    except Exception as exc:
-        logger.warning("AI panel: could not get engine: %s", exc)
+    except Exception:
         return None
 
 
-def _get_config_manager():
-    from backend.ai.config.manager import get_config_manager
-    return get_config_manager()
+async def _get_owner_id() -> int:
+    from backend.helper.inline_engine import _owner_id
+    return _owner_id
 
 
-def _get_provider_config_manager():
-    from backend.ai.providers.manager.config_manager import get_provider_config_manager
-    return get_provider_config_manager()
+async def _get_saved_config(owner_id: int) -> dict:
+    from backend.ai.config_store import get_config
+    return await get_config(owner_id)
 
 
-def _status_badge(ok: bool) -> str:
-    return "READY" if ok else "FAIL"
+async def _save_config(owner_id: int, config: dict) -> bool:
+    from backend.ai.config_store import save_config
+    return await save_config(owner_id, config)
 
 
-def _warning_block(text: str) -> str:
-    if "FAIL" not in text:
-        return ""
-    failures = [ln for ln in text.split("\n") if "FAIL" in ln]
-    if not failures:
-        return ""
-    return "\n\n⚠ **Warning:**\n" + "\n".join(failures)
+async def _discover() -> list:
+    from backend.ai.discovery import discover_providers
+    return await discover_providers()
 
 
-def _get_provider_info() -> dict:
-    """Return current provider name, model, status, and init error."""
-    info: dict = {
-        "provider": "Unknown",
-        "model": "—",
-        "status": "UNKNOWN",
-        "init_error": "",
-        "is_dummy": True,
-        "is_fallback": False,
-    }
+def _get_engine_info() -> dict:
+    info: dict = {"provider": "—", "model": "—", "status": "UNKNOWN", "connected": False}
     engine = _get_engine()
     if engine is None:
-        info["status"] = "FAIL: no engine"
+        info["status"] = "No engine"
         return info
     try:
         mgr = engine.provider_manager
         active = mgr.get_active()
         info["provider"] = active.name
-        info["is_dummy"] = active.name == "dummy"
-        info["is_fallback"] = active.name == mgr.registry.fallback_name and not info["is_dummy"]
-        health = active.health()
-        healthy = health.get("healthy", False)
-        info["status"] = _status_badge(healthy)
-        if not healthy:
-            reason = health.get("reason", "")
-            if reason:
-                info["init_error"] = str(reason)
+        info["connected"] = active.health().get("healthy", False)
+        info["status"] = "Connected" if info["connected"] else "Disconnected"
         try:
             pconfig = mgr.get_provider_config(active.name)
             info["model"] = pconfig.default_model or "—"
         except Exception:
             pass
-    except Exception as exc:
-        info["status"] = f"FAIL: {exc}"
-        info["init_error"] = str(exc)
+    except Exception:
+        pass
     return info
 
 
-# ── Panel: AI Control Panel (main) ──
-
-
-def _build_ai_main_buttons() -> list:
-    builder = InlinePanelBuilder()
-    builder.add_buttons(
-        ("⚙️ Settings", "panel:ai_settings"),
-        ("🔧 Diagnostics", "panel:ai_diagnostics"),
-    )
-    return builder.build()
-
-
-def _build_ai_main_body() -> str:
-    info = _get_provider_info()
-    lines = ["**🧠 AI Control Panel**\n"]
-    lines.append(f"**Provider:** {info['provider']}")
-    lines.append(f"**Model:** {info['model']}")
-    lines.append(f"**Status:** {info['status']}")
-    if info["init_error"]:
-        lines.append(f"**Last Error:** {info['init_error']}")
-    if info["is_dummy"]:
-        lines.append("")
-        lines.append("_⚠ Dummy provider active — no real provider configured._")
-    lines.append("")
-    lines.append("_Tap Settings to configure provider, model, and options._")
-    return "\n".join(lines)
+def _status_icon(connected: bool) -> str:
+    return "🟢" if connected else "🔴"
 
 
 async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "🧠 AI Control Panel", _build_ai_main_body(), _build_ai_main_buttons()
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    engine_info = _get_engine_info()
+    available = [p for p in await _discover() if p.status == "available"]
+    is_configured = config.get("is_configured", False) or len(available) > 0
+    if not is_configured and not available:
+        return await _ai_wizard_panel_handler(event, "")
+    saved_provider = config.get("provider", "") or engine_info["provider"]
+    saved_model = config.get("model", "") or engine_info["model"]
+    connected = engine_info["connected"]
+    lines = [
+        "**🧠 AI Assistant**\n",
+        f"{_status_icon(connected)} **Status:** {'Connected' if connected else 'Disconnected'}",
+        f"**Provider:** {saved_provider.title() if saved_provider else '—'}",
+        f"**Model:** {saved_model or '—'}",
+    ]
+    if config.get("last_request_at"):
+        lines.append(f"**Last request:** {config['last_request_at'][:19]}")
+    lines.append("")
+    lines.append("_Tap **Chat** to start talking._")
+    builder = InlinePanelBuilder()
+    builder.add_row("💬 Chat", "action:ai_chat")
+    builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("🤖 Model", "panel:ai_model"))
+    builder.add_buttons(("📊 Status", "panel:ai_status"), ("⚙️ Settings", "panel:ai_settings"))
+    builder.add_row("🔧 Diagnostics", "panel:ai_diagnostics")
+    return "🧠 AI", "\n".join(lines), builder.build()
 
 
 async def _ai_main_inline_builder(event, extra: str) -> list:
-    return [render("🧠 AI Control Panel", _build_ai_main_body(), _build_ai_main_buttons())]
+    result = await _ai_main_panel_handler(event, extra)
+    if result is None:
+        return [render("🧠 AI", "Error loading panel.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
-# ── Panel: Settings (unified control center) ──
-
-_TOGGLE_FIELDS = [
-    "enabled",
-    "streaming_enabled",
-    "vision_enabled",
-    "reasoning_enabled",
-    "developer_mode",
-]
-
-_TOGGLE_LABELS = {
-    "enabled": "⚡ Enabled",
-    "streaming_enabled": "📡 Streaming",
-    "vision_enabled": "👁 Vision",
-    "reasoning_enabled": "🧩 Reasoning",
-    "developer_mode": "👨‍💻 Developer Mode",
-}
-
-_NUMERIC_FIELDS = [
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "timeout",
-    "retry_count",
-    "history_budget",
-    "tool_budget",
-]
-
-_NUMERIC_LABELS = {
-    "temperature": "🌡 Temperature",
-    "top_p": "🎯 Top P",
-    "max_tokens": "📦 Max Tokens",
-    "timeout": "⏱ Timeout",
-    "retry_count": "🔁 Retry",
-    "history_budget": "📝 History Budget",
-    "tool_budget": "🛠 Tool Budget",
-}
-
-_NUMERIC_PROMPTS = {
-    "temperature": "**Temperature**\n\nEnter value (0.0 – 2.0):\n\n_Reply below._",
-    "top_p": "**Top P**\n\nEnter value (0.0 – 1.0):\n\n_Reply below._",
-    "max_tokens": "**Max Tokens**\n\nEnter a positive integer:\n\n_Reply below._",
-    "timeout": "**Timeout**\n\nEnter timeout in seconds (positive integer):\n\n_Reply below._",
-    "retry_count": "**Retry Count**\n\nEnter retry count (0+):\n\n_Reply below._",
-    "history_budget": "**History Budget**\n\nEnter budget in tokens (positive integer):\n\n_Reply below._",
-    "tool_budget": "**Tool Budget**\n\nEnter budget in tokens (positive integer):\n\n_Reply below._",
-}
-
-_NUMERIC_PARSERS = {
-    "temperature": float,
-    "top_p": float,
-    "max_tokens": int,
-    "timeout": int,
-    "retry_count": int,
-    "history_budget": int,
-    "tool_budget": int,
-}
-
-_PROVIDER_TEXT_FIELDS = [
-    "api_key",
-    "base_url",
-    "default_model",
-]
-
-_PROVIDER_TEXT_LABELS = {
-    "api_key": "🔑 API Key",
-    "base_url": "🌐 Base URL",
-    "default_model": "🤖 Default Model",
-}
-
-_PROVIDER_TEXT_PROMPTS = {
-    "api_key": "**API Key**\n\nEnter the API key for this provider:\n\n_Reply below._",
-    "base_url": "**Base URL**\n\nEnter the base URL for this provider:\n\n_Reply below._",
-    "default_model": "**Default Model**\n\nEnter the default model name:\n\n_Reply below._",
-}
-
-
-def _build_settings_buttons() -> list:
-    mgr = _get_config_manager()
-    snap = mgr.snapshot()
-    pcm = _get_provider_config_manager()
-    pconfig = pcm.get_active_config()
+async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    results = await _discover()
+    available = [p for p in results if p.status == "available"]
+    not_configured = [p for p in results if p.status == "not_configured"]
+    invalid = [p for p in results if p.status == "invalid"]
+    current = config.get("provider", "")
+    lines = ["**🔄 Provider**\n"]
+    if available:
+        lines.append("**Available:**")
+        for p in available:
+            mark = "✅" if p.name == current else "  "
+            lines.append(f"  {mark} {p.icon} {p.display_name}")
+        lines.append("")
+    if invalid:
+        lines.append("**Invalid Key:**")
+        for p in invalid:
+            lines.append(f"  ⚠️ {p.icon} {p.display_name}")
+        lines.append("")
+    if not_configured:
+        lines.append("**Not Configured:**")
+        for p in not_configured:
+            lines.append(f"  ⬜ {p.icon} {p.display_name}")
+        lines.append("")
+    if not available:
+        lines.append("_No providers available. Set an API key to get started._")
+        lines.append("")
+        lines.append("_Tap **Setup Guide** for instructions._")
     builder = InlinePanelBuilder()
-
-    builder.add_buttons(
-        ("⬅ Back", "panel:ai"),
-    )
-
-    builder.add_row(
-        f"{_TOGGLE_LABELS['enabled']}: {'ON' if snap.enabled else 'OFF'}",
-        "action:ai_toggle_enabled",
-    )
-
-    builder.add_buttons(
-        (f"🧠 Provider: {snap.provider}", "action:ai_provider_cycle"),
-        (f"🤖 Model: {pconfig.default_model or '—'}", "input:ai_provider_config:default_model"),
-    )
-
-    builder.add_buttons(
-        (f"{_PROVIDER_TEXT_LABELS['api_key']}: {'✅' if pconfig.api_key else '❌'}", "input:ai_provider_config:api_key"),
-        (f"{_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url[:20] + '…' if len(pconfig.base_url) > 20 else pconfig.base_url or '—'}", "input:ai_provider_config:base_url"),
-    )
-
-    builder.add_buttons(
-        (f"{_NUMERIC_LABELS['temperature']}: {pconfig.temperature}", "input:ai_provider_config:temperature"),
-        (f"{_NUMERIC_LABELS['top_p']}: {pconfig.top_p}", "input:ai_provider_config:top_p"),
-    )
-
-    builder.add_buttons(
-        (f"{_NUMERIC_LABELS['max_tokens']}: {pconfig.max_tokens}", "input:ai_provider_config:max_tokens"),
-        (f"{_NUMERIC_LABELS['timeout']}: {pconfig.timeout}s", "input:ai_provider_config:timeout"),
-    )
-
-    builder.add_row(
-        f"{_NUMERIC_LABELS['retry_count']}: {pconfig.retry_count}",
-        "input:ai_provider_config:retry_count",
-    )
-
-    builder.add_buttons(
-        (f"{_NUMERIC_LABELS['history_budget']}: {snap.history_budget}", "input:ai_settings:history_budget"),
-        (f"{_NUMERIC_LABELS['tool_budget']}: {snap.tool_budget}", "input:ai_settings:tool_budget"),
-    )
-
-    for field in ("streaming_enabled", "vision_enabled", "reasoning_enabled", "developer_mode"):
-        val = getattr(snap, field)
-        builder.add_row(
-            f"{_TOGGLE_LABELS[field]}: {'ON' if val else 'OFF'}",
-            f"action:ai_toggle_{field}",
-        )
-
-    builder.add_row("Reset Provider Config", "action:ai_reset_provider_config")
-
-    return builder.build()
+    if available:
+        for p in available:
+            label = f"{'✅' if p.name == current else '  '} {p.icon} {p.display_name}"
+            builder.add_row(label, f"action:ai_select_provider:{p.name}")
+    else:
+        builder.add_row("📖 Setup Guide", "panel:ai_wizard")
+    builder.add_row("🔄 Refresh", "action:ai_refresh_providers")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "🔄 Provider", "\n".join(lines), builder.build()
 
 
-def _build_settings_body() -> str:
-    mgr = _get_config_manager()
-    snap = mgr.snapshot()
-    pcm = _get_provider_config_manager()
-    active_name = pcm.active_name
-    pconfig = pcm.get_active_config()
-    info = _get_provider_info()
+async def _ai_provider_inline_builder(event, extra: str) -> list:
+    result = await _ai_provider_panel_handler(event, extra)
+    if result is None:
+        return [render("Provider", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
-    lines = ["**⚙️ AI Settings**\n"]
 
-    lines.append("**Provider Status**")
-    lines.append(f"  • Provider: {info['provider']}")
-    lines.append(f"  • Model: {info['model']}")
-    lines.append(f"  • Status: {info['status']}")
-    if info["init_error"]:
-        lines.append(f"  • Error: {info['init_error']}")
-    lines.append("")
+async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    provider_name = config.get("provider", "")
+    if not provider_name:
+        return "🤖 Model", "⚠️ Select a provider first.", [
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0]]
+        ]
+    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+    api_key = get_api_key_for_provider(provider_name)
+    base_url = get_base_url_for_provider(provider_name)
+    if not api_key:
+        return "🤖 Model", "⚠️ No API key for this provider.", [
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0]]
+        ]
+    page = 0
+    if extra.startswith("page:"):
+        try:
+            page = int(extra[5:])
+        except ValueError:
+            page = 0
+    models = await fetch_models(provider_name, api_key, base_url)
+    if not models:
+        return "🤖 Model", "⚠️ Could not fetch models.\n\nTap **Refresh** to try again.", [
+            [InlinePanelBuilder().add_row("🔄 Refresh", "action:ai_refresh_models").build()[0]],
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0]],
+        ]
+    per_page = 8
+    total = len(models)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    start = page * per_page
+    end = start + per_page
+    page_models = models[start:end]
+    current_model = config.get("model", "")
+    lines = [
+        f"**🤖 Model Selection**\n",
+        f"_{total} models available · Page {page + 1}/{total_pages}_\n",
+    ]
+    builder = InlinePanelBuilder()
+    for m in page_models:
+        mark = "✅" if m.id == current_model else "  "
+        label = f"{mark} {m.name}"
+        if m.context_length > 0:
+            ctx_k = m.context_length // 1000
+            label += f" ({ctx_k}K)"
+        builder.add_row(label[:60], f"action:ai_select_model:{m.id}")
+    nav = []
+    if page > 0:
+        nav.append(("‹ Prev", f"panel:ai_model:page:{page - 1}"))
+    nav.append((f"{page + 1}/{total_pages}", "panel:ai_model:noop"))
+    if page < total_pages - 1:
+        nav.append(("Next ›", f"panel:ai_model:page:{page + 1}"))
+    if nav:
+        builder.add_buttons(*nav)
+    builder.add_row("🔄 Refresh Models", "action:ai_refresh_models")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "🤖 Model", "\n".join(lines), builder.build()
 
-    lines.append(f"**Active Config ({active_name})**")
-    lines.append(f"  • {_PROVIDER_TEXT_LABELS['api_key']}: {'✅ set' if pconfig.api_key else '❌ missing'}")
-    lines.append(f"  • {_PROVIDER_TEXT_LABELS['base_url']}: {pconfig.base_url or '—'}")
-    lines.append(f"  • {_PROVIDER_TEXT_LABELS['default_model']}: {pconfig.default_model or '—'}")
-    lines.append(f"  • {_NUMERIC_LABELS['temperature']}: {pconfig.temperature}")
-    lines.append(f"  • {_NUMERIC_LABELS['top_p']}: {pconfig.top_p}")
-    lines.append(f"  • {_NUMERIC_LABELS['max_tokens']}: {pconfig.max_tokens}")
-    lines.append(f"  • {_NUMERIC_LABELS['timeout']}: {pconfig.timeout}s")
-    lines.append(f"  • {_NUMERIC_LABELS['retry_count']}: {pconfig.retry_count}")
-    lines.append("")
 
-    lines.append("**Conversation & Memory**")
-    lines.append(f"  • {_NUMERIC_LABELS['history_budget']}: {snap.history_budget} tokens")
-    lines.append(f"  • {_NUMERIC_LABELS['tool_budget']}: {snap.tool_budget} tokens")
-    lines.append(f"  • {_TOGGLE_LABELS['streaming_enabled']}: {'ON' if snap.streaming_enabled else 'OFF'}")
-    lines.append(f"  • {_TOGGLE_LABELS['vision_enabled']}: {'ON' if snap.vision_enabled else 'OFF'}")
-    lines.append(f"  • {_TOGGLE_LABELS['reasoning_enabled']}: {'ON' if snap.reasoning_enabled else 'OFF'}")
-    lines.append(f"  • {_TOGGLE_LABELS['developer_mode']}: {'ON' if snap.developer_mode else 'OFF'}")
-    lines.append("")
+async def _ai_model_inline_builder(event, extra: str) -> list:
+    result = await _ai_model_panel_handler(event, extra)
+    if result is None:
+        return [render("Model", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
-    lines.append("_Tap toggles to flip • Tap values to edit • Tap Provider to cycle._")
-    return "\n".join(lines)
+
+async def _ai_wizard_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.ai.discovery import get_wizard_info
+    wizard_info = get_wizard_info()
+    results = await _discover()
+    invalid = [p for p in results if p.status == "invalid"]
+    lines = [
+        "**🧠 AI Setup**\n",
+        "No provider detected.\n",
+        "To use AI, set one API key as an environment variable:\n",
+    ]
+    for p in wizard_info:
+        lines.append(f"  {p['icon']} **{p['display_name']}**")
+        lines.append(f"     Set: `{p['env_var']}`")
+        lines.append("")
+    if invalid:
+        lines.append("⚠️ **Invalid keys detected:**")
+        for p in invalid:
+            lines.append(f"  {p.icon} {p.display_name} — key may be expired or wrong")
+        lines.append("")
+    lines.append("_Set a key and tap **Refresh**._")
+    builder = InlinePanelBuilder()
+    builder.add_row("🔄 Refresh", "action:ai_refresh_providers")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "🧠 AI Setup", "\n".join(lines), builder.build()
+
+
+async def _ai_wizard_inline_builder(event, extra: str) -> list:
+    result = await _ai_wizard_panel_handler(event, extra)
+    if result is None:
+        return [render("Setup", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
 async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "AI · Settings", _build_settings_body(), _build_settings_buttons()
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    lines = [
+        "**⚙️ AI Settings**\n",
+        f"**Temperature:** {config.get('temperature', 1.0)}",
+        f"**Max Tokens:** {config.get('max_tokens', 4096)}",
+        f"**Context Budget:** {config.get('history_budget', 4000)} tokens",
+    ]
+    prompt = config.get("system_prompt", "")
+    if prompt:
+        lines.append(f"**System Prompt:** Custom ✅")
+    else:
+        lines.append(f"**System Prompt:** Default")
+    builder = InlinePanelBuilder()
+    builder.add_row("🌡 Temperature", "input:ai_settings:temperature")
+    builder.add_row("📦 Max Tokens", "input:ai_settings:max_tokens")
+    builder.add_row("📝 Context Budget", "input:ai_settings:history_budget")
+    builder.add_row("💬 System Prompt", "input:ai_settings:system_prompt")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "⚙️ Settings", "\n".join(lines), builder.build()
 
 
 async def _ai_settings_inline_builder(event, extra: str) -> list:
-    return [render("AI · Settings", _build_settings_body(), _build_settings_buttons())]
+    result = await _ai_settings_panel_handler(event, extra)
+    if result is None:
+        return [render("Settings", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
-# ── Provider cycle action ──
-
-
-async def _ai_provider_cycle_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Cycle to the next registered provider."""
-    engine = _get_engine()
-    if engine is None:
-        return "AI · Settings", "**Error:** engine not available", _build_settings_buttons()
-    mgr = engine.provider_manager
-    providers = mgr.list_providers()
-    if len(providers) <= 1:
-        return "AI · Settings", _build_settings_body(), _build_settings_buttons()
-    current = mgr.get_active_name()
-    try:
-        idx = providers.index(current)
-    except ValueError:
-        idx = -1
-    next_idx = (idx + 1) % len(providers)
-    next_name = providers[next_idx]
-    ok = mgr.switch_provider(next_name)
-    if ok:
-        logger.info("AI provider cycled to '%s'", next_name)
-    else:
-        logger.warning("AI provider cycle to '%s' failed", next_name)
-    return "AI · Settings", _build_settings_body(), _build_settings_buttons()
-
-
-# ── Toggle actions ──
-
-
-def _make_toggle_action(field: str):
-    async def _toggle(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-        mgr = _get_config_manager()
-        current = mgr.get(field)
-        try:
-            mgr.set(field, not current)
-            logger.info("AI settings: toggled %s → %s", field, not current)
-        except Exception as exc:
-            logger.warning("AI settings: toggle %s failed: %s", field, exc)
-        return "AI · Settings", _build_settings_body(), _build_settings_buttons()
-    return _toggle
-
-
-for _field in _TOGGLE_FIELDS:
-    globals()[f"_ai_toggle_{_field}_action"] = _make_toggle_action(_field)
-
-
-# ── Numeric input handlers (reply-mode) ──
-
-
-def _make_input_handler(field: str):
-    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-        from backend.helper.inline_engine import _self_client
-        from backend.ai.config.validation import ConfigValidationError
-
-        text = text.strip()
-        parser = _NUMERIC_PARSERS[field]
-        mgr = _get_config_manager()
-
-        try:
-            value = parser(text)
-        except (ValueError, TypeError):
-            result = f"❌ Invalid number: `{text}`"
-        else:
-            try:
-                mgr.set(field, value)
-                result = f"✅ {_NUMERIC_LABELS[field]} set to {value}"
-                logger.info("AI settings: set %s → %s", field, value)
-            except ConfigValidationError as exc:
-                result = f"❌ {exc}"
-
-        helper = _self_client
-        if helper and inline_chat_id and inline_msg_id:
-            from backend.helper import render_edit, to_edit_buttons
-            body = _build_settings_body()
-            buttons = _build_settings_buttons()
-            edit_text, edit_buttons = render_edit("AI · Settings", f"{result}\n\n{body}", buttons)
-            try:
-                await helper.edit_message(inline_chat_id, inline_msg_id, edit_text)
-            except Exception as exc:
-                logger.warning("AI settings input edit failed: %s", exc)
-
-        if _self_client:
-            try:
-                await _self_client.delete_messages(chat_id, [msg_id])
-            except Exception:
-                pass
-
-    return _handler
-
-
-for _field in _NUMERIC_FIELDS:
-    globals()[f"_ai_input_{_field}"] = _make_input_handler(_field)
-
-
-# ── Provider config input handlers (text fields via ProviderConfigManager) ──
-
-
-def _make_provider_config_input_handler(field: str):
-    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-        from backend.helper.inline_engine import _self_client
-
-        text = text.strip()
-        pcm = _get_provider_config_manager()
-        active_name = pcm.active_name
-
-        result = pcm.update(active_name, field, text)
-        if result.valid:
-            msg = f"✅ {_PROVIDER_TEXT_LABELS[field]} set"
-            logger.info("AI provider config: set %s.%s", active_name, field)
-        else:
-            errors = "; ".join(e.message for e in result.errors)
-            msg = f"❌ {errors}"
-
-        helper = _self_client
-        if helper and inline_chat_id and inline_msg_id:
-            from backend.helper import render_edit, to_edit_buttons
-            body = _build_settings_body()
-            buttons = _build_settings_buttons()
-            edit_text, edit_buttons = render_edit("AI · Settings", f"{msg}\n\n{body}", buttons)
-            try:
-                await helper.edit_message(inline_chat_id, inline_msg_id, edit_text)
-            except Exception as exc:
-                logger.warning("AI provider config input edit failed: %s", exc)
-
-        if _self_client:
-            try:
-                await _self_client.delete_messages(chat_id, [msg_id])
-            except Exception:
-                pass
-
-    return _handler
-
-
-for _field in _PROVIDER_TEXT_FIELDS:
-    globals()[f"_ai_provider_config_input_{_field}"] = _make_provider_config_input_handler(_field)
-
-
-# ── Provider config numeric input handlers ──
-
-
-def _make_provider_config_numeric_handler(field: str):
-    async def _handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-        from backend.helper.inline_engine import _self_client
-
-        text = text.strip()
-        pcm = _get_provider_config_manager()
-        active_name = pcm.active_name
-
-        parser = _NUMERIC_PARSERS.get(field, str)
-        try:
-            value = parser(text)
-        except (ValueError, TypeError):
-            msg = f"❌ Invalid number: `{text}`"
-        else:
-            result = pcm.update(active_name, field, value)
-            if result.valid:
-                msg = f"✅ {_NUMERIC_LABELS[field]} set to {value}"
-                logger.info("AI provider config: set %s.%s → %s", active_name, field, value)
-            else:
-                errors = "; ".join(e.message for e in result.errors)
-                msg = f"❌ {errors}"
-
-        helper = _self_client
-        if helper and inline_chat_id and inline_msg_id:
-            from backend.helper import render_edit, to_edit_buttons
-            body = _build_settings_body()
-            buttons = _build_settings_buttons()
-            edit_text, edit_buttons = render_edit("AI · Settings", f"{msg}\n\n{body}", buttons)
-            try:
-                await helper.edit_message(inline_chat_id, inline_msg_id, edit_text)
-            except Exception as exc:
-                logger.warning("AI provider config numeric edit failed: %s", exc)
-
-        if _self_client:
-            try:
-                await _self_client.delete_messages(chat_id, [msg_id])
-            except Exception:
-                pass
-
-    return _handler
-
-
-for _field in ("temperature", "top_p", "max_tokens", "timeout", "retry_count"):
-    globals()[f"_ai_provider_config_input_{_field}"] = _make_provider_config_numeric_handler(_field)
-
-
-# ── Reset provider config action ──
-
-
-async def _ai_reset_provider_config_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    pcm = _get_provider_config_manager()
-    active_name = pcm.active_name
-    pcm.reset(active_name)
-    logger.info("AI settings: reset provider config for '%s'", active_name)
-    return "AI · Settings", _build_settings_body(), _build_settings_buttons()
-
-
-# ── Panel: Diagnostics ──
-
-
-def _build_diagnostics_body() -> str:
-    engine = _get_engine()
-
-    engine_status = "FAIL: no engine"
-    conv_status = "FAIL: no engine"
-    prompt_status = "FAIL: no engine"
-    provider_status = "FAIL: no engine"
-    config_status = "FAIL: no engine"
-    metrics_status = "FAIL: no engine"
-    overall_status = "FAIL"
-
-    if engine is not None:
-        try:
-            from backend.ai.runtime.report import build_report
-            report = build_report(engine)
-            engine_status = report.engine_status
-            conv_status = report.conversation_status
-            prompt_status = report.prompt_status
-            provider_status = report.provider_status
-            config_status = report.configuration_status
-            metrics_status = report.metrics_status
-            overall_status = report.overall_status
-        except Exception as exc:
-            logger.warning("AI diagnostics panel: %s", exc)
-            overall_status = f"FAIL: {exc}"
-
+async def _ai_status_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    engine_info = _get_engine_info()
     lines = [
-        "**AI Diagnostics**\n",
-        f"**Engine:** {engine_status}",
-        f"**Conversation:** {conv_status}",
-        f"**Prompt Builder:** {prompt_status}",
-        f"**Context Builder:** {conv_status}",
-        f"**Provider:** {provider_status}",
-        f"**Configuration:** {config_status}",
-        f"**Metrics:** {metrics_status}",
-        f"**Overall:** {overall_status}",
+        "**📊 AI Status**\n",
+        f"**Provider:** {config.get('provider', '—').title() or '—'}",
+        f"**Model:** {config.get('model', '—')}",
+        f"**Connected:** {'✅ Yes' if engine_info['connected'] else '❌ No'}",
     ]
-
-    warning = _warning_block("\n".join([
-        engine_status, conv_status, prompt_status,
-        provider_status, config_status, metrics_status,
-    ]))
-    if warning:
-        lines.append(warning)
-
-    return "\n".join(lines)
-
-
-def _build_ai_diagnostics_buttons() -> list:
+    if config.get("last_request_at"):
+        lines.append(f"**Last Request:** {config['last_request_at'][:19]}")
+    else:
+        lines.append("**Last Request:** Never")
+    latency = config.get("last_latency_ms", 0)
+    if latency > 0:
+        lines.append(f"**Latency:** {latency:.0f}ms")
+    else:
+        lines.append("**Latency:** —")
+    engine = _get_engine()
+    if engine:
+        try:
+            snap = engine.metrics_snapshot()
+            lines.append(f"**Total Requests:** {snap.get('total_executions', 0)}")
+            lines.append(f"**Successful:** {snap.get('successful_executions', 0)}")
+        except Exception:
+            pass
     builder = InlinePanelBuilder()
-    builder.add_buttons(
-        ("⬅ Back", "panel:ai"),
-    )
-    builder.add_row("Refresh", "action:ai_diagnostics_refresh")
-    return builder.build()
+    builder.add_row("🔄 Refresh", "action:ai_status_refresh")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "📊 AI Status", "\n".join(lines), builder.build()
+
+
+async def _ai_status_inline_builder(event, extra: str) -> list:
+    result = await _ai_status_panel_handler(event, extra)
+    if result is None:
+        return [render("Status", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
 async def _ai_diagnostics_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    return "AI · Diagnostics", _build_diagnostics_body(), _build_ai_diagnostics_buttons()
+    engine = _get_engine()
+    lines = ["**🔧 AI Diagnostics**\n"]
+    if engine is None:
+        lines.append("❌ Engine not available")
+    else:
+        try:
+            health = engine.engine_health()
+            lines.append(f"**Engine:** {health}")
+            snap = engine.metrics_snapshot()
+            lines.append(f"**Executions:** {snap.get('total_executions', 0)}")
+            lines.append(f"**Avg Latency:** {snap.get('average_latency', 0):.3f}s")
+            lines.append(f"**Providers:** {', '.join(engine.provider_manager.list_providers())}")
+        except Exception as exc:
+            lines.append(f"Error: {exc}")
+    builder = InlinePanelBuilder()
+    builder.add_row("🔄 Refresh", "action:ai_diagnostics_refresh")
+    builder.add_row("⬅ Back", "panel:ai")
+    return "🔧 Diagnostics", "\n".join(lines), builder.build()
 
 
 async def _ai_diagnostics_inline_builder(event, extra: str) -> list:
-    return [render("AI · Diagnostics", _build_diagnostics_body(), _build_ai_diagnostics_buttons())]
+    result = await _ai_diagnostics_panel_handler(event, extra)
+    if result is None:
+        return [render("Diagnostics", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    provider_name = extra.strip()
+    owner_id = await _get_owner_id()
+    from backend.ai.discovery import get_provider_info
+    info = get_provider_info(provider_name)
+    if not info:
+        return "Provider", "❌ Unknown provider.", []
+    config = await _get_saved_config(owner_id)
+    config["provider"] = provider_name
+    config["model"] = info["default_model"]
+    config["is_configured"] = True
+    await _save_config(owner_id, config)
+    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+    api_key = get_api_key_for_provider(provider_name)
+    base_url = get_base_url_for_provider(provider_name)
+    models = await fetch_models(provider_name, api_key, base_url)
+    if models:
+        first = models[0]
+        config["model"] = first.id
+        await _save_config(owner_id, config)
+    return await _ai_provider_panel_handler(event, "")
+
+
+async def _ai_select_model_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    model_id = extra.strip()
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    config["model"] = model_id
+    await _save_config(owner_id, config)
+    return "🤖 Model", f"✅ Model set to:\n`{model_id}`", [
+        [InlinePanelBuilder().add_row("⬅ Back to AI", "panel:ai").build()[0]]
+    ]
+
+
+async def _ai_refresh_providers_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.ai.discovery import discover_providers
+    await discover_providers(force_refresh=True)
+    return await _ai_provider_panel_handler(event, "")
+
+
+async def _ai_refresh_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    provider_name = config.get("provider", "")
+    if provider_name:
+        from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+        api_key = get_api_key_for_provider(provider_name)
+        base_url = get_base_url_for_provider(provider_name)
+        await fetch_models(provider_name, api_key, base_url, force_refresh=True)
+    return await _ai_model_panel_handler(event, "")
+
+
+async def _ai_status_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    return await _ai_status_panel_handler(event, "")
 
 
 async def _ai_diagnostics_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    return "AI · Diagnostics", _build_diagnostics_body(), _build_ai_diagnostics_buttons()
+    return await _ai_diagnostics_panel_handler(event, "")
 
 
-# ── Registration ──
+async def _ai_chat_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    provider = config.get("provider", "")
+    model = config.get("model", "")
+    if not provider:
+        return "🧠 AI", "⚠️ No provider configured.\n\nTap **Provider** to select one.", [
+            [InlinePanelBuilder().add_row("🔄 Select Provider", "panel:ai_provider").build()[0]],
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0]],
+        ]
+    if not model:
+        return "🧠 AI", "⚠️ No model selected.\n\nTap **Model** to select one.", [
+            [InlinePanelBuilder().add_row("🤖 Select Model", "panel:ai_model").build()[0]],
+            [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0]],
+        ]
+    return "🧠 AI", (
+        f"✅ Ready to chat!\n\n"
+        f"**Provider:** {provider.title()}\n"
+        f"**Model:** {model}\n\n"
+        f"Send `.ai <message>` to start talking.\n"
+        f"Example: `.ai Hello, how are you?`"
+    ), []
+
+
+async def _ai_temperature_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    try:
+        val = float(text.strip())
+    except ValueError:
+        result = "❌ Invalid number."
+    else:
+        if 0.0 <= val <= 2.0:
+            from backend.ai.config_store import update_setting
+            await update_setting(owner_id, "temperature", val)
+            result = f"✅ Temperature set to {val}"
+        else:
+            result = "❌ Temperature must be 0.0–2.0"
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _ai_max_tokens_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    try:
+        val = int(text.strip())
+    except ValueError:
+        result = "❌ Invalid number."
+    else:
+        if val > 0:
+            from backend.ai.config_store import update_setting
+            await update_setting(owner_id, "max_tokens", val)
+            result = f"✅ Max tokens set to {val}"
+        else:
+            result = "❌ Must be positive."
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _ai_history_budget_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    try:
+        val = int(text.strip())
+    except ValueError:
+        result = "❌ Invalid number."
+    else:
+        if val > 0:
+            from backend.ai.config_store import update_setting
+            await update_setting(owner_id, "history_budget", val)
+            result = f"✅ Context budget set to {val}"
+        else:
+            result = "❌ Must be positive."
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _ai_system_prompt_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+    owner_id = await _get_owner_id()
+    from backend.ai.config_store import update_setting
+    await update_setting(owner_id, "system_prompt", text.strip())
+    result = "✅ System prompt updated."
+    from backend.helper.client import get_client
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception:
+            pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
 
 
 def register(client, owner_id: int) -> None:
     try:
         register_panel("ai", _ai_main_panel_handler, parent="menu", title="🧠 AI")
         register_inline_builder("ai", _ai_main_inline_builder)
-
-        register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="AI · Settings")
+        register_panel("ai_provider", _ai_provider_panel_handler, parent="ai", title="🔄 Provider")
+        register_inline_builder("ai_provider", _ai_provider_inline_builder)
+        register_panel("ai_model", _ai_model_panel_handler, parent="ai", title="🤖 Model")
+        register_inline_builder("ai_model", _ai_model_inline_builder)
+        register_panel("ai_wizard", _ai_wizard_panel_handler, parent="ai", title="Setup")
+        register_inline_builder("ai_wizard", _ai_wizard_inline_builder)
+        register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="⚙️ Settings")
         register_inline_builder("ai_settings", _ai_settings_inline_builder)
-
-        register_panel("ai_diagnostics", _ai_diagnostics_panel_handler, parent="ai", title="AI · Diagnostics")
+        register_panel("ai_status", _ai_status_panel_handler, parent="ai", title="📊 Status")
+        register_inline_builder("ai_status", _ai_status_inline_builder)
+        register_panel("ai_diagnostics", _ai_diagnostics_panel_handler, parent="ai", title="🔧 Diagnostics")
         register_inline_builder("ai_diagnostics", _ai_diagnostics_inline_builder)
-
-        for field in _TOGGLE_FIELDS:
-            register_action(f"ai_toggle_{field}", globals()[f"_ai_toggle_{field}_action"])
-
-        for field in _NUMERIC_FIELDS:
-            register_input("ai_settings", field, {
-                "handler": globals()[f"_ai_input_{field}"],
-                "prompt": _NUMERIC_PROMPTS[field],
-            })
-
-        for field in _PROVIDER_TEXT_FIELDS:
-            register_input("ai_provider_config", field, {
-                "handler": globals()[f"_ai_provider_config_input_{field}"],
-                "prompt": _PROVIDER_TEXT_PROMPTS[field],
-            })
-
-        for field in ("temperature", "top_p", "max_tokens", "timeout", "retry_count"):
-            register_input("ai_provider_config", field, {
-                "handler": globals()[f"_ai_provider_config_input_{field}"],
-                "prompt": _NUMERIC_PROMPTS[field],
-            })
-
+        register_action("ai_select_provider", _ai_select_provider_action)
+        register_action("ai_select_model", _ai_select_model_action)
+        register_action("ai_refresh_providers", _ai_refresh_providers_action)
+        register_action("ai_refresh_models", _ai_refresh_models_action)
+        register_action("ai_chat", _ai_chat_action)
+        register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
-        register_action("ai_provider_cycle", _ai_provider_cycle_action)
-        register_action("ai_reset_provider_config", _ai_reset_provider_config_action)
-
-        logger.info("AI panels registered OK (unified settings + diagnostics)")
+        register_input("ai_settings", "temperature", {
+            "handler": _ai_temperature_input,
+            "prompt": "**🌡 Temperature**\n\nEnter value (0.0 – 2.0):\n\n_Reply below._",
+        })
+        register_input("ai_settings", "max_tokens", {
+            "handler": _ai_max_tokens_input,
+            "prompt": "**📦 Max Tokens**\n\nEnter a positive integer:\n\n_Reply below._",
+        })
+        register_input("ai_settings", "history_budget", {
+            "handler": _ai_history_budget_input,
+            "prompt": "**📝 Context Budget**\n\nEnter budget in tokens (positive integer):\n\n_Reply below._",
+        })
+        register_input("ai_settings", "system_prompt", {
+            "handler": _ai_system_prompt_input,
+            "prompt": "**💬 System Prompt**\n\nEnter your custom system prompt:\n(or 'reset' to use default)\n\n_Reply below._",
+        })
+        logger.info("AI panels registered OK (simplified UX)")
     except Exception as exc:
         logger.error("AI panel registration FAILED: %s", exc)
