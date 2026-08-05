@@ -129,6 +129,31 @@ async def get_logs(limit: int = 100):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/ai/providers")
+async def api_ai_providers():
+    from backend.ai.discovery import discover_providers
+    results = await discover_providers()
+    return {"providers": [r.__dict__ for r in results]}
+
+
+@app.get("/api/ai/models/{provider_name}")
+async def api_ai_models(provider_name: str):
+    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+    api_key = get_api_key_for_provider(provider_name)
+    base_url = get_base_url_for_provider(provider_name)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No API key configured for this provider")
+    models = await fetch_models(provider_name, api_key, base_url)
+    return {"provider": provider_name, "models": [m.__dict__ for m in models]}
+
+
+@app.get("/api/ai/config")
+async def api_ai_config():
+    from backend.ai.config_store import get_config
+    config = await get_config(_owner_id)
+    return config
+
+
 def mount_static():
     if _DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")

@@ -39,6 +39,39 @@ export interface BotLog {
   created_at: string;
 }
 
+export interface ProviderStatus {
+  name: string;
+  display_name: string;
+  env_var: string;
+  status: 'available' | 'detected' | 'invalid' | 'not_configured';
+  has_key: boolean;
+  validated: boolean;
+  default_model: string;
+  base_url: string;
+  icon: string;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  provider: string;
+  context_length: number;
+  description: string;
+  is_alias: boolean;
+}
+
+export interface AIConfig {
+  provider: string;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  system_prompt: string;
+  history_budget: number;
+  is_configured: boolean;
+  last_request_at: string | null;
+  last_latency_ms: number;
+}
+
 const BASE = '/api';
 
 async function fetchJSON<T>(path: string): Promise<T> {
@@ -56,4 +89,10 @@ export const api = {
     fetchJSON<BioState>(`/bio`),
   logs: (limit = 100) =>
     fetchJSON<{ logs: BotLog[] }>(`/logs?limit=${limit}`),
+  aiProviders: () =>
+    fetchJSON<{ providers: ProviderStatus[] }>(`/ai/providers`),
+  aiModels: (provider: string) =>
+    fetchJSON<{ provider: string; models: ModelInfo[] }>(`/ai/models/${provider}`),
+  aiConfig: () =>
+    fetchJSON<AIConfig>(`/ai/config`),
 };

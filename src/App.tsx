@@ -4,8 +4,9 @@ import { api } from './lib/api';
 import SavedItems from './components/SavedItems';
 import BioStatus from './components/BioStatus';
 import LogViewer from './components/LogViewer';
+import AIConfigPanel from './components/AIConfigPanel';
 
-type Tab = 'saves' | 'bio' | 'logs';
+type Tab = 'saves' | 'bio' | 'ai' | 'logs';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('saves');
@@ -45,6 +46,7 @@ export default function App() {
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: 'saves', label: 'Saves', count: savesTotal },
     { id: 'bio', label: 'Bio Engine' },
+    { id: 'ai', label: 'AI' },
     { id: 'logs', label: 'Logs', count: logs.length },
   ];
 
@@ -108,6 +110,7 @@ export default function App() {
           <>
             {tab === 'saves' && <SavedItems items={saves} total={savesTotal} />}
             {tab === 'bio' && <BioStatus state={bio} />}
+            {tab === 'ai' && <AIConfigPanel />}
             {tab === 'logs' && <LogViewer logs={logs} />}
           </>
         )}
