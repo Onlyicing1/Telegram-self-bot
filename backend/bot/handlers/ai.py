@@ -52,12 +52,17 @@ async def _get_owner_id() -> int:
 
 async def _get_saved_config(owner_id: int) -> dict:
     from backend.ai.config_store import get_config
-    return await get_config(owner_id)
+    config = await get_config(owner_id)
+    logger.info("[AI_TRACE] _get_saved_config owner_id=%s provider='%s' model='%s'", owner_id, config.get("provider", ""), config.get("model", ""))
+    return config
 
 
 async def _save_config(owner_id: int, config: dict) -> bool:
     from backend.ai.config_store import save_config
-    return await save_config(owner_id, config)
+    logger.info("[AI_TRACE] _save_config owner_id=%s provider='%s' model='%s'", owner_id, config.get("provider", ""), config.get("model", ""))
+    result = await save_config(owner_id, config)
+    logger.info("[AI_TRACE] _save_config result=%s", result)
+    return result
 
 
 async def _discover() -> list:
@@ -204,7 +209,9 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     provider_name = config.get("provider", "")
+    logger.info("[AI_TRACE] model_panel_handler provider_name='%s' extra='%s'", provider_name, extra)
     if not provider_name:
+        logger.warning("[AI_TRACE] model_panel_handler NO PROVIDER — config=%s", config)
         return "🤖 Model", "⚠️ Select a provider first.", [
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
@@ -405,15 +412,18 @@ async def _ai_diagnostics_inline_builder(event, extra: str) -> list:
 async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     provider_name = extra.strip()
     owner_id = await _get_owner_id()
+    logger.info("[AI_TRACE] select_provider START provider_name='%s' owner_id=%s", provider_name, owner_id)
     from backend.ai.discovery import get_provider_info
     info = get_provider_info(provider_name)
     if not info:
+        logger.warning("[AI_TRACE] select_provider UNKNOWN provider '%s'", provider_name)
         return "Provider", "❌ Unknown provider.", []
     config = await _get_saved_config(owner_id)
     config["provider"] = provider_name
     config["model"] = info["default_model"]
     config["is_configured"] = True
     await _save_config(owner_id, config)
+    logger.info("[AI_TRACE] select_provider SAVED provider='%s' model='%s'", provider_name, config["model"])
     from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
@@ -422,15 +432,19 @@ async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[s
         first = models[0]
         config["model"] = first.id
         await _save_config(owner_id, config)
+        logger.info("[AI_TRACE] select_provider MODEL_UPDATED model='%s'", first.id)
+    logger.info("[AI_TRACE] select_provider → entering model panel")
     return await _ai_model_panel_handler(event, "")
 
 
 async def _ai_select_model_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     model_id = extra.strip()
     owner_id = await _get_owner_id()
+    logger.info("[AI_TRACE] select_model START model_id='%s' owner_id=%s", model_id, owner_id)
     config = await _get_saved_config(owner_id)
     config["model"] = model_id
     await _save_config(owner_id, config)
+    logger.info("[AI_TRACE] select_model SAVED provider='%s' model='%s'", config.get("provider", ""), model_id)
     return await _ai_main_panel_handler(event, "")
 
 
