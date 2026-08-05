@@ -174,7 +174,7 @@ async def _heartbeat_loop() -> None:
                 )
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
-                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+                    immortal_create_task(lambda: sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
         if last_update > 0 and last_event > 0 and (now - last_event) > _STALL_THRESHOLD:
             if (now - last_update) < _STALL_THRESHOLD:
@@ -193,7 +193,7 @@ async def _heartbeat_loop() -> None:
                 )
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
-                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+                    immortal_create_task(lambda: sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
         if last_callback > 0 and (now - last_callback) > _STALL_THRESHOLD:
             if rpc_healthy:
@@ -210,7 +210,7 @@ async def _heartbeat_loop() -> None:
                 )
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
-                    immortal_create_task(sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+                    immortal_create_task(lambda: sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
 
 
 def start_heartbeat() -> None:
