@@ -35,6 +35,7 @@ from backend.helper.inline_engine import (
     register_inline_handler,
     set_self_client,
     set_helper_username,
+    set_helper_id,
     set_owner_id,
 )
 from backend.helper.lifecycle import (

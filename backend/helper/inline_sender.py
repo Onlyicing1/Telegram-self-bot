@@ -22,8 +22,30 @@ logger = logging.getLogger(__name__)
 async def send_inline_panel(self_client, chat_id: int, query: str) -> bool:
     helper_username = inline_engine.get_helper_username()
     if not helper_username:
-        logger.warning("[PANEL] send_inline_panel: no helper username — aborting")
+        from backend.helper import client as helper_client_mod
+        if not helper_client_mod.is_available():
+            logger.error(
+                "[PANEL] send_inline_panel: helper bot is not connected — "
+                "cannot use inline mode"
+            )
+        elif not inline_engine.get_helper_id():
+            logger.error(
+                "[PANEL] send_inline_panel: helper username is empty and "
+                "helper id is 0 — GetMe likely failed during helper startup"
+            )
+        else:
+            logger.error(
+                "[PANEL] send_inline_panel: helper account has no public "
+                "username (id=%s) — inline mode requires a @username, "
+                "set one via BotFather or Telegram settings",
+                inline_engine.get_helper_id(),
+            )
         return False
+
+    logger.info(
+        "[PANEL] send_inline_panel: using helper @%s for query='%s'",
+        helper_username, query,
+    )
 
     from backend.services import settings_service
 

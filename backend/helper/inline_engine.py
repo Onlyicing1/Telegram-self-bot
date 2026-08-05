@@ -22,6 +22,7 @@ _builders: dict[str, InlineResultBuilder] = {}
 _self_client = None
 _helper_client_ref: Any = None
 _helper_username: str = ""
+_helper_id: int = 0
 _owner_id: int = 0
 
 
@@ -44,6 +45,17 @@ def set_helper_username(username: str) -> None:
     global _helper_username
     username = username.lstrip("@") if username else ""
     _helper_username = username
+    if username:
+        logger.info("[HELPER] username set to @%s", username)
+    else:
+        logger.warning("[HELPER] username set to empty — inline mode will fail")
+
+
+def set_helper_id(helper_id: int) -> None:
+    global _helper_id
+    _helper_id = helper_id or 0
+    if helper_id:
+        logger.info("[HELPER] id set to %s", helper_id)
 
 
 def set_owner_id(owner_id: int) -> None:
@@ -53,6 +65,10 @@ def set_owner_id(owner_id: int) -> None:
 
 def get_helper_username() -> str:
     return _helper_username
+
+
+def get_helper_id() -> int:
+    return _helper_id
 
 
 def get_owner_id() -> int:
@@ -91,7 +107,22 @@ async def trigger(self_client, chat_id: int, query: str) -> tuple[bool, int, int
     msg_id is 0 on failure. inline_message_id is "" when not applicable.
     """
     if not _helper_username:
-        logger.warning("trigger: no helper username set — cannot inline query")
+        from backend.helper import client as helper_client_mod
+        if not helper_client_mod.is_available():
+            logger.error(
+                "[PANEL] trigger: cannot start inline — helper bot is not connected"
+            )
+        elif not _helper_id:
+            logger.error(
+                "[PANEL] trigger: helper username is empty and helper id is 0 — "
+                "GetMe likely failed during helper startup"
+            )
+        else:
+            logger.error(
+                "[PANEL] trigger: helper account has no public username (id=%s) — "
+                "inline mode requires a @username set via BotFather or Telegram settings",
+                _helper_id,
+            )
         return False, chat_id, 0, ""
 
     try:
