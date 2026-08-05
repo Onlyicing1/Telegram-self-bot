@@ -70,6 +70,8 @@ export interface AIConfig {
   is_configured: boolean;
   last_request_at: string | null;
   last_latency_ms: number;
+  trigger_en: string | null;
+  trigger_fa: string | null;
 }
 
 const BASE = '/api';
@@ -95,4 +97,14 @@ export const api = {
     fetchJSON<{ provider: string; models: ModelInfo[] }>(`/ai/models/${provider}`),
   aiConfig: () =>
     fetchJSON<AIConfig>(`/ai/config`),
+  aiUpdateTriggers: (triggerEn: string, triggerFa: string) =>
+    fetch(`${BASE}/ai/triggers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trigger_en: triggerEn, trigger_fa: triggerFa }),
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      return data as { success: boolean; message: string };
+    }),
 };

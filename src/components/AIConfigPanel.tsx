@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import type { ProviderStatus, ModelInfo, AIConfig } from '../lib/api';
 import { api } from '../lib/api';
 
+import TriggerConfig from './TriggerConfig';
+
 const STATUS_STYLES: Record<string, string> = {
   available: 'text-emerald-400 bg-emerald-400/10',
   detected: 'text-sky-400 bg-sky-400/10',
@@ -87,11 +89,11 @@ export default function AIConfigPanel() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest">AI Assistant</h2>
           <span className={`text-xs px-3 py-1 rounded-full font-medium ${
-            available.length > 0
+            available.length > 0 && config?.trigger_en && config.trigger_en.trim() !== '' || available.length > 0 && config?.trigger_fa && config.trigger_fa.trim() !== ''
               ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
               : 'bg-surface-variant text-on-surface-variant border border-outline-variant'
           }`}>
-            {available.length > 0 ? 'Ready' : 'Not Configured'}
+            {available.length > 0 && ((config?.trigger_en && config.trigger_en.trim() !== '') || (config?.trigger_fa && config.trigger_fa.trim() !== '')) ? 'Ready' : 'Not Configured'}
           </span>
         </div>
 
@@ -125,6 +127,11 @@ export default function AIConfigPanel() {
           </div>
         )}
       </div>
+
+      {/* Trigger Configuration */}
+      {available.length > 0 && (
+        <TriggerConfig config={config} onUpdated={load} />
+      )}
 
       {/* Available Providers */}
       {available.length > 0 && (
