@@ -3,12 +3,12 @@
 
 Wires the AI Engine to Telegram. When the owner sends .ai <message>,
 the handler:
-  1. Restores the saved provider/model from DB (auto-restore)
+  1. Restores the saved provider/model from Supabase (auto-restore)
   2. Gets or creates an AI session for the owner
   3. Builds an AIRequest with the user's message
   4. Executes the request through the full AI pipeline
   5. Edits the triggering message with the AI response
-  6. Records request latency in DB
+  6. Records request latency in Supabase
 
 The AI works immediately after deployment if an API key is configured.
 Without an API key, the dummy provider returns a placeholder response.
@@ -51,7 +51,7 @@ def _get_engine():
 
 
 async def _restore_config(owner_id: int) -> None:
-    """Restore saved provider/model from DB and apply to the engine."""
+    """Restore saved provider/model from Supabase and apply to the engine."""
     try:
         from backend.ai.config_store import get_config
         config = await get_config(owner_id)
