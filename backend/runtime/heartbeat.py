@@ -157,6 +157,32 @@ async def _heartbeat_loop() -> None:
 
         rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
 
+        # ── State-machine invariant check ──
+        # READY must never coexist with disconnected clients.  If we see it,
+        # trigger recovery immediately — this is the bug that caused the bot
+        # to "fall asleep" while the runtime believed everything was healthy.
+        current_state = _state_ref.get("runtime_state", "unknown")
+        self_connected = _state_ref.get("self_connected", False)
+        helper_connected = _state_ref.get("helper_connected", False)
+        if current_state == "READY" and (not self_connected or not helper_connected):
+            trace(
+                "READY_BUT_DISCONNECTED",
+                runtime_state=current_state,
+                self_connected=self_connected,
+                helper_connected=helper_connected,
+            )
+            logger.error(
+                "READY_BUT_DISCONNECTED — runtime_state=READY but "
+                "self_connected=%s helper_connected=%s — triggering recovery",
+                self_connected, helper_connected,
+            )
+            sup = _supervisor_ref
+            if sup is not None and not sup._recovery_lock.locked():
+                guarded_create_task(
+                    sup._trigger_reconnect(),
+                    name="lifeos-heartbeat-invariant-recovery",
+                )
+
         if last_update > 0 and (now - last_update) > _STALL_THRESHOLD:
             if rpc_healthy:
                 trace(
