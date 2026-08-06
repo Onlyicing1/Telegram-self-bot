@@ -93,9 +93,9 @@ class RuntimeSupervisor:
         "cfg", "api_id", "api_hash", "session_string", "owner_id", "tz_str",
         "bot_token", "helper_enabled", "state", "client", "helper_client",
         "client_generation", "shutdown_event", "_run_task", "_web_task",
-        "_consecutive_failures", "_reconnect_failures", "_recovery_attempts",
-        "_recovery_lock", "_recovery_cooldown_until", "_last_watchdog_tick",
-        "_client_alive",
+        "_helper_task", "_consecutive_failures", "_reconnect_failures",
+        "_recovery_attempts", "_recovery_lock", "_recovery_cooldown_until",
+        "_last_watchdog_tick", "_client_alive",
     )
 
     def __init__(self, cfg: dict) -> None:
@@ -114,6 +114,7 @@ class RuntimeSupervisor:
         self.shutdown_event = asyncio.Event()
         self._run_task: asyncio.Task | None = None
         self._web_task: asyncio.Task | None = None
+        self._helper_task: asyncio.Task | None = None
         self._consecutive_failures = 0
         self._reconnect_failures = 0
         self._recovery_attempts = 0
@@ -256,6 +257,7 @@ class RuntimeSupervisor:
             if helper is not None:
                 self.helper_client = helper
                 set_helper_connected(True)
+                update_heartbeat_state(helper_connected=True)
                 register_helper_hooks(helper)
 
                 from backend.helper.client import get_bot_username, get_bot_id
@@ -275,11 +277,35 @@ class RuntimeSupervisor:
                 register_inline_handler(helper, self.owner_id)
                 from backend.helper.panels import register_callback_handlers
                 register_callback_handlers(helper, self.owner_id)
+
+                self._start_helper_loop(helper)
+
                 trace("HELPER_STARTED", username=bot_username, bot_id=bot_id)
         except Exception as exc:
             trace_exception("HELPER_START_FAILED", exc)
             logger.error("Helper bot start failed: %s", exc)
             set_helper_connected(False)
+            update_heartbeat_state(helper_connected=False)
+
+    def _start_helper_loop(self, helper) -> None:
+        if self._helper_task is not None and not self._helper_task.done():
+            trace("HELPER_LOOP_ALREADY_RUNNING")
+            return
+        self._helper_task = immortal_create_task(
+            helper.run_until_disconnected,
+            name="lifeos-helper",
+        )
+        trace("HELPER_LOOP_STARTED", gen=self.client_generation)
+
+    async def _stop_helper_loop(self) -> None:
+        task = self._helper_task
+        self._helper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
 
     async def _resume_bio_cron(self) -> None:
         from backend.db import client as db_client
@@ -417,8 +443,10 @@ class RuntimeSupervisor:
         set_task_state("lifeos-recovery", "RUNNING")
 
         logger.info("Recovery: stopping helper bot")
+        await self._stop_helper_loop()
         await self._stop_helper()
         set_helper_connected(False)
+        update_heartbeat_state(helper_connected=False)
 
         logger.info("Recovery: clearing inline panel state")
         await get_lifecycle().shutdown_all()
@@ -516,8 +544,10 @@ class RuntimeSupervisor:
             trace("CLIENT_REBUILD", gen=self.client_generation + 1, reason="failsafe")
             logger.warning("CLIENT_REBUILD — failsafe destroying all Telethon tasks")
 
+            await self._stop_helper_loop()
             await self._stop_helper()
             set_helper_connected(False)
+            update_heartbeat_state(helper_connected=False)
 
             await get_lifecycle().shutdown_all()
             clear_all_targets()
@@ -807,6 +837,36 @@ class RuntimeSupervisor:
                 await self._trigger_reconnect()
                 continue
 
+            # ── Helper health check ──
+            if self.helper_enabled and not self._recovery_lock.locked():
+                helper = self.helper_client
+                helper_alive = (
+                    helper is not None
+                    and helper.is_connected()
+                )
+                if not helper_alive:
+                    trace(
+                        "HELPER_DISCONNECTED",
+                        gen=self.client_generation,
+                        helper_task_alive=(
+                            self._helper_task is not None
+                            and not self._helper_task.done()
+                        ),
+                    )
+                    logger.warning(
+                        "HELPER_DISCONNECTED — restarting helper bot"
+                    )
+                    set_last_rebuild_reason("watchdog: helper disconnected")
+                    set_helper_connected(False)
+                    update_heartbeat_state(helper_connected=False)
+                    await self._stop_helper_loop()
+                    await self._stop_helper()
+                    try:
+                        await self._start_helper()
+                    except Exception as exc:
+                        trace_exception("HELPER_RESTART_FAILED", exc)
+                        logger.error("HELPER_RESTART_FAILED: %s", exc)
+
             client = self.client
             if client is None or not self._client_alive:
                 self._consecutive_failures += 1
@@ -903,6 +963,7 @@ class RuntimeSupervisor:
 
         await self._stop_web_server()
 
+        await self._stop_helper_loop()
         await self._stop_helper()
 
         if self.client is not None:
@@ -920,6 +981,7 @@ class RuntimeSupervisor:
         set_supervisor_ok(False)
         set_telethon_connected(False)
         set_helper_connected(False)
+        update_heartbeat_state(helper_connected=False)
         trace("SHUTDOWN_COMPLETE")
         logger.info("LifeOS stopped cleanly.")
         try:
