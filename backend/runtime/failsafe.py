@@ -25,7 +25,7 @@ import logging
 import time
 
 from backend.runtime.tracer import trace
-from backend.runtime.task_guard import immortal_create_task, guarded_create_task
+from backend.runtime.task_guard import immortal_create_task
 from backend.health import (
     get_last_telethon_event,
     get_last_rpc,
