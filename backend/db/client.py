@@ -77,9 +77,18 @@ def is_available() -> bool:
 
 
 async def _run_sync(fn, *args, **kwargs):
-    """Run a synchronous DB function in a thread with a timeout."""
-    return await asyncio.wait_for(
+    """Run a synchronous DB function in a thread with a bounded timeout.
+
+    Uses the centralized operation watchdog so that stuck DB operations
+    emit structured OP_TIMEOUT diagnostics (operation name, elapsed time,
+    runtime state, client generation) instead of dying silently.
+    """
+    from backend.runtime.operation_watchdog import guarded_await
+
+    op_name = getattr(fn, "__name__", "db_unknown")
+    return await guarded_await(
         asyncio.to_thread(fn, *args, **kwargs),
+        name=f"db:{op_name}",
         timeout=_DB_TIMEOUT,
     )
 
