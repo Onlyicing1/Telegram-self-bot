@@ -102,6 +102,8 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "is_configured": config.get("is_configured", False),
             "trigger_en": config.get("trigger_en", "") or None,
             "trigger_fa": config.get("trigger_fa", "") or None,
+            "last_request_at": config.get("last_request_at") or None,
+            "last_latency_ms": config.get("last_latency_ms", 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if existing and existing.data:
