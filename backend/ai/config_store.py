@@ -47,6 +47,13 @@ async def _run_sync(fn, *args, **kwargs):
     )
 
 
+def _is_missing_config_response(exc: Exception) -> bool:
+    return (
+        str(getattr(exc, "code", "")) == "204"
+        and getattr(exc, "message", "") == "Missing response"
+    )
+
+
 def _get_config_sync(owner_id: int) -> dict[str, Any] | None:
     db = _get_db()
     if not db:
@@ -56,6 +63,8 @@ def _get_config_sync(owner_id: int) -> dict[str, Any] | None:
         result = db.table("ai_config").select("*").eq("owner_id", owner_id).maybe_single().execute()
         return result.data if result else None
     except Exception as exc:
+        if _is_missing_config_response(exc):
+            return None
         logger.warning("[AI_CONFIG] DB get failed for owner_id=%s: %s — using fallback", owner_id, exc)
         return _fallback_config.get(owner_id)
 
@@ -93,6 +102,8 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "is_configured": config.get("is_configured", False),
             "trigger_en": config.get("trigger_en", "") or None,
             "trigger_fa": config.get("trigger_fa", "") or None,
+            "last_request_at": config.get("last_request_at") or None,
+            "last_latency_ms": config.get("last_latency_ms", 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if existing and existing.data:
