@@ -24,6 +24,7 @@ from telethon import events
 from backend.bot.handlers.guard import is_owner
 from backend.diagnostics import record_event
 from backend.runtime.tracer import trace
+from backend.ai import diagnostics as ai_diag
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,10 @@ def register(client, owner_id: int, tz_str: str):
 
         from backend.ai.session.request import AIRequest
 
+        rid = ai_diag.new_request_id()
+        ai_diag.register_start(rid, owner_id=owner_id)
+        logger.info("AI_REQUEST_START id=%s owner=%d mode=cmd", rid, owner_id)
+
         session_id = f"owner-{owner_id}"
         request = AIRequest(
             session_id=session_id,
@@ -148,6 +153,7 @@ def register(client, owner_id: int, tz_str: str):
             chat_id=event.chat_id,
             message_id=event.message.id,
             timezone=tz_str,
+            request_id=rid,
         )
 
         thinking_text = (
@@ -173,7 +179,11 @@ def register(client, owner_id: int, tz_str: str):
             if result.success:
                 try:
                     from backend.ai.config_store import record_request
+                    ai_diag.set_stage(rid, "DB_OPERATION")
+                    logger.info("AI_DB_OPERATION_START id=%s", rid)
                     await record_request(owner_id, result.latency * 1000)
+                    ai_diag.mark_success("DB_OPERATION")
+                    logger.info("AI_DB_OPERATION_END id=%s", rid)
                 except Exception:
                     pass
 
@@ -204,16 +214,23 @@ def register(client, owner_id: int, tz_str: str):
                 )
 
             try:
+                ai_diag.set_stage(rid, "TELEGRAM_REPLY")
+                logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
                 await event.edit(final_text)
+                ai_diag.mark_success("TELEGRAM_REPLY")
+                logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
             except Exception as exc:
                 logger.warning("ai response edit failed: %s", exc)
                 try:
                     await event.reply(final_text)
+                    ai_diag.mark_success("TELEGRAM_REPLY")
+                    logger.info("AI_TELEGRAM_REPLY_END id=%s (via reply)", rid)
                 except Exception:
                     pass
 
         except asyncio.TimeoutError:
-            trace("AI_CMD_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s")
+            ai_diag.register_end(rid)
+            trace("AI_CMD_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s", rid=rid)
             logger.error("AI cmd: request timed out after %ss", _AI_TIMEOUT)
             error_text = (
                 f"{user_message}\n"
@@ -228,9 +245,11 @@ def register(client, owner_id: int, tz_str: str):
                 pass
 
         except asyncio.CancelledError:
+            ai_diag.register_end(rid)
             raise
 
         except Exception as exc:
+            ai_diag.register_end(rid)
             logger.exception("AI handler error: %s", exc)
             trace("AI_HANDLER_ERROR", error=str(exc))
             error_text = (

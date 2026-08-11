@@ -60,3 +60,4 @@ class AIRequest:
     language: str = "English"
     timezone: str = "UTC"
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_id: str = ""
