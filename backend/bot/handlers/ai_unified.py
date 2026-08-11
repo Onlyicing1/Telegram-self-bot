@@ -30,6 +30,7 @@ from telethon import events
 from backend.bot.handlers.guard import is_owner
 from backend.diagnostics import record_event
 from backend.runtime.tracer import trace
+from backend.ai import diagnostics as ai_diag
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,15 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     trigger_label = trigger_word
     display_prompt = prompt_text
 
+    rid = ai_diag.new_request_id()
+    ai_diag.register_start(rid, owner_id=owner_id)
+    logger.info("AI_REQUEST_START id=%s owner=%d mode=trigger", rid, owner_id)
+
+    ai_diag.set_stage(rid, "CONFIG_LOAD")
+    logger.info("AI_CONFIG_LOAD_START id=%s", rid)
     await _restore_config(owner_id)
+    ai_diag.mark_success("CONFIG_LOAD")
+    logger.info("AI_CONFIG_LOAD_END id=%s", rid)
 
     session_id = f"owner-{owner_id}"
     request = AIRequest(
@@ -282,6 +291,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         message_id=event.message.id,
         reply_context=reply_context or ReplyContext(),
         timezone=tz_str,
+        request_id=rid,
     )
 
     try:
@@ -300,7 +310,11 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         if result.success:
             try:
                 from backend.ai.config_store import record_request
+                ai_diag.set_stage(rid, "DB_OPERATION")
+                logger.info("AI_DB_OPERATION_START id=%s", rid)
                 await record_request(owner_id, result.latency * 1000)
+                ai_diag.mark_success("DB_OPERATION")
+                logger.info("AI_DB_OPERATION_END id=%s", rid)
             except Exception as exc:
                 logger.warning("AI handler: record_request failed: %s", exc)
 
@@ -313,17 +327,24 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         else:
             final_text = _format_error(display_prompt, trigger_label, "AI returned no response.")
 
+        ai_diag.set_stage(rid, "TELEGRAM_REPLY")
+        logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
         try:
             await event.edit(final_text)
+            ai_diag.mark_success("TELEGRAM_REPLY")
+            logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
         except Exception as exc:
             logger.warning("AI handler: failed to edit final response: %s", exc)
             try:
                 await event.reply(final_text)
+                ai_diag.mark_success("TELEGRAM_REPLY")
+                logger.info("AI_TELEGRAM_REPLY_END id=%s (via reply)", rid)
             except Exception as exc2:
                 logger.error("AI handler: both edit and reply failed: %s", exc2)
 
     except asyncio.TimeoutError:
-        trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s")
+        ai_diag.register_end(rid)
+        trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s", rid=rid)
         logger.error("AI handler: request timed out after %ss", _AI_TIMEOUT)
         error_text = _format_error(
             display_prompt, trigger_label,
@@ -335,9 +356,11 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             logger.error("AI handler: failed to edit timeout error: %s", exc)
 
     except asyncio.CancelledError:
+        ai_diag.register_end(rid)
         raise
 
     except Exception as exc:
+        ai_diag.register_end(rid)
         logger.exception("AI handler error: %s", exc)
         trace("AI_HANDLER_ERROR", error=str(exc))
         error_text = _format_error(display_prompt, trigger_label, _humanize_error(str(exc)))
