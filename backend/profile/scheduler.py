@@ -107,7 +107,7 @@ async def _collect_updates(owner_id: int, tz_str: str) -> dict[str, str]:
     return merged
 
 
-async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
+async def _cron_loop(owner_id: int, tz_str: str) -> None:
     tz = get_tz(tz_str)
     trace("PROFILE_CRON_STARTED", tz=tz_str)
     logger.info("Profile scheduler started (tz=%s)", tz_str)
@@ -124,6 +124,11 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
         try:
             updates = await _collect_updates(owner_id, tz_str)
             if not updates:
+                continue
+
+            client = _client
+            if client is None:
+                logger.warning("Profile scheduler: no active client — skipping tick")
                 continue
 
             t0 = time.monotonic()
@@ -171,11 +176,11 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
             logger.exception("Profile scheduler tick error (will retry next minute)")
 
 
-async def _supervised_cron(client, owner_id: int, tz_str: str) -> None:
+async def _supervised_cron(owner_id: int, tz_str: str) -> None:
     attempt = 0
     while True:
         try:
-            await _cron_loop(client, owner_id, tz_str)
+            await _cron_loop(owner_id, tz_str)
             trace("PROFILE_CRON_SUPERVISOR_EXIT", reason="loop_exited_normally")
             logger.info("Profile scheduler supervisor: loop exited normally.")
             return
@@ -196,16 +201,11 @@ def start_cron(client, owner_id: int, tz_str: str) -> None:
         return
     _set_client(client)
     _task = guarded_create_task(
-        _supervised_cron(client, owner_id, tz_str),
+        _supervised_cron(owner_id, tz_str),
         name="lifeos-profile-scheduler",
     )
     trace("PROFILE_CRON_START_REQUESTED")
     record_event("profile", "start_cron", 0, "SUCCESS")
-
-
-def update_client(client) -> None:
-    """Swap the client after a rebuild without restarting the scheduler."""
-    _set_client(client)
 
 
 async def stop_cron() -> None:

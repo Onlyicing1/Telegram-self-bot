@@ -361,6 +361,7 @@ class RuntimeSupervisor:
             trace("RECOVERY_COOLDOWN", remaining=f"{self._recovery_cooldown_until - time.time():.0f}s")
             return
 
+        escalate = False
         async with self._recovery_lock:
             self._reconnect_failures += 1
             trace("WATCHDOG_RECOVERY", reason="reconnect", attempt=self._reconnect_failures)
@@ -393,8 +394,10 @@ class RuntimeSupervisor:
                 trace_exception("RECONNECT_FAILED", exc, gen=self.client_generation)
                 logger.warning("RECONNECT_FAILED: %s — escalating to rebuild", exc)
                 set_last_rebuild_reason(f"reconnect_failed: {exc}")
-                await self._trigger_full_recovery()
-                return
+                escalate = True
+
+        if escalate:
+            await self._trigger_full_recovery()
 
     async def _trigger_full_recovery(self) -> None:
         if self._in_recovery_cooldown():
