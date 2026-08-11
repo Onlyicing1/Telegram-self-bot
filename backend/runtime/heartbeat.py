@@ -153,6 +153,8 @@ async def _heartbeat_loop() -> None:
             last_rpc_age=last_rpc_age,
             last_command_age=last_command_age,
             last_callback_age=last_callback_age,
+            **_ai_diag_snapshot(),
+            **_recovery_state(),
         )
 
         rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
@@ -237,6 +239,35 @@ async def _heartbeat_loop() -> None:
                 sup = _supervisor_ref
                 if sup is not None and not sup._recovery_lock.locked():
                     immortal_create_task(lambda: sup._trigger_reconnect(), name="lifeos-heartbeat-recovery")
+
+
+def _ai_diag_snapshot() -> dict:
+    """Compact AI diagnostics for heartbeat — never raises."""
+    try:
+        from backend.ai import diagnostics as ai_diag
+        snap = ai_diag.snapshot()
+        return {
+            "ai_active": snap["ai_active"],
+            "ai_oldest_s": snap["ai_oldest_age_s"],
+            "ai_stage": snap["ai_stage"],
+            "ai_last_provider_s": snap["ai_last_provider_s"],
+            "ai_last_db_s": snap["ai_last_db_s"],
+            "ai_last_tg_reply_s": snap["ai_last_tg_reply_s"],
+        }
+    except Exception:
+        return {}
+
+
+def _recovery_state() -> dict:
+    """Recovery lock state — never raises."""
+    try:
+        sup = _supervisor_ref
+        if sup is not None:
+            locked = sup._recovery_lock.locked()
+            return {"recovery_lock": "HELD" if locked else "free"}
+    except Exception:
+        pass
+    return {}
 
 
 def start_heartbeat() -> None:
