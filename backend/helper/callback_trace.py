@@ -10,6 +10,7 @@ import asyncio
 import logging
 import traceback as tb_mod
 
+from backend.runtime.operation_watchdog import guarded_await
 from backend.runtime.tracer import trace_task_crash
 from backend.runtime.task_guard import guarded_create_task
 
@@ -74,6 +75,10 @@ def finish_trace(trace_id: str) -> None:
 
 async def _send_to_saved(text: str) -> None:
     try:
-        await _self_client.send_message("me", text)
+        await guarded_await(
+            _self_client.send_message("me", text),
+            name="callback:send_saved",
+            timeout=15.0,
+        )
     except Exception as exc:
         logger.warning("callback_trace: failed to send to Saved Messages: %s", exc)

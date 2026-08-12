@@ -33,6 +33,7 @@ from typing import Any
 from backend.ai.tools.base import PermissionLevel, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.registry import ToolRegistry
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -157,10 +158,13 @@ class ToolExecutor:
             self._record_history(owner_id, session_id, tool_name, arguments, tool_result, latency_ms)
 
             from backend.ai import persistence
-            asyncio.ensure_future(persistence.record_tool_call(
-                owner_id, session_id, tool_name, arguments,
-                tool_result.success, tool_result.message, latency_ms,
-            ))
+            guarded_create_task(
+                persistence.record_tool_call(
+                    owner_id, session_id, tool_name, arguments,
+                    tool_result.success, tool_result.message, latency_ms,
+                ),
+                name="ai:record-tool-call",
+            )
 
             return ToolExecutionResult(
                 tool_name=tool_name,
