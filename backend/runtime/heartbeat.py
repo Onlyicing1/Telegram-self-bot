@@ -23,7 +23,7 @@ import resource
 import time
 
 from backend.runtime.tracer import trace
-from backend.runtime.task_guard import immortal_create_task
+from backend.runtime.task_guard import immortal_create_task, guarded_create_task
 from backend.health import tick_loop, get_stale_loops
 
 logger = logging.getLogger("backend.heartbeat")
@@ -31,6 +31,11 @@ logger = logging.getLogger("backend.heartbeat")
 _INTERVAL = 30.0
 _STALL_THRESHOLD = 90.0
 _LOOP_STARVATION_MS = 5000.0
+_PERMANENT_TASK_NAMES = frozenset({
+    "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",
+    "lifeos-diagnostics", "lifeos-memory-cleanup", "lifeos-run",
+    "lifeos-web", "lifeos-helper-watchdog",
+})
 _task: asyncio.Task | None = None
 
 _state_ref: dict = {
@@ -101,9 +106,14 @@ async def _heartbeat_loop() -> None:
 
         try:
             tasks = asyncio.all_tasks()
-            pending = sum(1 for t in tasks if not t.done())
+            all_pending = [t for t in tasks if not t.done()]
+            pending = len(all_pending)
+            permanent_count = sum(
+                1 for t in all_pending if t.get_name() in _PERMANENT_TASK_NAMES
+            )
         except Exception:
             pending = -1
+            permanent_count = -1
 
         try:
             usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -141,6 +151,8 @@ async def _heartbeat_loop() -> None:
             self_connected=_state_ref.get("self_connected", False),
             helper_connected=_state_ref.get("helper_connected", False),
             pending_tasks=pending,
+            permanent_tasks=permanent_count,
+            bounded_tasks=(pending - permanent_count) if pending >= 0 and permanent_count >= 0 else -1,
             loop_latency_ms=f"{loop_latency:.1f}",
             memory_mb=f"{mem_mb:.1f}",
             runtime_state=_state_ref.get("runtime_state", "unknown"),

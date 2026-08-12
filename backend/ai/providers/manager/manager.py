@@ -45,8 +45,11 @@ from backend.ai.providers.base.exceptions import ProviderUnavailable
 from backend.ai.providers.manager.config_manager import ProviderConfigManager
 from backend.ai.providers.manager.metrics import ProviderMetricsRegistry
 from backend.ai.providers.registry.registry import ProviderRegistry
+from backend.runtime.operation_watchdog import guarded_await
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_RPC_TIMEOUT = 30.0
 
 
 class ProviderManager:
@@ -74,7 +77,11 @@ class ProviderManager:
         provider_name = provider.name
         start = time.perf_counter()
         try:
-            response = await provider.chat(messages, **kwargs)
+            response = await guarded_await(
+                provider.chat(messages, **kwargs),
+                name=f"provider:chat:{provider_name}",
+                timeout=_PROVIDER_RPC_TIMEOUT,
+            )
             latency = time.perf_counter() - start
             self._metrics.record(provider_name, latency=latency, error="")
             return response
@@ -204,7 +211,11 @@ class ProviderManager:
     async def _fallback(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         fallback = self._registry.get_fallback()
         try:
-            return await fallback.chat(messages, **kwargs)
+            return await guarded_await(
+                fallback.chat(messages, **kwargs),
+                name=f"provider:fallback:{fallback.name}",
+                timeout=_PROVIDER_RPC_TIMEOUT,
+            )
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK CRASHED: %s", exc)
             return ProviderResponse(
@@ -261,18 +272,22 @@ class ProviderManager:
             if not self._registry.has(name):
                 continue
             provider = self._registry.get(name)
+            start = time.perf_counter()
             try:
                 h = provider.health()
                 if not h.get("healthy", False):
                     continue
-                start = time.perf_counter()
-                response = await provider.chat(messages, **kwargs)
+                response = await guarded_await(
+                    provider.chat(messages, **kwargs),
+                    name=f"provider:fallback_chain:{name}",
+                    timeout=_PROVIDER_RPC_TIMEOUT,
+                )
                 latency = time.perf_counter() - start
                 self._metrics.record(name, latency=latency, error="")
                 logger.info("ProviderManager: fallback chain succeeded with '%s'", name)
                 return response
             except Exception as exc:
-                latency = time.perf_counter() - start if 'start' in dir() else 0.0
+                latency = time.perf_counter() - start
                 self._metrics.record(name, latency=latency, error=str(exc))
                 logger.warning("ProviderManager: fallback chain provider '%s' failed: %s", name, exc)
                 continue
