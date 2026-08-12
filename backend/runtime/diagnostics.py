@@ -42,6 +42,17 @@ _SLOW_HANDLER_PATTERNS = (
     "_input_listener", "panel_cmd", "save_cmd", "del_cmd",
     "health_cmd", "kill_cmd", "logs_cmd", "help_cmd",
 )
+_PERMANENT_TASK_NAMES = frozenset({
+    "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",
+    "lifeos-diagnostics", "lifeos-memory-cleanup", "lifeos-run",
+    "lifeos-web", "lifeos-helper-watchdog",
+})
+_PERMANENT_CORO_PATTERNS = (
+    "run_until_disconnected", "run_until_connected",
+    "_heartbeat_loop", "_keepalive_loop", "_failsafe_loop",
+    "_diagnostics_loop", "_cleanup_loop", "_run_loop",
+    "uvicorn", "serve",
+)
 
 _task: asyncio.Task | None = None
 _prev_stacks: dict[str, str] = {}
@@ -110,6 +121,20 @@ def _is_blocked_on_sync_primitive(awaited: str) -> bool:
     )
 
 
+def _is_permanent_task(name: str, coro_name: str = "") -> bool:
+    """Classify a task as permanent (long-lived) or bounded (should complete).
+
+    Permanent tasks are expected to wait indefinitely — an unchanged
+    stack trace across dumps is NORMAL for them.  Bounded tasks should
+    complete within a reasonable period; an unchanged stack is a stall.
+    """
+    if name in _PERMANENT_TASK_NAMES:
+        return True
+    if any(pat in coro_name for pat in _PERMANENT_CORO_PATTERNS):
+        return True
+    return False
+
+
 def _detect_deadlocks(pending_tasks: list, task_info: dict, elapsed: dict) -> list[str]:
     """Detect tasks blocked on sync primitives with no progress."""
     deadlocks = []
@@ -125,10 +150,12 @@ def _detect_deadlocks(pending_tasks: list, task_info: dict, elapsed: dict) -> li
     return deadlocks
 
 
-def _detect_starvation() -> list[str]:
-    """Detect tasks whose stack hasn't changed across multiple dumps."""
+def _detect_starvation(permanent_names: frozenset[str] = frozenset()) -> list[str]:
+    """Detect bounded tasks whose stack hasn't changed across multiple dumps."""
     starved = []
     for name, count in _stack_unchanged_count.items():
+        if name in permanent_names:
+            continue
         if count >= _STARVATION_THRESHOLD:
             elapsed = time.time() - _task_first_seen.get(name, time.time())
             starved.append(
@@ -244,6 +271,7 @@ async def _dump_tasks() -> None:
             coro_name = _get_coro_name(coro)
             await_loc = _get_await_location(coro)
             awaited_obj = _get_awaited_object(coro)
+            is_permanent = _is_permanent_task(name, coro_name)
 
             if name not in _task_first_seen:
                 _task_first_seen[name] = now
@@ -254,12 +282,14 @@ async def _dump_tasks() -> None:
                 "await_loc": await_loc,
                 "awaited": awaited_obj,
                 "stack": stack_str,
+                "permanent": is_permanent,
             }
 
             prev = _prev_stacks.get(name)
             if prev is not None and prev == stack_str:
-                stalled.append(name)
                 _stack_unchanged_count[name] = _stack_unchanged_count.get(name, 0) + 1
+                if not is_permanent:
+                    stalled.append(name)
             else:
                 _stack_unchanged_count[name] = 0
 
@@ -268,9 +298,18 @@ async def _dump_tasks() -> None:
 
     _prev_stacks = stacks
 
+    permanent_names = frozenset(
+        name for name, info in task_info.items() if info.get("permanent", False)
+    )
+    permanent_count = len(permanent_names)
+    bounded_count = len(pending) - permanent_count
+    bounded_tasks = [t for t in pending if t.get_name() not in permanent_names]
+
     trace(
         "ASYNC_TASK_DUMP",
         pending_count=len(pending),
+        permanent_count=permanent_count,
+        bounded_count=bounded_count,
         loop_latency_ms=f"{loop_latency_ms:.1f}",
         stalled_count=len(stalled),
         stalled_tasks=",".join(stalled) if stalled else "",
@@ -279,18 +318,19 @@ async def _dump_tasks() -> None:
     if loop_latency_ms > _STALL_THRESHOLD_MS:
         logger.warning(
             "EVENT_LOOP_STALL — %.1fms latency (threshold=%.0fms), "
-            "%d pending tasks, %d stalled",
+            "%d pending tasks (%d permanent, %d bounded), %d stalled",
             loop_latency_ms, _STALL_THRESHOLD_MS,
-            len(pending), len(stalled),
+            len(pending), permanent_count, bounded_count, len(stalled),
         )
 
-    deadlocks = _detect_deadlocks(pending, task_info, elapsed)
-    starved = _detect_starvation()
-    slow_handlers = _detect_slow_handlers(pending, task_info, elapsed)
+    deadlocks = _detect_deadlocks(bounded_tasks, task_info, elapsed)
+    starved = _detect_starvation(permanent_names)
+    slow_handlers = _detect_slow_handlers(bounded_tasks, task_info, elapsed)
 
     if stalled:
         lines = [
-            f"TASK_NO_PROGRESS — {len(stalled)} tasks unchanged since last dump:",
+            f"TASK_NO_PROGRESS — {len(stalled)} bounded tasks unchanged since last dump "
+            f"(permanent tasks excluded):",
         ]
         for name in stalled:
             info = task_info.get(name, {})
@@ -326,8 +366,9 @@ async def _dump_tasks() -> None:
             await_loc = info.get("await_loc", "")
             awaited = info.get("awaited", "")
             wait_time = elapsed.get(name, 0.0)
+            classification = "PERMANENT" if info.get("permanent", False) else "BOUNDED"
             task_summary.append(
-                f"  {name}: {coro_name} awaiting={awaited} "
+                f"  [{classification}] {name}: {coro_name} awaiting={awaited} "
                 f"elapsed={wait_time:.0f}s"
             )
             if await_loc:
