@@ -5,6 +5,7 @@ All methods return plain dicts. Callers never receive Telethon objects.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -93,7 +94,7 @@ async def get_me(client: Any) -> dict[str, Any]:
 
 async def get_dialogs(client: Any, limit: int = 100) -> list[dict[str, Any]]:
     """List dialogs (chat list). Returns list of serialized dicts."""
-    try:
+    async def collect_dialogs() -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         async for dialog in client.iter_dialogs(limit=limit):
             results.append({
@@ -107,8 +108,15 @@ async def get_dialogs(client: Any, limit: int = 100) -> list[dict[str, Any]]:
             if len(results) >= limit:
                 break
         return results
+
+    try:
+        return await guarded_await(
+            collect_dialogs(),
+            name="telegram:get_dialogs",
+            timeout=_RPC_TIMEOUT,
+        )
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError("get_dialogs timed out")
+        raise TelegramTimeoutError(f"get_dialogs timed out after {_RPC_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
