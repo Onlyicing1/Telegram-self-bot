@@ -23,6 +23,8 @@ from telethon.tl.types import (
 from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.runtime.operation_watchdog import guarded_await
+from backend.runtime.task_guard import guarded_create_task
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,19 @@ _MIME_EXT = {
     "application/zip": ".zip",
     "application/vnd.android.package-archive": ".apk",
 }
+
+
+async def _edit_progress(progress_msg, text: str) -> None:
+    if progress_msg is None:
+        return
+    try:
+        await guarded_await(
+            progress_msg.edit(text),
+            name="save:progress-edit",
+            timeout=15.0,
+        )
+    except Exception as exc:
+        logger.debug("Save progress update failed: %s", exc)
 
 
 def detect_media_type(mime: str | None) -> str:
@@ -459,7 +474,10 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
             text = dl_tracker.update(received, total)
             if text and progress_msg:
                 try:
-                    asyncio.get_event_loop().create_task(progress_msg.edit(text))
+                    guarded_create_task(
+                        _edit_progress(progress_msg, text),
+                        name="save:progress-edit",
+                    )
                 except Exception:
                     pass
 
@@ -484,7 +502,10 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
             text = ul_tracker.update(sent_bytes, total)
             if text and progress_msg:
                 try:
-                    asyncio.get_event_loop().create_task(progress_msg.edit(text))
+                    guarded_create_task(
+                        _edit_progress(progress_msg, text),
+                        name="save:progress-edit",
+                    )
                 except Exception:
                     pass
 

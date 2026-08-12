@@ -30,6 +30,8 @@ from backend.helper.session_manager import (
     Session,
 )
 from backend.helper.panel_timer import PanelTimerManager
+from backend.runtime.operation_watchdog import guarded_await
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,11 @@ logger = logging.getLogger(__name__)
 async def _delayed_delete(client, chat_id: int, msg_id: int, delay: float = 2.5) -> None:
     try:
         await asyncio.sleep(delay)
-        await client.delete_messages(chat_id, [msg_id])
+        await guarded_await(
+            client.delete_messages(chat_id, [msg_id]),
+            name="panel:delayed-delete",
+            timeout=15.0,
+        )
     except Exception:
         pass
 
@@ -325,7 +331,10 @@ class PanelLifecycleManager:
                     logger.debug("[LIFECYCLE] cleanup edit_message: %s", exc)
 
             if edited and self._self_client is not None and chat_id and msg_id:
-                asyncio.create_task(_delayed_delete(self._self_client, chat_id, msg_id))
+                guarded_create_task(
+                    _delayed_delete(self._self_client, chat_id, msg_id),
+                    name="panel:delayed-delete",
+                )
 
         logger.info("[LIFECYCLE] CLEANUP chat=%s msg=%s", chat_id, msg_id)
 
