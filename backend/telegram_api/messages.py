@@ -1,8 +1,8 @@
 """
 Messages module — send, edit, delete, forward, search, iterate.
 
-Every method has a bounded timeout and returns plain dicts or simple
-types. Callers never touch Telethon objects.
+Short-lived methods use bounded timeouts and return plain dicts or simple
+types. Message iteration and search remain unbounded. Callers never touch Telethon objects.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from backend.telegram_api.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-_RPC_TIMEOUT = 30.0
+_SHORT_CALL_TIMEOUT = 30.0
 
 
 async def send_message(client: Any, chat_id: int | str, text: str, **kwargs: Any) -> dict[str, Any]:
@@ -28,11 +28,11 @@ async def send_message(client: Any, chat_id: int | str, text: str, **kwargs: Any
         msg = await guarded_await(
             client.send_message(chat_id, text, **kwargs),
             name="telegram:send_message",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         return serialize_message(msg)
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"send_message timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"send_message timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
@@ -45,11 +45,11 @@ async def edit_message(client: Any, chat_id: int | str, msg_id: int, text: str, 
         msg = await guarded_await(
             client.edit_message(chat_id, msg_id, text, **kwargs),
             name="telegram:edit_message",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         return serialize_message(msg)
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"edit_message timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"edit_message timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
@@ -64,11 +64,11 @@ async def delete_messages(client: Any, chat_id: int | str, msg_ids: list[int]) -
         await guarded_await(
             client.delete_messages(chat_id, msg_ids),
             name="telegram:delete_messages",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         return len(msg_ids)
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"delete_messages timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"delete_messages timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
@@ -81,11 +81,11 @@ async def get_message(client: Any, chat_id: int | str, msg_id: int) -> dict[str,
         msg = await guarded_await(
             client.get_messages(chat_id, ids=msg_id),
             name="telegram:get_message",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         return serialize_message(msg)
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"get_message timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"get_message timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
@@ -98,7 +98,7 @@ async def get_messages(client: Any, chat_id: int | str, ids: list[int]) -> list[
         msgs = await guarded_await(
             client.get_messages(chat_id, ids=ids),
             name="telegram:get_messages",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         if msgs is None:
             return []
@@ -106,7 +106,7 @@ async def get_messages(client: Any, chat_id: int | str, ids: list[int]) -> list[
             return [serialize_message(m) for m in msgs]
         return [serialize_message(msgs)]
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"get_messages timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"get_messages timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
@@ -126,7 +126,7 @@ async def forward_messages(
         result = await guarded_await(
             client.forward_messages(dest_chat_id, msg_ids, from_peer=from_chat_id),
             name="telegram:forward_messages",
-            timeout=_RPC_TIMEOUT,
+            timeout=_SHORT_CALL_TIMEOUT,
         )
         if result is None:
             return []
@@ -134,7 +134,7 @@ async def forward_messages(
             return [serialize_message(m) for m in result]
         return [serialize_message(result)]
     except asyncio.TimeoutError:
-        raise TelegramTimeoutError(f"forward_messages timed out after {_RPC_TIMEOUT}s")
+        raise TelegramTimeoutError(f"forward_messages timed out after {_SHORT_CALL_TIMEOUT}s")
     except Exception as exc:
         if isinstance(exc, TelegramAPIError):
             raise
