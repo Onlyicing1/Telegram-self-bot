@@ -10,6 +10,7 @@ import asyncio
 import logging
 from typing import Any
 
+from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import serialize_message
 from backend.telegram_api.exceptions import (
     TelegramAPIError,
@@ -24,8 +25,9 @@ _RPC_TIMEOUT = 30.0
 async def send_message(client: Any, chat_id: int | str, text: str, **kwargs: Any) -> dict[str, Any]:
     """Send a text message. Returns serialized message dict."""
     try:
-        msg = await asyncio.wait_for(
+        msg = await guarded_await(
             client.send_message(chat_id, text, **kwargs),
+            name="telegram:send_message",
             timeout=_RPC_TIMEOUT,
         )
         return serialize_message(msg)
@@ -40,8 +42,9 @@ async def send_message(client: Any, chat_id: int | str, text: str, **kwargs: Any
 async def edit_message(client: Any, chat_id: int | str, msg_id: int, text: str, **kwargs: Any) -> dict[str, Any]:
     """Edit a message's text. Returns serialized message dict."""
     try:
-        msg = await asyncio.wait_for(
+        msg = await guarded_await(
             client.edit_message(chat_id, msg_id, text, **kwargs),
+            name="telegram:edit_message",
             timeout=_RPC_TIMEOUT,
         )
         return serialize_message(msg)
@@ -58,8 +61,9 @@ async def delete_messages(client: Any, chat_id: int | str, msg_ids: list[int]) -
     if not msg_ids:
         return 0
     try:
-        await asyncio.wait_for(
+        await guarded_await(
             client.delete_messages(chat_id, msg_ids),
+            name="telegram:delete_messages",
             timeout=_RPC_TIMEOUT,
         )
         return len(msg_ids)
@@ -74,8 +78,9 @@ async def delete_messages(client: Any, chat_id: int | str, msg_ids: list[int]) -
 async def get_message(client: Any, chat_id: int | str, msg_id: int) -> dict[str, Any]:
     """Get a single message by ID. Returns serialized dict."""
     try:
-        msg = await asyncio.wait_for(
+        msg = await guarded_await(
             client.get_messages(chat_id, ids=msg_id),
+            name="telegram:get_message",
             timeout=_RPC_TIMEOUT,
         )
         return serialize_message(msg)
@@ -90,8 +95,9 @@ async def get_message(client: Any, chat_id: int | str, msg_id: int) -> dict[str,
 async def get_messages(client: Any, chat_id: int | str, ids: list[int]) -> list[dict[str, Any]]:
     """Get multiple messages by ID. Returns list of serialized dicts."""
     try:
-        msgs = await asyncio.wait_for(
+        msgs = await guarded_await(
             client.get_messages(chat_id, ids=ids),
+            name="telegram:get_messages",
             timeout=_RPC_TIMEOUT,
         )
         if msgs is None:
@@ -117,8 +123,9 @@ async def forward_messages(
     if isinstance(msg_ids, int):
         msg_ids = [msg_ids]
     try:
-        result = await asyncio.wait_for(
+        result = await guarded_await(
             client.forward_messages(dest_chat_id, msg_ids, from_peer=from_chat_id),
+            name="telegram:forward_messages",
             timeout=_RPC_TIMEOUT,
         )
         if result is None:

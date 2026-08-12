@@ -5,10 +5,10 @@ All methods return plain dicts. Callers never receive Telethon objects.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
+from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import serialize_chat, serialize_user
 from backend.telegram_api.exceptions import (
     TelegramAPIError,
@@ -29,8 +29,9 @@ async def get_entity(client: Any, entity: int | str) -> Any:
     further API calls.
     """
     try:
-        return await asyncio.wait_for(
+        return await guarded_await(
             client.get_entity(entity),
+            name="telegram:get_entity",
             timeout=_RPC_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -44,8 +45,9 @@ async def get_entity(client: Any, entity: int | str) -> Any:
 async def get_input_entity(client: Any, entity: int | str) -> Any:
     """Resolve an entity reference to an InputPeer."""
     try:
-        return await asyncio.wait_for(
+        return await guarded_await(
             client.get_input_entity(entity),
+            name="telegram:get_input_entity",
             timeout=_RPC_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -75,7 +77,11 @@ async def get_user(client: Any, user_id: int | str) -> dict[str, Any]:
 async def get_me(client: Any) -> dict[str, Any]:
     """Get the current account's user info. Returns serialized dict."""
     try:
-        me = await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
+        me = await guarded_await(
+            client.get_me(),
+            name="telegram:get_me",
+            timeout=_RPC_TIMEOUT,
+        )
         return serialize_user(me)
     except asyncio.TimeoutError:
         raise TelegramTimeoutError(f"get_me timed out after {_RPC_TIMEOUT}s")

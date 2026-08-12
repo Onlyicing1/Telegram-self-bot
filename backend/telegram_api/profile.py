@@ -7,10 +7,10 @@ engines — this module only exposes the raw profile update primitive.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
+from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api.exceptions import TelegramAPIError, TelegramTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,9 @@ async def update_profile(
         return {"updated": False}
 
     try:
-        await asyncio.wait_for(
+        await guarded_await(
             client(UpdateProfileRequest(**kwargs)),
+            name="telegram:update_profile",
             timeout=_RPC_TIMEOUT,
         )
         return {"updated": True, "fields": list(kwargs.keys())}
