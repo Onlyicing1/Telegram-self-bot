@@ -1,3 +1,4 @@
+successfully downloaded text file (SHA: 3c4d2cb4ec67cff465717ba4dc875788a5a754f5)
 # LifeOS — Telegram Self-Bot
 
 A production-grade **Telegram self-bot** (userbot) that turns your own
@@ -27,13 +28,12 @@ on **Render**.
 12. [How Deployment Works](#how-deployment-works)
 13. [Environment Variables](#environment-variables)
 14. [Render Deployment](#render-deployment)
-15. [Render Keep-Alive / Cron](#render-keep-alive--cron)
-16. [Supabase Setup](#supabase-setup)
-17. [Development Workflow](#development-workflow)
-18. [Repository Philosophy](#repository-philosophy)
-19. [Features](#features)
-20. [Commands](#commands)
-21. [Troubleshooting](#troubleshooting)
+15. [Supabase Setup](#supabase-setup)
+16. [Development Workflow](#development-workflow)
+17. [Repository Philosophy](#repository-philosophy)
+18. [Features](#features)
+19. [Commands](#commands)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -659,53 +659,6 @@ If the runtime supervisor exhausts recovery attempts, it calls
 
 The `render.yaml` Blueprint in the repository defines the service and
 all environment variables. Import it on Render for one-click setup.
-
----
-
-## Render Keep-Alive / Cron
-
-An external cron or monitoring service can periodically send an HTTP GET
-request to the deployed Render service to keep it active and monitor
-availability. This does not guarantee the service will never sleep, but
-it helps reduce idle spin-down and provides uptime monitoring.
-
-### Setup
-
-1. Create an account on a cron/monitoring service (e.g. cron-job.org,
-   UptimeRobot, or similar).
-2. Create a new monitoring job targeting your deployed service URL.
-   Use a generic placeholder such as `https://example.com` — never put
-   the real deployment URL in committed documentation.
-
-### Common Settings
-
-| Setting | Value |
-|---|---|
-| Enable job | ON |
-| Save responses in job history | ON |
-| Execution schedule | Every 10 minutes (every 5 minutes also acceptable) |
-| Notify when execution fails | ON |
-| Notify when job is disabled due to failures | ON |
-
-### Advanced Settings
-
-| Setting | Value |
-|---|---|
-| Requires HTTP authentication | OFF |
-| Headers | None |
-| Time zone | Asia/Tehran |
-| Request method | GET |
-| Request body | Empty |
-| Timeout | 30 seconds |
-| Treat HTTP 3xx redirects as success | ON |
-
-### How It Works
-
-The external monitor periodically contacts the deployed service with a
-GET request. This keeps the Render web service active and lets the
-monitoring service track availability over time. It does not guarantee
-the service will never sleep — Render's free tier may still spin down
-the instance under certain conditions.
 
 ---
 
