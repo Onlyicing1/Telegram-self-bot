@@ -47,6 +47,13 @@ class ReplyContext:
         media_type:    Media type label (e.g. ``"Photo"``) or empty.
         text_preview:  First 200 characters of the message text.
         timestamp:     ISO string of the message timestamp, or empty.
+        is_ai_message:   True when the replied message is a known AI response.
+        ai_session_id:   Session ID that produced the AI message (when known).
+        ai_role:         Role of the AI message (``"assistant"``).
+        ai_content:      Full AI response text (untruncated when available).
+        ai_provider:     Provider that generated the AI message.
+        ai_model:        Model that generated the AI message.
+        ai_timestamp:    UTC ISO string when the AI message was registered.
     """
 
     exists: bool = False
@@ -58,6 +65,13 @@ class ReplyContext:
     media_type: str = ""
     text_preview: str = ""
     timestamp: str = ""
+    is_ai_message: bool = False
+    ai_session_id: str = ""
+    ai_role: str = ""
+    ai_content: str = ""
+    ai_provider: str = ""
+    ai_model: str = ""
+    ai_timestamp: str = ""
 
 
 @dataclass(frozen=True)

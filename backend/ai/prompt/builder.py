@@ -201,16 +201,32 @@ class PromptBuilder:
         lines.append(f"Flow: {ctx.current_flow or 'None'}")
 
         if ctx.reply.exists:
-            lines.append("[Reply Context]")
-            lines.append(f"Message ID: {ctx.reply.message_id}")
-            lines.append(f"Sender: {ctx.reply.sender_name or 'Unknown'}")
-            lines.append(f"Chat: {ctx.reply.chat_title or 'Unknown'} ({ctx.reply.chat_id})")
-            if ctx.reply.media_type:
-                lines.append(f"Media: {ctx.reply.media_type}")
-            if ctx.reply.text_preview:
-                lines.append(f"Text: {ctx.reply.text_preview}")
-            if ctx.reply.timestamp:
-                lines.append(f"Timestamp: {ctx.reply.timestamp}")
+            if ctx.reply.is_ai_message:
+                lines.append("[Reply to AI Message]")
+                lines.append(f"Message ID: {ctx.reply.message_id}")
+                lines.append(f"AI Session: {ctx.reply.ai_session_id or 'Unknown'}")
+                lines.append(f"AI Role: {ctx.reply.ai_role or 'assistant'}")
+                if ctx.reply.ai_provider:
+                    lines.append(f"AI Provider: {ctx.reply.ai_provider}")
+                if ctx.reply.ai_model:
+                    lines.append(f"AI Model: {ctx.reply.ai_model}")
+                if ctx.reply.ai_timestamp:
+                    lines.append(f"AI Timestamp: {ctx.reply.ai_timestamp}")
+                if ctx.reply.chat_title:
+                    lines.append(f"Chat: {ctx.reply.chat_title} ({ctx.reply.chat_id})")
+                lines.append("[AI Message Content]")
+                lines.append(ctx.reply.ai_content or "(empty)")
+            else:
+                lines.append("[Reply Context]")
+                lines.append(f"Message ID: {ctx.reply.message_id}")
+                lines.append(f"Sender: {ctx.reply.sender_name or 'Unknown'}")
+                lines.append(f"Chat: {ctx.reply.chat_title or 'Unknown'} ({ctx.reply.chat_id})")
+                if ctx.reply.media_type:
+                    lines.append(f"Media: {ctx.reply.media_type}")
+                if ctx.reply.text_preview:
+                    lines.append(f"Text: {ctx.reply.text_preview}")
+                if ctx.reply.timestamp:
+                    lines.append(f"Timestamp: {ctx.reply.timestamp}")
         else:
             lines.append("Reply: None")
 

@@ -239,6 +239,11 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     if not prompt_text:
         return "", ReplyContext(), "The replied message has no text content to use as a prompt."
 
+    # ── Resolve AI message if the replied-to message is a known AI response ──
+    from backend.ai.context.reply_resolver import get_resolver
+
+    resolved = get_resolver().resolve(reply_msg.id or 0)
+
     # ── Build reply context ──
     reply_ctx = ReplyContext(
         exists=True,
@@ -250,6 +255,13 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
         media_type=media_info.media_type,
         text_preview=(media_info.text or media_info.caption or "")[:200],
         timestamp=msg_timestamp,
+        is_ai_message=resolved is not None,
+        ai_session_id=resolved.session_id if resolved else "",
+        ai_role=resolved.role if resolved else "",
+        ai_content=resolved.content if resolved else "",
+        ai_provider=resolved.provider if resolved else "",
+        ai_model=resolved.model if resolved else "",
+        ai_timestamp=resolved.timestamp if resolved else "",
     )
 
     return prompt_text, reply_ctx, ""
@@ -333,6 +345,16 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             await event.edit(final_text)
             ai_diag.mark_success("TELEGRAM_REPLY")
             logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
+            if result.success and result.response:
+                from backend.ai.context.reply_resolver import get_resolver
+                get_resolver().register(
+                    telegram_msg_id=event.message.id,
+                    session_id=session_id,
+                    role="assistant",
+                    content=result.response,
+                    provider=result.provider,
+                    model=result.model,
+                )
         except Exception as exc:
             logger.warning("AI handler: failed to edit final response: %s", exc)
             try:

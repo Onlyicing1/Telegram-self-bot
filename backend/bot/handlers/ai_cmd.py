@@ -219,6 +219,16 @@ def register(client, owner_id: int, tz_str: str):
                 await event.edit(final_text)
                 ai_diag.mark_success("TELEGRAM_REPLY")
                 logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
+                if result.success and result.response:
+                    from backend.ai.context.reply_resolver import get_resolver
+                    get_resolver().register(
+                        telegram_msg_id=event.message.id,
+                        session_id=session_id,
+                        role="assistant",
+                        content=result.response,
+                        provider=result.provider,
+                        model=result.model,
+                    )
             except Exception as exc:
                 logger.warning("ai response edit failed: %s", exc)
                 try:
