@@ -302,7 +302,34 @@ class Dispatcher:
             ),
             history=history_entries,
             memory=memory_data,
+            preferences=self._load_preferences(request.owner_id),
         )
+
+    def _load_preferences(self, owner_id: int) -> Any:
+        """Load the owner's AI preferences from the repository manager.
+
+        Uses ``RepositoryManager.preferences.get_or_create()`` which
+        returns an in-memory ``PreferencesRecord`` with defaults when
+        the ``ai_preferences`` table does not exist yet.
+        """
+        from backend.ai.conversation.context_builder import PreferencesContext
+
+        try:
+            from backend.ai.database.manager import get_repository_manager
+
+            repo = get_repository_manager().preferences
+            rec = repo.get_or_create(owner_id)
+            return PreferencesContext(
+                language=rec.language,
+                personality=rec.personality,
+                response_style=rec.response_style,
+                custom_instructions=rec.custom_instructions,
+                auto_memory=rec.auto_memory,
+                auto_tools=rec.auto_tools,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Preferences load failed for owner %s: %r", owner_id, exc)
+            return PreferencesContext()
 
     def _adapt_session(self, session: Any, request: AIRequest | None = None) -> Any:
         """Adapt a RuntimeSession to the ConversationSession shape the

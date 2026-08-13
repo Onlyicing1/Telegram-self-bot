@@ -35,6 +35,7 @@ class PromptSection(str, Enum):
     PLATFORM_CONSTRAINTS = "platform_constraints"
     RUNTIME_RULES = "runtime_rules"
     MEMORY = "memory"
+    PREFERENCES = "preferences"
     CURRENT_CONTEXT = "current_context"
     CONVERSATION_STATE = "conversation_state"
     TOOL_METADATA = "tool_metadata"
@@ -49,6 +50,7 @@ SECTION_ORDER: tuple[PromptSection, ...] = (
     PromptSection.PLATFORM_CONSTRAINTS,
     PromptSection.RUNTIME_RULES,
     PromptSection.MEMORY,
+    PromptSection.PREFERENCES,
     PromptSection.CURRENT_CONTEXT,
     PromptSection.CONVERSATION_STATE,
     PromptSection.TOOL_METADATA,
