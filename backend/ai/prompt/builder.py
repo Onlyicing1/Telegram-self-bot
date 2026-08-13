@@ -146,6 +146,7 @@ class PromptBuilder:
         sections[PromptSection.PLATFORM_CONSTRAINTS] = PLATFORM_CONSTRAINTS_TEMPLATE
         sections[PromptSection.RUNTIME_RULES] = RUNTIME_RULES_TEMPLATE
         sections[PromptSection.MEMORY] = self._render_memory(ctx)
+        sections[PromptSection.PREFERENCES] = self._render_preferences(ctx)
         sections[PromptSection.CURRENT_CONTEXT] = self._render_current_context(ctx)
         sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(ctx)
         sections[PromptSection.TOOL_METADATA] = self._render_tool_metadata(ctx)
@@ -156,13 +157,32 @@ class PromptBuilder:
         return sections
 
     def _merge_system(self, sections: dict[PromptSection, str]) -> str:
-        """Merge the three system-level sections into one string."""
+        """Merge system-level sections into one string.
+
+        Includes system rules, platform constraints, runtime rules,
+        and preferences — all are system-level instructions that shape
+        the assistant's behavior.
+        """
         parts = [
             sections.get(PromptSection.SYSTEM_RULES, ""),
             sections.get(PromptSection.PLATFORM_CONSTRAINTS, ""),
             sections.get(PromptSection.RUNTIME_RULES, ""),
+            sections.get(PromptSection.PREFERENCES, ""),
         ]
         return "\n\n".join(p for p in parts if p)
+
+    def _render_preferences(self, ctx: ConversationContext) -> str:
+        """Render the preferences block from PreferencesContext."""
+        p = ctx.preferences
+        lines: list[str] = ["[Preferences]"]
+        lines.append(f"Language: {p.language}")
+        lines.append(f"Personality: {p.personality}")
+        lines.append(f"Response Style: {p.response_style}")
+        lines.append(f"Auto-memory: {'enabled' if p.auto_memory else 'disabled'}")
+        lines.append(f"Auto-tools: {'enabled' if p.auto_tools else 'disabled'}")
+        if p.custom_instructions:
+            lines.append(f"Custom Instructions: {p.custom_instructions}")
+        return "\n".join(lines)
 
     def _render_memory(self, ctx: ConversationContext) -> str:
         """Render the memory block from MemoryManager output.
@@ -336,6 +356,7 @@ class PromptBuilder:
                 runtime=ctx.runtime,
                 history=history,
                 memory=ctx.memory,
+                preferences=ctx.preferences,
                 created_at=ctx.created_at,
             )
             sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(trimmed_ctx)

@@ -122,10 +122,31 @@ class RuntimeContext:
 
 
 @dataclass(frozen=True)
+class PreferencesContext:
+    """Snapshot of the owner's AI preferences.
+
+    Attributes:
+        language:            Preferred language (e.g. ``"English"``).
+        personality:         Personality mode (e.g. ``"default"``).
+        response_style:      Response style (e.g. ``"concise"``).
+        custom_instructions: Extra system instructions, or empty.
+        auto_memory:         Whether auto-memory is enabled.
+        auto_tools:          Whether auto-tools are enabled.
+    """
+
+    language: str = "English"
+    personality: str = "default"
+    response_style: str = "concise"
+    custom_instructions: str = ""
+    auto_memory: bool = True
+    auto_tools: bool = True
+
+
+@dataclass(frozen=True)
 class ConversationContext:
     """The ONE immutable context object consumed by the Prompt Builder.
 
-    Assembled by ``ContextBuilder.build()`` from seven sources. The
+    Assembled by ``ContextBuilder.build()`` from eight sources. The
     Prompt Builder receives this object and nothing else.
 
     Attributes:
@@ -149,6 +170,7 @@ class ConversationContext:
         runtime:         Runtime context (AI state, counters).
         history:         Recent conversation history entries.
         memory:          Memory text blocks from MemoryManager (permanent/long/short).
+        preferences:     AI preferences snapshot (language, personality, etc.).
         created_at:      UTC timestamp when this context was assembled.
     """
 
@@ -172,6 +194,7 @@ class ConversationContext:
     runtime: RuntimeContext
     history: list[HistoryEntry]
     memory: dict[str, str] = field(default_factory=dict)
+    preferences: PreferencesContext = field(default_factory=PreferencesContext)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -211,6 +234,7 @@ class ContextBuilder:
         runtime: RuntimeContext | None = None,
         history: list[HistoryEntry] | None = None,
         memory: dict[str, str] | None = None,
+        preferences: PreferencesContext | None = None,
     ) -> ConversationContext:
         """Assemble an immutable ``ConversationContext``.
 
@@ -225,6 +249,7 @@ class ContextBuilder:
             runtime:       Runtime context (or None for defaults).
             history:       Recent history entries (or None for empty).
             memory:        Memory text blocks from MemoryManager (or None for empty).
+            preferences:   AI preferences snapshot (or None for defaults).
 
         Returns:
             A frozen ``ConversationContext`` ready for the Prompt Builder.
@@ -261,5 +286,6 @@ class ContextBuilder:
             runtime=runtime or RuntimeContext(),
             history=history or [],
             memory=memory or {},
+            preferences=preferences or PreferencesContext(),
             created_at=now,
         )
