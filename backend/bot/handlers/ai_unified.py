@@ -6,12 +6,17 @@ TRIGGER MODE:
   prompt becomes "Hello".
 
 REPLY MODE:
-  Owner replies to any message and sends ONLY the trigger word
-  ("Nova" or "نوا") → the replied message becomes the prompt.
+  Owner replies to any message and sends the trigger word.
 
-  If the owner replies and also writes extra text:
-    "Nova summarize this"
-  → prompt becomes the replied message text + "\n\nsummarize this"
+  When replying to an AI message:
+    - The FULL previous AI response is injected as reply CONTEXT.
+    - The user's new text (after the trigger word) is the ACTUAL user message.
+    - The old AI response is NEVER used as the new user message.
+
+  If the owner replies with only the trigger word (no extra text):
+    - The replied-to AI message is still CONTEXT only.
+    - The user message becomes a generic continuation prompt
+      (e.g. "Continue" or "Tell me more about the above").
 
 Both modes enter the SAME execution pipeline:
   1. Build AIRequest with appropriate reply_context
@@ -156,11 +161,19 @@ def _humanize_error(error: str) -> str:
     return error[:200] if error else "Unknown error."
 
 
-async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", str]:
-    """Extract prompt text from a reply.
+async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "ReplyContext", str]:
+    """Extract reply context from a replied-to message.
 
-    Returns (prompt_text, reply_context, error_message).
-    On success, error_message is empty. On failure, prompt_text is empty.
+    The replied-to message is ALWAYS treated as CONTEXT — never as the
+    user's new message.  The user's actual instruction (``user_text``)
+    is the prompt that goes to the AI.
+
+    When replying to a known AI message, the full untruncated AI response
+    is injected via ``ReplyContext.ai_content`` so the Prompt Builder can
+    include it as high-priority context.
+
+    Returns (user_message, reply_context, error_message).
+    On success, error_message is empty. On failure, user_message is empty.
     """
     from backend.ai.conversation.context_builder import ReplyContext
     from backend.ai.media import classify_message
@@ -214,42 +227,31 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     except Exception:
         pass
 
-    # ── Build the prompt text ──
-    # The replied message content becomes the prompt.
-    # If the owner also wrote extra text (after the trigger word),
-    # it gets appended.
-    raw_text = event.raw_text or ""
-    words = raw_text.split(None, 1)
-    extra_text = words[1].strip() if len(words) > 1 else ""
-
     # ── Resolve AI message if the replied-to message is a known AI response ──
     from backend.ai.context.reply_resolver import get_resolver
 
     resolved = get_resolver().resolve(reply_msg.id or 0)
 
-    # Build the base prompt from the replied message.
-    # When the replied message is a known AI response, use the full
-    # untruncated content from the resolver instead of Telegram's
-    # 200-character preview.
-    if resolved and resolved.content:
-        base_prompt = resolved.content
-    elif media_info.is_text:
-        base_prompt = media_info.text or ""
+    # ── Determine the user's actual message ──
+    # The user_text is what the owner typed after the trigger word.
+    # If they only sent the trigger word with no extra text, use a
+    # generic continuation prompt — the replied-to message is context,
+    # NOT the user's instruction.
+    if user_text:
+        user_message = user_text
+    elif resolved and resolved.content:
+        user_message = "Continue. Tell me more about the above."
+    elif media_info.is_text and (media_info.text or media_info.caption):
+        user_message = "Continue. Tell me more about the above."
     else:
-        base_prompt = media_info.as_context_text()
-
-    if extra_text:
-        if base_prompt:
-            prompt_text = f"{base_prompt}\n\n{extra_text}"
-        else:
-            prompt_text = extra_text
-    else:
-        prompt_text = base_prompt
-
-    if not prompt_text:
-        return "", ReplyContext(), "The replied message has no text content to use as a prompt."
+        user_message = "Continue. Tell me more about the above."
 
     # ── Build reply context ──
+    # The replied-to message content goes into ReplyContext, NOT into
+    # the user_message.  The Prompt Builder reads ai_content / text_preview
+    # from the ReplyContext and injects it as context.
+    ai_content = resolved.content if resolved else ""
+
     reply_ctx = ReplyContext(
         exists=True,
         message_id=reply_msg.id or 0,
@@ -263,13 +265,13 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
         is_ai_message=resolved is not None,
         ai_session_id=resolved.session_id if resolved else "",
         ai_role=resolved.role if resolved else "",
-        ai_content=resolved.content if resolved else "",
+        ai_content=ai_content,
         ai_provider=resolved.provider if resolved else "",
         ai_model=resolved.model if resolved else "",
         ai_timestamp=resolved.timestamp if resolved else "",
     )
 
-    return prompt_text, reply_ctx, ""
+    return user_message, reply_ctx, ""
 
 
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
@@ -403,14 +405,23 @@ def register(client, owner_id: int, tz_str: str):
     This handler fires on ALL outgoing messages. It detects two activation
     methods:
 
-    METHOD 1 — Trigger Mode:
+    METHOD 1 — Trigger Mode (no reply):
       Owner sends "Nova Hello" → trigger "Nova" stripped → prompt = "Hello"
+      No reply context is extracted.
 
-    METHOD 2 — Reply Mode:
-      Owner replies to any message and sends ONLY the trigger word
-      ("Nova" or "نوا") → replied message becomes the prompt.
-      If extra text is added after the trigger, it's appended to the
-      replied message content.
+    METHOD 2 — Reply-Aware Trigger Mode (message is a reply):
+      Owner replies to any message and sends the trigger word, optionally
+      with extra text.
+
+      When replying to an AI message:
+        - The FULL previous AI response is injected as reply CONTEXT.
+        - The user's new text (after the trigger) is the ACTUAL user message.
+        - If no extra text, a generic continuation prompt is used.
+        - The old AI response is NEVER used as the new user message.
+
+      When replying to a non-AI message:
+        - The replied message content is injected as reply context.
+        - The user's new text is the user message (or a continuation prompt).
 
     Messages starting with "." (dot commands) are always skipped.
     """
@@ -442,27 +453,35 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         remaining = words[1].strip() if len(words) > 1 else ""
+        is_reply = bool(getattr(event, "is_reply", False))
 
-        # ── METHOD 1: Trigger Mode (has remaining text, no reply needed) ──
-        if remaining:
-            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
-            await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+        # ── Reply-Aware Mode: message is a reply ──
+        # ALWAYS extract reply context when the message is a reply,
+        # regardless of whether the user wrote extra text.  This ensures
+        # the AI receives the replied-to message as context.
+        if is_reply:
+            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
+            user_message, reply_ctx, error_msg = await _extract_reply_context(
+                event, client, remaining
+            )
+
+            if error_msg:
+                try:
+                    await event.edit(_format_error(first_word, first_word, error_msg))
+                except Exception as exc:
+                    logger.warning("AI handler: failed to edit reply error: %s", exc)
+                return
+
+            await _execute_ai(
+                event, owner_id, user_message, first_word, tz_str,
+                reply_context=reply_ctx,
+            )
             return
 
-        # ── METHOD 2: Reply Mode (only trigger word sent, need a reply) ──
-        is_reply = bool(getattr(event, "is_reply", False))
-        if not is_reply:
+        # ── Trigger Mode: no reply, must have remaining text ──
+        if not remaining:
             # Only the trigger word with no text and no reply — ignore silently
             return
 
-        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
-        prompt_text, reply_ctx, error_msg = await _extract_reply_context(event, client)
-
-        if error_msg:
-            try:
-                await event.edit(_format_error(first_word, first_word, error_msg))
-            except Exception as exc:
-                logger.warning("AI handler: failed to edit reply error: %s", exc)
-            return
-
-        await _execute_ai(event, owner_id, prompt_text, first_word, tz_str, reply_context=reply_ctx)
+        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
+        await _execute_ai(event, owner_id, remaining, first_word, tz_str)
