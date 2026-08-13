@@ -7,6 +7,8 @@ Verifies the reply-to-AI fix:
   2. Reply to AI + trigger only → AI receives old AI response as context
      and a continuation prompt as the user message.
   3. Plain trigger mode (no reply) still works unchanged.
+  4. Reply to AI without trigger word → AI activated with full text as
+     the user message and old AI response as context.
 """
 from __future__ import annotations
 
@@ -168,3 +170,51 @@ async def test_reply_to_non_ai_message_with_extra_text():
     assert reply_ctx.exists is True
     assert reply_ctx.is_ai_message is False
     assert reply_ctx.ai_content == ""
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_without_trigger_uses_full_text_as_message():
+    """When replying to an AI message with text that does NOT start with
+    a trigger word, the reply-to-AI detection must activate the AI and the
+    user's full text must become the user message."""
+    from backend.ai.context.reply_resolver import ReplyResolver, ResolvedAIContent
+    from backend.ai.conversation.context_builder import ReplyContext
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=400,
+        session_id="owner-1",
+        role="assistant",
+        content="The weather today is sunny with a high of 25°C.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 400
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "What about tomorrow?"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "What about tomorrow?"
+        )
+
+    assert error == ""
+    assert user_message == "What about tomorrow?"
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "The weather today is sunny with a high of 25°C."
+    assert user_message != "The weather today is sunny with a high of 25°C."
