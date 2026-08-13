@@ -54,6 +54,7 @@ class Dispatcher:
         "_metrics",
         "_tool_registry",
         "_tool_executor",
+        "_memory_manager",
     )
 
     def __init__(
@@ -65,6 +66,7 @@ class Dispatcher:
         metrics: EngineMetrics | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_executor: ToolExecutor | None = None,
+        memory_manager: Any | None = None,
     ) -> None:
         self._conversation = conversation
         self._prompt_builder = prompt_builder
@@ -78,6 +80,7 @@ class Dispatcher:
         self._metrics = metrics or EngineMetrics()
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
+        self._memory_manager = memory_manager
 
     @property
     def metrics(self) -> EngineMetrics:
@@ -274,6 +277,12 @@ class Dispatcher:
                 content=item.content,
                 tool_name=item.role if item.role == "tool" else "",
             ))
+        memory_data: dict[str, str] = {}
+        if self._memory_manager is not None:
+            try:
+                memory_data = self._memory_manager.retrieve_for_prompt(request.owner_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Memory retrieval failed for owner %s: %r", request.owner_id, exc)
         return ContextBuilder().build(
             session=self._adapt_session(session, request),
             user_text=request.user_message,
@@ -289,6 +298,7 @@ class Dispatcher:
                 turn_count=len(history_items),
             ),
             history=history_entries,
+            memory=memory_data,
         )
 
     def _adapt_session(self, session: Any, request: AIRequest | None = None) -> Any:

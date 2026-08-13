@@ -145,6 +145,7 @@ class PromptBuilder:
         sections[PromptSection.SYSTEM_RULES] = SYSTEM_RULES_TEMPLATE
         sections[PromptSection.PLATFORM_CONSTRAINTS] = PLATFORM_CONSTRAINTS_TEMPLATE
         sections[PromptSection.RUNTIME_RULES] = RUNTIME_RULES_TEMPLATE
+        sections[PromptSection.MEMORY] = self._render_memory(ctx)
         sections[PromptSection.CURRENT_CONTEXT] = self._render_current_context(ctx)
         sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(ctx)
         sections[PromptSection.TOOL_METADATA] = self._render_tool_metadata(ctx)
@@ -162,6 +163,38 @@ class PromptBuilder:
             sections.get(PromptSection.RUNTIME_RULES, ""),
         ]
         return "\n\n".join(p for p in parts if p)
+
+    def _render_memory(self, ctx: ConversationContext) -> str:
+        """Render the memory block from MemoryManager output.
+
+        The memory dict contains up to three keys: ``permanent``,
+        ``long``, and ``short``. Each is a pre-formatted text block
+        (or empty string). We merge them into a single ``[Memory]``
+        section with sub-headers.
+        """
+        mem = ctx.memory
+        if not mem:
+            return ""
+        lines: list[str] = ["[Memory]"]
+        permanent = mem.get("permanent", "")
+        long_term = mem.get("long", "")
+        short = mem.get("short", "")
+        if permanent:
+            lines.append("[Permanent Facts]")
+            lines.append(permanent)
+        if long_term:
+            if lines[-1] != "[Memory]":
+                lines.append("")
+            lines.append("[Long-term Memory]")
+            lines.append(long_term)
+        if short:
+            if lines[-1] != "[Memory]":
+                lines.append("")
+            lines.append("[Short-term Memory]")
+            lines.append(short)
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
 
     def _render_current_context(self, ctx: ConversationContext) -> str:
         """Render the runtime/context block (§25.1 fields)."""
@@ -302,6 +335,7 @@ class PromptBuilder:
                 settings=ctx.settings,
                 runtime=ctx.runtime,
                 history=history,
+                memory=ctx.memory,
                 created_at=ctx.created_at,
             )
             sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(trimmed_ctx)

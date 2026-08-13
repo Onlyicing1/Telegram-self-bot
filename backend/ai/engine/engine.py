@@ -30,6 +30,7 @@ from backend.ai.engine.dispatcher import Dispatcher
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
+from backend.ai.memory.manager import MemoryManager
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.providers.factory import ProviderFactory
 from backend.ai.providers.manager.manager import ProviderManager
@@ -59,6 +60,7 @@ class Engine:
         "_metrics",
         "_tool_registry",
         "_tool_executor",
+        "_memory_manager",
     )
 
     def __init__(
@@ -68,6 +70,7 @@ class Engine:
         providers: ProviderRegistry | ProviderManager | None = None,
         hooks: EngineHooks | None = None,
         tool_registry: ToolRegistry | None = None,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self._conversation = conversation or ConversationManager()
         self._prompt_builder = prompt_builder or PromptBuilder()
@@ -88,6 +91,7 @@ class Engine:
             from backend.ai.tools.context import ToolContext
             ctx = ToolContext(telegram=None, owner_id=0, tz_str="UTC")
             self._tool_executor = ToolExecutor(tool_registry, ctx)
+        self._memory_manager = memory_manager or MemoryManager()
         self._dispatcher = Dispatcher(
             conversation=self._conversation,
             prompt_builder=self._prompt_builder,
@@ -96,6 +100,7 @@ class Engine:
             metrics=self._metrics,
             tool_registry=self._tool_registry,
             tool_executor=self._tool_executor,
+            memory_manager=self._memory_manager,
         )
         logger.info(
             "Engine initialized (provider=%s, providers=%s)",
@@ -114,7 +119,7 @@ class Engine:
         return await self._dispatcher.dispatch(user_request)
 
     def engine_health(self) -> str:
-        """Return ``"READY"`` or ``"FAILED: <reason>"``."""
+        """Return ``"READY"`` or ``"FAILED: <reason>``."""
         try:
             provider = self._provider_manager.get_active()
             health = provider.health()
@@ -147,6 +152,10 @@ class Engine:
     @property
     def tool_registry(self) -> ToolRegistry | None:
         return self._tool_registry
+
+    @property
+    def memory_manager(self) -> MemoryManager:
+        return self._memory_manager
 
     def attach_tools(self, registry: ToolRegistry, owner_id: int = 0, tz_str: str = "UTC") -> None:
         """Attach or replace the tool registry and executor at runtime."""
