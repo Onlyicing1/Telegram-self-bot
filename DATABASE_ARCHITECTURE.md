@@ -1023,7 +1023,47 @@ bot appears to work but does not persist anything.
 migrations). After that, the configuration flow will be deterministic:
 writes either succeed (data persists) or fail (error is visible).
 
-### 19.10 `ai_database/manager.py` — no Supabase implementations wired
+### 19.10 `ai_messages.telegram_msg_id` — optional column for persistent reply resolution
+
+**Severity:** Low (enhancement, not a bug)
+
+**Problem:** The `ReplyResolver` (`backend/ai/context/reply_resolver.py`)
+maps Telegram message IDs to full AI response content so that when the
+owner replies to a previous AI message, the full untruncated AI text is
+injected as high-priority context. Currently this mapping is stored
+in-memory only (bounded LRU, 500 entries). On restart, all mappings are
+lost — the owner can only get reply-aware context for AI messages
+produced during the current process lifetime.
+
+**Current behavior:** In-memory resolution works for active sessions.
+This is the primary use case (the owner replies to a recent AI message
+within the same session). The 200-character `text_preview` is used as
+a fallback when the in-memory mapping is not found.
+
+**Optional future schema change:** Add a `telegram_msg_id` column to
+`ai_messages` so the resolver can fall back to a DB lookup when the
+in-memory map misses. This would enable reply-aware context across
+restarts.
+
+**Required schema change (if implemented):**
+
+| Table | Column | Type | Nullable | Default | Index | Purpose |
+|---|---|---|---|---|---|---|
+| `ai_messages` | `telegram_msg_id` | `bigint` | YES | `NULL` | `idx_ai_messages_tg_msg` (btree on `telegram_msg_id`) | Stores the Telegram message ID that contains the AI response. Enables the ReplyResolver to look up full AI content by Telegram message ID across restarts. |
+
+**Why it is required:** Without this column, the in-memory resolver
+cannot be backed by persistent storage. The column is nullable because
+not all AI messages have a Telegram message ID (e.g. internal/system
+messages). The index enables fast lookup by `telegram_msg_id` when
+resolving a reply.
+
+**Important:** This schema change is NOT required for the current
+reply-aware context feature to work. The in-memory resolver is the
+primary mechanism. This column would only add cross-restart persistence
+as a fallback. Application code must NOT depend on this column existing —
+the resolver must always handle the case where the column is absent.
+
+### 19.11 `ai_database/manager.py` — no Supabase implementations wired
 
 **Severity:** Medium
 
