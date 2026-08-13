@@ -222,8 +222,18 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     words = raw_text.split(None, 1)
     extra_text = words[1].strip() if len(words) > 1 else ""
 
-    # Build the base prompt from the replied message
-    if media_info.is_text:
+    # ── Resolve AI message if the replied-to message is a known AI response ──
+    from backend.ai.context.reply_resolver import get_resolver
+
+    resolved = get_resolver().resolve(reply_msg.id or 0)
+
+    # Build the base prompt from the replied message.
+    # When the replied message is a known AI response, use the full
+    # untruncated content from the resolver instead of Telegram's
+    # 200-character preview.
+    if resolved and resolved.content:
+        base_prompt = resolved.content
+    elif media_info.is_text:
         base_prompt = media_info.text or ""
     else:
         base_prompt = media_info.as_context_text()
@@ -238,11 +248,6 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
 
     if not prompt_text:
         return "", ReplyContext(), "The replied message has no text content to use as a prompt."
-
-    # ── Resolve AI message if the replied-to message is a known AI response ──
-    from backend.ai.context.reply_resolver import get_resolver
-
-    resolved = get_resolver().resolve(reply_msg.id or 0)
 
     # ── Build reply context ──
     reply_ctx = ReplyContext(
