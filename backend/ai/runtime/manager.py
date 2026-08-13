@@ -227,6 +227,46 @@ class ConversationManager:
             )
         return session
 
+    # ── Persistent history restoration ──
+
+    async def restore_history(self, owner_id: int, session_id: str) -> int:
+        """Restore persisted messages from Supabase into the owner's RAM session.
+
+        Called once when a session is created/recovered after a restart.
+        System-role messages are skipped (managed by ``set_system_prompt``).
+        Returns the number of items loaded. On any error, returns 0 silently.
+        """
+        session = self._registry.get_session(owner_id)
+        if session is None:
+            return 0
+        if session.conversation_history.size() > 1:
+            return 0
+        try:
+            from backend.ai import persistence
+            rows = await persistence.get_messages(session_id, limit=50)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("restore_history fetch failed for '%s': %r", session_id, exc)
+            return 0
+        if not rows:
+            return 0
+        items: List[HistoryItem] = []
+        for row in rows:
+            role = row.get("role", "")
+            content = row.get("content", "")
+            if not role or not content:
+                continue
+            items.append(HistoryItem(
+                role=role,
+                content=content,
+                estimated_tokens=int(row.get("token_count") or 0),
+            ))
+        loaded = session.conversation_history.restore(items)
+        session._refresh_token_estimate()  # noqa: SLF001
+        self._trim_if_needed(session)
+        if loaded:
+            logger.info("Restored %d messages for session '%s'", loaded, session_id)
+        return loaded
+
     # ── Diagnostics ──
 
     @property

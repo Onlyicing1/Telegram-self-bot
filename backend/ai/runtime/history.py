@@ -7,7 +7,7 @@ Each item stores:
     timestamp:        UTC datetime when the item was recorded
     estimated_tokens: ``len(content) / 4`` (see ``tokens.estimate_tokens``)
 
-The history is in-memory only. No database. No persistence. No
+The history is in-memory-only. No database. No persistence. No
 summarization. It is created per session and discarded when the session
 is closed or trimmed away.
 
@@ -91,6 +91,21 @@ class ConversationHistory:
         if n <= 0:
             return []
         return list(self._items[-n:])
+
+    def restore(self, items: List[HistoryItem]) -> int:
+        """Bulk-load previously persisted items into history.
+
+        Items must be in chronological order (oldest first). System-role
+        items are skipped — the system prompt is managed separately by
+        ``RuntimeSession.set_system_prompt``. Returns the number loaded.
+        """
+        loaded = 0
+        for item in items:
+            if item.role == ROLE_SYSTEM:
+                continue
+            self._items.append(item)
+            loaded += 1
+        return loaded
 
     def clear(self) -> None:
         """Remove every item."""
