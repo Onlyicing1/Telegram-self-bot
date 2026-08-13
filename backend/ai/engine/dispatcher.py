@@ -102,6 +102,9 @@ class Dispatcher:
                 session = self._conversation.create_session(
                     owner_id=request.owner_id, session_id=request.session_id or None
                 )
+            await self._conversation.restore_history(
+                owner_id=request.owner_id, session_id=session.session_id
+            )
             if request.user_message:
                 self._conversation.add_user_message(
                     owner_id=request.owner_id, content=request.user_message
