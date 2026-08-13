@@ -18,6 +18,13 @@ REPLY MODE:
     - The user message becomes a generic continuation prompt
       (e.g. "Continue" or "Tell me more about the above").
 
+REPLY-TO-AI MODE (no trigger word needed):
+  Owner replies to a known AI message with plain text that does NOT
+  start with a trigger word.  The reply is detected BEFORE the trigger
+  rejection, so the AI is activated with:
+    - The user's full text as the user message.
+    - The replied-to AI message as high-priority context.
+
 Both modes enter the SAME execution pipeline:
   1. Build AIRequest with appropriate reply_context
   2. Edit the triggering message to show "Thinking..."
@@ -423,6 +430,12 @@ def register(client, owner_id: int, tz_str: str):
         - The replied message content is injected as reply context.
         - The user's new text is the user message (or a continuation prompt).
 
+    METHOD 3 — Reply-to-AI Mode (no trigger word needed):
+      Owner replies to a known AI message with plain text that does NOT
+      start with a trigger word.  The reply-to-AI check happens BEFORE the
+      trigger rejection, so the AI is activated with the full text as the
+      user message and the replied-to AI message as context.
+
     Messages starting with "." (dot commands) are always skipped.
     """
 
@@ -443,45 +456,68 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         first_word = words[0]
+        remaining = words[1].strip() if len(words) > 1 else ""
 
         trigger_en, trigger_fa = await _load_triggers(owner_id)
-        if not trigger_en and not trigger_fa:
-            return
+        trigger_matched = False
+        if trigger_en or trigger_fa:
+            from backend.ai.config_store import match_trigger
+            trigger_matched = match_trigger(first_word, trigger_en, trigger_fa)
 
-        from backend.ai.config_store import match_trigger
-        if not match_trigger(first_word, trigger_en, trigger_fa):
-            return
-
-        remaining = words[1].strip() if len(words) > 1 else ""
         is_reply = bool(getattr(event, "is_reply", False))
 
-        # ── Reply-Aware Mode: message is a reply ──
-        # ALWAYS extract reply context when the message is a reply,
-        # regardless of whether the user wrote extra text.  This ensures
-        # the AI receives the replied-to message as context.
+        # ── Detect reply to a known AI message ──
+        # This check happens BEFORE the trigger rejection so that replying
+        # to an AI message with plain text (no trigger word) still activates
+        # the AI.  The replied AI message becomes context and the user's
+        # full text becomes the prompt.
+        reply_to_ai = False
         if is_reply:
-            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
+            from backend.ai.context.reply_resolver import get_resolver
+            try:
+                reply_msg = await event.get_reply_message()
+                if reply_msg is not None:
+                    resolved = get_resolver().resolve(reply_msg.id or 0)
+                    if resolved is not None:
+                        reply_to_ai = True
+            except Exception as exc:
+                logger.warning("AI handler: reply-to-AI check failed: %s", exc)
+
+        if not trigger_matched and not reply_to_ai:
+            return
+
+        # Determine the actual user message and trigger label
+        if trigger_matched:
+            trigger_label = first_word
+            user_text = remaining
+        else:
+            trigger_label = first_word
+            user_text = raw_text
+
+        # ── Reply-Aware Mode: message is a reply ──
+        if is_reply:
+            trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="reply",
+                  reply_to_ai=reply_to_ai)
             user_message, reply_ctx, error_msg = await _extract_reply_context(
-                event, client, remaining
+                event, client, user_text
             )
 
             if error_msg:
                 try:
-                    await event.edit(_format_error(first_word, first_word, error_msg))
+                    await event.edit(_format_error(trigger_label, trigger_label, error_msg))
                 except Exception as exc:
                     logger.warning("AI handler: failed to edit reply error: %s", exc)
                 return
 
             await _execute_ai(
-                event, owner_id, user_message, first_word, tz_str,
+                event, owner_id, user_message, trigger_label, tz_str,
                 reply_context=reply_ctx,
             )
             return
 
         # ── Trigger Mode: no reply, must have remaining text ──
-        if not remaining:
-            # Only the trigger word with no text and no reply — ignore silently
+        if not user_text:
             return
 
-        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
-        await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+        trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")
+        await _execute_ai(event, owner_id, user_text, trigger_label, tz_str)
