@@ -125,7 +125,7 @@ class RuntimeContext:
 class ConversationContext:
     """The ONE immutable context object consumed by the Prompt Builder.
 
-    Assembled by ``ContextBuilder.build()`` from six sources. The
+    Assembled by ``ContextBuilder.build()`` from seven sources. The
     Prompt Builder receives this object and nothing else.
 
     Attributes:
@@ -148,6 +148,7 @@ class ConversationContext:
         settings:        Settings context (owner's bot settings snapshot).
         runtime:         Runtime context (AI state, counters).
         history:         Recent conversation history entries.
+        memory:          Memory text blocks from MemoryManager (permanent/long/short).
         created_at:      UTC timestamp when this context was assembled.
     """
 
@@ -170,6 +171,7 @@ class ConversationContext:
     settings: SettingsContext
     runtime: RuntimeContext
     history: list[HistoryEntry]
+    memory: dict[str, str] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -208,6 +210,7 @@ class ContextBuilder:
         settings: SettingsContext | None = None,
         runtime: RuntimeContext | None = None,
         history: list[HistoryEntry] | None = None,
+        memory: dict[str, str] | None = None,
     ) -> ConversationContext:
         """Assemble an immutable ``ConversationContext``.
 
@@ -221,6 +224,7 @@ class ContextBuilder:
             settings:      Settings context (or None for empty).
             runtime:       Runtime context (or None for defaults).
             history:       Recent history entries (or None for empty).
+            memory:        Memory text blocks from MemoryManager (or None for empty).
 
         Returns:
             A frozen ``ConversationContext`` ready for the Prompt Builder.
@@ -256,5 +260,6 @@ class ContextBuilder:
             settings=settings or SettingsContext(),
             runtime=runtime or RuntimeContext(),
             history=history or [],
+            memory=memory or {},
             created_at=now,
         )
