@@ -83,12 +83,6 @@ async def _restore_config(owner_id: int) -> None:
         logger.warning("AI handler: config restore failed: %s", exc)
 
 
-def _truncate(text: str, limit: int = 4000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "…"
-
-
 def _humanize_error(error: str) -> str:
     """Convert raw error strings into human-readable messages."""
     error_lower = error.lower()
@@ -188,12 +182,26 @@ def register(client, owner_id: int, tz_str: str):
                     pass
 
             if result.success and result.response:
-                response_text = _truncate(result.response)
-                final_text = (
-                    f"{user_message}\n"
-                    f"────────────\n"
-                    f"🤖 AI\n"
-                    f"{response_text}"
+                ai_diag.set_stage(rid, "TELEGRAM_REPLY")
+                logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
+                from backend.ai.tools.delivery import deliver_response
+                delivery_result = await deliver_response(
+                    event, user_message, "AI", result.response,
+                )
+                if delivery_result.success:
+                    ai_diag.mark_success("TELEGRAM_REPLY")
+                logger.info(
+                    "AI_TELEGRAM_REPLY_END id=%s chunks=%d/%d",
+                    rid, delivery_result.chunks_delivered, delivery_result.total_chunks,
+                )
+                from backend.ai.context.reply_resolver import get_resolver
+                get_resolver().register(
+                    telegram_msg_id=event.message.id,
+                    session_id=session_id,
+                    role="assistant",
+                    content=result.response,
+                    provider=result.provider,
+                    model=result.model,
                 )
             elif result.errors:
                 error_msg = _humanize_error(result.errors[0])
@@ -204,6 +212,14 @@ def register(client, owner_id: int, tz_str: str):
                     f"❌ Error\n"
                     f"{error_msg}"
                 )
+                try:
+                    await event.edit(final_text)
+                except Exception as exc:
+                    logger.warning("ai response edit failed: %s", exc)
+                    try:
+                        await event.reply(final_text)
+                    except Exception:
+                        pass
             else:
                 final_text = (
                     f"{user_message}\n"
@@ -212,29 +228,8 @@ def register(client, owner_id: int, tz_str: str):
                     f"❌ Error\n"
                     f"AI returned no response."
                 )
-
-            try:
-                ai_diag.set_stage(rid, "TELEGRAM_REPLY")
-                logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
-                await event.edit(final_text)
-                ai_diag.mark_success("TELEGRAM_REPLY")
-                logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
-                if result.success and result.response:
-                    from backend.ai.context.reply_resolver import get_resolver
-                    get_resolver().register(
-                        telegram_msg_id=event.message.id,
-                        session_id=session_id,
-                        role="assistant",
-                        content=result.response,
-                        provider=result.provider,
-                        model=result.model,
-                    )
-            except Exception as exc:
-                logger.warning("ai response edit failed: %s", exc)
                 try:
-                    await event.reply(final_text)
-                    ai_diag.mark_success("TELEGRAM_REPLY")
-                    logger.info("AI_TELEGRAM_REPLY_END id=%s (via reply)", rid)
+                    await event.edit(final_text)
                 except Exception:
                     pass
 

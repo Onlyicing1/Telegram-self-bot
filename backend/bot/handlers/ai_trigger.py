@@ -139,12 +139,6 @@ def _format_error(user_message: str, trigger_label: str, error: str) -> str:
     )
 
 
-def _truncate(text: str, limit: int = 4000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "…"
-
-
 def _humanize_error(error: str) -> str:
     """Convert raw error strings into human-readable messages."""
     error_lower = error.lower()
@@ -218,22 +212,37 @@ async def _execute_ai(event, owner_id: int, user_message: str, trigger_word: str
                 logger.warning("AI trigger: record_request failed: %s", exc)
 
         if result.success and result.response:
-            response_text = _truncate(result.response)
-            final_text = _format_response(user_message, trigger_label, response_text)
+            from backend.ai.tools.delivery import deliver_response
+            delivery_result = await deliver_response(
+                event, user_message, trigger_label, result.response,
+            )
+            if delivery_result.success:
+                logger.info(
+                    "AI trigger: response delivered chunks=%d/%d",
+                    delivery_result.chunks_delivered, delivery_result.total_chunks,
+                )
+            else:
+                logger.warning(
+                    "AI trigger: delivery failed: %s",
+                    delivery_result.error,
+                )
         elif result.errors:
             error_msg = _humanize_error(result.errors[0])
             final_text = _format_error(user_message, trigger_label, error_msg)
+            try:
+                await event.edit(final_text)
+            except Exception as exc:
+                logger.warning("AI trigger: failed to edit error response: %s", exc)
+                try:
+                    await event.reply(final_text)
+                except Exception:
+                    pass
         else:
             final_text = _format_error(user_message, trigger_label, "AI returned no response.")
-
-        try:
-            await event.edit(final_text)
-        except Exception as exc:
-            logger.warning("AI trigger: failed to edit final response: %s", exc)
             try:
-                await event.reply(final_text)
-            except Exception as exc2:
-                logger.error("AI trigger: both edit and reply failed: %s", exc2)
+                await event.edit(final_text)
+            except Exception:
+                pass
 
     except asyncio.TimeoutError:
         trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s")
