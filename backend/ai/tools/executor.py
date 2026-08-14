@@ -27,6 +27,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,26 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOLS_PER_TURN = 5
 TOOL_TIMEOUT_SECONDS = 10
+
+_STATUS_LABELS: dict[str, str] = {
+    "save": "💾 Saving...",
+    "search": "🔎 Searching saved items...",
+    "list_saves": "📋 Loading saved items...",
+    "delete": "🗑️ Deleting...",
+    "delete_by_id": "🗑️ Deleting saved item...",
+    "settings_get": "⚙️ Checking settings...",
+    "settings_set": "⚙️ Updating settings...",
+    "bio_show": "👤 Checking bio...",
+    "bio_template": "👤 Updating bio...",
+    "bio_text": "👤 Updating bio...",
+    "bio_mood": "👤 Updating bio...",
+    "bio_on": "👤 Updating bio...",
+    "bio_off": "👤 Updating bio...",
+    "username_show": "📛 Checking username...",
+    "username_set": "📛 Updating username...",
+    "organize_list": "🗂️ Checking organization...",
+    "organize_clean": "🧹 Cleaning organization...",
+}
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,7 @@ class ToolExecutor:
         tool_calls: list[dict[str, Any]],
         owner_id: int = 0,
         session_id: str = "",
+        status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> list[ToolExecutionResult]:
         """Execute a batch of tool calls from a provider response.
 
@@ -106,6 +128,14 @@ class ToolExecutor:
                     error="max_tools_exceeded",
                 ))
                 break
+
+            tool_name = call.get("name", "") or call.get("tool", "")
+            if status_callback and tool_name:
+                label = _STATUS_LABELS.get(tool_name, f"⏳ Running {tool_name}...")
+                try:
+                    await status_callback(label)
+                except Exception as exc:
+                    logger.debug("ToolExecutor: status callback failed for '%s': %s", tool_name, exc)
 
             result = await self._execute_single(call, owner_id, session_id)
             results.append(result)

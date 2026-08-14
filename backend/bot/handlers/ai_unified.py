@@ -315,6 +315,17 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         request_id=rid,
     )
 
+    async def _status_callback(status: str) -> None:
+        try:
+            await event.edit(
+                f"{display_prompt}\n"
+                f"────────────\n"
+                f"🤖 {trigger_label}\n"
+                f"{status}"
+            )
+        except Exception as exc:
+            logger.debug("AI handler: status edit failed: %s", exc)
+
     try:
         await event.edit(_format_thinking(display_prompt, trigger_label))
     except Exception as exc:
@@ -322,7 +333,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
 
     try:
         result = await asyncio.wait_for(
-            engine.execute(request),
+            engine.execute(request, status_callback=_status_callback),
             timeout=_AI_TIMEOUT,
         )
         record_event("ai", "execute", 0, "SUCCESS" if result.success else "FAILED",
