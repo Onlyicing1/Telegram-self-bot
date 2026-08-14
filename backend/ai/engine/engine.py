@@ -110,16 +110,20 @@ class Engine:
 
     # ── Public API ──
 
-    async def execute(self, user_request: AIRequest) -> EngineResult:
+    async def execute(
+        self,
+        user_request: AIRequest,
+        status_callback: "Callable[[str], Awaitable[None]] | None" = None,
+    ) -> EngineResult:
         """Execute a request through the full AI pipeline.
 
         This is the ONLY public execution method. Returns an immutable
         ``EngineResult``. Never raises.
         """
-        return await self._dispatcher.dispatch(user_request)
+        return await self._dispatcher.dispatch(user_request, status_callback=status_callback)
 
     def engine_health(self) -> str:
-        """Return ``"READY"`` or ``"FAILED: <reason>``."""
+        """Return ``"READY" or "FAILED: <reason>``."""
         try:
             provider = self._provider_manager.get_active()
             health = provider.health()

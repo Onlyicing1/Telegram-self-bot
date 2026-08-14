@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
@@ -86,7 +87,11 @@ class Dispatcher:
     def metrics(self) -> EngineMetrics:
         return self._metrics
 
-    async def dispatch(self, request: AIRequest) -> EngineResult:
+    async def dispatch(
+        self,
+        request: AIRequest,
+        status_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> EngineResult:
         """Execute ``request`` through the full pipeline. Never raises."""
         start = time.perf_counter()
         warnings: list[str] = []
@@ -151,6 +156,7 @@ class Dispatcher:
                     response.tool_calls,
                     owner_id=request.owner_id,
                     session_id=request.session_id,
+                    status_callback=status_callback,
                 )
                 for er in exec_results:
                     tool_results.append(er.as_dict())
