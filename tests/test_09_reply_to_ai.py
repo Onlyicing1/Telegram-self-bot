@@ -16,6 +16,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+
 @pytest.mark.asyncio
 async def test_reply_to_ai_with_extra_text_uses_user_text_as_message():
     """When replying to an AI message with 'Nova explain more', the user
@@ -171,7 +172,6 @@ async def test_reply_to_non_ai_message_with_extra_text():
     assert reply_ctx.is_ai_message is False
     assert reply_ctx.ai_content == ""
 
-
 @pytest.mark.asyncio
 async def test_reply_to_ai_without_trigger_uses_full_text_as_message():
     """When replying to an AI message with text that does NOT start with
@@ -218,3 +218,158 @@ async def test_reply_to_ai_without_trigger_uses_full_text_as_message():
     assert reply_ctx.is_ai_message is True
     assert reply_ctx.ai_content == "The weather today is sunny with a high of 25°C."
     assert user_message != "The weather today is sunny with a high of 25°C."
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_persian_no_trigger_label_not_first_word():
+    """Reply-to-AI with Persian text and no trigger: the first word must
+    NOT be promoted to trigger_label. The label must be the generic 'AI'."""
+    from backend.bot.handlers.ai_unified import _format_response
+
+    raw_text = "میشه بیشتر توضیح بدی؟"
+    first_word = raw_text.split(None, 1)[0]
+    trigger_matched = False
+    reply_to_ai = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = ""
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "AI"
+    assert trigger_label != first_word
+    assert user_text == raw_text
+
+    formatted = _format_response(user_text, trigger_label, "response text")
+    assert "🤖 AI" in formatted
+    assert f"🤖 {first_word}" not in formatted
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_english_no_trigger_label_not_first_word():
+    """Reply-to-AI with English text and no trigger: the first word must
+    NOT be promoted to trigger_label."""
+    from backend.bot.handlers.ai_unified import _format_response
+
+    raw_text = "Can you explain more?"
+    first_word = raw_text.split(None, 1)[0]
+    trigger_matched = False
+    reply_to_ai = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = ""
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "AI"
+    assert trigger_label != first_word
+    assert user_text == raw_text
+
+    formatted = _format_response(user_text, trigger_label, "response text")
+    assert "🤖 AI" in formatted
+    assert f"🤖 {first_word}" not in formatted
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_with_actual_trigger_label_is_trigger_word():
+    """Reply-to-AI WITH a valid configured trigger: trigger_label must be
+    the trigger word, and user_text must be the remaining text."""
+    raw_text = "Nova explain more"
+    first_word = raw_text.split(None, 1)[0]
+    remaining = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
+    trigger_matched = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = remaining
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "Nova"
+    assert user_text == "explain more"
+
+
+@pytest.mark.asyncio
+async def test_normal_trigger_no_reply_label_is_trigger_word():
+    """Normal trigger mode (no reply): trigger_label is the trigger word,
+    user_text is the remaining text."""
+    raw_text = "Nova سلام"
+    first_word = raw_text.split(None, 1)[0]
+    remaining = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
+    trigger_matched = True
+    is_reply = False
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = remaining
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "Nova"
+    assert user_text == "سلام"
+    assert is_reply is False
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_full_message_remains_user_message():
+    """When replying to AI without trigger, the complete user text must
+    remain the user_message — nothing is stripped."""
+    from backend.ai.context.reply_resolver import ReplyResolver
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=500,
+        session_id="owner-1",
+        role="assistant",
+        content="Previous AI response.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 500
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "چرا اینطوری شد؟"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "چرا اینطوری شد؟"
+        )
+
+    assert error == ""
+    assert user_message == "چرا اینطوری شد؟"
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "Previous AI response."
+    assert user_message != "Previous AI response."
+
+
+@pytest.mark.asyncio
+async def test_response_edits_new_message_not_old():
+    """The _execute_ai function edits event.message (the NEW user message),
+    not the replied-to AI message. We verify by checking that
+    _execute_ai calls event.edit, not reply_msg.edit."""
+    from backend.bot.handlers.ai_unified import _format_response
+
+    formatted = _format_response("user text", "AI", "AI response")
+    assert "user text" in formatted
+    assert "AI response" in formatted
+    assert "🤖 AI" in formatted

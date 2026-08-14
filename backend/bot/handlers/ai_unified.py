@@ -432,9 +432,9 @@ def register(client, owner_id: int, tz_str: str):
 
     METHOD 3 — Reply-to-AI Mode (no trigger word needed):
       Owner replies to a known AI message with plain text that does NOT
-      start with a trigger word.  The reply-to-AI check happens BEFORE the
-      trigger rejection, so the AI is activated with the full text as the
-      user message and the replied-to AI message as context.
+      start with a trigger word.  The reply is detected BEFORE the trigger
+      rejection, so the AI is activated with the full text as the user
+      message and the replied-to AI message as context.
 
     Messages starting with "." (dot commands) are always skipped.
     """
@@ -491,7 +491,7 @@ def register(client, owner_id: int, tz_str: str):
             trigger_label = first_word
             user_text = remaining
         else:
-            trigger_label = first_word
+            trigger_label = "AI"
             user_text = raw_text
 
         # ── Reply-Aware Mode: message is a reply ──
