@@ -29,9 +29,10 @@ Both modes enter the SAME execution pipeline:
   1. Build AIRequest with appropriate reply_context
   2. Edit the triggering message to show "Thinking..."
   3. Execute through engine.execute()
-  4. Edit the message with the final response
+  4. Deliver the final response via the centralized delivery module
 
-Edit-in-place UX — no second messages are ever sent.
+Short responses edit the original message in-place (zero-spam).
+Oversized responses are safely split and delivered in chunks.
 """
 import asyncio
 import logging
@@ -145,12 +146,6 @@ def _format_error(user_message: str, trigger_label: str, error: str) -> str:
         f"❌ Error\n"
         f"{error}"
     )
-
-
-def _truncate(text: str, limit: int = 4000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "…"
 
 
 def _humanize_error(error: str) -> str:
@@ -283,7 +278,7 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
 
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                       tz_str: str, reply_context=None) -> None:
-    """Execute the AI pipeline and edit the triggering message with the result."""
+    """Execute the AI pipeline and deliver the result via centralized delivery."""
     from backend.ai.session.request import AIRequest
     from backend.ai.conversation.context_builder import ReplyContext
 
@@ -345,38 +340,44 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 logger.warning("AI handler: record_request failed: %s", exc)
 
         if result.success and result.response:
-            response_text = _truncate(result.response)
-            final_text = _format_response(display_prompt, trigger_label, response_text)
+            ai_diag.set_stage(rid, "TELEGRAM_REPLY")
+            logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
+            from backend.ai.tools.delivery import deliver_response
+            delivery_result = await deliver_response(
+                event, display_prompt, trigger_label, result.response,
+            )
+            if delivery_result.success:
+                ai_diag.mark_success("TELEGRAM_REPLY")
+            logger.info(
+                "AI_TELEGRAM_REPLY_END id=%s chunks=%d/%d",
+                rid, delivery_result.chunks_delivered, delivery_result.total_chunks,
+            )
+            from backend.ai.context.reply_resolver import get_resolver
+            get_resolver().register(
+                telegram_msg_id=event.message.id,
+                session_id=session_id,
+                role="assistant",
+                content=result.response,
+                provider=result.provider,
+                model=result.model,
+            )
         elif result.errors:
             error_msg = _humanize_error(result.errors[0])
             final_text = _format_error(display_prompt, trigger_label, error_msg)
+            try:
+                await event.edit(final_text)
+            except Exception as exc:
+                logger.warning("AI handler: failed to edit error response: %s", exc)
+                try:
+                    await event.reply(final_text)
+                except Exception:
+                    pass
         else:
             final_text = _format_error(display_prompt, trigger_label, "AI returned no response.")
-
-        ai_diag.set_stage(rid, "TELEGRAM_REPLY")
-        logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
-        try:
-            await event.edit(final_text)
-            ai_diag.mark_success("TELEGRAM_REPLY")
-            logger.info("AI_TELEGRAM_REPLY_END id=%s", rid)
-            if result.success and result.response:
-                from backend.ai.context.reply_resolver import get_resolver
-                get_resolver().register(
-                    telegram_msg_id=event.message.id,
-                    session_id=session_id,
-                    role="assistant",
-                    content=result.response,
-                    provider=result.provider,
-                    model=result.model,
-                )
-        except Exception as exc:
-            logger.warning("AI handler: failed to edit final response: %s", exc)
             try:
-                await event.reply(final_text)
-                ai_diag.mark_success("TELEGRAM_REPLY")
-                logger.info("AI_TELEGRAM_REPLY_END id=%s (via reply)", rid)
-            except Exception as exc2:
-                logger.error("AI handler: both edit and reply failed: %s", exc2)
+                await event.edit(final_text)
+            except Exception as exc:
+                logger.warning("AI handler: failed to edit no-response error: %s", exc)
 
     except asyncio.TimeoutError:
         ai_diag.register_end(rid)
