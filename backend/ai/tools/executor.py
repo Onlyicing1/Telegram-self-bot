@@ -110,12 +110,18 @@ class ToolExecutor:
         owner_id: int = 0,
         session_id: str = "",
         status_callback: Callable[[str], Awaitable[None]] | None = None,
+        context_override: ToolContext | None = None,
     ) -> list[ToolExecutionResult]:
         """Execute a batch of tool calls from a provider response.
 
         Enforces MAX_TOOLS_PER_TURN. Tools requiring confirmation are
         returned as "needs_confirmation" without executing.
+
+        If ``context_override`` is provided, it replaces the executor's
+        base context for this batch — this is how per-request runtime
+        context (chat_id, reply_msg, etc.) reaches the tools.
         """
+        ctx = context_override or self._context
         results: list[ToolExecutionResult] = []
 
         for i, call in enumerate(tool_calls):
@@ -137,7 +143,7 @@ class ToolExecutor:
                 except Exception as exc:
                     logger.debug("ToolExecutor: status callback failed for '%s': %s", tool_name, exc)
 
-            result = await self._execute_single(call, owner_id, session_id)
+            result = await self._execute_single(call, owner_id, session_id, ctx)
             results.append(result)
 
         return results
@@ -147,8 +153,10 @@ class ToolExecutor:
         call: dict[str, Any],
         owner_id: int,
         session_id: str,
+        context: ToolContext | None = None,
     ) -> ToolExecutionResult:
         """Execute a single tool call. Never raises."""
+        ctx = context or self._context
         tool_name = call.get("name", "") or call.get("tool", "")
         arguments = call.get("arguments", {}) or call.get("parameters", {})
 
@@ -180,7 +188,7 @@ class ToolExecutor:
         start = time.perf_counter()
         try:
             tool_result: ToolResult = await asyncio.wait_for(
-                tool.execute(self._context, arguments),
+                tool.execute(ctx, arguments),
                 timeout=TOOL_TIMEOUT_SECONDS,
             )
             latency_ms = (time.perf_counter() - start) * 1000
