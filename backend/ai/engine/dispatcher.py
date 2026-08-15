@@ -152,11 +152,13 @@ class Dispatcher:
         tool_results: list[dict[str, Any]] = []
         if response.tool_calls and self._tool_executor:
             try:
+                per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
                     response.tool_calls,
                     owner_id=request.owner_id,
                     session_id=request.session_id,
                     status_callback=status_callback,
+                    context_override=per_request_ctx,
                 )
                 for er in exec_results:
                     tool_results.append(er.as_dict())
@@ -218,6 +220,35 @@ class Dispatcher:
         return result
 
     # ── internal ──
+
+    def _build_tool_context(self, request: AIRequest) -> ToolContext:
+        """Build a per-request ToolContext from the executor's base context.
+
+        Enriches the base context's ``extra`` dict with ``chat_id`` and
+        ``reply_msg`` from the current AIRequest so tools (save, delete,
+        etc.) can operate on the correct chat and replied-to message.
+        """
+        base = self._tool_executor._context
+        extra: dict[str, Any] = dict(base.extra) if base.extra else {}
+        extra["chat_id"] = request.chat_id
+        if request.reply_context and request.reply_context.exists:
+            extra["reply_msg"] = {
+                "message_id": request.reply_context.message_id,
+                "sender_id": request.reply_context.sender_id,
+                "sender_name": request.reply_context.sender_name,
+                "chat_id": request.reply_context.chat_id,
+                "chat_title": request.reply_context.chat_title,
+                "media_type": request.reply_context.media_type,
+                "text_preview": request.reply_context.text_preview,
+                "timestamp": request.reply_context.timestamp,
+            }
+        return ToolContext(
+            telegram=base.telegram,
+            owner_id=request.owner_id,
+            tz_str=request.timezone or base.tz_str,
+            client=base.client,
+            extra=extra,
+        )
 
     def _render_tool_schemas(self, schemas: list[dict[str, Any]]) -> str:
         """Render tool schemas into a compact text block for the prompt."""
