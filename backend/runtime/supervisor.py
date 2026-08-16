@@ -249,6 +249,30 @@ class RuntimeSupervisor:
             configure_callback_trace(self.client, self.owner_id)
             register_input_listener(self.client, self.owner_id)
 
+        self._wire_ai_tools()
+
+    def _wire_ai_tools(self) -> None:
+        try:
+            from backend.ai.engine.engine import get_engine
+            from backend.ai.tools.registry import create_default_registry
+            from backend.ai.tools.context import ToolContext
+            from backend.telegram_api import TelegramAPI
+
+            engine = get_engine()
+            tool_ctx = ToolContext(
+                telegram=TelegramAPI(self.client),
+                owner_id=self.owner_id,
+                tz_str=self.tz_str,
+                client=self.client,
+            )
+            registry = create_default_registry(tool_ctx)
+            engine.attach_tools(registry, owner_id=self.owner_id, tz_str=self.tz_str)
+            trace("AI_TOOLS_WIRED", gen=self.client_generation)
+            logger.info("AI tool runtime wired (gen=%d)", self.client_generation)
+        except Exception as exc:
+            trace_exception("AI_TOOLS_WIRE_FAILED", exc)
+            logger.warning("AI tool runtime wiring failed: %s", exc)
+
     async def _start_helper(self) -> None:
         if not self.helper_enabled:
             return
