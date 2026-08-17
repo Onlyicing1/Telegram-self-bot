@@ -22,6 +22,7 @@ builder, provider manager, hooks, metrics).
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -41,6 +42,8 @@ from backend.ai.tools.registry import ToolRegistry, create_default_registry
 from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+MAX_TOOL_ROUNDS = 3
 
 
 class Dispatcher:
@@ -139,7 +142,7 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider_manager", start, errors, metadata)
 
-        # ── Stage 4: Provider ──
+        # ── Stage 4: Provider + Tool Loop ──
         try:
             messages = self._build_messages(prompt_package)
             response: ProviderResponse = await self._provider_manager.chat(messages)
@@ -148,9 +151,14 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider", start, errors, metadata)
 
-        # ── Stage 4b: Tool Execution ──
-        tool_results: list[dict[str, Any]] = []
-        if response.tool_calls and self._tool_executor:
+        all_tool_results: list[dict[str, Any]] = []
+        accumulated_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        accumulated_finish_reasons: list[str] = []
+
+        for round_num in range(MAX_TOOL_ROUNDS):
+            if not response.success or not response.tool_calls or not self._tool_executor:
+                break
+
             try:
                 per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
@@ -161,17 +169,39 @@ class Dispatcher:
                     context_override=per_request_ctx,
                 )
                 for er in exec_results:
-                    tool_results.append(er.as_dict())
+                    all_tool_results.append(er.as_dict())
                     if er.success:
                         self._conversation.add_tool_result(
                             owner_id=request.owner_id,
                             tool_name=er.tool_name,
                             result=er.message,
                         )
-                metadata["tool_results"] = tool_results
-                metadata["stages"].append("tool_execution")
+                metadata["tool_results"] = all_tool_results
+                metadata["tool_rounds"] = round_num + 1
+                metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"tool_execution: {exc}")
+                warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
+                break
+
+            continuation_messages = self._build_continuation_messages(messages, response, exec_results)
+            try:
+                cont_response: ProviderResponse = await self._provider_manager.chat(continuation_messages)
+                safe_call(self._hooks, "after_provider", cont_response)
+                metadata["stages"].append(f"provider_continuation_{round_num + 1}")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"provider_continuation_{round_num + 1}: {exc}")
+                break
+
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                accumulated_usage[k] += int(cont_response.usage.get(k, 0))
+            if cont_response.metadata.get("finish_reason"):
+                accumulated_finish_reasons.append(cont_response.metadata["finish_reason"])
+
+            response = cont_response
+            messages = continuation_messages
+
+        if accumulated_finish_reasons:
+            metadata["continuation_finish_reasons"] = accumulated_finish_reasons
 
         # ── Stage 5: Conversation Update ──
         try:
@@ -185,13 +215,30 @@ class Dispatcher:
 
         # ── Stage 6: Result ──
         latency = time.perf_counter() - start
+        provider_usage_total = int(response.usage.get("total_tokens", 0))
         prompt_tokens = int(response.usage.get("prompt_tokens", 0)) or prompt_package.estimated_tokens.estimated_input_tokens
         completion_tokens = int(response.usage.get("completion_tokens", 0))
-        total_tokens = prompt_tokens + completion_tokens
+        if provider_usage_total and provider_usage_total != prompt_tokens + completion_tokens:
+            total_tokens = provider_usage_total
+        else:
+            total_tokens = prompt_tokens + completion_tokens
+        total_tokens += accumulated_usage.get("total_tokens", 0)
+        prompt_tokens += accumulated_usage.get("prompt_tokens", 0)
+        completion_tokens += accumulated_usage.get("completion_tokens", 0)
+        if total_tokens < prompt_tokens + completion_tokens:
+            total_tokens = prompt_tokens + completion_tokens
         prompt_chars = prompt_package.estimated_tokens.prompt_size_chars
 
         if not response.success and response.text:
             errors.append(response.text)
+
+        if all_tool_results:
+            tool_errors = [r for r in all_tool_results if not r.get("success")]
+            if tool_errors:
+                for te in tool_errors:
+                    err_type = te.get("error", "")
+                    if err_type and err_type != "max_tools_exceeded":
+                        warnings.append(f"tool_{te.get('tool_name', '?')}: {err_type}")
 
         result = EngineResult(
             success=bool(response.success),
@@ -295,6 +342,48 @@ class Dispatcher:
             messages.append({"role": "system", "content": prompt_package.tool_context})
         if prompt_package.user_input:
             messages.append({"role": "user", "content": prompt_package.user_input})
+        return messages
+
+    def _build_continuation_messages(
+        self,
+        original_messages: list[dict[str, Any]],
+        response: ProviderResponse,
+        exec_results: list[Any],
+    ) -> list[dict[str, Any]]:
+        messages = list(original_messages)
+
+        assistant_content = response.text or ""
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_content}
+        if response.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name", ""),
+                        "arguments": json.dumps(tc.get("arguments", {})),
+                    },
+                }
+                for tc in response.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        for tc, er in zip(response.tool_calls, exec_results, strict=False):
+            tool_name = tc.get("name", er.tool_name)
+            content = json.dumps({
+                "tool": tool_name,
+                "success": er.success,
+                "message": er.message,
+                "data": er.data,
+                "error": er.error,
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "name": tool_name,
+                "content": content,
+            })
+
         return messages
 
     def _build_context(self, request: AIRequest, session: Any) -> Any:
