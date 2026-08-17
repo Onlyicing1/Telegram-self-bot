@@ -101,13 +101,19 @@ class OpenAICompatProvider(BaseProvider):
                         text=f"Rate limited. Try again in {retry_after}s.",
                         provider_name=self.name,
                         success=False,
+                        metadata={"http_status": 429, "retry_after": retry_after},
                     )
 
                 if resp.status_code >= 400:
                     error_msg = "Unknown error"
+                    provider_error_code = ""
+                    provider_error_type = ""
                     try:
                         error_data = resp.json()
-                        error_msg = error_data.get("error", {}).get("message", error_msg)
+                        err_obj = error_data.get("error", {})
+                        error_msg = err_obj.get("message", error_msg)
+                        provider_error_code = str(err_obj.get("code", ""))
+                        provider_error_type = err_obj.get("type", "")
                     except Exception:
                         error_msg = resp.text[:200]
                     logger.warning("%s API error %d: %s", self.name, resp.status_code, error_msg)
@@ -115,12 +121,20 @@ class OpenAICompatProvider(BaseProvider):
                         text=f"API error ({resp.status_code}): {error_msg}",
                         provider_name=self.name,
                         success=False,
+                        metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type},
                     )
 
                 data = resp.json()
                 choices = data.get("choices", [])
                 text = choices[0].get("message", {}).get("content", "") if choices else ""
+                finish_reason = choices[0].get("finish_reason", "") if choices else ""
                 usage = data.get("usage", {})
+
+                if not text and finish_reason:
+                    if finish_reason == "length":
+                        text = "Response truncated due to token limit."
+                    elif finish_reason == "content_filter":
+                        text = "Response blocked by content filter."
 
                 return ProviderResponse(
                     text=text,
@@ -130,7 +144,7 @@ class OpenAICompatProvider(BaseProvider):
                         "prompt_tokens": usage.get("prompt_tokens", 0),
                         "completion_tokens": usage.get("completion_tokens", 0),
                     },
-                    metadata={"latency": latency, "model": payload["model"]},
+                    metadata={"latency": latency, "model": payload["model"], "finish_reason": finish_reason},
                 )
 
             except httpx.TimeoutException:
@@ -142,6 +156,7 @@ class OpenAICompatProvider(BaseProvider):
                     text=f"Request timed out after {self._config.timeout}s.",
                     provider_name=self.name,
                     success=False,
+                    metadata={"error_type": "timeout"},
                 )
             except Exception as exc:
                 logger.warning("%s error: %s (attempt %d/%d)", self.name, exc, attempt + 1, self._config.retry_count + 1)
@@ -152,12 +167,14 @@ class OpenAICompatProvider(BaseProvider):
                     text=f"Request failed: {exc}",
                     provider_name=self.name,
                     success=False,
+                    metadata={"error_type": type(exc).__name__},
                 )
 
         return ProviderResponse(
             text=f"Request failed after {self._config.retry_count + 1} attempts.",
             provider_name=self.name,
             success=False,
+            metadata={"error_type": "retry_exhausted"},
         )
 
     async def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:

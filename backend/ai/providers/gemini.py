@@ -106,25 +106,50 @@ class GeminiProvider(BaseProvider):
                     if attempt < self._config.retry_count:
                         await asyncio.sleep(retry_after)
                         continue
-                    return ProviderResponse(text=f"Rate limited.", provider_name=self.name, success=False)
+                    return ProviderResponse(
+                        text=f"Rate limited.",
+                        provider_name=self.name,
+                        success=False,
+                        metadata={"http_status": 429, "retry_after": retry_after},
+                    )
 
                 if resp.status_code >= 400:
                     error_msg = resp.text[:200]
+                    provider_error_code = ""
+                    provider_error_type = ""
                     try:
                         error_data = resp.json()
-                        error_msg = error_data.get("error", {}).get("message", error_msg)
+                        err_obj = error_data.get("error", {})
+                        error_msg = err_obj.get("message", error_msg)
+                        provider_error_code = str(err_obj.get("code", ""))
+                        provider_error_type = err_obj.get("status", "")
                     except Exception:
                         pass
                     logger.warning("Gemini API error %d: %s", resp.status_code, error_msg)
-                    return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False)
+                    return ProviderResponse(
+                        text=f"API error ({resp.status_code}): {error_msg}",
+                        provider_name=self.name,
+                        success=False,
+                        metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type},
+                    )
 
                 data = resp.json()
                 candidates = data.get("candidates", [])
                 text = ""
+                finish_reason = ""
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     text = " ".join(p.get("text", "") for p in parts)
+                    finish_reason = candidates[0].get("finishReason", "")
                 usage = data.get("usageMetadata", {})
+
+                if not text and finish_reason:
+                    if finish_reason == "MAX_TOKENS":
+                        text = "Response truncated due to token limit."
+                    elif finish_reason == "SAFETY":
+                        text = "Response blocked by content filter."
+                    elif finish_reason == "RECITATION":
+                        text = "Response blocked due to recitation."
 
                 return ProviderResponse(
                     text=text,
@@ -134,21 +159,36 @@ class GeminiProvider(BaseProvider):
                         "prompt_tokens": usage.get("promptTokenCount", 0),
                         "completion_tokens": usage.get("candidatesTokenCount", 0),
                     },
-                    metadata={"latency": latency, "model": model},
+                    metadata={"latency": latency, "model": model, "finish_reason": finish_reason},
                 )
 
             except httpx.TimeoutException:
                 if attempt < self._config.retry_count:
                     await asyncio.sleep(min(2 ** attempt, 10))
                     continue
-                return ProviderResponse(text=f"Timeout after {self._config.timeout}s.", provider_name=self.name, success=False)
+                return ProviderResponse(
+                    text=f"Timeout after {self._config.timeout}s.",
+                    provider_name=self.name,
+                    success=False,
+                    metadata={"error_type": "timeout"},
+                )
             except Exception as exc:
                 if attempt < self._config.retry_count:
                     await asyncio.sleep(min(2 ** attempt, 10))
                     continue
-                return ProviderResponse(text=f"Error: {exc}", provider_name=self.name, success=False)
+                return ProviderResponse(
+                    text=f"Error: {exc}",
+                    provider_name=self.name,
+                    success=False,
+                    metadata={"error_type": type(exc).__name__},
+                )
 
-        return ProviderResponse(text="Failed after retries.", provider_name=self.name, success=False)
+        return ProviderResponse(
+            text="Failed after retries.",
+            provider_name=self.name,
+            success=False,
+            metadata={"error_type": "retry_exhausted"},
+        )
 
     async def list_models(self) -> list[dict[str, Any]]:
         """Fetch available models from the Gemini API."""

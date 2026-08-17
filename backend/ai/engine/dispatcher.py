@@ -175,7 +175,7 @@ class Dispatcher:
 
         # ── Stage 5: Conversation Update ──
         try:
-            if response.text:
+            if response.success and response.text:
                 self._conversation.add_assistant_message(
                     owner_id=request.owner_id, content=response.text
                 )
@@ -190,6 +190,9 @@ class Dispatcher:
         total_tokens = prompt_tokens + completion_tokens
         prompt_chars = prompt_package.estimated_tokens.prompt_size_chars
 
+        if not response.success and response.text:
+            errors.append(response.text)
+
         result = EngineResult(
             success=bool(response.success),
             provider=response.provider_name or provider_name,
@@ -198,7 +201,7 @@ class Dispatcher:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            response=response.text,
+            response=response.text if response.success else "",
             warnings=warnings,
             errors=errors,
             metadata=metadata,
