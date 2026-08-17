@@ -117,6 +117,8 @@ async def test_dispatcher_tool_continuation():
     mock_pm = MagicMock()
     mock_pm.get_active_name.return_value = "test"
     mock_pm.get_active.return_value.config.model = "m"
+    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
+    mock_pm.get_active.return_value.chat = AsyncMock()
     first = ProviderResponse(text="", provider_name="test", success=True,
         tool_calls=[{"id": "c1", "name": "search", "arguments": {"q": "t"}}],
         usage={"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
@@ -124,7 +126,7 @@ async def test_dispatcher_tool_continuation():
     final = ProviderResponse(text="Found 3 items.", provider_name="test", success=True,
         usage={"prompt_tokens": 70, "completion_tokens": 25, "total_tokens": 95},
         metadata={"finish_reason": "stop"})
-    mock_pm.chat = AsyncMock(side_effect=[first, final])
+    mock_pm.get_active().chat = AsyncMock(side_effect=[first, final])
 
     mock_conv = MagicMock()
     mock_sess = MagicMock()
@@ -151,11 +153,11 @@ async def test_dispatcher_tool_continuation():
     mock_te._context.extra = {}
 
     d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics(), tool_executor=mock_te)
-    result = await d.dispatch(AIRequest(owner_id=123, user_message="Search", chat_id=456))
+    result = await d.dispatch(AIRequest(session_id="s1", message_id=1, owner_id=123, user_message="Search", chat_id=456))
 
     assert result.success is True
     assert result.response == "Found 3 items."
-    assert mock_pm.chat.call_count == 2
+    assert mock_pm.get_active().chat.call_count == 2
     assert result.metadata.get("tool_rounds") == 1
 
 
@@ -169,12 +171,14 @@ async def test_tool_error_distinguishable():
     mock_pm = MagicMock()
     mock_pm.get_active_name.return_value = "test"
     mock_pm.get_active.return_value.config.model = "m"
+    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
+    mock_pm.get_active.return_value.chat = AsyncMock()
     first = ProviderResponse(text="", provider_name="test", success=True,
         tool_calls=[{"id": "c1", "name": "bad_tool", "arguments": {}}],
         usage={"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60})
     final = ProviderResponse(text="Can't find that tool.", provider_name="test", success=True,
         usage={"prompt_tokens": 60, "completion_tokens": 15, "total_tokens": 75})
-    mock_pm.chat = AsyncMock(side_effect=[first, final])
+    mock_pm.get_active().chat = AsyncMock(side_effect=[first, final])
 
     mock_conv = MagicMock()
     mock_sess = MagicMock()
@@ -201,7 +205,7 @@ async def test_tool_error_distinguishable():
     mock_te._context.extra = {}
 
     d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics(), tool_executor=mock_te)
-    result = await d.dispatch(AIRequest(owner_id=123, user_message="Run", chat_id=456))
+    result = await d.dispatch(AIRequest(session_id="s1", message_id=1, owner_id=123, user_message="Run", chat_id=456))
 
     assert result.success is True
     tr = result.metadata.get("tool_results", [])
@@ -220,10 +224,12 @@ async def test_token_usage_preserved():
     mock_pm = MagicMock()
     mock_pm.get_active_name.return_value = "test"
     mock_pm.get_active.return_value.config.model = "m"
+    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
+    mock_pm.get_active.return_value.chat = AsyncMock()
     resp = ProviderResponse(text="Hi", provider_name="test", success=True,
         usage={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
         metadata={"finish_reason": "stop"})
-    mock_pm.chat = AsyncMock(return_value=resp)
+    mock_pm.get_active().chat = AsyncMock(return_value=resp)
 
     mock_conv = MagicMock()
     mock_sess = MagicMock()
@@ -245,7 +251,7 @@ async def test_token_usage_preserved():
     mock_pb.build.return_value = pp
 
     d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics())
-    result = await d.dispatch(AIRequest(owner_id=123, user_message="Hi", chat_id=456))
+    result = await d.dispatch(AIRequest(session_id="s1", message_id=1, owner_id=123, user_message="Hi", chat_id=456))
 
     assert result.total_tokens == 150
     assert result.prompt_tokens == 100
@@ -262,9 +268,11 @@ async def test_provider_failure_error():
     mock_pm = MagicMock()
     mock_pm.get_active_name.return_value = "test"
     mock_pm.get_active.return_value.config.model = "m"
+    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
+    mock_pm.get_active.return_value.chat = AsyncMock()
     resp = ProviderResponse(text="Rate limited.", provider_name="test", success=False,
         metadata={"http_status": 429})
-    mock_pm.chat = AsyncMock(return_value=resp)
+    mock_pm.get_active().chat = AsyncMock(return_value=resp)
 
     mock_conv = MagicMock()
     mock_sess = MagicMock()
@@ -286,7 +294,7 @@ async def test_provider_failure_error():
     mock_pb.build.return_value = pp
 
     d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics())
-    result = await d.dispatch(AIRequest(owner_id=123, user_message="Hi", chat_id=456))
+    result = await d.dispatch(AIRequest(session_id="s1", message_id=1, owner_id=123, user_message="Hi", chat_id=456))
 
     assert result.success is False
     assert "Rate limited" in result.errors[0]

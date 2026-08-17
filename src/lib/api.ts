@@ -74,6 +74,29 @@ export interface AIConfig {
   trigger_fa: string | null;
 }
 
+export interface ModelTestResult {
+  provider: string;
+  display_name: string;
+  icon: string;
+  model: string;
+  status: 'AVAILABLE' | 'UNAVAILABLE' | 'ERROR' | 'TIMEOUT' | 'NOT_CONFIGURED';
+  error: string | null;
+  latency_s: number | null;
+  http_status: number | null;
+}
+
+export interface ModelTestResponse {
+  results: ModelTestResult[];
+  summary: {
+    total: number;
+    available: number;
+    unavailable: number;
+    error: number;
+    timeout: number;
+    not_configured: number;
+  };
+}
+
 const BASE = '/api';
 
 async function fetchJSON<T>(path: string): Promise<T> {
@@ -106,5 +129,14 @@ export const api = {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       return data as { success: boolean; message: string };
+    }),
+  aiTestModels: () =>
+    fetch(`${BASE}/ai/test-models`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      return data as ModelTestResponse;
     }),
 };

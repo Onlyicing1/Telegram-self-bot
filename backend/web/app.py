@@ -164,6 +164,17 @@ async def api_ai_update_triggers(body: dict):
     return {"success": success, "message": message}
 
 
+@app.post("/api/ai/test-models")
+async def api_ai_test_models():
+    from backend.ai.model_tester import test_all_models
+    try:
+        results = await test_all_models(owner_id=_owner_id)
+        return results
+    except Exception as exc:
+        logger.error("api/ai/test-models error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def mount_static():
     if _DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")

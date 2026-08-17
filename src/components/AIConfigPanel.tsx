@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { ProviderStatus, ModelInfo, AIConfig } from '../lib/api';
+import type { ProviderStatus, ModelInfo, AIConfig, ModelTestResponse } from '../lib/api';
 import { api } from '../lib/api';
 
 import TriggerConfig from './TriggerConfig';
@@ -18,6 +18,14 @@ const STATUS_LABELS: Record<string, string> = {
   not_configured: 'Not Configured',
 };
 
+const TEST_STATUS_STYLES: Record<string, string> = {
+  AVAILABLE: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30',
+  UNAVAILABLE: 'bg-red-500/15 text-red-400 border border-red-500/30',
+  ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
+  TIMEOUT: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
+  NOT_CONFIGURED: 'bg-slate-500/15 text-slate-400 border border-outline-variant',
+};
+
 export default function AIConfigPanel() {
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [config, setConfig] = useState<AIConfig | null>(null);
@@ -25,6 +33,11 @@ export default function AIConfigPanel() {
   const [loading, setLoading] = useState(true);
   const [loadingModels, setLoadingModels] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Model Testing State
+  const [testingModels, setTestingModels] = useState(false);
+  const [testResults, setTestResults] = useState<ModelTestResponse | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -66,6 +79,19 @@ export default function AIConfigPanel() {
     }
   }, [config?.provider, loadModels]);
 
+  const handleTestModels = async () => {
+    setTestingModels(true);
+    setTestError(null);
+    try {
+      const res = await api.aiTestModels();
+      setTestResults(res);
+    } catch (e) {
+      setTestError(e instanceof Error ? e.message : 'Test request failed');
+    } finally {
+      setTestingModels(false);
+    }
+  };
+
   if (loading) {
     return <div className="flex items-center justify-center h-48 text-on-surface-variant text-sm">Loading…</div>;
   }
@@ -86,8 +112,27 @@ export default function AIConfigPanel() {
     <div className="space-y-6">
       {/* Status Card */}
       <div className="bg-surface-container border border-outline-variant rounded-2xl p-5">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest">AI Assistant</h2>
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest">AI Assistant</h2>
+            <button
+              onClick={handleTestModels}
+              disabled={testingModels}
+              className="px-3 py-1 rounded-xl bg-primary/10 hover:bg-primary/20 border border-primary/30 text-primary text-xs font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+            >
+              {testingModels ? (
+                <>
+                  <span className="inline-block animate-spin">⏳</span>
+                  <span>Testing Models…</span>
+                </>
+              ) : (
+                <>
+                  <span>🧪</span>
+                  <span>Test Models</span>
+                </>
+              )}
+            </button>
+          </div>
           <span className={`text-xs px-3 py-1 rounded-full font-medium ${
             available.length > 0 && config?.trigger_en && config.trigger_en.trim() !== '' || available.length > 0 && config?.trigger_fa && config.trigger_fa.trim() !== ''
               ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
@@ -127,6 +172,76 @@ export default function AIConfigPanel() {
           </div>
         )}
       </div>
+
+      {/* Test Error Banner */}
+      {testError && (
+        <div className="px-4 py-3 rounded-2xl bg-error/10 border border-error/30 text-error text-sm flex items-center justify-between">
+          <span>{testError}</span>
+          <button onClick={() => setTestError(null)} className="text-xs text-on-surface-variant hover:text-on-surface">Dismiss</button>
+        </div>
+      )}
+
+      {/* Model Test Results */}
+      {testResults && (
+        <div className="bg-surface-container border border-outline-variant rounded-2xl p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-on-surface uppercase tracking-widest flex items-center gap-2">
+                <span>Model Availability Results</span>
+              </h3>
+              <p className="text-xs text-on-surface-variant mt-0.5">
+                {testResults.summary.available} available · {testResults.summary.unavailable + testResults.summary.error + testResults.summary.timeout} failed · {testResults.summary.not_configured} not configured
+              </p>
+            </div>
+            <button
+              onClick={() => setTestResults(null)}
+              className="text-xs text-on-surface-variant hover:text-on-surface px-2 py-1 rounded-lg hover:bg-surface-variant/50"
+            >
+              Close
+            </button>
+          </div>
+
+          <div className="space-y-2.5">
+            {testResults.results.map((res, i) => (
+              <div
+                key={`${res.provider}-${res.model}-${i}`}
+                className="bg-surface rounded-xl p-3.5 border border-outline-variant/60 space-y-1.5"
+              >
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="text-base">{res.icon}</span>
+                    <span className="text-sm font-medium text-on-surface">{res.display_name}</span>
+                    <span className="text-xs text-on-surface-variant font-mono truncate max-w-[180px]">
+                      {res.model}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {res.latency_s !== null && (
+                      <span className="text-xs text-on-surface-variant font-mono">
+                        {res.latency_s}s
+                      </span>
+                    )}
+                    <span
+                      className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
+                        TEST_STATUS_STYLES[res.status] || TEST_STATUS_STYLES.NOT_CONFIGURED
+                      }`}
+                    >
+                      {res.status}
+                    </span>
+                  </div>
+                </div>
+
+                {res.error && (
+                  <p className="text-xs text-red-400/90 font-mono pl-7 break-words">
+                    {res.error}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Trigger Configuration */}
       {available.length > 0 && (
