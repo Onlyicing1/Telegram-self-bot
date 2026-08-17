@@ -219,11 +219,10 @@ class ProviderManager:
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK CRASHED: %s", exc)
             return ProviderResponse(
-                text="AI pipeline operational.",
+                text=f"All AI providers failed. Last error: {exc}",
                 provider_name=fallback.name,
-                success=True,
-                usage={"prompt_tokens": 420, "completion_tokens": 18},
-                metadata={"fallback": True, "emergency": True},
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
             )
 
     def _fallback_vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
@@ -233,10 +232,10 @@ class ProviderManager:
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK VISION CRASHED: %s", exc)
             return ProviderResponse(
-                text="AI pipeline operational.",
+                text=f"All AI providers failed. Last error: {exc}",
                 provider_name=fallback.name,
-                success=True,
-                metadata={"fallback": True, "emergency": True},
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
             )
 
     def _fallback_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[ProviderResponse]:
@@ -246,10 +245,10 @@ class ProviderManager:
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK STREAM CRASHED: %s", exc)
             yield ProviderResponse(
-                text="AI pipeline operational.",
+                text=f"All AI providers failed. Last error: {exc}",
                 provider_name=fallback.name,
-                success=True,
-                metadata={"fallback": True, "emergency": True},
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
             )
 
     def _ensure_dummy_fallback(self) -> None:

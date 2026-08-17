@@ -237,6 +237,17 @@ async def _execute_ai(event, owner_id: int, user_message: str, trigger_word: str
                     await event.reply(final_text)
                 except Exception:
                     pass
+        elif result.response:
+            error_msg = _humanize_error(result.response)
+            final_text = _format_error(user_message, trigger_label, error_msg)
+            try:
+                await event.edit(final_text)
+            except Exception as exc:
+                logger.warning("AI trigger: failed to edit provider error: %s", exc)
+                try:
+                    await event.reply(final_text)
+                except Exception:
+                    pass
         else:
             final_text = _format_error(user_message, trigger_label, "AI returned no response.")
             try:

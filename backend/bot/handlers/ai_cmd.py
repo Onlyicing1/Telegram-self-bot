@@ -220,6 +220,23 @@ def register(client, owner_id: int, tz_str: str):
                         await event.reply(final_text)
                     except Exception:
                         pass
+            elif result.response:
+                error_msg = _humanize_error(result.response)
+                final_text = (
+                    f"{user_message}\n"
+                    f"────────────\n"
+                    f"🤖 AI\n"
+                    f"❌ Error\n"
+                    f"{error_msg}"
+                )
+                try:
+                    await event.edit(final_text)
+                except Exception as exc:
+                    logger.warning("ai response edit failed: %s", exc)
+                    try:
+                        await event.reply(final_text)
+                    except Exception:
+                        pass
             else:
                 final_text = (
                     f"{user_message}\n"
