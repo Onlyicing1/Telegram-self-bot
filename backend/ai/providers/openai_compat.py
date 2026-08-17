@@ -7,6 +7,7 @@ inherit from this class. Handles async HTTP, retry, rate limits, timeouts.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -126,9 +127,25 @@ class OpenAICompatProvider(BaseProvider):
 
                 data = resp.json()
                 choices = data.get("choices", [])
-                text = choices[0].get("message", {}).get("content", "") if choices else ""
+                message = choices[0].get("message", {}) if choices else {}
+                text = message.get("content", "") if choices else ""
                 finish_reason = choices[0].get("finish_reason", "") if choices else ""
                 usage = data.get("usage", {})
+
+                tool_calls: list[dict[str, Any]] = []
+                raw_tool_calls = message.get("tool_calls", []) if choices else []
+                for tc in raw_tool_calls:
+                    fn = tc.get("function", {})
+                    args_raw = fn.get("arguments", "{}")
+                    try:
+                        arguments = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except (json.JSONDecodeError, TypeError):
+                        arguments = {}
+                    tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": arguments,
+                    })
 
                 if not text and finish_reason:
                     if finish_reason == "length":
@@ -140,9 +157,11 @@ class OpenAICompatProvider(BaseProvider):
                     text=text,
                     provider_name=self.name,
                     success=True,
+                    tool_calls=tool_calls,
                     usage={
                         "prompt_tokens": usage.get("prompt_tokens", 0),
                         "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
                     },
                     metadata={"latency": latency, "model": payload["model"], "finish_reason": finish_reason},
                 )
@@ -186,16 +205,12 @@ class OpenAICompatProvider(BaseProvider):
         )
 
     async def list_models(self) -> list[dict[str, Any]]:
-        """Fetch available models from the provider's /models endpoint."""
         if not self._config.api_key or not self._config.enabled:
             return []
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(
                 timeout=self._config.timeout,
-                headers={
-                    "Authorization": f"Bearer {self._config.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {self._config.api_key}", "Content-Type": "application/json"},
             )
         url = f"{self._config.base_url}/models"
         try:
