@@ -13,10 +13,10 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| HEAD (local, verified) | `7631a6cdd2151ec066fe4cb74a0c6de3b1a3f216` |
+| HEAD (local, verified) | `4e8c4d851c6458e1c0b72ab7dcb63b2d753e1c51` |
 | Investigation date | 2026-08-18 |
 | Scope | **Bio** + **Username** subsystems: complete current structure, execution flow, state, scheduling, persistence, handlers, AI/tool integration, Telegram execution, and Bio-vs-Username comparison. |
-| Status | **INVESTIGATION ONLY** — no production code changed, no DB changes, no commit. Only `INVESTIGATION.md` was replaced. |
+| Status | **FIXES IMPLEMENTED + VERIFIED** — all §13 fixes were implemented in commit `4e8c4d8` and verified on `origin/main`. This file remains the canonical current report. |
 
 > Note: the canonical report file is `INVESTIGATION.md` (this file). It was
 > previously named `INVESTIGATION_REPORT.md`; the rename is already reflected
@@ -488,14 +488,39 @@ shutdown: bio_engine.stop_cron() → username_engine.stop_cron()  (same task, tw
 
 ---
 
-## 14. REMAINING WORK
+## 14. RESOLUTION STATUS
 
-- Execute the §13 fixes (the cross-engine `stop_cron` bug is the priority).
-- Add Bio/Username unit tests (none exist today).
-- Verify live Telegram profile updates (both `about` and `first_name`).
-- Reconcile README `.bio`/`.username` documentation with the actual Glass-UI-
-  only surface.
-- Decide the `telegram_api/profile.py` consolidation.
+All §13 fixes were implemented in commit `4e8c4d8`
+("fix: decouple bio/username scheduler lifecycle and consolidate profile
+engines") and are verified on `origin/main`:
+
+1. ✅ **Shared scheduler stop bug** — `backend/profile/scheduler.py` tracks
+   per-engine active state (`set_engine_active` / `any_engine_active` /
+   `stop_if_idle`); each engine's `stop_cron()` (via the shared
+   `backend/profile/engine.py`) cancels the scheduler only when no engine
+   remains active.
+2. ✅ **Duplication consolidated** — new `backend/profile/engine.py`
+   (`ProfileEngine`) is the single engine implementation; `bio/engine.py` and
+   `username/engine.py` are thin wrappers preserving `about`/`first_name`,
+   `last_bio`/`last_name`, default templates, and public interfaces.
+3. ✅ **Bio default template** — corrected to `🕒 {time} | 💭 {mood}` in both
+   `backend/bio/engine.py` and `backend/bot/handlers/bio.py`.
+4. ✅ **Single RPC path** — orphaned `backend/telegram_api/profile.py` and
+   `TelegramAPI.update_profile` removed; the scheduler is the only
+   `UpdateProfileRequest` execution path.
+5. ✅ **Symmetric health telemetry** — `username_cron_ok`,
+   `last_username_update`, and `set_last_username_update` added; the scheduler
+   dispatches per-field telemetry so username-only updates are not recorded as
+   bio updates.
+6. ✅ **ENV symmetry** — `USERNAME_UPDATE_ENABLED` added (config.py,
+   supervisor resume, render.yaml), mirroring `BIO_UPDATE_ENABLED`.
+7. ✅ **README corrected** — the nonexistent `.bio` / `.username` dot-command
+   documentation was removed (Glass-UI-only interface).
+8. ✅ **Regression tests** — `tests/test_15_bio_username.py` (19 tests) covers
+   rendering, dedup, merge, idempotency, both stop-bug directions, telemetry,
+   and DB fallback consistency.
+9. ✅ **Username DB fallback aligned** — `_get_or_create_username_state_sync`
+   now mirrors the bio catch-and-fallback path (no bare `raise`).
 
 ---
 
@@ -518,5 +543,5 @@ Checks the execution agent should perform after any change:
 ### Verification levels for this investigation
 
 - `SOURCE VERIFIED` ✅ (all claims read directly from the repository files listed above)
-- `TEST VERIFIED` ❌ (no Bio/Username tests exist; no tests were run — investigation only)
+- `TEST VERIFIED` ✅ (full suite: 223 passed, 1 pre-existing starlette warning; `tests/test_15_bio_username.py` 19/19)
 - `LIVE TELEGRAM VERIFIED` ❌ (no credentials/session in this environment)
