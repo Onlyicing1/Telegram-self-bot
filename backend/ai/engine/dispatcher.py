@@ -46,6 +46,22 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 3
 
 
+_BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
+_TRUNCATED_FINISH_TOKENS = ("MAX_TOKENS", "LENGTH", "TRUNCATED")
+
+
+def _is_blocked_finish(reason: str) -> bool:
+    """True when the provider finish reason indicates a blocked response."""
+    upper = (reason or "").upper()
+    return any(tok in upper for tok in _BLOCKED_FINISH_TOKENS)
+
+
+def _is_truncated_finish(reason: str) -> bool:
+    """True when the provider finish reason indicates token truncation."""
+    upper = (reason or "").upper()
+    return any(tok in upper for tok in _TRUNCATED_FINISH_TOKENS)
+
+
 class Dispatcher:
     """Drives an ``AIRequest`` through every AI layer and returns an ``EngineResult``."""
 
@@ -89,6 +105,14 @@ class Dispatcher:
     @property
     def metrics(self) -> EngineMetrics:
         return self._metrics
+
+    def set_tool_executor(self, executor: ToolExecutor | None) -> None:
+        """Attach or replace the ToolExecutor used by the tool loop.
+
+        Called by the Engine when tools are wired at runtime so the
+        dispatcher never runs with a stale ``None`` executor reference.
+        """
+        self._tool_executor = executor
 
     async def dispatch(
         self,
@@ -152,11 +176,29 @@ class Dispatcher:
             return self._fail(exc, "provider", start, errors, metadata)
 
         all_tool_results: list[dict[str, Any]] = []
-        accumulated_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # Usage accumulation: initial response + every continuation round.
+        # Nothing is double-counted and the initial usage is never lost.
+        usage: dict[str, int] = {
+            "prompt_tokens": int(response.usage.get("prompt_tokens", 0)),
+            "completion_tokens": int(response.usage.get("completion_tokens", 0)),
+            "total_tokens": int(response.usage.get("total_tokens", 0)),
+        }
         accumulated_finish_reasons: list[str] = []
+        if response.metadata.get("finish_reason"):
+            accumulated_finish_reasons.append(response.metadata["finish_reason"])
+
+        tool_rounds_executed = 0
+        rounds_exhausted = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
-            if not response.success or not response.tool_calls or not self._tool_executor:
+            if not response.success or not response.tool_calls:
+                break
+            if not self._tool_executor:
+                warnings.append(
+                    "tool_execution_unavailable: no ToolExecutor attached — "
+                    "pending tool calls were not executed"
+                )
+                metadata["tool_executor_missing"] = True
                 break
 
             try:
@@ -170,15 +212,19 @@ class Dispatcher:
                 )
                 for er in exec_results:
                     all_tool_results.append(er.as_dict())
-                    if er.success:
-                        self._conversation.add_tool_result(
-                            owner_id=request.owner_id,
-                            tool_name=er.tool_name,
-                            result=er.message,
-                        )
+                    # Record EVERY tool outcome (success or failure) so tool
+                    # failures never silently disappear from history.
+                    marker = "✅" if er.success else "❌"
+                    detail = er.message or er.error or "no message"
+                    self._conversation.add_tool_result(
+                        owner_id=request.owner_id,
+                        tool_name=er.tool_name,
+                        result=f"{marker} {detail}",
+                    )
                 metadata["tool_results"] = all_tool_results
                 metadata["tool_rounds"] = round_num + 1
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
+                tool_rounds_executed = round_num + 1
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
                 break
@@ -193,12 +239,26 @@ class Dispatcher:
                 break
 
             for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                accumulated_usage[k] += int(cont_response.usage.get(k, 0))
+                usage[k] += int(cont_response.usage.get(k, 0))
             if cont_response.metadata.get("finish_reason"):
                 accumulated_finish_reasons.append(cont_response.metadata["finish_reason"])
 
             response = cont_response
             messages = continuation_messages
+
+        # ── Tool-round exhaustion: pending tool calls are NEVER silently dropped ──
+        if response.tool_calls:
+            rounds_exhausted = True
+            metadata["tool_rounds_exhausted"] = True
+            metadata["tool_rounds_executed"] = tool_rounds_executed
+            metadata["pending_tool_calls"] = [
+                {"name": tc.get("name", ""), "id": tc.get("id", "")}
+                for tc in response.tool_calls
+            ]
+            warnings.append(
+                f"tool_round_limit_reached: {len(response.tool_calls)} pending tool call(s) "
+                f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+            )
 
         if accumulated_finish_reasons:
             metadata["continuation_finish_reasons"] = accumulated_finish_reasons
@@ -215,22 +275,46 @@ class Dispatcher:
 
         # ── Stage 6: Result ──
         latency = time.perf_counter() - start
-        provider_usage_total = int(response.usage.get("total_tokens", 0))
-        prompt_tokens = int(response.usage.get("prompt_tokens", 0)) or prompt_package.estimated_tokens.estimated_input_tokens
-        completion_tokens = int(response.usage.get("completion_tokens", 0))
-        if provider_usage_total and provider_usage_total != prompt_tokens + completion_tokens:
-            total_tokens = provider_usage_total
-        else:
+        prompt_tokens = usage["prompt_tokens"]
+        completion_tokens = usage["completion_tokens"]
+        total_tokens = usage["total_tokens"]
+        if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
+            # Providers that omit usage: fall back to the prompt estimate.
+            prompt_tokens = prompt_package.estimated_tokens.estimated_input_tokens
             total_tokens = prompt_tokens + completion_tokens
-        total_tokens += accumulated_usage.get("total_tokens", 0)
-        prompt_tokens += accumulated_usage.get("prompt_tokens", 0)
-        completion_tokens += accumulated_usage.get("completion_tokens", 0)
-        if total_tokens < prompt_tokens + completion_tokens:
+        elif total_tokens == 0:
+            total_tokens = prompt_tokens + completion_tokens
+        elif total_tokens < prompt_tokens + completion_tokens:
             total_tokens = prompt_tokens + completion_tokens
         prompt_chars = prompt_package.estimated_tokens.prompt_size_chars
 
         if not response.success and response.text:
             errors.append(response.text)
+
+        # ── Empty-response / finish-state classification ──
+        # The final result must distinguish every meaningful outcome so the
+        # Telegram UI never masks a real condition behind "AI returned no
+        # response."
+        finish_reason = (
+            (response.metadata or {}).get("finish_reason", "")
+            or (accumulated_finish_reasons[-1] if accumulated_finish_reasons else "")
+        )
+        if not response.success:
+            finish_state = "provider_failure"
+        elif rounds_exhausted:
+            finish_state = "tool_rounds_exhausted"
+        elif response.text:
+            finish_state = "text"
+        elif response.tool_calls:
+            finish_state = "tool_only"
+        elif _is_blocked_finish(finish_reason):
+            finish_state = "provider_blocked"
+        elif _is_truncated_finish(finish_reason):
+            finish_state = "token_truncated"
+        else:
+            finish_state = "empty"
+        metadata["finish_state"] = finish_state
+        metadata["finish_reason"] = finish_reason
 
         if all_tool_results:
             tool_errors = [r for r in all_tool_results if not r.get("success")]

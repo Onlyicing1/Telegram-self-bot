@@ -8,11 +8,13 @@ a ``ProviderResponse``. The manager:
 
   1. Gets the active provider from the registry.
   2. Validates it (health + enabled).
-  3. If unhealthy → falls back to the dummy provider.
-  4. Calls ``provider.chat()`` inside a try/except.
-  5. If the call crashes → marks the provider unhealthy, records
-     the error in metrics, falls back to dummy, and returns the
-     dummy response.
+  3. If unhealthy → uses the fallback provider.
+  4. Calls ``provider.chat()`` inside a guarded await.
+  5. If the call crashes OR returns ``success=False`` (429/500/quota/
+     invalid request/...), the configured fallback chain is tried, then
+     the emergency fallback. The emergency fallback ALWAYS returns
+     ``success=False`` with the original failures preserved — never fake
+     success.
   6. Records latency + success/failure in per-provider metrics.
 
 The manager also exposes:
@@ -72,7 +74,14 @@ class ProviderManager:
     # ── Public API ──
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
-        """Send a chat request to the active provider. Never raises."""
+        """Send a chat request to the active provider. Never raises.
+
+        Fallback is entered on BOTH hard exceptions AND structured
+        ``success=False`` responses (429/500/quota/invalid request/...):
+        the configured fallback chain is tried, then the emergency
+        fallback. The dummy provider is terminal — it never reports
+        fake success and is never used as a fallback source of success.
+        """
         provider = self._get_healthy_provider()
         provider_name = provider.name
         start = time.perf_counter()
@@ -84,13 +93,32 @@ class ProviderManager:
             )
             latency = time.perf_counter() - start
             self._metrics.record(provider_name, latency=latency, error="")
-            return response
+            if response.success or provider_name == "dummy":
+                # A dummy response is already terminal (success=False with
+                # diagnostics when nothing is configured) — never fall back
+                # from the fallback itself.
+                return response
+            logger.warning(
+                "ProviderManager: '%s' returned success=False — attempting fallback",
+                provider_name,
+            )
+            return await self._try_fallback_chain(
+                messages,
+                original_provider=provider_name,
+                initial_failure=f"{provider_name}: success=False ({response.text[:200]})",
+                **kwargs,
+            )
         except Exception as exc:
             latency = time.perf_counter() - start
             error_msg = f"{type(exc).__name__}: {exc}"
             self._metrics.record(provider_name, latency=latency, error=error_msg)
             logger.warning("ProviderManager: '%s' crashed during chat: %s", provider_name, exc)
-            return await self._try_fallback_chain(messages, **kwargs)
+            return await self._try_fallback_chain(
+                messages,
+                original_provider=provider_name,
+                initial_failure=f"{provider_name}: {type(exc).__name__}: {exc}",
+                **kwargs,
+            )
 
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
@@ -208,22 +236,42 @@ class ProviderManager:
         logger.warning("ProviderManager: active provider '%s' unhealthy, falling back", provider.name)
         return self._registry.get_fallback()
 
-    async def _fallback(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+    async def _fallback(
+        self,
+        messages: list[dict[str, Any]],
+        failures: list[str] | None = None,
+        **kwargs: Any,
+    ) -> ProviderResponse:
+        """Emergency fallback — always returns success=False with diagnostics.
+
+        Even though the dummy provider "succeeds" deterministically, a
+        fallback after real provider failures must NEVER look like a
+        successful AI answer. The original failure information is preserved.
+        """
         fallback = self._registry.get_fallback()
+        errors = list(failures or [])
+        detail = "; ".join(errors) if errors else "no additional provider error information"
         try:
-            return await guarded_await(
+            await guarded_await(
                 fallback.chat(messages, **kwargs),
                 name=f"provider:fallback:{fallback.name}",
                 timeout=_PROVIDER_RPC_TIMEOUT,
             )
         except Exception as exc:
             logger.error("ProviderManager: FALLBACK CRASHED: %s", exc)
-            return ProviderResponse(
-                text=f"All AI providers failed. Last error: {exc}",
-                provider_name=fallback.name,
-                success=False,
-                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
-            )
+            errors.append(f"fallback: {type(exc).__name__}: {exc}")
+        return ProviderResponse(
+            text=f"All AI providers failed. Last error: {detail}",
+            provider_name=fallback.name,
+            success=False,
+            metadata={
+                "fallback": True,
+                "emergency": True,
+                "fallback_exhausted": True,
+                "errors": errors,
+                "fallback_chain_tried": list(self._fallback_chain),
+            },
+        )
 
     def _fallback_vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         fallback = self._registry.get_fallback()
@@ -265,9 +313,26 @@ class ProviderManager:
             self._fallback_chain = [p.strip() for p in chain_str.split(",") if p.strip()]
             logger.info("ProviderManager: fallback chain = %s", self._fallback_chain)
 
-    async def _try_fallback_chain(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
-        """Try each provider in the fallback chain before falling back to dummy."""
+    async def _try_fallback_chain(
+        self,
+        messages: list[dict[str, Any]],
+        original_provider: str = "",
+        initial_failure: str = "",
+        **kwargs: Any,
+    ) -> ProviderResponse:
+        """Try each provider in the fallback chain before the emergency fallback.
+
+        Both hard exceptions and ``success=False`` responses from a chain
+        member are treated as failures and advance the chain. The provider
+        that already failed in this request is skipped so a failure can
+        never loop back into itself.
+        """
+        failures: list[str] = []
+        if initial_failure:
+            failures.append(initial_failure)
         for name in self._fallback_chain:
+            if name == original_provider:
+                continue
             if not self._registry.has(name):
                 continue
             provider = self._registry.get(name)
@@ -275,6 +340,7 @@ class ProviderManager:
             try:
                 h = provider.health()
                 if not h.get("healthy", False):
+                    failures.append(f"{name}: unhealthy (skipped)")
                     continue
                 response = await guarded_await(
                     provider.chat(messages, **kwargs),
@@ -282,12 +348,25 @@ class ProviderManager:
                     timeout=_PROVIDER_RPC_TIMEOUT,
                 )
                 latency = time.perf_counter() - start
-                self._metrics.record(name, latency=latency, error="")
-                logger.info("ProviderManager: fallback chain succeeded with '%s'", name)
-                return response
+                if response.success:
+                    self._metrics.record(name, latency=latency, error="")
+                    merged = dict(response.metadata or {})
+                    merged["fallback"] = True
+                    merged["fallback_from"] = original_provider or None
+                    logger.info("ProviderManager: fallback chain succeeded with '%s'", name)
+                    from dataclasses import replace
+                    return replace(response, metadata=merged)
+                self._metrics.record(name, latency=latency, error=response.text[:200])
+                failures.append(f"{name}: success=False ({response.text[:200]})")
+                logger.warning(
+                    "ProviderManager: fallback chain provider '%s' returned success=False",
+                    name,
+                )
+                continue
             except Exception as exc:
                 latency = time.perf_counter() - start
                 self._metrics.record(name, latency=latency, error=str(exc))
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
                 logger.warning("ProviderManager: fallback chain provider '%s' failed: %s", name, exc)
                 continue
-        return await self._fallback(messages, **kwargs)
+        return await self._fallback(messages, failures=failures, **kwargs)

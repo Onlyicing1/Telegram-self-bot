@@ -120,6 +120,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         lines.append("_Tap **Provider** to select one._")
         builder = InlinePanelBuilder()
         builder.add_row("🔄 Select Provider", "panel:ai_provider")
+        builder.add_row("🧪 Test Models", "action:ai_test_models")
         _nav_buttons(builder)
         return "🧠 AI", "\n".join(lines), builder.build()
 
@@ -131,6 +132,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         builder = InlinePanelBuilder()
         builder.add_row("🤖 Select Model", "panel:ai_model")
         builder.add_row("🔄 Change Provider", "panel:ai_provider")
+        builder.add_row("🧪 Test Models", "action:ai_test_models")
         _nav_buttons(builder)
         return "🧠 AI", "\n".join(lines), builder.build()
 
@@ -145,6 +147,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder.add_row("💬 Start Chat", "action:ai_start_chat")
     builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("🤖 Model", "panel:ai_model"))
     builder.add_buttons(("📊 Status", "panel:ai_status"), ("⚙️ Settings", "panel:ai_settings"))
+    builder.add_row("🧪 Test Models", "action:ai_test_models")
     _nav_buttons(builder)
     return "🧠 AI", "\n".join(lines), builder.build()
 
@@ -529,6 +532,75 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
     ), []
 
 
+_TEST_STATUS_ICONS: dict[str, str] = {
+    "AVAILABLE": "🟢",
+    "NOT_CONFIGURED": "⚪",
+    "AUTH_ERROR": "🔴",
+    "RATE_LIMITED": "🟠",
+    "TIMEOUT": "🟡",
+    "PROVIDER_ERROR": "🔴",
+    "INVALID_MODEL": "🔵",
+    "BLOCKED": "🚫",
+    "UNKNOWN_ERROR": "❓",
+    "ERROR": "❓",
+}
+
+
+async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Run the model availability diagnostics inside the existing glass UI.
+
+    Uses the same isolated tester as the web dashboard — it never touches
+    conversation history, the active provider configuration, or the DB.
+    """
+    from backend.ai.model_tester import test_all_models
+
+    owner_id = await _get_owner_id()
+    try:
+        results_payload = await test_all_models(owner_id=owner_id)
+    except Exception as exc:
+        logger.error("[AI_TRACE] test_models action failed: %s", exc)
+        builder = InlinePanelBuilder()
+        builder.add_row("🔄 Retry", "action:ai_test_models")
+        builder.add_row("📊 Status", "panel:ai_status")
+        _nav_buttons(builder)
+        return "🧪 Test Models", f"**🧪 Test Models**\n\n❌ Diagnostic run failed: {exc}", builder.build()
+
+    results = results_payload.get("results", [])
+    summary = results_payload.get("summary", {})
+
+    lines = ["**🧪 Model Tests**\n"]
+    lines.append(
+        f"_{summary.get('total', 0)} tested · {summary.get('available', 0)} available · "
+        f"{summary.get('not_configured', 0)} not configured · "
+        f"{summary.get('unavailable', 0) + summary.get('error', 0) + summary.get('timeout', 0)} failed_"
+    )
+    lines.append("")
+
+    for r in results:
+        status = r.get("status", "UNKNOWN_ERROR")
+        icon = _TEST_STATUS_ICONS.get(status, "❓")
+        display = r.get("display_name", r.get("provider", "?"))
+        model = r.get("model", "?")
+        line = f"{icon} **{display}** `{model}` — {status}"
+        latency = r.get("latency_s")
+        if latency is not None:
+            line += f" · {latency}s"
+        lines.append(line)
+        if r.get("http_status"):
+            lines.append(f"    _HTTP {r['http_status']}_")
+        if r.get("retry_after"):
+            lines.append(f"    _retry-after: {r['retry_after']}s_")
+        if r.get("error"):
+            lines.append(f"    _{r['error'][:160]}_")
+        lines.append("")
+
+    builder = InlinePanelBuilder()
+    builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
+    builder.add_row("📊 Status", "panel:ai_status")
+    _nav_buttons(builder)
+    return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
+
+
 async def _ai_temperature_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.helper.inline_engine import _self_client
     owner_id = await _get_owner_id()
@@ -720,6 +792,7 @@ def register(client, owner_id: int) -> None:
         register_action("ai_refresh_providers", _ai_refresh_providers_action)
         register_action("ai_refresh_models", _ai_refresh_models_action)
         register_action("ai_start_chat", _ai_start_chat_action)
+        register_action("ai_test_models", _ai_test_models_action)
         register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_input("ai_settings", "trigger_en", {

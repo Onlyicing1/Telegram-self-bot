@@ -21,9 +21,15 @@ const STATUS_LABELS: Record<string, string> = {
 const TEST_STATUS_STYLES: Record<string, string> = {
   AVAILABLE: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30',
   UNAVAILABLE: 'bg-red-500/15 text-red-400 border border-red-500/30',
+  INVALID_MODEL: 'bg-sky-500/15 text-sky-400 border border-sky-500/30',
+  BLOCKED: 'bg-fuchsia-500/15 text-fuchsia-400 border border-fuchsia-500/30',
+  AUTH_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
+  PROVIDER_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
+  RATE_LIMITED: 'bg-orange-500/15 text-orange-400 border border-orange-500/30',
   ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
   TIMEOUT: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
   NOT_CONFIGURED: 'bg-slate-500/15 text-slate-400 border border-outline-variant',
+  UNKNOWN_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
 };
 
 export default function AIConfigPanel() {
@@ -232,6 +238,12 @@ export default function AIConfigPanel() {
                   </div>
                 </div>
 
+                {res.http_status !== null && res.http_status !== undefined && (
+                  <p className="text-xs text-on-surface-variant font-mono pl-7">
+                    HTTP {res.http_status}
+                    {res.retry_after !== null && res.retry_after !== undefined && ` · retry-after: ${res.retry_after}s`}
+                  </p>
+                )}
                 {res.error && (
                   <p className="text-xs text-red-400/90 font-mono pl-7 break-words">
                     {res.error}

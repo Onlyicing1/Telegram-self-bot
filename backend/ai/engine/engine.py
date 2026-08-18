@@ -14,7 +14,9 @@ request through every layer in the fixed order:
 
 The engine is constructed once and injected wherever needed. No
 globals, no duplicated managers, no singletons. The active provider is
-always the DummyProvider — no HTTP, no SDK, no external API.
+selected from the environment (``AI_PROVIDER`` + configured API keys);
+the DummyProvider is only the automatic fallback and never reports
+fake success.
 
 Failure handling:
     Any exception inside any layer is caught by the dispatcher and
@@ -161,11 +163,31 @@ class Engine:
     def memory_manager(self) -> MemoryManager:
         return self._memory_manager
 
-    def attach_tools(self, registry: ToolRegistry, owner_id: int = 0, tz_str: str = "UTC") -> None:
-        """Attach or replace the tool registry and executor at runtime."""
+    def attach_tools(
+        self,
+        registry: ToolRegistry,
+        context: "ToolContext | None" = None,
+        owner_id: int = 0,
+        tz_str: str = "UTC",
+    ) -> None:
+        """Attach or replace the tool registry and executor at runtime.
+
+        ``context`` carries the REAL runtime ToolContext (TelegramAPI
+        facade + Telethon client) built by the supervisor. The executor
+        base context is created from it so per-request contexts inherit
+        ``ctx.telegram`` and ``ctx.client`` at execution time.
+
+        The executor is propagated to the Dispatcher so the tool
+        continuation loop actually runs — there is exactly ONE
+        authoritative tool execution path.
+        """
         from backend.ai.tools.context import ToolContext
+        base_ctx = context if context is not None else ToolContext(
+            telegram=None, owner_id=owner_id, tz_str=tz_str,
+        )
         self._tool_registry = registry
-        self._tool_executor = ToolExecutor(registry, ToolContext(telegram=None, owner_id=owner_id, tz_str=tz_str))
+        self._tool_executor = ToolExecutor(registry, base_ctx)
+        self._dispatcher.set_tool_executor(self._tool_executor)
 
 
 # ── Module-level convenience ──

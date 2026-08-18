@@ -1,13 +1,16 @@
 """
 DummyProvider — the always-on, zero-dependency default provider.
 
-This provider makes no network calls, requires no API key, and never
-fails. It exists so the AI pipeline always has a working provider to
-fall back to. Every real provider that crashes or is unavailable is
-automatically replaced by this one via the ``ProviderManager``
-fallback system.
+This provider makes no network calls and requires no API key. It
+exists so the AI pipeline always has a provider instance available
+when no real provider is configured or every real provider fails.
 
-The response text is deterministic: ``"AI pipeline operational."``
+It NEVER reports fake success: when used as the active provider with
+no keys configured it returns ``success=False`` with a clear
+"not configured" diagnostic, and the ``ProviderManager`` converts
+emergency-fallback dummy responses into ``success=False`` results
+that preserve the original provider failures.
+
 Token counts are fixed constants so tests can assert exact values.
 """
 from __future__ import annotations
@@ -19,7 +22,11 @@ from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.base.defaults import get_provider_default
 
-DUMMY_TEXT = "AI pipeline operational."
+DUMMY_TEXT = (
+    "AI is not configured. Set an API key for a supported provider "
+    "(e.g. AI_OPENAI_API_KEY, AI_GEMINI_API_KEY, AI_GROQ_API_KEY, "
+    "AI_OPENROUTER_API_KEY) to enable AI."
+)
 DUMMY_PROMPT_TOKENS = 420
 DUMMY_COMPLETION_TOKENS = 18
 
@@ -67,15 +74,25 @@ class DummyProvider(BaseProvider):
         }
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
+        """Deterministic response — always ``success=False``.
+
+        A real AI answer was never produced, so a success flag would be
+        fake. The ProviderManager surfaces this message as the final
+        failure when no provider is configured.
+        """
         return ProviderResponse(
             text=DUMMY_TEXT,
             provider_name=self.name,
-            success=True,
+            success=False,
             usage={
                 "prompt_tokens": DUMMY_PROMPT_TOKENS,
                 "completion_tokens": DUMMY_COMPLETION_TOKENS,
             },
-            metadata={"deterministic": True, "version": self.PROVIDER_VERSION},
+            metadata={
+                "deterministic": True,
+                "version": self.PROVIDER_VERSION,
+                "reason": "no_provider_configured",
+            },
         )
 
     def count_tokens(self, text: str) -> int:

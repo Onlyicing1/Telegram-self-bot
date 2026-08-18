@@ -6,10 +6,13 @@ delegates entirely to the existing save service. No logic is duplicated.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
+
+logger = logging.getLogger(__name__)
 
 
 class SaveTool(Tool):
@@ -57,9 +60,16 @@ class SaveTool(Tool):
         from backend.services import save_service
 
         mode = arguments.get("mode", "forward")
-        reply_msg = context.extra.get("reply_msg") if context.extra else None
-        if reply_msg is None:
+        reply_meta = context.extra.get("reply_msg") if context.extra else None
+        if reply_meta is None:
             return ToolResult(success=False, message="No replied message to save.")
+
+        reply_msg = await self._resolve_reply_message(context, reply_meta)
+        if reply_msg is None:
+            return ToolResult(
+                success=False,
+                message="Could not fetch the replied message from Telegram to save it.",
+            )
 
         try:
             result = await save_service.execute_save(
@@ -68,3 +78,29 @@ class SaveTool(Tool):
             return ToolResult(success=True, message=result, data={"mode": mode})
         except Exception as exc:
             return ToolResult(success=False, message=f"Save failed: {exc}")
+
+    async def _resolve_reply_message(self, context: ToolContext, meta: dict[str, Any]):
+        """Resolve the real Telethon Message for the reply metadata.
+
+        The dispatcher carries reply metadata (chat_id + message_id) in
+        ``context.extra``; the service layer needs the actual Message
+        object. We fetch it through the SAME client the runtime already
+        injected — never a second client, never fake values.
+        """
+        client = None
+        if context.telegram is not None:
+            client = getattr(context.telegram, "client", None)
+        if client is None:
+            client = context.client
+        if client is None:
+            return None
+
+        chat_id = meta.get("chat_id")
+        message_id = meta.get("message_id")
+        if not chat_id or not message_id:
+            return None
+        try:
+            return await client.get_messages(chat_id, ids=message_id)
+        except Exception as exc:
+            logger.warning("SaveTool: could not fetch reply message %s/%s: %s", chat_id, message_id, exc)
+            return None

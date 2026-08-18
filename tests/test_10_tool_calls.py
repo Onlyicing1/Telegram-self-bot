@@ -260,24 +260,49 @@ async def test_token_usage_preserved():
 
 @pytest.mark.asyncio
 async def test_provider_failure_error():
+    """A provider returning success=False (e.g. HTTP 429) must become a
+    structured failure — the emergency fallback must NOT report fake success
+    and the original provider error must survive."""
     from backend.ai.engine.dispatcher import Dispatcher
     from backend.ai.engine.hooks import NOOP_HOOKS
     from backend.ai.engine.metrics import EngineMetrics
+    from backend.ai.providers.manager.manager import ProviderManager
+    from backend.ai.providers.base.contract import BaseProvider
     from backend.ai.session.request import AIRequest
 
-    mock_pm = MagicMock()
-    mock_pm.get_active_name.return_value = "test"
-    mock_pm.get_active.return_value.config.model = "m"
-    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
-    mock_pm.get_active.return_value.chat = AsyncMock()
-    resp = ProviderResponse(text="Rate limited.", provider_name="test", success=False,
-        metadata={"http_status": 429})
-    mock_pm.get_active().chat = AsyncMock(return_value=resp)
+    class RateLimitedProvider(BaseProvider):
+        PROVIDER_NAME = "rate_limited"
+        PROVIDER_VERSION = "1.0.0"
+
+        def initialize(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+        async def chat(self, messages, **kwargs):
+            return ProviderResponse(
+                text="Rate limited.",
+                provider_name=self.name,
+                success=False,
+                metadata={"http_status": 429, "retry_after": 5},
+            )
+
+        def count_tokens(self, text: str) -> int:
+            return len(text) // 4
+
+        def health(self) -> dict:
+            return {"healthy": True, "provider": self.name}
+
+    pm = ProviderManager()
+    prov = RateLimitedProvider()
+    pm.register_provider(prov)
+    pm.switch_provider("rate_limited")
 
     mock_conv = MagicMock()
     mock_sess = MagicMock()
     mock_sess.session_id = "s"
-    mock_sess.active_provider = "test"
+    mock_sess.active_provider = "rate_limited"
     mock_conv.get_session.return_value = mock_sess
     mock_conv.restore_history = AsyncMock()
     mock_conv.get_history.return_value = []
@@ -293,11 +318,13 @@ async def test_provider_failure_error():
     pp.estimated_tokens.prompt_size_chars = 50
     mock_pb.build.return_value = pp
 
-    d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics())
+    d = Dispatcher(mock_conv, mock_pb, pm, NOOP_HOOKS, EngineMetrics())
     result = await d.dispatch(AIRequest(session_id="s1", message_id=1, owner_id=123, user_message="Hi", chat_id=456))
 
     assert result.success is False
     assert "Rate limited" in result.errors[0]
+    assert result.metadata.get("finish_state") == "provider_failure"
+    assert result.response == ""
 
 
 @pytest.mark.asyncio

@@ -70,7 +70,7 @@ async def test_single_model_unavailable_http_404():
         with patch("backend.ai.providers.groq.GroqProvider.chat", new_callable=AsyncMock) as mock_chat:
             mock_chat.return_value = mock_response
             res = await test_single_model("groq", "Groq", "⚡", "unknown-model")
-            assert res["status"] == "UNAVAILABLE"
+            assert res["status"] == "INVALID_MODEL"
             assert res["http_status"] == 404
             assert "Model not found" in res["error"]
 
@@ -89,6 +89,76 @@ async def test_test_all_models_runs_all_targets():
     assert "unavailable" in summary
     assert "not_configured" in summary
     assert summary["total"] == len(results_data["results"])
+
+
+@pytest.mark.asyncio
+async def test_single_model_auth_error_401():
+    mock_response = ProviderResponse(
+        text="Invalid API key", provider_name="openai", success=False,
+        metadata={"http_status": 401, "provider_error_type": "invalid_request_error"},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.openai.OpenAIProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("openai", "OpenAI", "🧠", "gpt-4o")
+    assert res["status"] == "AUTH_ERROR"
+    assert res["http_status"] == 401
+    assert "Invalid API key" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_single_model_rate_limited_429():
+    mock_response = ProviderResponse(
+        text="Rate limited", provider_name="groq", success=False,
+        metadata={"http_status": 429, "retry_after": 7},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.groq.GroqProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("groq", "Groq", "⚡", "llama-3.3-70b-versatile")
+    assert res["status"] == "RATE_LIMITED"
+    assert res["retry_after"] == 7
+    assert "retry-after" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_single_model_blocked_400():
+    mock_response = ProviderResponse(
+        text="The response was blocked by the content filter", provider_name="gemini",
+        success=False, metadata={"http_status": 400},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.gemini.GeminiProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("gemini", "Gemini", "💎", "gemini-2.0-flash")
+    assert res["status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_single_model_provider_error_500():
+    mock_response = ProviderResponse(
+        text="Internal server error", provider_name="mistral", success=False,
+        metadata={"http_status": 500},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.mistral.MistralProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("mistral", "Mistral", "🌬", "mistral-large-latest")
+    assert res["status"] == "PROVIDER_ERROR"
+    assert res["http_status"] == 500
+
+
+@pytest.mark.asyncio
+async def test_single_model_unknown_error_no_http():
+    mock_response = ProviderResponse(
+        text="Unexpected failure", provider_name="cerebras", success=False,
+        metadata={},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.cerebras.CerebrasProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("cerebras", "Cerebras", "🔥", "llama-3.3-70b")
+    assert res["status"] == "UNKNOWN_ERROR"
 
 
 def test_api_ai_test_models_endpoint():

@@ -79,10 +79,24 @@ export interface ModelTestResult {
   display_name: string;
   icon: string;
   model: string;
-  status: 'AVAILABLE' | 'UNAVAILABLE' | 'ERROR' | 'TIMEOUT' | 'NOT_CONFIGURED';
+  status:
+    | 'AVAILABLE'
+    | 'UNAVAILABLE'
+    | 'NOT_CONFIGURED'
+    | 'AUTH_ERROR'
+    | 'RATE_LIMITED'
+    | 'TIMEOUT'
+    | 'PROVIDER_ERROR'
+    | 'INVALID_MODEL'
+    | 'BLOCKED'
+    | 'UNKNOWN_ERROR'
+    | 'ERROR';
   error: string | null;
   latency_s: number | null;
   http_status: number | null;
+  retry_after: number | null;
+  error_type: string | null;
+  provider_code: string | null;
 }
 
 export interface ModelTestResponse {

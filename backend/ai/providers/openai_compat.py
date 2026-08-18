@@ -135,17 +135,35 @@ class OpenAICompatProvider(BaseProvider):
                 tool_calls: list[dict[str, Any]] = []
                 raw_tool_calls = message.get("tool_calls", []) if choices else []
                 for tc in raw_tool_calls:
-                    fn = tc.get("function", {})
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                     args_raw = fn.get("arguments", "{}")
-                    try:
-                        arguments = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    except (json.JSONDecodeError, TypeError):
+                    malformed = False
+                    arguments_error = ""
+                    if isinstance(args_raw, str):
+                        try:
+                            arguments = json.loads(args_raw) if args_raw.strip() else {}
+                        except (json.JSONDecodeError, TypeError) as exc:
+                            # Malformed JSON must NOT silently become a valid
+                            # empty argument object — the executor receives a
+                            # structured failure instead of executing with {}.
+                            arguments = {}
+                            malformed = True
+                            arguments_error = f"malformed JSON arguments: {exc}"
+                    elif isinstance(args_raw, dict):
+                        arguments = args_raw
+                    else:
                         arguments = {}
-                    tool_calls.append({
+                        malformed = True
+                        arguments_error = f"unexpected arguments type: {type(args_raw).__name__}"
+                    entry: dict[str, Any] = {
                         "id": tc.get("id", ""),
                         "name": fn.get("name", ""),
                         "arguments": arguments,
-                    })
+                    }
+                    if malformed:
+                        entry["malformed_arguments"] = True
+                        entry["arguments_error"] = arguments_error
+                    tool_calls.append(entry)
 
                 if not text and finish_reason:
                     if finish_reason == "length":

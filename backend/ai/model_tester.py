@@ -39,6 +39,43 @@ def sanitize_error_message(msg: str) -> str:
     return sanitized
 
 
+def _classify_failure(metadata: dict[str, Any], err_text: str) -> tuple[str, str]:
+    """Classify a failed provider response into a deterministic status.
+
+    Returns ``(status, sanitized_error)``. Never exposes API keys.
+    """
+    http_status = metadata.get("http_status")
+    err_type = (metadata.get("error_type", "") or "").lower()
+    provider_type = (metadata.get("provider_error_type", "") or "").lower()
+    provider_code = str(metadata.get("provider_error_code", "") or "")
+    err_lower = (err_text or "").lower()
+
+    if err_type == "timeout" or "timeout" in err_lower or "timed out" in err_lower:
+        return "TIMEOUT", "Request timed out"
+
+    if "content_filter" in err_lower or "safety" in err_lower or "recitation" in err_lower or "blocked" in err_lower:
+        return "BLOCKED", sanitize_error_message(err_text)
+
+    if http_status in (401, 403):
+        return "AUTH_ERROR", sanitize_error_message(err_text)
+
+    if http_status == 429:
+        retry_after = metadata.get("retry_after")
+        suffix = f" (retry-after: {retry_after}s)" if retry_after else ""
+        return "RATE_LIMITED", f"Rate limited by provider{suffix}"
+
+    if http_status == 404 or "not found" in err_lower or "unknown model" in err_lower:
+        return "INVALID_MODEL", sanitize_error_message(err_text)
+
+    if http_status and http_status >= 500:
+        return "PROVIDER_ERROR", sanitize_error_message(err_text)
+
+    if provider_type or provider_code or http_status:
+        return "PROVIDER_ERROR", sanitize_error_message(err_text)
+
+    return "UNKNOWN_ERROR", sanitize_error_message(err_text or "Request failed without details")
+
+
 async def test_single_model(
     provider_name: str,
     display_name: str,
@@ -59,6 +96,9 @@ async def test_single_model(
             "error": "Provider not recognized in registry",
             "latency_s": None,
             "http_status": None,
+            "retry_after": None,
+            "error_type": None,
+            "provider_code": None,
         }
 
     api_key = _get_env(p_info["env_vars"])
@@ -72,6 +112,9 @@ async def test_single_model(
             "error": "API key not configured in environment",
             "latency_s": None,
             "http_status": None,
+            "retry_after": None,
+            "error_type": None,
+            "provider_code": None,
         }
 
     base_url = (
@@ -112,33 +155,17 @@ async def test_single_model(
                 "error": None,
                 "latency_s": latency_s,
                 "http_status": 200,
+                "retry_after": None,
+                "error_type": None,
+                "provider_code": None,
             }
 
         # Failure handling
         metadata = response.metadata or {}
         http_status = metadata.get("http_status")
-        err_type = metadata.get("error_type", "")
         err_text = response.text or "Request failed"
+        status, clean_err = _classify_failure(metadata, err_text)
 
-        if err_type == "timeout" or "timeout" in err_text.lower():
-            return {
-                "provider": provider_name,
-                "display_name": display_name,
-                "icon": icon,
-                "model": model_id,
-                "status": "TIMEOUT",
-                "error": f"Request timed out after {timeout}s",
-                "latency_s": latency_s,
-                "http_status": http_status,
-            }
-
-        # Check status classification
-        if http_status and http_status >= 400:
-            status = "UNAVAILABLE"
-        else:
-            status = "UNAVAILABLE" if "not found" in err_text.lower() or "invalid" in err_text.lower() else "ERROR"
-
-        clean_err = sanitize_error_message(err_text)
         return {
             "provider": provider_name,
             "display_name": display_name,
@@ -148,6 +175,9 @@ async def test_single_model(
             "error": clean_err,
             "latency_s": latency_s,
             "http_status": http_status,
+            "retry_after": metadata.get("retry_after"),
+            "error_type": metadata.get("error_type") or metadata.get("provider_error_type"),
+            "provider_code": metadata.get("provider_error_code"),
         }
 
     except asyncio.TimeoutError:
@@ -161,6 +191,9 @@ async def test_single_model(
             "error": f"Request timed out after {timeout}s",
             "latency_s": latency_s,
             "http_status": None,
+            "retry_after": None,
+            "error_type": "timeout",
+            "provider_code": None,
         }
     except Exception as exc:
         latency_s = round(time.perf_counter() - t0, 2)
@@ -170,10 +203,13 @@ async def test_single_model(
             "display_name": display_name,
             "icon": icon,
             "model": model_id,
-            "status": "ERROR",
+            "status": "UNKNOWN_ERROR",
             "error": clean_err,
             "latency_s": latency_s,
             "http_status": None,
+            "retry_after": None,
+            "error_type": type(exc).__name__,
+            "provider_code": None,
         }
     finally:
         if provider_inst:
@@ -258,6 +294,20 @@ async def test_all_models(
         "not_configured": 0,
     }
 
+    # Deterministic bucket mapping for the compact summary.
+    _BUCKETS: dict[str, str] = {
+        "AVAILABLE": "available",
+        "NOT_CONFIGURED": "not_configured",
+        "TIMEOUT": "timeout",
+        "INVALID_MODEL": "unavailable",
+        "BLOCKED": "unavailable",
+        "AUTH_ERROR": "error",
+        "RATE_LIMITED": "error",
+        "PROVIDER_ERROR": "error",
+        "UNKNOWN_ERROR": "error",
+        "ERROR": "error",
+    }
+
     for idx, item in enumerate(raw_results):
         target_info = targets[idx] if idx < len(targets) else {"provider": "unknown", "display_name": "Unknown", "icon": "❓", "model": "unknown"}
         if isinstance(item, Exception):
@@ -266,20 +316,20 @@ async def test_all_models(
                 "display_name": target_info["display_name"],
                 "icon": target_info["icon"],
                 "model": target_info["model"],
-                "status": "ERROR",
+                "status": "UNKNOWN_ERROR",
                 "error": sanitize_error_message(str(item)),
                 "latency_s": None,
                 "http_status": None,
+                "retry_after": None,
+                "error_type": type(item).__name__,
+                "provider_code": None,
             }
         else:
             res = item
 
         results.append(res)
-        status_key = res["status"].lower()
-        if status_key in summary:
-            summary[status_key] += 1
-        else:
-            summary["error"] += 1
+        bucket = _BUCKETS.get(res.get("status", "UNKNOWN_ERROR"), "error")
+        summary[bucket] += 1
 
     return {"results": results, "summary": summary}
 

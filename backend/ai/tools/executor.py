@@ -168,6 +168,25 @@ class ToolExecutor:
                 error="missing_name",
             )
 
+        if call.get("malformed_arguments"):
+            # Malformed arguments are a STRUCTURED failure: the tool is
+            # never executed with fake {} arguments.
+            detail = call.get("arguments_error") or "arguments could not be parsed"
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool '{tool_name}' was not executed: {detail}.",
+                error="malformed_arguments",
+            )
+
+        if not isinstance(arguments, dict):
+            return ToolExecutionResult(
+                tool_name=tool_name,
+                success=False,
+                message=f"Tool '{tool_name}' received non-object arguments.",
+                error="malformed_arguments",
+            )
+
         tool = self._registry.get(tool_name)
         if tool is None:
             return ToolExecutionResult(
@@ -181,8 +200,12 @@ class ToolExecutor:
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
-                message=f"Tool '{tool_name}' requires owner confirmation.",
+                message=(
+                    f"Tool '{tool_name}' requires owner confirmation before it "
+                    "can be executed."
+                ),
                 needs_confirmation=True,
+                error="confirmation_required",
             )
 
         start = time.perf_counter()

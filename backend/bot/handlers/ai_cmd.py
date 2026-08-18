@@ -83,6 +83,31 @@ async def _restore_config(owner_id: int) -> None:
         logger.warning("AI handler: config restore failed: %s", exc)
 
 
+def _describe_empty_result(result) -> str:
+    """Turn an empty EngineResult into a meaningful, deterministic message."""
+    metadata = result.metadata or {}
+    finish_state = metadata.get("finish_state", "")
+    finish_reason = metadata.get("finish_reason", "") or ""
+    if finish_state == "tool_rounds_exhausted":
+        pending = len(metadata.get("pending_tool_calls", []))
+        rounds = metadata.get("tool_rounds_executed", 0)
+        return (
+            f"Tool round limit reached after {rounds} round(s) — "
+            f"{pending} pending tool call(s) were not executed."
+        )
+    if finish_state == "tool_only":
+        return "The AI requested tools but produced no final text response."
+    if finish_state == "provider_blocked":
+        suffix = f" ({finish_reason})" if finish_reason else ""
+        return f"Response blocked by the provider{suffix}."
+    if finish_state == "token_truncated":
+        return "Response truncated because the token limit was reached."
+    if finish_state == "empty":
+        suffix = f" (provider finish reason: {finish_reason})" if finish_reason else ""
+        return f"AI returned no response.{suffix}"
+    return "AI returned no response."
+
+
 def _humanize_error(error: str) -> str:
     """Convert raw error strings into human-readable messages."""
     error_lower = error.lower()
@@ -185,8 +210,15 @@ def register(client, owner_id: int, tz_str: str):
                 ai_diag.set_stage(rid, "TELEGRAM_REPLY")
                 logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
                 from backend.ai.tools.delivery import deliver_response
+                response_text = result.response
+                if result.metadata.get("tool_rounds_exhausted"):
+                    pending = len(result.metadata.get("pending_tool_calls", []))
+                    response_text = (
+                        f"{response_text}\n\n⚠️ Tool round limit reached — "
+                        f"{pending} pending tool call(s) were not executed."
+                    )
                 delivery_result = await deliver_response(
-                    event, user_message, "AI", result.response,
+                    event, user_message, "AI", response_text,
                 )
                 if delivery_result.success:
                     ai_diag.mark_success("TELEGRAM_REPLY")
@@ -238,12 +270,13 @@ def register(client, owner_id: int, tz_str: str):
                     except Exception:
                         pass
             else:
+                error_msg = _describe_empty_result(result)
                 final_text = (
                     f"{user_message}\n"
                     f"────────────\n"
                     f"🤖 AI\n"
                     f"❌ Error\n"
-                    f"AI returned no response."
+                    f"{error_msg}"
                 )
                 try:
                     await event.edit(final_text)

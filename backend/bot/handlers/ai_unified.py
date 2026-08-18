@@ -148,6 +148,35 @@ def _format_error(user_message: str, trigger_label: str, error: str) -> str:
     )
 
 
+def _describe_empty_result(result) -> str:
+    """Turn an empty EngineResult into a meaningful, deterministic message.
+
+    Replaces the generic "AI returned no response." masking by reading the
+    dispatcher's finish-state classification.
+    """
+    metadata = result.metadata or {}
+    finish_state = metadata.get("finish_state", "")
+    finish_reason = metadata.get("finish_reason", "") or ""
+    if finish_state == "tool_rounds_exhausted":
+        pending = len(metadata.get("pending_tool_calls", []))
+        rounds = metadata.get("tool_rounds_executed", 0)
+        return (
+            f"Tool round limit reached after {rounds} round(s) — "
+            f"{pending} pending tool call(s) were not executed."
+        )
+    if finish_state == "tool_only":
+        return "The AI requested tools but produced no final text response."
+    if finish_state == "provider_blocked":
+        suffix = f" ({finish_reason})" if finish_reason else ""
+        return f"Response blocked by the provider{suffix}."
+    if finish_state == "token_truncated":
+        return "Response truncated because the token limit was reached."
+    if finish_state == "empty":
+        suffix = f" (provider finish reason: {finish_reason})" if finish_reason else ""
+        return f"AI returned no response.{suffix}"
+    return "AI returned no response."
+
+
 def _humanize_error(error: str) -> str:
     error_lower = error.lower()
     if "401" in error_lower or "unauthorized" in error_lower or "invalid api key" in error_lower:
@@ -193,29 +222,33 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
     # ── Classify media ──
     media_info = classify_message(reply_msg)
 
-    # ── Extract sender info ──
+    # ── Extract sender info + chat info (parallel — independent network calls) ──
     sender_name = ""
     sender_id = 0
-    try:
-        sender = await reply_msg.get_sender()
-        if sender:
-            sender_id = getattr(sender, "id", 0) or 0
-            first = getattr(sender, "first_name", "") or ""
-            last = getattr(sender, "last_name", "") or ""
-            sender_name = (f"{first} {last}").strip() or getattr(sender, "username", "") or ""
-    except Exception:
-        pass
-
-    # ── Chat info ──
     chat_title = ""
-    chat_id = 0
-    try:
-        chat_id = reply_msg.chat_id or 0
-        chat = await reply_msg.get_chat()
-        if chat:
-            chat_title = getattr(chat, "title", "") or getattr(chat, "username", "") or ""
-    except Exception:
-        pass
+    chat_id = reply_msg.chat_id or 0
+    sender_fetch, chat_fetch = await asyncio.gather(
+        reply_msg.get_sender(),
+        reply_msg.get_chat(),
+        return_exceptions=True,
+    )
+    if isinstance(sender_fetch, BaseException):
+        sender_fetch = None
+    if isinstance(chat_fetch, BaseException):
+        chat_fetch = None
+    if sender_fetch is not None:
+        try:
+            sender_id = getattr(sender_fetch, "id", 0) or 0
+            first = getattr(sender_fetch, "first_name", "") or ""
+            last = getattr(sender_fetch, "last_name", "") or ""
+            sender_name = (f"{first} {last}").strip() or getattr(sender_fetch, "username", "") or ""
+        except Exception:
+            pass
+    if chat_fetch is not None:
+        try:
+            chat_title = getattr(chat_fetch, "title", "") or getattr(chat_fetch, "username", "") or ""
+        except Exception:
+            pass
 
     # ── Timestamp ──
     msg_timestamp = ""
@@ -354,8 +387,15 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             ai_diag.set_stage(rid, "TELEGRAM_REPLY")
             logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
             from backend.ai.tools.delivery import deliver_response
+            response_text = result.response
+            if result.metadata.get("tool_rounds_exhausted"):
+                pending = len(result.metadata.get("pending_tool_calls", []))
+                response_text = (
+                    f"{response_text}\n\n⚠️ Tool round limit reached — "
+                    f"{pending} pending tool call(s) were not executed."
+                )
             delivery_result = await deliver_response(
-                event, display_prompt, trigger_label, result.response,
+                event, display_prompt, trigger_label, response_text,
             )
             if delivery_result.success:
                 ai_diag.mark_success("TELEGRAM_REPLY")
@@ -395,7 +435,8 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 except Exception:
                     pass
         else:
-            final_text = _format_error(display_prompt, trigger_label, "AI returned no response.")
+            error_msg = _describe_empty_result(result)
+            final_text = _format_error(display_prompt, trigger_label, error_msg)
             try:
                 await event.edit(final_text)
             except Exception as exc:
