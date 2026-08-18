@@ -160,6 +160,53 @@ def build_caption(
     return "\n".join(lines)
 
 
+def _append_original_text(caption: str, message) -> str:
+    """Append the original message text below the LifeOS caption block.
+
+    Both save modes use this single caption pipeline so the saved item
+    carries the generated caption without losing the source content.
+    """
+    try:
+        text = (getattr(message, "text", None) or "").strip()
+    except Exception:
+        text = ""
+    if not text:
+        return caption
+    return f"{caption}\n\n{text}"
+
+
+def _upload_kwargs_for_media(media, mime_type: str | None, file_name: str | None) -> dict:
+    """Build ``send_file`` kwargs that preserve the original media type.
+
+    - Photos are sent as photo messages (Telethon auto-detects from the
+      ``.jpg`` name when ``force_document=False``).
+    - Documents keep their original Telegram attributes (video, audio/voice,
+      animated, sticker, filename) so a re-uploaded item renders as the same
+      type instead of degrading to a generic document.
+    """
+    if isinstance(media, MessageMediaPhoto):
+        return {"force_document": False}
+    if isinstance(media, MessageMediaDocument):
+        doc = getattr(media, "document", None)
+        attrs: list = []
+        has_filename = False
+        for attr in getattr(doc, "attributes", []) or []:
+            if isinstance(attr, DocumentAttributeFilename):
+                has_filename = True
+                attrs.append(DocumentAttributeFilename(file_name or attr.file_name or "file"))
+            else:
+                attrs.append(attr)
+        if not has_filename and file_name:
+            attrs.append(DocumentAttributeFilename(file_name))
+        kwargs: dict = {"attributes": attrs, "force_document": False}
+        doc_mime = getattr(doc, "mime_type", None) if doc is not None else None
+        resolved_mime = mime_type or doc_mime
+        if resolved_mime:
+            kwargs["mime_type"] = resolved_mime
+        return kwargs
+    return {"force_document": False}
+
+
 def build_confirmation(
     save_code: str,
     mode: str,
@@ -420,17 +467,20 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     tags = build_tags(media_type, now)
 
     try:
-        caption = build_caption(
-            save_code=save_code,
-            sender=sender_name,
-            chat_id=origin_chat_id,
-            msg_id=origin_msg_id,
-            dt=now,
-            media_type=media_type,
-            mime=mime_type,
-            file_size=file_size,
-            file_name=file_name,
-            tags=tags,
+        caption = _append_original_text(
+            build_caption(
+                save_code=save_code,
+                sender=sender_name,
+                chat_id=origin_chat_id,
+                msg_id=origin_msg_id,
+                dt=now,
+                media_type=media_type,
+                mime=mime_type,
+                file_size=file_size,
+                file_name=file_name,
+                tags=tags,
+            ),
+            target_msg,
         )
         logger.info("[LINK_SAVE] caption built")
     except Exception as exc:
@@ -515,8 +565,8 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
                 "me",
                 tmp_path,
                 caption=caption,
-                force_document=False,
                 progress_callback=_on_upload,
+                **_upload_kwargs_for_media(target_msg.media, mime_type, file_name),
             )
             record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
             logger.info("[LINK_SAVE] upload complete: saved_chat_id=%s saved_msg_id=%s",
@@ -631,6 +681,21 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
     )
 
     if mode == "f":
+        caption = _append_original_text(
+            build_caption(
+                save_code=save_code,
+                sender=sender_name,
+                chat_id=origin_chat_id,
+                msg_id=origin_msg_id,
+                dt=now,
+                media_type=media_type,
+                mime=mime_type,
+                file_size=file_size,
+                file_name=file_name,
+                tags=tags,
+            ),
+            reply_msg,
+        )
         t0 = asyncio.get_event_loop().time()
         try:
             raw = await client.forward_messages("me", reply_msg)
@@ -642,6 +707,17 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             logger.error("forward save failed: %s", exc)
             record_event("save", "forward_messages", 0, "ERROR", str(exc))
             return f"❌ Forward failed: {exc}"
+
+        # Attach the generated caption to the forwarded message itself so the
+        # saved item carries the expected caption (with the original text
+        # preserved below it) instead of only living in the database.
+        caption_attached = False
+        if fwd is not None:
+            try:
+                await client.edit_message("me", fwd, caption=caption)
+                caption_attached = True
+            except Exception as exc:
+                logger.warning("forward save caption attach failed: %s", exc)
 
         payload = {
             "save_code": save_code,
@@ -657,7 +733,7 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             "file_size": file_size,
             "media_type": media_type,
             "tags": tags,
-            "caption": None,
+            "caption": caption if caption_attached else None,
             "owner_id": owner_id,
             "created_at": now.isoformat(),
         }
@@ -680,7 +756,16 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
 
     else:
         if not media:
-            return "⚠️ Replied message has no downloadable media."
+            original_text = (reply_msg.text or "").strip()
+            if not original_text:
+                return "⚠️ Replied message has no downloadable media."
+            # TEXT → TEXT: deep-save plain text as a text message.
+            media_type = "Text"
+            mime_type = None
+            file_name = None
+            file_id = None
+            file_size = len(original_text.encode("utf-8"))
+            tags = build_tags(media_type, now)
 
         max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
         if file_size and file_size > max_bytes:
@@ -692,55 +777,69 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
                 "Use `.save f` for a forward save instead."
             )
 
-        caption = build_caption(
-            save_code=save_code,
-            sender=sender_name,
-            chat_id=origin_chat_id,
-            msg_id=origin_msg_id,
-            dt=now,
-            media_type=media_type,
-            mime=mime_type,
-            file_size=file_size,
-            file_name=file_name,
-            tags=tags,
+        caption = _append_original_text(
+            build_caption(
+                save_code=save_code,
+                sender=sender_name,
+                chat_id=origin_chat_id,
+                msg_id=origin_msg_id,
+                dt=now,
+                media_type=media_type,
+                mime=mime_type,
+                file_size=file_size,
+                file_name=file_name,
+                tags=tags,
+            ),
+            reply_msg,
         )
 
-        buf = io.BytesIO()
         sent = None
-        try:
-            t0 = asyncio.get_event_loop().time()
-            await client.download_media(reply_msg, file=buf)
-            record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-
-            buf_size = buf.tell()
-            if buf_size == 0:
-                return "❌ Download produced an empty buffer."
-
-            buf.seek(0)
-            buf.name = file_name
-
+        actual_size = file_size
+        if not media:
             try:
-                t1 = asyncio.get_event_loop().time()
-                sent = await client.send_file(
-                    "me",
-                    buf,
-                    caption=caption,
-                    force_document=False,
-                )
-                record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+                t0 = asyncio.get_event_loop().time()
+                sent = await client.send_message("me", caption)
+                record_event("save", "send_message", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
             except Exception as exc:
-                logger.error("deep save upload failed: %s", exc)
-                record_event("save", "send_file", 0, "ERROR", str(exc))
+                logger.error("deep save text send failed: %s", exc)
+                record_event("save", "send_message", 0, "ERROR", str(exc))
                 return f"❌ Upload failed: {exc}"
+        else:
+            buf = io.BytesIO()
+            try:
+                t0 = asyncio.get_event_loop().time()
+                await client.download_media(reply_msg, file=buf)
+                record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
 
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("deep save download failed: %s", exc)
-            record_event("save", "download_media", 0, "ERROR", str(exc))
-            return f"❌ Download failed: {exc}"
-        finally:
-            buf.close()
+                actual_size = buf.tell()
+                if actual_size == 0:
+                    return "❌ Download produced an empty buffer."
+
+                buf.seek(0)
+                buf.name = file_name
+
+                try:
+                    t1 = asyncio.get_event_loop().time()
+                    sent = await client.send_file(
+                        "me",
+                        buf,
+                        caption=caption,
+                        **_upload_kwargs_for_media(media, mime_type, file_name),
+                    )
+                    record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+                except Exception as exc:
+                    logger.error("deep save upload failed: %s", exc)
+                    record_event("save", "send_file", 0, "ERROR", str(exc))
+                    return f"❌ Upload failed: {exc}"
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("deep save download failed: %s", exc)
+                record_event("save", "download_media", 0, "ERROR", str(exc))
+                return f"❌ Download failed: {exc}"
+            finally:
+                buf.close()
 
         saved_chat_id = sent.chat_id if sent else None
         saved_msg_id = sent.id if sent else None
@@ -756,7 +855,7 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             "sender_id": sender_id,
             "mime_type": mime_type,
             "file_id": file_id,
-            "file_size": file_size,
+            "file_size": actual_size,
             "media_type": media_type,
             "tags": tags,
             "caption": caption,

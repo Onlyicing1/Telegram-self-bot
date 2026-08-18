@@ -112,7 +112,7 @@ async def _profile_inline_builder(event, extra: str) -> list:
     return [render("Profile", "Choose a section:", builder.build())]
 
 
-def _build_settings_body() -> str:
+async def _build_settings_body() -> str:
     from backend.services import settings_service
     ac = settings_service.is_auto_close_enabled()
     acd = settings_service.auto_close_delay()
