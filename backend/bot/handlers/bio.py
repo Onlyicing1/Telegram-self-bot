@@ -53,7 +53,7 @@ _BIO_VARS = [
     ("{text}", "Custom freeform text", "Working"),
 ]
 
-_DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood"
+_DEFAULT_TEMPLATE = "🕒 {time} | 💭 {mood}"
 
 _builder_buffers: dict[int, str] = {}
 

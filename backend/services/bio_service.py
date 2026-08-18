@@ -36,7 +36,7 @@ async def do_off(owner_id: int) -> str:
         await db_client.update_bio_state(owner_id, {"is_active": False})
     except Exception as exc:
         return f"❌ DB error: {exc}"
-    bio_engine.stop_cron()
+    await bio_engine.stop_cron()
     record_event("bio", "cron off", 0, "SUCCESS")
     return "⏹ Bio cron **OFF**"
 

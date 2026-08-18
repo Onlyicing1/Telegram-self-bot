@@ -61,7 +61,7 @@ from backend.profile import scheduler as profile_scheduler
 from backend.diagnostics import record_event
 from backend.health import (
     set_runtime_state, set_telethon_connected, set_supervisor_ok,
-    set_bio_cron_ok, set_helper_connected, set_last_update,
+    set_bio_cron_ok, set_username_cron_ok, set_helper_connected, set_last_update,
     set_last_telethon_event, set_last_event_dispatch,
     set_last_rpc, set_rpc_latency, set_restart_count, increment_restart,
     set_client_generation, set_last_rebuild_reason, set_task_state,
@@ -352,7 +352,12 @@ class RuntimeSupervisor:
             state = await db_client.get_username_state(self.owner_id)
             if state and state.get("is_active"):
                 username_engine.start_cron(self.client, self.owner_id, self.tz_str)
+                set_username_cron_ok(True)
                 trace("USERNAME_CRON_RESUMED")
+            elif self.cfg.get("USERNAME_UPDATE_ENABLED"):
+                username_engine.start_cron(self.client, self.owner_id, self.tz_str)
+                set_username_cron_ok(True)
+                trace("USERNAME_CRON_AUTO_STARTED")
         except Exception as exc:
             trace_exception("USERNAME_CRON_RESUME_FAILED", exc)
 

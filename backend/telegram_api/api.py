@@ -6,8 +6,8 @@ They never import Telethon, never call ``client.send_message()``, and
 never handle raw Telethon objects.
 
 The facade wraps a Telethon client and delegates to the sub-modules
-(messages, media, entities, profile). Every method is async, has a
-bounded timeout, and returns plain dicts or simple types.
+(messages, media, entities). Every method is async, has a bounded
+timeout, and returns plain dicts or simple types.
 
 The facade is stateless beyond the client reference. No caching, no
 background tasks, no polling. It is a pure pass-through.
@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from backend.telegram_api import entities, media, messages, profile
+from backend.telegram_api import entities, media, messages
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +123,3 @@ class TelegramAPI:
     async def get_input_entity(self, entity: int | str) -> Any:
         return await entities.get_input_entity(self._client, entity)
 
-    # ── Profile ──
-
-    async def update_profile(
-        self,
-        about: str | None = None,
-        first_name: str | None = None,
-        last_name: str | None = None,
-    ) -> dict[str, Any]:
-        return await profile.update_profile(self._client, about, first_name, last_name)

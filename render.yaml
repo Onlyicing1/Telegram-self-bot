@@ -25,6 +25,8 @@ services:
         value: Asia/Tehran
       - key: BIO_UPDATE_ENABLED
         value: "false"
+      - key: USERNAME_UPDATE_ENABLED
+        value: "false"
       - key: LOG_LEVEL
         value: INFO
       - key: AI_ENABLED

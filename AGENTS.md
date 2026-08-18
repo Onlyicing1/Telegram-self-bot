@@ -660,6 +660,7 @@ main.tsx
 | `GHOST_ROOM_ID` | `""` | Unused in current code. |
 | `DEST_CHANNEL_ID` | `""` | Unused in current code. |
 | `BIO_UPDATE_ENABLED` | `false` | If `true`, auto-starts bio cron on boot regardless of DB state. |
+| `USERNAME_UPDATE_ENABLED` | `false` | If `true`, auto-starts username cron on boot regardless of DB state. |
 | `LOG_LEVEL` | `INFO` | Python logging level. |
 
 ### Frontend-only

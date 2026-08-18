@@ -41,7 +41,7 @@ on **Render**.
 
 LifeOS is a **self-bot** — it operates *your own* Telegram account via
 Telethon's `StringSession`. There is no separate bot account for commands.
-You type commands (`.save`, `.bio`, `.help`) in any chat, and the bot
+You type commands (`.menu`, `.help`, `.ping`) in any chat, and the bot
 edits your message in-place with the result. Zero spam, zero new messages.
 
 When a helper bot token is configured, the full **Inline Glass UI**
@@ -126,7 +126,7 @@ lifeos/
 │   │       ├── ai.py           # AI Glass Panel (settings, provider, triggers, etc.)
 │   │       ├── ai_cmd.py     # .ai command handler (DEPRECATED — use triggers)
 │   │       ├── ai_trigger.py # Trigger-based AI activation (default method)
-│   │       ├── bio.py          # .bio command + panel
+│   │       ├── bio.py          # Bio Glass panel
 │   │       ├── database.py     # .db command + panel
 │   │       ├── delete.py       # .del command + panel
 │   │       ├── discover.py     # .list, .find commands
@@ -135,7 +135,7 @@ lifeos/
 │   │       ├── organize.py     # LifeOS status panel
 │   │       ├── retrieve.py     # .retrieve, .preview, .send
 │   │       ├── save.py         # .save command + panel
-│   │       └── username.py     # .username command + panel
+│   │       └── username.py     # Username Glass panel
 │   │
 │   ├── services/               # Business logic (between handlers and DB)
 │   │   ├── save_service.py
@@ -599,6 +599,7 @@ The bot deploys as a **single web service** on Render:
 | `TZ` | `Asia/Tehran` | Timezone for bio/username engines |
 | `PORT` | `8000` | Web server port |
 | `BIO_UPDATE_ENABLED` | `false` | Auto-start bio cron on boot |
+| `USERNAME_UPDATE_ENABLED` | `false` | Auto-start username cron on boot |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
 ### Optional — AI
@@ -933,23 +934,27 @@ All commands use the `.` prefix. Only fire on outgoing messages.
 
 ### Bio Engine
 
-| Command | Description |
+Managed through the Inline Glass UI: `.menu` → **Profile** → **Bio**.
+
+| Action | Description |
 |---|---|
-| `.bio` | Bio engine panel |
-| `.bio on` / `.bio off` | Start / stop bio cron |
-| `.bio show` | Show bio state |
-| `.bio template <tpl>` | Set bio template |
-| `.bio text <text>` | Set {text} token |
-| `.bio mood <mood>` | Set {mood} token |
+| Enable / Disable Sync | Start / stop bio cron |
+| Show State | Show bio state |
+| Template Builder | Set bio template |
+| Set Text | Set {text} token |
+| Set Mood | Set {mood} token |
 
 ### Username Engine
 
-| Command | Description |
+Managed through the Inline Glass UI: `.menu` → **Profile** → **Username**.
+
+| Action | Description |
 |---|---|
-| `.username` | Username engine panel |
-| `.username on` / `.username off` | Start / stop username cron |
-| `.username show` | Show username state |
-| `.username template <tpl>` | Set username template |
+| Enable / Disable Sync | Start / stop username cron |
+| Show State | Show username state |
+| Template Builder | Set username template |
+| Set Text | Set {text} token |
+| Set Mood | Set {mood} token |
 
 ### Database
 
@@ -978,7 +983,7 @@ All commands use the `.` prefix. Only fire on outgoing messages.
 
 ### Bio or Username engine not updating
 
-- Check that the engine is active (`.bio show` or `.username show`).
+- Check that the engine is active (`.menu` → **Profile** → **Bio/Username** → **Show State**).
 - Check that the template contains at least one token.
 - Check the shared Profile Scheduler is running (visible in `.health`).
 - Check for `FloodWaitError` in logs.

@@ -40,6 +40,7 @@ UpdaterFn = Callable[[int, str], Awaitable[dict[str, str] | None]]
 _updaters: list[tuple[str, UpdaterFn]] = []
 _task: asyncio.Task | None = None
 _client = None
+_active_engines: set[str] = set()
 
 
 def _backoff(attempt: int) -> float:
@@ -80,6 +81,28 @@ def unregister_updater(name: str) -> None:
     _updaters = [(n, fn) for n, fn in _updaters if n != name]
 
 
+def set_engine_active(name: str, active: bool) -> None:
+    """Track which profile engines currently want the scheduler running."""
+    if active:
+        _active_engines.add(name)
+    else:
+        _active_engines.discard(name)
+
+
+def any_engine_active() -> bool:
+    return bool(_active_engines)
+
+
+async def stop_if_idle() -> None:
+    """Stop the shared scheduler only when no profile engine remains active.
+
+    Turning off one engine (Bio or Username) must never stop the other while
+    it is still active — both engines share this single scheduler task.
+    """
+    if not any_engine_active():
+        await stop_cron()
+
+
 def _set_client(client) -> None:
     global _client
     _client = client
@@ -105,6 +128,21 @@ async def _collect_updates(owner_id: int, tz_str: str) -> dict[str, str]:
             trace_exception("PROFILE_UPDATER_ERROR", exc, updater=name)
             logger.exception("Profile updater '%s' error: %s", name, exc)
     return merged
+
+
+def _record_update_telemetry(updates: dict[str, str]) -> None:
+    """Record per-field health telemetry for the fields actually updated.
+
+    A username-only update must not be recorded as a bio update.
+    """
+    try:
+        from backend.health import set_last_bio_update, set_last_username_update
+    except Exception:
+        return
+    if "about" in updates:
+        set_last_bio_update()
+    if "first_name" in updates:
+        set_last_username_update()
 
 
 async def _cron_loop(owner_id: int, tz_str: str) -> None:
@@ -161,11 +199,7 @@ async def _cron_loop(owner_id: int, tz_str: str) -> None:
                 record_event("profile", "UpdateProfileRequest", 0, "ERROR", str(api_exc))
                 continue
 
-            try:
-                from backend.health import set_last_bio_update
-                set_last_bio_update()
-            except Exception:
-                pass
+            _record_update_telemetry(updates)
 
         except asyncio.CancelledError:
             trace("PROFILE_CRON_CANCELLED")

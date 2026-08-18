@@ -42,5 +42,6 @@ def load() -> dict:
         "GHOST_ROOM_ID": os.getenv("GHOST_ROOM_ID", ""),
         "DEST_CHANNEL_ID": os.getenv("DEST_CHANNEL_ID", ""),
         "BIO_UPDATE_ENABLED": os.getenv("BIO_UPDATE_ENABLED", "false").lower() == "true",
+        "USERNAME_UPDATE_ENABLED": os.getenv("USERNAME_UPDATE_ENABLED", "false").lower() == "true",
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper(),
     }

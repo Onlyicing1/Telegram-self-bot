@@ -36,6 +36,7 @@ _runtime_state: str = "STARTING"
 _telethon_connected: bool = False
 _supervisor_ok: bool = False
 _bio_cron_ok: bool = False
+_username_cron_ok: bool = False
 _helper_connected: bool = False
 
 _restart_count: int = 0
@@ -51,6 +52,7 @@ _watchdog_ok: bool = False
 _last_watchdog_check: float = 0.0
 _last_telethon_event: float = 0.0
 _last_bio_update: float = 0.0
+_last_username_update: float = 0.0
 _last_callback: float = 0.0
 _last_event_dispatch: float = 0.0
 
@@ -134,6 +136,11 @@ def set_bio_cron_ok(ok: bool) -> None:
     _bio_cron_ok = bool(ok)
 
 
+def set_username_cron_ok(ok: bool) -> None:
+    global _username_cron_ok
+    _username_cron_ok = bool(ok)
+
+
 def set_helper_connected(connected: bool) -> None:
     global _helper_connected
     _helper_connected = bool(connected)
@@ -193,6 +200,11 @@ def set_watchdog_ok(ok: bool) -> None:
 def set_last_bio_update() -> None:
     global _last_bio_update
     _last_bio_update = time.time()
+
+
+def set_last_username_update() -> None:
+    global _last_username_update
+    _last_username_update = time.time()
 
 
 def set_last_telethon_event() -> None:
@@ -293,6 +305,7 @@ def snapshot() -> dict:
         "supervisor_ok": _supervisor_ok,
         "helper_connected": _helper_connected,
         "bio_cron_ok": _bio_cron_ok,
+        "username_cron_ok": _username_cron_ok,
         "heartbeat_age_s": round(age, 2) if age >= 0 else None,
         "uptime_s": round(_uptime(), 1) if _uptime() >= 0 else None,
         "restart_count": _restart_count,
@@ -308,6 +321,7 @@ def snapshot() -> dict:
         "last_watchdog_check_s": _age_or_none(_last_watchdog_check),
         "last_telethon_event_s": _age_or_none(_last_telethon_event),
         "last_bio_update_s": _age_or_none(_last_bio_update),
+        "last_username_update_s": _age_or_none(_last_username_update),
         "last_callback_s": _age_or_none(_last_callback),
         "last_event_dispatch_s": _age_or_none(_last_event_dispatch),
     }
