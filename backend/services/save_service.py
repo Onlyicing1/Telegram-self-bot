@@ -5,7 +5,6 @@ Both text commands and inline panels call these exact functions.
 No business logic exists in any handler module.
 """
 import asyncio
-import io
 import logging
 import os
 import re
@@ -231,6 +230,31 @@ def _unwrap_forward(result) -> object | None:
     if result is None:
         return None
     return result[0] if isinstance(result, list) else result
+
+
+def _extract_uploaded_metadata(sent) -> tuple[str | None, str | None, int | None]:
+    """Extract (file_id, mime_type, file_size) from the newly-uploaded message.
+
+    Deep save persists metadata that refers to the NEW message Telegram
+    created for the re-upload, not the original source message, so lookups
+    and retrieval always point at the actual saved item.
+    """
+    media = getattr(sent, "media", None)
+    if isinstance(media, MessageMediaDocument):
+        doc = media.document
+        return (
+            str(getattr(doc, "id", "")) or None,
+            getattr(doc, "mime_type", None),
+            getattr(doc, "size", None),
+        )
+    if isinstance(media, MessageMediaPhoto):
+        photo = media.photo
+        return (
+            str(getattr(photo, "id", "")) or None,
+            "image/jpeg",
+            None,
+        )
+    return None, None, None
 
 
 def parse_telegram_link(link: str) -> tuple[str | None, int, int]:
@@ -589,6 +613,9 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     saved_chat_id = sent.chat_id if sent else None
     saved_msg_id = sent.id if sent else None
 
+    # Metadata refers to the NEWLY uploaded message, not the source.
+    new_file_id, new_mime, new_size = _extract_uploaded_metadata(sent)
+
     payload = {
         "save_code": save_code,
         "save_type": "deep",
@@ -598,9 +625,9 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
         "saved_msg_id": saved_msg_id,
         "sender_name": sender_name,
         "sender_id": sender_id,
-        "mime_type": mime_type,
-        "file_id": file_id,
-        "file_size": file_size,
+        "mime_type": new_mime or mime_type,
+        "file_id": new_file_id or file_id,
+        "file_size": actual_size or new_size or file_size,
         "media_type": media_type,
         "tags": tags,
         "caption": caption,
@@ -805,24 +832,25 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
                 record_event("save", "send_message", 0, "ERROR", str(exc))
                 return f"❌ Upload failed: {exc}"
         else:
-            buf = io.BytesIO()
+            # DEEP SAVE = true download → temporary file → NEW upload.
+            # The saved item is a brand-new message; the source is never
+            # forwarded. The temp file is removed on every exit path.
+            tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
+            tmp_path = os.path.join(tmp_dir, os.path.basename(file_name or "file.bin"))
             try:
                 t0 = asyncio.get_event_loop().time()
-                await client.download_media(reply_msg, file=buf)
+                await client.download_media(reply_msg, file=tmp_path)
                 record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
 
-                actual_size = buf.tell()
+                actual_size = os.path.getsize(tmp_path)
                 if actual_size == 0:
-                    return "❌ Download produced an empty buffer."
-
-                buf.seek(0)
-                buf.name = file_name
+                    return "❌ Download produced an empty file."
 
                 try:
                     t1 = asyncio.get_event_loop().time()
                     sent = await client.send_file(
                         "me",
-                        buf,
+                        tmp_path,
                         caption=caption,
                         **_upload_kwargs_for_media(media, mime_type, file_name),
                     )
@@ -839,10 +867,13 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
                 record_event("save", "download_media", 0, "ERROR", str(exc))
                 return f"❌ Download failed: {exc}"
             finally:
-                buf.close()
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         saved_chat_id = sent.chat_id if sent else None
         saved_msg_id = sent.id if sent else None
+
+        # Metadata refers to the NEWLY uploaded message, not the source.
+        new_file_id, new_mime, new_size = _extract_uploaded_metadata(sent)
 
         payload = {
             "save_code": save_code,
@@ -853,9 +884,9 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             "saved_msg_id": saved_msg_id,
             "sender_name": sender_name,
             "sender_id": sender_id,
-            "mime_type": mime_type,
-            "file_id": file_id,
-            "file_size": actual_size,
+            "mime_type": new_mime or mime_type,
+            "file_id": new_file_id or file_id,
+            "file_size": actual_size or new_size,
             "media_type": media_type,
             "tags": tags,
             "caption": caption,

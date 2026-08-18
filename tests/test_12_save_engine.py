@@ -6,16 +6,18 @@ Covers:
     so the Settings button on the main menu silently did nothing).
   - Forward save attaches the generated caption to the forwarded message
     and preserves the original text.
-  - Deep save preserves the original media type (photo / video / voice /
-    sticker / document) via Telegram attributes instead of degrading to a
-    generic document.
-  - Deep save of plain text (TEXT → TEXT).
-  - Deep save metadata (save_code, mime, file_id, actual file_size, ids).
-  - BytesIO buffer is always closed.
+  - Deep save is a TRUE re-upload: download → temporary file → send_file.
+    It never calls forward_messages, preserves the original media type
+    (photo / video / voice / sticker / document) via Telegram attributes,
+    cleans up its temporary file on success AND failure, and handles
+    plain text (TEXT → TEXT).
+  - Deep save metadata (save_code, mime, actual file_size, ids) refers to
+    the NEWLY uploaded message, not the source.
 """
 from __future__ import annotations
 
-import io
+import os
+import tempfile
 
 import pytest
 
@@ -66,12 +68,16 @@ class FakeSent:
     chat_id = "me"
     id = 600
 
+    def __init__(self, media=None):
+        self.media = media
+
 
 class MockClient:
     download_bytes = b"fake-media-bytes"
 
-    def __init__(self):
+    def __init__(self, sent_media=None):
         self.calls = []
+        self._sent_media = sent_media
 
     async def forward_messages(self, entity, messages):
         self.calls.append(("forward_messages", entity, messages))
@@ -82,13 +88,19 @@ class MockClient:
         return FakeSent()
 
     async def download_media(self, message, file=None, **kwargs):
+        self.calls.append(("download_media", message, file))
         if file is not None:
-            file.write(self.download_bytes)
+            if isinstance(file, (str, os.PathLike)):
+                os.makedirs(os.path.dirname(file), exist_ok=True)
+                with open(file, "wb") as fh:
+                    fh.write(self.download_bytes)
+            else:
+                file.write(self.download_bytes)
         return "downloaded"
 
     async def send_file(self, entity, file, **kwargs):
         self.calls.append(("send_file", entity, file, kwargs))
-        return FakeSent()
+        return FakeSent(media=self._sent_media)
 
     async def send_message(self, entity, text):
         self.calls.append(("send_message", entity, text))
@@ -105,6 +117,14 @@ def reset_fallback():
 
 def _send_file_call(client):
     return [c for c in client.calls if c[0] == "send_file"][0]
+
+
+def _assert_no_leftover_temp_dirs():
+    leftovers = [
+        d for d in os.listdir(tempfile.gettempdir())
+        if d.startswith("lifeos_dl_")
+    ]
+    assert leftovers == [], f"leftover temp dirs: {leftovers}"
 
 
 def _save_code(result: str) -> str:
@@ -290,8 +310,9 @@ async def test_deep_save_photo_preserves_type_and_actual_size():
     assert kwargs["force_document"] is False
     assert "**LifeOS**" in kwargs["caption"]
     assert "hello world" in kwargs["caption"]
-    assert isinstance(file, io.BytesIO)
-    assert file.closed  # buffer always closed
+    assert isinstance(file, str)  # temporary file path, not an in-memory buffer
+    assert not os.path.exists(file)  # temp file removed after upload
+    _assert_no_leftover_temp_dirs()
 
     row = await db_client.query_save(_save_code(result))
     assert row["save_type"] == "deep"
@@ -299,6 +320,20 @@ async def test_deep_save_photo_preserves_type_and_actual_size():
     assert row["file_size"] == len(client.download_bytes)  # actual downloaded size
     assert row["saved_msg_id"] == 600
     assert row["caption"]
+
+
+@pytest.mark.asyncio
+async def test_deep_save_never_forwards():
+    client = MockClient()
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+
+    assert "Saved Successfully" in result
+    # Deep save must be a genuine download → upload, never a forward.
+    assert not [c for c in client.calls if c[0] == "forward_messages"]
+    assert [c for c in client.calls if c[0] == "download_media"]
+    assert [c for c in client.calls if c[0] == "send_file"]
 
 
 @pytest.mark.asyncio
@@ -373,7 +408,7 @@ async def test_deep_save_no_media_no_text_errors():
 
 
 @pytest.mark.asyncio
-async def test_deep_save_buffer_closed_on_download_error():
+async def test_deep_save_cleans_temp_on_download_error():
     client = MockClient()
 
     async def boom(message, file=None, **kwargs):
@@ -384,6 +419,31 @@ async def test_deep_save_buffer_closed_on_download_error():
     msg = FakeMessage(media=media)
     result = await save_service.execute_save(client, 42, msg, "d", "UTC")
     assert "❌ Download failed" in result
+    _assert_no_leftover_temp_dirs()
+
+
+@pytest.mark.asyncio
+async def test_deep_save_persists_new_upload_file_id():
+    # The DB must reference the NEWLY uploaded message, not the source.
+    new_doc = FakeDoc()
+    new_doc.id = 424242
+    new_doc.mime_type = "application/zip"
+    client = MockClient(sent_media=MessageMediaDocument(document=new_doc, ttl_seconds=None))
+
+    doc = FakeDoc()
+    doc.mime_type = "application/zip"
+    doc.size = 777
+    doc.attributes = [DocumentAttributeFilename("archive.zip")]
+    media = MessageMediaDocument(document=doc, ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+
+    row = await db_client.query_save(_save_code(result))
+    assert row["save_type"] == "deep"
+    assert row["file_id"] == "424242"  # NEW upload id (source was 9999)
+    assert row["mime_type"] == "application/zip"
+    assert row["saved_msg_id"] == 600
+    assert row["saved_chat_id"] == "me"
 
 
 @pytest.mark.asyncio
