@@ -69,6 +69,26 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+# Service-layer failure prefixes. Services communicate failures as
+# "❌ ..." / "⚠️ ..." result strings instead of raising. Tools must
+# derive ``success`` from these prefixes — a service returning a string
+# is NOT proof the operation succeeded.
+_SERVICE_FAILURE_PREFIXES = ("❌", "⚠️", "🚫")
+
+
+def result_from_service(result: str, *, data: dict[str, Any] | None = None) -> ToolResult:
+    """Wrap a service-layer result string, deriving success from the outcome.
+
+    Services communicate failures as "❌ ..." / "⚠️ ..." strings. A tool
+    that merely returned without raising must never report success: the AI
+    answers from the REAL result, so failures are surfaced as
+    ``success=False`` with the actual service message.
+    """
+    text = str(result)
+    failed = text.startswith(_SERVICE_FAILURE_PREFIXES)
+    return ToolResult(success=not failed, message=text, data=data or {})
+
+
 @runtime_checkable
 class Tool(Protocol):
     """The contract every tool must implement.

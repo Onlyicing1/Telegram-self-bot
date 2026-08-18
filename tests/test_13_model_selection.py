@@ -223,7 +223,7 @@ async def test_ai_test_models_action_shows_usable_buttons_and_keeps_existing():
         title, body, buttons = await ai_module._ai_test_models_action(None, "", 0)
 
     assert title == "🧪 Test Models"
-    assert "Usable models" in body
+    assert "Usable Models" in body
     datas = _flatten_button_datas(buttons)
     # Only the AVAILABLE model becomes a one-tap selection button.
     assert "action:ai_pick_model:groq:openai/gpt-oss-120b" in datas

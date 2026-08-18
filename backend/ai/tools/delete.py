@@ -63,10 +63,32 @@ class DeleteTool(Tool):
             return ToolResult(success=False, message="No chat context for deletion.")
 
         try:
-            result = await delete_service.do_del_n(context.telegram.client, chat_id, count)
-            return ToolResult(success=True, message=result, data={"count": count})
+            deleted, error = await delete_service.do_del_n_counts(
+                context.telegram.client, chat_id, count
+            )
         except Exception as exc:
-            return ToolResult(success=False, message=f"Delete failed: {exc}")
+            return ToolResult(
+                success=False,
+                message=f"Delete failed: {exc}",
+                data={"count": 0},
+            )
+        if error is not None:
+            return ToolResult(
+                success=False,
+                message=f"Delete failed: {error}",
+                data={"count": deleted},
+            )
+        if deleted == 0:
+            return ToolResult(
+                success=True,
+                message="No outgoing messages were deleted (none matched in this chat).",
+                data={"count": 0},
+            )
+        return ToolResult(
+            success=True,
+            message=f"Deleted {deleted} outgoing message(s) in this chat.",
+            data={"count": deleted},
+        )
 
 
 class DeleteByIdTool(Tool):
@@ -119,7 +141,29 @@ class DeleteByIdTool(Tool):
             return ToolResult(success=False, message="No chat context for deletion.")
 
         try:
-            result = await delete_service.do_del_id(context.telegram.client, chat_id, message_id)
-            return ToolResult(success=True, message=result, data={"message_id": message_id})
+            deleted, error = await delete_service.do_del_id_counts(
+                context.telegram.client, chat_id, message_id
+            )
         except Exception as exc:
-            return ToolResult(success=False, message=f"Delete by ID failed: {exc}")
+            return ToolResult(
+                success=False,
+                message=f"Delete by ID failed: {exc}",
+                data={"message_id": message_id, "count": 0},
+            )
+        if error is not None:
+            return ToolResult(
+                success=False,
+                message=f"Delete by ID failed: {error}",
+                data={"message_id": message_id, "count": deleted},
+            )
+        if deleted == 0:
+            return ToolResult(
+                success=True,
+                message="No outgoing messages were deleted (none matched from that ID forward).",
+                data={"message_id": message_id, "count": 0},
+            )
+        return ToolResult(
+            success=True,
+            message=f"Deleted {deleted} outgoing message(s) starting from ID {message_id}.",
+            data={"message_id": message_id, "count": deleted},
+        )

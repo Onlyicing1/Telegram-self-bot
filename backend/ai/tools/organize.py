@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
 
 
@@ -47,7 +47,7 @@ class OrganizeListTool(Tool):
 
         try:
             result = await organize_service.do_list(context.owner_id)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Organize list failed: {exc}")
 
@@ -87,6 +87,6 @@ class OrganizeCleanTool(Tool):
 
         try:
             result = await organize_service.do_clean(context.owner_id)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Organize clean failed: {exc}")

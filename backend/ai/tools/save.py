@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,13 @@ class SaveTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import save_service
 
-        mode = arguments.get("mode", "forward")
+        # ``execute_save`` expects the compact mode codes used by the save
+        # panel: "f" = forward, "d" = deep (download + re-upload). The AI
+        # tool surface uses friendly names — map them so "forward" never
+        # silently becomes a deep save (and vice versa).
+        mode_arg = arguments.get("mode", "forward")
+        mode = "f" if str(mode_arg).lower().startswith("f") else "d"
+
         reply_meta = context.extra.get("reply_msg") if context.extra else None
         if reply_meta is None:
             return ToolResult(success=False, message="No replied message to save.")
@@ -75,7 +81,9 @@ class SaveTool(Tool):
             result = await save_service.execute_save(
                 context.telegram.client, context.owner_id, reply_msg, mode, context.tz_str
             )
-            return ToolResult(success=True, message=result, data={"mode": mode})
+            # Services report failures as "❌ ..."/"⚠️ ..." strings — only a
+            # success string means the save actually happened.
+            return result_from_service(result, data={"mode": mode})
         except Exception as exc:
             return ToolResult(success=False, message=f"Save failed: {exc}")
 

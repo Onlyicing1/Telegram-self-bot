@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
 
 
@@ -55,7 +55,7 @@ class UsernameSetTemplateTool(Tool):
             return ToolResult(success=False, message="Missing template argument.")
         try:
             result = await username_service.do_template(context.owner_id, template)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username template set failed: {exc}")
 
@@ -101,7 +101,7 @@ class UsernameSetTextTool(Tool):
         text = arguments.get("text", "")
         try:
             result = await username_service.do_text(context.owner_id, text)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username text set failed: {exc}")
 
@@ -147,7 +147,7 @@ class UsernameSetMoodTool(Tool):
         mood = arguments.get("mood", "")
         try:
             result = await username_service.do_mood(context.owner_id, mood)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username mood set failed: {exc}")
 
@@ -187,7 +187,7 @@ class UsernameOnTool(Tool):
 
         try:
             result = await username_service.do_on(context.telegram.client, context.owner_id, context.tz_str)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username on failed: {exc}")
 
@@ -227,7 +227,7 @@ class UsernameOffTool(Tool):
 
         try:
             result = await username_service.do_off(context.owner_id)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username off failed: {exc}")
 
@@ -267,6 +267,6 @@ class UsernameShowTool(Tool):
 
         try:
             result = await username_service.do_show(context.owner_id, context.tz_str)
-            return ToolResult(success=True, message=result)
+            return result_from_service(result)
         except Exception as exc:
             return ToolResult(success=False, message=f"Username show failed: {exc}")

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
 
 
@@ -54,7 +54,7 @@ class SearchTool(Tool):
             return ToolResult(success=False, message="Missing query argument.")
         try:
             result = await discover_service.do_find(context.owner_id, query, context.tz_str)
-            return ToolResult(success=True, message=result, data={"query": query})
+            return result_from_service(result, data={"query": query})
         except Exception as exc:
             return ToolResult(success=False, message=f"Search failed: {exc}")
 
@@ -103,6 +103,6 @@ class ListSavesTool(Tool):
         limit = arguments.get("limit", 10)
         try:
             result = await discover_service.do_list(context.owner_id, limit, context.tz_str)
-            return ToolResult(success=True, message=result, data={"limit": limit})
+            return result_from_service(result, data={"limit": limit})
         except Exception as exc:
             return ToolResult(success=False, message=f"List saves failed: {exc}")

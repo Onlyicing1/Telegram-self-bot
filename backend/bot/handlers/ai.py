@@ -604,6 +604,17 @@ _TEST_STATUS_ICONS: dict[str, str] = {
     "ERROR": "❓",
 }
 
+# Most recent Test Models payload — powers the compact message and the
+# one-tap "All Results" diagnostic view without re-running the tests.
+_last_test_payload: dict = {}
+
+
+def _short_model_name(model_id: str) -> str:
+    """Compact model name for tight glass layouts."""
+    if not model_id:
+        return "?"
+    return model_id.split("/")[-1]
+
 
 async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Run the model availability diagnostics inside the existing glass UI.
@@ -624,6 +635,9 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
         _nav_buttons(builder)
         return "🧪 Test Models", f"**🧪 Test Models**\n\n❌ Diagnostic run failed: {exc}", builder.build()
 
+    global _last_test_payload
+    _last_test_payload = results_payload
+
     results = results_payload.get("results", [])
     summary = results_payload.get("summary", {})
 
@@ -638,8 +652,74 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     )
     lines.append("")
 
-    # Group results by provider (targets are built per provider, so results
-    # naturally cluster — sorting keeps the grouping deterministic).
+    # Compact layout: usable models are the focus (provider-grouped, model
+    # name dominant, one line each). Failure details stay out of the main
+    # message — one compact line per model, capped, full detail one tap away.
+    usable = [r for r in results if r.get("status") == "AVAILABLE"]
+    usable_sorted = sorted(
+        usable,
+        key=lambda x: (x.get("provider", ""), x.get("latency_s") if x.get("latency_s") is not None else 999),
+    )
+
+    if usable_sorted:
+        lines.append("**✅ Usable Models**")
+        current_provider = None
+        for r in usable_sorted:
+            provider = r.get("provider", "?")
+            if provider != current_provider:
+                current_provider = provider
+                lines.append(f"🟢 **{r.get('display_name', provider)}**")
+            lines.append(f"• `{_short_model_name(r.get('model', '?'))}`")
+        lines.append("")
+    else:
+        lines.append("_No usable chat models right now._")
+        lines.append("")
+
+    failed = [r for r in results if r.get("status") != "AVAILABLE"]
+    if failed:
+        lines.append(f"**⚠️ Not usable: {len(failed)}**")
+        for r in failed[:8]:
+            status = r.get("status", "UNKNOWN_ERROR")
+            icon = _TEST_STATUS_ICONS.get(status, "❓")
+            lines.append(f"{icon} `{_short_model_name(r.get('model', '?'))}` — {status}")
+        if len(failed) > 8:
+            lines.append(f"_…and {len(failed) - 8} more_")
+        lines.append("")
+
+    # Buttons: usable models select provider+model together; everything else
+    # is navigation/diagnostics. All existing actions preserved.
+    builder = InlinePanelBuilder()
+    if usable_sorted:
+        for r in usable_sorted[:12]:
+            label = f"🟢 {r.get('display_name', r.get('provider', '?'))} — {_short_model_name(r.get('model', '?'))}"
+            latency = r.get("latency_s")
+            if latency is not None:
+                label += f" ({latency}s)"
+            builder.add_row(label[:64], f"action:ai_pick_model:{r['provider']}:{r['model']}")
+    builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
+    if results:
+        builder.add_row("🔍 All Results", "action:ai_test_details")
+    builder.add_row("🤖 Pick Model", "panel:ai_model")
+    builder.add_row("📊 Status", "panel:ai_status")
+    _nav_buttons(builder)
+    return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
+
+
+async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Show the full per-model diagnostics from the last Test Models run.
+
+    Keeps the main model-selection message compact while preserving full
+    failure details (HTTP status, retry-after, sanitized errors) one tap
+    away. Uses the cached payload — never re-runs the tests.
+    """
+    results = (_last_test_payload or {}).get("results", [])
+    if not results:
+        builder = InlinePanelBuilder()
+        builder.add_row("🧪 Run Tests", "action:ai_test_models")
+        _nav_buttons(builder)
+        return "🧪 Test Models", "**🧪 Model Tests**\n\n_No results yet. Tap **Run Tests** first._", builder.build()
+
+    lines = ["**🧪 Model Tests — All Results**\n"]
     current_provider = None
     for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
         provider = r.get("provider", "?")
@@ -662,26 +742,9 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
             lines.append(f"      _{r['error'][:160]}_")
         lines.append("")
 
-    # Usable models — only AVAILABLE results are offered as one-tap
-    # selection buttons; provider and model are picked together.
-    usable = [r for r in results if r.get("status") == "AVAILABLE"]
-    usable_sorted = sorted(usable, key=lambda x: (x.get("provider", ""), x.get("latency_s") if x.get("latency_s") is not None else 999))
-
     builder = InlinePanelBuilder()
-    if usable_sorted:
-        lines.append(f"**✅ Usable models — tap to select**")
-        for r in usable_sorted[:12]:
-            label = f"🟢 {r.get('display_name', r.get('provider', '?'))} — {r.get('model', '?')}"
-            latency = r.get("latency_s")
-            if latency is not None:
-                label += f" ({latency}s)"
-            builder.add_row(label[:64], f"action:ai_pick_model:{r['provider']}:{r['model']}")
-    else:
-        lines.append(f"_No usable chat models right now._")
-    lines.append("")
     builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
     builder.add_row("🤖 Pick Model", "panel:ai_model")
-    builder.add_row("📊 Status", "panel:ai_status")
     _nav_buttons(builder)
     return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
 
@@ -879,6 +942,7 @@ def register(client, owner_id: int) -> None:
         register_action("ai_refresh_models", _ai_refresh_models_action)
         register_action("ai_start_chat", _ai_start_chat_action)
         register_action("ai_test_models", _ai_test_models_action)
+        register_action("ai_test_details", _ai_test_details_action)
         register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_input("ai_settings", "trigger_en", {

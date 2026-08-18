@@ -3,6 +3,8 @@ Delete service — all deletion business logic lives here.
 
 Both text commands and inline panels call these exact functions.
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 
@@ -13,9 +15,16 @@ from backend.services import settings_service
 logger = logging.getLogger(__name__)
 
 
-async def do_del_n(client, chat_id, n: int) -> str:
+async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | None]:
+    """Delete the last ``n`` outgoing messages.
+
+    Returns ``(deleted_count, error)`` so callers (text commands, panels,
+    AI tools) can report the REAL number of deleted messages and a real
+    failure — never an inferred success. ``deleted_count`` is the actual
+    number of messages Telegram deleted; ``error`` is ``None`` on success.
+    """
     if n < 1 or n > 500:
-        return "⚠️ n must be between 1 and 500."
+        return 0, ValueError("n must be between 1 and 500")
     t0 = asyncio.get_event_loop().time()
     try:
         msg_ids = []
@@ -23,33 +32,58 @@ async def do_del_n(client, chat_id, n: int) -> str:
             msg_ids.append(msg.id)
             if len(msg_ids) >= n:
                 break
-        if msg_ids:
-            await client.delete_messages(chat_id, msg_ids[:n])
+        deleted = msg_ids[:n]
+        if deleted:
+            await client.delete_messages(chat_id, deleted)
         record_event("delete", "del n", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        return f"🗑 Deleted `{len(msg_ids[:n])}` messages."
+        return len(deleted), None
     except Exception as exc:
         logger.error("del n failed: %s", exc)
         record_event("delete", "del n", 0, "ERROR", str(exc))
-        return f"❌ Delete failed: {exc}"
+        return 0, exc
 
 
-async def do_del_id(client, chat_id, start_id: int) -> str:
+async def do_del_id_counts(client, chat_id, start_id: int) -> tuple[int, Exception | None]:
+    """Delete all outgoing messages from ``start_id`` forward.
+
+    Same contract as :func:`do_del_n_counts` — returns the real number of
+    deleted messages plus any error, never a fabricated success.
+    """
     t0 = asyncio.get_event_loop().time()
+    total = 0
     try:
-        msg_ids = []
+        batch = []
         async for msg in client.iter_messages(chat_id, min_id=start_id - 1, from_user="me"):
-            msg_ids.append(msg.id)
-            if len(msg_ids) >= settings_service.delete_batch_size():
-                await client.delete_messages(chat_id, msg_ids)
-                msg_ids = []
-        if msg_ids:
-            await client.delete_messages(chat_id, msg_ids)
+            batch.append(msg.id)
+            if len(batch) >= settings_service.delete_batch_size():
+                await client.delete_messages(chat_id, batch)
+                total += len(batch)
+                batch = []
+        if batch:
+            await client.delete_messages(chat_id, batch)
+            total += len(batch)
         record_event("delete", "del id", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        return f"🗑 Deleted messages from ID `{start_id}` forward."
+        return total, None
     except Exception as exc:
         logger.error("del id failed: %s", exc)
         record_event("delete", "del id", 0, "ERROR", str(exc))
-        return f"❌ Delete failed: {exc}"
+        return total, exc
+
+
+async def do_del_n(client, chat_id, n: int) -> str:
+    if n < 1 or n > 500:
+        return "⚠️ n must be between 1 and 500."
+    deleted, err = await do_del_n_counts(client, chat_id, n)
+    if err is not None:
+        return f"❌ Delete failed: {err}"
+    return f"🗑 Deleted `{deleted}` messages."
+
+
+async def do_del_id(client, chat_id, start_id: int) -> str:
+    deleted, err = await do_del_id_counts(client, chat_id, start_id)
+    if err is not None:
+        return f"❌ Delete failed: {err}"
+    return f"🗑 Deleted messages from ID `{start_id}` forward."
 
 
 async def do_del_code(client, owner_id: int, code: str) -> str:
