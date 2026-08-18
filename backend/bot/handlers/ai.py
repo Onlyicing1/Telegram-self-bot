@@ -541,6 +541,7 @@ _TEST_STATUS_ICONS: dict[str, str] = {
     "PROVIDER_ERROR": "🔴",
     "INVALID_MODEL": "🔵",
     "BLOCKED": "🚫",
+    "INSUFFICIENT_CREDITS": "💳",
     "UNKNOWN_ERROR": "❓",
     "ERROR": "❓",
 }
@@ -568,34 +569,44 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     results = results_payload.get("results", [])
     summary = results_payload.get("summary", {})
 
+    def s(key: str, default: int = 0) -> int:
+        return summary.get(key, default)
+
     lines = ["**🧪 Model Tests**\n"]
     lines.append(
-        f"_{summary.get('total', 0)} tested · {summary.get('available', 0)} available · "
-        f"{summary.get('not_configured', 0)} not configured · "
-        f"{summary.get('unavailable', 0) + summary.get('error', 0) + summary.get('timeout', 0)} failed_"
+        f"_Available: {s('available')} · Failed: {s('failed')} · "
+        f"Rate limited: {s('rate_limited')} · Not configured: {s('not_configured')} · "
+        f"Invalid: {s('invalid')} · No credits: {s('insufficient_credits')}_"
     )
     lines.append("")
 
-    for r in results:
+    # Group results by provider (targets are built per provider, so results
+    # naturally cluster — sorting keeps the grouping deterministic).
+    current_provider = None
+    for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
+        provider = r.get("provider", "?")
+        if provider != current_provider:
+            current_provider = provider
+            lines.append(f"**{r.get('display_name', provider)}**")
         status = r.get("status", "UNKNOWN_ERROR")
         icon = _TEST_STATUS_ICONS.get(status, "❓")
-        display = r.get("display_name", r.get("provider", "?"))
         model = r.get("model", "?")
-        line = f"{icon} **{display}** `{model}` — {status}"
+        line = f"  {icon} `{model}` — {status}"
         latency = r.get("latency_s")
         if latency is not None:
             line += f" · {latency}s"
         lines.append(line)
         if r.get("http_status"):
-            lines.append(f"    _HTTP {r['http_status']}_")
+            lines.append(f"      _HTTP {r['http_status']}_")
         if r.get("retry_after"):
-            lines.append(f"    _retry-after: {r['retry_after']}s_")
+            lines.append(f"      _retry-after: {r['retry_after']}s_")
         if r.get("error"):
-            lines.append(f"    _{r['error'][:160]}_")
+            lines.append(f"      _{r['error'][:160]}_")
         lines.append("")
 
     builder = InlinePanelBuilder()
     builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
+    builder.add_row("🤖 Pick Model", "panel:ai_model")
     builder.add_row("📊 Status", "panel:ai_status")
     _nav_buttons(builder)
     return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()

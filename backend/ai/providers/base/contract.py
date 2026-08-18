@@ -14,6 +14,7 @@ The contract:
     vision(messages, img)→ ProviderResponse   (image + text)
     stream(messages)     → Iterator[ProviderResponse]  (token-by-token)
     count_tokens(text)   → int
+    list_models()        → list[dict]  (live model listing; [] when unsupported)
     supports_tools()     → bool
     supports_vision()    → bool
     supports_reasoning() → bool
@@ -21,7 +22,9 @@ The contract:
 
 ``chat()`` and ``vision()`` are the primary entry points. ``stream()``
 yields incremental responses. ``count_tokens()`` gives a fast estimate
-without making an API call.
+without making an API call. ``list_models()`` queries the provider's
+model-list endpoint when one exists and returns ``[]`` otherwise, so
+model discovery can degrade gracefully for providers without listing.
 
 Capabilities are exposed both as individual ``supports_*()`` methods
 (for convenience) and as a ``capabilities`` property returning a
@@ -109,6 +112,14 @@ class BaseProvider(ABC):
             success=False,
             metadata={"reason": "streaming not supported"},
         )
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Return the provider's available models, or [] when unsupported.
+
+        Providers that support model listing override this. The default
+        returns an empty list so callers can degrade gracefully.
+        """
+        return []
 
     @abstractmethod
     def count_tokens(self, text: str) -> int: ...

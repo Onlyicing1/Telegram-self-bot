@@ -85,6 +85,7 @@ export interface ModelTestResult {
     | 'NOT_CONFIGURED'
     | 'AUTH_ERROR'
     | 'RATE_LIMITED'
+    | 'INSUFFICIENT_CREDITS'
     | 'TIMEOUT'
     | 'PROVIDER_ERROR'
     | 'INVALID_MODEL'
@@ -97,18 +98,45 @@ export interface ModelTestResult {
   retry_after: number | null;
   error_type: string | null;
   provider_code: string | null;
+  finish_reason: string | null;
+  capabilities: string[];
+  tested_at?: string | null;
+}
+
+export interface ModelTestSummary {
+  total: number;
+  available: number;
+  unavailable: number;
+  error: number;
+  timeout: number;
+  not_configured: number;
+  discovered: number;
+  tested: number;
+  failed: number;
+  rate_limited: number;
+  invalid: number;
+  insufficient_credits: number;
+  blocked: number;
+  auth_error: number;
+  provider_error: number;
 }
 
 export interface ModelTestResponse {
+  success: boolean;
+  tested_at: string | null;
+  partial: boolean;
+  providers: ProviderStatus[];
+  models: ModelInfo[];
   results: ModelTestResult[];
-  summary: {
-    total: number;
-    available: number;
-    unavailable: number;
-    error: number;
-    timeout: number;
-    not_configured: number;
-  };
+  summary: ModelTestSummary;
+}
+
+export interface ProviderModels {
+  provider: string;
+  display_name: string;
+  icon: string;
+  status: string;
+  models: ModelInfo[];
 }
 
 const BASE = '/api';
@@ -131,7 +159,29 @@ export const api = {
   aiProviders: () =>
     fetchJSON<{ providers: ProviderStatus[] }>(`/ai/providers`),
   aiModels: (provider: string) =>
-    fetchJSON<{ provider: string; models: ModelInfo[] }>(`/ai/models/${provider}`),
+    fetchJSON<{ provider: string; source: string; models: ModelInfo[] }>(`/ai/models/${provider}`),
+  aiModelsAll: () =>
+    fetchJSON<{ providers: ProviderModels[] }>(`/ai/models`),
+  aiSetProvider: (provider: string) =>
+    fetch(`${BASE}/ai/provider`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider }),
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      return data as { success: boolean; provider: string; model: string };
+    }),
+  aiSetModel: (model: string) =>
+    fetch(`${BASE}/ai/model`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      return data as { success: boolean; model: string };
+    }),
   aiConfig: () =>
     fetchJSON<AIConfig>(`/ai/config`),
   aiUpdateTriggers: (triggerEn: string, triggerFa: string) =>

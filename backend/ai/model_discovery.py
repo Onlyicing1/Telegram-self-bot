@@ -3,9 +3,19 @@ Model Discovery — queries provider APIs for available models.
 
 When the user selects a provider, this module queries the provider's
 API to download the list of available models. Models are cached in
-memory with a TTL. The user can manually refresh.
+memory with a TTL (configurable via ``MODEL_DISCOVERY_CACHE_TTL``,
+default 600s). The user can manually refresh.
 
-Never hardcodes model lists — always queries the live API.
+Behavior:
+  - Chat-capable filtering: models that are obviously not usable for
+    normal text chat (embeddings, whisper, tts, moderation, dall-e,
+    image/audio generation, rerank, realtime, guard, search) are
+    excluded from discovery results.
+  - Fallback catalog: if a provider's model-list API fails or returns
+    nothing, a centralized per-provider fallback catalog
+    (``_FALLBACK_CATALOG`` — the ONE place to update offline model
+    lists) is used so the UI still has models to show.
+  - Per-provider fetch locks: a slow provider never blocks another.
 
 Usage:
     from backend.ai.model_discovery import fetch_models, get_cached_models
@@ -25,9 +35,86 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL = 600  # 10 minutes
+_CACHE_TTL = int(os.getenv("MODEL_DISCOVERY_CACHE_TTL", "600"))  # seconds
 _model_cache: dict[str, dict[str, Any]] = {}  # provider_name -> {"models": [...], "timestamp": float}
-_fetch_lock = asyncio.Lock()
+_locks: dict[str, asyncio.Lock] = {}
+_last_source: dict[str, str] = {}  # provider_name -> "api" | "fallback"
+
+# Substrings that identify models NOT usable for normal text chat.
+_EXCLUDE_SUBSTRINGS = (
+    "embedding",
+    "whisper",
+    "tts-",
+    "tts_",
+    "moderation",
+    "dall-e",
+    "dall_e",
+    "image",
+    "audio",
+    "rerank",
+    "realtime",
+    "guard",
+    "search",
+    "stt",
+)
+
+
+def is_chat_capable(model_id: str) -> bool:
+    """True when a model id looks usable for normal text chat.
+
+    Conservative blocklist — chat-capable multimodal models (e.g. gpt-4o,
+    gemini-2.5-flash) are kept; clearly non-chat model families
+    (embeddings, whisper, tts, moderation, dall-e, image/audio gen,
+    rerank, realtime, guardrails, search) are excluded.
+    """
+    if not model_id:
+        return False
+    low = model_id.lower()
+    return not any(s in low for s in _EXCLUDE_SUBSTRINGS)
+
+
+# ── Centralized fallback catalog (offline model lists) ──
+# Used ONLY when a provider's model-list API is unreachable or empty.
+# This is the single place to update curated model names.
+_FALLBACK_CATALOG: dict[str, list[str]] = {
+    "gemini": [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    ],
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-3.5-turbo",
+    ],
+    "openrouter": [
+        "openrouter/auto",
+        "openai/gpt-4o",
+        "anthropic/claude-3.5-sonnet",
+        "google/gemini-2.0-flash-001",
+    ],
+    "groq": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+    ],
+    "cerebras": [
+        "llama-3.3-70b",
+        "llama-3.1-8b",
+    ],
+    "mistral": [
+        "mistral-large-latest",
+        "mistral-small-latest",
+        "open-mistral-nemo",
+    ],
+}
+
+
+def _get_lock(provider_name: str) -> asyncio.Lock:
+    return _locks.setdefault(provider_name, asyncio.Lock())
 
 
 @dataclass(frozen=True)
@@ -39,6 +126,25 @@ class ModelInfo:
     context_length: int = 0
     description: str = ""
     is_alias: bool = False
+    capabilities: list[str] = field(default_factory=list)
+
+
+def _build_fallback_models(provider_name: str) -> list[ModelInfo]:
+    """Build ModelInfo list from the centralized fallback catalog."""
+    ids = _FALLBACK_CATALOG.get(provider_name, [])
+    return [
+        ModelInfo(
+            id=mid,
+            name=mid.split("/")[-1] if "/" in mid else mid,
+            provider=provider_name,
+        )
+        for mid in ids
+    ]
+
+
+def get_last_fetch_source(provider_name: str) -> str:
+    """Return 'api' or 'fallback' for the most recent fetch of a provider."""
+    return _last_source.get(provider_name, "")
 
 
 async def fetch_models(
@@ -49,14 +155,16 @@ async def fetch_models(
 ) -> list[ModelInfo]:
     """Query a provider's API for available models.
 
-    Returns a list of ModelInfo objects. Caches results for 10 minutes.
+    Returns a list of chat-capable ModelInfo objects. Caches results
+    for the configured TTL. Falls back to the centralized catalog when
+    the API is unreachable or returns no chat-capable models.
     """
     now = time.time()
     cached = _model_cache.get(provider_name)
     if not force_refresh and cached and (now - cached["timestamp"]) < _CACHE_TTL:
         return cached["models"]
 
-    async with _fetch_lock:
+    async with _get_lock(provider_name):
         cached = _model_cache.get(provider_name)
         if not force_refresh and cached and (now - cached["timestamp"]) < _CACHE_TTL:
             return cached["models"]
@@ -66,6 +174,16 @@ async def fetch_models(
         else:
             models = await _fetch_openai_compat_models(provider_name, api_key, base_url)
 
+        if not models:
+            fallback = _build_fallback_models(provider_name)
+            if fallback:
+                logger.info("Model discovery: %s API empty/unreachable — using fallback catalog (%d models)",
+                            provider_name, len(fallback))
+                _last_source[provider_name] = "fallback"
+            _model_cache[provider_name] = {"models": fallback, "timestamp": time.time()}
+            return fallback
+
+        _last_source[provider_name] = "api"
         _model_cache[provider_name] = {"models": models, "timestamp": time.time()}
         return models
 
@@ -94,6 +212,8 @@ async def _fetch_openai_compat_models(
                 model_id = m.get("id", "")
                 if not model_id:
                     continue
+                if not is_chat_capable(model_id):
+                    continue
 
                 context_length = 0
                 ctx = m.get("context_length") or m.get("max_context_length") or 0
@@ -102,12 +222,20 @@ async def _fetch_openai_compat_models(
 
                 display_name = model_id.split("/")[-1] if "/" in model_id else model_id
 
+                caps: list[str] = []
+                raw_caps = m.get("capabilities") if isinstance(m.get("capabilities"), dict) else {}
+                for cap_name, enabled in raw_caps.items():
+                    if enabled is True:
+                        caps.append(str(cap_name))
+
                 models.append(ModelInfo(
                     id=model_id,
                     name=display_name,
                     provider=provider_name,
                     context_length=context_length,
                     description=m.get("description", ""),
+                    is_alias=bool(m.get("is_alias", False)),
+                    capabilities=caps,
                 ))
 
             models.sort(key=lambda m: m.name.lower())
@@ -137,24 +265,25 @@ async def _fetch_gemini_models(api_key: str, base_url: str) -> list[ModelInfo]:
                 model_name = m.get("name", "").replace("models/", "")
                 if not model_name:
                     continue
+                if not is_chat_capable(model_name):
+                    continue
 
-                display_name = model_name
                 supports_generation = "generateContent" in m.get("supportedGenerationMethods", [])
                 if not supports_generation:
                     continue
 
                 context_length = 0
                 input_limit = m.get("inputTokenLimit", 0)
-                output_limit = m.get("outputTokenLimit", 0)
                 if isinstance(input_limit, (int, float)):
                     context_length = int(input_limit)
 
                 models.append(ModelInfo(
                     id=model_name,
-                    name=display_name,
+                    name=model_name,
                     provider="gemini",
                     context_length=context_length,
                     description=m.get("description", ""),
+                    capabilities=list(m.get("supportedGenerationMethods", [])),
                 ))
 
             models.sort(key=lambda m: m.name.lower())
@@ -177,8 +306,10 @@ def clear_cache(provider_name: str | None = None) -> None:
     """Clear model cache for a provider, or all if None."""
     if provider_name is None:
         _model_cache.clear()
+        _last_source.clear()
     else:
         _model_cache.pop(provider_name, None)
+        _last_source.pop(provider_name, None)
 
 
 def get_api_key_for_provider(provider_name: str) -> str:

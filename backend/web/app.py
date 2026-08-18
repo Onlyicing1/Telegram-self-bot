@@ -2,6 +2,7 @@
 FastAPI micro web server — keeps Render's HTTP health check satisfied
 and exposes read-only API endpoints for the dashboard UI.
 """
+import asyncio
 import logging
 from pathlib import Path
 
@@ -135,15 +136,48 @@ async def api_ai_providers():
     return {"providers": [r.__dict__ for r in results]}
 
 
+@app.get("/api/ai/models")
+async def api_ai_models_all():
+    """Discovered models for every configured (has-key) provider, concurrently."""
+    from backend.ai.discovery import discover_providers
+    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+
+    results = await discover_providers()
+    configured = [r for r in results if r.has_key]
+
+    async def _load(p):
+        api_key = get_api_key_for_provider(p.name)
+        base_url = get_base_url_for_provider(p.name)
+        models = await fetch_models(p.name, api_key, base_url)
+        return {
+            "provider": p.name,
+            "display_name": p.display_name,
+            "icon": p.icon,
+            "status": p.status,
+            "models": [m.__dict__ for m in models[:30]],
+        }
+
+    if not configured:
+        return {"providers": []}
+
+    loaded = await asyncio.gather(*[_load(p) for p in configured], return_exceptions=True)
+    providers = [p for p in loaded if isinstance(p, dict)]
+    return {"providers": providers}
+
+
 @app.get("/api/ai/models/{provider_name}")
 async def api_ai_models(provider_name: str):
-    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider, get_last_fetch_source
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
     if not api_key:
         raise HTTPException(status_code=400, detail="No API key configured for this provider")
     models = await fetch_models(provider_name, api_key, base_url)
-    return {"provider": provider_name, "models": [m.__dict__ for m in models]}
+    return {
+        "provider": provider_name,
+        "source": get_last_fetch_source(provider_name) or "api",
+        "models": [m.__dict__ for m in models],
+    }
 
 
 @app.get("/api/ai/config")
@@ -151,6 +185,36 @@ async def api_ai_config():
     from backend.ai.config_store import get_config
     config = await get_config(_owner_id)
     return config
+
+
+@app.post("/api/ai/provider")
+async def api_ai_set_provider(body: dict):
+    from backend.ai.config_store import update_provider
+    from backend.ai.discovery import get_provider_info
+
+    provider = (body.get("provider") or "").strip()
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required")
+    info = get_provider_info(provider)
+    if not info:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'")
+    ok = await update_provider(_owner_id, provider)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save provider")
+    return {"success": True, "provider": provider, "model": info["default_model"]}
+
+
+@app.post("/api/ai/model")
+async def api_ai_set_model(body: dict):
+    from backend.ai.config_store import update_model
+
+    model = (body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    ok = await update_model(_owner_id, model)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save model")
+    return {"success": True, "model": model}
 
 
 @app.post("/api/ai/triggers")

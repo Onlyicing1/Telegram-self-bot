@@ -169,3 +169,165 @@ def test_api_ai_test_models_endpoint():
     assert "results" in data
     assert "summary" in data
     assert isinstance(data["results"], list)
+
+
+@pytest.mark.asyncio
+async def test_single_model_insufficient_credits_402():
+    mock_response = ProviderResponse(
+        text="Insufficient credits", provider_name="openrouter", success=False,
+        metadata={"http_status": 402, "provider_error_type": "INSUFFICIENT_CREDITS"},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.openrouter.OpenRouterProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("openrouter", "OpenRouter", "🟢", "openrouter/auto")
+    assert res["status"] == "INSUFFICIENT_CREDITS"
+    assert res["http_status"] == 402
+
+
+@pytest.mark.asyncio
+async def test_single_model_insufficient_credits_textual():
+    # OpenRouter-style failure without an HTTP 402: error type/text must still
+    # classify as INSUFFICIENT_CREDITS, not a generic PROVIDER_ERROR.
+    mock_response = ProviderResponse(
+        text="You do not have enough credits to run this request",
+        provider_name="openrouter", success=False,
+        metadata={"provider_error_type": "INSUFFICIENT_CREDITS"},
+    )
+    with patch("backend.ai.model_tester._get_env", return_value="fake_key"):
+        with patch("backend.ai.providers.openrouter.OpenRouterProvider.chat", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = mock_response
+            res = await test_single_model("openrouter", "OpenRouter", "🟢", "openrouter/auto")
+    assert res["status"] == "INSUFFICIENT_CREDITS"
+
+
+@pytest.mark.asyncio
+async def test_single_model_not_configured_makes_no_request():
+    # A provider without a key must NEVER construct a provider instance
+    # or make a network request.
+    with patch("backend.ai.model_tester._get_env", return_value=""):
+        with patch("backend.ai.model_tester.ProviderFactory.create_provider", side_effect=AssertionError("must not create provider")):
+            res = await test_single_model("mistral", "Mistral", "🌬", "mistral-large-latest")
+    assert res["status"] == "NOT_CONFIGURED"
+    assert res["latency_s"] is None
+
+
+@pytest.mark.asyncio
+async def test_test_all_models_caps_per_provider_and_filters():
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+        ProviderStatus(name="groq", display_name="Groq", env_var="AI_GROQ_API_KEY", status="available", has_key=True, validated=True, default_model="llama-3.3-70b-versatile", base_url="https://api.groq.com/openai/v1", icon="⚡"),
+    ]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        prefix = provider_name
+        ms = [ModelInfo(id=f"{prefix}-m{i:02d}", name=f"{prefix}-m{i:02d}", provider=provider_name) for i in range(20)]
+        ms.append(ModelInfo(id="whisper-1", name="whisper-1", provider=provider_name))
+        return ms
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", new_callable=AsyncMock) as mock_test:
+        mock_disc.return_value = fake_providers
+        mock_test.side_effect = fake_test
+        data = await test_all_models(owner_id=0, per_model_timeout=0.5, overall_timeout=10, max_per_provider=3)
+
+    results = data["results"]
+    assert len(results) == 6  # 2 providers × max 3
+    by_provider: dict[str, list[str]] = {}
+    for r in results:
+        by_provider.setdefault(r["provider"], []).append(r["model"])
+    assert len(by_provider["openai"]) <= 3
+    assert len(by_provider["groq"]) <= 3
+    all_models = by_provider["openai"] + by_provider["groq"]
+    assert all("whisper" not in m and "embedding" not in m for m in all_models)
+    assert data["summary"]["available"] == 6
+    assert data["summary"]["discovered"] >= 1
+    assert data["summary"]["total"] == len(results)
+
+
+@pytest.mark.asyncio
+async def test_test_all_models_partial_on_overall_timeout():
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+    ]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [ModelInfo(id="gpt-4o", name="gpt-4o", provider="openai")]
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(1)
+        return {}
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", new_callable=AsyncMock) as mock_test:
+        mock_disc.return_value = fake_providers
+        mock_test.side_effect = slow
+        data = await test_all_models(owner_id=0, per_model_timeout=5, overall_timeout=0.2)
+
+    assert data["partial"] is True
+    assert any(r["status"] == "TIMEOUT" for r in data["results"])
+    assert data["summary"]["timeout"] >= 1
+
+
+def test_api_ai_set_model_endpoint():
+    client = TestClient(app)
+    with patch("backend.ai.config_store.update_model", new_callable=AsyncMock) as mock_upd:
+        mock_upd.return_value = True
+        resp = client.post("/api/ai/model", json={"model": "gpt-4o"})
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert resp.json()["model"] == "gpt-4o"
+    resp2 = client.post("/api/ai/model", json={"model": ""})
+    assert resp2.status_code == 400
+
+
+def test_api_ai_set_provider_endpoint():
+    client = TestClient(app)
+    with patch("backend.ai.config_store.update_provider", new_callable=AsyncMock) as mock_upd:
+        mock_upd.return_value = True
+        resp = client.post("/api/ai/provider", json={"provider": "openai"})
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+    resp2 = client.post("/api/ai/provider", json={"provider": "nonexistent"})
+    assert resp2.status_code == 400
+
+
+def test_api_ai_models_all_endpoint():
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+
+    client = TestClient(app)
+    fake = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+    ]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [ModelInfo(id="gpt-4o", name="gpt-4o", provider="openai")]
+
+    with patch("backend.ai.discovery.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_discovery.fetch_models", side_effect=fake_fetch):
+        mock_disc.return_value = fake
+        resp = client.get("/api/ai/models")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "providers" in data
+    assert data["providers"][0]["provider"] == "openai"
+    assert data["providers"][0]["models"][0]["id"] == "gpt-4o"

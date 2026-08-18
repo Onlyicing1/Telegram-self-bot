@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import type { ProviderStatus, ModelInfo, AIConfig, ModelTestResponse } from '../lib/api';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import type { ProviderStatus, ModelInfo, AIConfig, ModelTestResponse, ModelTestResult, ProviderModels } from '../lib/api';
 import { api } from '../lib/api';
 
 import TriggerConfig from './TriggerConfig';
@@ -26,16 +26,48 @@ const TEST_STATUS_STYLES: Record<string, string> = {
   AUTH_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
   PROVIDER_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
   RATE_LIMITED: 'bg-orange-500/15 text-orange-400 border border-orange-500/30',
+  INSUFFICIENT_CREDITS: 'bg-violet-500/15 text-violet-400 border border-violet-500/30',
   ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
   TIMEOUT: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
   NOT_CONFIGURED: 'bg-slate-500/15 text-slate-400 border border-outline-variant',
   UNKNOWN_ERROR: 'bg-red-500/15 text-red-400 border border-red-500/30',
 };
 
+// Statuses that mean "this model failed its availability test".
+const FAILED_STATUSES = new Set([
+  'UNAVAILABLE', 'AUTH_ERROR', 'PROVIDER_ERROR', 'RATE_LIMITED',
+  'INSUFFICIENT_CREDITS', 'TIMEOUT', 'INVALID_MODEL', 'BLOCKED', 'UNKNOWN_ERROR', 'ERROR',
+]);
+
+const TEST_LABELS: Record<string, string> = {
+  AVAILABLE: 'Available',
+  INVALID_MODEL: 'Invalid model',
+  AUTH_ERROR: 'Auth error',
+  RATE_LIMITED: 'Rate limited',
+  INSUFFICIENT_CREDITS: 'No credits',
+  TIMEOUT: 'Timeout',
+  PROVIDER_ERROR: 'Provider error',
+  BLOCKED: 'Blocked',
+  NOT_CONFIGURED: 'Not configured',
+  UNKNOWN_ERROR: 'Unknown error',
+};
+
+function groupByProvider(results: ModelTestResult[]): Array<{ provider: string; display_name: string; icon: string; items: ModelTestResult[] }> {
+  const map = new Map<string, { provider: string; display_name: string; icon: string; items: ModelTestResult[] }>();
+  for (const r of results) {
+    const key = r.provider;
+    if (!map.has(key)) {
+      map.set(key, { provider: key, display_name: r.display_name, icon: r.icon, items: [] });
+    }
+    map.get(key)!.items.push(r);
+  }
+  return Array.from(map.values()).sort((a, b) => a.display_name.localeCompare(b.display_name));
+}
+
 export default function AIConfigPanel() {
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [config, setConfig] = useState<AIConfig | null>(null);
-  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [modelsByProvider, setModelsByProvider] = useState<ProviderModels[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingModels, setLoadingModels] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,6 +76,10 @@ export default function AIConfigPanel() {
   const [testingModels, setTestingModels] = useState(false);
   const [testResults, setTestResults] = useState<ModelTestResponse | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
+
+  // Model/Provider selection state
+  const [selecting, setSelecting] = useState<string | null>(null);
+  const [selectError, setSelectError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -66,24 +102,29 @@ export default function AIConfigPanel() {
     load();
   }, [load]);
 
-  const loadModels = useCallback(async (providerName: string) => {
-    if (!providerName) return;
+  const loadModelsAll = useCallback(async () => {
     setLoadingModels(true);
     try {
-      const res = await api.aiModels(providerName);
-      setModels(res.models);
+      const res = await api.aiModelsAll();
+      setModelsByProvider(res.providers);
     } catch {
-      setModels([]);
+      setModelsByProvider([]);
     } finally {
       setLoadingModels(false);
     }
   }, []);
 
   useEffect(() => {
-    if (config?.provider) {
-      loadModels(config.provider);
+    loadModelsAll();
+  }, [loadModelsAll]);
+
+  // Re-fetch the model grid after a test run so availability stays fresh.
+  useEffect(() => {
+    if (testResults) {
+      loadModelsAll();
     }
-  }, [config?.provider, loadModels]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [testResults]);
 
   const handleTestModels = async () => {
     setTestingModels(true);
@@ -95,6 +136,48 @@ export default function AIConfigPanel() {
       setTestError(e instanceof Error ? e.message : 'Test request failed');
     } finally {
       setTestingModels(false);
+    }
+  };
+
+  const availabilityMap = useMemo(() => {
+    const map = new Map<string, ModelTestResult>();
+    if (!testResults) return map;
+    for (const r of testResults.results) {
+      map.set(`${r.provider}|${r.model}`, r);
+    }
+    return map;
+  }, [testResults]);
+
+  const handleSelectModel = async (provider: string, model: string) => {
+    if (selecting) return;
+    setSelecting(`${provider}|${model}`);
+    setSelectError(null);
+    try {
+      if (config?.provider !== provider) {
+        await api.aiSetProvider(provider);
+      }
+      await api.aiSetModel(model);
+      await load();
+      await loadModelsAll();
+    } catch (e) {
+      setSelectError(e instanceof Error ? e.message : 'Failed to select model');
+    } finally {
+      setSelecting(null);
+    }
+  };
+
+  const handleSelectProvider = async (provider: string) => {
+    if (selecting || config?.provider === provider) return;
+    setSelecting(`provider:${provider}`);
+    setSelectError(null);
+    try {
+      await api.aiSetProvider(provider);
+      await load();
+      await loadModelsAll();
+    } catch (e) {
+      setSelectError(e instanceof Error ? e.message : 'Failed to select provider');
+    } finally {
+      setSelecting(null);
     }
   };
 
@@ -113,6 +196,39 @@ export default function AIConfigPanel() {
   const available = providers.filter(p => p.status === 'available');
   const notConfigured = providers.filter(p => p.status === 'not_configured');
   const invalid = providers.filter(p => p.status === 'invalid');
+  const configuredProviderNames = new Set(providers.filter(p => p.has_key).map(p => p.name));
+
+  const summary = testResults?.summary;
+
+  const summaryChips: Array<{ label: string; value: number; tone: string }> = summary
+    ? [
+        { label: 'Available', value: summary.available, tone: 'text-emerald-400' },
+        { label: 'Failed', value: summary.failed, tone: 'text-red-400' },
+        { label: 'Rate limited', value: summary.rate_limited, tone: 'text-orange-400' },
+        { label: 'Not configured', value: summary.not_configured, tone: 'text-slate-400' },
+        { label: 'Invalid', value: summary.invalid, tone: 'text-sky-400' },
+        { label: 'No credits', value: summary.insufficient_credits, tone: 'text-violet-400' },
+      ].filter(c => c.value > 0)
+    : [];
+
+  const groupedResults = testResults ? groupByProvider(testResults.results) : [];
+
+  const cardStatus = (pm: ProviderModels, m: ModelInfo): { label: string; cls: string; failed: boolean } => {
+    const isCurrent = config?.provider === pm.provider && config?.model === m.id;
+    if (isCurrent) return { label: '✓ Active', cls: 'text-primary border border-primary/40 bg-primary/10', failed: false };
+    if (!configuredProviderNames.has(pm.provider)) {
+      return { label: '○ Not configured', cls: 'text-slate-500 border border-outline-variant bg-surface-variant/30', failed: false };
+    }
+    const tested = availabilityMap.get(`${pm.provider}|${m.id}`);
+    if (tested) {
+      if (tested.status === 'AVAILABLE') {
+        return { label: '✓ Available', cls: 'text-emerald-400 border border-emerald-500/30 bg-emerald-500/10', failed: false };
+      }
+      const label = TEST_LABELS[tested.status] || tested.status;
+      return { label: `✕ ${label}`, cls: 'text-red-400/90 border border-red-500/25 bg-red-500/10', failed: true };
+    }
+    return { label: '? Not tested', cls: 'text-on-surface-variant border border-outline-variant bg-surface-variant/30', failed: false };
+  };
 
   return (
     <div className="space-y-6">
@@ -179,24 +295,30 @@ export default function AIConfigPanel() {
         )}
       </div>
 
-      {/* Test Error Banner */}
-      {testError && (
+      {/* Action Error Banner */}
+      {(testError || selectError) && (
         <div className="px-4 py-3 rounded-2xl bg-error/10 border border-error/30 text-error text-sm flex items-center justify-between">
-          <span>{testError}</span>
-          <button onClick={() => setTestError(null)} className="text-xs text-on-surface-variant hover:text-on-surface">Dismiss</button>
+          <span>{testError || selectError}</span>
+          <button onClick={() => { setTestError(null); setSelectError(null); }} className="text-xs text-on-surface-variant hover:text-on-surface">Dismiss</button>
         </div>
       )}
 
       {/* Model Test Results */}
       {testResults && (
         <div className="bg-surface-container border border-outline-variant rounded-2xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between flex-wrap gap-2">
             <div>
               <h3 className="text-sm font-semibold text-on-surface uppercase tracking-widest flex items-center gap-2">
                 <span>Model Availability Results</span>
+                {testResults.partial && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                    PARTIAL — overall timeout
+                  </span>
+                )}
               </h3>
               <p className="text-xs text-on-surface-variant mt-0.5">
-                {testResults.summary.available} available · {testResults.summary.unavailable + testResults.summary.error + testResults.summary.timeout} failed · {testResults.summary.not_configured} not configured
+                {summary ? `${summary.tested} tested · ${summary.discovered} discovered` : ''}
+                {testResults.tested_at ? ` · ${testResults.tested_at.substring(0, 19).replace('T', ' ')}` : ''}
               </p>
             </div>
             <button
@@ -207,48 +329,57 @@ export default function AIConfigPanel() {
             </button>
           </div>
 
-          <div className="space-y-2.5">
-            {testResults.results.map((res, i) => (
-              <div
-                key={`${res.provider}-${res.model}-${i}`}
-                className="bg-surface rounded-xl p-3.5 border border-outline-variant/60 space-y-1.5"
-              >
-                <div className="flex items-center justify-between flex-wrap gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="text-base">{res.icon}</span>
-                    <span className="text-sm font-medium text-on-surface">{res.display_name}</span>
-                    <span className="text-xs text-on-surface-variant font-mono truncate max-w-[180px]">
-                      {res.model}
-                    </span>
-                  </div>
+          {/* Summary chips */}
+          {summaryChips.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {summaryChips.map(chip => (
+                <span key={chip.label} className={`text-xs px-2.5 py-1 rounded-full font-medium bg-surface-variant/40 border border-outline-variant ${chip.tone}`}>
+                  {chip.label}: {chip.value}
+                </span>
+              ))}
+            </div>
+          )}
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    {res.latency_s !== null && (
-                      <span className="text-xs text-on-surface-variant font-mono">
-                        {res.latency_s}s
+          {/* Provider-grouped compact results */}
+          <div className="space-y-4">
+            {groupedResults.map(group => (
+              <div key={group.provider} className="space-y-1.5">
+                <h4 className="text-xs font-semibold text-on-surface-variant uppercase tracking-widest flex items-center gap-2">
+                  <span>{group.icon}</span>
+                  <span>{group.display_name}</span>
+                  <span className="flex-1 h-px bg-outline-variant/60" />
+                </h4>
+                {group.items.map((res, i) => (
+                  <div
+                    key={`${res.provider}-${res.model}-${i}`}
+                    className="bg-surface rounded-xl px-3.5 py-2.5 border border-outline-variant/60"
+                  >
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-sm text-on-surface font-mono truncate min-w-0">
+                        {res.model}
                       </span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {res.latency_s !== null && (
+                          <span className="text-xs text-on-surface-variant font-mono">{res.latency_s}s</span>
+                        )}
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${TEST_STATUS_STYLES[res.status] || TEST_STATUS_STYLES.NOT_CONFIGURED}`}>
+                          {TEST_LABELS[res.status] || res.status}
+                        </span>
+                      </div>
+                    </div>
+                    {(res.http_status !== null || res.error) && (
+                      <details className="mt-1.5 group">
+                        <summary className="text-[11px] text-on-surface-variant cursor-pointer select-none hover:text-on-surface">
+                          {res.http_status !== null ? `HTTP ${res.http_status}${res.retry_after !== null && res.retry_after !== undefined ? ` · retry-after: ${res.retry_after}s` : ''}` : 'Details'}
+                          {res.error && ' — tap to expand'}
+                        </summary>
+                        {res.error && (
+                          <p className="mt-1 text-[11px] text-red-400/90 font-mono break-words">{res.error}</p>
+                        )}
+                      </details>
                     )}
-                    <span
-                      className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
-                        TEST_STATUS_STYLES[res.status] || TEST_STATUS_STYLES.NOT_CONFIGURED
-                      }`}
-                    >
-                      {res.status}
-                    </span>
                   </div>
-                </div>
-
-                {res.http_status !== null && res.http_status !== undefined && (
-                  <p className="text-xs text-on-surface-variant font-mono pl-7">
-                    HTTP {res.http_status}
-                    {res.retry_after !== null && res.retry_after !== undefined && ` · retry-after: ${res.retry_after}s`}
-                  </p>
-                )}
-                {res.error && (
-                  <p className="text-xs text-red-400/90 font-mono pl-7 break-words">
-                    {res.error}
-                  </p>
-                )}
+                ))}
               </div>
             ))}
           </div>
@@ -264,68 +395,89 @@ export default function AIConfigPanel() {
       {available.length > 0 && (
         <div>
           <h3 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest mb-3">
-            Available Providers
+            Providers
           </h3>
-          <div className="space-y-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {available.map(p => (
-              <div
+              <button
                 key={p.name}
-                className={`bg-surface-container rounded-2xl px-5 py-4 border transition-colors ${
+                onClick={() => handleSelectProvider(p.name)}
+                disabled={selecting !== null || config?.provider === p.name}
+                className={`text-left bg-surface-container rounded-2xl px-4 py-3 border transition-colors ${
                   config?.provider === p.name
                     ? 'border-primary/40 bg-primary/5'
                     : 'border-outline-variant hover:border-primary/30'
-                }`}
+                } disabled:opacity-70`}
               >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-3 min-w-0">
                     <span className="text-lg">{p.icon}</span>
-                    <div>
-                      <p className="text-sm font-medium text-on-surface">{p.display_name}</p>
-                      <p className="text-xs text-on-surface-variant font-mono">{p.default_model}</p>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-on-surface truncate">{p.display_name}</p>
+                      <p className="text-xs text-on-surface-variant font-mono truncate">{p.default_model}</p>
                     </div>
                   </div>
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_STYLES.available}`}>
-                    {config?.provider === p.name ? '✓ Selected' : 'Available'}
+                  <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${STATUS_STYLES.available}`}>
+                    {selecting === `provider:${p.name}` ? '…' : config?.provider === p.name ? '✓ Selected' : 'Select'}
                   </span>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         </div>
       )}
 
-      {/* Models */}
-      {config?.provider && models.length > 0 && (
+      {/* Model Selection — compact multi-column grid */}
+      {modelsByProvider.length > 0 && (
         <div>
           <h3 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest mb-3">
-            Models for {config.provider.charAt(0).toUpperCase() + config.provider.slice(1)}
+            Models
+            {loadingModels && <span className="ml-2 text-xs font-normal text-on-surface-variant animate-pulse">refreshing…</span>}
           </h3>
-          <div className="bg-surface-container border border-outline-variant rounded-2xl overflow-hidden">
-            <div className="divide-y divide-outline-variant/50 max-h-64 overflow-y-auto">
-              {models.map(m => (
-                <div
-                  key={m.id}
-                  className={`px-5 py-3 flex items-center justify-between ${
-                    config.model === m.id ? 'bg-primary/5' : 'hover:bg-surface-variant/30'
-                  } transition-colors`}
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm text-on-surface font-mono truncate">{m.name}</p>
-                    {m.context_length > 0 && (
-                      <p className="text-xs text-on-surface-variant">
-                        {m.context_length >= 1000
-                          ? `${Math.round(m.context_length / 1000)}K context`
-                          : `${m.context_length} context`}
-                      </p>
-                    )}
-                  </div>
-                  {config.model === m.id && (
-                    <span className="text-xs text-primary font-medium shrink-0">✓ Active</span>
-                  )}
-                </div>
-              ))}
-            </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
+            {modelsByProvider.map(pm =>
+              pm.models.map(m => {
+                const status = cardStatus(pm, m);
+                const isCurrent = config?.provider === pm.provider && config?.model === m.id;
+                const key = `${pm.provider}|${m.id}`;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => handleSelectModel(pm.provider, m.id)}
+                    disabled={selecting !== null || (status.failed && !isCurrent)}
+                    title={status.failed && !isCurrent ? `${status.label} — select only models that work for chat` : undefined}
+                    className={`text-left bg-surface-container rounded-xl px-3.5 py-3 border transition-colors ${
+                      isCurrent
+                        ? 'border-primary/50 bg-primary/5'
+                        : 'border-outline-variant hover:border-primary/30'
+                    } disabled:opacity-60 disabled:cursor-not-allowed`}
+                  >
+                    <div className="flex items-center gap-1.5 text-[11px] text-on-surface-variant mb-1">
+                      <span>{pm.icon}</span>
+                      <span className="truncate">{pm.display_name}</span>
+                    </div>
+                    <p className={`text-sm font-mono truncate ${isCurrent ? 'text-primary' : 'text-on-surface'}`}>
+                      {m.name}
+                    </p>
+                    <div className="mt-1.5 flex items-center justify-between gap-2">
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${status.cls}`}>
+                        {status.label}
+                      </span>
+                      {selecting === key && <span className="text-[10px] text-on-surface-variant animate-pulse">saving…</span>}
+                      {m.context_length > 0 && !isCurrent && (
+                        <span className="text-[10px] text-on-surface-variant shrink-0">
+                          {m.context_length >= 1000 ? `${Math.round(m.context_length / 1000)}K` : `${m.context_length}`}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })
+            )}
           </div>
+          <p className="mt-2 text-[11px] text-on-surface-variant">
+            Statuses come from the latest <span className="font-medium">Test Models</span> run. Failed models are disabled unless already selected.
+          </p>
         </div>
       )}
 
