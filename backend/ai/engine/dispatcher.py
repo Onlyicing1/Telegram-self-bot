@@ -127,6 +127,13 @@ class Dispatcher:
 
         safe_call(self._hooks, "before_execution", request)
 
+        # Native tool definitions are computed once and passed to every
+        # provider round so the model can emit real tool calls (save,
+        # delete, search, ...). Providers translate this OpenAI-format list
+        # into their own API shape (e.g. Gemini functionDeclarations).
+        tool_definitions = self._build_tool_definitions()
+        chat_kwargs: dict[str, Any] = {"tools": tool_definitions} if tool_definitions else {}
+
         # ── Stage 1: Conversation Runtime ──
         try:
             session = self._conversation.get_session(request.owner_id)
@@ -169,7 +176,7 @@ class Dispatcher:
         # ── Stage 4: Provider + Tool Loop ──
         try:
             messages = self._build_messages(prompt_package)
-            response: ProviderResponse = await self._provider_manager.chat(messages)
+            response: ProviderResponse = await self._provider_manager.chat(messages, **chat_kwargs)
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
@@ -231,7 +238,7 @@ class Dispatcher:
 
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
             try:
-                cont_response: ProviderResponse = await self._provider_manager.chat(continuation_messages)
+                cont_response: ProviderResponse = await self._provider_manager.chat(continuation_messages, **chat_kwargs)
                 safe_call(self._hooks, "after_provider", cont_response)
                 metadata["stages"].append(f"provider_continuation_{round_num + 1}")
             except Exception as exc:  # noqa: BLE001
@@ -384,6 +391,49 @@ class Dispatcher:
             extra=extra,
         )
 
+    def _build_tool_definitions(self) -> list[dict[str, Any]]:
+        """Build native OpenAI-format tool definitions from the registry.
+
+        The registry's ``list_schemas()`` returns a flat ``parameters``
+        dict (param name → JSON-schema-ish descriptor). Providers need a
+        full function-calling schema, so we wrap it as
+        ``{"type": "object", "properties": {...}}``. Params without a
+        ``default`` are treated as required so providers surface them to
+        the model.
+        """
+        if not self._tool_registry or self._tool_registry.is_empty():
+            return []
+
+        definitions: list[dict[str, Any]] = []
+        for schema in self._tool_registry.list_schemas():
+            raw_params = schema.get("parameters") or {}
+            if isinstance(raw_params, dict):
+                if "properties" in raw_params:
+                    properties = raw_params.get("properties") or {}
+                    required = raw_params.get("required") or []
+                else:
+                    properties = raw_params
+                    required = [
+                        name for name, info in raw_params.items()
+                        if isinstance(info, dict) and "default" not in info
+                    ]
+            else:
+                properties = {}
+                required = []
+
+            function_def: dict[str, Any] = {
+                "name": schema["name"],
+                "description": schema.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                },
+            }
+            if required:
+                function_def["parameters"]["required"] = required
+            definitions.append({"type": "function", "function": function_def})
+        return definitions
+
     def _render_tool_schemas(self, schemas: list[dict[str, Any]]) -> str:
         """Render tool schemas into a compact text block for the prompt."""
         if not schemas:
@@ -400,7 +450,13 @@ class Dispatcher:
                         ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
                         parts.append(f"{pname}({ptype})")
                     param_str = ", ".join(parts)
-            safe_badge = "safe" if s.get("safe") else "needs-confirm"
+            level = s.get("permission_level", "")
+            if level in ("admin_only", "confirmation_required"):
+                safe_badge = "needs-confirm"
+            elif level == "dangerous":
+                safe_badge = "destructive-on-explicit-request"
+            else:
+                safe_badge = "safe"
             lines.append(
                 f"  - {s['name']}({param_str}) — {s['description']} [{safe_badge}]"
             )

@@ -16,8 +16,10 @@ account. A **FastAPI** micro-server runs in the same process to serve
 `/health` (Render/health checks) and a read-only React dashboard.
 
 The user interface is **Glass UI first**: an inline panel system opened via
-`.menu` and rendered through an optional helper bot. There are exactly two
-text dot commands (`.menu`, `.ai`); everything else is a panel/action/input.
+`.menu` and rendered through an optional helper bot. There is exactly ONE
+text dot command (`.menu`); everything else is a panel/action/input or a
+natural-language AI request addressed to the assistant (default trigger
+`Nova`).
 
 Core subsystems:
 
@@ -75,7 +77,6 @@ backend/
 │       ├── bio.py                   # Bio profile panels
 │       ├── username.py              # Username profile panels
 │       ├── ai.py                    # AI config/status panels + AI trigger config inputs
-│       ├── ai_cmd.py                # .ai <text> (thin wrapper over ai_unified)
 │       ├── ai_unified.py            # canonical trigger/reply AI activation
 │       └── organize.py              # no-op stub (moved to other panels)
 │
@@ -184,12 +185,14 @@ logic or are under test — see INVESTIGATION.md):
 All handlers fire on `events.NewMessage(outgoing=True)`. Every handler calls
 `is_owner(event, owner_id)` first; non-owners are silently ignored.
 
-### Dot commands (exactly two)
+### Dot command (exactly one)
 
 | Command | Pattern | Behavior |
 |---|---|---|
 | `.menu` | `^\.menu$` | Opens the Glass UI mother panel (inline via helper bot; falls back to edit-in-place text if the helper is unavailable). |
-| `.ai <text>` | `^\.ai(?:\s+(.+))?$` | Runs the AI pipeline through the canonical `ai_unified._execute_ai`. With no text, shows usage. |
+
+There are no other dot commands. Legacy text commands (`.ping`, `.help`,
+`.save`, `.del`, `.bio`, `.username`, `.ai`, ...) have been removed.
 
 ### AI activation (no dot command required)
 
@@ -197,14 +200,16 @@ All handlers fire on `events.NewMessage(outgoing=True)`. Every handler calls
 handler. It fires on every outgoing non-dot message and supports:
 
 1. **Trigger mode** — message starts with the configured trigger word
-   (e.g. `Nova <text>`); the trigger is stripped and the rest is the prompt.
+   (default English trigger `Nova`, e.g. `Nova <text>`); the trigger is
+   stripped and the rest is the prompt.
 2. **Reply-aware trigger** — a reply to a message using the trigger word; the
    replied-to content is injected as context.
 3. **Reply-to-AI** — replying to a known AI message with plain text activates
    the AI with that text (continuation).
 
-There is no `ai_trigger.py` module. `ai_cmd.py` is a thin `.ai` wrapper over
-the same `_execute_ai` pipeline.
+The trigger/reply handler resolves the intent into **native tool calls**
+(save, delete, search, ...) and executes them through the shared service
+layer — it is an execution interface, never just a text response.
 
 ### Glass UI (primary interface)
 
@@ -297,15 +302,22 @@ error.
 
 ## 9. AI System
 
-- **Entry points**: `.ai <text>` (via `ai_cmd.py`) and trigger/reply activation
-  (via `ai_unified.py`). Both delegate to `_execute_ai`.
+- **Entry point**: trigger/reply activation (via `ai_unified.py`), which
+  delegates to `_execute_ai`. Default English trigger word is `Nova`.
+- **Native tools**: the dispatcher passes OpenAI-format tool definitions to
+  providers (Gemini translates them to `functionDeclarations`), so the model
+  emits real function calls that the `ToolExecutor` runs.
 - **Providers**: `openai`, `gemini`, `openrouter`, `groq`, `cerebras`,
   `mistral`, and `dummy`. Provider selection and fallback live in
   `backend/ai/providers/`.
 - **Tools**: stateless wrappers over services (`save`, `retrieve`, `delete`,
   `bio_*`, `username_*`, `organize_*`, `settings_*`, …). The `ToolExecutor`
-  is the sole component that calls `tool.execute()`. Tools with
-  `long_running=True` (Deep Save) are exempt from the generic tool timeout.
+  is the sole component that calls `tool.execute()`. The owner's message IS
+  the authorization in this single-owner self-bot, so deterministic
+  destructive tools (delete with an explicit count) execute directly;
+  `ADMIN_ONLY`/`CONFIRMATION_REQUIRED` still require confirmation. Tools
+  with `long_running=True` (Deep Save) are exempt from the generic tool
+  timeout.
 - **HTTP**: providers use `httpx.AsyncClient` (async) — no sync HTTP in the
   loop. The handler wraps the AI request in a bounded `wait_for`.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`

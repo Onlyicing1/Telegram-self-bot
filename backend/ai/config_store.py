@@ -28,7 +28,7 @@ _DEFAULTS: dict[str, Any] = {
     "system_prompt": "",
     "history_budget": 4000,
     "is_configured": False,
-    "trigger_en": "",
+    "trigger_en": "Nova",
     "trigger_fa": "",
 }
 

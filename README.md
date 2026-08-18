@@ -41,8 +41,15 @@ on **Render**.
 
 LifeOS is a **self-bot** — it operates *your own* Telegram account via
 Telethon's `StringSession`. There is no separate bot account for commands.
-You type commands (`.menu`, `.help`, `.ping`) in any chat, and the bot
-edits your message in-place with the result. Zero spam, zero new messages.
+
+You interact through the **Inline Glass UI** — `.menu` opens the panel
+system — and through the **AI assistant**: address it by name (e.g.
+`Nova`) and it **executes real actions**, not just text. Responses edit
+your message in-place. Zero spam, zero new messages.
+
+**`.menu` is the only dot-prefixed text command.** All legacy dot
+commands (`.ping`, `.help`, `.save`, `.del`, `.bio`, `.username`,
+`.ai`, ...) have been removed in favor of the Glass UI and AI execution.
 
 When a helper bot token is configured, the full **Inline Glass UI**
 becomes available — interactive inline-button panels for every feature.
@@ -120,22 +127,20 @@ lifeos/
 │   │
 │   ├── bot/                    # Telegram self-bot layer
 │   │   ├── client.py           # Telethon StringSession client
-│   │   ├── router.py           # Command router (all . commands)
-│   │   └── handlers/           # Per-feature command handlers
-│   │       ├── ai_cmd.py       # .ai command handler
-│   │       ├── ai.py           # AI Glass Panel (settings, provider, triggers, etc.)
-│   │       ├── ai_cmd.py     # .ai command handler (DEPRECATED — use triggers)
-│   │       ├── ai_trigger.py # Trigger-based AI activation (default method)
+│   │   ├── router.py           # Handler registration (all handlers)
+│   │   └── handlers/           # Glass panels + AI activation
+│   │       ├── misc.py         # .menu (mother panel) + settings/health/context
+│   │       ├── save.py         # Deep Save panel/actions/inputs
+│   │       ├── retrieve.py     # Saved-items browser (under Save)
+│   │       ├── delete.py       # Delete panel/actions/inputs
+│   │       ├── discover.py     # List + Find panels
+│   │       ├── database.py     # Database maintenance panel
 │   │       ├── bio.py          # Bio Glass panel
-│   │       ├── database.py     # .db command + panel
-│   │       ├── delete.py       # .del command + panel
-│   │       ├── discover.py     # .list, .find commands
+│   │       ├── username.py     # Username Glass panel
+│   │       ├── ai.py           # AI Glass Panel (settings, provider, triggers, etc.)
+│   │       ├── ai_unified.py   # Trigger/reply AI activation (Nova)
 │   │       ├── guard.py        # Owner-only permission check
-│   │       ├── misc.py         # .ping, .id, .help, .health, .kill
-│   │       ├── organize.py     # LifeOS status panel
-│   │       ├── retrieve.py     # .retrieve, .preview, .send
-│   │       ├── save.py         # .save command + panel
-│   │       └── username.py     # Username Glass panel
+│   │       └── organize.py     # no-op stub (moved to other panels)
 │   │
 │   ├── services/               # Business logic (between handlers and DB)
 │   │   ├── save_service.py
@@ -398,26 +403,49 @@ Edit triggering message with response
 
 ### Execution Pipeline
 
-1. The trigger handler (`ai_trigger.py`) detects a trigger match.
+1. The trigger handler (`ai_unified.py`) detects a trigger match (or a
+   reply to a known AI message).
 2. It restores the saved provider/model from Supabase.
-3. It builds an `AIRequest` with the stripped message.
+3. It builds an `AIRequest` with the stripped message plus Telegram
+   context (current chat, replied-to message, sender, media, ...).
 4. The Engine delegates to the Dispatcher, which runs 6 stages:
    - Gets or creates a conversation session for the owner
    - Builds the prompt (system prompt + conversation history + memory)
-   - Routes to the active provider (with fallback chain)
-   - Calls the provider's `chat()` method
-   - Updates the conversation history with the response
+   - Injects native tool definitions and routes to the active provider
+   - Calls the provider's `chat()` method (with native function calling)
+   - Runs tool calls through the ToolExecutor (save, delete, search, ...)
    - Returns an `EngineResult`
 5. The handler edits the triggering message with the AI response.
-6. If the provider returned tool calls, the ToolExecutor runs them
-   (READ_ONLY and READ_WRITE auto-execute; DANGEROUS and ADMIN_ONLY
-   require owner confirmation).
 
-### Backward Compatibility
+### AI Execution (Nova is an execution interface, not just chat)
 
-The old `.ai <message>` command is deprecated but still works. Users
-should migrate to the trigger system. The trigger system is the default
-activation method.
+When the owner asks Nova to do something, the AI resolves the intent
+into a **real tool call** on the existing execution layer:
+
+```
+Nova, save this                  → SaveTool  → execute_save()
+Nova, deep save this             → SaveTool  → execute_save() (Deep Save)
+Nova, delete the last 5 messages → DeleteTool → delete_service.do_del_n_counts()
+```
+
+The execution pipeline is:
+
+```
+Natural language
+  → intent resolution (native tool call)
+  → argument validation
+  → real execution (existing service function)
+  → real result (success/failure)
+  → AI response based on the REAL result
+```
+
+Nova **never** claims an action succeeded unless the underlying service
+actually returned success. If a save/download/delete fails, the AI
+reports the real failure — it never fabricates a confirmation.
+
+Destructive actions (delete) resolve a deterministic target/count from
+the request (e.g. `delete` with `count=5`). If the target or count is
+ambiguous, the AI asks for clarification instead of guessing.
 
 ### Provider Selection
 
@@ -516,8 +544,8 @@ captures:
 - Result (SUCCESS / FAILED / ERROR)
 - Details (error message or summary)
 
-Events are visible via the `.logs` command and the `.kill` diagnostic
-snapshot. The tracer never blocks — it writes to an in-memory list.
+Events are visible via the Diagnostics / Health Dashboard panels. The
+tracer never blocks — it writes to an in-memory list.
 
 ---
 
@@ -837,8 +865,8 @@ Requires `BOT_TOKEN` (helper bot).
 
 ### Save System
 
-- **Forward save** (`.save f`) — forwards to Saved Messages instantly
-- **Deep save** (`.save d`) — download + re-upload with rich caption
+- **Deep Save only** — download + re-upload as a NEW Saved Messages
+  message (there is no Forward Save)
 - **Link save** — save from a Telegram message link
 - **Metadata persistence** — full metadata in `saved_items` table
 - **Save codes** — compact codes (e.g. `S0001`)
@@ -877,8 +905,8 @@ failures → client declared dead → recovery triggered.
 
 ### Diagnostics
 
-Event log (`.logs`), diagnostic snapshot (`.kill`), asyncio task
-diagnostics, and runtime heartbeat.
+In-memory event log, diagnostic snapshot, asyncio task diagnostics, and
+runtime heartbeat (available from the Health/Dashboard panels).
 
 ### AI Assistant
 
@@ -890,80 +918,47 @@ the web dashboard. See [How AI Works](#how-ai-works) above.
 
 ## Commands
 
-All commands use the `.` prefix. Only fire on outgoing messages.
+`.menu` is the **only** dot-prefixed text command. It opens the Glass UI
+mother panel. Every other feature is accessed through the Glass UI
+(inline buttons) or through the AI assistant (address it by name, e.g.
+`Nova`).
 
-### Utility
+### Glass UI (`.menu`)
 
-| Command | Description |
+| Panel | Access |
 |---|---|
-| `.ping` | PONG |
-| `.id` | Chat & Message IDs |
-| `.help` | Interactive help panel |
-| `.panel` | Context panel for replied message |
-| `.health` | Health dashboard |
-| `.kill` | Diagnostic snapshot + recovery |
-| `.logs` | Event log viewer |
-| `.ai <message>` | AI assistant (deprecated — use trigger words) |
+| Save (Deep Save) | `.menu` → **📥 Save** |
+| Retrieve | `.menu` → **📥 Save** → **🔍 Retrieve** |
+| Delete | `.menu` → **🗑 Delete** |
+| List / Find | `.menu` → **📋 List** / **🔍 Find** |
+| Database | `.menu` → **🗄 Database** |
+| AI | `.menu` → **🧠 AI** |
+| Bio | `.menu` → **Profile** → **🧬 Bio** |
+| Username | `.menu` → **Profile** → **👤 Username** |
+| Settings / Health / Context | `.menu` → respective panels |
 
-### Save Engine
+### AI (Nova)
 
-| Command | Description |
-|---|---|
-| `.save f` | Forward save to Saved Messages |
-| `.save d` | Deep save (download + re-upload) |
-| `.save` | Save panel (Inline Glass UI) |
+Activate the AI by starting a message with the trigger word (default
+`Nova`), or by replying to a known AI message with plain text.
 
-### Retrieve & Discover
+```
+Nova, save this
+Nova, deep save this
+Nova, delete the last 10 messages
+Nova, what are my saved items?
+```
 
-| Command | Description |
-|---|---|
-| `.retrieve` / `.r` / `.files` | Browse saved items |
-| `.preview <code>` | Show metadata for a saved item |
-| `.send <code>` | Forward saved asset to current chat |
-| `.list [n]` | Show recent saved items |
-| `.find <text>` | Search saved items |
+These are **execution requests**, not just chat. Nova resolves the
+intent to a tool call, runs the existing execution function, and
+reports the **real** result.
 
-### Delete
+### Removed legacy dot commands
 
-| Command | Description |
-|---|---|
-| `.del <n>` | Delete last N outgoing messages |
-| `.del id <msgid>` | Delete from message ID forward |
-| `.del <code>` | Delete a saved item |
-| `.del` | Delete panel |
-
-### Bio Engine
-
-Managed through the Inline Glass UI: `.menu` → **Profile** → **Bio**.
-
-| Action | Description |
-|---|---|
-| Enable / Disable Sync | Start / stop bio cron |
-| Show State | Show bio state |
-| Template Builder | Set bio template |
-| Set Text | Set {text} token |
-| Set Mood | Set {mood} token |
-
-### Username Engine
-
-Managed through the Inline Glass UI: `.menu` → **Profile** → **Username**.
-
-| Action | Description |
-|---|---|
-| Enable / Disable Sync | Start / stop username cron |
-| Show State | Show username state |
-| Template Builder | Set username template |
-| Set Text | Set {text} token |
-| Set Mood | Set {mood} token |
-
-### Database
-
-| Command | Description |
-|---|---|
-| `.db` | Database panel |
-| `.db clean` | Remove orphan rows |
-| `.db stats` | Database statistics |
-| `.db vacuum` | Cleanup + optimize |
+The following text commands no longer exist and are not hidden aliases:
+`.ping`, `.id`, `.help`, `.health`, `.kill`, `.logs`, `.save`, `.save f`,
+`.save d`, `.del`, `.retrieve`, `.preview`, `.send`, `.list`, `.find`,
+`.db`, `.bio`, `.username`, `.ai`.
 
 ---
 
@@ -985,7 +980,7 @@ Managed through the Inline Glass UI: `.menu` → **Profile** → **Username**.
 
 - Check that the engine is active (`.menu` → **Profile** → **Bio/Username** → **Show State**).
 - Check that the template contains at least one token.
-- Check the shared Profile Scheduler is running (visible in `.health`).
+- Check the shared Profile Scheduler is running (visible in the Health Dashboard panel).
 - Check for `FloodWaitError` in logs.
 
 ### Database errors
@@ -997,18 +992,16 @@ Managed through the Inline Glass UI: `.menu` → **Profile** → **Username**.
 ### Client keeps disconnecting
 
 - The watchdog automatically detects disconnections and rebuilds.
-- Check `.health` for restart count and last rebuild reason.
-- Check `.kill` for a full diagnostic snapshot.
+- Check the Health Dashboard panel for restart count and last rebuild reason.
+- Check the Diagnostics panel for a full snapshot.
 
 ### AI not responding
 
-- Check `AI_ENABLED=true` is set.
 - Check that a provider API key is configured (e.g. `AI_OPENAI_API_KEY`).
-- Check that at least one trigger word is configured (English or Persian).
+- The default English trigger word is `Nova` — send `Nova <request>` to
+  activate the AI. Change it in the AI Settings panel.
 - Without an API key, the DummyProvider returns a placeholder.
-- Without trigger words, AI will not activate.
-- Check `.health` for the AI engine status.
-- The old `.ai` command still works as a fallback (deprecated).
+- Check the Health Dashboard panel for the AI engine status.
 
 ---
 

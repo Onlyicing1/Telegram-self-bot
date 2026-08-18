@@ -105,6 +105,24 @@ class GeminiProvider(BaseProvider):
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
+        tools = kwargs.get("tools")
+        if tools:
+            declarations: list[dict[str, Any]] = []
+            for tool_def in tools:
+                fn = tool_def.get("function", {}) if isinstance(tool_def, dict) else {}
+                params = fn.get("parameters") or {}
+                decl: dict[str, Any] = {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                }
+                if isinstance(params, dict) and params:
+                    params_copy = dict(params)
+                    if params_copy.get("type") == "object":
+                        params_copy["type"] = "OBJECT"
+                    decl["parameters"] = params_copy
+                declarations.append(decl)
+            payload["tools"] = [{"functionDeclarations": declarations}]
+
         for attempt in range(self._config.retry_count + 1):
             try:
                 t0 = time.perf_counter()

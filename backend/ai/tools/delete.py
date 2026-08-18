@@ -37,8 +37,7 @@ class DeleteTool(Tool):
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 500,
-                "default": 1,
-                "description": "Number of messages to delete.",
+                "description": "Number of messages to delete (required, 1-500).",
             },
         }
 
@@ -57,7 +56,15 @@ class DeleteTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import delete_service
 
-        count = arguments.get("count", 1)
+        count = arguments.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1 or count > 500:
+            return ToolResult(
+                success=False,
+                message=(
+                    "Delete requires an explicit count between 1 and 500 "
+                    "(e.g. 'delete the last 5 messages'). No messages were deleted."
+                ),
+            )
         chat_id = context.extra.get("chat_id") if context.extra else None
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")
@@ -134,8 +141,11 @@ class DeleteByIdTool(Tool):
         from backend.services import delete_service
 
         message_id = arguments.get("message_id")
-        if message_id is None:
-            return ToolResult(success=False, message="Missing message_id argument.")
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            return ToolResult(
+                success=False,
+                message=("Delete by ID requires an explicit message ID. No messages were deleted."),
+            )
         chat_id = context.extra.get("chat_id") if context.extra else None
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")

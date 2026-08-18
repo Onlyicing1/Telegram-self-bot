@@ -14,10 +14,13 @@ The executor is the SOLE component that calls ``tool.execute()``. The
 Engine and Dispatcher never call tools directly.
 
 Safety:
-  - READ_ONLY and READ_WRITE tools execute automatically.
-  - DANGEROUS, ADMIN_ONLY, and CONFIRMATION_REQUIRED tools return a
-    "confirmation required" result instead of executing. The caller
-    (Engine) must surface this to the owner for confirmation.
+  - READ_ONLY, READ_WRITE, and DANGEROUS tools execute directly. This is
+    a single-owner self-bot: the owner's outgoing message is the explicit
+    instruction and authorization. Destructive tools enforce deterministic
+    arguments in their own ``execute()``.
+  - ADMIN_ONLY and CONFIRMATION_REQUIRED tools return a "confirmation
+    required" result instead of executing. The caller (Engine) must
+    surface this to the owner for confirmation.
   - Unknown tools return an error result.
   - Every execution is wrapped in try/except — the executor never raises.
 """
@@ -263,9 +266,19 @@ class ToolExecutor:
             )
 
     def _is_auto_executable(self, tool: Any) -> bool:
-        """Check if a tool can execute without owner confirmation."""
+        """Check if a tool can execute without a confirmation round-trip.
+
+        READ_ONLY, READ_WRITE, and DANGEROUS tools execute directly: the
+        owner's message IS the authorization in this single-owner self-bot,
+        and destructive tools validate deterministic arguments themselves.
+        ADMIN_ONLY and CONFIRMATION_REQUIRED still require confirmation.
+        """
         level = tool.permission_level
-        return level in (PermissionLevel.READ_ONLY, PermissionLevel.READ_WRITE)
+        return level in (
+            PermissionLevel.READ_ONLY,
+            PermissionLevel.READ_WRITE,
+            PermissionLevel.DANGEROUS,
+        )
 
     def _record_history(
         self,

@@ -85,6 +85,9 @@ class OpenAICompatProvider(BaseProvider):
         }
         if "top_p" in kwargs:
             payload["top_p"] = kwargs["top_p"]
+        tools = kwargs.get("tools")
+        if tools:
+            payload["tools"] = tools
 
         for attempt in range(self._config.retry_count + 1):
             try:
