@@ -1,8 +1,5 @@
 """
-.del <n>         — Delete the last n outgoing messages in this chat.
-.del id <msgid>  — Delete all messages from <msgid> forward in this chat.
-.del <code>      — Delete a saved item: Telegram message + DB row.
-.del             — Inline panel: choose deletion mode.
+Delete Engine — Glass UI only (no dot commands).
 
 Delete-From-Message methods:
   - Reply Mode: wait for reply, delete from replied message forward

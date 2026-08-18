@@ -4,9 +4,8 @@ Diagnostics module — event history (black box) + .kill diagnostic snapshot.
 Provides:
   - An in-memory circular event log (500 entries, automatic overwrite)
   - Event recording from every subsystem (Telethon, Bio, DB, Save, etc.)
-  - A complete diagnostic snapshot of all subsystems for .kill
-  - Stalled-task detection and selective recovery
-  - Event filtering and formatting for .logs
+  - A complete diagnostic snapshot of all subsystems
+  - Event filtering and formatting
 
 The diagnostic snapshot now reads from the RuntimeSupervisor when
 available, falling back to direct module access for backward compatibility.
@@ -258,63 +257,3 @@ def build_diagnostic_report(client, bio_engine, db_client, health_snap: dict) ->
     sections.append("")
     sections.extend(_collect_last_events_section())
     return "\n".join(sections)
-
-
-async def recover_stalled(client, owner_id: int, tz_str: str, bio_engine, db_client) -> str:
-    """Recover stalled tasks. Uses RuntimeSupervisor if available."""
-    stalled = []
-    recovered = []
-    still_unhealthy = []
-
-    current = asyncio.current_task()
-    protected = {
-        "lifeos-tg-supervisor", "lifeos-watchdog", "lifeos-heartbeat",
-        "lifeos-web", "lifeos-liveness", "lifeos-helper-supervisor",
-        "lifeos-helper-watchdog",
-    }
-    for task in asyncio.all_tasks():
-        if task is current or task.done():
-            continue
-        name = task.get_name()
-        if name in protected:
-            continue
-        coro = task.get_coro()
-        if coro is None:
-            continue
-        frame = coro.cr_frame
-        if frame is None:
-            continue
-        stalled.append(task)
-
-    for task in stalled:
-        name = task.get_name()
-        try:
-            task.cancel()
-            await asyncio.wait_for(task, timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-        recovered.append(name)
-
-    if not bio_engine.is_running():
-        try:
-            bio_engine.start_cron(client, owner_id, tz_str)
-            await asyncio.sleep(1)
-            if bio_engine.is_running():
-                recovered.append("Bio Cron restarted")
-            else:
-                still_unhealthy.append("Bio Cron failed to restart")
-        except Exception as exc:
-            still_unhealthy.append(f"Bio Cron restart error: {exc}")
-
-    lines = ["", "=== RECOVERY ==="]
-    if recovered:
-        lines.append("Recovered:")
-        for r in recovered:
-            lines.append(f"  ✔ {r}")
-    if still_unhealthy:
-        lines.append("Still unhealthy:")
-        for u in still_unhealthy:
-            lines.append(f"  ✖ {u}")
-    if not recovered and not still_unhealthy:
-        lines.append("No stalled tasks detected — nothing to recover.")
-    return "\n".join(lines)

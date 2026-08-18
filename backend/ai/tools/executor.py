@@ -210,10 +210,16 @@ class ToolExecutor:
 
         start = time.perf_counter()
         try:
-            tool_result: ToolResult = await asyncio.wait_for(
-                tool.execute(ctx, arguments),
-                timeout=TOOL_TIMEOUT_SECONDS,
-            )
+            # Long-running tools (e.g. Deep Save media transfer) must not be
+            # cancelled by the generic short tool timeout. Other tools keep the
+            # bounded timeout so a stuck tool cannot hang a request forever.
+            if getattr(tool, "long_running", False):
+                tool_result: ToolResult = await tool.execute(ctx, arguments)
+            else:
+                tool_result: ToolResult = await asyncio.wait_for(
+                    tool.execute(ctx, arguments),
+                    timeout=TOOL_TIMEOUT_SECONDS,
+                )
             latency_ms = (time.perf_counter() - start) * 1000
 
             self._record_history(owner_id, session_id, tool_name, arguments, tool_result, latency_ms)

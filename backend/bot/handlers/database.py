@@ -1,8 +1,7 @@
 """
-.db clean   — Remove orphan DB rows.
-.db stats   — Display database statistics.
-.db vacuum  — Run orphan cleanup + index optimization.
-.db        — Inline panel: choose database action.
+Database — Glass UI only (no dot commands).
+
+  panel:db — Inline panel: choose database action.
 
 Business logic lives in backend.services.database_service.
 """

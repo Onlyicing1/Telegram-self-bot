@@ -1,8 +1,8 @@
 """
-.list [n]       — Show recent saved items (newest first, default 10).
-.find <text>    — Search saved items by short code, filename, caption, or mime type.
-.list           — Inline panel: show recent saves.
-.find           — Inline panel: input prompt for search text.
+Discover — Glass UI only (no dot commands).
+
+  panel:list — Inline panel: show recent saves.
+  panel:find — Inline panel: input prompt for search text.
 
 Business logic lives in backend.services.discover_service.
 """

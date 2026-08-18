@@ -52,6 +52,10 @@ class SaveTool(Tool):
     def return_type(self) -> str:
         return "ToolResult with save_code and confirmation message in data"
 
+    @property
+    def long_running(self) -> bool:
+        return True
+
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import save_service
 

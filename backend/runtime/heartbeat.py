@@ -6,9 +6,10 @@ task count, event loop latency, memory, client generation, RPC latency,
 update queue size, handler count, and age tracking for all critical events.
 
 Stall detection:
-  - If updates stop arriving while RPC is still healthy → UPDATE_PIPELINE_STALLED
-  - If dispatcher stops processing updates → EVENT_DISPATCH_STALLED
+  - If dispatcher stops processing updates while updates still arrive → EVENT_DISPATCH_STALLED
   - If event loop latency exceeds threshold → EVENT_LOOP_STARVATION
+
+Absence of updates/callbacks alone is a normal idle account and is NOT a stall.
 
 Loop instrumentation:
   - Reports its own progress via tick_loop("lifeos-heartbeat")
@@ -169,26 +170,29 @@ async def _heartbeat_loop() -> None:
             **_recovery_state(),
         )
 
-        rpc_healthy = last_rpc > 0 and (now - last_rpc) < _INTERVAL * 2
-
         # ── State-machine invariant check ──
-        # READY must never coexist with disconnected clients.  If we see it,
-        # trigger recovery immediately — this is the bug that caused the bot
-        # to "fall asleep" while the runtime believed everything was healthy.
+        # READY must never coexist with a disconnected SELF client. The helper
+        # bot is optional — when it is disabled, helper_connected=False is a
+        # valid state and must NOT trigger recovery on its own.
         current_state = _state_ref.get("runtime_state", "unknown")
         self_connected = _state_ref.get("self_connected", False)
         helper_connected = _state_ref.get("helper_connected", False)
-        if current_state == "READY" and (not self_connected or not helper_connected):
+        helper_enabled = bool(getattr(_supervisor_ref, "helper_enabled", False))
+        if current_state == "READY" and (
+            not self_connected or (helper_enabled and not helper_connected)
+        ):
             trace(
                 "READY_BUT_DISCONNECTED",
                 runtime_state=current_state,
                 self_connected=self_connected,
                 helper_connected=helper_connected,
+                helper_enabled=helper_enabled,
             )
             logger.error(
                 "READY_BUT_DISCONNECTED — runtime_state=READY but "
-                "self_connected=%s helper_connected=%s — triggering recovery",
-                self_connected, helper_connected,
+                "self_connected=%s helper_connected=%s helper_enabled=%s — "
+                "triggering recovery",
+                self_connected, helper_connected, helper_enabled,
             )
             sup = _supervisor_ref
             if sup is not None and not sup._recovery_lock.locked():
@@ -197,28 +201,10 @@ async def _heartbeat_loop() -> None:
                     name="lifeos-heartbeat-invariant-recovery",
                 )
 
-        if last_update > 0 and (now - last_update) > _STALL_THRESHOLD:
-            if rpc_healthy:
-                trace(
-                    "UPDATE_PIPELINE_STALLED",
-                    last_update_age=last_update_age,
-                    last_rpc_age=last_rpc_age,
-                    threshold=f"{_STALL_THRESHOLD:.0f}s",
-                    gen=_state_ref.get("client_generation", 0),
-                )
-                logger.warning(
-                    "UPDATE_PIPELINE_STALLED — no updates for %s but RPC is healthy "
-                    "(last_rpc_age=%s, gen=%d) — triggering reconnect",
-                    last_update_age, last_rpc_age,
-                    _state_ref.get("client_generation", 0),
-                )
-                sup = _supervisor_ref
-                if sup is not None and not sup._recovery_lock.locked():
-                    guarded_create_task(
-                        sup._trigger_reconnect(),
-                        name="lifeos-heartbeat-recovery",
-                    )
-
+        # ── Event-dispatch stall ──
+        # A genuine dispatcher stall is "updates ARE arriving but no event was
+        # dispatched for a long time". Absence of updates/callbacks alone is a
+        # normal idle account and is NOT a stall, so it never triggers recovery.
         if last_update > 0 and last_event > 0 and (now - last_event) > _STALL_THRESHOLD:
             if (now - last_update) < _STALL_THRESHOLD:
                 trace(
@@ -232,26 +218,6 @@ async def _heartbeat_loop() -> None:
                     "EVENT_DISPATCH_STALLED — updates arriving (%s) but no event "
                     "dispatched for %s (gen=%d) — triggering reconnect",
                     last_update_age, last_event_age,
-                    _state_ref.get("client_generation", 0),
-                )
-                sup = _supervisor_ref
-                if sup is not None and not sup._recovery_lock.locked():
-                    guarded_create_task(
-                        sup._trigger_reconnect(),
-                        name="lifeos-heartbeat-recovery",
-                    )
-
-        if last_callback > 0 and (now - last_callback) > _STALL_THRESHOLD:
-            if rpc_healthy:
-                trace(
-                    "CALLBACK_DISPATCH_STALLED",
-                    last_callback_age=last_callback_age,
-                    threshold=f"{_STALL_THRESHOLD:.0f}s",
-                    gen=_state_ref.get("client_generation", 0),
-                )
-                logger.warning(
-                    "CALLBACK_DISPATCH_STALLED — no callbacks for %s (gen=%d) — triggering reconnect",
-                    last_callback_age,
                     _state_ref.get("client_generation", 0),
                 )
                 sup = _supervisor_ref

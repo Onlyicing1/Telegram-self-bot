@@ -96,12 +96,19 @@ def register_input_listener(self_client, owner_id: int) -> None:
         handler = pending_entry["handler"]
         inline_chat_id = pending_entry.get("inline_chat_id", 0)
         inline_msg_id = pending_entry.get("inline_msg_id", 0)
+        timeout = pending_entry.get("timeout", 60.0)
         try:
-            await asyncio.wait_for(
-                handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id),
-                timeout=60.0,
-            )
+            if timeout is None:
+                # Long-running operations (Deep Save) are intentionally unbounded.
+                await handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id)
+            else:
+                await asyncio.wait_for(
+                    handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id),
+                    timeout=timeout,
+                )
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
-            logger.error("INPUT_HANDLER_TIMEOUT owner=%s panel=%s — input handler exceeded 60s", owner_id, pending_entry.get("panel_id", ""))
+            logger.error("INPUT_HANDLER_TIMEOUT owner=%s panel=%s — input handler exceeded %.0fs", owner_id, pending_entry.get("panel_id", ""), timeout)
         except Exception:
             logger.exception("Input listener handler failed")

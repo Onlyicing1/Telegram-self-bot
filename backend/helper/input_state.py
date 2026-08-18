@@ -33,8 +33,14 @@ def set_pending(
     inline_chat_id: int = 0,
     inline_msg_id: int = 0,
     extra: str = "",
+    timeout: float | None = 60.0,
 ) -> None:
-    """Set a pending input request for the owner. Replaces any previous pending input."""
+    """Set a pending input request for the owner. Replaces any previous pending input.
+
+    ``timeout`` bounds the handler execution once the owner's reply arrives.
+    Pass ``None`` for operations that may legitimately run long (e.g. Deep Save
+    media transfer). The separate 120 s pending-state expiry is unaffected.
+    """
     _pending[owner_id] = {
         "panel_id": panel_id,
         "handler": handler,
@@ -43,6 +49,7 @@ def set_pending(
         "inline_chat_id": inline_chat_id,
         "inline_msg_id": inline_msg_id,
         "extra": extra,
+        "timeout": timeout,
         "created_at": time.monotonic(),
     }
     logger.debug("Input pending for owner %s: panel=%s", owner_id, panel_id)

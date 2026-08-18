@@ -1,10 +1,5 @@
 """
-Retrieve — unified file-browser experience.
-
-Commands:
-  .retrieve / .r / .files       — Opens Saved Items browser (default entry)
-  .preview <code>               — Text-command preview (shortcut)
-  .send <code>                  — Text-command retrieve (shortcut)
+Retrieve — unified file-browser experience (Glass UI only, no dot commands).
 
 Panel IDs (single deterministic workflow):
   retrieve       — Main menu: Saved Items + Retrieve by Code
@@ -51,7 +46,7 @@ _SAVED_PER_PAGE = 8
 # ── Utility ──
 
 def _parse_extra_id(extra: str) -> str | None:
-    """Extract item save_code from extra string like 'id:SV-XXXXXX'."""
+    """Extract item save_code from extra string like 'id:S0042'."""
     if extra.startswith("id:"):
         return extra[3:]
     return None
@@ -96,7 +91,7 @@ async def _retrieve_saved_panel_handler(event, extra: str) -> tuple[str, str, li
         items, total = await db_client.list_saves(_owner_id, limit=per_page, offset=offset)
 
     if not items:
-        return "Saved Items", "_No saved items found._\n\nSave something first with `.save`.", []
+        return "Saved Items", "_No saved items found._\n\nSave something first from the LifeOS menu (📥 Save → Deep Save).", []
 
     body = f"_{total} items · page {page}/{total_pages}_"
 
@@ -291,7 +286,7 @@ def register(client, owner_id: int):
     register_action("retrieve_item_delete", _retrieve_item_delete_action)
     register_input("retrieve", "code", {
         "handler": _retrieve_code_input_handler,
-        "prompt": "**Retrieve by Code**\n\nEnter save code (e.g. SV-XXXXXX):\n\n_Reply with the code below._",
+        "prompt": "**Retrieve by Code**\n\nEnter save code (e.g. S0042):\n\n_Reply with the code below._",
     })
     register_input("retrieve_item", "rename", {
         "handler": _retrieve_rename_input_handler,

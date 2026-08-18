@@ -28,7 +28,7 @@ Mandatory log tags:
   TASK_RESTART
   LOOP_STALLED
   EVENT_LOOP_STARVATION
-  CALLBACK_DISPATCH_STALLED
+  EVENT_DISPATCH_STALLED
   RECOVERY_SUCCESS
   RECOVERY_FAILED
 """
@@ -79,6 +79,7 @@ _REGISTER_TIMEOUT = 30
 _LOOP_STALE_THRESHOLD = 90
 _LOOP_STARVATION_MS = 5000
 _RECOVERY_COOLDOWN = 180
+_RECONNECT_COOLDOWN = 60
 _MAX_RECOVERY_ATTEMPTS = 5
 
 
@@ -95,7 +96,7 @@ class RuntimeSupervisor:
         "client_generation", "shutdown_event", "_run_task", "_web_task",
         "_helper_task", "_consecutive_failures", "_reconnect_failures",
         "_recovery_attempts", "_recovery_lock", "_recovery_cooldown_until",
-        "_last_watchdog_tick", "_client_alive",
+        "_reconnect_cooldown_until", "_last_watchdog_tick", "_client_alive",
     )
 
     def __init__(self, cfg: dict) -> None:
@@ -120,6 +121,7 @@ class RuntimeSupervisor:
         self._recovery_attempts = 0
         self._recovery_lock = asyncio.Lock()
         self._recovery_cooldown_until = 0.0
+        self._reconnect_cooldown_until = 0.0
         self._last_watchdog_tick = 0.0
         self._client_alive = False
 
@@ -361,6 +363,21 @@ class RuntimeSupervisor:
         except Exception as exc:
             trace_exception("USERNAME_CRON_RESUME_FAILED", exc)
 
+    async def _stop_run_loop(self) -> None:
+        task = self._run_task
+        self._run_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
+    def _start_run_loop(self) -> None:
+        if self._run_task is not None and not self._run_task.done():
+            return
+        self._run_task = immortal_create_task(self._run_loop, name="lifeos-run")
+
     async def _run_loop(self) -> None:
         while not self.shutdown_event.is_set():
             try:
@@ -372,6 +389,14 @@ class RuntimeSupervisor:
                 logger.exception("Run loop error: %s", exc)
 
             if self.shutdown_event.is_set():
+                break
+
+            # An intentional recovery disconnect is in progress. The recovery
+            # path owns the connection lifecycle and will recreate this run
+            # task — do NOT interpret the disconnect as permanent death and
+            # fight the recovery by re-entering run_until_disconnected().
+            if self._recovery_lock.locked():
+                trace("SELF_RUN_LOOP_YIELDS_TO_RECOVERY", gen=self.client_generation)
                 break
 
             self._client_alive = False
@@ -386,17 +411,31 @@ class RuntimeSupervisor:
     async def _trigger_reconnect(self) -> None:
         if self._recovery_lock.locked():
             return
-        if self._in_recovery_cooldown():
-            trace("RECOVERY_COOLDOWN", remaining=f"{self._recovery_cooldown_until - time.time():.0f}s")
+        if self._in_reconnect_cooldown():
+            trace("RECONNECT_COOLDOWN", remaining=f"{self._reconnect_cooldown_until - time.monotonic():.0f}s")
             return
 
         escalate = False
         async with self._recovery_lock:
+            # Re-check after acquiring the lock — a queued reconnect must not
+            # run again immediately after another reconnect just succeeded.
+            if self._in_reconnect_cooldown():
+                return
+
             self._reconnect_failures += 1
             trace("WATCHDOG_RECOVERY", reason="reconnect", attempt=self._reconnect_failures)
             logger.warning("WATCHDOG_RECOVERY — reconnect attempt %d", self._reconnect_failures)
 
             try:
+                # Single connection ownership: stop the run loop before touching
+                # the client so run_until_disconnected() cannot fight the
+                # intentional disconnect.
+                await self._stop_run_loop()
+
+                self._client_alive = False
+                set_telethon_connected(False)
+                update_heartbeat_state(self_connected=False)
+
                 if self.client:
                     await asyncio.wait_for(self.client.disconnect(), timeout=10.0)
                 await asyncio.sleep(1)
@@ -411,10 +450,14 @@ class RuntimeSupervisor:
                 self._client_alive = True
                 self._consecutive_failures = 0
                 self._reconnect_failures = 0
+                self._reconnect_cooldown_until = time.monotonic() + _RECONNECT_COOLDOWN
                 set_telethon_connected(True)
                 update_heartbeat_state(self_connected=True)
                 set_last_update()
                 set_last_telethon_event()
+
+                self._start_run_loop()
+
                 trace("SELF_RECONNECTED", gen=self.client_generation)
                 logger.info("SELF_RECONNECTED (gen=%d)", self.client_generation)
                 return
@@ -516,6 +559,7 @@ class RuntimeSupervisor:
             trace("SELF_REBUILDING", gen=self.client_generation + 1)
             logger.info("Recovery: building new client")
             await self._build_and_register()
+            self._start_run_loop()
             trace("SELF_RECONNECTED", gen=self.client_generation)
             logger.info("Recovery: new client ready (gen=%d)", self.client_generation)
 
@@ -958,6 +1002,9 @@ class RuntimeSupervisor:
 
     def _in_recovery_cooldown(self) -> bool:
         return time.time() < self._recovery_cooldown_until
+
+    def _in_reconnect_cooldown(self) -> bool:
+        return time.monotonic() < self._reconnect_cooldown_until
 
     async def stop(self) -> None:
         trace("SHUTDOWN_INITIATED")

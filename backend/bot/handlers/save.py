@@ -84,6 +84,7 @@ async def _save_reply_action(event, extra: str, chat_id: int) -> tuple[str, str,
         inline_chat_id=chat_id,
         inline_msg_id=getattr(event, "message_id", 0) or 0,
         extra="",
+        timeout=None,
     )
 
     return "Deep Save", wait_text, []

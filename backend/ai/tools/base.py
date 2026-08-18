@@ -135,6 +135,16 @@ the existing service layer and return a ``ToolResult``.
         """Human-readable description of the structured data shape."""
         ...
 
+    @property
+    def long_running(self) -> bool:
+        """True if the tool may legitimately run beyond the generic tool timeout.
+
+        Deep Save (media download + re-upload) is the canonical example: large
+        transfers must not be cancelled by the generic short tool timeout.
+        Defaults to False for normal tools.
+        """
+        ...
+
     async def execute(self, context: "ToolContext", arguments: dict[str, Any]) -> ToolResult:
         """Perform the action and return a structured result.
 
