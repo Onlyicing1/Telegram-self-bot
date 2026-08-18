@@ -1,7 +1,7 @@
 """
 Save tool — wraps ``save_service.execute_save``.
 
-The AI calls this tool to save a message to Saved Messages. The tool
+The AI calls this tool to Deep-Save a message to Saved Messages. The tool
 delegates entirely to the existing save service. No logic is duplicated.
 """
 from __future__ import annotations
@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class SaveTool(Tool):
-    """Save a replied message to Saved Messages.
+    """Deep-save a replied message to Saved Messages.
 
-    Arguments:
-        mode:  ``"forward"`` or ``"deep"`` (default: ``"forward"``).
+    Downloads the source content and re-uploads it as a NEW message. Deep
+    Save is the only save method — there is no Forward Save.
     """
 
     def __init__(self, context: ToolContext) -> None:
@@ -31,18 +31,14 @@ class SaveTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Save a message to Saved Messages. Requires a replied message."
+        return (
+            "Deep-save a message to Saved Messages by downloading and "
+            "re-uploading it as a new message. Requires a replied message."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {
-            "mode": {
-                "type": "string",
-                "enum": ["forward", "deep"],
-                "default": "forward",
-                "description": "Save mode: 'forward' (instant) or 'deep' (download + re-upload).",
-            },
-        }
+        return {}
 
     @property
     def permission_level(self) -> PermissionLevel:
@@ -59,13 +55,6 @@ class SaveTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import save_service
 
-        # ``execute_save`` expects the compact mode codes used by the save
-        # panel: "f" = forward, "d" = deep (download + re-upload). The AI
-        # tool surface uses friendly names — map them so "forward" never
-        # silently becomes a deep save (and vice versa).
-        mode_arg = arguments.get("mode", "forward")
-        mode = "f" if str(mode_arg).lower().startswith("f") else "d"
-
         reply_meta = context.extra.get("reply_msg") if context.extra else None
         if reply_meta is None:
             return ToolResult(success=False, message="No replied message to save.")
@@ -79,11 +68,11 @@ class SaveTool(Tool):
 
         try:
             result = await save_service.execute_save(
-                context.telegram.client, context.owner_id, reply_msg, mode, context.tz_str
+                context.telegram.client, context.owner_id, reply_msg, context.tz_str
             )
             # Services report failures as "❌ ..."/"⚠️ ..." strings — only a
             # success string means the save actually happened.
-            return result_from_service(result, data={"mode": mode})
+            return result_from_service(result, data={"mode": "deep"})
         except Exception as exc:
             return ToolResult(success=False, message=f"Save failed: {exc}")
 

@@ -8,8 +8,8 @@ Covers the "false success" bug class: services communicate failures as
 Also covers:
   - delete_service returns REAL deleted counts and real errors
   - DeleteTool / DeleteByIdTool report actual counts (0, partial, error)
-  - SaveTool maps "forward"/"deep" to the compact mode codes ("f"/"d")
-    so the AI save tool never silently becomes a deep save
+  - SaveTool is Deep Save only (no forward mode) and delegates to
+    ``execute_save`` — it never fabricates a mode code
   - Deep save from a protected chat never falls back to forwarding
   - The compact glass Test Models message (provider-grouped usable list,
     no per-model diagnostic paragraphs, buttons preserved) plus the
@@ -181,29 +181,20 @@ class _FakeMessage:
 
 
 @pytest.mark.asyncio
-async def test_save_tool_maps_forward_mode_code():
+async def test_save_tool_is_deep_only_and_has_no_mode_param():
     from backend.ai.tools.save import SaveTool
+
+    assert SaveTool.parameters.fget(SaveTool) == {}
 
     with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
         tool = SaveTool(_ctx(FakeDeleteClient()))
         with patch.object(tool, "_resolve_reply_message", AsyncMock(return_value=_FakeMessage())):
-            result = await tool.execute(_ctx(FakeDeleteClient()), {"mode": "forward"})
+            result = await tool.execute(_ctx(FakeDeleteClient()), {})
 
     assert result.success is True
-    assert m.await_args.args[3] == "f"  # execute_save receives "f", not "forward"
-
-
-@pytest.mark.asyncio
-async def test_save_tool_maps_deep_mode_code():
-    from backend.ai.tools.save import SaveTool
-
-    with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
-        tool = SaveTool(_ctx(FakeDeleteClient()))
-        with patch.object(tool, "_resolve_reply_message", AsyncMock(return_value=_FakeMessage())):
-            result = await tool.execute(_ctx(FakeDeleteClient()), {"mode": "deep"})
-
-    assert result.success is True
-    assert m.await_args.args[3] == "d"
+    # execute_save is called with (client, owner_id, reply_msg, tz_str) — no mode.
+    assert len(m.await_args.args) == 4
+    assert m.await_args.args[2] is not None
 
 
 @pytest.mark.asyncio
@@ -212,14 +203,14 @@ async def test_save_tool_service_error_string_is_not_success():
 
     with patch(
         "backend.services.save_service.execute_save",
-        AsyncMock(return_value="❌ Forward failed: protected chat"),
+        AsyncMock(return_value="❌ Deep Save failed: unable to download the source message."),
     ):
         tool = SaveTool(_ctx(FakeDeleteClient()))
         with patch.object(tool, "_resolve_reply_message", AsyncMock(return_value=_FakeMessage())):
-            result = await tool.execute(_ctx(FakeDeleteClient()), {"mode": "forward"})
+            result = await tool.execute(_ctx(FakeDeleteClient()), {})
 
     assert result.success is False
-    assert "protected chat" in result.message
+    assert "unable to download" in result.message
 
 
 @pytest.mark.asyncio
@@ -289,7 +280,7 @@ async def test_deep_save_protected_chat_never_forwards():
     msg.get_sender = get_sender  # type: ignore[attr-defined]
 
     with patch.object(save_service.db_client, "get_next_save_code", AsyncMock(return_value="S001")):
-        result = await save_service.execute_save(ProtectedClient(), 1, msg, "d", "UTC")
+        result = await save_service.execute_save(ProtectedClient(), 1, msg, "UTC")
 
     assert "download_media" in calls
     assert "forward_messages" not in calls

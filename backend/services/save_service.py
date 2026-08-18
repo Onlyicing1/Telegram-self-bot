@@ -1,8 +1,17 @@
 """
-Save service — all save business logic lives here.
+Save service — the single authoritative Save Engine.
 
-Both text commands and inline panels call these exact functions.
-No business logic exists in any handler module.
+Deep Save is the ONLY save method. It downloads the source content and
+re-uploads it as a brand-new Saved Messages message:
+
+    SOURCE MESSAGE → download → local temp file → upload → NEW message → DB
+
+There is no native forwarding anywhere in this module. A protected chat
+that blocks forwarding does not affect Deep Save, and a Deep Save failure
+is never silently converted into a forward.
+
+Text commands, the Glass UI, and the AI SaveTool all call the same
+``execute_save`` pipeline — no business logic lives in any handler.
 """
 import asyncio
 import logging
@@ -10,7 +19,6 @@ import os
 import re
 import shutil
 import tempfile
-import time
 from datetime import datetime
 
 from telethon.tl.types import (
@@ -22,8 +30,6 @@ from telethon.tl.types import (
 from backend.bio.engine import _get_tz
 from backend.db import client as db_client
 from backend.diagnostics import record_event
-from backend.runtime.operation_watchdog import guarded_await
-from backend.runtime.task_guard import guarded_create_task
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -33,9 +39,6 @@ _LINK_RE = re.compile(
     r"(?:c/(\d+)/(\d+)"        # private:  /c/<internal_chat>/<msg_id>
     r"|(\w+)/(\d+))"           # username: /<username>/<msg_id>
 )
-
-_PROGRESS_INTERVAL = 120
-_PROGRESS_BAR_LEN = 10
 
 _MEDIA_TYPE_MAP = {
     "image/jpeg": "Photo",
@@ -58,6 +61,7 @@ _MEDIA_ICON = {
     "Voice": "🎤",
     "Sticker": "🏷",
     "Document": "📄",
+    "Text": "📝",
     "Unknown": "📦",
 }
 
@@ -75,19 +79,6 @@ _MIME_EXT = {
     "application/zip": ".zip",
     "application/vnd.android.package-archive": ".apk",
 }
-
-
-async def _edit_progress(progress_msg, text: str) -> None:
-    if progress_msg is None:
-        return
-    try:
-        await guarded_await(
-            progress_msg.edit(text),
-            name="save:progress-edit",
-            timeout=15.0,
-        )
-    except Exception as exc:
-        logger.debug("Save progress update failed: %s", exc)
 
 
 def detect_media_type(mime: str | None) -> str:
@@ -142,19 +133,23 @@ def build_caption(
     file_name: str | None,
     tags: list[str],
 ) -> str:
+    """Compact, information-dense LifeOS caption.
+
+    The model name is dominant, the metadata is one line each, and the
+    original source text is appended afterwards by ``_append_original_text``.
+    """
     size_str = _format_bytes(file_size) if file_size else "—"
+    icon = media_icon(media_type)
     lines = [
-        f"**LifeOS** `{save_code}`",
-        "",
-        f"**Type** {media_type}",
-        f"**Size** {size_str}",
-        f"**Sender** {sender}",
-        f"**Saved** {dt.strftime('%Y-%m-%d %H:%M')}",
+        f"{icon} {save_code} · DEEP",
+        f"👤 {sender}",
+        f"🕒 {dt.strftime('%Y-%m-%d %H:%M')}",
+        f"🆔 {chat_id}/{msg_id}",
+        f"🗂 {media_type} · {size_str}" + (f" · {mime}" if mime else ""),
     ]
-    if file_name and file_name != "—":
-        lines.append(f"**File** `{file_name}`")
+    if file_name:
+        lines.append(f"📄 {file_name}")
     if tags:
-        lines.append("")
         lines.append(" ".join(tags))
     return "\n".join(lines)
 
@@ -162,8 +157,8 @@ def build_caption(
 def _append_original_text(caption: str, message) -> str:
     """Append the original message text below the LifeOS caption block.
 
-    Both save modes use this single caption pipeline so the saved item
-    carries the generated caption without losing the source content.
+    The saved item carries the generated caption without losing the source
+    content. Text-only sources are represented here too.
     """
     try:
         text = (getattr(message, "text", None) or "").strip()
@@ -208,12 +203,10 @@ def _upload_kwargs_for_media(media, mime_type: str | None, file_name: str | None
 
 def build_confirmation(
     save_code: str,
-    mode: str,
     media_type: str,
     file_name: str | None,
 ) -> str:
     icon = media_icon(media_type)
-    mode_label = "Forward Save" if mode == "f" else "Deep Save"
     lines = [
         f"{icon} **Saved Successfully**",
         "",
@@ -222,20 +215,13 @@ def build_confirmation(
     ]
     if file_name:
         lines.append(f"**Filename:** `{file_name}`")
-    lines.append(f"**Mode:** {mode_label}")
     return "\n".join(lines)
-
-
-def _unwrap_forward(result) -> object | None:
-    if result is None:
-        return None
-    return result[0] if isinstance(result, list) else result
 
 
 def _extract_uploaded_metadata(sent) -> tuple[str | None, str | None, int | None]:
     """Extract (file_id, mime_type, file_size) from the newly-uploaded message.
 
-    Deep save persists metadata that refers to the NEW message Telegram
+    Deep Save persists metadata that refers to the NEW message Telegram
     created for the re-upload, not the original source message, so lookups
     and retrieval always point at the actual saved item.
     """
@@ -298,363 +284,6 @@ def _format_bytes(n: int | None) -> str:
     return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
-def _format_elapsed(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _progress_bar(perc: float) -> str:
-    filled = int(perc / 100 * _PROGRESS_BAR_LEN)
-    return "█" * filled + "░" * (_PROGRESS_BAR_LEN - filled)
-
-
-def _render_progress(phase: str, received: int, total: int | None, elapsed: float) -> str:
-    if total:
-        perc = min(100.0, received / total * 100)
-    else:
-        perc = 0.0
-    bar = _progress_bar(perc)
-    total_str = _format_bytes(total) if total else "—"
-    label = "Downloading..." if phase == "download" else "Uploading..."
-    speed = int(received / elapsed) if elapsed > 0 else 0
-    return (
-        f"{label}\n"
-        f"{bar} {perc:.0f}%\n"
-        f"{'Downloaded' if phase == 'download' else 'Uploaded'}:\n"
-        f"{_format_bytes(received)} / {total_str}\n"
-        f"Total Size:\n{total_str}\n"
-        f"Speed:\n{_format_bytes(speed)}/s\n"
-        f"Elapsed:\n{_format_elapsed(elapsed)}"
-    )
-
-
-class _ProgressTracker:
-    """Tracks real progress from Telethon callbacks, throttles edits to 2 min."""
-
-    def __init__(self):
-        self._received = 0
-        self._total: int | None = None
-        self._start = time.monotonic()
-        self._last_edit = 0.0
-        self._first_render = True
-
-    def update(self, received: int, total: int | None) -> str | None:
-        self._received = received
-        if total is not None:
-            self._total = total
-        now = time.monotonic()
-        if self._first_render:
-            self._first_render = False
-            self._last_edit = now
-            return None
-        if now - self._last_edit >= _PROGRESS_INTERVAL:
-            self._last_edit = now
-            elapsed = now - self._start
-            return _render_progress("download", self._received, self._total, elapsed)
-        return None
-
-    def final(self) -> str:
-        elapsed = time.monotonic() - self._start
-        return _render_progress("download", self._received, self._total, elapsed)
-
-
-class _UploadProgressTracker:
-    """Tracks upload progress, throttles edits to 2 min."""
-
-    def __init__(self, total: int | None):
-        self._total = total
-        self._received = 0
-        self._start = time.monotonic()
-        self._last_edit = 0.0
-        self._first_render = True
-
-    def update(self, sent: int, total: int | None) -> str | None:
-        self._received = sent
-        if total is not None:
-            self._total = total
-        now = time.monotonic()
-        if self._first_render:
-            self._first_render = False
-            self._last_edit = now
-            return None
-        if now - self._last_edit >= _PROGRESS_INTERVAL:
-            self._last_edit = now
-            elapsed = now - self._start
-            return _render_progress("upload", self._received, self._total, elapsed)
-        return None
-
-    def final(self) -> str:
-        elapsed = time.monotonic() - self._start
-        return _render_progress("upload", self._received, self._total, elapsed)
-
-
-async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progress_msg=None) -> str:
-    """Resolve a Telegram link, download the media, deep-save it.
-
-    Reuses execute_save's payload/insert logic.  If progress_msg is provided
-    (a Telethon message object), it is edited at most every 2 minutes with
-    real progress from Telethon's download/upload callbacks.
-    """
-    logger.info("[LINK_SAVE] resolving link: %s", link)
-    channel, chat_id, msg_id = parse_telegram_link(link)
-    if not channel and not chat_id:
-        logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
-        return "❌ Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
-
-    target_msg = None
-    try:
-        if chat_id:
-            logger.info("[LINK_SAVE] fetching source message...")
-            target_msg = await client.get_messages(chat_id, ids=msg_id)
-        else:
-            logger.info("[LINK_SAVE] resolving username '%s'...", channel)
-            entity = await client.get_entity(channel)
-            logger.info("[LINK_SAVE] fetching source message...")
-            target_msg = await client.get_messages(entity, ids=msg_id)
-        logger.info("[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
-                    getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None))
-    except Exception as exc:
-        logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
-        return f"❌ Could not resolve link: {exc}"
-
-    if target_msg is None:
-        logger.warning("[LINK_SAVE] source message not found at link")
-        return "❌ Message not found at that link."
-
-    try:
-        has_media = target_msg.media is not None
-        logger.info("[LINK_SAVE] media detected: has_media=%s media_type=%s",
-                    has_media, type(target_msg.media).__name__)
-    except Exception as exc:
-        logger.error("[LINK_SAVE] media detection failed: %s", exc, exc_info=True)
-        return f"❌ Media detection failed: {exc}"
-
-    if not target_msg.media:
-        return "❌ The linked message has no downloadable media."
-
-    try:
-        save_code = await db_client.get_next_save_code()
-        logger.info("[LINK_SAVE] save code generated: %s", save_code)
-    except Exception as exc:
-        logger.error("[LINK_SAVE] save code generation failed: %s", exc, exc_info=True)
-        return f"❌ Save code generation failed: {exc}"
-
-    tz = _get_tz(tz_str)
-    now = datetime.now(tz)
-
-    sender_name = "Unknown"
-    sender_id = target_msg.sender_id or 0
-    try:
-        sender = await target_msg.get_sender()
-        if sender:
-            parts = [
-                getattr(sender, "first_name", "") or "",
-                getattr(sender, "last_name", "") or "",
-            ]
-            sender_name = " ".join(p for p in parts if p).strip() or str(sender_id)
-        logger.info("[LINK_SAVE] sender resolved: name=%s id=%s", sender_name, sender_id)
-    except Exception as exc:
-        logger.error("[LINK_SAVE] sender resolution failed: %s", exc, exc_info=True)
-
-    origin_chat_id = target_msg.chat_id
-    origin_msg_id = target_msg.id
-
-    mime_type = None
-    file_size = None
-    file_name = None
-    file_id = None
-
-    try:
-        media = target_msg.media
-        if isinstance(media, MessageMediaDocument):
-            doc = media.document
-            mime_type = getattr(doc, "mime_type", None)
-            file_size = getattr(doc, "size", None)
-            file_name = extract_file_name(media)
-            file_id = str(getattr(doc, "id", ""))
-        elif isinstance(media, MessageMediaPhoto):
-            mime_type = "image/jpeg"
-            photo = media.photo
-            if hasattr(photo, "sizes") and photo.sizes:
-                file_size = getattr(photo.sizes[-1], "size", None)
-            file_id = str(getattr(photo, "id", ""))
-        logger.info("[LINK_SAVE] media metadata extracted: mime=%s size=%s file=%s file_id=%s",
-                    mime_type, file_size, file_name, file_id)
-    except Exception as exc:
-        logger.error("[LINK_SAVE] media metadata extraction failed: %s", exc, exc_info=True)
-        return f"❌ Media metadata extraction failed: {exc}"
-
-    media_type = detect_media_type(mime_type)
-    if not file_name:
-        file_name = generate_filename(media, mime_type, save_code)
-    tags = build_tags(media_type, now)
-
-    try:
-        caption = _append_original_text(
-            build_caption(
-                save_code=save_code,
-                sender=sender_name,
-                chat_id=origin_chat_id,
-                msg_id=origin_msg_id,
-                dt=now,
-                media_type=media_type,
-                mime=mime_type,
-                file_size=file_size,
-                file_name=file_name,
-                tags=tags,
-            ),
-            target_msg,
-        )
-        logger.info("[LINK_SAVE] caption built")
-    except Exception as exc:
-        logger.error("[LINK_SAVE] caption build failed: %s", exc, exc_info=True)
-        return f"❌ Caption build failed: {exc}"
-
-    from backend.helper.client import get_client as _get_helper
-
-    tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
-    tmp_path = os.path.join(tmp_dir, file_name)
-    sent = None
-    try:
-        download_client = client
-        download_msg = target_msg
-
-        helper = _get_helper()
-        if helper and helper.is_connected():
-            try:
-                logger.info("[LINK_SAVE] helper bot available, fetching message with helper...")
-                if chat_id:
-                    h_msg = await helper.get_messages(chat_id, ids=msg_id)
-                else:
-                    h_entity = await helper.get_entity(channel)
-                    h_msg = await helper.get_messages(h_entity, ids=msg_id)
-                if h_msg is not None:
-                    download_client = helper
-                    download_msg = h_msg
-                    logger.info("[LINK_SAVE] helper bot fetched message, will use helper for download")
-                else:
-                    logger.warning("[LINK_SAVE] helper bot returned None message, falling back to self")
-            except Exception as exc:
-                logger.warning("[LINK_SAVE] helper bot fetch failed, falling back to self: %s", exc, exc_info=True)
-        else:
-            logger.info("[LINK_SAVE] helper bot not available, using self account for download")
-
-        logger.info("[LINK_SAVE] download started: %s -> %s", save_code, tmp_path)
-
-        dl_tracker = _ProgressTracker()
-
-        def _on_download(received, total):
-            text = dl_tracker.update(received, total)
-            if text and progress_msg:
-                try:
-                    guarded_create_task(
-                        _edit_progress(progress_msg, text),
-                        name="save:progress-edit",
-                    )
-                except Exception:
-                    pass
-
-        t0 = asyncio.get_event_loop().time()
-        result_path = await download_client.download_media(
-            download_msg, file=tmp_path, progress_callback=_on_download,
-        )
-        record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        logger.info("[LINK_SAVE] download complete: path=%s", result_path)
-
-        if result_path is None or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            logger.error("[LINK_SAVE] download produced empty or missing file")
-            return "❌ Download produced an empty file."
-
-        actual_size = os.path.getsize(tmp_path)
-        logger.info("[LINK_SAVE] downloaded file size: %s bytes", actual_size)
-
-        logger.info("[LINK_SAVE] upload started: %s", save_code)
-        ul_tracker = _UploadProgressTracker(file_size or actual_size)
-
-        def _on_upload(sent_bytes, total):
-            text = ul_tracker.update(sent_bytes, total)
-            if text and progress_msg:
-                try:
-                    guarded_create_task(
-                        _edit_progress(progress_msg, text),
-                        name="save:progress-edit",
-                    )
-                except Exception:
-                    pass
-
-        try:
-            t1 = asyncio.get_event_loop().time()
-            sent = await client.send_file(
-                "me",
-                tmp_path,
-                caption=caption,
-                progress_callback=_on_upload,
-                **_upload_kwargs_for_media(target_msg.media, mime_type, file_name),
-            )
-            record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
-            logger.info("[LINK_SAVE] upload complete: saved_chat_id=%s saved_msg_id=%s",
-                        getattr(sent, "chat_id", None), getattr(sent, "id", None))
-        except Exception as exc:
-            logger.error("[LINK_SAVE] upload failed: %s", exc, exc_info=True)
-            record_event("save", "send_file", 0, "ERROR", str(exc))
-            return f"❌ Upload failed: {exc}"
-
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.error("[LINK_SAVE] download failed: %s", exc, exc_info=True)
-        record_event("save", "download_media", 0, "ERROR", str(exc))
-        return f"❌ Download failed: {exc}"
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("[LINK_SAVE] temp file cleaned up: %s", tmp_dir)
-
-    saved_chat_id = sent.chat_id if sent else None
-    saved_msg_id = sent.id if sent else None
-
-    # Metadata refers to the NEWLY uploaded message, not the source.
-    new_file_id, new_mime, new_size = _extract_uploaded_metadata(sent)
-
-    payload = {
-        "save_code": save_code,
-        "save_type": "deep",
-        "origin_chat_id": origin_chat_id,
-        "origin_msg_id": origin_msg_id,
-        "saved_chat_id": saved_chat_id,
-        "saved_msg_id": saved_msg_id,
-        "sender_name": sender_name,
-        "sender_id": sender_id,
-        "mime_type": new_mime or mime_type,
-        "file_id": new_file_id or file_id,
-        "file_size": actual_size or new_size or file_size,
-        "media_type": media_type,
-        "tags": tags,
-        "caption": caption,
-        "owner_id": owner_id,
-        "created_at": now.isoformat(),
-    }
-    try:
-        logger.info("[LINK_SAVE] database insert started: %s", save_code)
-        inserted = await db_client.insert_save(payload)
-        logger.info("[LINK_SAVE] database insert complete: %s inserted=%s", save_code, inserted is not None)
-    except Exception as exc:
-        logger.error("[LINK_SAVE] database insert failed: %s", exc, exc_info=True)
-        inserted = None
-
-    try:
-        await db_client.log(owner_id, "INFO", f"Saved D {save_code} (link)", {
-            "save_code": save_code,
-            "origin_chat_id": origin_chat_id,
-            "origin_msg_id": origin_msg_id,
-        })
-    except Exception as exc:
-        logger.error("[LINK_SAVE] db log write failed: %s", exc, exc_info=True)
-
-    logger.info("[LINK_SAVE] completed: %s", save_code)
-    return build_confirmation(save_code, "d", media_type, file_name)
-
-
 async def _resolve_sender(reply_msg) -> tuple[str, int]:
     """Resolve the source message's sender name + id (best effort)."""
     sender_id = getattr(reply_msg, "sender_id", None) or 0
@@ -699,107 +328,17 @@ def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | 
     return mime_type, file_size, file_name, file_id, media_type
 
 
-async def execute_forward_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
-    """Forward Save — Telegram native forwarding (mode='f').
+async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
+    """Deep Save — the single authoritative save pipeline.
 
-    This is intentionally the ONLY place in the Save Engine that forwards. It
-    never downloads and never falls back to a deep re-upload.
-    """
-    save_code = await db_client.get_next_save_code()
-    now = datetime.now(_get_tz(tz_str))
-    sender_name, sender_id = await _resolve_sender(reply_msg)
-    origin_chat_id = reply_msg.chat_id
-    origin_msg_id = reply_msg.id
-    mime_type, file_size, file_name, file_id, media_type = _extract_source_media(reply_msg, save_code)
-    tags = build_tags(media_type, now)
+    Deep Save downloads the source content and uploads it again as a NEW
+    Saved Messages message. It NEVER forwards, under any circumstance:
 
-    logger.info(
-        "[SAVE] owner=%s mode=f media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
-        owner_id, reply_msg.media is not None, save_code, file_name, mime_type, file_size, file_id,
-    )
+    - text-only source → a new ``send_message`` text message
+    - media source → ``download_media`` → validate → ``send_file``
 
-    caption = _append_original_text(
-        build_caption(
-            save_code=save_code,
-            sender=sender_name,
-            chat_id=origin_chat_id,
-            msg_id=origin_msg_id,
-            dt=now,
-            media_type=media_type,
-            mime=mime_type,
-            file_size=file_size,
-            file_name=file_name,
-            tags=tags,
-        ),
-        reply_msg,
-    )
-
-    t0 = asyncio.get_event_loop().time()
-    try:
-        raw = await client.forward_messages("me", reply_msg)
-        fwd = _unwrap_forward(raw)
-        saved_chat_id = fwd.chat_id if fwd else None
-        saved_msg_id = fwd.id if fwd else None
-        record_event("save", "forward_messages", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-    except Exception as exc:
-        logger.error("forward save failed: %s", exc)
-        record_event("save", "forward_messages", 0, "ERROR", str(exc))
-        return f"❌ Forward failed: {exc}"
-
-    # Attach the generated caption to the forwarded message itself so the
-    # saved item carries the expected caption (with the original text
-    # preserved below it) instead of only living in the database.
-    caption_attached = False
-    if fwd is not None:
-        try:
-            await client.edit_message("me", fwd, text=caption)
-            caption_attached = True
-        except Exception as exc:
-            logger.warning("forward save caption attach failed: %s", exc)
-
-    payload = {
-        "save_code": save_code,
-        "save_type": "forward",
-        "origin_chat_id": origin_chat_id,
-        "origin_msg_id": origin_msg_id,
-        "saved_chat_id": saved_chat_id,
-        "saved_msg_id": saved_msg_id,
-        "sender_name": sender_name,
-        "sender_id": sender_id,
-        "mime_type": mime_type,
-        "file_id": file_id,
-        "file_size": file_size,
-        "media_type": media_type,
-        "tags": tags,
-        "caption": caption if caption_attached else None,
-        "owner_id": owner_id,
-        "created_at": now.isoformat(),
-    }
-    inserted = None
-    try:
-        inserted = await db_client.insert_save(payload)
-    except Exception as exc:
-        logger.error("[SAVE_DB] forward insert_save raised: %s", exc, exc_info=True)
-    if inserted is None:
-        logger.error("[SAVE_DB] forward insert returned None — row NOT in database")
-    else:
-        logger.info("[SAVE_DB] forward insert_ok=True id=%s", inserted.get("id"))
-
-    await db_client.log(owner_id, "INFO", f"Saved F {save_code}", {
-        "save_code": save_code,
-        "origin_chat_id": origin_chat_id,
-        "origin_msg_id": origin_msg_id,
-    })
-    return build_confirmation(save_code, "f", media_type, file_name)
-
-
-async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
-    """Deep Save — download → re-upload as a NEW Saved Messages message (mode='d').
-
-    This pipeline NEVER forwards. It physically downloads the source content
-    and uploads it again, so it works when native forwarding is restricted
-    (as long as Telegram permits downloading). A download/upload failure is a
-    Deep Save failure — it never falls back to forwarding.
+    A download or upload failure is an honest Deep Save failure. The DB
+    record is written only after the Telegram operation succeeded.
     """
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
@@ -810,11 +349,11 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
     media = reply_msg.media
     mime_type, file_size, file_name, file_id, media_type = _extract_source_media(reply_msg, save_code)
 
-    # STAGE 1 — text-only source becomes a NEW text message (no media transfer).
+    # Text-only source → a NEW text message (no media transfer, no forward).
     if media is None:
         original_text = (reply_msg.text or "").strip()
         if not original_text:
-            return "⚠️ Replied message has no downloadable media."
+            return "⚠️ Replied message has no text or media to save."
         media_type = "Text"
         mime_type = None
         file_name = None
@@ -822,7 +361,7 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
         file_size = len(original_text.encode("utf-8"))
 
     logger.info(
-        "[SAVE] owner=%s mode=d media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
+        "[SAVE] owner=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
         owner_id, media is not None, save_code, file_name, mime_type, file_size, file_id,
     )
 
@@ -830,11 +369,7 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
     if file_size and file_size > max_bytes:
         mb = file_size / (1024 * 1024)
         limit_mb = settings_service.max_deep_save_mb()
-        return (
-            f"⚠️ File is {mb:.1f} MB — exceeds the "
-            f"{limit_mb} MB deep-save limit.\n"
-            "Use `.save f` for a forward save instead."
-        )
+        return f"⚠️ File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
 
     tags = build_tags(media_type, now)
     caption = _append_original_text(
@@ -853,9 +388,9 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
         reply_msg,
     )
 
-    # STAGE 2 — transfer content into a brand-new Saved Messages message.
     sent = None
     actual_size = file_size
+
     if media is None:
         try:
             t0 = asyncio.get_event_loop().time()
@@ -864,20 +399,30 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
         except Exception as exc:
             logger.error("deep save text send failed: %s", exc)
             record_event("save", "send_message", 0, "ERROR", str(exc))
-            return f"❌ Upload failed: {exc}"
+            return f"❌ Deep Save failed: text could not be uploaded to Saved Messages ({exc})"
     else:
         # Isolated temp storage per operation; removed on every exit path.
         tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
         tmp_path = os.path.join(tmp_dir, os.path.basename(file_name or "file.bin"))
         try:
-            t0 = asyncio.get_event_loop().time()
-            await client.download_media(reply_msg, file=tmp_path)
-            record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+            # STAGE 1 — physically download the source media.
+            try:
+                t0 = asyncio.get_event_loop().time()
+                await client.download_media(reply_msg, file=tmp_path)
+                record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+            except Exception as exc:
+                logger.error("deep save download failed: %s", exc)
+                record_event("save", "download_media", 0, "ERROR", str(exc))
+                return f"❌ Deep Save failed: unable to download the source message ({exc})"
 
+            # Validate the download before uploading anything.
+            if not os.path.exists(tmp_path):
+                return "❌ Deep Save failed: downloaded file is missing."
             actual_size = os.path.getsize(tmp_path)
             if actual_size == 0:
-                return "❌ Download produced an empty file."
+                return "❌ Deep Save failed: downloaded file is empty."
 
+            # STAGE 2 — upload the downloaded content as a NEW message.
             try:
                 t1 = asyncio.get_event_loop().time()
                 sent = await client.send_file(
@@ -890,13 +435,9 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
             except Exception as exc:
                 logger.error("deep save upload failed: %s", exc)
                 record_event("save", "send_file", 0, "ERROR", str(exc))
-                return f"❌ Upload failed: {exc}"
+                return f"❌ Deep Save failed: downloaded media could not be uploaded to Saved Messages ({exc})"
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.error("deep save download failed: %s", exc)
-            record_event("save", "download_media", 0, "ERROR", str(exc))
-            return f"❌ Download failed: {exc}"
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -923,32 +464,59 @@ async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> st
         "owner_id": owner_id,
         "created_at": now.isoformat(),
     }
+
     inserted = None
     try:
         inserted = await db_client.insert_save(payload)
     except Exception as exc:
-        logger.error("[SAVE_DB] deep insert_save raised: %s", exc, exc_info=True)
+        logger.error("[SAVE_DB] insert_save raised: %s", exc, exc_info=True)
+
     if inserted is None:
-        logger.error("[SAVE_DB] deep insert returned None — row NOT in database")
-    else:
-        logger.info("[SAVE_DB] deep insert_ok=True id=%s", inserted.get("id"))
+        logger.error("[SAVE_DB] insert returned None — row NOT in database")
+        await db_client.log(owner_id, "ERROR", f"Saved D {save_code} but DB insert failed", {
+            "save_code": save_code,
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+        })
+        return f"⚠️ Uploaded to Saved Messages, but the database record failed for `{save_code}`."
 
     await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
         "save_code": save_code,
         "origin_chat_id": origin_chat_id,
         "origin_msg_id": origin_msg_id,
     })
-    return build_confirmation(save_code, "d", media_type, file_name)
+    logger.info("[SAVE] completed: %s", save_code)
+    return build_confirmation(save_code, media_type, file_name)
 
 
-async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str) -> str:
-    """Dispatch a save request to the Forward or Deep pipeline.
+async def execute_link_save(client, owner_id: int, link: str, tz_str: str) -> str:
+    """Resolve a Telegram link and Deep-Save the linked message.
 
-    The engine is the single authority for mode semantics. Forward Save and
-    Deep Save are two independent pipelines — this dispatcher only selects
-    which one runs; it never shares their Telegram transfer logic.
+    This is the same Deep Save pipeline as ``execute_save`` — the only
+    difference is the source resolution (a t.me link instead of a reply).
     """
-    mode = (mode or "").strip().lower()
-    if mode in ("f", "forward", "fwd"):
-        return await execute_forward_save(client, owner_id, reply_msg, tz_str)
-    return await execute_deep_save(client, owner_id, reply_msg, tz_str)
+    logger.info("[LINK_SAVE] resolving link: %s", link)
+    channel, chat_id, msg_id = parse_telegram_link(link)
+    if not channel and not chat_id:
+        logger.warning("[LINK_SAVE] invalid telegram link: %s", link)
+        return "❌ Could not parse link. Use https://t.me/channel/123 or https://t.me/c/123/456"
+
+    try:
+        if chat_id:
+            target_msg = await client.get_messages(chat_id, ids=msg_id)
+        else:
+            entity = await client.get_entity(channel)
+            target_msg = await client.get_messages(entity, ids=msg_id)
+        logger.info(
+            "[LINK_SAVE] source message fetched: msg_id=%s chat_id=%s",
+            getattr(target_msg, "id", None), getattr(target_msg, "chat_id", None),
+        )
+    except Exception as exc:
+        logger.error("[LINK_SAVE] fetch source message failed: %s", exc, exc_info=True)
+        return f"❌ Could not resolve link: {exc}"
+
+    if target_msg is None:
+        logger.warning("[LINK_SAVE] source message not found at link")
+        return "❌ Message not found at that link."
+
+    return await execute_save(client, owner_id, target_msg, tz_str)

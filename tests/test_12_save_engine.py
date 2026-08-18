@@ -1,18 +1,19 @@
 """
-Save engine + Settings panel regression tests.
+Save engine + Settings panel + Glass Reply Mode regression tests.
 
 Covers:
   - Settings glass panel renders (was: await on sync function → TypeError,
     so the Settings button on the main menu silently did nothing).
-  - Forward save attaches the generated caption to the forwarded message
-    and preserves the original text.
-  - Deep save is a TRUE re-upload: download → temporary file → send_file.
-    It never calls forward_messages, preserves the original media type
-    (photo / video / voice / sticker / document) via Telegram attributes,
-    cleans up its temporary file on success AND failure, and handles
-    plain text (TEXT → TEXT).
-  - Deep save metadata (save_code, mime, actual file_size, ids) refers to
+  - Deep Save is the ONLY save method and is a TRUE re-upload:
+    download → temporary file → send_file. It never calls forward_messages,
+    preserves the original media type (photo / video / voice / sticker /
+    document) via Telegram attributes, cleans up its temporary file on
+    success AND failure, and handles plain text (TEXT → send_message).
+  - Deep Save metadata (save_code, mime, actual file_size, ids) refers to
     the NEWLY uploaded message, not the source.
+  - The Glass UI Reply Mode flow: `.menu → Save → Deep Save → Reply Mode`
+    sets a pending state, and the next outgoing reply resolves its
+    ``reply_to_msg_id`` to the exact target message before saving it.
 """
 from __future__ import annotations
 
@@ -81,12 +82,6 @@ class MockClient:
 
     async def forward_messages(self, entity, messages):
         self.calls.append(("forward_messages", entity, messages))
-        return FakeSent()
-
-    async def edit_message(self, entity, message, text=None, **kwargs):
-        # Mirror Telethon's real signature: ``edit_message`` has no
-        # ``caption`` kwarg — captions/text are edited via ``text=``.
-        self.calls.append(("edit_message", entity, message, text))
         return FakeSent()
 
     async def download_media(self, message, file=None, **kwargs):
@@ -196,7 +191,7 @@ async def test_settings_callback_dispatch_renders_panel():
 
 
 def test_append_original_text():
-    base = "**LifeOS** `SV-000001`"
+    base = "📦 S0001 · DEEP"
     assert save_service._append_original_text(base, FakeMessage(text="source text")) == (
         f"{base}\n\nsource text"
     )
@@ -204,9 +199,31 @@ def test_append_original_text():
     assert save_service._append_original_text(base, FakeMessage(text=None)) == base
 
 
+def test_build_caption_is_compact():
+    caption = save_service.build_caption(
+        save_code="S0001",
+        sender="Test User",
+        chat_id=100,
+        msg_id=200,
+        dt=__import__("datetime").datetime(2026, 8, 18, 15, 30),
+        media_type="Photo",
+        mime="image/jpeg",
+        file_size=12345,
+        file_name="photo_S0001.jpg",
+        tags=["#saved"],
+    )
+    assert "S0001 · DEEP" in caption
+    assert "Test User" in caption
+    assert "100/200" in caption
+    assert "Photo" in caption
+    assert "#saved" in caption
+    # No verbose "Original Message Information:" style blocks.
+    assert "Original Message Information" not in caption
+
+
 def test_upload_kwargs_photo():
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
-    kw = save_service._upload_kwargs_for_media(media, "image/jpeg", "photo_SV-1.jpg")
+    kw = save_service._upload_kwargs_for_media(media, "image/jpeg", "photo_S0001.jpg")
     assert kw == {"force_document": False}
 
 
@@ -263,40 +280,7 @@ def test_upload_kwargs_plain_document_keeps_mime_and_name():
     assert filenames and filenames[0].file_name == "report.pdf"
 
 
-# ── forward save ──
-
-
-@pytest.mark.asyncio
-async def test_forward_save_attaches_caption_and_preserves_text():
-    client = MockClient()
-    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
-    msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "f", "UTC")
-
-    assert "Saved Successfully" in result
-    fwd = [c for c in client.calls if c[0] == "forward_messages"][0]
-    assert fwd[1] == "me"
-    assert fwd[2] is msg
-
-    edit = [c for c in client.calls if c[0] == "edit_message"][0]
-    assert edit[1] == "me"
-    assert "**LifeOS**" in edit[3]
-    assert "hello world" in edit[3]  # original text preserved below the caption
-
-    row = await db_client.query_save(_save_code(result))
-    assert row is not None
-    assert row["save_type"] == "forward"
-    assert row["media_type"] == "Photo"
-    assert row["mime_type"] == "image/jpeg"
-    assert row["file_id"] == "8888"
-    assert row["origin_chat_id"] == 100
-    assert row["origin_msg_id"] == 200
-    assert row["saved_msg_id"] == 600
-    assert row["owner_id"] == 42
-    assert row["caption"] and "**LifeOS**" in row["caption"]
-
-
-# ── deep save ──
+# ── deep save (the only save method) ──
 
 
 @pytest.mark.asyncio
@@ -304,13 +288,13 @@ async def test_deep_save_photo_preserves_type_and_actual_size():
     client = MockClient()
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     assert "Saved Successfully" in result
     _, entity, file, kwargs = _send_file_call(client)
     assert entity == "me"
     assert kwargs["force_document"] is False
-    assert "**LifeOS**" in kwargs["caption"]
+    assert "DEEP" in kwargs["caption"]
     assert "hello world" in kwargs["caption"]
     assert isinstance(file, str)  # temporary file path, not an in-memory buffer
     assert not os.path.exists(file)  # temp file removed after upload
@@ -329,10 +313,10 @@ async def test_deep_save_never_forwards():
     client = MockClient()
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     assert "Saved Successfully" in result
-    # Deep save must be a genuine download → upload, never a forward.
+    # Deep Save must be a genuine download → upload, never a forward.
     assert not [c for c in client.calls if c[0] == "forward_messages"]
     assert [c for c in client.calls if c[0] == "download_media"]
     assert [c for c in client.calls if c[0] == "send_file"]
@@ -349,7 +333,7 @@ async def test_deep_save_video_keeps_video_attributes():
     ]
     media = MessageMediaDocument(document=doc, ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     _, _, _, kwargs = _send_file_call(client)
     videos = [a for a in kwargs["attributes"] if isinstance(a, DocumentAttributeVideo)]
@@ -371,7 +355,7 @@ async def test_deep_save_voice_keeps_voice_type():
     ]
     media = MessageMediaDocument(document=doc, ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     _, _, _, kwargs = _send_file_call(client)
     audios = [a for a in kwargs["attributes"] if isinstance(a, DocumentAttributeAudio)]
@@ -385,13 +369,14 @@ async def test_deep_save_voice_keeps_voice_type():
 async def test_deep_save_text_message():
     client = MockClient()
     msg = FakeMessage(text="just some plain text", media=None)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     assert "Saved Successfully" in result
     sm = [c for c in client.calls if c[0] == "send_message"][0]
     assert sm[1] == "me"
-    assert "**LifeOS**" in sm[2]
+    assert "DEEP" in sm[2]
     assert "just some plain text" in sm[2]
+    assert not [c for c in client.calls if c[0] == "forward_messages"]
 
     row = await db_client.query_save(_save_code(result))
     assert row["save_type"] == "deep"
@@ -404,8 +389,8 @@ async def test_deep_save_text_message():
 async def test_deep_save_no_media_no_text_errors():
     client = MockClient()
     msg = FakeMessage(text="", media=None)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
-    assert "no downloadable media" in result
+    result = await save_service.execute_save(client, 42, msg, "UTC")
+    assert "no text or media" in result
     assert not [c for c in client.calls if c[0] in ("send_file", "send_message")]
 
 
@@ -419,8 +404,8 @@ async def test_deep_save_cleans_temp_on_download_error():
     client.download_media = boom
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
-    assert "❌ Download failed" in result
+    result = await save_service.execute_save(client, 42, msg, "UTC")
+    assert "❌ Deep Save failed" in result
     # A download failure must remain a DEEP-save failure — it must never
     # react by falling back to forwarding (protected-chat invariant).
     assert not [c for c in client.calls if c[0] == "forward_messages"]
@@ -443,7 +428,7 @@ async def test_deep_save_persists_new_upload_file_id():
     doc.attributes = [DocumentAttributeFilename("archive.zip")]
     media = MessageMediaDocument(document=doc, ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     row = await db_client.query_save(_save_code(result))
     assert row["save_type"] == "deep"
@@ -462,7 +447,7 @@ async def test_deep_save_persists_full_metadata():
     doc.attributes = [DocumentAttributeFilename("archive.zip")]
     media = MessageMediaDocument(document=doc, ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     row = await db_client.query_save(_save_code(result))
     assert row["mime_type"] == "application/zip"
@@ -477,57 +462,6 @@ async def test_deep_save_persists_full_metadata():
     assert row["tags"]
 
 
-# ── mode normalization (engine is the single authority) ──
-
-
-@pytest.mark.asyncio
-async def test_execute_save_normalizes_friendly_mode_names():
-    # "forward"/"fwd" are FORWARD saves; "deep" is a deep save. A friendly
-    # name must never silently cross the forward/deep boundary.
-    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
-    msg = FakeMessage(media=media)
-
-    fwd_client = MockClient()
-    await save_service.execute_save(fwd_client, 42, msg, "forward", "UTC")
-    assert [c for c in fwd_client.calls if c[0] == "forward_messages"]
-    assert not [c for c in fwd_client.calls if c[0] == "send_file"]
-
-    deep_client = MockClient()
-    await save_service.execute_save(deep_client, 42, msg, "deep", "UTC")
-    assert not [c for c in deep_client.calls if c[0] == "forward_messages"]
-    assert [c for c in deep_client.calls if c[0] == "download_media"]
-    assert [c for c in deep_client.calls if c[0] == "send_file"]
-
-
-# ── rebuilt pipeline: independent entrypoints ──
-
-
-@pytest.mark.asyncio
-async def test_deep_save_pipeline_entrypoint():
-    client = MockClient()
-    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
-    msg = FakeMessage(media=media)
-    result = await save_service.execute_deep_save(client, 42, msg, "UTC")
-
-    assert "Saved Successfully" in result
-    assert not [c for c in client.calls if c[0] == "forward_messages"]
-    assert [c for c in client.calls if c[0] == "download_media"]
-    assert [c for c in client.calls if c[0] == "send_file"]
-
-
-@pytest.mark.asyncio
-async def test_forward_save_pipeline_entrypoint():
-    client = MockClient()
-    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
-    msg = FakeMessage(media=media)
-    result = await save_service.execute_forward_save(client, 42, msg, "UTC")
-
-    assert "Saved Successfully" in result
-    assert [c for c in client.calls if c[0] == "forward_messages"]
-    assert not [c for c in client.calls if c[0] == "download_media"]
-    assert not [c for c in client.calls if c[0] == "send_file"]
-
-
 @pytest.mark.asyncio
 async def test_deep_save_forward_restriction_does_not_block_deep():
     # A protected chat blocks forwarding — but Deep Save must NOT depend on
@@ -540,7 +474,7 @@ async def test_deep_save_forward_restriction_does_not_block_deep():
     client.forward_messages = forward_blocked
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
     assert "Saved Successfully" in result
     assert not [c for c in client.calls if c[0] == "forward_messages"]
@@ -558,24 +492,137 @@ async def test_deep_save_upload_failure_no_db_record_and_cleanup():
     client.send_file = upload_boom
     media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
     msg = FakeMessage(media=media)
-    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+    result = await save_service.execute_save(client, 42, msg, "UTC")
 
-    assert "❌ Upload failed" in result
+    assert "❌ Deep Save failed" in result
     assert db_client._fallback["saved_items"] == []  # no success DB record
     _assert_no_leftover_temp_dirs()
 
 
-# ── Glass panel mode routing ──
+# ── Glass UI: Save → Deep Save → Reply Mode ──
+
+
+def _panel_button_datas(buttons) -> list[str]:
+    datas = []
+    for row in buttons:
+        if isinstance(row, list):
+            for btn in row:
+                data = getattr(btn, "data", None)
+                if isinstance(data, bytes):
+                    datas.append(data.decode("utf-8", errors="replace"))
+                elif isinstance(data, str):
+                    datas.append(data)
+    return datas
 
 
 @pytest.mark.asyncio
-async def test_save_panel_deep_mode_routing():
+async def test_save_panel_has_no_forward_save():
     from backend.bot.handlers import save as save_handler
 
-    _, _, buttons = await save_handler._save_panel_handler(None, "type:d")
-    data = [b.data for row in buttons for b in row]
-    assert any(b"save_reply:d" in d for d in data)
+    title, body, buttons = await save_handler._save_panel_handler(None, "")
+    labels = [b.text for row in buttons for b in row]
+    datas = _panel_button_datas(buttons)
+    assert "Forward Save" not in labels
+    assert any("Deep Save" in l for l in labels)
+    assert any(d.startswith("panel:save:type:d") for d in datas)
+    assert any(d == "panel:retrieve" for d in datas)
 
-    _, _, buttons = await save_handler._save_panel_handler(None, "type:f")
-    data = [b.data for row in buttons for b in row]
-    assert any(b"save_reply:f" in d for d in data)
+
+@pytest.mark.asyncio
+async def test_save_panel_deep_source_shows_reply_mode():
+    from backend.bot.handlers import save as save_handler
+
+    title, body, buttons = await save_handler._save_panel_handler(None, "type:d")
+    labels = [b.text for row in buttons for b in row]
+    datas = _panel_button_datas(buttons)
+    assert any("Reply Mode" in l for l in labels)
+    assert "action:save_reply" in datas
+    assert "input:save:link" in datas
+
+
+@pytest.mark.asyncio
+async def test_save_reply_action_sets_pending_deep_state(monkeypatch):
+    from backend.bot.handlers import save as save_handler
+    from backend.helper import inline_engine, input_state
+
+    monkeypatch.setattr(inline_engine, "_owner_id", 12345)
+
+    class FakeEvent:
+        message_id = 999
+    ev = FakeEvent()
+
+    title, body, buttons = await save_handler._save_reply_action(ev, "", 111)
+    assert "Reply Mode" in body
+
+    pending = input_state.get_pending(12345)
+    assert pending is not None
+    assert pending["panel_id"] == "save_reply"
+    assert pending["chat_id"] == 111
+    input_state.clear_pending(12345)
+
+
+@pytest.mark.asyncio
+async def test_save_reply_wait_resolves_reply_to_msg_id_and_deep_saves(monkeypatch):
+    from backend.bot.handlers import save as save_handler
+    from backend.helper import inline_engine, input_state
+
+    calls = []
+
+    class TargetMsg:
+        chat_id = 111
+        id = 555
+        text = "target text"
+        media = None
+        sender_id = 777
+
+        async def get_sender(self):
+            return None
+
+    class ReplyMsg:
+        chat_id = 111
+        id = 444
+        reply_to_msg_id = 555
+
+    class FakeClient:
+        async def get_messages(self, chat_id, ids):
+            calls.append(("get_messages", chat_id, ids))
+            if ids == 444:
+                return ReplyMsg()
+            if ids == 555:
+                return TargetMsg()
+            return None
+
+        async def delete_messages(self, chat_id, ids):
+            calls.append(("delete_messages", chat_id, ids))
+
+        async def send_message(self, entity, text):
+            calls.append(("send_message", entity, text))
+            return type("S", (), {"chat_id": "me", "id": 600, "media": None})()
+
+        async def send_file(self, *a, **k):
+            calls.append(("send_file", a, k))
+            return type("S", (), {"chat_id": "me", "id": 600, "media": None})()
+
+        async def download_media(self, *a, **k):
+            calls.append(("download_media", a, k))
+            return "ok"
+
+        async def forward_messages(self, *a, **k):
+            calls.append(("forward_messages", a, k))
+            raise AssertionError("deep save must never forward")
+
+    monkeypatch.setattr(inline_engine, "_owner_id", 12345)
+    monkeypatch.setattr(inline_engine, "_self_client", FakeClient())
+    monkeypatch.setattr(save_handler, "get_client", lambda: None)
+    input_state.clear_pending(12345)
+
+    await save_handler._save_reply_wait_handler("ignored", 111, 444, 0, 0)
+
+    # Resolved the user reply, then the exact replied-to target message.
+    assert ("get_messages", 111, 444) in calls
+    assert ("get_messages", 111, 555) in calls
+    # Text-only target → a NEW text message, never a forward.
+    assert any(c[0] == "send_message" for c in calls)
+    assert not any(c[0] == "forward_messages" for c in calls)
+    # The trigger reply is cleaned up after saving.
+    assert any(c[0] == "delete_messages" and c[1] == 111 for c in calls)

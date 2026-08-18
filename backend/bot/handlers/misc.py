@@ -476,8 +476,7 @@ async def _context_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     except Exception as exc:
         body_lines.append(f"Error: {exc}")
     builder = InlinePanelBuilder()
-    builder.add_row("Save (Forward)", "action:save_reply:f")
-    builder.add_row("Save (Deep)", "action:save_reply:d")
+    builder.add_row("⬇️ Deep Save", "action:save_reply")
     return "Context Panel", "\n".join(body_lines), builder.build()
 
 
