@@ -71,6 +71,35 @@ async def test_fetch_openai_compat_filters_non_chat_and_caches():
 
 
 @pytest.mark.asyncio
+async def test_openai_compat_excludes_metadata_non_text_models():
+    clear_cache()
+    payload = {
+        "data": [
+            {"id": "gpt-4o", "context_length": 128000},
+            {"id": "gpt-image-1", "capabilities": {"text": False, "image": True}},
+            {"id": "video-model", "capabilities": {"text": False, "video": True}},
+            {"id": "audio-model", "capabilities": {"text": False, "audio": True}},
+            {"id": "chat-with-caps", "capabilities": {"text": True, "reasoning": True}},
+        ]
+    }
+    mock_client = _mock_async_client(_mock_response(200, payload))
+
+    with patch("backend.ai.model_discovery.httpx.AsyncClient", return_value=mock_client):
+        models = await fetch_models("openrouter", "fake_key", "https://openrouter.ai/api/v1")
+
+    ids = [m.id for m in models]
+    assert "gpt-4o" in ids
+    assert "chat-with-caps" in ids
+    assert "gpt-image-1" not in ids
+    assert "video-model" not in ids
+    assert "audio-model" not in ids
+
+    # Provider metadata survives into capabilities for chat-capable models.
+    chat = next(m for m in models if m.id == "chat-with-caps")
+    assert "reasoning" in chat.capabilities
+
+
+@pytest.mark.asyncio
 async def test_force_refresh_bypasses_cache():
     clear_cache()
     payload = {"data": [{"id": "gpt-4o"}]}
@@ -80,6 +109,14 @@ async def test_force_refresh_bypasses_cache():
         await fetch_models("openai", "k", "https://api.openai.com/v1")
         await fetch_models("openai", "k", "https://api.openai.com/v1", force_refresh=True)
     assert mock_client.get.call_count == 2
+
+
+def test_gemini_fallback_catalog_has_no_stale_20_models():
+    from backend.ai.model_discovery import _FALLBACK_CATALOG
+    gemini = _FALLBACK_CATALOG.get("gemini", [])
+    assert "gemini-2.0-flash" not in gemini
+    assert "gemini-2.0-flash-lite" not in gemini
+    assert "gemini-2.5-flash" in gemini
 
 
 @pytest.mark.asyncio

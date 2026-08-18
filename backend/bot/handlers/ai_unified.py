@@ -102,11 +102,10 @@ async def _restore_config(owner_id: int) -> None:
 
         engine = _get_engine()
         if engine and provider:
-            if engine.provider_manager.registry.has(provider):
-                engine.provider_manager.switch_provider(provider)
-                if model:
-                    pconfig = engine.provider_manager.get_provider_config(provider)
-                    pconfig.default_model = model
+            # Authoritative path: switch provider + apply model to the
+            # runtime provider instance (same as web/glass selection).
+            from backend.ai.engine.engine import apply_runtime_selection
+            apply_runtime_selection(provider, model)
 
         if engine:
             try:

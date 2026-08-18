@@ -89,13 +89,16 @@ class ProviderConfigManager:
 
     # ── Update ──
 
-    def update(self, name: str, field: str, value: Any) -> ValidationResult:
+    def update(self, name: str, field: str, value: Any, config: ProviderConfig | None = None) -> ValidationResult:
         """Update a single field on a provider's config.
 
+        ``config`` may be an external authoritative object (e.g. the
+        registered provider instance's config); when provided it is
+        updated directly so there is exactly ONE config per provider.
         Returns the ValidationResult after the update. If the update
         is invalid, the field is NOT changed.
         """
-        config = self.get_config(name)
+        config = config if config is not None else self.get_config(name)
         if not hasattr(config, field):
             result = ValidationResult(valid=False, provider_name=name)
             result.add(field, "UNKNOWN_FIELD", f"Unknown config field: {field!r}")
@@ -130,9 +133,20 @@ class ProviderConfigManager:
 
     # ── Reset ──
 
-    def reset(self, name: str) -> ProviderConfig:
-        """Reset a provider's config to factory defaults."""
+    def reset(self, name: str, config: ProviderConfig | None = None) -> ProviderConfig:
+        """Reset a provider's config to factory defaults.
+
+        When ``config`` is provided (the authoritative object), its
+        fields are reset in place so the registered provider instance
+        observes the reset immediately.
+        """
         fresh = get_provider_default(name)
+        if config is not None:
+            for field, value in fresh.as_dict().items():
+                if hasattr(config, field):
+                    setattr(config, field, value)
+            logger.info("ProviderConfigManager: reset '%s' (in-place) to defaults", name)
+            return config
         self._configs[name] = fresh
         logger.info("ProviderConfigManager: reset '%s' to defaults", name)
         return fresh
@@ -145,9 +159,9 @@ class ProviderConfigManager:
 
     # ── Validate ──
 
-    def validate(self, name: str) -> ValidationResult:
+    def validate(self, name: str, config: ProviderConfig | None = None) -> ValidationResult:
         """Validate a provider's current config."""
-        return validate_provider_config(self.get_config(name))
+        return validate_provider_config(config if config is not None else self.get_config(name))
 
     def validate_all(self) -> dict[str, ValidationResult]:
         """Validate all provider configs. Returns name→result dict."""

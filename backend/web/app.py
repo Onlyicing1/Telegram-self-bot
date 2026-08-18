@@ -201,12 +201,15 @@ async def api_ai_set_provider(body: dict):
     ok = await update_provider(_owner_id, provider)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save provider")
+    # Persistence alone is not enough — the runtime provider instance must
+    # switch immediately so chat uses the same (provider, model) pair.
+    _apply_runtime_selection(provider, info["default_model"])
     return {"success": True, "provider": provider, "model": info["default_model"]}
 
 
 @app.post("/api/ai/model")
 async def api_ai_set_model(body: dict):
-    from backend.ai.config_store import update_model
+    from backend.ai.config_store import get_config, update_model
 
     model = (body.get("model") or "").strip()
     if not model:
@@ -214,6 +217,9 @@ async def api_ai_set_model(body: dict):
     ok = await update_model(_owner_id, model)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save model")
+    # Apply the model to the runtime provider instance (same authoritative path).
+    config = await get_config(_owner_id)
+    _apply_runtime_selection(config.get("provider", ""), model)
     return {"success": True, "model": model}
 
 
@@ -237,6 +243,21 @@ async def api_ai_test_models():
     except Exception as exc:
         logger.error("api/ai/test-models error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _apply_runtime_selection(provider: str, model: str) -> None:
+    """Push a (provider, model) selection into the runtime engine.
+
+    Uses the same authoritative path as the glass actions and the chat
+    entry points — never a parallel config store. Failures are logged,
+    never raised (the persisted config_store remains the source of truth
+    and the chat entry point re-applies it on the next request).
+    """
+    try:
+        from backend.ai.engine.engine import apply_runtime_selection
+        apply_runtime_selection(provider, model)
+    except Exception as exc:
+        logger.warning("api/ai: runtime selection apply failed: %s", exc)
 
 
 def mount_static():

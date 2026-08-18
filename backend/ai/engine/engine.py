@@ -210,3 +210,18 @@ def get_engine() -> Engine:
 def engine_health() -> str:
     """Module-level health check — delegates to the default engine."""
     return get_engine().engine_health()
+
+
+def apply_runtime_selection(provider: str, model: str = "") -> bool:
+    """Apply a (provider, model) selection to the runtime engine.
+
+    This is the ONE authoritative path used by the web API, the glass
+    actions, and the chat entry points: it switches the active provider
+    and updates the registered provider instance's config so the runtime
+    sends exactly the (provider, model) the user selected. Never raises.
+    """
+    try:
+        return get_engine().provider_manager.apply_selection(provider, model)
+    except Exception as exc:
+        logger.warning("engine.apply_runtime_selection failed for provider=%s: %s", provider, exc)
+        return False

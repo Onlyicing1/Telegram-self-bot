@@ -45,6 +45,21 @@ def _get_engine():
         return None
 
 
+def _apply_runtime_selection(provider: str, model: str) -> None:
+    """Push a (provider, model) selection into the runtime engine.
+
+    Same authoritative path as the web API and the chat entry points —
+    never a parallel config store. Failures are logged, not raised; the
+    persisted config_store remains the source of truth and chat re-applies
+    it on the next request.
+    """
+    try:
+        from backend.ai.engine.engine import apply_runtime_selection
+        apply_runtime_selection(provider, model)
+    except Exception as exc:
+        logger.warning("AI panel: runtime selection apply failed: %s", exc)
+
+
 async def _get_owner_id() -> int:
     from backend.helper.inline_engine import _owner_id
     return _owner_id
@@ -439,6 +454,7 @@ async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[s
     config["is_configured"] = True
     await _save_config(owner_id, config)
     logger.info("[AI_TRACE] select_provider SAVED provider='%s' model='%s'", provider_name, config["model"])
+    _apply_runtime_selection(provider_name, config["model"])
     from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
@@ -447,6 +463,7 @@ async def _ai_select_provider_action(event, extra: str, chat_id: int) -> tuple[s
         first = models[0]
         config["model"] = first.id
         await _save_config(owner_id, config)
+        _apply_runtime_selection(provider_name, first.id)
         logger.info("[AI_TRACE] select_provider MODEL_UPDATED model='%s'", first.id)
     logger.info("[AI_TRACE] select_provider → entering model panel")
     return await _ai_model_panel_handler(event, "")
@@ -459,8 +476,49 @@ async def _ai_select_model_action(event, extra: str, chat_id: int) -> tuple[str,
     config = await _get_saved_config(owner_id)
     config["model"] = model_id
     await _save_config(owner_id, config)
+    _apply_runtime_selection(config.get("provider", ""), model_id)
     logger.info("[AI_TRACE] select_model SAVED provider='%s' model='%s'", config.get("provider", ""), model_id)
     return await _ai_main_panel_handler(event, "")
+
+
+async def _ai_pick_model_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Pick a tested-usable model — provider and model are selected TOGETHER.
+
+    Callback data: ``ai_pick_model:<provider>:<model>``. Selecting a model
+    this way also selects its provider automatically, persists both, and
+    applies them to the runtime in one authoritative call — eliminating
+    provider/model mismatches.
+    """
+    provider_name, _, model_id = extra.partition(":")
+    provider_name = provider_name.strip()
+    model_id = model_id.strip()
+    owner_id = await _get_owner_id()
+    logger.info("[AI_TRACE] pick_model START provider='%s' model='%s' owner_id=%s", provider_name, model_id, owner_id)
+    if not provider_name or not model_id:
+        return "🧠 AI", "❌ Invalid model selection.", []
+    from backend.ai.discovery import get_provider_info
+    if not get_provider_info(provider_name):
+        return "🧠 AI", f"❌ Unknown provider '{provider_name}'.", []
+
+    config = await _get_saved_config(owner_id)
+    config["provider"] = provider_name
+    config["model"] = model_id
+    config["is_configured"] = True
+    await _save_config(owner_id, config)
+    _apply_runtime_selection(provider_name, model_id)
+    logger.info("[AI_TRACE] pick_model SAVED + APPLIED provider='%s' model='%s'", provider_name, model_id)
+
+    builder = InlinePanelBuilder()
+    builder.add_row("💬 Start Chat", "action:ai_start_chat")
+    builder.add_row("🔁 Re-run Tests", "action:ai_test_models")
+    builder.add_row("📊 Status", "panel:ai_status")
+    _nav_buttons(builder)
+    return (
+        "🧠 AI",
+        f"**Model selected**\n\nProvider: **{provider_name}**\nModel: `{model_id}`\n\n"
+        f"This pair is saved and applied to the runtime. Start chat to use it.",
+        builder.build(),
+    )
 
 
 async def _ai_refresh_providers_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -604,7 +662,23 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
             lines.append(f"      _{r['error'][:160]}_")
         lines.append("")
 
+    # Usable models — only AVAILABLE results are offered as one-tap
+    # selection buttons; provider and model are picked together.
+    usable = [r for r in results if r.get("status") == "AVAILABLE"]
+    usable_sorted = sorted(usable, key=lambda x: (x.get("provider", ""), x.get("latency_s") if x.get("latency_s") is not None else 999))
+
     builder = InlinePanelBuilder()
+    if usable_sorted:
+        lines.append(f"**✅ Usable models — tap to select**")
+        for r in usable_sorted[:12]:
+            label = f"🟢 {r.get('display_name', r.get('provider', '?'))} — {r.get('model', '?')}"
+            latency = r.get("latency_s")
+            if latency is not None:
+                label += f" ({latency}s)"
+            builder.add_row(label[:64], f"action:ai_pick_model:{r['provider']}:{r['model']}")
+    else:
+        lines.append(f"_No usable chat models right now._")
+    lines.append("")
     builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
     builder.add_row("🤖 Pick Model", "panel:ai_model")
     builder.add_row("📊 Status", "panel:ai_status")
@@ -800,6 +874,7 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_diagnostics", _ai_diagnostics_inline_builder)
         register_action("ai_select_provider", _ai_select_provider_action)
         register_action("ai_select_model", _ai_select_model_action)
+        register_action("ai_pick_model", _ai_pick_model_action)
         register_action("ai_refresh_providers", _ai_refresh_providers_action)
         register_action("ai_refresh_models", _ai_refresh_models_action)
         register_action("ai_start_chat", _ai_start_chat_action)

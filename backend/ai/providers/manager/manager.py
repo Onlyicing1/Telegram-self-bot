@@ -167,6 +167,27 @@ class ProviderManager:
             return False
         return self._registry.switch_provider(name)
 
+    def apply_selection(self, provider: str, model: str = "") -> bool:
+        """Switch the active provider and apply the selected model to the
+        runtime provider instance in one call.
+
+        This is the single path UI selections (web + glass) and the chat
+        entry points use so the (provider, model) pair the user picks is
+        exactly what the runtime sends at request time. The model is
+        written to the registered provider's OWN config object (the
+        authoritative one) — never a divergent copy.
+        """
+        if not provider or not self._registry.has(provider):
+            logger.warning("ProviderManager: apply_selection: provider '%s' not registered", provider)
+            return False
+        self._registry.switch_provider(provider)
+        if model:
+            config = self._config_for(provider)
+            if config is not None:
+                config.default_model = model
+                logger.info("ProviderManager: applied model '%s' to runtime provider '%s'", model, provider)
+        return True
+
     def get_active_name(self) -> str:
         return self._registry.active_name
 
@@ -200,27 +221,51 @@ class ProviderManager:
     def config_manager(self) -> ProviderConfigManager:
         return self._config_mgr
 
-    def get_provider_config(self, name: str | None = None) -> ProviderConfig:
-        """Return the ProviderConfig for a provider (active if name is None)."""
-        if name is None:
-            return self._config_mgr.get_active_config()
+    def _config_for(self, name: str) -> ProviderConfig:
+        """Return the ONE authoritative ProviderConfig for a provider.
+
+        Registered providers own the config instance used at request time
+        (``provider.config``). The config manager must never hold a
+        divergent copy of a registered provider's config, otherwise a
+        model selected through the UI never reaches the runtime request.
+        Unregistered (default-only) providers fall back to the config
+        manager so discovery/status still has something to read.
+        """
+        provider = self._registry.get(name)
+        if provider is not None:
+            return provider.config
         return self._config_mgr.get_config(name)
+
+    def get_provider_config(self, name: str | None = None) -> ProviderConfig:
+        """Return the authoritative ProviderConfig (active if name is None).
+
+        This is the SINGLE source of truth for a provider's runtime
+        configuration — the same object the provider instance reads when
+        it builds a request. Model/provider selection must go through this
+        so the runtime always uses the selected (provider, model) pair.
+        """
+        if name is None:
+            name = self._registry.active_name
+        return self._config_for(name)
 
     def update_provider_config(self, name: str, field: str, value: Any) -> Any:
         """Update a provider config field. Returns the ValidationResult."""
-        return self._config_mgr.update(name, field, value)
+        return self._config_mgr.update(name, field, value, config=self._config_for(name))
 
     def reset_provider_config(self, name: str) -> ProviderConfig:
         """Reset a provider's config to factory defaults."""
-        return self._config_mgr.reset(name)
+        return self._config_mgr.reset(name, config=self._config_for(name))
 
     def validate_provider(self, name: str) -> Any:
         """Validate a provider's config. Returns ValidationResult."""
-        return self._config_mgr.validate(name)
+        return self._config_mgr.validate(name, config=self._config_for(name))
 
     def export_configs(self) -> dict[str, dict[str, Any]]:
         """Export all provider configs as dicts."""
-        return self._config_mgr.export()
+        return {
+            name: self._config_for(name).as_dict()
+            for name in sorted(set(list(self._config_mgr.list_provider_names()) + self._registry.list()))
+        }
 
     # ── Internal ──
 

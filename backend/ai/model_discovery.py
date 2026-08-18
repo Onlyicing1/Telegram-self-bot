@@ -80,8 +80,6 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
     "gemini": [
         "gemini-2.5-flash",
         "gemini-2.5-pro",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
     ],
     "openai": [
         "gpt-4o",
@@ -224,6 +222,12 @@ async def _fetch_openai_compat_models(
 
                 caps: list[str] = []
                 raw_caps = m.get("capabilities") if isinstance(m.get("capabilities"), dict) else {}
+                # Metadata-driven filter: when the provider explicitly says
+                # the model is NOT text-capable (e.g. OpenRouter's
+                # capabilities.text: false), exclude it even if the name
+                # gives no hint (image/video/audio-only models).
+                if "text" in raw_caps and raw_caps.get("text") is False:
+                    continue
                 for cap_name, enabled in raw_caps.items():
                     if enabled is True:
                         caps.append(str(cap_name))

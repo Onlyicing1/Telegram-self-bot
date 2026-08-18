@@ -148,6 +148,17 @@ export default function AIConfigPanel() {
     return map;
   }, [testResults]);
 
+  // After a test run, only CURRENTLY USABLE models (AVAILABLE + the
+  // user's active selection) belong in the normal selection catalog.
+  const usableMap = useMemo(() => {
+    if (!testResults) return null;
+    const map = new Map<string, ModelTestResult>();
+    for (const r of testResults.results) {
+      if (r.status === 'AVAILABLE') map.set(`${r.provider}|${r.model}`, r);
+    }
+    return map;
+  }, [testResults]);
+
   const handleSelectModel = async (provider: string, model: string) => {
     if (selecting) return;
     setSelecting(`${provider}|${model}`);
@@ -427,56 +438,131 @@ export default function AIConfigPanel() {
         </div>
       )}
 
-      {/* Model Selection — compact multi-column grid */}
+      {/* Model Selection — compact multi-column grid, usable-only after a test run */}
       {modelsByProvider.length > 0 && (
         <div>
           <h3 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest mb-3">
             Models
             {loadingModels && <span className="ml-2 text-xs font-normal text-on-surface-variant animate-pulse">refreshing…</span>}
-          </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
-            {modelsByProvider.map(pm =>
-              pm.models.map(m => {
-                const status = cardStatus(pm, m);
-                const isCurrent = config?.provider === pm.provider && config?.model === m.id;
-                const key = `${pm.provider}|${m.id}`;
-                return (
-                  <button
-                    key={key}
-                    onClick={() => handleSelectModel(pm.provider, m.id)}
-                    disabled={selecting !== null || (status.failed && !isCurrent)}
-                    title={status.failed && !isCurrent ? `${status.label} — select only models that work for chat` : undefined}
-                    className={`text-left bg-surface-container rounded-xl px-3.5 py-3 border transition-colors ${
-                      isCurrent
-                        ? 'border-primary/50 bg-primary/5'
-                        : 'border-outline-variant hover:border-primary/30'
-                    } disabled:opacity-60 disabled:cursor-not-allowed`}
-                  >
-                    <div className="flex items-center gap-1.5 text-[11px] text-on-surface-variant mb-1">
-                      <span>{pm.icon}</span>
-                      <span className="truncate">{pm.display_name}</span>
-                    </div>
-                    <p className={`text-sm font-mono truncate ${isCurrent ? 'text-primary' : 'text-on-surface'}`}>
-                      {m.name}
-                    </p>
-                    <div className="mt-1.5 flex items-center justify-between gap-2">
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${status.cls}`}>
-                        {status.label}
-                      </span>
-                      {selecting === key && <span className="text-[10px] text-on-surface-variant animate-pulse">saving…</span>}
-                      {m.context_length > 0 && !isCurrent && (
-                        <span className="text-[10px] text-on-surface-variant shrink-0">
-                          {m.context_length >= 1000 ? `${Math.round(m.context_length / 1000)}K` : `${m.context_length}`}
-                        </span>
-                      )}
-                    </div>
-                  </button>
-                );
-              })
+            {testResults && usableMap && (
+              <span className="ml-2 text-xs font-normal text-on-surface-variant">
+                (usable only — run Test Models to refresh)
+              </span>
             )}
-          </div>
+          </h3>
+          {testResults && usableMap && (
+            (() => {
+              const visible = modelsByProvider
+                .map(pm => ({
+                  pm,
+                  models: pm.models.filter(m =>
+                    (config?.provider === pm.provider && config?.model === m.id) ||
+                    usableMap.has(`${pm.provider}|${m.id}`)
+                  ),
+                }))
+                .filter(g => g.models.length > 0);
+              if (visible.length === 0) {
+                return (
+                  <div className="bg-surface-container border border-outline-variant rounded-2xl p-5">
+                    <p className="text-sm text-on-surface font-medium">No currently usable chat models.</p>
+                    <p className="text-xs text-on-surface-variant mt-1">
+                      Run <span className="font-medium">Test Models</span> and check the results above — models that fail (invalid, rate limited, no credits, auth errors) are excluded from the selection catalog.
+                    </p>
+                  </div>
+                );
+              }
+              return (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
+                  {visible.map(({ pm, models }) =>
+                    models.map(m => {
+                      const status = cardStatus(pm, m);
+                      const isCurrent = config?.provider === pm.provider && config?.model === m.id;
+                      const key = `${pm.provider}|${m.id}`;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => handleSelectModel(pm.provider, m.id)}
+                          disabled={selecting !== null || (status.failed && !isCurrent)}
+                          title={status.failed && !isCurrent ? `${status.label} — select only models that work for chat` : undefined}
+                          className={`text-left bg-surface-container rounded-xl px-3.5 py-3 border transition-colors ${
+                            isCurrent
+                              ? 'border-primary/50 bg-primary/5'
+                              : 'border-outline-variant hover:border-primary/30'
+                          } disabled:opacity-60 disabled:cursor-not-allowed`}
+                        >
+                          <div className="flex items-center gap-1.5 text-[11px] text-on-surface-variant mb-1">
+                            <span>{pm.icon}</span>
+                            <span className="truncate">{pm.display_name}</span>
+                          </div>
+                          <p className={`text-sm font-mono truncate ${isCurrent ? 'text-primary' : 'text-on-surface'}`}>
+                            {m.name}
+                          </p>
+                          <div className="mt-1.5 flex items-center justify-between gap-2">
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${status.cls}`}>
+                              {status.label}
+                            </span>
+                            {selecting === key && <span className="text-[10px] text-on-surface-variant animate-pulse">saving…</span>}
+                            {m.context_length > 0 && !isCurrent && (
+                              <span className="text-[10px] text-on-surface-variant shrink-0">
+                                {m.context_length >= 1000 ? `${Math.round(m.context_length / 1000)}K` : `${m.context_length}`}
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              );
+            })()
+          )}
+          {(!testResults || !usableMap) && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
+              {modelsByProvider.map(pm =>
+                pm.models.map(m => {
+                  const status = cardStatus(pm, m);
+                  const isCurrent = config?.provider === pm.provider && config?.model === m.id;
+                  const key = `${pm.provider}|${m.id}`;
+                  return (
+                    <button
+                      key={key}
+                      onClick={() => handleSelectModel(pm.provider, m.id)}
+                      disabled={selecting !== null || (status.failed && !isCurrent)}
+                      title={status.failed && !isCurrent ? `${status.label} — select only models that work for chat` : undefined}
+                      className={`text-left bg-surface-container rounded-xl px-3.5 py-3 border transition-colors ${
+                        isCurrent
+                          ? 'border-primary/50 bg-primary/5'
+                          : 'border-outline-variant hover:border-primary/30'
+                      } disabled:opacity-60 disabled:cursor-not-allowed`}
+                    >
+                      <div className="flex items-center gap-1.5 text-[11px] text-on-surface-variant mb-1">
+                        <span>{pm.icon}</span>
+                        <span className="truncate">{pm.display_name}</span>
+                      </div>
+                      <p className={`text-sm font-mono truncate ${isCurrent ? 'text-primary' : 'text-on-surface'}`}>
+                        {m.name}
+                      </p>
+                      <div className="mt-1.5 flex items-center justify-between gap-2">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${status.cls}`}>
+                          {status.label}
+                        </span>
+                        {selecting === key && <span className="text-[10px] text-on-surface-variant animate-pulse">saving…</span>}
+                        {m.context_length > 0 && !isCurrent && (
+                          <span className="text-[10px] text-on-surface-variant shrink-0">
+                            {m.context_length >= 1000 ? `${Math.round(m.context_length / 1000)}K` : `${m.context_length}`}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
           <p className="mt-2 text-[11px] text-on-surface-variant">
-            Statuses come from the latest <span className="font-medium">Test Models</span> run. Failed models are disabled unless already selected.
+            {testResults
+              ? 'Showing only models proven usable by the latest Test Models run (plus your active selection).'
+              : 'Statuses come from the latest Test Models run — run it to verify models before selecting.'}
           </p>
         </div>
       )}
