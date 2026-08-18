@@ -655,20 +655,10 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
     return build_confirmation(save_code, "d", media_type, file_name)
 
 
-async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str) -> str:
-    """Execute a save operation and return a result string."""
-    # The engine is the single authority for mode semantics. Normalize every
-    # caller-facing spelling here so "forward"/"fwd" can never silently
-    # become a deep save (the ``else`` branch below is DEEP, not a fallback).
-    mode = (mode or "").strip().lower()
-    mode = "f" if mode in ("f", "forward", "fwd") else "d"
-
-    save_code = await db_client.get_next_save_code()
-    tz = _get_tz(tz_str)
-    now = datetime.now(tz)
-
+async def _resolve_sender(reply_msg) -> tuple[str, int]:
+    """Resolve the source message's sender name + id (best effort)."""
+    sender_id = getattr(reply_msg, "sender_id", None) or 0
     sender_name = "Unknown"
-    sender_id = reply_msg.sender_id or 0
     try:
         sender = await reply_msg.get_sender()
         if sender:
@@ -679,10 +669,11 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
             sender_name = " ".join(p for p in parts if p).strip() or str(sender_id)
     except Exception:
         pass
+    return sender_name, sender_id
 
-    origin_chat_id = reply_msg.chat_id
-    origin_msg_id = reply_msg.id
 
+def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | None, str | None, str | None, str]:
+    """Extract (mime_type, file_size, file_name, file_id, media_type) from the source."""
     mime_type = None
     file_size = None
     file_name = None
@@ -705,213 +696,259 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
     media_type = detect_media_type(mime_type)
     if not file_name:
         file_name = generate_filename(media, mime_type, save_code)
+    return mime_type, file_size, file_name, file_id, media_type
+
+
+async def execute_forward_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
+    """Forward Save — Telegram native forwarding (mode='f').
+
+    This is intentionally the ONLY place in the Save Engine that forwards. It
+    never downloads and never falls back to a deep re-upload.
+    """
+    save_code = await db_client.get_next_save_code()
+    now = datetime.now(_get_tz(tz_str))
+    sender_name, sender_id = await _resolve_sender(reply_msg)
+    origin_chat_id = reply_msg.chat_id
+    origin_msg_id = reply_msg.id
+    mime_type, file_size, file_name, file_id, media_type = _extract_source_media(reply_msg, save_code)
     tags = build_tags(media_type, now)
 
-    has_media = media is not None
     logger.info(
-        "[SAVE] owner=%s mode=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
-        owner_id, mode, has_media, save_code, file_name, mime_type, file_size, file_id,
+        "[SAVE] owner=%s mode=f media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
+        owner_id, reply_msg.media is not None, save_code, file_name, mime_type, file_size, file_id,
     )
 
-    if mode == "f":
-        caption = _append_original_text(
-            build_caption(
-                save_code=save_code,
-                sender=sender_name,
-                chat_id=origin_chat_id,
-                msg_id=origin_msg_id,
-                dt=now,
-                media_type=media_type,
-                mime=mime_type,
-                file_size=file_size,
-                file_name=file_name,
-                tags=tags,
-            ),
-            reply_msg,
-        )
-        t0 = asyncio.get_event_loop().time()
+    caption = _append_original_text(
+        build_caption(
+            save_code=save_code,
+            sender=sender_name,
+            chat_id=origin_chat_id,
+            msg_id=origin_msg_id,
+            dt=now,
+            media_type=media_type,
+            mime=mime_type,
+            file_size=file_size,
+            file_name=file_name,
+            tags=tags,
+        ),
+        reply_msg,
+    )
+
+    t0 = asyncio.get_event_loop().time()
+    try:
+        raw = await client.forward_messages("me", reply_msg)
+        fwd = _unwrap_forward(raw)
+        saved_chat_id = fwd.chat_id if fwd else None
+        saved_msg_id = fwd.id if fwd else None
+        record_event("save", "forward_messages", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+    except Exception as exc:
+        logger.error("forward save failed: %s", exc)
+        record_event("save", "forward_messages", 0, "ERROR", str(exc))
+        return f"❌ Forward failed: {exc}"
+
+    # Attach the generated caption to the forwarded message itself so the
+    # saved item carries the expected caption (with the original text
+    # preserved below it) instead of only living in the database.
+    caption_attached = False
+    if fwd is not None:
         try:
-            raw = await client.forward_messages("me", reply_msg)
-            fwd = _unwrap_forward(raw)
-            saved_chat_id = fwd.chat_id if fwd else None
-            saved_msg_id = fwd.id if fwd else None
-            record_event("save", "forward_messages", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+            await client.edit_message("me", fwd, text=caption)
+            caption_attached = True
         except Exception as exc:
-            logger.error("forward save failed: %s", exc)
-            record_event("save", "forward_messages", 0, "ERROR", str(exc))
-            return f"❌ Forward failed: {exc}"
+            logger.warning("forward save caption attach failed: %s", exc)
 
-        # Attach the generated caption to the forwarded message itself so the
-        # saved item carries the expected caption (with the original text
-        # preserved below it) instead of only living in the database.
-        caption_attached = False
-        if fwd is not None:
-            try:
-                await client.edit_message("me", fwd, text=caption)
-                caption_attached = True
-            except Exception as exc:
-                logger.warning("forward save caption attach failed: %s", exc)
-
-        payload = {
-            "save_code": save_code,
-            "save_type": "forward",
-            "origin_chat_id": origin_chat_id,
-            "origin_msg_id": origin_msg_id,
-            "saved_chat_id": saved_chat_id,
-            "saved_msg_id": saved_msg_id,
-            "sender_name": sender_name,
-            "sender_id": sender_id,
-            "mime_type": mime_type,
-            "file_id": file_id,
-            "file_size": file_size,
-            "media_type": media_type,
-            "tags": tags,
-            "caption": caption if caption_attached else None,
-            "owner_id": owner_id,
-            "created_at": now.isoformat(),
-        }
-        inserted = None
-        try:
-            inserted = await db_client.insert_save(payload)
-        except Exception as exc:
-            logger.error("[SAVE_DB] forward insert_save raised: %s", exc, exc_info=True)
-        if inserted is None:
-            logger.error("[SAVE_DB] forward insert returned None — row NOT in database")
-        else:
-            logger.info("[SAVE_DB] forward insert_ok=True id=%s", inserted.get("id"))
-
-        await db_client.log(owner_id, "INFO", f"Saved F {save_code}", {
-            "save_code": save_code,
-            "origin_chat_id": origin_chat_id,
-            "origin_msg_id": origin_msg_id,
-        })
-        return build_confirmation(save_code, mode, media_type, file_name)
-
+    payload = {
+        "save_code": save_code,
+        "save_type": "forward",
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+        "saved_chat_id": saved_chat_id,
+        "saved_msg_id": saved_msg_id,
+        "sender_name": sender_name,
+        "sender_id": sender_id,
+        "mime_type": mime_type,
+        "file_id": file_id,
+        "file_size": file_size,
+        "media_type": media_type,
+        "tags": tags,
+        "caption": caption if caption_attached else None,
+        "owner_id": owner_id,
+        "created_at": now.isoformat(),
+    }
+    inserted = None
+    try:
+        inserted = await db_client.insert_save(payload)
+    except Exception as exc:
+        logger.error("[SAVE_DB] forward insert_save raised: %s", exc, exc_info=True)
+    if inserted is None:
+        logger.error("[SAVE_DB] forward insert returned None — row NOT in database")
     else:
-        if not media:
-            original_text = (reply_msg.text or "").strip()
-            if not original_text:
-                return "⚠️ Replied message has no downloadable media."
-            # TEXT → TEXT: deep-save plain text as a text message.
-            media_type = "Text"
-            mime_type = None
-            file_name = None
-            file_id = None
-            file_size = len(original_text.encode("utf-8"))
-            tags = build_tags(media_type, now)
+        logger.info("[SAVE_DB] forward insert_ok=True id=%s", inserted.get("id"))
 
-        max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
-        if file_size and file_size > max_bytes:
-            mb = file_size / (1024 * 1024)
-            limit_mb = settings_service.max_deep_save_mb()
-            return (
-                f"⚠️ File is {mb:.1f} MB — exceeds the "
-                f"{limit_mb} MB deep-save limit.\n"
-                "Use `.save f` for a forward save instead."
-            )
+    await db_client.log(owner_id, "INFO", f"Saved F {save_code}", {
+        "save_code": save_code,
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+    })
+    return build_confirmation(save_code, "f", media_type, file_name)
 
-        caption = _append_original_text(
-            build_caption(
-                save_code=save_code,
-                sender=sender_name,
-                chat_id=origin_chat_id,
-                msg_id=origin_msg_id,
-                dt=now,
-                media_type=media_type,
-                mime=mime_type,
-                file_size=file_size,
-                file_name=file_name,
-                tags=tags,
-            ),
-            reply_msg,
+
+async def execute_deep_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
+    """Deep Save — download → re-upload as a NEW Saved Messages message (mode='d').
+
+    This pipeline NEVER forwards. It physically downloads the source content
+    and uploads it again, so it works when native forwarding is restricted
+    (as long as Telegram permits downloading). A download/upload failure is a
+    Deep Save failure — it never falls back to forwarding.
+    """
+    save_code = await db_client.get_next_save_code()
+    now = datetime.now(_get_tz(tz_str))
+    sender_name, sender_id = await _resolve_sender(reply_msg)
+    origin_chat_id = reply_msg.chat_id
+    origin_msg_id = reply_msg.id
+
+    media = reply_msg.media
+    mime_type, file_size, file_name, file_id, media_type = _extract_source_media(reply_msg, save_code)
+
+    # STAGE 1 — text-only source becomes a NEW text message (no media transfer).
+    if media is None:
+        original_text = (reply_msg.text or "").strip()
+        if not original_text:
+            return "⚠️ Replied message has no downloadable media."
+        media_type = "Text"
+        mime_type = None
+        file_name = None
+        file_id = None
+        file_size = len(original_text.encode("utf-8"))
+
+    logger.info(
+        "[SAVE] owner=%s mode=d media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
+        owner_id, media is not None, save_code, file_name, mime_type, file_size, file_id,
+    )
+
+    max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
+    if file_size and file_size > max_bytes:
+        mb = file_size / (1024 * 1024)
+        limit_mb = settings_service.max_deep_save_mb()
+        return (
+            f"⚠️ File is {mb:.1f} MB — exceeds the "
+            f"{limit_mb} MB deep-save limit.\n"
+            "Use `.save f` for a forward save instead."
         )
 
-        sent = None
-        actual_size = file_size
-        if not media:
-            try:
-                t0 = asyncio.get_event_loop().time()
-                sent = await client.send_message("me", caption)
-                record_event("save", "send_message", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-            except Exception as exc:
-                logger.error("deep save text send failed: %s", exc)
-                record_event("save", "send_message", 0, "ERROR", str(exc))
-                return f"❌ Upload failed: {exc}"
-        else:
-            # DEEP SAVE = true download → temporary file → NEW upload.
-            # The saved item is a brand-new message; the source is never
-            # forwarded. The temp file is removed on every exit path.
-            tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
-            tmp_path = os.path.join(tmp_dir, os.path.basename(file_name or "file.bin"))
-            try:
-                t0 = asyncio.get_event_loop().time()
-                await client.download_media(reply_msg, file=tmp_path)
-                record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
+    tags = build_tags(media_type, now)
+    caption = _append_original_text(
+        build_caption(
+            save_code=save_code,
+            sender=sender_name,
+            chat_id=origin_chat_id,
+            msg_id=origin_msg_id,
+            dt=now,
+            media_type=media_type,
+            mime=mime_type,
+            file_size=file_size,
+            file_name=file_name,
+            tags=tags,
+        ),
+        reply_msg,
+    )
 
-                actual_size = os.path.getsize(tmp_path)
-                if actual_size == 0:
-                    return "❌ Download produced an empty file."
-
-                try:
-                    t1 = asyncio.get_event_loop().time()
-                    sent = await client.send_file(
-                        "me",
-                        tmp_path,
-                        caption=caption,
-                        **_upload_kwargs_for_media(media, mime_type, file_name),
-                    )
-                    record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
-                except Exception as exc:
-                    logger.error("deep save upload failed: %s", exc)
-                    record_event("save", "send_file", 0, "ERROR", str(exc))
-                    return f"❌ Upload failed: {exc}"
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("deep save download failed: %s", exc)
-                record_event("save", "download_media", 0, "ERROR", str(exc))
-                return f"❌ Download failed: {exc}"
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        saved_chat_id = sent.chat_id if sent else None
-        saved_msg_id = sent.id if sent else None
-
-        # Metadata refers to the NEWLY uploaded message, not the source.
-        new_file_id, new_mime, new_size = _extract_uploaded_metadata(sent)
-
-        payload = {
-            "save_code": save_code,
-            "save_type": "deep",
-            "origin_chat_id": origin_chat_id,
-            "origin_msg_id": origin_msg_id,
-            "saved_chat_id": saved_chat_id,
-            "saved_msg_id": saved_msg_id,
-            "sender_name": sender_name,
-            "sender_id": sender_id,
-            "mime_type": new_mime or mime_type,
-            "file_id": new_file_id or file_id,
-            "file_size": actual_size or new_size,
-            "media_type": media_type,
-            "tags": tags,
-            "caption": caption,
-            "owner_id": owner_id,
-            "created_at": now.isoformat(),
-        }
-        inserted = None
+    # STAGE 2 — transfer content into a brand-new Saved Messages message.
+    sent = None
+    actual_size = file_size
+    if media is None:
         try:
-            inserted = await db_client.insert_save(payload)
+            t0 = asyncio.get_event_loop().time()
+            sent = await client.send_message("me", caption)
+            record_event("save", "send_message", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         except Exception as exc:
-            logger.error("[SAVE_DB] deep insert_save raised: %s", exc, exc_info=True)
-        if inserted is None:
-            logger.error("[SAVE_DB] deep insert returned None — row NOT in database")
-        else:
-            logger.info("[SAVE_DB] deep insert_ok=True id=%s", inserted.get("id"))
+            logger.error("deep save text send failed: %s", exc)
+            record_event("save", "send_message", 0, "ERROR", str(exc))
+            return f"❌ Upload failed: {exc}"
+    else:
+        # Isolated temp storage per operation; removed on every exit path.
+        tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")
+        tmp_path = os.path.join(tmp_dir, os.path.basename(file_name or "file.bin"))
+        try:
+            t0 = asyncio.get_event_loop().time()
+            await client.download_media(reply_msg, file=tmp_path)
+            record_event("save", "download_media", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
 
-        await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
-            "save_code": save_code,
-            "origin_chat_id": origin_chat_id,
-            "origin_msg_id": origin_msg_id,
-        })
-        return build_confirmation(save_code, mode, media_type, file_name)
+            actual_size = os.path.getsize(tmp_path)
+            if actual_size == 0:
+                return "❌ Download produced an empty file."
+
+            try:
+                t1 = asyncio.get_event_loop().time()
+                sent = await client.send_file(
+                    "me",
+                    tmp_path,
+                    caption=caption,
+                    **_upload_kwargs_for_media(media, mime_type, file_name),
+                )
+                record_event("save", "send_file", (asyncio.get_event_loop().time() - t1) * 1000, "SUCCESS")
+            except Exception as exc:
+                logger.error("deep save upload failed: %s", exc)
+                record_event("save", "send_file", 0, "ERROR", str(exc))
+                return f"❌ Upload failed: {exc}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("deep save download failed: %s", exc)
+            record_event("save", "download_media", 0, "ERROR", str(exc))
+            return f"❌ Download failed: {exc}"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # STAGE 3 — metadata from the NEWLY uploaded message + DB persistence.
+    saved_chat_id = sent.chat_id if sent else None
+    saved_msg_id = sent.id if sent else None
+    new_file_id, new_mime, new_size = _extract_uploaded_metadata(sent)
+
+    payload = {
+        "save_code": save_code,
+        "save_type": "deep",
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+        "saved_chat_id": saved_chat_id,
+        "saved_msg_id": saved_msg_id,
+        "sender_name": sender_name,
+        "sender_id": sender_id,
+        "mime_type": new_mime or mime_type,
+        "file_id": new_file_id or file_id,
+        "file_size": actual_size or new_size,
+        "media_type": media_type,
+        "tags": tags,
+        "caption": caption,
+        "owner_id": owner_id,
+        "created_at": now.isoformat(),
+    }
+    inserted = None
+    try:
+        inserted = await db_client.insert_save(payload)
+    except Exception as exc:
+        logger.error("[SAVE_DB] deep insert_save raised: %s", exc, exc_info=True)
+    if inserted is None:
+        logger.error("[SAVE_DB] deep insert returned None — row NOT in database")
+    else:
+        logger.info("[SAVE_DB] deep insert_ok=True id=%s", inserted.get("id"))
+
+    await db_client.log(owner_id, "INFO", f"Saved D {save_code}", {
+        "save_code": save_code,
+        "origin_chat_id": origin_chat_id,
+        "origin_msg_id": origin_msg_id,
+    })
+    return build_confirmation(save_code, "d", media_type, file_name)
+
+
+async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str) -> str:
+    """Dispatch a save request to the Forward or Deep pipeline.
+
+    The engine is the single authority for mode semantics. Forward Save and
+    Deep Save are two independent pipelines — this dispatcher only selects
+    which one runs; it never shares their Telegram transfer logic.
+    """
+    mode = (mode or "").strip().lower()
+    if mode in ("f", "forward", "fwd"):
+        return await execute_forward_save(client, owner_id, reply_msg, tz_str)
+    return await execute_deep_save(client, owner_id, reply_msg, tz_str)

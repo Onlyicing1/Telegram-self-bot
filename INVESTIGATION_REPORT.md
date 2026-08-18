@@ -1,4 +1,4 @@
-# INVESTIGATION REPORT — LifeOS (Deep Save)
+# INVESTIGATION REPORT — LifeOS (Deep Save rebuilt)
 
 > **CANONICAL INVESTIGATION HANDOFF FILE**
 >
@@ -27,224 +27,238 @@
 |---|---|
 | **Repository** | `Onlyicing1/Telegram-self-bot` |
 | **Branch** | `main` |
-| **Scope** | Deep Save (`mode="d"`) implementation correctness |
-| **Type** | Investigation + fix (code changed, tests updated) |
+| **Scope** | Deep Save rebuild (independent download → re-upload pipeline) |
+| **Type** | Investigation + rebuild (code restructured, tests added) |
 
 ---
 
 ## 1. Problem
 
-The Deep Save feature was repeatedly reported as "broken" with a claim that a
-Deep Save request in a content-protected chat reached Telegram's
-`ForwardMessagesRequest` and failed with "You can't forward messages from a
-protected chat". Deep Save exists specifically to work in situations where
-native forwarding is blocked, so this was the symptom to prove or disprove.
+Deep Save (`mode="d"`) must be an independent **download → re-upload**
+pipeline that works when native Telegram forwarding is restricted (protected
+chats, forwarding-restricted media). It must **never** call
+`forward_messages`/`ForwardMessagesRequest` and must **never** fall back to
+forwarding.
+
+A production log showed `mode=f … forward save failed: You can't forward
+messages from a protected chat`, so the mode routing also had to be verified.
 
 ## 2. Root Cause
 
-**The reported protected-chat → forward failure is NOT reproduced by the
-current code.** `mode="d"` cannot reach `forward_messages`. The claim appears
-to be based on stale code or a misattributed log line.
+**The old deep-save logic itself was already a true download → re-upload**
+(the prior commits had fixed this), but it lived inside one monolithic
+`execute_save()` as an `else` branch of the forward path. That structure
+violated the required invariant that Forward Save and Deep Save be **two
+explicitly separate pipelines**, and made the "Deep Save might forward" fear
+hard to disprove by inspection.
 
-Two real, code-confirmed defects **were** found in the authoritative Save
-Engine while tracing the deep-save path:
+The `mode=f` production log was **not** a deep→forward routing bug: it was a
+genuine forward-save execution. Verified routing facts:
 
-1. **Forward-save caption attachment never worked.**
-   `backend/services/save_service.py` called
-   `client.edit_message("me", fwd, caption=caption)`. Telethon's
-   `edit_message` has **no `caption` keyword** (its parameter is `text=`), so
-   this raised `TypeError` every time, was swallowed by the surrounding
-   `except` (logged only as a warning), and left the forwarded message's
-   caption unattached with `caption=None` written to the database.
-
-2. **Mode normalization lived only in one caller.** `execute_save` used
-   `if mode == "f": forward else: deep`. The AI `SaveTool` mapped friendly
-   names to `"f"`/`"d"`, but the engine itself treated any non-`"f"` string
-   (including `"forward"` or `"fwd"`) as **deep**. The engine — the single
-   authority — did not own mode semantics, so a future/alternate caller
-   passing `"forward"` would silently perform a deep save.
+- The only `forward_messages` call in the Save Engine is inside the Forward
+  pipeline (now `execute_forward_save`).
+- The Glass Save panel routes Deep Save as `panel:save:type:d` →
+  `action:save_reply:d` → `mode="d"` (deterministic).
+- The AI `SaveTool` maps `"forward"`→`"f"` and `"deep"`→`"d"` (deterministic).
+- The `.save f` / `.save d` dot commands documented in docstrings and
+  AGENTS.md are **not registered** — the live command surface is `.menu`
+  (Glass UI) and `.ai` (AI). A user typing `.save d` gets no handler, so the
+  panel/AI paths are the real entry points.
 
 ## 3. Confirmed Facts
 
-- **Deep Save is a true download → re-upload.** `execute_save(mode="d")`
-  downloads the source media to a unique temporary directory and uploads it
-  with `send_file` as a brand-new Telegram message. It never calls
-  `forward_messages`.
-- The **only** `forward_messages` call in the Save Engine is inside the
-  `mode == "f"` branch (`backend/services/save_service.py`, ~line 728).
-- **Text-only deep save** sends a new text message via `send_message`
-  (TEXT → TEXT). No download is attempted for media-less messages.
-- **Captions** for deep save are attached directly to the uploaded media via
-  `send_file(caption=caption)`; text-only deep save sends the combined
-  LifeOS header + original text as the message body.
-- **Media type preservation** is implemented via `_upload_kwargs_for_media`,
-  which passes the original Telegram document attributes (video/audio/voice/
-  sticker/filename), the original MIME type, and `force_document=False`.
-- **Metadata refers to the new upload.** `_extract_uploaded_metadata(sent)`
-  reads `file_id`/`mime_type`/`size` from the message returned by
-  `send_file`, and the DB payload falls back to source metadata only when
-  Telegram returns nothing.
-- **Database insert happens after** the Telegram upload succeeds. Failed
-  download/upload returns an `"❌ …"` string **before** any `insert_save`.
-- **Temporary files are always cleaned up.** The deep-save media path wraps
-  download/upload in `try/finally: shutil.rmtree(tmp_dir, ignore_errors=True)`.
-- **Protected-chat invariant holds.** A download failure returns an honest
-  `"❌ Download failed: …"` and does **not** fall back to forwarding (tested).
+- **Deep Save was rebuilt from scratch** into `execute_deep_save()` — a
+  standalone pipeline with no forward call and no forward fallback.
+- **Deep Save = download source content → upload as a NEW Saved Messages
+  message.** Media path: `download_media(reply_msg, file=tmp_path)` →
+  `send_file("me", tmp_path, caption=…)`. Text path: `send_message("me",
+  caption)` (TEXT → TEXT).
+- **Deep Save NEVER forwards.** No `forward_messages` call site exists in
+  `execute_deep_save` or any path reachable from it.
+- Forward Save is now `execute_forward_save()` — the **only** place that
+  calls `forward_messages`. It does not download.
+- Mode normalization is owned by the engine dispatcher (`execute_save`):
+  `"f"|"forward"|"fwd"` → Forward; everything else → Deep.
+- Captions use the single pipeline `build_caption()` + `_append_original_text()`
+  and are attached to the uploaded media via `send_file(caption=…)`.
+- Destination metadata (`saved_chat_id`, `saved_msg_id`, `file_id`,
+  `mime_type`, `file_size`) is derived from the **newly uploaded** message via
+  `_extract_uploaded_metadata(sent)`; `origin_chat_id`/`origin_msg_id` stay the
+  source.
+- Database insert happens **after** a successful upload; download/upload
+  failure returns an `"❌ …"` string **before** any `insert_save`.
+- Temporary storage is unique per operation (`tempfile.mkdtemp`) and removed
+  in `finally` on success, download failure, and upload failure.
 
 ## 4. Direct Source Evidence
 
-- **FILE:** `backend/services/save_service.py` — `execute_save(client, owner_id,
-  reply_msg, mode, tz_str)`
-  **EVIDENCE:** forward branch `if mode == "f":` calls `client.forward_messages
-  ("me", reply_msg)` (~line 728). The `else` branch (deep) calls
-  `client.download_media(reply_msg, file=tmp_path)` (~line 842) then
+- **FILE:** `backend/services/save_service.py` — `execute_deep_save()`
+  **EVIDENCE:** STAGE 1 (text-only → `send_message`), STAGE 2 (media →
+  `client.download_media(reply_msg, file=tmp_path)` then
   `client.send_file("me", tmp_path, caption=caption,
-  **_upload_kwargs_for_media(...))` (~line 851). No `forward_messages` in the
-  deep branch.
-- **FILE:** `backend/services/save_service.py` — `_upload_kwargs_for_media`
-  **EVIDENCE:** `MessageMediaPhoto → {"force_document": False}`; otherwise
-  rebuilds `attributes` from the source document, re-adds
-  `DocumentAttributeFilename`, resolves `mime_type`, returns
-  `{"attributes": attrs, "force_document": False, "mime_type": ...}`.
-- **FILE:** `backend/services/save_service.py` — `_append_original_text`
-  **EVIDENCE:** appends the source `message.text` below the generated LifeOS
-  caption (single caption pipeline shared by both modes).
-- **FILE:** `backend/services/save_service.py` — `_extract_uploaded_metadata`
-  **EVIDENCE:** reads `id`/`mime_type`/`size` from `sent.media.document` or
-  `sent.media.photo` (the NEW message), not the source.
-- **FILE:** `backend/services/save_service.py` — deep-save media path
-  **EVIDENCE:** `tmp_dir = tempfile.mkdtemp(prefix="lifeos_dl_")`;
-  `finally: shutil.rmtree(tmp_dir, ignore_errors=True)`.
-- **FILE:** `/tmp/lifeos-venv/.../telethon/client/messages.py` — `edit_message`
-  **EVIDENCE:** signature is `edit_message(entity, message=None, text=None,
-  *, parse_mode=(), attributes=None, formatting_entities=None,
-  link_preview=True, file=None, thumb=None, force_document=False,
-  buttons=None, supports_streaming=False, schedule=None)`. **No `caption`
-  keyword** — confirming the forward-save caption bug.
-- **FILE:** `/tmp/lifeos-venv/.../telethon/utils.py` — `get_attributes`
-  **EVIDENCE:** explicit user `attributes` override auto-detected ones by
-  class (`attr_dict[type(a)] = a`), so passing the original
-  `DocumentAttributeVideo`/`DocumentAttributeAudio`/`DocumentAttributeSticker`
-  preserves the media type on re-upload.
-- **FILE:** `/tmp/lifeos-venv/.../telethon/client/uploads.py` —
-  `_file_to_media`
-  **EVIDENCE:** `as_image = is_image and not force_document` (photos stay
-  photos); documents are sent with `force_file=force_document and not
-  is_image` and the supplied attributes, so video/voice/audio attributes
-  round-trip correctly.
+  **_upload_kwargs_for_media(...))`), STAGE 3 (metadata + `insert_save`).
+  No `forward_messages` in the function.
+- **FILE:** `backend/services/save_service.py` — `execute_forward_save()`
+  **EVIDENCE:** `client.forward_messages("me", reply_msg)` — the only forward
+  call site in the Save Engine.
+- **FILE:** `backend/services/save_service.py` — `execute_save()`
+  **EVIDENCE:** thin dispatcher; normalizes mode then calls one of the two
+  pipelines. It never performs a transfer itself.
+- **FILE:** `backend/services/save_service.py` — `_extract_uploaded_metadata()`
+  **EVIDENCE:** reads `id`/`mime_type`/`size` from `sent.media` (the NEW
+  message), not the source.
+- **FILE:** `backend/services/save_service.py` — `_upload_kwargs_for_media()`
+  **EVIDENCE:** rebuilds `DocumentAttribute*` attributes + MIME +
+  `force_document=False` so photo/video/audio/voice/sticker/document
+  semantics are preserved on re-upload.
+- **FILE:** `backend/bot/handlers/save.py` — `_save_panel_handler()`
+  **EVIDENCE:** `panel:save:type:d` → `action:save_reply:d`; `type:f` →
+  `action:save_reply:f`.
+- **FILE:** `backend/ai/tools/save.py` — `SaveTool.execute()`
+  **EVIDENCE:** `mode = "f" if str(mode_arg).lower().startswith("f") else "d"`
+  then delegates to `execute_save`.
+- **FILE:** `backend/bot/router.py` — `register_all()`
+  **EVIDENCE:** only `misc`/`ai`/`ai_cmd`/`ai_unified` register
+  `events.NewMessage` handlers. `save.register()` registers only panels and
+  actions, so `.save f`/`.save d` dot commands are **not** live.
 
 ## 5. Relevant Files
 
-- `backend/services/save_service.py` — authoritative Save Engine (changed).
-- `backend/ai/tools/save.py` — `SaveTool` (caller; maps `"forward"/"deep"` →
-  `"f"/"d"`). Not changed.
-- `backend/bot/handlers/save.py` — Glass Save panel (caller; passes
-  `"f"`/`"d"`). Not changed.
-- `backend/telegram_api/api.py` / `messages.py` / `media.py` — bounded
-  Telegram facade (not used by `save_service`, which uses the raw client).
-- `tests/test_12_save_engine.py` — regression tests (changed).
+- `backend/services/save_service.py` — authoritative Save Engine (rebuilt).
+- `backend/bot/handlers/save.py` — Glass Save panel (routing verified, unchanged).
+- `backend/ai/tools/save.py` — AI `SaveTool` (mapping verified, unchanged).
+- `tests/test_12_save_engine.py` — regression tests (extended).
 
 ## 6. Relevant Functions / Classes
 
 | Function/Class | Role |
 |---|---|
-| `execute_save()` | One authoritative save entry point; branches `"f"` vs `"d"`. |
+| `execute_save()` | Dispatcher (single authority for mode semantics). |
+| `execute_forward_save()` | Forward pipeline (`forward_messages` only). |
+| `execute_deep_save()` | Deep pipeline (download → re-upload only). |
 | `execute_link_save()` | Link-based deep save (also download → re-upload). |
-| `build_caption()` | Deterministic LifeOS caption header. |
-| `_append_original_text()` | Preserves source text below the header. |
-| `_upload_kwargs_for_media()` | Preserves media type/attributes on re-upload. |
-| `_extract_uploaded_metadata()` | Reads metadata from the NEW upload. |
-| `SaveTool.execute()` | AI path; delegates to `execute_save`. |
-| `_save_reply_wait_handler()` | Glass panel path; delegates to `execute_save`. |
+| `_resolve_sender()` | Shared sender resolution. |
+| `_extract_source_media()` | Shared source metadata extraction. |
+| `build_caption()` / `_append_original_text()` | Shared caption pipeline. |
+| `_upload_kwargs_for_media()` | Media-type-preserving upload kwargs. |
+| `_extract_uploaded_metadata()` | Destination metadata from the NEW message. |
+| `SaveTool.execute()` | AI path → `execute_save`. |
+| `_save_panel_handler()` | Glass path → `save_reply:f`/`save_reply:d`. |
 
-## 7. Current Behavior (after this fix)
+## 7. Previous Implementation (rejected)
 
-- `mode="d"` → download → temp file → `send_file`/`send_message` → DB insert
-  → cleanup. Never forwards.
-- `mode="f"` → `forward_messages` → caption attached via `edit_message
-  (text=…)` → DB insert.
-- Friendly mode names (`"forward"`, `"fwd"`) now normalize to forward inside
-  the engine, so they can no longer silently become a deep save.
+The previous `execute_save()` held both behaviors in one function: `if
+mode == "f": …forward… else: …deep…`. The deep branch itself was a correct
+download → re-upload, but:
 
-## 8. Desired Behavior (invariant)
+- Forward and Deep were not separate functions, so the invariant
+  "mode=d must never forward" was only true by reading one `else` branch.
+- There was no independent Deep Save entry point to test or reason about
+  directly.
+
+## 8. New Architecture
 
 ```
-mode="d"  =  download → re-upload  (MUST NEVER fall back to forwarding)
-mode="f"  =  forward                (native Telegram forward)
+Glass UI / AI SaveTool
+        │  (mode = "f" | "d")
+        ▼
+execute_save()   ← dispatcher, normalizes mode, no transfer logic
+   ┌────┴────┐
+   │         │
+ mode=f    mode=d
+   │         │
+   ▼         ▼
+execute_forward_save()      execute_deep_save()
+   │  forward_messages        │  STAGE 1: text-only → send_message
+   │  + caption attach        │  STAGE 2: media → download_media → validate
+   │                          │           → send_file (NEW message)
+   │                          │  STAGE 3: extract NEW metadata → insert_save
+   └────┬────┘                └──────────┬──────────┘
+        └──────────────┬─────────────────┘
+                       ▼
+                   Database
 ```
 
-Deep Save must remain a Deep Save failure on any download/upload error. It
-must not degrade into Forward Save.
+## 9. Exact Execution Path (Deep Save)
 
-## 9. Changes Made
+1. `execute_save(client, owner_id, reply_msg, "d", tz_str)` normalizes `"d"`.
+2. Dispatches to `execute_deep_save()`.
+3. Resolve sender + source metadata (`_resolve_sender`,
+   `_extract_source_media`).
+4. If no media → build caption → `send_message("me", caption)`.
+5. Else → `tempfile.mkdtemp` → `download_media(reply_msg, file=tmp_path)` →
+   validate non-empty → `send_file("me", tmp_path, caption=caption,
+   **_upload_kwargs_for_media(...))`.
+6. `finally` removes the temp directory.
+7. `_extract_uploaded_metadata(sent)` reads the NEW message's file metadata.
+8. `insert_save(payload)` (destination ids/file metadata) → `db_client.log`
+   → success confirmation.
 
-1. `backend/services/save_service.py`:
-   - Added engine-level mode normalization at the top of `execute_save`:
-     `"f"|"forward"|"fwd"` → `"f"`, everything else → `"d"`.
-   - Fixed forward-save caption attachment: `edit_message(..., caption=caption)`
-     → `edit_message(..., text=caption)`.
-2. `tests/test_12_save_engine.py`:
-   - `MockClient.edit_message` now mirrors Telethon's real signature
-     (`text=None, **kwargs`) so the forward-caption test actually catches a
-     `caption=` regression.
-   - Added `test_execute_save_normalizes_friendly_mode_names` (forward vs
-     deep stay separated for friendly names).
-   - Strengthened `test_deep_save_cleans_temp_on_download_error` to also
-     assert no `forward_messages` on a failed download.
+## 10. Changes Made
 
-## 10. Remaining Work
+- `backend/services/save_service.py`: split the monolithic `execute_save`
+  into `execute_forward_save()`, `execute_deep_save()`, and a thin
+  `execute_save()` dispatcher, plus `_resolve_sender()` and
+  `_extract_source_media()` shared helpers. Behavior is preserved; only the
+  pipeline boundaries are now explicit.
+- `tests/test_12_save_engine.py`: added tests for the two independent
+  entry points, forward-restriction independence, upload-failure honesty
+  (no DB record + cleanup), strengthened download-failure assertions, and
+  Glass panel mode routing.
 
-- **Bounded download/upload.** `save_service` uses the raw Telethon client
-  directly (`download_media`, `send_file`) without the `guarded_await`
-  watchdog used by `backend/telegram_api/*`. These are async and non-blocking
-  (no event-loop stall), but a stuck connection could await indefinitely. A
-  **size-proportional** timeout (not a flat 30s, which would break large
-  files) is the recommended next hardening step. Not implemented in this
-  task to avoid "blindly increasing timeouts".
+## 11. Remaining Work
+
+- **Bounded download/upload.** `execute_deep_save` uses the raw Telethon
+  client (`download_media`, `send_file`) without the `guarded_await` watchdog
+  used by `backend/telegram_api/*`. They are async and non-blocking, but a
+  stuck connection could await indefinitely. A **size-proportional** timeout
+  (not a flat 30s) is the recommended next hardening step.
 - **DB failure after a successful upload** is logged but still returns the
-  success confirmation (the media *is* in Saved Messages). This matches the
-  documented "don't pretend the save never happened" policy; if the team wants
-  a "⚠️ saved to Telegram but DB record failed" message, that is a policy
-  change, not applied here.
-- **Animated GIF labeling:** animated GIFs are `video/mp4` with
-  `DocumentAttributeAnimated`; `detect_media_type` labels them `"Video"`
-  (cosmetic only — the animated attribute is preserved on re-upload).
-- **`.save f` / `.save d` dot commands** are documented in
-  `backend/bot/handlers/save.py`'s docstring but not registered; saving is
-  currently panel-driven (`panel:save`) plus the AI `save` tool. Out of scope
-  for this task.
+  success confirmation (the media *is* in Saved Messages). Changing this to a
+  degraded "⚠️ saved to Telegram but DB record failed" message is a policy
+  decision, not yet applied.
+- **`.save f` / `.save d` dot commands are not registered.** The save surface
+  is Glass-UI + AI-tool. Registering them (routing to `execute_save`) is
+  possible but was not part of this task, to avoid introducing a second
+  command surface for a panel-driven architecture.
+- **Animated GIF labeling:** animated GIFs (`video/mp4` +
+  `DocumentAttributeAnimated`) are labeled `"Video"` by `detect_media_type`
+  (cosmetic; the animated attribute is preserved on re-upload).
 
-## 11. Database / Schema Impact
+## 12. Database / Schema Impact
 
 - **None.** No schema changes. `save_type` (`"forward"`/`"deep"`) is the
-  existing "mode" column. The payload already populates `save_code`,
-  `origin_chat_id`, `origin_msg_id`, `saved_chat_id`, `saved_msg_id`,
-  `file_id`, `mime_type`, `file_size`, `owner_id`, `created_at`, `caption`,
-  `tags`, `media_type`, `sender_name`, `sender_id`.
+  existing mode column; all required fields are already populated.
 
-## 12. Hard Constraints
+## 13. Hard Constraints
 
-- One authoritative Save Engine (`execute_save` / `execute_link_save`). No
-  duplicate save pipeline was introduced.
-- Deep Save MUST NOT call `forward_messages`/`ForwardMessagesRequest`.
-- Forward Save stays a forward; it was not converted to deep.
-- Single Telethon client; no new client/event loop; temp files cleaned up.
+- One authoritative Save Engine (`execute_save` + two pipelines). No
+  duplicate pipeline was introduced.
+- `mode="d"` = download → re-upload; it MUST NEVER forward and never falls
+  back to forwarding.
+- `mode="f"` = forward; it was not converted to deep.
+- Single Telethon client; no new event loop; temp files cleaned up in
+  `finally`.
 
-## 13. Validation
+## 14. Validation
 
 - `python -m py_compile backend/services/save_service.py` → OK.
-- `pytest tests/test_12_save_engine.py -q` → **20 passed**.
-- `pytest -q` (full suite) → **200 passed**, 0 failures.
-- Tests now cover: deep save never forwards; deep download failure never
-  forwards; forward save still forwards and attaches the caption; text-only
-  deep save; photo/video/voice/sticker/document attribute preservation;
-  metadata from the NEW upload; temp-file cleanup on success and failure;
-  friendly mode-name normalization.
+- `pytest tests/test_12_save_engine.py -q` → **25 passed**.
+- `pytest -q` (full suite) → **205 passed**, 0 failures.
+- Coverage now includes: Deep Save never forwards; deep works even when
+  `forward_messages` raises (protected-chat simulation); download failure →
+  no upload + no DB record; upload failure → no DB record + cleanup; text-only
+  deep save; media-type attribute preservation; destination metadata from the
+  NEW upload; temp cleanup on success/failure; independent
+  `execute_forward_save`/`execute_deep_save` entry points; Glass panel
+  `save_reply:d`/`save_reply:f` routing.
 
-## 14. Unknowns / Missing Evidence
+## 15. Live Telegram Verification Status
 
-- **No live Telegram validation** was possible (no credentials/session in this
-  environment). Re-upload media-type behavior is verified against the
-  installed Telethon 1.34 source and mock-client tests, **not** a live chat.
-- The exact production log line that showed `ForwardMessagesRequest` could not
-  be replayed; it does not correspond to the current `mode="d"` code path.
+- **SOURCE VERIFIED** ✅ — Telethon 1.34 source confirms `get_attributes`
+  honors explicit attributes and `_file_to_media` preserves photo/video/audio
+  round-trips.
+- **TEST VERIFIED** ✅ — mock-client regression tests above all pass.
+- **LIVE TELEGRAM VERIFIED** ❌ — not performed (no credentials/session in
+  this environment). Real re-upload behavior in a protected chat is untested
+  live.

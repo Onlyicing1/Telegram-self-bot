@@ -424,6 +424,8 @@ async def test_deep_save_cleans_temp_on_download_error():
     # A download failure must remain a DEEP-save failure — it must never
     # react by falling back to forwarding (protected-chat invariant).
     assert not [c for c in client.calls if c[0] == "forward_messages"]
+    assert not [c for c in client.calls if c[0] == "send_file"]
+    assert db_client._fallback["saved_items"] == []  # no success DB record
     _assert_no_leftover_temp_dirs()
 
 
@@ -495,3 +497,85 @@ async def test_execute_save_normalizes_friendly_mode_names():
     assert not [c for c in deep_client.calls if c[0] == "forward_messages"]
     assert [c for c in deep_client.calls if c[0] == "download_media"]
     assert [c for c in deep_client.calls if c[0] == "send_file"]
+
+
+# ── rebuilt pipeline: independent entrypoints ──
+
+
+@pytest.mark.asyncio
+async def test_deep_save_pipeline_entrypoint():
+    client = MockClient()
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_deep_save(client, 42, msg, "UTC")
+
+    assert "Saved Successfully" in result
+    assert not [c for c in client.calls if c[0] == "forward_messages"]
+    assert [c for c in client.calls if c[0] == "download_media"]
+    assert [c for c in client.calls if c[0] == "send_file"]
+
+
+@pytest.mark.asyncio
+async def test_forward_save_pipeline_entrypoint():
+    client = MockClient()
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_forward_save(client, 42, msg, "UTC")
+
+    assert "Saved Successfully" in result
+    assert [c for c in client.calls if c[0] == "forward_messages"]
+    assert not [c for c in client.calls if c[0] == "download_media"]
+    assert not [c for c in client.calls if c[0] == "send_file"]
+
+
+@pytest.mark.asyncio
+async def test_deep_save_forward_restriction_does_not_block_deep():
+    # A protected chat blocks forwarding — but Deep Save must NOT depend on
+    # forwarding. It downloads + re-uploads independently.
+    client = MockClient()
+
+    async def forward_blocked(entity, messages):
+        raise RuntimeError("You can't forward messages from a protected chat")
+
+    client.forward_messages = forward_blocked
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+
+    assert "Saved Successfully" in result
+    assert not [c for c in client.calls if c[0] == "forward_messages"]
+    assert [c for c in client.calls if c[0] == "download_media"]
+    assert [c for c in client.calls if c[0] == "send_file"]
+
+
+@pytest.mark.asyncio
+async def test_deep_save_upload_failure_no_db_record_and_cleanup():
+    client = MockClient()
+
+    async def upload_boom(entity, file, **kwargs):
+        raise RuntimeError("upload rejected")
+
+    client.send_file = upload_boom
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_save(client, 42, msg, "d", "UTC")
+
+    assert "❌ Upload failed" in result
+    assert db_client._fallback["saved_items"] == []  # no success DB record
+    _assert_no_leftover_temp_dirs()
+
+
+# ── Glass panel mode routing ──
+
+
+@pytest.mark.asyncio
+async def test_save_panel_deep_mode_routing():
+    from backend.bot.handlers import save as save_handler
+
+    _, _, buttons = await save_handler._save_panel_handler(None, "type:d")
+    data = [b.data for row in buttons for b in row]
+    assert any(b"save_reply:d" in d for d in data)
+
+    _, _, buttons = await save_handler._save_panel_handler(None, "type:f")
+    data = [b.data for row in buttons for b in row]
+    assert any(b"save_reply:f" in d for d in data)
