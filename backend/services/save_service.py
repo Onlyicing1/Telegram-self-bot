@@ -657,6 +657,12 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str, progr
 
 async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str) -> str:
     """Execute a save operation and return a result string."""
+    # The engine is the single authority for mode semantics. Normalize every
+    # caller-facing spelling here so "forward"/"fwd" can never silently
+    # become a deep save (the ``else`` branch below is DEEP, not a fallback).
+    mode = (mode or "").strip().lower()
+    mode = "f" if mode in ("f", "forward", "fwd") else "d"
+
     save_code = await db_client.get_next_save_code()
     tz = _get_tz(tz_str)
     now = datetime.now(tz)
@@ -741,7 +747,7 @@ async def execute_save(client, owner_id: int, reply_msg, mode: str, tz_str: str)
         caption_attached = False
         if fwd is not None:
             try:
-                await client.edit_message("me", fwd, caption=caption)
+                await client.edit_message("me", fwd, text=caption)
                 caption_attached = True
             except Exception as exc:
                 logger.warning("forward save caption attach failed: %s", exc)

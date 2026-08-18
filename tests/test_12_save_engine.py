@@ -83,8 +83,10 @@ class MockClient:
         self.calls.append(("forward_messages", entity, messages))
         return FakeSent()
 
-    async def edit_message(self, entity, message, caption=None, **kwargs):
-        self.calls.append(("edit_message", entity, message, caption))
+    async def edit_message(self, entity, message, text=None, **kwargs):
+        # Mirror Telethon's real signature: ``edit_message`` has no
+        # ``caption`` kwarg — captions/text are edited via ``text=``.
+        self.calls.append(("edit_message", entity, message, text))
         return FakeSent()
 
     async def download_media(self, message, file=None, **kwargs):
@@ -419,6 +421,9 @@ async def test_deep_save_cleans_temp_on_download_error():
     msg = FakeMessage(media=media)
     result = await save_service.execute_save(client, 42, msg, "d", "UTC")
     assert "❌ Download failed" in result
+    # A download failure must remain a DEEP-save failure — it must never
+    # react by falling back to forwarding (protected-chat invariant).
+    assert not [c for c in client.calls if c[0] == "forward_messages"]
     _assert_no_leftover_temp_dirs()
 
 
@@ -468,3 +473,25 @@ async def test_deep_save_persists_full_metadata():
     assert row["owner_id"] == 42
     assert row["save_code"] == _save_code(result)
     assert row["tags"]
+
+
+# ── mode normalization (engine is the single authority) ──
+
+
+@pytest.mark.asyncio
+async def test_execute_save_normalizes_friendly_mode_names():
+    # "forward"/"fwd" are FORWARD saves; "deep" is a deep save. A friendly
+    # name must never silently cross the forward/deep boundary.
+    media = MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None)
+    msg = FakeMessage(media=media)
+
+    fwd_client = MockClient()
+    await save_service.execute_save(fwd_client, 42, msg, "forward", "UTC")
+    assert [c for c in fwd_client.calls if c[0] == "forward_messages"]
+    assert not [c for c in fwd_client.calls if c[0] == "send_file"]
+
+    deep_client = MockClient()
+    await save_service.execute_save(deep_client, 42, msg, "deep", "UTC")
+    assert not [c for c in deep_client.calls if c[0] == "forward_messages"]
+    assert [c for c in deep_client.calls if c[0] == "download_media"]
+    assert [c for c in deep_client.calls if c[0] == "send_file"]
