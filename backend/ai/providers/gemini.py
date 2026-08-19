@@ -13,7 +13,7 @@ import httpx
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-from backend.ai.providers.base.defaults import get_provider_default
+from backend.ai.providers.base.defaults import get_provider_default, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class GeminiProvider(BaseProvider):
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=self._config.timeout)
 
-        model = kwargs.get("model", self._config.default_model)
+        model = resolve_model(self.name, kwargs.get("model") or self._config.default_model)
         url = f"{_GEMINI_BASE}/models/{model}:generateContent?key={self._config.api_key}"
 
         system_text = ""
@@ -148,12 +148,14 @@ class GeminiProvider(BaseProvider):
                     pass
                 if resp.status_code in (401, 403):
                     failure_type = "auth"
+                elif resp.status_code == 404:
+                    failure_type = "model_not_found"
                 elif resp.status_code >= 500:
                     failure_type = "server"
                 else:
                     failure_type = "request"
                 logger.warning("Gemini API error %d: %s", resp.status_code, error_msg)
-                return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False, metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type, "failure_type": failure_type})
+                return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False, metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type, "failure_type": failure_type, "model": model})
 
             data = resp.json()
             candidates = data.get("candidates", [])

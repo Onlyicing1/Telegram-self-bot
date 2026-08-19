@@ -45,6 +45,7 @@ from typing import Any, Iterator
 
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.base.defaults import resolve_model
 from backend.ai.providers.base.exceptions import ProviderUnavailable
 from backend.ai.providers.manager.config_manager import ProviderConfigManager
 from backend.ai.providers.manager.health import (
@@ -64,6 +65,7 @@ _MAX_RETRIES = 1
 _RETRY_BACKOFF_SECONDS = 1.0
 _DEFAULT_CONCURRENCY = 4
 _PROVIDER_CONCURRENCY: dict[str, int] = {"zai": 2}
+_MODEL_UNAVAILABLE_TTL = 3600.0
 
 
 class ProviderManager:
@@ -73,7 +75,10 @@ class ProviderManager:
     All other layers call ``manager.chat()``.
     """
 
-    __slots__ = ("_registry", "_metrics", "_config_mgr", "_fallback_chain", "_health")
+    __slots__ = (
+        "_registry", "_metrics", "_config_mgr", "_fallback_chain", "_health",
+        "_unavailable_models",
+    )
 
     def __init__(self, registry: ProviderRegistry | None = None) -> None:
         self._registry = registry or ProviderRegistry()
@@ -84,6 +89,7 @@ class ProviderManager:
             default_concurrency=_DEFAULT_CONCURRENCY,
             concurrency_overrides=_PROVIDER_CONCURRENCY,
         )
+        self._unavailable_models: dict[tuple[str, str], float] = {}
         self._ensure_dummy_fallback()
         self._load_env_fallback_chain()
 
@@ -376,6 +382,9 @@ class ProviderManager:
             return f"state={self._health.state(name)}"
         if not self._provider_healthy(provider):
             return "unhealthy"
+        model = self._effective_model(provider)
+        if model and self._model_unavailable(name, model):
+            return f"model={model}:unavailable"
         if needs_tools and not self._supports_tools(provider):
             return "capability=no_tool_calls"
         return ""
@@ -411,6 +420,29 @@ class ProviderManager:
         score -= min(0.5, 0.1 * self._health.consecutive_failures(name))
         score += min(0.2, 0.05 * self._health.consecutive_successes(name))
         return round(max(0.0, score), 4)
+
+    def _effective_model(self, provider: BaseProvider) -> str:
+        """Return the provider's resolved model name (deprecation-substituted)."""
+        try:
+            return resolve_model(self._safe_provider_name(provider), provider.config.default_model or "")
+        except Exception:
+            return ""
+
+    def _model_unavailable(self, name: str, model: str) -> bool:
+        """True when (name, model) was marked unavailable and the TTL is live."""
+        until = self._unavailable_models.get((name, model))
+        return until is not None and time.monotonic() < until
+
+    def _mark_model_unavailable(self, name: str, model: str) -> None:
+        """Mark a (provider, model) pair unavailable so it is not retried.
+
+        A 404 model-not-found is a permanent configuration error for THAT
+        model. It must never be hammered on every request; the TTL allows a
+        re-check later (e.g. after the provider re-enables the model) without
+        requiring a process restart.
+        """
+        self._unavailable_models[(name, model)] = time.monotonic() + _MODEL_UNAVAILABLE_TTL
+        logger.warning("PROVIDER_MODEL_UNAVAILABLE provider=%s model=%s", name, model)
 
     async def _call_once(
         self,
@@ -526,6 +558,13 @@ class ProviderManager:
             # Permanent configuration/request errors (e.g. a model name the
             # API does not recognize). Never retried, never cooled down — the
             # caller advances to the next fallback candidate deterministically.
+            if ftype == "model_not_found":
+                provider = self._registry.get(name)
+                model = (response.metadata or {}).get("model") or (
+                    self._effective_model(provider) if provider is not None else ""
+                )
+                if model:
+                    self._mark_model_unavailable(name, model)
             logger.warning(
                 "provider-health: '%s' config/request error (%s) — not cooling down",
                 name, ftype,

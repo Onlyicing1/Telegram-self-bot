@@ -197,22 +197,30 @@ def _describe_empty_result(result) -> str:
 
 
 def _humanize_error(error: str) -> str:
+    """Convert an internal AI failure into a clean, provider-agnostic message.
+
+    Provider internals (429, model not found, cooldown, HTTP status codes,
+    connection resets) stay in the logs — the Telegram response only ever
+    carries an actionable, non-leaky message. Only authentication failures
+    (a genuine configuration problem the owner must fix) are surfaced, and
+    still without the raw provider detail.
+    """
     error_lower = error.lower()
-    if "401" in error_lower or "unauthorized" in error_lower or "invalid api key" in error_lower:
-        return "Invalid API key. Check your provider configuration."
-    if "429" in error_lower or "rate" in error_lower:
-        return "Rate limited. Please wait and try again."
-    if "cooling" in error_lower or "cooldown" in error_lower:
-        return "The AI provider is temporarily cooling down. Please try again shortly."
-    if "timeout" in error_lower or "timed out" in error_lower:
-        return "Request timed out. The provider took too long to respond."
-    if "model not found" in error_lower or "404" in error_lower or "not found" in error_lower:
-        # Surface the provider's actual detail so an invalid model can be
-        # identified, instead of collapsing it to a generic message.
-        detail = error[:240].strip() or "unknown model"
-        return f"Model not found. Check your model selection. ({detail})"
-    if "connection" in error_lower or "network" in error_lower or "dns" in error_lower:
-        return "Provider unavailable. Network error reaching the API."
+    if (
+        "401" in error_lower or "403" in error_lower
+        or "unauthorized" in error_lower or "invalid api key" in error_lower
+    ):
+        return "AI provider authentication failed. Check your API key configuration."
+    if (
+        "all ai providers failed" in error_lower
+        or "429" in error_lower or "rate" in error_lower
+        or "cooling" in error_lower or "cooldown" in error_lower
+        or "timeout" in error_lower or "timed out" in error_lower
+        or "model not found" in error_lower or "404" in error_lower
+        or "connection" in error_lower or "network" in error_lower
+        or "dns" in error_lower or "unavailable" in error_lower
+    ):
+        return "AI is temporarily unavailable. Please try again shortly."
     return error[:200] if error else "Unknown error."
 
 

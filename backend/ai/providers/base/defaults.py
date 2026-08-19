@@ -34,7 +34,7 @@ def _gemini_default() -> ProviderConfig:
         provider_name="gemini",
         base_url="",
         api_key="",
-        default_model="gemini-2.0-flash",
+        default_model="gemini-2.5-flash",
         temperature=1.0,
         top_p=1.0,
         max_tokens=8192,
@@ -285,3 +285,31 @@ def get_provider_default(name: str) -> ProviderConfig:
 def list_provider_names() -> list[str]:
     """Return all provider names that have defaults."""
     return list(_PROVIDER_DEFAULTS.keys())
+
+
+# ── Model resolution / deprecation ──
+
+# Known-retired models → current replacement. Kept as data (not code) so a
+# stale value in env/Supabase config never poisons the provider: it is
+# substituted before the request is built. Add entries here when a provider
+# retires a model — no execution logic needs to change.
+DEPRECATED_MODELS: dict[str, str] = {
+    "gemini-2.0-flash": "gemini-2.5-flash",
+}
+
+
+def resolve_model(provider_name: str, model: str) -> str:
+    """Resolve a configured model, substituting known-deprecated models.
+
+    Returns ``model`` unchanged when it is not in the deprecation map. This is
+    a pure, provider-agnostic data lookup — no network, no provider coupling.
+    """
+    resolved = DEPRECATED_MODELS.get((model or "").strip())
+    if resolved and resolved != model:
+        import logging
+        logging.getLogger(__name__).warning(
+            "provider-model: '%s' model '%s' is deprecated — using '%s'",
+            provider_name, model, resolved,
+        )
+        return resolved
+    return model

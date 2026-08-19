@@ -112,7 +112,7 @@ async def test_prose_recovers_to_native_tool_via_bounded_retry():
 
     result = await d.dispatch(AIRequest(
         session_id="s1", message_id=1, owner_id=123,
-        user_message="وضعیت first name اکانتم رو بگو", chat_id=456,
+        user_message="ببین چیکار میتونی بکنی", chat_id=456,
     ))
 
     assert result.success is True
@@ -148,7 +148,7 @@ async def test_prose_recovery_falls_back_to_original_prose():
 
     result = await d.dispatch(AIRequest(
         session_id="s1", message_id=1, owner_id=123,
-        user_message="وضعیت first name اکانتم رو بگو", chat_id=456,
+        user_message="سلام، چطوری؟", chat_id=456,
     ))
 
     assert result.success is True
@@ -173,20 +173,21 @@ def test_action_nudge_is_appended_as_user_turn():
 # ── Model-not-found surfacing ──
 
 
-def test_humanize_model_not_found_includes_detail():
+def test_humanize_provider_exhaustion_is_clean_and_generic():
     from backend.bot.handlers.ai_unified import _humanize_error
 
     msg = _humanize_error(
         "All AI providers failed. Last error: groq: success=False "
         "(API error (404): Model 'openai/gpt-oss-120b' not found)"
     )
-    assert "Model not found" in msg
-    assert "not found" in msg
+    assert "temporarily unavailable" in msg
+    assert "groq" not in msg
+    assert "openai/gpt-oss-120b" not in msg
 
 
-def test_humanize_rate_limit_not_misclassified_as_model():
+def test_humanize_rate_limit_is_clean():
     from backend.bot.handlers.ai_unified import _humanize_error
 
     msg = _humanize_error("Rate limited. Try again in 5s.")
-    assert "Rate limited" in msg
-    assert "Model not found" not in msg
+    assert "temporarily unavailable" in msg
+    assert "Rate limited" not in msg

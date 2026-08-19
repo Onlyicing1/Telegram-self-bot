@@ -38,6 +38,7 @@ ACTION_NAMES = frozenset({
     "database_stats",
     "bio_status",
     "username_status",
+    "account_status",
     "send",
     "clean_chat",
     "remember",
@@ -55,6 +56,7 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "database_stats",
     "bio_status",
     "username_status",
+    "account_status",
 })
 
 # Read-only status/query actions: no target — the mapped tool reads the
@@ -67,6 +69,7 @@ _STATUS_ACTIONS = frozenset({
     "database_stats",
     "bio_status",
     "username_status",
+    "account_status",
 })
 
 TARGET_SCOPES = frozenset({
@@ -368,6 +371,9 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action == "username_status":
         return [{"name": "username_show", "arguments": {}}]
 
+    if action == "account_status":
+        return [{"name": "account_show", "arguments": {}}]
+
     if action == "delete_messages":
         if target == "message_id":
             return [{"name": "delete_message_by_id", "arguments": {"message_id": result.message_id}}]
@@ -455,6 +461,11 @@ _DB_STATUS_WORDS = frozenset({
     "show", "what", "info",
 })
 _USERNAME_WORDS = frozenset({"یوزرنیم", "یوزرنیمم", "یوزر", "username"})
+_ACCOUNT_WORDS = frozenset({
+    "اسم", "اسمم", "نام", "نامم", "اکانت", "اکانتم", "اکانتی",
+    "حساب", "حسابم", "حسابی", "پروفایل", "پروفایلم",
+    "name", "account", "profile", "first", "last", "identity",
+})
 _BIO_WORDS = frozenset({"بایو", "بیو", "bio"})
 _STATUS_WORDS = frozenset({
     "وضعیت", "وضعیتش", "چیه", "چی", "چه", "بگو", "نشون", "ببین", "چطور",
@@ -479,7 +490,10 @@ def _tokenize(text: str) -> list[str]:
     s = s.replace("\u200c", " ").replace("\u200b", " ")
     s = s.replace("'", "").replace("’", "")
     s = s.lower()
-    return [t for t in re.findall(r"[a-z0-9\u0600-\u06ff]+", s) if t]
+    # \u0600-\u061f is Arabic/Persian *punctuation* (، ؛ ؟) and diacritics,
+    # not letters; including it made "چیه؟" tokenize as "چیه؟" and miss
+    # dictionary matches. Letters start at \u0621 (hamza) onward.
+    return [t for t in re.findall(r"[a-z0-9\u0621-\u06ff]+", s) if t]
 
 
 def _is_stem_token(tok: str, stems: tuple[str, ...]) -> bool:
@@ -619,6 +633,14 @@ def _parse_status_intent(words: list[str]) -> ActionParseResult | None:
             kind=KIND_EXECUTABLE,
             action="database_stats",
             tool_calls=[{"name": "database_stats", "arguments": {}}],
+        )
+
+    # Account identity/name: "وضعیت اسم اکانتم رو بگو" / "what is my name?".
+    if (wordset & _ACCOUNT_WORDS) and (wordset & _STATUS_WORDS):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="account_status",
+            tool_calls=[{"name": "account_show", "arguments": {}}],
         )
 
     # Username status: "وضعیت یوزرنیم رو بگو".

@@ -505,7 +505,7 @@ locally before any execution:
 ```json
 {"action": "save" | "deep_save" | "save_link" | "delete_messages"
           | "list_saved_items" | "search_saved_items" | "list_recent_messages"
-          | "database_stats" | "bio_status" | "username_status",
+          | "database_stats" | "bio_status" | "username_status" | "account_status",
  "target": "replied_message" | "current_message" | "last_message" | "recent_messages" | "message_id",
  "count": 1..500,
  "link": "https://t.me/...",
@@ -536,10 +536,20 @@ user message + provider output
 - Read-only status/query actions map deterministically to existing tools:
   `list_saved_items` → `list_saves`, `search_saved_items` → `search`,
   `database_stats` → `database_stats`, `bio_status` → `bio_show`,
-  `username_status` → `username_show`. The deterministic command parser
-  recognizes "چه چیزایی سیو دارم؟", "وضعیت دیتابیس چیه؟",
-  "وضعیت یوزرنیم رو بگو", and English equivalents, so these execute
+  `username_status` → `username_show`, `account_status` → `account_show`.
+  The deterministic command parser recognizes "چه چیزایی سیو دارم؟",
+  "وضعیت دیتابیس چیه؟", "وضعیت یوزرنیم رو بگو",
+  "وضعیت اسم اکانتم رو بگو", and English equivalents, so these execute
   even when the provider returns prose instead of a tool call.
+- `account_show` reads the authenticated self account identity (id, first
+  name, last name, username, phone) from the Telegram client's `get_me()`
+  — it never depends on a provider hallucinating the value.
+- Provider/model configuration is validated at request time: stale or
+  deprecated models (e.g. a Gemini model that no longer exists) are
+  resolved to a valid default or marked unavailable and skipped, and the
+  OpenAI-compatible request builder only sends `tool_choice` when it does
+  not contradict native tool calling (fixes Groq's "tool choice is none,
+  but model called a tool" 400).
 - `list_recent_messages` reads the **real Telegram chat through the
   active Telethon client** — all participants, chronological
   (oldest → newest) — never the AI conversation/session history. It

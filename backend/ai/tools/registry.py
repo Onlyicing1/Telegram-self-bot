@@ -136,6 +136,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
         UsernameSetTemplateTool, UsernameSetTextTool, UsernameSetMoodTool,
         UsernameOnTool, UsernameOffTool, UsernameShowTool,
     )
+    from backend.ai.tools.account import AccountShowTool
     from backend.ai.tools.retrieve import SearchTool, ListSavesTool
     from backend.ai.tools.database import DatabaseStatsTool
     from backend.ai.tools.settings import SettingsGetTool, SettingsSetTool
@@ -176,6 +177,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(SearchTool(context))
     registry.register(ListSavesTool(context))
     registry.register(DatabaseStatsTool(context))
+    registry.register(AccountShowTool(context))
     registry.register(SettingsGetTool(context))
     registry.register(SettingsSetTool(context))
     registry.register(OrganizeListTool(context))

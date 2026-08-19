@@ -16,7 +16,7 @@ import httpx
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
-from backend.ai.providers.base.defaults import get_provider_default
+from backend.ai.providers.base.defaults import get_provider_default, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +76,9 @@ class OpenAICompatProvider(BaseProvider):
             )
 
         url = f"{self._config.base_url}/chat/completions"
+        model = resolve_model(self.name, kwargs.get("model") or self._config.default_model)
         payload: dict[str, Any] = {
-            "model": kwargs.get("model", self._config.default_model),
+            "model": model,
             "messages": messages,
             "temperature": kwargs.get("temperature", self._config.temperature),
             "max_tokens": kwargs.get("max_tokens", self._config.max_tokens),
@@ -87,6 +88,11 @@ class OpenAICompatProvider(BaseProvider):
         tools = kwargs.get("tools")
         if tools:
             payload["tools"] = tools
+            # Tool-required requests must allow tool calling. Never force
+            # ``tool_choice=none`` alongside tools — that is the contradictory
+            # request Groq rejects with "Tool choice is none, but model called
+            # a tool". Default to auto; callers may override.
+            payload["tool_choice"] = kwargs.get("tool_choice", "auto")
 
         # Single attempt — retries, cooldown, and fallback are owned by the
         # ProviderManager so a rate-limited provider is never retried in a loop.
@@ -138,6 +144,7 @@ class OpenAICompatProvider(BaseProvider):
                         "provider_error_code": provider_error_code,
                         "provider_error_type": provider_error_type,
                         "failure_type": failure_type,
+                        "model": model,
                     },
                 )
 
@@ -197,7 +204,7 @@ class OpenAICompatProvider(BaseProvider):
                     "completion_tokens": usage.get("completion_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 },
-                metadata={"latency": latency, "model": payload["model"], "finish_reason": finish_reason},
+                metadata={"latency": latency, "model": model, "finish_reason": finish_reason},
             )
 
         except httpx.TimeoutException:
