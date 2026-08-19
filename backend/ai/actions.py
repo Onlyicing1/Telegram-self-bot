@@ -643,12 +643,14 @@ def _parse_status_intent(words: list[str]) -> ActionParseResult | None:
             tool_calls=[{"name": "account_show", "arguments": {}}],
         )
 
-    # Username status: "وضعیت یوزرنیم رو بگو".
+    # Username status: "وضعیت یوزرنیم رو بگو". This is the ACTUAL
+    # Telegram @username, retrieved through the authenticated self client's
+    # get_me() — not the first_name "username engine" scheduler state.
     if (wordset & _USERNAME_WORDS) and (wordset & _STATUS_WORDS):
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
-            action="username_status",
-            tool_calls=[{"name": "username_show", "arguments": {}}],
+            action="account_status",
+            tool_calls=[{"name": "account_show", "arguments": {}}],
         )
 
     # Bio status: "وضعیت بایو چیه".

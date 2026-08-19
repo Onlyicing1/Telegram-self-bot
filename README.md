@@ -443,8 +443,9 @@ The execution pipeline is:
 ```
 Natural language (Persian or English)
   → AI trigger / handler
+  → LOCAL deterministic fast path (high-confidence command vocabulary)
   → provider abstraction (active provider → fallback chain)
-  → intent resolution (native tool call)
+  → intent resolution (native tool call / JSON action)
   → argument + target validation
   → real execution (existing service function)
   → real result (success/failure)
@@ -454,6 +455,29 @@ Natural language (Persian or English)
 AI and the Glass UI converge on the **same** service functions
 (`save_service`, `delete_service`, …) — the AI never reimplements a
 feature and never reports fake success.
+
+### Local deterministic fast path (provider-independent)
+
+High-confidence command intents are executed **before** any provider
+round, through the SAME `ToolExecutor`. This is an optimization for
+obviously structured intents — NOT a keyword command parser replacing the
+AI — and it is the reason deterministic operations keep working when
+Groq/Gemini/etc. are rate-limited, misconfigured, or down:
+
+- Read-only status/review: `list_saves`, `search`, `database_stats`,
+  `bio_show`, `username_show` → `account_show` (actual `get_me` identity),
+  and `list_recent_messages` (real Telegram history).
+- Save: `save` / `save_link` (Deep Save only).
+- Delete: only when the target is unambiguous — an explicit message ID,
+  an explicit multi-message count (`ده پیام آخر رو پاک کن`), or a
+  replied-to message (`اینو پاک کن` while replying).
+
+Conversational requests (`هستی؟`) and semantic requests
+(`پیام‌های مربوط به دعوا رو پاک کن`) are NOT fast-pathed — they still go
+through the AI so the model can reason over real chat history. A bare
+"last/recent" without an explicit count is also left to the AI, because
+"اخیر" in a semantic phrase like "دعوای اخیر" is not the same as
+"delete the last message". This keeps destructive actions conservative.
 
 ### Target Resolution
 
@@ -603,6 +627,25 @@ For `list_recent_messages`, the real chat retrieval is logged as
 `LIST_RECENT_MESSAGES_START` / `LIST_RECENT_MESSAGES_RESULT` with
 `chat_id`, `requested_limit`, `returned_count`, `first_message_id`, and
 `last_message_id` (message contents are never logged).
+
+A single `AI_EXEC_TRACE` prefix spans the whole journey so one Telegram
+request can be followed across provider and tool attempts without logging
+secrets:
+
+```
+AI_EXEC_TRACE stage=telegram_received
+AI_EXEC_TRACE stage=intent_resolved intent=... kind=...
+AI_EXEC_TRACE stage=provider_selected provider=...
+AI_EXEC_TRACE stage=provider_request
+AI_EXEC_TRACE stage=provider_response success=... structured=...
+AI_EXEC_TRACE stage=tool_selected tools=[...]
+AI_EXEC_TRACE stage=tool_execute
+AI_EXEC_TRACE stage=tool_result tool=... success=...
+AI_EXEC_TRACE stage=telegram_response success=...
+```
+
+Tool arguments are logged as **keys only**, never values — no message
+contents, API keys, `StringSession`, or credentials appear in the trace.
 
 - Each AI request is bounded by a 60 s `wait_for`; each provider HTTP
   request is bounded by a 30 s guard.

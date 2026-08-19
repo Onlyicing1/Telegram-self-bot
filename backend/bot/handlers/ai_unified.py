@@ -356,6 +356,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     ai_diag.register_start(rid, owner_id=owner_id)
     logger.info("AI_REQUEST_START id=%s owner=%d", rid, owner_id)
     logger.info("TELEGRAM_CHAT_RESOLVE id=%s chat_id=%s", rid, getattr(event, "chat_id", None))
+    logger.info("AI_EXEC_TRACE request_id=%s stage=telegram_received", rid)
 
     engine = _get_engine()
     if engine is None:
@@ -469,6 +470,10 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             )
             if delivery_result.success:
                 ai_diag.mark_success("TELEGRAM_REPLY")
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=telegram_response success=%s",
+                rid, delivery_result.success,
+            )
             logger.info(
                 "AI_RESPONSE_SEND_END id=%s chunks=%d/%d",
                 rid, delivery_result.chunks_delivered, delivery_result.total_chunks,

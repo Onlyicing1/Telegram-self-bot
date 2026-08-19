@@ -190,6 +190,22 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "conversation_runtime", start, errors, metadata)
 
+        # ── Local deterministic fast path (BEFORE any provider round) ──
+        # High-confidence command intents (status queries, last-N delete /
+        # review, save/delete by reply, save-by-link) resolve WITHOUT a
+        # provider round. This keeps deterministic operations working even
+        # when every AI provider is down, rate-limited, or misconfigured —
+        # the reason "وضعیت یوزرنیمم رو بگو" must not depend on Groq.
+        # It is NOT a keyword command parser replacing the AI: only the
+        # narrow, high-confidence command vocabulary resolves here; every
+        # conversational and semantic request continues to the provider.
+        if self._tool_executor is not None:
+            fast = await self._try_local_fast_path(
+                request, rid, status_callback, start, metadata,
+            )
+            if fast is not None:
+                return fast
+
         # ── Stage 2: Prompt Builder ──
         try:
             _stage("PROMPT_BUILD")
@@ -210,6 +226,10 @@ class Dispatcher:
         try:
             provider_name = self._provider_manager.get_active_name()
             metadata["stages"].append("provider_manager")
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=provider_selected provider=%s",
+                rid or "-", provider_name,
+            )
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider_manager", start, errors, metadata)
 
@@ -218,11 +238,21 @@ class Dispatcher:
             messages = self._build_messages(prompt_package)
             _stage("PROVIDER_REQUEST")
             logger.info("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=provider_request provider=%s",
+                rid or "-", provider_name,
+            )
             response: ProviderResponse = await self._provider_manager.chat(messages, **chat_kwargs)
             _mark_success("PROVIDER_REQUEST")
             logger.info(
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
                 rid or "-", response.provider_name or provider_name, response.success,
+            )
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=provider_response success=%s "
+                "structured=%s tool_calls=%d",
+                rid or "-", response.success, bool(response.tool_calls),
+                len(response.tool_calls or []),
             )
             if not response.success:
                 ftype = (response.metadata or {}).get("failure_type", "unknown")
@@ -588,6 +618,182 @@ class Dispatcher:
             client=base.client,
             extra=extra,
         )
+
+    async def _try_local_fast_path(
+        self,
+        request: AIRequest,
+        rid: str,
+        status_callback: Callable[[str], Awaitable[None]] | None,
+        start: float,
+        metadata: dict[str, Any],
+    ) -> EngineResult | None:
+        """Deterministic fast path for high-confidence command intents.
+
+        Runs BEFORE any provider round. Only the narrow, high-confidence
+        command vocabulary resolves here (status queries, last-N delete /
+        review, save/delete by reply, save-by-link); the AI still handles
+        every conversational and semantic request. Returns None when the
+        intent is conversational so the caller continues to the provider.
+
+        This is the reliability guarantee that deterministic operations
+        work even when every provider is rate-limited, misconfigured, or
+        down — and it proves (via AI_EXEC_TRACE) that the live Telegram
+        request reaches the real tool executor, not just a unit test.
+        """
+        has_reply = bool(request.reply_context and request.reply_context.exists)
+        result = parse_command_intent(request.user_message, has_reply=has_reply)
+
+        if result.kind == "conversational":
+            return None
+
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=intent_resolved intent=%s kind=%s",
+            rid or "-", result.action or "none", result.kind,
+        )
+
+        # Unsupported is a deterministic safety outcome — return it directly
+        # without spending a provider round.
+        if result.kind == "unsupported":
+            message = f"❌ Unsupported action: {result.action}"
+            return self._build_fast_path_result(
+                request, rid, start, metadata, success=True, text=message,
+                action=result.action, kind=result.kind, target=result.target,
+            )
+
+        # Clarify is fast-pathed ONLY for save (a deterministic "reply to the
+        # message" prompt). Delete clarification is left to the AI because the
+        # deterministic parser cannot distinguish "delete the last message"
+        # from a semantic request like "پیام‌های مربوط به X رو پاک کن".
+        if result.kind == "clarify":
+            if result.action in ("save", "deep_save", "save_link"):
+                message = result.reason or "Could you clarify what you'd like me to do?"
+                return self._build_fast_path_result(
+                    request, rid, start, metadata, success=True, text=message,
+                    action=result.action, kind=result.kind, target=result.target,
+                )
+            return None
+
+        if result.kind != "executable" or not result.tool_calls:
+            return None
+
+        # Destructive delete is fast-pathed ONLY when the target is
+        # unambiguous and deterministic: an explicit message ID, an explicit
+        # multi-message count, or a replied-to message. A bare "last/recent"
+        # (count==1 derived from "اخیر") is ambiguous with semantic deletion
+        # and must stay on the AI path.
+        if result.action == "delete_messages":
+            safe_delete = (
+                result.target in ("message_id", "replied_message", "current_message")
+                or (
+                    result.target == "recent_messages"
+                    and result.count is not None
+                    and result.count >= 2
+                )
+            )
+            if not safe_delete:
+                logger.info(
+                    "AI_EXEC_TRACE request_id=%s stage=fast_path_skipped reason=ambiguous_delete",
+                    rid or "-",
+                )
+                return None
+
+        # Execute the resolved tools through the SAME ToolExecutor used by
+        # the provider tool loop — one canonical execution path.
+        per_request_ctx = self._build_tool_context(request)
+        tool_names = [tc.get("name", "") for tc in result.tool_calls]
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=tool_selected tools=%s",
+            rid or "-", tool_names,
+        )
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=tool_execute tools=%s",
+            rid or "-", tool_names,
+        )
+        try:
+            exec_results = await self._tool_executor.execute_calls(
+                result.tool_calls,
+                owner_id=request.owner_id,
+                session_id=request.session_id,
+                status_callback=status_callback,
+                context_override=per_request_ctx,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=tool_execute error=%s", rid or "-", exc
+            )
+            exec_results = []
+
+        all_tool_results = [er.as_dict() for er in exec_results]
+        for er in exec_results:
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",
+                rid or "-", er.tool_name, er.success,
+            )
+            self._conversation.add_tool_result(
+                owner_id=request.owner_id,
+                tool_name=er.tool_name,
+                result=f"{'✅' if er.success else '❌'} {er.message or er.error or 'no message'}",
+            )
+        metadata["tool_results"] = all_tool_results
+        metadata["stages"].append("local_fast_path_tool_execution")
+
+        summary = self._summarize_tool_results(all_tool_results) or "Action completed."
+        self._conversation.add_assistant_message(owner_id=request.owner_id, content=summary)
+
+        return self._build_fast_path_result(
+            request, rid, start, metadata, success=True, text=summary,
+            action=result.action, kind=result.kind, target=result.target,
+        )
+
+    def _build_fast_path_result(
+        self,
+        request: AIRequest,
+        rid: str,
+        start: float,
+        metadata: dict[str, Any],
+        *,
+        success: bool,
+        text: str,
+        action: str,
+        kind: str,
+        target: str,
+    ) -> EngineResult:
+        """Build the EngineResult for a locally-resolved fast-path intent."""
+        latency = time.perf_counter() - start
+        meta = dict(metadata)
+        meta["finish_state"] = "local_fast_path"
+        # Same shape as the provider structured-action path so diagnostics
+        # and tests read a consistent ai_action object.
+        meta["ai_action"] = {"action": action, "kind": kind, "target": target}
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=telegram_response success=%s",
+            rid or "-", success,
+        )
+        result = EngineResult(
+            success=success,
+            provider="local",
+            model="deterministic",
+            latency=latency,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            response=text if success else "",
+            warnings=[],
+            errors=[] if success else [text],
+            metadata=meta,
+        )
+        safe_call(self._hooks, "after_response", result)
+        self._metrics.record(
+            success=success,
+            provider="local",
+            owner_id=request.owner_id,
+            latency=latency,
+            prompt_chars=len(request.user_message or ""),
+            prompt_tokens=0,
+            completion_tokens=0,
+            error="" if success else text,
+        )
+        return result
 
     def _apply_structured_action(
         self,

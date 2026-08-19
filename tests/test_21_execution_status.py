@@ -52,9 +52,12 @@ def test_deterministic_database_stats_english():
 
 
 def test_deterministic_username_status():
+    # "وضعیت یوزرنیم رو بگو" is the ACTUAL Telegram @username — resolved
+    # through the authenticated self client's get_me (account_show), not the
+    # first_name "username engine" scheduler state.
     r = parse_command_intent("وضعیت یوزرنیم رو بگو", has_reply=False)
     assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "username_show", "arguments": {}}]
+    assert r.tool_calls == [{"name": "account_show", "arguments": {}}]
 
 
 def test_deterministic_bio_status():
@@ -286,7 +289,10 @@ async def test_empty_provider_response_is_retried_once_then_tool_executes():
     d, mock_pm = _make_dispatcher(mock_te, [empty, tool_response, continuation])
 
     result = await d.dispatch(AIRequest(
-        session_id="s1", message_id=1, owner_id=123, user_message="وضعیت دیتابیس چیه", chat_id=456,
+        session_id="s1", message_id=1, owner_id=123,
+        # Conversational (not a deterministic command) so the request reaches
+        # the provider and exercises the empty-response → tool-call retry.
+        user_message="سلام", chat_id=456,
     ))
 
     assert result.success is True
