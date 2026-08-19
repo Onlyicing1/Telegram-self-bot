@@ -208,6 +208,60 @@ def load_provider_env_configs() -> dict[str, dict[str, Any]]:
             "enabled": True,
         }
 
+    zai_key = os.getenv("AI_ZAI_API_KEY", "") or os.getenv("ZAI_API_KEY", "")
+    if zai_key:
+        configs["zai"] = {
+            "api_key": zai_key,
+            "default_model": os.getenv("AI_ZAI_MODEL", "") or os.getenv("ZAI_MODEL", ""),
+            "base_url": os.getenv("AI_ZAI_BASE_URL", "") or os.getenv("ZAI_BASE_URL", ""),
+            "enabled": True,
+        }
+
+    sambanova_key = os.getenv("AI_SAMBANOVA_API_KEY", "") or os.getenv("SAMBANOVA_API_KEY", "")
+    if sambanova_key:
+        configs["sambanova"] = {
+            "api_key": sambanova_key,
+            "default_model": os.getenv("AI_SAMBANOVA_MODEL", "") or os.getenv("SAMBANOVA_MODEL", ""),
+            "base_url": os.getenv("AI_SAMBANOVA_BASE_URL", "") or os.getenv("SAMBANOVA_BASE_URL", ""),
+            "enabled": True,
+        }
+
+    nvidia_key = os.getenv("AI_NVIDIA_API_KEY", "") or os.getenv("NVIDIA_API_KEY", "")
+    if nvidia_key:
+        configs["nvidia"] = {
+            "api_key": nvidia_key,
+            "default_model": os.getenv("AI_NVIDIA_MODEL", "") or os.getenv("NVIDIA_MODEL", ""),
+            "base_url": os.getenv("AI_NVIDIA_BASE_URL", "") or os.getenv("NVIDIA_BASE_URL", ""),
+            "enabled": True,
+        }
+
+    cohere_key = os.getenv("AI_COHERE_API_KEY", "") or os.getenv("COHERE_API_KEY", "")
+    if cohere_key:
+        configs["cohere"] = {
+            "api_key": cohere_key,
+            "default_model": os.getenv("AI_COHERE_MODEL", "") or os.getenv("COHERE_MODEL", ""),
+            "base_url": os.getenv("AI_COHERE_BASE_URL", "") or os.getenv("COHERE_BASE_URL", ""),
+            "enabled": True,
+        }
+
+    siliconflow_key = os.getenv("AI_SILICONFLOW_API_KEY", "") or os.getenv("SILICONFLOW_API_KEY", "")
+    if siliconflow_key:
+        configs["siliconflow"] = {
+            "api_key": siliconflow_key,
+            "default_model": os.getenv("AI_SILICONFLOW_MODEL", "") or os.getenv("SILICONFLOW_MODEL", ""),
+            "base_url": os.getenv("AI_SILICONFLOW_BASE_URL", "") or os.getenv("SILICONFLOW_BASE_URL", ""),
+            "enabled": True,
+        }
+
+    fireworks_key = os.getenv("AI_FIREWORKS_API_KEY", "") or os.getenv("FIREWORKS_API_KEY", "")
+    if fireworks_key:
+        configs["fireworks"] = {
+            "api_key": fireworks_key,
+            "default_model": os.getenv("AI_FIREWORKS_MODEL", "") or os.getenv("FIREWORKS_MODEL", ""),
+            "base_url": os.getenv("AI_FIREWORKS_BASE_URL", "") or os.getenv("FIREWORKS_BASE_URL", ""),
+            "enabled": True,
+        }
+
     return configs
 
 

@@ -149,6 +149,96 @@ def _groq_default() -> ProviderConfig:
     )
 
 
+def _zai_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="zai",
+        base_url="https://api.z.ai/api/paas/v4",
+        api_key="",
+        default_model="glm-4.5-flash",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _sambanova_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="sambanova",
+        base_url="https://api.sambanova.ai/v1",
+        api_key="",
+        default_model="DeepSeek-V3-0324",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _nvidia_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="nvidia",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="",
+        default_model="qwen/qwen2.5-72b-instruct",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _cohere_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="cohere",
+        base_url="https://api.cohere.com/compatibility/v1",
+        api_key="",
+        default_model="command-r-plus",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _siliconflow_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="siliconflow",
+        base_url="https://api.siliconflow.cn/v1",
+        api_key="",
+        default_model="Qwen/Qwen2.5-72B-Instruct",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
+def _fireworks_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="fireworks",
+        base_url="https://api.fireworks.ai/inference/v1",
+        api_key="",
+        default_model="accounts/fireworks/models/llama-v3p3-70b-instruct",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
 def _custom_default() -> ProviderConfig:
     return ProviderConfig(
         provider_name="custom",
@@ -175,6 +265,12 @@ _PROVIDER_DEFAULTS: dict[str, callable] = {
     "cerebras": _cerebras_default,
     "mistral": _mistral_default,
     "groq": _groq_default,
+    "zai": _zai_default,
+    "sambanova": _sambanova_default,
+    "nvidia": _nvidia_default,
+    "cohere": _cohere_default,
+    "siliconflow": _siliconflow_default,
+    "fireworks": _fireworks_default,
 }
 
 

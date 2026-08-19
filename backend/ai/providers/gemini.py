@@ -3,7 +3,6 @@ GeminiProvider — Google Gemini adapter (real implementation).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -123,79 +122,75 @@ class GeminiProvider(BaseProvider):
                 declarations.append(decl)
             payload["tools"] = [{"functionDeclarations": declarations}]
 
-        for attempt in range(self._config.retry_count + 1):
-            try:
-                t0 = time.perf_counter()
-                resp = await self._http_client.post(url, json=payload)
-                latency = time.perf_counter() - t0
+        # Single attempt — retries, cooldown, and fallback are owned by the
+        # ProviderManager so a rate-limited provider is never retried in a loop.
+        try:
+            t0 = time.perf_counter()
+            resp = await self._http_client.post(url, json=payload)
+            latency = time.perf_counter() - t0
 
-                if resp.status_code == 429:
-                    retry_after = 5
-                    logger.warning("Gemini rate limited, waiting %ds", retry_after)
-                    if attempt < self._config.retry_count:
-                        await asyncio.sleep(retry_after)
-                        continue
-                    return ProviderResponse(text="Rate limited.", provider_name=self.name, success=False, metadata={"http_status": 429, "retry_after": retry_after})
+            if resp.status_code == 429:
+                retry_after = 5
+                logger.warning("Gemini rate limited (retry_after=%ds)", retry_after)
+                return ProviderResponse(text="Rate limited.", provider_name=self.name, success=False, metadata={"http_status": 429, "retry_after": retry_after, "failure_type": "rate_limited"})
 
-                if resp.status_code >= 400:
-                    error_msg = resp.text[:200]
-                    provider_error_code = ""
-                    provider_error_type = ""
-                    try:
-                        error_data = resp.json()
-                        err_obj = error_data.get("error", {})
-                        error_msg = err_obj.get("message", error_msg)
-                        provider_error_code = str(err_obj.get("code", ""))
-                        provider_error_type = err_obj.get("status", "")
-                    except Exception:
-                        pass
-                    logger.warning("Gemini API error %d: %s", resp.status_code, error_msg)
-                    return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False, metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type})
+            if resp.status_code >= 400:
+                error_msg = resp.text[:200]
+                provider_error_code = ""
+                provider_error_type = ""
+                try:
+                    error_data = resp.json()
+                    err_obj = error_data.get("error", {})
+                    error_msg = err_obj.get("message", error_msg)
+                    provider_error_code = str(err_obj.get("code", ""))
+                    provider_error_type = err_obj.get("status", "")
+                except Exception:
+                    pass
+                if resp.status_code in (401, 403):
+                    failure_type = "auth"
+                elif resp.status_code >= 500:
+                    failure_type = "server"
+                else:
+                    failure_type = "request"
+                logger.warning("Gemini API error %d: %s", resp.status_code, error_msg)
+                return ProviderResponse(text=f"API error ({resp.status_code}): {error_msg}", provider_name=self.name, success=False, metadata={"http_status": resp.status_code, "provider_error_code": provider_error_code, "provider_error_type": provider_error_type, "failure_type": failure_type})
 
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                text = ""
-                finish_reason = ""
-                tool_calls: list[dict[str, Any]] = []
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    text_parts: list[str] = []
-                    for p in parts:
-                        if "text" in p:
-                            text_parts.append(p["text"])
-                        elif "functionCall" in p:
-                            fc = p["functionCall"]
-                            tool_calls.append({"id": fc.get("id", ""), "name": fc.get("name", ""), "arguments": fc.get("args", {})})
-                    text = " ".join(text_parts)
-                    finish_reason = candidates[0].get("finishReason", "")
-                usage = data.get("usageMetadata", {})
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            text = ""
+            finish_reason = ""
+            tool_calls: list[dict[str, Any]] = []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text_parts: list[str] = []
+                for p in parts:
+                    if "text" in p:
+                        text_parts.append(p["text"])
+                    elif "functionCall" in p:
+                        fc = p["functionCall"]
+                        tool_calls.append({"id": fc.get("id", ""), "name": fc.get("name", ""), "arguments": fc.get("args", {})})
+                text = " ".join(text_parts)
+                finish_reason = candidates[0].get("finishReason", "")
+            usage = data.get("usageMetadata", {})
 
-                if not text and not tool_calls and finish_reason:
-                    if finish_reason == "MAX_TOKENS":
-                        text = "Response truncated due to token limit."
-                    elif finish_reason == "SAFETY":
-                        text = "Response blocked by content filter."
-                    elif finish_reason == "RECITATION":
-                        text = "Response blocked due to recitation."
+            if not text and not tool_calls and finish_reason:
+                if finish_reason == "MAX_TOKENS":
+                    text = "Response truncated due to token limit."
+                elif finish_reason == "SAFETY":
+                    text = "Response blocked by content filter."
+                elif finish_reason == "RECITATION":
+                    text = "Response blocked due to recitation."
 
-                return ProviderResponse(
-                    text=text, provider_name=self.name, success=True, tool_calls=tool_calls,
-                    usage={"prompt_tokens": usage.get("promptTokenCount", 0), "completion_tokens": usage.get("candidatesTokenCount", 0), "total_tokens": usage.get("totalTokenCount", 0)},
-                    metadata={"latency": latency, "model": model, "finish_reason": finish_reason},
-                )
+            return ProviderResponse(
+                text=text, provider_name=self.name, success=True, tool_calls=tool_calls,
+                usage={"prompt_tokens": usage.get("promptTokenCount", 0), "completion_tokens": usage.get("candidatesTokenCount", 0), "total_tokens": usage.get("totalTokenCount", 0)},
+                metadata={"latency": latency, "model": model, "finish_reason": finish_reason},
+            )
 
-            except httpx.TimeoutException:
-                if attempt < self._config.retry_count:
-                    await asyncio.sleep(min(2 ** attempt, 10))
-                    continue
-                return ProviderResponse(text=f"Timeout after {self._config.timeout}s.", provider_name=self.name, success=False, metadata={"error_type": "timeout"})
-            except Exception as exc:
-                if attempt < self._config.retry_count:
-                    await asyncio.sleep(min(2 ** attempt, 10))
-                    continue
-                return ProviderResponse(text=f"Error: {exc}", provider_name=self.name, success=False, metadata={"error_type": type(exc).__name__})
-
-        return ProviderResponse(text="Failed after retries.", provider_name=self.name, success=False, metadata={"error_type": "retry_exhausted"})
+        except httpx.TimeoutException:
+            return ProviderResponse(text=f"Timeout after {self._config.timeout}s.", provider_name=self.name, success=False, metadata={"failure_type": "timeout"})
+        except Exception as exc:
+            return ProviderResponse(text=f"Error: {exc}", provider_name=self.name, success=False, metadata={"failure_type": "network", "error": f"{type(exc).__name__}: {exc}"})
 
     async def list_models(self) -> list[dict[str, Any]]:
         if not self._config.api_key or not self._config.enabled:

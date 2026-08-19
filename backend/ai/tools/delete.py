@@ -54,10 +54,11 @@ class DeleteTool(Tool):
         return "ToolResult with deletion count in message"
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.persian import coerce_int
         from backend.services import delete_service
 
-        count = arguments.get("count")
-        if not isinstance(count, int) or isinstance(count, bool) or count < 1 or count > 500:
+        count = coerce_int(arguments.get("count"))
+        if count is None or count < 1 or count > 500:
             return ToolResult(
                 success=False,
                 message=(
@@ -138,10 +139,11 @@ class DeleteByIdTool(Tool):
         return "ToolResult with deletion count in message"
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.persian import coerce_int
         from backend.services import delete_service
 
-        message_id = arguments.get("message_id")
-        if not isinstance(message_id, int) or isinstance(message_id, bool):
+        message_id = coerce_int(arguments.get("message_id"))
+        if message_id is None:
             return ToolResult(
                 success=False,
                 message=("Delete by ID requires an explicit message ID. No messages were deleted."),

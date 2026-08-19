@@ -431,13 +431,20 @@ Nova, delete the last 5 messages → DeleteTool → delete_service.do_del_n_coun
 The execution pipeline is:
 
 ```
-Natural language
+Natural language (Persian or English)
+  → AI trigger / handler
+  → provider abstraction (active provider → fallback chain)
   → intent resolution (native tool call)
   → argument validation
   → real execution (existing service function)
   → real result (success/failure)
   → AI response based on the REAL result
 ```
+
+Persian, informal/colloquial Persian, and mixed Persian-English commands
+are supported. Persian digits (۰-۹) in numeric arguments are normalized
+before validation. Exact values such as usernames, URLs, and quoted text
+are preserved verbatim.
 
 Nova **never** claims an action succeeded unless the underlying service
 actually returned success. If a save/download/delete fails, the AI
@@ -475,29 +482,129 @@ provider by name — it calls `ProviderManager.chat()`.
 ### Provider Registry
 
 All providers are registered in a `ProviderRegistry`. The
-`ProviderManager` routes requests to the active provider and handles
-fallback.
+`ProviderManager` routes requests through an ordered candidate list
+(active provider → configured fallback chain → emergency dummy fallback)
+and applies a per-provider health/cooldown state machine.
+
+### Execution Boundary
+
+AI providers only parse intent. They never touch Telegram, Supabase, or
+the runtime. The pipeline is:
+
+```
+Natural-language Telegram command
+  → AI trigger / handler
+  → provider abstraction
+  → healthy AI provider (native tool call)
+  → normalized execution intent (tool name + arguments)
+  → LOCAL validation (registry + argument validation)
+  → existing LifeOS executor (service layer)
+  → Telegram / database
+  → real result
+```
+
+A provider that returns an unknown tool name is rejected locally — an LLM
+can never invent an action that reaches Telegram.
 
 ### Available Providers
 
-| Provider | Status | Notes |
-|---|---|---|
-| `dummy` | Active (default) | Deterministic placeholder, no network |
-| `gemini` | Real implementation | Google Gemini API |
-| `openai` | Real implementation | OpenAI GPT, supports custom base URLs |
-| `openrouter` | Real implementation | OpenRouter (100+ models via one API) |
-| `cerebras` | Real implementation | Cerebras inference (OpenAI-compatible) |
-| `groq` | Real implementation | Groq inference (OpenAI-compatible) |
-| `mistral` | Real implementation | Mistral AI (OpenAI-compatible) |
+Core (genuinely recurring free access, subject to live account/geo check):
 
-All providers except `dummy` subclass `OpenAICompatProvider`, which
-implements the OpenAI-compatible chat completions API via `httpx` with
-retry, exponential backoff, and usage parsing.
+| Provider | Model/route | Env var | Class | Role |
+|---|---|---|---|---|
+| Google Gemini | `gemini-2.5-flash` (configurable) | `GEMINI_API_KEY` | A | Primary |
+| Mistral AI | `mistral-small-latest` (configurable) | `MISTRAL_API_KEY` | A/B | Fallback 1 |
+| Z.ai / GLM | `glm-4.5-flash` (configurable) | `ZAI_API_KEY` | A/B | Fallback 2 |
+| Groq | `qwen-2.5-32b` (configurable) | `GROQ_API_KEY` | A/B | Fallback 3 |
+
+Backup / evaluation:
+
+| Provider | Model/route | Env var | Class | Role |
+|---|---|---|---|---|
+| SambaNova Cloud | `DeepSeek-V3-0324` | `SAMBANOVA_API_KEY` | B | Emergency backup |
+| NVIDIA NIM | `qwen/qwen2.5-72b-instruct` | `NVIDIA_API_KEY` | B | Backup/eval |
+| Cohere | `command-r-plus` | `COHERE_API_KEY` | B/C | Evaluation |
+| SiliconFlow | `Qwen/Qwen2.5-72B-Instruct` | `SILICONFLOW_API_KEY` | B/C | Backup/eval |
+| Cerebras | `llama-3.3-70b` | `CEREBRAS_API_KEY` | B | Backup/eval |
+| Fireworks AI | `accounts/fireworks/models/llama-v3p3-70b-instruct` | `FIREWORKS_API_KEY` | C | Only if recurring access |
+
+`openai` and `openrouter` remain registered for compatibility, but are
+**not** part of the recommended core order (see below).
+
+Free-tier classification:
+- **A** = genuinely recurring free access
+- **B** = free but heavily restricted (low daily quota / concurrency)
+- **C** = promotional/temporary credits
+- **D** = requires payment/card
+- **E** = not practically usable
+
+Exact quotas are account- and model-dependent and change over time — the
+model names above are configurable defaults, not guarantees. Verify the
+current model name against your provider account.
+
+### API Compatibility
+
+- `gemini` uses Google's native `generateContent` API.
+- `mistral`, `zai`, `groq`, `sambanova`, `nvidia`, `siliconflow`,
+  `fireworks`, `cerebras`, `openai`, and `openrouter` use the
+  OpenAI-compatible chat-completions API via `OpenAICompatProvider`.
+- `cohere` uses Cohere's OpenAI-compatibility endpoint
+  (`https://api.cohere.com/compatibility/v1`).
+
+### Rate Limits, Retry & Fallback
+
+`ProviderManager` owns the provider state machine. Providers themselves
+make a **single attempt** — retries, cooldown, and fallback are centralized:
+
+```
+healthy
+  │ transient failure (network/timeout/5xx)
+  ▼
+retry once
+  ├── success ──► healthy
+  └── failure ──► cooling_down
+cooling_down
+  │ cooldown expires
+  ▼
+probe (next request)
+  ├── success ──► healthy
+  └── failure ──► cooling_down / disabled
+```
+
+- **429 / rate-limit** — reads `Retry-After`, marks the provider
+  `cooling_down`, and immediately tries the next healthy provider. It is
+  **never** retried in a loop.
+- **5xx / network / timeout** — exactly **one** immediate retry, then
+  fallback.
+- **401 / 403 (auth)** — the provider is marked `disabled` until
+  configuration changes; no wasted requests.
+- **Semantic uncertainty** ("I don't understand") is a successful
+  clarification response, **not** a failure — the system never fails over
+  to another provider to manufacture destructive intent.
+
+Cooldown uses `time.monotonic()`. Concurrency is bounded per provider
+(default 4; Z.ai is capped at 2). Provider HTTP requests are individually
+bounded via the existing watchdog (`guarded_await`).
 
 ### Configuration
 
-Providers are configured via environment variables (`AI_*` prefix).
-See [Environment Variables](#environment-variables) below.
+Providers are configured via environment variables (both `AI_*_API_KEY`
+and bare `*_API_KEY` forms are accepted). See
+[Environment Variables](#environment-variables) below.
+
+Minimal setup (no real keys — fill in your own):
+
+```env
+GEMINI_API_KEY=...
+MISTRAL_API_KEY=...
+ZAI_API_KEY=...
+GROQ_API_KEY=...
+SAMBANOVA_API_KEY=...
+AI_PROVIDER_FALLBACK=gemini,mistral,zai,groq,sambanova
+```
+
+OpenRouter is intentionally **not** part of the core order — the goal is
+independent provider quota pools, not a single router aggregating them.
 
 ### Adding a New Provider
 
@@ -505,8 +612,9 @@ See [Environment Variables](#environment-variables) below.
    `OpenAICompatProvider` (or `BaseProvider` for non-OpenAI-compatible).
 2. Set `PROVIDER_NAME` and `PROVIDER_VERSION`.
 3. Add defaults to `base/defaults.py`.
-4. Add the class to `_PROVIDER_CLASSES` in `factory.py`.
-5. Import and export it in `providers/__init__.py`.
+4. Add the class to `_PROVIDER_CLASSES` and env maps in `factory.py`.
+5. Add env loading in `config/env.py` and metadata in `discovery.py`.
+6. Import and export it in `providers/__init__.py`.
 
 ---
 
@@ -649,25 +757,40 @@ All AI variables are optional. AI is off by default.
 
 ### Optional — AI Provider Keys
 
+Both `AI_*_API_KEY` and bare `*_API_KEY` forms are accepted. A provider
+without a key is simply unavailable — it never breaks startup.
+
 | Variable | Description |
 |---|---|
-| `AI_GEMINI_API_KEY` | Gemini API key |
-| `AI_OPENAI_API_KEY` | OpenAI API key |
-| `AI_OPENROUTER_API_KEY` | OpenRouter API key |
-| `AI_GROQ_API_KEY` | Groq API key |
-| `AI_CEREBRAS_API_KEY` | Cerebras API key |
-| `AI_MISTRAL_API_KEY` | Mistral API key |
+| `GEMINI_API_KEY` / `AI_GEMINI_API_KEY` | Google Gemini API key |
+| `MISTRAL_API_KEY` / `AI_MISTRAL_API_KEY` | Mistral AI API key |
+| `ZAI_API_KEY` / `AI_ZAI_API_KEY` | Z.ai / GLM API key |
+| `GROQ_API_KEY` / `AI_GROQ_API_KEY` | Groq API key |
+| `SAMBANOVA_API_KEY` / `AI_SAMBANOVA_API_KEY` | SambaNova Cloud API key |
+| `NVIDIA_API_KEY` / `AI_NVIDIA_API_KEY` | NVIDIA NIM API key |
+| `COHERE_API_KEY` / `AI_COHERE_API_KEY` | Cohere API key |
+| `SILICONFLOW_API_KEY` / `AI_SILICONFLOW_API_KEY` | SiliconFlow API key |
+| `CEREBRAS_API_KEY` / `AI_CEREBRAS_API_KEY` | Cerebras API key |
+| `FIREWORKS_API_KEY` / `AI_FIREWORKS_API_KEY` | Fireworks AI API key |
+| `OPENAI_API_KEY` / `AI_OPENAI_API_KEY` | OpenAI API key (optional compat) |
+| `OPENROUTER_API_KEY` / `AI_OPENROUTER_API_KEY` | OpenRouter API key (optional compat) |
 
 ### Optional — AI Provider Model Overrides
 
 | Variable | Description |
 |---|---|
-| `AI_GEMINI_MODEL` | Gemini model name |
-| `AI_OPENAI_MODEL` | OpenAI model name |
-| `AI_OPENROUTER_MODEL` | OpenRouter model name |
-| `AI_GROQ_MODEL` | Groq model name |
-| `AI_CEREBRAS_MODEL` | Cerebras model name |
-| `AI_MISTRAL_MODEL` | Mistral model name |
+| `GEMINI_MODEL` / `AI_GEMINI_MODEL` | Gemini model name |
+| `MISTRAL_MODEL` / `AI_MISTRAL_MODEL` | Mistral model name |
+| `ZAI_MODEL` / `AI_ZAI_MODEL` | Z.ai / GLM model name |
+| `GROQ_MODEL` / `AI_GROQ_MODEL` | Groq model name |
+| `SAMBANOVA_MODEL` / `AI_SAMBANOVA_MODEL` | SambaNova model name |
+| `NVIDIA_MODEL` / `AI_NVIDIA_MODEL` | NVIDIA model name |
+| `COHERE_MODEL` / `AI_COHERE_MODEL` | Cohere model name |
+| `SILICONFLOW_MODEL` / `AI_SILICONFLOW_MODEL` | SiliconFlow model name |
+| `CEREBRAS_MODEL` / `AI_CEREBRAS_MODEL` | Cerebras model name |
+| `FIREWORKS_MODEL` / `AI_FIREWORKS_MODEL` | Fireworks model name |
+| `OPENAI_MODEL` / `AI_OPENAI_MODEL` | OpenAI model name |
+| `OPENROUTER_MODEL` / `AI_OPENROUTER_MODEL` | OpenRouter model name |
 
 ---
 

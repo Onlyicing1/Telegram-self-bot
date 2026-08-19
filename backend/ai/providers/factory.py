@@ -22,14 +22,20 @@ from backend.ai.providers.base.contract import BaseProvider
 from backend.ai.providers.base.defaults import get_provider_default
 from backend.ai.providers.base.exceptions import ProviderNotFound
 from backend.ai.providers.cerebras import CerebrasProvider
+from backend.ai.providers.cohere import CohereProvider
 from backend.ai.providers.dummy.provider import DummyProvider
+from backend.ai.providers.fireworks import FireworksProvider
 from backend.ai.providers.gemini import GeminiProvider
 from backend.ai.providers.groq import GroqProvider
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.mistral import MistralProvider
+from backend.ai.providers.nvidia import NVIDIAProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
 from backend.ai.providers.registry.registry import ProviderRegistry
+from backend.ai.providers.sambanova import SambaNovaProvider
+from backend.ai.providers.siliconflow import SiliconFlowProvider
+from backend.ai.providers.zai import ZaiProvider
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,12 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "cerebras": CerebrasProvider,
     "mistral": MistralProvider,
     "groq": GroqProvider,
+    "zai": ZaiProvider,
+    "sambanova": SambaNovaProvider,
+    "nvidia": NVIDIAProvider,
+    "cohere": CohereProvider,
+    "siliconflow": SiliconFlowProvider,
+    "fireworks": FireworksProvider,
 }
 
 _ENV_KEY_MAP: dict[str, list[str]] = {
@@ -50,6 +62,12 @@ _ENV_KEY_MAP: dict[str, list[str]] = {
     "cerebras": ["AI_CEREBRAS_API_KEY", "CEREBRAS_API_KEY"],
     "mistral": ["AI_MISTRAL_API_KEY", "MISTRAL_API_KEY"],
     "groq": ["AI_GROQ_API_KEY", "GROQ_API_KEY"],
+    "zai": ["AI_ZAI_API_KEY", "ZAI_API_KEY"],
+    "sambanova": ["AI_SAMBANOVA_API_KEY", "SAMBANOVA_API_KEY"],
+    "nvidia": ["AI_NVIDIA_API_KEY", "NVIDIA_API_KEY"],
+    "cohere": ["AI_COHERE_API_KEY", "COHERE_API_KEY"],
+    "siliconflow": ["AI_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY"],
+    "fireworks": ["AI_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"],
 }
 
 _ENV_MODEL_MAP: dict[str, str] = {
@@ -59,11 +77,23 @@ _ENV_MODEL_MAP: dict[str, str] = {
     "cerebras": "AI_CEREBRAS_MODEL",
     "mistral": "AI_MISTRAL_MODEL",
     "groq": "AI_GROQ_MODEL",
+    "zai": "AI_ZAI_MODEL",
+    "sambanova": "AI_SAMBANOVA_MODEL",
+    "nvidia": "AI_NVIDIA_MODEL",
+    "cohere": "AI_COHERE_MODEL",
+    "siliconflow": "AI_SILICONFLOW_MODEL",
+    "fireworks": "AI_FIREWORKS_MODEL",
 }
 
 _ENV_BASE_URL_MAP: dict[str, str] = {
     "openai": "AI_OPENAI_BASE_URL",
     "openrouter": "AI_OPENROUTER_BASE_URL",
+    "zai": "AI_ZAI_BASE_URL",
+    "sambanova": "AI_SAMBANOVA_BASE_URL",
+    "nvidia": "AI_NVIDIA_BASE_URL",
+    "cohere": "AI_COHERE_BASE_URL",
+    "siliconflow": "AI_SILICONFLOW_BASE_URL",
+    "fireworks": "AI_FIREWORKS_BASE_URL",
 }
 
 

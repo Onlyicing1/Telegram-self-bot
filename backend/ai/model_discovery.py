@@ -108,6 +108,34 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
         "mistral-small-latest",
         "open-mistral-nemo",
     ],
+    "zai": [
+        "glm-4.5-flash",
+        "glm-4-flash",
+        "glm-4-plus",
+    ],
+    "sambanova": [
+        "DeepSeek-V3-0324",
+        "DeepSeek-R1",
+        "Meta-Llama-3.3-70B-Instruct",
+    ],
+    "nvidia": [
+        "qwen/qwen2.5-72b-instruct",
+        "deepseek-ai/deepseek-r1",
+    ],
+    "cohere": [
+        "command-r-plus",
+        "command-r7b-12-2024",
+        "command-a-03-2025",
+    ],
+    "siliconflow": [
+        "Qwen/Qwen2.5-72B-Instruct",
+        "Qwen/Qwen2.5-32B-Instruct",
+        "deepseek-ai/DeepSeek-V3",
+    ],
+    "fireworks": [
+        "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "accounts/fireworks/models/qwen2p5-72b-instruct",
+    ],
 }
 
 

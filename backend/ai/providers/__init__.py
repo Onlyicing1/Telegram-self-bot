@@ -73,8 +73,10 @@ from backend.ai.providers.base.validation import (
     validate_provider_config,
 )
 from backend.ai.providers.cerebras import CerebrasProvider
+from backend.ai.providers.cohere import CohereProvider
 from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.factory import ProviderFactory
+from backend.ai.providers.fireworks import FireworksProvider
 from backend.ai.providers.gemini import GeminiProvider
 from backend.ai.providers.groq import GroqProvider
 from backend.ai.providers.manager.config_manager import (
@@ -87,9 +89,13 @@ from backend.ai.providers.manager.metrics import (
     ProviderMetricsRegistry,
 )
 from backend.ai.providers.mistral import MistralProvider
+from backend.ai.providers.nvidia import NVIDIAProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
 from backend.ai.providers.registry.registry import ProviderRegistry
+from backend.ai.providers.sambanova import SambaNovaProvider
+from backend.ai.providers.siliconflow import SiliconFlowProvider
+from backend.ai.providers.zai import ZaiProvider
 
 __all__ = [
     # Base
@@ -128,4 +134,10 @@ __all__ = [
     "CerebrasProvider",
     "MistralProvider",
     "GroqProvider",
+    "ZaiProvider",
+    "SambaNovaProvider",
+    "NVIDIAProvider",
+    "CohereProvider",
+    "SiliconFlowProvider",
+    "FireworksProvider",
 ]
