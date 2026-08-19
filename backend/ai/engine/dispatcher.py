@@ -51,6 +51,18 @@ MAX_TOOL_ROUNDS = 3
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
 _TRUNCATED_FINISH_TOKENS = ("MAX_TOKENS", "LENGTH", "TRUNCATED")
 
+# Appended as an extra user turn for the bounded recovery retry. It nudges the
+# model to emit a structured tool call / JSON action instead of prose, without
+# altering conversation history. Any action still passes through the local
+# parser + validator before execution, so the nudge never weakens safety.
+_ENFORCE_ACTION_NUDGE = (
+    "If the user's request requires an action (save, delete, list/search saved "
+    "items, database status, bio/username status, or reviewing recent Telegram "
+    "messages), respond with ONLY a native tool call or a single JSON action "
+    "object — no prose, no questions, no permission explanations. If the request "
+    "is purely conversational, answer normally."
+)
+
 
 def _is_blocked_finish(reason: str) -> bool:
     """True when the provider finish reason indicates a blocked response."""
@@ -212,12 +224,19 @@ class Dispatcher:
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
                 rid or "-", response.provider_name or provider_name, response.success,
             )
+            if not response.success:
+                ftype = (response.metadata or {}).get("failure_type", "unknown")
+                logger.warning(
+                    "AI_PROVIDER_FAILURE_CATEGORY id=%s provider=%s category=%s",
+                    rid or "-", response.provider_name or provider_name, ftype,
+                )
 
             # Bounded retry for a transient EMPTY provider response (a
             # "thinking stall" where the model returns finish_reason=stop with
             # no text and no tool call). This is NOT a permanent-config retry
             # and never re-runs tools — no tool has executed at this point, so
-            # a destructive save/delete cannot double-run.
+            # a destructive save/delete cannot double-run. The retry appends
+            # a format-enforcement nudge so a stall does not just repeat itself.
             finish_reason = (response.metadata or {}).get("finish_reason", "")
             if (
                 response.success
@@ -230,8 +249,9 @@ class Dispatcher:
                     "AI_PROVIDER_EMPTY_RESPONSE_RETRY id=%s provider=%s",
                     rid or "-", response.provider_name or provider_name,
                 )
+                retry_messages = self._append_action_nudge(messages)
                 retry_response: ProviderResponse = await self._provider_manager.chat(
-                    messages, **chat_kwargs
+                    retry_messages, **chat_kwargs
                 )
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
                     retry_meta = dict(retry_response.metadata or {})
@@ -254,6 +274,53 @@ class Dispatcher:
         if response.success and not response.tool_calls:
             response = self._apply_structured_action(response, request, rid)
             structured_action = bool(response.tool_calls)
+
+            # Recovery: the model returned prose that neither the deterministic
+            # command parser nor the JSON action parser resolved into an action.
+            # Exactly ONE bounded retry asks the model to emit a structured
+            # action. No tool has run yet, so a destructive save/delete can
+            # never double-execute. If the retry still yields prose, the
+            # original prose is kept as the conversational answer.
+            if (
+                not structured_action
+                and not response.metadata.get("ai_action")
+                and response.text
+            ):
+                logger.info(
+                    "AI_ACTION_RECOVERY_RETRY id=%s provider=%s",
+                    rid or "-", response.provider_name or provider_name,
+                )
+                try:
+                    recovery_messages = self._append_action_nudge(messages)
+                    recovery_response: ProviderResponse = await self._provider_manager.chat(
+                        recovery_messages, **chat_kwargs
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "AI_ACTION_RECOVERY_RETRY_FAILED id=%s error=%s", rid or "-", exc
+                    )
+                    recovery_response = ProviderResponse(
+                        text="", provider_name=provider_name, success=False,
+                        metadata={"failure_type": "network"},
+                    )
+
+                if recovery_response.success and recovery_response.tool_calls:
+                    # Native tool call from the recovery response — use it
+                    # directly (the nudge produced the structured output).
+                    response = recovery_response
+                    structured_action = True
+                    logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                elif recovery_response.success and recovery_response.text:
+                    candidate = self._apply_structured_action(recovery_response, request, rid)
+                    if candidate.tool_calls:
+                        response = candidate
+                        structured_action = True
+                        logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
+                    elif candidate.metadata.get("ai_action"):
+                        # A clarify/invalid/unsupported action is a real
+                        # deterministic outcome — prefer it over raw prose.
+                        response = candidate
+
             if response.metadata.get("ai_action"):
                 metadata["ai_action"] = {
                     "action": response.metadata.get("ai_action"),
@@ -642,6 +709,17 @@ class Dispatcher:
                 media = " 📎" if m.get("has_media") else ""
                 lines.append(f"[{m.get('id')}] {sender}: (no text){media}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _append_action_nudge(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return ``messages`` with a format-enforcement user turn appended.
+
+        Used by the bounded recovery retries (empty response and prose-with-no-
+        action). The nudge asks for a structured tool call / JSON action but
+        never bypasses validation — whatever the model returns is still parsed
+        and validated locally before any tool executes.
+        """
+        return list(messages) + [{"role": "user", "content": _ENFORCE_ACTION_NUDGE}]
 
     def _build_tool_definitions(self) -> list[dict[str, Any]]:
         """Build native OpenAI-format tool definitions from the registry.

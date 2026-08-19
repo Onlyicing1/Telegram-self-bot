@@ -504,8 +504,8 @@ locally before any execution:
 
 ```json
 {"action": "save" | "deep_save" | "save_link" | "delete_messages"
-          | "list_saved_items" | "search_saved_items" | "database_stats"
-          | "bio_status" | "username_status",
+          | "list_saved_items" | "search_saved_items" | "list_recent_messages"
+          | "database_stats" | "bio_status" | "username_status",
  "target": "replied_message" | "current_message" | "last_message" | "recent_messages" | "message_id",
  "count": 1..500,
  "link": "https://t.me/...",
@@ -600,12 +600,24 @@ For `list_recent_messages`, the real chat retrieval is logged as
   with no text and no tool call) is retried exactly **once** before being
   classified. This retry happens before any tool executes, so a
   destructive save/delete can never run twice from the same request.
+- When the provider returns **prose** with no resolvable action (no tool
+  call, no JSON, and no deterministic command match), exactly **one**
+  bounded recovery retry re-asks the model to emit a structured tool
+  call / JSON action. No tool has executed yet, so a destructive
+  save/delete can never double-run. If the recovery still yields prose,
+  the original conversational answer is kept (the format-enforcement
+  nudge is never surfaced to the user).
 - Provider failures are classified: `429` → cooldown (honoring
   `Retry-After`), `401/403` → disabled until config changes, `5xx` /
-  network / timeout → one bounded retry then cooldown, and
-  `404`/invalid model → surfaced as a deterministic config error without
-  cooldown or infinite retry. Cooldown expires on a monotonic clock, so a
-  provider is never permanently stuck in `cooling_down`.
+  network / timeout → one bounded retry (after a short backoff) then
+  cooldown, and `404`/invalid model → surfaced as a deterministic config
+  error without cooldown or infinite retry. Cooldown expires on a
+  monotonic clock, so a provider is never permanently stuck in
+  `cooling_down`.
+- `model_not_found` is surfaced with the provider's actual detail (the
+  rejected model is identifiable in the message) instead of a generic
+  "model not found" string, and the failure is logged with the selected
+  provider + model so misconfiguration is diagnosable.
 - Concurrency is bounded (default 4; override with
   `AI_MAX_CONCURRENCY`). Requests beyond the limit fail cleanly rather
   than piling up.

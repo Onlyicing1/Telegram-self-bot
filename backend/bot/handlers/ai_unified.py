@@ -206,8 +206,11 @@ def _humanize_error(error: str) -> str:
         return "The AI provider is temporarily cooling down. Please try again shortly."
     if "timeout" in error_lower or "timed out" in error_lower:
         return "Request timed out. The provider took too long to respond."
-    if "404" in error_lower or "not found" in error_lower or "model" in error_lower:
-        return "Model not found. Check your model selection."
+    if "model not found" in error_lower or "404" in error_lower or "not found" in error_lower:
+        # Surface the provider's actual detail so an invalid model can be
+        # identified, instead of collapsing it to a generic message.
+        detail = error[:240].strip() or "unknown model"
+        return f"Model not found. Check your model selection. ({detail})"
     if "connection" in error_lower or "network" in error_lower or "dns" in error_lower:
         return "Provider unavailable. Network error reaching the API."
     return error[:200] if error else "Unknown error."
@@ -472,6 +475,10 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 model=result.model,
             )
         elif result.errors:
+            logger.info(
+                "AI_PROVIDER_FAILURE id=%s provider=%s model=%s",
+                rid, result.provider, result.model,
+            )
             error_msg = _humanize_error(result.errors[0])
             final_text = _format_error(display_prompt, trigger_label, error_msg)
             try:

@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _PROVIDER_RPC_TIMEOUT = 30.0
 _MAX_RETRIES = 1
+_RETRY_BACKOFF_SECONDS = 1.0
 _DEFAULT_CONCURRENCY = 4
 _PROVIDER_CONCURRENCY: dict[str, int] = {"zai": 2}
 
@@ -399,14 +400,21 @@ class ProviderManager:
                 return response
 
             ftype = self._failure_type(response)
+            logger.warning(
+                "provider-attempt: '%s' failed category=%s retryable=%s",
+                name, ftype, ftype in RETRYABLE_FAILURES,
+            )
             if ftype not in RETRYABLE_FAILURES:
                 self._apply_failure(name, ftype, response)
                 return response
 
-            # ONE immediate retry for transient/network/server errors.
+            # ONE bounded retry for transient/network/server errors, after a
+            # short backoff so a burst cannot hammer the upstream API.
+            await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
             retry_response = await self._call_once(provider, messages, kwargs)
             if retry_response.success:
                 self._health.mark_healthy(name)
+                logger.info("provider-attempt: '%s' recovered on retry", name)
                 return self._with_retry_metadata(retry_response, 1)
 
             self._apply_failure(name, self._failure_type(retry_response), retry_response)

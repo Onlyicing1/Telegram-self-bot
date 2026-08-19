@@ -34,6 +34,7 @@ ACTION_NAMES = frozenset({
     "delete_messages",
     "list_saved_items",
     "search_saved_items",
+    "list_recent_messages",
     "database_stats",
     "bio_status",
     "username_status",
@@ -50,16 +51,19 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "delete_messages",
     "list_saved_items",
     "search_saved_items",
+    "list_recent_messages",
     "database_stats",
     "bio_status",
     "username_status",
 })
 
-# Read-only status/query actions: no target/count — the mapped tool reads the
-# owner's own saved-items DB or profile-engine state.
+# Read-only status/query actions: no target — the mapped tool reads the
+# owner's own saved-items DB, profile-engine state, or REAL Telegram chat
+# history. ``list_recent_messages`` additionally accepts an optional limit.
 _STATUS_ACTIONS = frozenset({
     "list_saved_items",
     "search_saved_items",
+    "list_recent_messages",
     "database_stats",
     "bio_status",
     "username_status",
@@ -211,7 +215,8 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         return ActionParseResult(kind=KIND_UNSUPPORTED, action=action)
 
     # Read-only status/query actions map directly to an existing tool. They
-    # take no target/count; ``search_saved_items`` requires a query.
+    # take no target; ``search_saved_items`` requires a query and
+    # ``list_recent_messages`` accepts an optional limit.
     if action in _STATUS_ACTIONS:
         if action == "search_saved_items":
             query = raw.get("query")
@@ -221,6 +226,16 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                     error="Missing 'query' field.",
                 )
             return ActionParseResult(kind=KIND_EXECUTABLE, action=action, query=query.strip())
+        if action == "list_recent_messages":
+            count: int | None = None
+            if "count" in raw:
+                count = coerce_int(raw.get("count"))
+                if count is None or count < _MIN_DELETE_COUNT or count > _MAX_DELETE_COUNT:
+                    return ActionParseResult(
+                        kind=KIND_INVALID,
+                        error=f"Invalid count: {raw.get('count')!r} (must be 1-{_MAX_DELETE_COUNT}).",
+                    )
+            return ActionParseResult(kind=KIND_EXECUTABLE, action=action, count=count)
         return ActionParseResult(kind=KIND_EXECUTABLE, action=action)
 
     # Save-by-link: the link is the target. The URL is preserved verbatim and
@@ -339,6 +354,10 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
 
     if action == "search_saved_items":
         return [{"name": "search", "arguments": {"query": result.query}}]
+
+    if action == "list_recent_messages":
+        args: dict[str, Any] = {"limit": result.count} if result.count else {}
+        return [{"name": "list_recent_messages", "arguments": args}]
 
     if action == "database_stats":
         return [{"name": "database_stats", "arguments": {}}]
