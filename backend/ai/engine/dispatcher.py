@@ -678,10 +678,25 @@ class Dispatcher:
 
         # Destructive delete is fast-pathed ONLY when the target is
         # unambiguous and deterministic: an explicit message ID, an explicit
-        # multi-message count, or a replied-to message. A bare "last/recent"
-        # (count==1 derived from "اخیر") is ambiguous with semantic deletion
-        # and must stay on the AI path.
+        # multi-message count, the replied-to message, or the explicit last
+        # message ("آخرین پیامم رو پاک کن"). Semantic deletes ("مربوط به X",
+        # "دعوای اخیر") never resolve to last_message here — the deterministic
+        # parser yields them to the AI (see _is_semantic_delete in actions.py).
         if result.action == "delete_messages":
+            logger.info(
+                "DELETE_INTENT request_id=%s target=%s count=%s",
+                rid or "-", result.target or "none",
+                result.count if result.count is not None else "-",
+            )
+            logger.info(
+                "DELETE_ACTION_RESOLVED request_id=%s action=delete_messages tools=%s",
+                rid or "-", [tc.get("name") for tc in result.tool_calls],
+            )
+            logger.info(
+                "DELETE_TARGET_RESOLVED request_id=%s target=%s count=%s",
+                rid or "-", result.target or "none",
+                result.count if result.count is not None else "-",
+            )
             safe_delete = (
                 result.target in ("message_id", "replied_message", "current_message")
                 or (
@@ -689,6 +704,7 @@ class Dispatcher:
                     and result.count is not None
                     and result.count >= 2
                 )
+                or (result.target == "last_message" and result.count == 1)
             )
             if not safe_delete:
                 logger.info(

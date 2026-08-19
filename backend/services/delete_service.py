@@ -87,12 +87,17 @@ async def delete_verified_self_messages(
             fetched = await client.get_messages(chat_id, ids=part)
         except Exception as exc:
             logger.warning(
-                "delete_verified_self_messages: fetch failed chat=%s ids=%s: %s",
+                "DELETE_OWNERSHIP_CHECK chat_id=%s ids=%s result=rejected "
+                "reason=fetch_failed error=%s",
                 chat_id, part, exc,
             )
             rejected.extend(part)
             continue
         if fetched is None:
+            logger.warning(
+                "DELETE_OWNERSHIP_CHECK chat_id=%s ids=%s result=rejected reason=fetch_empty",
+                chat_id, part,
+            )
             rejected.extend(part)
             continue
         if not isinstance(fetched, list):
@@ -104,17 +109,51 @@ async def delete_verified_self_messages(
             mid = getattr(msg, "id", None)
             if mid is not None:
                 by_id[mid] = msg
+        chunk_verified = 0
+        chunk_rejected = 0
         for mid in part:
             if _is_self_owned(by_id.get(mid), me_id):
                 verified.append(mid)
+                chunk_verified += 1
             else:
                 rejected.append(mid)
+                chunk_rejected += 1
+        logger.info(
+            "DELETE_OWNERSHIP_CHECK chat_id=%s ids=%s verified=%d rejected=%d "
+            "me_id_resolved=%s",
+            chat_id, part, chunk_verified, chunk_rejected,
+            "yes" if me_id is not None else "no",
+        )
 
     deleted: list[int] = []
+    delete_errors: list[str] = []
     for start in range(0, len(verified), chunk):
         batch = verified[start:start + chunk]
-        await client.delete_messages(chat_id, batch)
-        deleted.extend(batch)
+        logger.info(
+            "DELETE_EXECUTION_START chat_id=%s batch_size=%d ids=%s",
+            chat_id, len(batch), batch,
+        )
+        try:
+            await client.delete_messages(chat_id, batch)
+            deleted.extend(batch)
+        except Exception as exc:
+            delete_errors.append(str(exc))
+            logger.error(
+                "DELETE_EXECUTION_ERROR chat_id=%s ids=%s error=%s",
+                chat_id, batch, exc,
+            )
+            rejected.extend(batch)
+    logger.info(
+        "DELETE_EXECUTION_END chat_id=%s deleted=%d rejected=%d",
+        chat_id, len(deleted), len(rejected),
+    )
+    if delete_errors:
+        # Transport failures propagate so callers stay honest — but the loop
+        # above already attempted every verified batch, so one bad batch can
+        # never silently block the rest of the deletion.
+        raise RuntimeError(
+            "Telegram delete failed for some messages: " + "; ".join(delete_errors)
+        )
     return deleted, rejected
 
 

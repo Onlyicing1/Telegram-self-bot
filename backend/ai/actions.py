@@ -477,6 +477,18 @@ _EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
 
 _THIS_TOKENS = frozenset({"این", "اینو", "اینم", "همین", "همینو", "this", "that", "it"})
 _LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "اخیر", "last", "latest", "recent"})
+# Semantic delete qualifiers: a delete request that references a topic or
+# context ("پیام‌های مربوط به دعوای اخیر رو پاک کن", "delete messages about
+# X") is a SEMANTIC request for the AI — the deterministic parser must never
+# collapse it into "delete the last message" (count=1). Only scope-free
+# positional deletes (this / last / last-N / explicit ID) are deterministic.
+_SEMANTIC_DELETE_WORDS = frozenset({
+    "مربوط", "درباره", "دربارش", "راجع", "راجب",
+    "دعوا", "بحث", "موضوع", "موضوعات",
+    "about", "regarding", "related", "argument", "topic", "subject",
+    "discussion", "conversation",
+})
+_SEMANTIC_DELETE_STEMS = ("مربوط", "دعوا", "بحث", "موضوع")
 _DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
 _MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
 _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
@@ -657,6 +669,22 @@ def _has_save_mention(words: list[str]) -> bool:
         w.startswith("سیو") or w.startswith("ذخیره") or w.startswith("ذخیر")
         for w in words
     )
+
+
+def _is_semantic_delete(words: list[str]) -> bool:
+    """True when a delete request references a topic/context (semantic).
+
+    "مربوط به X", "دعوای اخیر", "بحث‌ها", "موضوعات" and their English
+    equivalents make the request semantic: the AI must resolve WHICH messages
+    to delete from the conversation. The deterministic parser only owns
+    scope-free positional deletes and must yield to the AI here.
+    """
+    for w in words:
+        if w in _SEMANTIC_DELETE_WORDS:
+            return True
+        if any(w.startswith(stem) for stem in _SEMANTIC_DELETE_STEMS):
+            return True
+    return False
 
 
 def _en_list_saved(words: list[str]) -> bool:
@@ -846,6 +874,13 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         )
 
     if do_delete:
+        # Semantic deletes must reach the AI, never the deterministic
+        # parser: "پیام‌های مربوط به دعوای اخیر رو پاک کن" would otherwise be
+        # collapsed into "delete the last message" (count=1), overriding the
+        # model's own semantic resolution and deleting the wrong message.
+        if _is_semantic_delete(words):
+            return ActionParseResult(kind=KIND_CONVERSATIONAL)
+
         # Explicit message-ID target: "پیام با ID 123 رو پاک کن".
         message_id = _extract_message_id(words)
         if message_id is not None:
