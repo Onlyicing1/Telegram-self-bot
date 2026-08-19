@@ -46,15 +46,38 @@ QUARANTINE_SECONDS = 600.0
 
 #: Per-failure-category cooldown penalties. ``rate_limited`` is resolved from
 #: the provider's retry-after by the caller; ``request``/``model_not_found``
-#: are permanent config errors and are never cooled down (see the manager).
+#: are permanent config errors and are never cooled down (see the manager);
+#: ``empty_response``/``structured_output`` are request-level quality signals
+#: handled by the router's failover path (no cooldown on a single occurrence).
 FAILURE_PENALTIES: dict[str, float] = {
     "timeout": 30.0,
     "server": 60.0,
     "network": 60.0,
     "malformed": 120.0,
     "quality": 120.0,
+    "empty_response": 30.0,
+    "structured_output": 120.0,
+    "tool_call": 60.0,
     "unknown": 60.0,
 }
+
+#: Canonical normalized failure categories. Provider-specific error strings
+#: (HTTP status, provider error codes, vendor messages) never travel past
+#: this layer — the rest of LifeOS reasons about these categories only.
+FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    "auth",              # 401/403 — disabled until configuration changes
+    "rate_limited",      # 429 / quota — cooldown, honor Retry-After
+    "model_not_found",   # 404 dead/retired model — (provider, model) unavailable
+    "timeout",           # request timeout — retry once, then fail over
+    "network",           # connection/reset — retry once, then fail over
+    "server",            # 5xx — bounded retry, then fail over
+    "request",           # 4xx invalid request — deterministic repair or fail over
+    "tool_call",         # provider emitted an unusable tool call
+    "structured_output", # malformed structured output / all-malformed tool calls
+    "empty_response",    # success with no text and no tool call
+    "malformed",         # unparsable provider response body
+    "unknown",           # anything unclassified
+})
 
 
 class ProviderHealthState:

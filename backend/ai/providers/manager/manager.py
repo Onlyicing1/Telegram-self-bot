@@ -141,17 +141,41 @@ class ProviderManager:
         # reliability × availability × latency). Deterministic and stable.
         eligible.sort(key=lambda item: (item[1] != first, -item[0]))
 
-        for score, name, provider in eligible:
-            logger.info("ROUTER_SELECTED provider=%s score=%.3f", name, score)
+        for idx, (score, name, provider) in enumerate(eligible):
+            model = self._effective_model(provider) or "-"
+            logger.info("ROUTER_SELECTED provider=%s model=%s score=%.3f", name, model, score)
             response = await self._attempt_with_retry(provider, messages, kwargs)
             if response.success:
+                # A semantically-empty or all-malformed "success" is not a
+                # usable execution answer. When another eligible provider is
+                # healthy, fail over to it for THIS request — bounded and
+                # deterministic, and nothing has executed yet (no tool has
+                # run), so a destructive action can never double-run. The
+                # provider is NOT cooled down: an empty/stalled model output
+                # is a request-level quality signal, penalized via the
+                # quality metrics; a single provider keeps the dispatcher's
+                # own bounded nudge-retry as its recovery path.
+                no_output = self._has_no_usable_output(response)
+                if no_output and idx + 1 < len(eligible):
+                    category = "STRUCTURED_OUTPUT" if (response.tool_calls or []) else "EMPTY_RESPONSE"
+                    matrix.append({"provider": name, "outcome": category.lower(), "score": round(score, 3)})
+                    logger.info(
+                        "AI_PROVIDER_FAILURE provider=%s model=%s category=%s failover=1",
+                        name, model, category,
+                    )
+                    continue
                 matrix.append({"provider": name, "outcome": "success", "score": round(score, 3)})
                 if name != first:
                     meta = dict(response.metadata or {})
                     meta["fallback"] = True
                     meta["fallback_from"] = first or None
                     meta["fallback_to"] = name
-                    logger.info("PROVIDER_FALLBACK from=%s to=%s", first or "-", name)
+                    from_provider = self._registry.get(first) if first else None
+                    from_model = self._effective_model(from_provider) if from_provider is not None else "-"
+                    logger.info(
+                        "AI_PROVIDER_FAILOVER from=%s/%s to=%s/%s",
+                        first or "-", from_model, name, model,
+                    )
                     response = replace(response, metadata=meta)
                 meta = dict(response.metadata or {})
                 meta["provider_matrix"] = matrix
@@ -502,7 +526,9 @@ class ProviderManager:
         advances to the next candidate.
         """
         name = self._safe_provider_name(provider)
+        model = self._effective_model(provider) or "-"
         async with self._health.acquire(name):
+            logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, model)
             response = await self._call_once(provider, messages, kwargs)
             if response.success:
                 self._health.record_success(name)
@@ -511,8 +537,8 @@ class ProviderManager:
 
             ftype = self._failure_type(response)
             logger.warning(
-                "provider-attempt: '%s' failed category=%s retryable=%s",
-                name, ftype, ftype in RETRYABLE_FAILURES,
+                "AI_PROVIDER_FAILURE provider=%s model=%s category=%s retryable=%s",
+                name, model, ftype, ftype in RETRYABLE_FAILURES,
             )
             if ftype not in RETRYABLE_FAILURES:
                 self._apply_failure(name, ftype, response)
@@ -521,11 +547,15 @@ class ProviderManager:
             # ONE bounded retry for transient/network/server errors, after a
             # short backoff so a burst cannot hammer the upstream API.
             await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+            logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2", name, model)
             retry_response = await self._call_once(provider, messages, kwargs)
             if retry_response.success:
                 self._health.record_success(name)
                 self._note_response_quality(name, retry_response, kwargs)
-                logger.info("provider-attempt: '%s' recovered on retry", name)
+                logger.info(
+                    "AI_PROVIDER_FAILURE provider=%s model=%s category=TRANSIENT_RECOVERED",
+                    name, model,
+                )
                 return self._with_retry_metadata(retry_response, 1)
 
             self._apply_failure(name, self._failure_type(retry_response), retry_response)
@@ -548,6 +578,22 @@ class ProviderManager:
         if isinstance(status, int) and 400 <= status < 500:
             return "request"
         return meta.get("error_type") or "unknown"
+
+    @staticmethod
+    def _has_no_usable_output(response: ProviderResponse) -> bool:
+        """True when a "successful" response carries no usable execution output.
+
+        Covers an empty response (no text, no tool call) and a response
+        whose tool calls are ALL malformed (unparsable arguments). Both are
+        structured-output failures — never a usable answer for the
+        execution layer.
+        """
+        if response.text:
+            return False
+        calls = response.tool_calls or []
+        if not calls:
+            return True
+        return all(bool(c.get("malformed_arguments")) for c in calls)
 
     def _apply_failure(self, name: str, ftype: str, response: ProviderResponse) -> None:
         meta = response.metadata or {}
@@ -597,10 +643,15 @@ class ProviderManager:
         """
         if not kwargs.get("tools"):
             return
-        ok = bool(response.text or response.tool_calls)
+        ok = bool(response.text or any(
+            not c.get("malformed_arguments") for c in (response.tool_calls or [])
+        ))
         self._metrics.record_quality(name, ok)
         if not ok:
-            logger.info("PROVIDER_RESPONSE_INVALID provider=%s reason=empty_with_tools", name)
+            logger.info(
+                "PROVIDER_RESPONSE_INVALID provider=%s reason=empty_or_malformed_with_tools",
+                name,
+            )
 
     @staticmethod
     def _with_retry_metadata(response: ProviderResponse, retry_count: int) -> ProviderResponse:

@@ -759,6 +759,19 @@ choice) is always preferred when healthy.
   that fail repeatedly, and each request records a **failure matrix**
   (`provider_matrix`) showing why every candidate was skipped, failed,
   or succeeded — without exposing secrets.
+- Provider errors are **normalized** into internal categories
+  (`auth`, `rate_limited`, `model_not_found`, `timeout`, `network`,
+  `server`, `request`, `tool_call`, `structured_output`,
+  `empty_response`, `malformed`, `unknown`) — provider-specific strings
+  never leak past the router or into Telegram.
+- A "successful" response with **no usable output** (empty text AND no
+  tool call, or a response whose tool calls are all malformed) is a
+  request-level failover trigger: when another eligible provider is
+  healthy, the SAME request is resent there. The empty provider is NOT
+  cooled down (a stalled model is a quality signal, not a health
+  failure) — a single-provider setup keeps the dispatcher's bounded
+  nudge-retry as its recovery path. Failover never re-executes anything:
+  no tool has run when the router decides.
 
 ### Execution Boundary
 
@@ -863,18 +876,31 @@ next request (recovery probe)
   clarification response, **not** a failure — the system never fails over
   to another provider to manufacture destructive intent.
 - **Response quality** is scored separately from HTTP success: a `200`
-  with no text and no tool call while tools were requested lowers the
-  provider's reliability score (the same `action=none` signal seen
-  downstream) without cooling it down on a single occurrence.
+  with no text and no tool call — or with only malformed tool calls —
+  while tools were requested lowers the provider's reliability score
+  (the same `action=none` signal seen downstream) without cooling it
+  down on a single occurrence.
+- **Model granularity**: a `model_not_found`/retired-model failure marks
+  exactly that `(provider, model)` pair unavailable (TTL-based), never
+  the whole provider — other models on the same provider stay eligible.
+- **Failover is deterministic and safe**: the active provider is always
+  tried first while healthy; fallback resends the IDENTICAL message list
+  (Persian intent, chat/reply context, tools), and every provider
+  response still passes the local action validator + ToolExecutor
+  allowlist — a provider can never bypass validation or execute an
+  unregistered tool.
 
 Cooldown uses `time.monotonic()`. Concurrency is bounded per provider
 (default 4; Z.ai is capped at 2). Provider HTTP requests are individually
 bounded via the existing watchdog (`guarded_await`).
 
-The router emits deterministic logs — `ROUTER_SCORE`, `ROUTER_SELECTED`,
-`PROVIDER_SKIPPED`, `PROVIDER_FALLBACK`, `PROVIDER_COOLDOWN`,
-`PROVIDER_QUARANTINED`, `PROVIDER_RECOVERED` — so a routing decision can
-be diagnosed end-to-end without logging credentials or secrets.
+The router emits deterministic logs — `AI_PROVIDER_ATTEMPT`
+(provider, model, attempt), `AI_PROVIDER_FAILURE` (normalized category),
+`AI_PROVIDER_FAILOVER` (from provider/model to provider/model),
+`ROUTER_SCORE`, `ROUTER_SELECTED`, `PROVIDER_SKIPPED`,
+`PROVIDER_COOLDOWN`, `PROVIDER_QUARANTINED`, `PROVIDER_RECOVERED` — so a
+routing decision can be diagnosed end-to-end (request → attempt →
+category → failover → outcome) without logging credentials or secrets.
 
 ### Configuration
 
