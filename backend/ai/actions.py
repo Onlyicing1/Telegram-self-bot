@@ -17,10 +17,11 @@ executor, no direct Telegram access.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from backend.ai.persian import coerce_int
+from backend.ai.persian import coerce_int, normalize_digits
 
 # ── Action vocabulary ──
 
@@ -276,3 +277,198 @@ def parse_action_text(text: str) -> ActionParseResult:
             tool_calls=tool_calls,
         )
     return result
+
+
+# ── Deterministic command intent (Persian/English) ──
+#
+# Safety net for when a provider returns prose instead of a structured action.
+# It recognizes the narrow, high-confidence command vocabulary (save / deep
+# save / delete N) directly from the ORIGINAL user message and resolves targets
+# from the reply context — never from the model's prose. Only deterministic,
+# high-confidence matches are produced; everything else stays conversational.
+
+_DELETE_STEMS = ("پاک", "حذف")
+_SAVE_STEMS = ("سیو", "ذخیره", "ذخیر")
+_SEND_STEMS = ("بفرست", "ارسال", "فوروارد")
+
+_IMPERATIVE_SUFFIXES = frozenset({"کن", "کنی", "کنید", "کنین"})
+
+_EN_DELETE = frozenset({"delete", "remove", "deleting", "removing", "deleted", "removed"})
+_EN_SAVE = frozenset({"save", "saving", "saved", "store", "storing"})
+_EN_SEND = frozenset({"send", "sending", "forward", "forwarding"})
+_EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
+
+_THIS_TOKENS = frozenset({"این", "اینو", "اینم", "همین", "همینو", "this", "that", "it"})
+_LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "last", "latest", "recent"})
+_DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
+_MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
+_COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase, normalize digits, and split Persian/English into word tokens."""
+    s = normalize_digits(text)
+    s = s.replace("\u200c", " ").replace("\u200b", " ")
+    s = s.replace("'", "").replace("’", "")
+    s = s.lower()
+    return [t for t in re.findall(r"[a-z0-9\u0600-\u06ff]+", s) if t]
+
+
+def _is_stem_token(tok: str, stems: tuple[str, ...]) -> bool:
+    """True when *tok* is a verb stem, optionally with an attached -sh clitic."""
+    for stem in stems:
+        if tok == stem:
+            return True
+        if tok.startswith(stem + "ش"):
+            return True
+    return False
+
+
+def _imperative_present(words: list[str], stems: tuple[str, ...]) -> bool:
+    """True when a Persian imperative (stem + کن/کنی/کنید) is present."""
+    for i, tok in enumerate(words):
+        if _is_stem_token(tok, stems):
+            if i + 1 < len(words) and words[i + 1] in _IMPERATIVE_SUFFIXES:
+                return True
+    return False
+
+
+def _negated_present(words: list[str], stems: tuple[str, ...]) -> bool:
+    """True when a Persian imperative is negated (stem + نکن...)."""
+    for i, tok in enumerate(words):
+        if _is_stem_token(tok, stems):
+            if i + 1 < len(words) and words[i + 1].startswith("نکن"):
+                return True
+    return False
+
+
+def _english_action(words: list[str], verbs: frozenset[str]) -> tuple[bool, bool]:
+    """Return (present, negated) for an English verb token."""
+    for i, tok in enumerate(words):
+        if tok in verbs:
+            negated = any(words[j] in _EN_NEGATION for j in range(max(0, i - 2), i))
+            return True, negated
+    return False, False
+
+
+def _extract_count(words: list[str]) -> int | None:
+    """Extract a 1..500 count near a message/last word (Persian digits normalized)."""
+    for i, tok in enumerate(words):
+        if tok.isdigit():
+            n = int(tok)
+            if 1 <= n <= _MAX_DELETE_COUNT:
+                window = words[max(0, i - 2):i + 3]
+                if any(w in _COUNT_CONTEXT for w in window):
+                    return n
+    return None
+
+
+def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
+    """Deterministically parse a Persian/English executable command.
+
+    Called when the model returned prose (no structured action). It never
+    trusts the model's prose: it reads the original user message and resolves
+    the target from the reply context. Only the narrow command vocabulary is
+    recognized — everything else is conversational.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ActionParseResult(kind=KIND_CONVERSATIONAL)
+
+    words = _tokenize(text)
+    if not words:
+        return ActionParseResult(kind=KIND_CONVERSATIONAL)
+
+    is_deep = any(w in _DEEP_TOKENS for w in words)
+    is_this = any(w in _THIS_TOKENS for w in words)
+    is_last = any(w in _LAST_TOKENS for w in words)
+    has_message_word = any(w in _MESSAGE_TOKENS for w in words)
+    count = _extract_count(words)
+
+    delete_pos = _imperative_present(words, _DELETE_STEMS)
+    delete_neg = _negated_present(words, _DELETE_STEMS)
+    save_pos = _imperative_present(words, _SAVE_STEMS)
+    save_neg = _negated_present(words, _SAVE_STEMS)
+    send_pos = _imperative_present(words, _SEND_STEMS) or any(
+        _is_stem_token(w, _SEND_STEMS) for w in words
+    )
+
+    en_delete, en_delete_neg = _english_action(words, _EN_DELETE)
+    en_save, en_save_neg = _english_action(words, _EN_SAVE)
+    en_send, _ = _english_action(words, _EN_SEND)
+
+    # A bare English verb with no target/count/reply is likely a question
+    # ("what does save mean?") rather than a command.
+    en_has_target = has_reply or is_this or is_last or count is not None or has_message_word
+    if not en_has_target:
+        en_delete = en_save = en_send = False
+
+    if en_delete:
+        delete_pos, delete_neg = True, en_delete_neg
+    if en_save:
+        save_pos, save_neg = True, en_save_neg
+    if en_send:
+        send_pos = True
+
+    do_delete = delete_pos and not delete_neg
+    do_save = save_pos and not save_neg
+
+    # Send is recognized but deliberately has no executor wired.
+    if send_pos and not do_delete and not do_save:
+        return ActionParseResult(kind=KIND_UNSUPPORTED, action="send")
+
+    if do_delete and do_save:
+        return ActionParseResult(
+            kind=KIND_CLARIFY,
+            reason="Do you want me to save or delete?",
+        )
+
+    if do_save:
+        action = "deep_save" if is_deep else "save"
+        if has_reply:
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action=action,
+                target="replied_message",
+                tool_calls=[{"name": "save", "arguments": {}}],
+            )
+        return ActionParseResult(
+            kind=KIND_CLARIFY,
+            action=action,
+            reason="Reply to the message you want me to save, then I can save it.",
+        )
+
+    if do_delete:
+        if is_last or count is not None:
+            n = count or 1
+            target = "last_message" if (is_last and n == 1) else "recent_messages"
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target=target,
+                count=n,
+                tool_calls=[{"name": "delete", "arguments": {"count": n}}],
+            )
+        if is_this:
+            if has_reply:
+                return ActionParseResult(
+                    kind=KIND_EXECUTABLE,
+                    action="delete_messages",
+                    target="replied_message",
+                    count=1,
+                    tool_calls=[{"name": "delete_replied", "arguments": {}}],
+                )
+            return ActionParseResult(
+                kind=KIND_CLARIFY,
+                action="delete_messages",
+                reason=(
+                    "Reply to the message you want me to delete, or tell me "
+                    "how many of your last messages to delete."
+                ),
+            )
+        return ActionParseResult(
+            kind=KIND_CLARIFY,
+            action="delete_messages",
+            reason="Which message(s) should I delete?",
+        )
+
+    return ActionParseResult(kind=KIND_CONVERSATIONAL)

@@ -472,10 +472,24 @@ are preserved verbatim.
 
 ### Structured Action Contract
 
-The AI model is an intent interpreter — never the executor. Its output
-(either a native tool call, or a JSON action object in the text response)
-is normalized into a strict, typed action schema and validated locally
-before any execution:
+The AI model is an intent interpreter — never the executor. Executable
+intent is resolved deterministically before the model's prose is ever
+trusted:
+
+1. Native tool call from the provider (when the model emits one).
+2. Deterministic command parser
+   (`backend/ai/actions.py:parse_command_intent`) over the ORIGINAL user
+   message — the authoritative path for the save / deep-save / delete
+   vocabulary (Persian + English, incl. negation and Persian digits).
+3. JSON action object embedded in the model's text response (secondary
+   fallback for cases the deterministic vocabulary does not cover).
+
+This is why a model reply like "which message?" no longer turns a clear
+command into a no-op: when the provider returns prose, the system reads
+"اینو پاک کن" / "delete last 3" directly and executes the matching tool.
+
+Every path is normalized into a strict, typed action schema and validated
+locally before any execution:
 
 ```json
 {"action": "save" | "deep_save" | "delete_messages",
@@ -484,10 +498,10 @@ before any execution:
 ```
 
 ```
-model output
-  → parse JSON action
+user message + provider output
+  → deterministic command intent (original user message) OR JSON action
   → local validation (action / fields / count / target)
-  → target resolution (semantic target → existing tool + args)
+  → target resolution (semantic target → existing tool + args, from reply context)
   → existing ToolExecutor → service → Telegram
   → real result → response
 ```

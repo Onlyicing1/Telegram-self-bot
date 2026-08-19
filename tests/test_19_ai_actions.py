@@ -15,6 +15,7 @@ from backend.ai.actions import (
     KIND_INVALID,
     KIND_UNSUPPORTED,
     parse_action_text,
+    parse_command_intent,
 )
 
 
@@ -201,6 +202,7 @@ async def test_dispatcher_executes_structured_action():
 
 @pytest.mark.asyncio
 async def test_dispatcher_reports_executor_failure_no_false_success():
+    from backend.ai.conversation.context_builder import ReplyContext
     from backend.ai.providers.base.contract import ProviderResponse
     from backend.ai.session.request import AIRequest
     from backend.ai.tools.executor import ToolExecutionResult
@@ -225,6 +227,7 @@ async def test_dispatcher_reports_executor_failure_no_false_success():
 
     result = await d.dispatch(AIRequest(
         session_id="s1", message_id=1, owner_id=123, user_message="save this", chat_id=456,
+        reply_context=ReplyContext(exists=True, message_id=789, chat_id=456, sender_id=123),
     ))
 
     # The pipeline did not crash, and it did NOT claim success.
@@ -280,3 +283,238 @@ async def test_dispatcher_conversational_is_unchanged():
 
     assert result.response == "What's the weather like?"
     mock_te.execute_calls.assert_not_called()
+
+
+# ── Deterministic command intent (model-prose safety net) ──
+
+
+def test_deterministic_persian_save():
+    r = parse_command_intent("این پیام رو سیو کن", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "save"
+    assert r.tool_calls == [{"name": "save", "arguments": {}}]
+
+
+def test_deterministic_persian_deep_save():
+    r = parse_command_intent("اینو عمیق ذخیره کن", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "deep_save"
+    assert r.tool_calls == [{"name": "save", "arguments": {}}]
+
+
+def test_deterministic_delete_replied():
+    r = parse_command_intent("این پیام رو پاک کن", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "delete_messages"
+    assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
+
+
+def test_deterministic_delete_last_message():
+    r = parse_command_intent("پیام آخر رو پاک کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 1}}]
+
+
+def test_deterministic_delete_n_persian_digits():
+    r = parse_command_intent("۱۰ پیام آخر رو پاک کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.count == 10
+    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 10}}]
+
+
+def test_deterministic_delete_n_no_last():
+    r = parse_command_intent("۳ پیام رو پاک کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 3}}]
+
+
+def test_deterministic_negation_save_not_delete():
+    r = parse_command_intent("اینو پاک نکن فقط سیوش کن", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "save"
+    assert r.tool_calls == [{"name": "save", "arguments": {}}]
+
+
+def test_deterministic_mixed_english_delete():
+    r = parse_command_intent("delete this message", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
+
+
+def test_deterministic_mixed_english_deep_save():
+    r = parse_command_intent("save this message with deep mode", has_reply=True)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "deep_save"
+    assert r.tool_calls == [{"name": "save", "arguments": {}}]
+
+
+def test_deterministic_english_delete_last_n():
+    r = parse_command_intent("delete last 10 messages", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 10}}]
+
+
+def test_deterministic_ambiguous_delete_clarifies():
+    r = parse_command_intent("پاک کن", has_reply=False)
+    assert r.kind == KIND_CLARIFY
+
+
+def test_deterministic_save_without_reply_clarifies():
+    r = parse_command_intent("اینو سیو کن", has_reply=False)
+    assert r.kind == KIND_CLARIFY
+
+
+def test_deterministic_conversational_is_not_action():
+    r = parse_command_intent("امروز چه خبر؟", has_reply=False)
+    assert r.kind == KIND_CONVERSATIONAL
+
+
+def test_deterministic_question_not_action():
+    r = parse_command_intent("what does save mean?", has_reply=False)
+    assert r.kind == KIND_CONVERSATIONAL
+
+
+def test_deterministic_send_unsupported():
+    r = parse_command_intent("اینو برای علی بفرست", has_reply=True)
+    assert r.kind == KIND_UNSUPPORTED
+    assert r.action == "send"
+
+
+def test_deterministic_negation_only_is_conversational():
+    r = parse_command_intent("اینو پاک نکن", has_reply=True)
+    assert r.kind == KIND_CONVERSATIONAL
+
+
+# ── Dispatcher: deterministic bridge turns model prose into execution ──
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_deterministic_bridge_over_model_prose():
+    from backend.ai.conversation.context_builder import ReplyContext
+    from backend.ai.providers.base.contract import ProviderResponse
+    from backend.ai.session.request import AIRequest
+    from backend.ai.tools.executor import ToolExecutionResult
+
+    mock_te = MagicMock()
+    mock_te.execute_calls = AsyncMock(return_value=[
+        ToolExecutionResult(
+            tool_name="delete_replied",
+            success=True,
+            message="Deleted the replied message.",
+            data={"count": 1},
+        ),
+    ])
+    mock_te._context = MagicMock()
+    mock_te._context.extra = {}
+    mock_te._context.telegram = None
+    mock_te._context.tz_str = "UTC"
+    mock_te._context.client = None
+
+    # The production failure: the model returns PROSE (no JSON, no tool call).
+    provider_response = ProviderResponse(
+        text="Sure! Which message would you like me to delete?",
+        provider_name="test",
+        success=True,
+        usage={},
+    )
+    d, _ = _make_dispatcher(mock_te, provider_response)
+
+    result = await d.dispatch(AIRequest(
+        session_id="s1",
+        message_id=1,
+        owner_id=123,
+        user_message="اینو پاک کن",
+        chat_id=456,
+        reply_context=ReplyContext(exists=True, message_id=789, chat_id=456, sender_id=123),
+    ))
+
+    called = mock_te.execute_calls.call_args.args[0]
+    assert called == [{"name": "delete_replied", "arguments": {}}]
+    assert "Deleted the replied message" in result.response
+    assert result.metadata.get("ai_action", {}).get("action") == "delete_messages"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_deterministic_bridge_delete_last_n():
+    from backend.ai.providers.base.contract import ProviderResponse
+    from backend.ai.session.request import AIRequest
+    from backend.ai.tools.executor import ToolExecutionResult
+
+    mock_te = MagicMock()
+    mock_te.execute_calls = AsyncMock(return_value=[
+        ToolExecutionResult(
+            tool_name="delete",
+            success=True,
+            message="Deleted 3 outgoing message(s).",
+            data={"count": 3},
+        ),
+    ])
+    mock_te._context = MagicMock()
+    mock_te._context.extra = {}
+    mock_te._context.telegram = None
+    mock_te._context.tz_str = "UTC"
+    mock_te._context.client = None
+
+    provider_response = ProviderResponse(
+        text="Please provide the message ID.",
+        provider_name="test",
+        success=True,
+        usage={},
+    )
+    d, _ = _make_dispatcher(mock_te, provider_response)
+
+    result = await d.dispatch(AIRequest(
+        session_id="s1",
+        message_id=1,
+        owner_id=123,
+        user_message="۳ پیام آخر رو پاک کن",
+        chat_id=456,
+    ))
+
+    called = mock_te.execute_calls.call_args.args[0]
+    assert called == [{"name": "delete", "arguments": {"count": 3}}]
+    assert "Deleted 3" in result.response
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_deterministic_bridge_save():
+    from backend.ai.conversation.context_builder import ReplyContext
+    from backend.ai.providers.base.contract import ProviderResponse
+    from backend.ai.session.request import AIRequest
+    from backend.ai.tools.executor import ToolExecutionResult
+
+    mock_te = MagicMock()
+    mock_te.execute_calls = AsyncMock(return_value=[
+        ToolExecutionResult(
+            tool_name="save",
+            success=True,
+            message="Saved as S0001.",
+            data={"save_code": "S0001"},
+        ),
+    ])
+    mock_te._context = MagicMock()
+    mock_te._context.extra = {}
+    mock_te._context.telegram = None
+    mock_te._context.tz_str = "UTC"
+    mock_te._context.client = None
+
+    provider_response = ProviderResponse(
+        text="Sure, I can help you save that message.",
+        provider_name="test",
+        success=True,
+        usage={},
+    )
+    d, _ = _make_dispatcher(mock_te, provider_response)
+
+    result = await d.dispatch(AIRequest(
+        session_id="s1",
+        message_id=1,
+        owner_id=123,
+        user_message="اینو سیو کن",
+        chat_id=456,
+        reply_context=ReplyContext(exists=True, message_id=789, chat_id=456, sender_id=123),
+    ))
+
+    called = mock_te.execute_calls.call_args.args[0]
+    assert called == [{"name": "save", "arguments": {}}]
+    assert "S0001" in result.response

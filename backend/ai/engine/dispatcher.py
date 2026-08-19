@@ -29,7 +29,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from backend.ai.actions import parse_action_text
+from backend.ai.actions import parse_action_text, parse_command_intent
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
@@ -218,7 +218,7 @@ class Dispatcher:
         # rejection outcomes become a deterministic text response.
         structured_action = False
         if response.success and not response.tool_calls:
-            response = self._apply_structured_action(response, rid)
+            response = self._apply_structured_action(response, request, rid)
             structured_action = bool(response.tool_calls)
             if response.metadata.get("ai_action"):
                 metadata["ai_action"] = {
@@ -483,25 +483,41 @@ class Dispatcher:
     def _apply_structured_action(
         self,
         response: ProviderResponse,
+        request: AIRequest,
         rid: str = "",
     ) -> ProviderResponse:
         """Bridge prose/JSON model output into the existing tool executor.
 
-        When the provider did not emit a native tool call, apply the
-        JSON-schema structured-output fallback: parse the text as an action
-        object, validate it locally, resolve the target into concrete tool
-        calls, and hand them to the SAME ToolExecutor. Clarification and
-        rejection outcomes become a deterministic text response — the model's
-        output is never trusted as executable code.
+        When the provider did not emit a native tool call, the deterministic
+        command parser runs FIRST over the original user message — the model's
+        prose is never trusted to decide execution or permissions. Only when
+        the deterministic parser finds nothing is the model's own JSON output
+        parsed. Either way the result is validated locally, resolved into
+        concrete tool calls for the SAME ToolExecutor, and clarification /
+        rejection outcomes become a deterministic text response.
         """
         text = (response.text or "").strip()
         if not text:
             return response
 
         logger.info("AI_ACTION_PARSE_START id=%s", rid or "-")
-        result = parse_action_text(text)
+
+        # Deterministic command intent is authoritative for the command
+        # vocabulary. It resolves targets from the reply context — it never
+        # depends on the model emitting JSON or a native tool call.
+        has_reply = bool(request.reply_context and request.reply_context.exists)
+        result = parse_command_intent(request.user_message, has_reply=has_reply)
+
         if result.kind == "conversational":
-            logger.info("AI_ACTION_PARSE_RESULT id=%s action=none", rid or "-")
+            # No deterministic command match — try the model's own JSON output.
+            result = parse_action_text(text)
+
+        if result.kind == "conversational":
+            logger.info(
+                "AI_ACTION_PARSE_RESULT id=%s action=none reason=no_action "
+                "text_len=%d has_json=%s",
+                rid or "-", len(text), "{" in text,
+            )
             return response
         logger.info(
             "AI_ACTION_PARSE_RESULT id=%s action=%s count=%s",
