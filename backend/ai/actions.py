@@ -85,8 +85,12 @@ TARGET_SCOPES = frozenset({
 # smuggle an unknown field through to execution.
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
-    "content", "reason", "link", "message_id",
+    "content", "reason", "link", "message_id", "fields",
 })
+
+# Identity fields the account_status action may request from account_show.
+# Everything else (phone, account ID, session data, credentials) is rejected.
+_ACCOUNT_IDENTITY_FIELDS = frozenset({"first_name", "last_name", "full_name", "username"})
 
 _MIN_DELETE_COUNT = 1
 _MAX_DELETE_COUNT = 500
@@ -134,6 +138,7 @@ class ActionParseResult:
     link: str = ""
     message_id: int | None = None
     query: str = ""
+    fields: list[str] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -217,9 +222,19 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     if action not in EXECUTABLE_ACTION_NAMES:
         return ActionParseResult(kind=KIND_UNSUPPORTED, action=action)
 
+    # ``fields`` is only meaningful for account_status (which fields of the
+    # account identity to return). Reject it for every other action so the
+    # model can never smuggle an unexpected field through to execution.
+    if "fields" in raw and action != "account_status":
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'fields' is only valid for the account_status action.",
+        )
+
     # Read-only status/query actions map directly to an existing tool. They
-    # take no target; ``search_saved_items`` requires a query and
-    # ``list_recent_messages`` accepts an optional limit.
+    # take no target; ``search_saved_items`` requires a query,
+    # ``list_recent_messages`` accepts an optional limit, and
+    # ``account_status`` accepts an optional ``fields`` allowlist.
     if action in _STATUS_ACTIONS:
         if action == "search_saved_items":
             query = raw.get("query")
@@ -239,6 +254,21 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                         error=f"Invalid count: {raw.get('count')!r} (must be 1-{_MAX_DELETE_COUNT}).",
                     )
             return ActionParseResult(kind=KIND_EXECUTABLE, action=action, count=count)
+        if action == "account_status":
+            fields: list[str] | None = None
+            if "fields" in raw:
+                raw_fields = raw.get("fields")
+                if (
+                    not isinstance(raw_fields, list)
+                    or not raw_fields
+                    or not all(isinstance(f, str) and f in _ACCOUNT_IDENTITY_FIELDS for f in raw_fields)
+                ):
+                    return ActionParseResult(
+                        kind=KIND_INVALID,
+                        error="Invalid 'fields' for account_status (allowed: first_name, last_name, full_name, username).",
+                    )
+                fields = list(dict.fromkeys(raw_fields))
+            return ActionParseResult(kind=KIND_EXECUTABLE, action=action, fields=fields)
         return ActionParseResult(kind=KIND_EXECUTABLE, action=action)
 
     # Save-by-link: the link is the target. The URL is preserved verbatim and
@@ -372,7 +402,8 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         return [{"name": "username_show", "arguments": {}}]
 
     if action == "account_status":
-        return [{"name": "account_show", "arguments": {}}]
+        args: dict[str, Any] = {"fields": list(result.fields)} if result.fields else {}
+        return [{"name": "account_show", "arguments": args}]
 
     if action == "delete_messages":
         if target == "message_id":
@@ -413,6 +444,7 @@ def parse_action_text(text: str) -> ActionParseResult:
             target=result.target or _default_target(result.action),
             count=result.count,
             caption=result.caption,
+            fields=result.fields,
             tool_calls=tool_calls,
         )
     return result
@@ -461,6 +493,25 @@ _DB_STATUS_WORDS = frozenset({
     "show", "what", "info",
 })
 _USERNAME_WORDS = frozenset({"یوزرنیم", "یوزرنیمم", "یوزر", "username"})
+# Explicit qualifiers that make "username" mean the REAL Telegram @username
+# handle ("یوزرنیم واقعی تلگرامم", "username تلگرامم", "what is my Telegram
+# username?"). Without one of these, casual Persian "یوزرنیم" means the
+# account FIRST NAME — the LifeOS "username engine" updates first_name.
+_REAL_USERNAME_WORDS = frozenset({"واقعی", "تلگرام", "telegram", "real", "handle"})
+
+
+def _has_real_username_qualifier(words: list[str]) -> bool:
+    """True when an explicit real-@username qualifier is present.
+
+    Persian qualifiers are stem-matched so possessive forms ("تلگرامم",
+    "تلگرامیم") count as "تلگرام"; English qualifiers match exactly.
+    """
+    for w in words:
+        if w in ("telegram", "real", "handle"):
+            return True
+        if w.startswith("واقعی") or w.startswith("تلگرام"):
+            return True
+    return False
 _ACCOUNT_WORDS = frozenset({
     "اسم", "اسمم", "نام", "نامم", "اکانت", "اکانتم", "اکانتی",
     "حساب", "حسابم", "حسابی", "پروفایل", "پروفایلم",
@@ -602,12 +653,19 @@ def _en_list_saved(words: list[str]) -> bool:
     return any(w in _EN_LIST_SAVED_WORDS for w in words)
 
 
-def _parse_status_intent(words: list[str]) -> ActionParseResult | None:
+def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionParseResult | None:
     """Deterministically recognize read-only status/query intents.
 
     Returns an executable tool call (list_saves / database_stats /
-    bio_show / username_show) or None. Called only after the imperative
+    bio_show / account_show) or None. Called only after the imperative
     save/delete/review paths fall through.
+
+    Account-identity semantics: casual Persian "یوزرنیم"/"username" means
+    the account FIRST NAME in this project (the username engine manages
+    first_name). Only an explicit qualifier — an "@" prefix, or words like
+    "واقعی" / "تلگرام" / "telegram" / "real" — selects the REAL Telegram
+    @username handle. Both resolve to ``account_show`` with a minimal
+    ``fields`` allowlist so unrelated account data is never returned.
     """
     wordset = set(words)
 
@@ -635,22 +693,32 @@ def _parse_status_intent(words: list[str]) -> ActionParseResult | None:
             tool_calls=[{"name": "database_stats", "arguments": {}}],
         )
 
-    # Account identity/name: "وضعیت اسم اکانتم رو بگو" / "what is my name?".
-    if (wordset & _ACCOUNT_WORDS) and (wordset & _STATUS_WORDS):
+    # REAL Telegram @username — ONLY when explicitly qualified:
+    # "@username", "یوزرنیم واقعی تلگرامم", "username تلگرامم رو بگو",
+    # "what is my Telegram username?", "show my @username".
+    if (
+        (wordset & _USERNAME_WORDS)
+        and (has_at or _has_real_username_qualifier(words))
+        and (wordset & _STATUS_WORDS)
+    ):
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action="account_status",
-            tool_calls=[{"name": "account_show", "arguments": {}}],
+            fields=["username"],
+            tool_calls=[{"name": "account_show", "arguments": {"fields": ["username"]}}],
         )
 
-    # Username status: "وضعیت یوزرنیم رو بگو". This is the ACTUAL
-    # Telegram @username, retrieved through the authenticated self client's
-    # get_me() — not the first_name "username engine" scheduler state.
-    if (wordset & _USERNAME_WORDS) and (wordset & _STATUS_WORDS):
+    # Account identity / FIRST NAME: "وضعیت اسم اکانتم رو بگو",
+    # "اسم اکانتم چیه؟", "what is my account name?", "show my first name",
+    # AND the casual form "وضعیت یوزرنیمم رو بگو" (Persian "یوزرنیم" =
+    # first name in this project). Only the first name is requested — phone,
+    # account ID, and the @username handle are never included.
+    if (wordset & (_ACCOUNT_WORDS | _USERNAME_WORDS)) and (wordset & _STATUS_WORDS):
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action="account_status",
-            tool_calls=[{"name": "account_show", "arguments": {}}],
+            fields=["first_name"],
+            tool_calls=[{"name": "account_show", "arguments": {"fields": ["first_name"]}}],
         )
 
     # Bio status: "وضعیت بایو چیه".
@@ -819,7 +887,7 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
             tool_calls=[{"name": "list_recent_messages", "arguments": args}],
         )
 
-    status = _parse_status_intent(words)
+    status = _parse_status_intent(words, has_at="@" in text)
     if status is not None:
         return status
 

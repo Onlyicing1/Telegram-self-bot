@@ -465,8 +465,9 @@ AI — and it is the reason deterministic operations keep working when
 Groq/Gemini/etc. are rate-limited, misconfigured, or down:
 
 - Read-only status/review: `list_saves`, `search`, `database_stats`,
-  `bio_show`, `username_show` → `account_show` (actual `get_me` identity),
-  and `list_recent_messages` (real Telegram history).
+  `bio_show`, `username_show`, and account-identity queries
+  (`account_show` — actual `get_me` identity, requested fields only),
+  plus `list_recent_messages` (real Telegram history).
 - Save: `save` / `save_link` (Deep Save only).
 - Delete: only when the target is unambiguous — an explicit message ID,
   an explicit multi-message count (`ده پیام آخر رو پاک کن`), or a
@@ -504,6 +505,27 @@ Persian, informal/colloquial Persian, and mixed Persian-English commands
 are supported. Persian digits (۰-۹) in numeric arguments are normalized
 before validation. Exact values such as usernames, URLs, and quoted text
 are preserved verbatim.
+
+### Account identity semantics (first name vs real @username)
+
+The LifeOS "username engine" manages the account **first name**, so in
+natural-language intent "یوزرنیم" / "username" means the first name:
+
+| Owner says | Resolved tool + fields |
+|---|---|
+| "وضعیت یوزرنیمم رو بگو" / "یوزرنیمم چیه؟" | `account_show` `fields=["first_name"]` |
+| "اسم اکانتم چیه؟" / "وضعیت اسم اکانتم رو بگو" | `account_show` `fields=["first_name"]` |
+| "what is my account name?" / "show my first name" | `account_show` `fields=["first_name"]` |
+| "یوزرنیم واقعی تلگرامم رو بگو" / "username تلگرامم رو بگو" | `account_show` `fields=["username"]` |
+| "@username من چیه؟" / "what is my Telegram username?" | `account_show` `fields=["username"]` |
+
+The distinction is resolved at the intent layer (`_parse_status_intent`)
+before tool selection: an explicit `@` / "واقعی" / "تلگرام" / "telegram"
+qualifier selects the real `@username`; without one, the request is a
+first-name query. `account_show` itself validates a `fields` allowlist
+(`first_name` / `last_name` / `full_name` / `username`) and **never
+returns phone, account ID, session, or credential data** — the structured
+`data` payload and the rendered message contain only the requested fields.
 
 ### Structured Action Contract
 
@@ -562,12 +584,20 @@ user message + provider output
   `database_stats` → `database_stats`, `bio_status` → `bio_show`,
   `username_status` → `username_show`, `account_status` → `account_show`.
   The deterministic command parser recognizes "چه چیزایی سیو دارم؟",
-  "وضعیت دیتابیس چیه؟", "وضعیت یوزرنیم رو بگو",
+  "وضعیت دیتابیس چیه؟", "وضعیت یوزرنیمم رو بگو",
   "وضعیت اسم اکانتم رو بگو", and English equivalents, so these execute
   even when the provider returns prose instead of a tool call.
-- `account_show` reads the authenticated self account identity (id, first
-  name, last name, username, phone) from the Telegram client's `get_me()`
-  — it never depends on a provider hallucinating the value.
+- `account_show` reads the authenticated self account identity from the
+  Telegram client's `get_me()` — it never depends on a provider
+  hallucinating the value. **Account-identity semantics:** in this project
+  casual Persian "یوزرنیم" / "username" means the account **first name**
+  (the username engine updates `first_name`), so "وضعیت یوزرنیمم رو بگو" /
+  "اسم اکانتم چیه؟" → `account_show` with `fields=["first_name"]`. The
+  REAL Telegram `@username` is returned only when explicitly qualified
+  ("@username", "یوزرنیم واقعی تلگرامم", "username تلگرامم رو بگو",
+  "what is my Telegram username?") → `fields=["username"]`. `account_show`
+  returns **only the requested fields** — phone number and account ID are
+  never serialized (data minimization).
 - Provider/model configuration is validated at request time: stale or
   deprecated models (e.g. a Gemini model that no longer exists) are
   resolved to a valid default or marked unavailable and skipped, and the

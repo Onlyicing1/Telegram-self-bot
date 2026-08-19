@@ -200,9 +200,15 @@ async def test_account_show_reads_get_me():
     result = await AccountShowTool(ctx).execute(ctx, {})
 
     assert result.success is True
-    assert "Ali Rezaei" in result.message
+    # The minimal default (first_name + username) — never phone or ID.
+    assert "First Name: Ali" in result.message
     assert "@alirezaei" in result.message
     assert result.data["first_name"] == "Ali"
+    assert result.data["username"] == "alirezaei"
+    assert "phone" not in result.data
+    assert "id" not in result.data
+    assert "989120000000" not in result.message
+    assert "123" not in result.message
 
 
 @pytest.mark.asyncio
@@ -223,23 +229,111 @@ def test_account_show_registered_in_default_registry():
     assert "account_show" in set(registry.list_names())
 
 
-# ── Deterministic account-name intent ──
+# ── Account identity semantics: casual "یوزرنیم" = first name; explicit
+#    qualifiers (@ / واقعی / تلگرام / telegram) = real @username ──
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "وضعیت اسم اکانتم رو بگو",
+        "وضعیت یوزرنیمم رو بگو",
+        "یوزرنیمم چیه؟",
+        "وضعیت یوزرنیم رو بگو",
         "اسم اکانتم چیه؟",
+        "وضعیت اسم اکانتم رو بگو",
         "نام اکانتم رو نشون بده",
         "what is my account name?",
         "what is my first name?",
+        "show my first name",
     ],
 )
 def test_account_name_intent_resolves_to_account_show(text):
     r = parse_command_intent(text, has_reply=False)
     assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "account_show", "arguments": {}}]
+    # Casual Persian "یوزرنیم"/"username" and account-name requests resolve
+    # to the account FIRST NAME — minimal output, never phone/ID/@username.
+    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "یوزرنیم واقعی تلگرامم رو بگو",
+        "username تلگرامم رو بگو",
+        "@username من چیه؟",
+        "what is my Telegram username?",
+        "show my @username",
+    ],
+)
+def test_real_telegram_username_intent_resolves_to_username(text):
+    r = parse_command_intent(text, has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    # Explicit qualifiers (@ / واقعی / تلگرام / telegram) select the REAL
+    # Telegram @username handle.
+    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["username"]}}]
+
+
+@pytest.mark.asyncio
+async def test_account_show_never_exposes_phone_or_id_for_identity_requests():
+    from backend.ai.tools.account import AccountShowTool
+    from backend.ai.tools.context import ToolContext
+
+    class FakeTelegram:
+        async def get_me(self):
+            return {
+                "id": 999, "first_name": "Ali", "last_name": "Rezaei",
+                "full_name": "Ali Rezaei", "username": "alirezaei",
+                "phone": "989120000000",
+            }
+
+    ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC")
+    tool = AccountShowTool(ctx)
+
+    for fields, expected_key, forbidden in (
+        (["first_name"], "first_name", ["username", "full_name"]),
+        (["username"], "username", ["first_name", "full_name"]),
+    ):
+        result = await tool.execute(ctx, {"fields": fields})
+        assert result.success is True
+        # Only the requested field is in the structured output.
+        assert set(result.data.keys()) == {expected_key}
+        for secret in ("phone", "id", "session", "token", "api_key"):
+            assert secret not in result.data
+            assert secret not in result.message.lower()
+        # Sensitive values never appear in the message.
+        assert "989120000000" not in result.message
+        assert "999" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_account_show_rejects_unknown_fields():
+    from backend.ai.tools.account import AccountShowTool
+    from backend.ai.tools.context import ToolContext
+
+    class FakeTelegram:
+        async def get_me(self):
+            return {"first_name": "Ali", "username": "alirezaei"}
+
+    ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC")
+    result = await AccountShowTool(ctx).execute(ctx, {"fields": ["phone"]})
+    assert result.success is False
+    result = await AccountShowTool(ctx).execute(ctx, {"fields": []})
+    assert result.success is False
+
+
+def test_account_status_json_action_fields_are_validated():
+    from backend.ai.actions import KIND_EXECUTABLE, KIND_INVALID, parse_action_text
+
+    r = parse_action_text('{"action": "account_status", "fields": ["first_name"]}')
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
+    r = parse_action_text('{"action": "account_status", "fields": ["phone"]}')
+    assert r.kind == KIND_INVALID
+    r = parse_action_text('{"action": "bio_status", "fields": ["first_name"]}')
+    assert r.kind == KIND_INVALID
+
+
+
 
 
 # ── Clean error humanization ──

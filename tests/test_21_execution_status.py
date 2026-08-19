@@ -52,12 +52,11 @@ def test_deterministic_database_stats_english():
 
 
 def test_deterministic_username_status():
-    # "وضعیت یوزرنیم رو بگو" is the ACTUAL Telegram @username — resolved
-    # through the authenticated self client's get_me (account_show), not the
-    # first_name "username engine" scheduler state.
+    # Casual Persian "یوزرنیم" means the account FIRST NAME in this project
+    # (the username engine updates first_name) — not the Telegram @username.
     r = parse_command_intent("وضعیت یوزرنیم رو بگو", has_reply=False)
     assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "account_show", "arguments": {}}]
+    assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
 
 
 def test_deterministic_bio_status():

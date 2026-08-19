@@ -119,7 +119,7 @@ def _mock_executor(results):
 @pytest.mark.asyncio
 async def test_username_status_runs_fast_path_without_provider():
     mock_te = _mock_executor([
-        ("account_show", True, "👤 Name: Ali\n   Username: @alirezaei", {"username": "alirezaei"}),
+        ("account_show", True, "👤 First Name: Ali", {"first_name": "Ali"}),
     ])
     provider = _FakeProvider("test")
     d, provider = _make_dispatcher(mock_te, provider)
@@ -131,7 +131,10 @@ async def test_username_status_runs_fast_path_without_provider():
 
     assert result.success is True
     assert result.metadata["finish_state"] == "local_fast_path"
-    assert "Username: @alirezaei" in result.response
+    # Casual Persian "یوزرنیم" resolves to the account FIRST NAME.
+    assert "First Name: Ali" in result.response
+    tool_calls = mock_te.execute_calls.call_args.args[0]
+    assert tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
     assert mock_te.execute_calls.await_count == 1
     # The provider was NEVER called — the fast path is provider-independent.
     assert provider.calls == 0
