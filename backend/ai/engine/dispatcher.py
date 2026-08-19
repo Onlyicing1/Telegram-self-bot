@@ -562,8 +562,11 @@ class Dispatcher:
     def _summarize_tool_results(results: list[dict[str, Any]]) -> str:
         """Build a concise response from the REAL tool results.
 
-        A failure is reported verbatim; multiple successes are joined. This is
-        the deterministic final answer for the structured-action path and the
+        A failure is reported verbatim; multiple successes are joined. READ
+        tools that carry structured message data (``list_recent_messages``)
+        render the actual messages so "review the last N messages" shows the
+        real Telegram conversation rather than a bare count. This is the
+        deterministic final answer for the structured-action path and the
         fallback when a continuation provider round returns no text.
         """
         if not results:
@@ -571,8 +574,32 @@ class Dispatcher:
         failures = [r for r in results if not r.get("success")]
         if failures:
             return failures[0].get("message") or "Action failed."
-        messages = [r.get("message", "") for r in results if r.get("message")]
-        return " ".join(messages) if messages else "Action completed."
+
+        rendered: list[str] = []
+        for r in results:
+            data = r.get("data") or {}
+            msgs = data.get("messages")
+            if isinstance(msgs, list) and msgs:
+                rendered.append(Dispatcher._render_message_list(msgs))
+            elif r.get("message"):
+                rendered.append(r.get("message"))
+        return "\n".join(rendered) if rendered else "Action completed."
+
+    @staticmethod
+    def _render_message_list(messages: list[dict[str, Any]]) -> str:
+        """Render real Telegram messages as a compact, chronological list."""
+        lines: list[str] = []
+        for m in messages:
+            sender = m.get("sender_name") or m.get("sender_username") or ""
+            if not sender:
+                sender = f"id{m.get('sender_id') or '?'}"
+            text = (m.get("text") or "").strip().replace("\n", " ")
+            if text:
+                lines.append(f"[{m.get('id')}] {sender}: {text}")
+            else:
+                media = " 📎" if m.get("has_media") else ""
+                lines.append(f"[{m.get('id')}] {sender}: (no text){media}")
+        return "\n".join(lines)
 
     def _build_tool_definitions(self) -> list[dict[str, Any]]:
         """Build native OpenAI-format tool definitions from the registry.

@@ -465,6 +465,7 @@ message IDs when the target is already clear:
 | "save this link" / "این لینک رو سیو کن" + t.me link | the linked message (Deep Save, URL preserved) |
 | "delete message ID N" / "پیام با ID N رو پاک کن" | that one outgoing message by ID |
 | "delete messages about X" / "پیام‌های مربوط به X رو پاک کن" | bounded candidate list → AI selects → validated delete |
+| "review the last N messages" / "N پیام آخر رو ببین" | the last N REAL Telegram messages (all participants) |
 
 Deletion follows the project's **outgoing-only** rule: only the owner's
 own sent messages can be deleted. If the target genuinely cannot be
@@ -524,11 +525,18 @@ user message + provider output
   (last N), `delete_replied` (replied message), `delete_message_by_id`
   (explicit single ID), or the semantic `list_recent_messages` →
   `delete_messages_by_ids` flow.
+- `list_recent_messages` reads the **real Telegram chat through the
+  active Telethon client** — all participants, chronological
+  (oldest → newest) — never the AI conversation/session history. It
+  exposes message IDs, sender, time, text/caption, reply target, and a
+  media flag. This is the canonical Telegram-history retrieval path.
 - Semantic delete is **bounded and validated**: `list_recent_messages`
-  returns a bounded candidate window (default 50, max 100 outgoing
-  messages), the AI selects concrete IDs it actually saw, and
+  returns a bounded candidate window (default 50, max 100) of the actual
+  recent chat messages, the AI selects concrete IDs it actually saw, and
   `delete_messages_by_ids` re-fetches and validates every ID
-  (outgoing-only) before deleting. Invented/foreign IDs are skipped.
+  (outgoing-only) before deleting. Invented/foreign/non-outgoing IDs are
+  skipped — a vague request never escalates into an unbounded or
+  arbitrary delete.
 - `send`, `clean_chat`, and `remember` are recognized but deliberately
   return "unsupported" because no existing executor is wired — the AI
   never fabricates a result.
@@ -559,12 +567,17 @@ stages and cleaned up in a `finally` block, so `ai_active` always
 returns to 0:
 
 ```
-AI_REQUEST_START → AI_CONFIG_LOAD → AI_PROVIDER_RESOLVE
+AI_REQUEST_START → TELEGRAM_CHAT_RESOLVE → AI_CONFIG_LOAD → AI_PROVIDER_RESOLVE
   → AI_PROMPT_BUILD → AI_PROVIDER_REQUEST_START → AI_PROVIDER_RESPONSE
   → AI_ACTION_PARSE_START → AI_ACTION_PARSE_RESULT → AI_ACTION_VALIDATION
   → AI_TARGET_RESOLUTION → AI_EXECUTION_START → AI_EXECUTION_RESULT/ERROR
   → AI_RESPONSE_SEND_START → AI_RESPONSE_SEND_END → AI_REQUEST_END
 ```
+
+For `list_recent_messages`, the real chat retrieval is logged as
+`LIST_RECENT_MESSAGES_START` / `LIST_RECENT_MESSAGES_RESULT` with
+`chat_id`, `requested_limit`, `returned_count`, `first_message_id`, and
+`last_message_id` (message contents are never logged).
 
 - Each AI request is bounded by a 60 s `wait_for`; each provider HTTP
   request is bounded by a 30 s guard.

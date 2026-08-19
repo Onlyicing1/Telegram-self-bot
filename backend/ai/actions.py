@@ -359,11 +359,22 @@ _EN_SEND = frozenset({"send", "sending", "forward", "forwarding"})
 _EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
 
 _THIS_TOKENS = frozenset({"این", "اینو", "اینم", "همین", "همینو", "this", "that", "it"})
-_LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "last", "latest", "recent"})
+_LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "اخیر", "last", "latest", "recent"})
 _DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
 _MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
 _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
 _ID_TOKENS = frozenset({"id", "msgid", "message_id", "ایدی", "آیدی", "شناسه"})
+
+_DEFAULT_LIST_LIMIT = 50
+
+# Persian number words → int, so "ده پیام" / "بیست و پنج پیام" parse like "۱۰ پیام".
+_FA_NUMBER_WORDS = {
+    "یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6, "هفت": 7, "هشت": 8, "نه": 9,
+    "ده": 10, "یازده": 11, "دوازده": 12, "سیزده": 13, "چهارده": 14, "پانزده": 15,
+    "شانزده": 16, "هفده": 17, "هجده": 18, "نوزده": 19,
+    "بیست": 20, "سی": 30, "چهل": 40, "پنجاه": 50, "شصت": 60, "هفتاد": 70, "هشتاد": 80, "نود": 90,
+    "صد": 100, "دویست": 200, "سیصد": 300, "چهارصد": 400, "پانصد": 500,
+}
 
 
 def _tokenize(text: str) -> list[str]:
@@ -412,15 +423,42 @@ def _english_action(words: list[str], verbs: frozenset[str]) -> tuple[bool, bool
     return False, False
 
 
+def _parse_number(words: list[str], i: int) -> int | None:
+    """Parse an ASCII/Persian digit or a Persian number word at index *i*.
+
+    Handles compounds like "بیست و پنج" (20 + 5 = 25). Returns None when
+    the token is not a number.
+    """
+    if i >= len(words):
+        return None
+    tok = words[i]
+    if tok.isdigit():
+        try:
+            return int(tok)
+        except ValueError:
+            return None
+    if tok not in _FA_NUMBER_WORDS:
+        return None
+    total = _FA_NUMBER_WORDS[tok]
+    j = i + 1
+    while j + 1 < len(words) and words[j] == "و" and words[j + 1] in _FA_NUMBER_WORDS:
+        total += _FA_NUMBER_WORDS[words[j + 1]]
+        j += 2
+    return total
+
+
 def _extract_count(words: list[str]) -> int | None:
-    """Extract a 1..500 count near a message/last word (Persian digits normalized)."""
-    for i, tok in enumerate(words):
-        if tok.isdigit():
-            n = int(tok)
-            if 1 <= n <= _MAX_DELETE_COUNT:
-                window = words[max(0, i - 2):i + 3]
-                if any(w in _COUNT_CONTEXT for w in window):
-                    return n
+    """Extract a 1..500 count near a message/last word.
+
+    Accepts Persian/Arabic-Indic digits (normalized), ASCII digits, and
+    Persian number words ("ده", "بیست و پنج", ...).
+    """
+    for i in range(len(words)):
+        n = _parse_number(words, i)
+        if n is not None and 1 <= n <= _MAX_DELETE_COUNT:
+            window = words[max(0, i - 2):i + 4]
+            if any(w in _COUNT_CONTEXT for w in window):
+                return n
     return None
 
 
@@ -482,6 +520,10 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
 
     do_delete = delete_pos and not delete_neg
     do_save = save_pos and not save_neg
+
+    delete_mentioned = delete_pos or delete_neg
+    save_mentioned = save_pos or save_neg
+    send_mentioned = send_pos
 
     link_url = _extract_telegram_link(text)
 
@@ -563,6 +605,26 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
             kind=KIND_CLARIFY,
             action="delete_messages",
             reason="Which message(s) should I delete?",
+        )
+
+    # "Review / show / tell me the last N messages" → list REAL Telegram
+    # history from the current chat (all participants). This is the AI-session
+    # vs Telegram-chat distinction: inspection always reads Telegram.
+    if (
+        has_message_word
+        and (is_last or count is not None)
+        and not delete_mentioned
+        and not save_mentioned
+        and not send_mentioned
+    ):
+        limit = count if count is not None else _DEFAULT_LIST_LIMIT
+        args: dict[str, Any] = {"limit": limit} if count is not None else {}
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="list_recent_messages",
+            target="recent_messages",
+            count=limit,
+            tool_calls=[{"name": "list_recent_messages", "arguments": args}],
         )
 
     return ActionParseResult(kind=KIND_CONVERSATIONAL)

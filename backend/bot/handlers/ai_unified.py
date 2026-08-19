@@ -342,6 +342,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     rid = ai_diag.new_request_id()
     ai_diag.register_start(rid, owner_id=owner_id)
     logger.info("AI_REQUEST_START id=%s owner=%d", rid, owner_id)
+    logger.info("TELEGRAM_CHAT_RESOLVE id=%s chat_id=%s", rid, getattr(event, "chat_id", None))
 
     engine = _get_engine()
     if engine is None:

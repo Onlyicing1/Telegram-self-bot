@@ -85,6 +85,47 @@ def test_unknown_field_still_rejected():
     assert r.kind == KIND_INVALID
 
 
+# ── Deterministic "review last N messages" → real Telegram history ──
+
+
+def test_deterministic_review_last_n_persian_word_number():
+    r = parse_command_intent("ده پیام آخر رو بررسی کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "list_recent_messages"
+    assert r.count == 10
+    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 10}}]
+
+
+def test_deterministic_review_last_n_persian_digits():
+    r = parse_command_intent("آخرین ۱۰ پیام این چت چی بودن؟", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 10}}]
+
+
+def test_deterministic_review_last_n_compound_word_number():
+    r = parse_command_intent("بیست و پنج پیام آخر رو ببین", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {"limit": 25}}]
+
+
+def test_deterministic_recent_messages_no_count_defaults():
+    r = parse_command_intent("پیام‌های اخیر این چت رو نشون بده", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "list_recent_messages"
+    assert r.tool_calls == [{"name": "list_recent_messages", "arguments": {}}]
+
+
+def test_deterministic_delete_persian_word_number():
+    r = parse_command_intent("ده پیام آخر رو پاک کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.tool_calls == [{"name": "delete", "arguments": {"count": 10}}]
+
+
+def test_deterministic_question_about_this_message_is_not_list():
+    r = parse_command_intent("این پیام چیه؟", has_reply=True)
+    assert r.kind == KIND_CONVERSATIONAL
+
+
 # ── SaveByLinkTool ──
 
 
@@ -230,21 +271,46 @@ async def test_delete_message_by_id_refuses_incoming():
 
 
 @pytest.mark.asyncio
-async def test_list_recent_messages_is_bounded_and_returns_ids():
+async def test_list_recent_messages_reads_all_participants_chronologically():
     from backend.ai.tools.context import ToolContext
     from backend.ai.tools.semantic import ListRecentMessagesTool
 
-    class FakeMessage:
-        def __init__(self, mid, text):
-            self.id = mid
-            self.text = text
-            self.media = None
+    class FakeSender:
+        def __init__(self, first, username):
+            self.first_name = first
+            self.last_name = ""
+            self.username = username
 
+    class FakeMessage:
+        def __init__(self, mid, text, sender_id, sender_name, out):
+            self.id = mid
+            self.message = text
+            self.text = text
+            self.sender_id = sender_id
+            self.sender_name = sender_name
+            self.out = out
+            self.media = None
+            self.reply_to = None
+            self.date = None
+
+        async def get_sender(self):
+            return FakeSender(self.sender_name, self.sender_name.lower())
+
+    # Telethon returns newest-first; the tool must normalize to oldest-first
+    # and include ALL participants (no from_user="me" filtering).
     class FakeClient:
-        async def iter_messages(self, chat_id, limit, from_user=None):
-            assert from_user == "me"
-            for i in range(limit):
-                yield FakeMessage(i + 1, f"message {i + 1}")
+        def __init__(self):
+            self.calls = []
+
+        async def iter_messages(self, chat_id, limit, **kwargs):
+            self.calls.append((chat_id, limit, kwargs))
+            newest_first = [
+                FakeMessage(3, "from other", 222, "Other", False),
+                FakeMessage(2, "from me", 111, "Me", True),
+                FakeMessage(1, "first", 333, "Third", False),
+            ]
+            for m in newest_first[:limit]:
+                yield m
 
     client = FakeClient()
 
@@ -258,8 +324,13 @@ async def test_list_recent_messages_is_bounded_and_returns_ids():
     result = await ListRecentMessagesTool(ctx).execute(ctx, {"limit": 3})
 
     assert result.success is True
-    assert len(result.data["messages"]) == 3
-    assert result.data["messages"][0]["id"] == 1
+    msgs = result.data["messages"]
+    assert [m["id"] for m in msgs] == [1, 2, 3]  # oldest → newest
+    assert msgs[0]["sender_id"] == 333  # incoming message included
+    assert msgs[1]["sender_id"] == 111  # outgoing message included
+    assert msgs[2]["sender_id"] == 222  # incoming message included
+    # no from_user filter was applied — the tool reads the real chat history.
+    assert "from_user" not in client.calls[0][2]
 
 
 @pytest.mark.asyncio
@@ -317,6 +388,35 @@ async def test_delete_messages_by_ids_rejects_empty_ids():
 
 
 # ── Security boundary ──
+
+
+def test_summarize_renders_real_message_list():
+    from backend.ai.engine.dispatcher import Dispatcher
+
+    summary = Dispatcher._summarize_tool_results([
+        {
+            "tool_name": "list_recent_messages",
+            "success": True,
+            "message": "Listed 2 recent Telegram message(s).",
+            "data": {
+                "messages": [
+                    {"id": 1, "sender_name": "Ali", "text": "hello", "has_media": False},
+                    {"id": 2, "sender_name": "Me", "text": "", "has_media": True},
+                ],
+            },
+        },
+    ])
+    assert "[1] Ali: hello" in summary
+    assert "[2] Me: (no text) 📎" in summary
+
+
+def test_summarize_reports_real_failure():
+    from backend.ai.engine.dispatcher import Dispatcher
+
+    summary = Dispatcher._summarize_tool_results([
+        {"tool_name": "delete", "success": False, "message": "Delete failed: flood", "data": {}},
+    ])
+    assert summary == "Delete failed: flood"
 
 
 def test_registry_has_no_arbitrary_telegram_or_exec_tools():
