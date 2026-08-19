@@ -43,6 +43,45 @@ async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | Non
         return 0, exc
 
 
+async def do_del_last_n_real(
+    client, chat_id, n: int
+) -> tuple[int, int, Exception | None]:
+    """Delete outgoing messages within the last ``n`` REAL chat messages.
+
+    Unlike :func:`do_del_n_counts` (which counts only the owner's outgoing
+    messages), this counts EVERY recent message in the chat — the owner,
+    other participants, and the Self-Bot's own generated/edited messages —
+    and deletes only the outgoing subset the connected account is allowed to
+    delete. Telegram's chronological history is the source of truth.
+
+    Returns ``(considered, deleted, error)``: ``considered`` is the number
+    of real messages inspected, ``deleted`` is the number Telegram deleted,
+    and ``error`` is ``None`` on success.
+    """
+    if n < 1 or n > 500:
+        return 0, 0, ValueError("n must be between 1 and 500")
+    t0 = asyncio.get_event_loop().time()
+    try:
+        recent = []
+        async for msg in client.iter_messages(chat_id, limit=n):
+            recent.append(msg)
+            if len(recent) >= n:
+                break
+        deletable = [m.id for m in recent if getattr(m, "out", False)]
+        if deletable:
+            await client.delete_messages(chat_id, deletable)
+        record_event(
+            "delete", "del last n real",
+            (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS",
+            f"{len(deletable)}/{len(recent)}",
+        )
+        return len(recent), len(deletable), None
+    except Exception as exc:
+        logger.error("del last n real failed: %s", exc)
+        record_event("delete", "del last n real", 0, "ERROR", str(exc))
+        return 0, 0, exc
+
+
 async def do_del_id_counts(client, chat_id, start_id: int) -> tuple[int, Exception | None]:
     """Delete all outgoing messages from ``start_id`` forward.
 

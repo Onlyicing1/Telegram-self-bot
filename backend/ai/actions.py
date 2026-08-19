@@ -32,13 +32,38 @@ ACTION_NAMES = frozenset({
     "deep_save",
     "save_link",
     "delete_messages",
+    "list_saved_items",
+    "search_saved_items",
+    "database_stats",
+    "bio_status",
+    "username_status",
     "send",
     "clean_chat",
     "remember",
     "clarify",
 })
 
-EXECUTABLE_ACTION_NAMES = frozenset({"save", "deep_save", "save_link", "delete_messages"})
+EXECUTABLE_ACTION_NAMES = frozenset({
+    "save",
+    "deep_save",
+    "save_link",
+    "delete_messages",
+    "list_saved_items",
+    "search_saved_items",
+    "database_stats",
+    "bio_status",
+    "username_status",
+})
+
+# Read-only status/query actions: no target/count — the mapped tool reads the
+# owner's own saved-items DB or profile-engine state.
+_STATUS_ACTIONS = frozenset({
+    "list_saved_items",
+    "search_saved_items",
+    "database_stats",
+    "bio_status",
+    "username_status",
+})
 
 TARGET_SCOPES = frozenset({
     "replied_message",
@@ -101,6 +126,7 @@ class ActionParseResult:
     error: str = ""
     link: str = ""
     message_id: int | None = None
+    query: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -183,6 +209,19 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
     if action not in EXECUTABLE_ACTION_NAMES:
         return ActionParseResult(kind=KIND_UNSUPPORTED, action=action)
+
+    # Read-only status/query actions map directly to an existing tool. They
+    # take no target/count; ``search_saved_items`` requires a query.
+    if action in _STATUS_ACTIONS:
+        if action == "search_saved_items":
+            query = raw.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return ActionParseResult(
+                    kind=KIND_INVALID,
+                    error="Missing 'query' field.",
+                )
+            return ActionParseResult(kind=KIND_EXECUTABLE, action=action, query=query.strip())
+        return ActionParseResult(kind=KIND_EXECUTABLE, action=action)
 
     # Save-by-link: the link is the target. The URL is preserved verbatim and
     # validated only for the Telegram-link shape — the tool re-validates it
@@ -295,6 +334,21 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         # SAME Deep Save pipeline. The URL is passed through verbatim.
         return [{"name": "save_by_link", "arguments": {"link": result.link}}]
 
+    if action == "list_saved_items":
+        return [{"name": "list_saves", "arguments": {}}]
+
+    if action == "search_saved_items":
+        return [{"name": "search", "arguments": {"query": result.query}}]
+
+    if action == "database_stats":
+        return [{"name": "database_stats", "arguments": {}}]
+
+    if action == "bio_status":
+        return [{"name": "bio_show", "arguments": {}}]
+
+    if action == "username_status":
+        return [{"name": "username_show", "arguments": {}}]
+
     if action == "delete_messages":
         if target == "message_id":
             return [{"name": "delete_message_by_id", "arguments": {"message_id": result.message_id}}]
@@ -366,6 +420,29 @@ _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
 _ID_TOKENS = frozenset({"id", "msgid", "message_id", "ایدی", "آیدی", "شناسه"})
 
 _DEFAULT_LIST_LIMIT = 50
+
+# Read-only status/query intent keywords (matched only after the imperative
+# save/delete/review paths fall through, so "اینو سیو کن" and "پیام آخر رو
+# پاک کن" always take precedence).
+_SAVE_LIST_WORDS = frozenset({
+    "چه", "لیست", "لیستش", "وضعیت", "وضعیتش", "چیزا", "چیزایی", "دارم",
+    "داریم", "داره", "دارن", "دارید", "شدن", "شده", "شد", "نشون", "بده",
+    "چند", "چندتا", "موجود", "مشاهده",
+})
+_DB_WORDS = frozenset({"دیتابیس", "دیتابیسم", "دیتا", "دیتابس", "database", "db", "آمار"})
+_DB_STATUS_WORDS = frozenset({
+    "وضعیت", "وضعیتش", "چیه", "چی", "چه", "بگو", "نشون", "ببین", "چطور",
+    "چطوره", "هست", "هستن", "آمار", "status", "stats", "state", "statistics",
+    "show", "what", "info",
+})
+_USERNAME_WORDS = frozenset({"یوزرنیم", "یوزرنیمم", "یوزر", "username"})
+_BIO_WORDS = frozenset({"بایو", "بیو", "bio"})
+_STATUS_WORDS = frozenset({
+    "وضعیت", "وضعیتش", "چیه", "چی", "چه", "بگو", "نشون", "ببین", "چطور",
+    "چطوره", "هست", "هستن", "status", "show", "what", "current", "state", "info",
+})
+_EN_SAVED_WORDS = frozenset({"saved", "saves"})
+_EN_LIST_SAVED_WORDS = frozenset({"list", "items", "item", "my", "mine", "show", "status"})
 
 # Persian number words → int, so "ده پیام" / "بیست و پنج پیام" parse like "۱۰ پیام".
 _FA_NUMBER_WORDS = {
@@ -469,6 +546,78 @@ def _extract_message_id(words: list[str]) -> int | None:
             for j in range(max(0, i - 2), min(len(words), i + 3)):
                 if words[j].isdigit() and int(words[j]) > 0:
                     return int(words[j])
+    return None
+
+
+def _has_save_mention(words: list[str]) -> bool:
+    """True when any token looks like the Persian save stem (سیو/ذخیره...)."""
+    return any(
+        w.startswith("سیو") or w.startswith("ذخیره") or w.startswith("ذخیر")
+        for w in words
+    )
+
+
+def _en_list_saved(words: list[str]) -> bool:
+    """High-confidence English "list/show my saved items" signal.
+
+    Only the noun/past forms ("saved"/"saves") count — the bare verb
+    "save" is an instruction, not a listing request, so "what does save
+    mean?" stays conversational.
+    """
+    if not any(w in _EN_SAVED_WORDS for w in words):
+        return False
+    return any(w in _EN_LIST_SAVED_WORDS for w in words)
+
+
+def _parse_status_intent(words: list[str]) -> ActionParseResult | None:
+    """Deterministically recognize read-only status/query intents.
+
+    Returns an executable tool call (list_saves / database_stats /
+    bio_show / username_show) or None. Called only after the imperative
+    save/delete/review paths fall through.
+    """
+    wordset = set(words)
+
+    # Saved items: "چه چیزایی سیو دارم" / "لیست سیوها رو بده" / "وضعیت سیوها چیه".
+    if _has_save_mention(words) and (wordset & _SAVE_LIST_WORDS):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="list_saved_items",
+            target="saved_items",
+            tool_calls=[{"name": "list_saves", "arguments": {}}],
+        )
+    if _en_list_saved(words):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="list_saved_items",
+            target="saved_items",
+            tool_calls=[{"name": "list_saves", "arguments": {}}],
+        )
+
+    # Database stats: "وضعیت دیتابیس چیه" / "database status".
+    if (wordset & _DB_WORDS) and (wordset & _DB_STATUS_WORDS):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="database_stats",
+            tool_calls=[{"name": "database_stats", "arguments": {}}],
+        )
+
+    # Username status: "وضعیت یوزرنیم رو بگو".
+    if (wordset & _USERNAME_WORDS) and (wordset & _STATUS_WORDS):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="username_status",
+            tool_calls=[{"name": "username_show", "arguments": {}}],
+        )
+
+    # Bio status: "وضعیت بایو چیه".
+    if (wordset & _BIO_WORDS) and (wordset & _STATUS_WORDS):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="bio_status",
+            tool_calls=[{"name": "bio_show", "arguments": {}}],
+        )
+
     return None
 
 
@@ -626,5 +775,9 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
             count=limit,
             tool_calls=[{"name": "list_recent_messages", "arguments": args}],
         )
+
+    status = _parse_status_intent(words)
+    if status is not None:
+        return status
 
     return ActionParseResult(kind=KIND_CONVERSATIONAL)

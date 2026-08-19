@@ -70,9 +70,17 @@ class DeleteTool(Tool):
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")
 
+        client = None
+        if context.telegram is not None:
+            client = getattr(context.telegram, "client", None)
+        if client is None:
+            client = context.client
+        if client is None:
+            return ToolResult(success=False, message="No Telegram client available.")
+
         try:
-            deleted, error = await delete_service.do_del_n_counts(
-                context.telegram.client, chat_id, count
+            considered, deleted, error = await delete_service.do_del_last_n_real(
+                client, chat_id, count
             )
         except Exception as exc:
             return ToolResult(
@@ -89,13 +97,19 @@ class DeleteTool(Tool):
         if deleted == 0:
             return ToolResult(
                 success=True,
-                message="No outgoing messages were deleted (none matched in this chat).",
-                data={"count": 0},
+                message=(
+                    f"Considered the last {considered} message(s) in this chat, "
+                    "but none were sent by the owner, so nothing was deleted."
+                ),
+                data={"count": 0, "considered": considered},
             )
         return ToolResult(
             success=True,
-            message=f"Deleted {deleted} outgoing message(s) in this chat.",
-            data={"count": deleted},
+            message=(
+                f"Deleted {deleted} outgoing message(s) from the last "
+                f"{considered} message(s) in this chat."
+            ),
+            data={"count": deleted, "considered": considered},
         )
 
 

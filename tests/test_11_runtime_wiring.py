@@ -576,7 +576,11 @@ async def test_engine_reports_failure_when_no_provider_configured():
 async def test_finish_state_classification_empty():
     from backend.ai.engine.engine import Engine
 
+    # Two empty responses: the dispatcher performs ONE bounded empty-response
+    # retry (a transient "thinking stall" safety net) before classifying the
+    # result as empty.
     provider = ScriptedProvider([
+        ProviderResponse(text="", provider_name="scripted", success=True, usage=_usage(10, 0)),
         ProviderResponse(text="", provider_name="scripted", success=True, usage=_usage(10, 0)),
     ])
     pm = ProviderManager()

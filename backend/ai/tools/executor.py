@@ -49,6 +49,7 @@ _STATUS_LABELS: dict[str, str] = {
     "save_by_link": "💾 Saving from link...",
     "search": "🔎 Searching saved items...",
     "list_saves": "📋 Loading saved items...",
+    "database_stats": "📊 Checking database...",
     "delete": "🗑️ Deleting...",
     "delete_by_id": "🗑️ Deleting saved item...",
     "delete_replied": "🗑️ Deleting...",

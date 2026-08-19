@@ -122,6 +122,8 @@ class OpenAICompatProvider(BaseProvider):
                     error_msg = resp.text[:200]
                 if resp.status_code in (401, 403):
                     failure_type = "auth"
+                elif resp.status_code == 404:
+                    failure_type = "model_not_found"
                 elif resp.status_code >= 500:
                     failure_type = "server"
                 else:

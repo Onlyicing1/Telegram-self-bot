@@ -174,14 +174,14 @@ async def test_delete_tool_accepts_persian_count():
     from unittest.mock import patch
 
     class FakeTelegram:
-        client = None
+        client = object()
 
     ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC", extra={"chat_id": -100})
     registry = ToolRegistry()
     registry.register(DeleteTool(ctx))
     executor = ToolExecutor(registry, ctx)
 
-    with patch("backend.services.delete_service.do_del_n_counts", AsyncMock(return_value=(10, None))):
+    with patch("backend.services.delete_service.do_del_last_n_real", AsyncMock(return_value=(10, 10, None))):
         results = await executor.execute_calls([{"name": "delete", "arguments": {"count": "۱۰"}}], owner_id=1)
 
     assert results[0].success is True
@@ -375,7 +375,7 @@ async def test_delete_tool_routes_through_service_not_client():
     registry.register(DeleteTool(ctx))
     executor = ToolExecutor(registry, ctx)
 
-    with patch("backend.services.delete_service.do_del_n_counts", AsyncMock(return_value=(2, None))) as svc:
+    with patch("backend.services.delete_service.do_del_last_n_real", AsyncMock(return_value=(2, 2, None))) as svc:
         results = await executor.execute_calls([{"name": "delete", "arguments": {"count": 2}}], owner_id=1)
 
     svc.assert_awaited_once()

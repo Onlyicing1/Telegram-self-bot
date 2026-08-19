@@ -422,6 +422,8 @@ class ProviderManager:
             return "rate_limited"
         if status in (401, 403):
             return "auth"
+        if status == 404:
+            return "model_not_found"
         if isinstance(status, int) and 500 <= status < 600:
             return "server"
         if isinstance(status, int) and 400 <= status < 500:
@@ -438,6 +440,14 @@ class ProviderManager:
             self._health.mark_cooling_down(name, retry_after)
         elif ftype in AUTH_FAILURES:
             self._health.mark_disabled(name)
+        elif ftype in ("request", "model_not_found"):
+            # Permanent configuration/request errors (e.g. a model name the
+            # API does not recognize). Never retried, never cooled down — the
+            # caller advances to the next fallback candidate deterministically.
+            logger.warning(
+                "provider-health: '%s' config/request error (%s) — not cooling down",
+                name, ftype,
+            )
         else:
             self._health.mark_cooling_down(name, DEFAULT_COOLDOWN_SECONDS)
 

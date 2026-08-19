@@ -202,6 +202,8 @@ def _humanize_error(error: str) -> str:
         return "Invalid API key. Check your provider configuration."
     if "429" in error_lower or "rate" in error_lower:
         return "Rate limited. Please wait and try again."
+    if "cooling" in error_lower or "cooldown" in error_lower:
+        return "The AI provider is temporarily cooling down. Please try again shortly."
     if "timeout" in error_lower or "timed out" in error_lower:
         return "Request timed out. The provider took too long to respond."
     if "404" in error_lower or "not found" in error_lower or "model" in error_lower:

@@ -429,9 +429,13 @@ Nova, save this                  → SaveTool            → execute_save()
 Nova, deep save this             → SaveTool            → execute_save() (Deep Save)
 Nova, save this link             → SaveByLinkTool      → execute_link_save() → execute_save()
 Nova, delete this message        → DeleteRepliedTool   → delete the replied message
-Nova, delete the last 5 messages → DeleteTool          → delete_service.do_del_n_counts()
+Nova, delete the last 5 messages → DeleteTool          → delete_service.do_del_last_n_real()
 Nova, delete message ID 123      → DeleteMessageByIdTool → delete that one outgoing message
 Nova, delete messages about X    → ListRecentMessagesTool → DeleteMessagesByIdsTool (bounded + validated)
+Nova, what have I saved          → ListSavesTool       → discover_service.do_list()
+Nova, search saved items for X   → SearchTool          → discover_service.do_find()
+Nova, database status            → DatabaseStatsTool   → database_service.do_stats()
+Nova, username/bio status        → UsernameShowTool / BioShowTool → existing profile-service state
 ```
 
 The execution pipeline is:
@@ -460,7 +464,7 @@ message IDs when the target is already clear:
 |---|---|
 | "this message" / "اینو" / "این پیام" while replying | the replied-to message |
 | "the last message" / "پیام آخر" | the most recent message (delete count=1) |
-| "the last N messages" / "N پیام آخر" | count=N |
+| "the last N messages" / "N پیام آخر" | count=N over ALL real chat messages (owner, others, Nova's own/edited) — the system deletes only the outgoing subset |
 | "save this" / "اینو سیو کن" while replying | the replied-to message |
 | "save this link" / "این لینک رو سیو کن" + t.me link | the linked message (Deep Save, URL preserved) |
 | "delete message ID N" / "پیام با ID N رو پاک کن" | that one outgoing message by ID |
@@ -499,11 +503,14 @@ Every path is normalized into a strict, typed action schema and validated
 locally before any execution:
 
 ```json
-{"action": "save" | "deep_save" | "save_link" | "delete_messages",
+{"action": "save" | "deep_save" | "save_link" | "delete_messages"
+          | "list_saved_items" | "search_saved_items" | "database_stats"
+          | "bio_status" | "username_status",
  "target": "replied_message" | "current_message" | "last_message" | "recent_messages" | "message_id",
  "count": 1..500,
  "link": "https://t.me/...",
- "message_id": <int>}
+ "message_id": <int>,
+ "query": "search term"}
 ```
 
 ```
@@ -522,9 +529,17 @@ user message + provider output
 - `save` / `deep_save` → the existing Deep Save executor (captions are
   always preserved). `save_link` → `execute_link_save()` (the same Deep
   Save pipeline, link preserved verbatim). `delete_messages` → `delete`
-  (last N), `delete_replied` (replied message), `delete_message_by_id`
+  (last N **real** messages — all participants counted, outgoing-only
+  deletion), `delete_replied` (replied message), `delete_message_by_id`
   (explicit single ID), or the semantic `list_recent_messages` →
   `delete_messages_by_ids` flow.
+- Read-only status/query actions map deterministically to existing tools:
+  `list_saved_items` → `list_saves`, `search_saved_items` → `search`,
+  `database_stats` → `database_stats`, `bio_status` → `bio_show`,
+  `username_status` → `username_show`. The deterministic command parser
+  recognizes "چه چیزایی سیو دارم؟", "وضعیت دیتابیس چیه؟",
+  "وضعیت یوزرنیم رو بگو", and English equivalents, so these execute
+  even when the provider returns prose instead of a tool call.
 - `list_recent_messages` reads the **real Telegram chat through the
   active Telethon client** — all participants, chronological
   (oldest → newest) — never the AI conversation/session history. It
@@ -581,6 +596,16 @@ For `list_recent_messages`, the real chat retrieval is logged as
 
 - Each AI request is bounded by a 60 s `wait_for`; each provider HTTP
   request is bounded by a 30 s guard.
+- A transient **empty** provider response (a "thinking stall": `success`
+  with no text and no tool call) is retried exactly **once** before being
+  classified. This retry happens before any tool executes, so a
+  destructive save/delete can never run twice from the same request.
+- Provider failures are classified: `429` → cooldown (honoring
+  `Retry-After`), `401/403` → disabled until config changes, `5xx` /
+  network / timeout → one bounded retry then cooldown, and
+  `404`/invalid model → surfaced as a deterministic config error without
+  cooldown or infinite retry. Cooldown expires on a monotonic clock, so a
+  provider is never permanently stuck in `cooling_down`.
 - Concurrency is bounded (default 4; override with
   `AI_MAX_CONCURRENCY`). Requests beyond the limit fail cleanly rather
   than piling up.

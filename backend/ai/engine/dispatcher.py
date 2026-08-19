@@ -153,6 +153,12 @@ class Dispatcher:
         # into their own API shape (e.g. Gemini functionDeclarations).
         tool_definitions = self._build_tool_definitions()
         chat_kwargs: dict[str, Any] = {"tools": tool_definitions} if tool_definitions else {}
+        logger.info(
+            "AI_TOOL_AVAILABILITY id=%s tools=%d names=%s",
+            rid or "-",
+            len(tool_definitions),
+            [d["function"]["name"] for d in tool_definitions],
+        )
 
         # ── Stage 1: Conversation Runtime ──
         try:
@@ -206,6 +212,34 @@ class Dispatcher:
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
                 rid or "-", response.provider_name or provider_name, response.success,
             )
+
+            # Bounded retry for a transient EMPTY provider response (a
+            # "thinking stall" where the model returns finish_reason=stop with
+            # no text and no tool call). This is NOT a permanent-config retry
+            # and never re-runs tools — no tool has executed at this point, so
+            # a destructive save/delete cannot double-run.
+            finish_reason = (response.metadata or {}).get("finish_reason", "")
+            if (
+                response.success
+                and not response.text
+                and not response.tool_calls
+                and not _is_blocked_finish(finish_reason)
+                and not _is_truncated_finish(finish_reason)
+            ):
+                logger.info(
+                    "AI_PROVIDER_EMPTY_RESPONSE_RETRY id=%s provider=%s",
+                    rid or "-", response.provider_name or provider_name,
+                )
+                retry_response: ProviderResponse = await self._provider_manager.chat(
+                    messages, **chat_kwargs
+                )
+                if retry_response.success and (retry_response.text or retry_response.tool_calls):
+                    retry_meta = dict(retry_response.metadata or {})
+                    retry_meta["ai_retry_count"] = int(retry_meta.get("ai_retry_count", 0)) + 1
+                    retry_response = replace(retry_response, metadata=retry_meta)
+                    response = retry_response
+                    logger.info("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
+
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
@@ -259,6 +293,13 @@ class Dispatcher:
                     "AI_TOOL_PARSE id=%s tools=%s",
                     rid or "-", [tc.get("name", "") for tc in response.tool_calls],
                 )
+                for tc in response.tool_calls:
+                    args = tc.get("arguments") or {}
+                    keys = sorted(args.keys()) if isinstance(args, dict) else []
+                    logger.info(
+                        "AI_TOOL_ARGS id=%s tool=%s args=%s",
+                        rid or "-", tc.get("name", ""), keys,
+                    )
                 _stage("TOOL_EXECUTION")
                 logger.info("AI_TOOL_EXECUTION_START id=%s", rid or "-")
                 logger.info(
@@ -461,6 +502,7 @@ class Dispatcher:
         base = self._tool_executor._context
         extra: dict[str, Any] = dict(base.extra) if base.extra else {}
         extra["chat_id"] = request.chat_id
+        extra["request_message_id"] = request.message_id
         if request.reply_context and request.reply_context.exists:
             extra["reply_msg"] = {
                 "message_id": request.reply_context.message_id,

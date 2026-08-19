@@ -53,7 +53,7 @@ class FakeDeleteClient:
     async def iter_messages(self, chat_id, **kwargs):
         limit = kwargs.get("limit")
         for mid in self.ids:
-            yield type("M", (), {"id": mid})()
+            yield type("M", (), {"id": mid, "out": True})()
             if limit is not None and len(self.deleted) + 1 >= limit:
                 break
 
@@ -140,7 +140,7 @@ async def test_delete_tool_zero_when_none_matched():
     result = await DeleteTool(_ctx(client)).execute(_ctx(client), {"count": 3})
     assert result.success is True
     assert result.data["count"] == 0
-    assert "No outgoing messages were deleted" in result.message
+    assert "nothing was deleted" in result.message
 
 
 @pytest.mark.asyncio
