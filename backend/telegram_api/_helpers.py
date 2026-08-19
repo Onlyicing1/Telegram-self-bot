@@ -46,6 +46,7 @@ def serialize_user(user: Any) -> dict[str, Any]:
         "full_name": f"{first} {last}".strip(),
         "username": getattr(user, "username", None),
         "phone": getattr(user, "phone", None),
+        "about": getattr(user, "about", None),
         "is_bot": getattr(user, "bot", False),
         "is_deleted": getattr(user, "deleted", False),
     }

@@ -59,10 +59,39 @@ def test_deterministic_username_status():
     assert r.tool_calls == [{"name": "account_show", "arguments": {"fields": ["first_name"]}}]
 
 
-def test_deterministic_bio_status():
-    r = parse_command_intent("وضعیت بایو چیه", has_reply=False)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "بیوم الان چیه؟",
+        "بیو اکانتم رو بگو",
+        "متن بیوی فعلی من چیه؟",
+        "وضعیت بیوم رو بگو",
+        "وضعیت بایو چیه",
+        "بیوی فعلیم",
+        "بیو الانم",
+        "my bio",
+        "what is my bio?",
+        "current bio",
+        "bio now",
+        "show my bio",
+    ],
+)
+def test_deterministic_bio_retrieval(text):
+    # Bio retrieval must deterministically resolve to get_bio (the REAL
+    # Telegram bio) — never account identity, username, or bio-set tools.
+    r = parse_command_intent(text, has_reply=False)
     assert r.kind == KIND_EXECUTABLE
-    assert r.tool_calls == [{"name": "bio_show", "arguments": {}}]
+    assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
+
+
+def test_bio_retrieval_not_misrouted_to_account_or_update():
+    # "بیو اکانتم رو بگو" is a BIO request even though it mentions the
+    # account — it must never resolve to account_show.
+    r = parse_command_intent("بیو اکانتم رو بگو", has_reply=False)
+    assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
+    # A bio CHANGE request is not a read: no get_bio call.
+    r = parse_command_intent("بیوم رو آپدیت کن", has_reply=False)
+    assert r.tool_calls != [{"name": "get_bio", "arguments": {}}]
 
 
 def test_deterministic_status_does_not_shadow_save_or_delete():
@@ -394,3 +423,58 @@ def test_registry_has_status_tools():
     assert "search" in names
     assert "username_show" in names
     assert "bio_show" in names
+    assert "get_bio" in names
+
+
+# ── get_bio: real Telegram bio retrieval ──
+
+
+def test_json_bio_actions_resolve_to_get_bio():
+    for text in ('{"action": "get_bio"}', '{"action": "bio_status"}'):
+        r = parse_action_text(text)
+        assert r.kind == KIND_EXECUTABLE
+        assert r.tool_calls == [{"name": "get_bio", "arguments": {}}]
+
+
+@pytest.mark.asyncio
+async def test_get_bio_reads_real_telegram_bio():
+    from backend.ai.tools.bio import BioGetTool
+    from backend.ai.tools.context import ToolContext
+
+    class FakeTelegram:
+        async def get_me(self):
+            return {
+                "first_name": "Ali", "username": "alirezaei",
+                "phone": "989120000000", "id": 999,
+                "about": "🕒 LifeOS | 💭 همیشه بهروز",
+            }
+
+    ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC")
+    result = await BioGetTool(ctx).execute(ctx, {})
+
+    assert result.success is True
+    assert "همیشه بهروز" in result.message
+    # Data minimization: ONLY the bio is returned — never phone/id/username.
+    assert result.data == {"bio": "🕒 LifeOS | 💭 همیشه بهروز"}
+    assert "phone" not in result.message.lower()
+    assert "989120000000" not in result.message
+    assert "999" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_get_bio_empty_and_missing_telegram():
+    from backend.ai.tools.bio import BioGetTool
+    from backend.ai.tools.context import ToolContext
+
+    class EmptyTelegram:
+        async def get_me(self):
+            return {"about": None, "id": 1}
+
+    ctx = ToolContext(telegram=EmptyTelegram(), owner_id=1, tz_str="UTC")
+    result = await BioGetTool(ctx).execute(ctx, {})
+    assert result.success is True
+    assert result.data == {"bio": ""}
+
+    no_tg = ToolContext(telegram=None, owner_id=1, tz_str="UTC")
+    result = await BioGetTool(no_tg).execute(no_tg, {})
+    assert result.success is False

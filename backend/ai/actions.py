@@ -37,6 +37,7 @@ ACTION_NAMES = frozenset({
     "list_recent_messages",
     "database_stats",
     "bio_status",
+    "get_bio",
     "username_status",
     "account_status",
     "send",
@@ -55,6 +56,7 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "list_recent_messages",
     "database_stats",
     "bio_status",
+    "get_bio",
     "username_status",
     "account_status",
 })
@@ -68,6 +70,7 @@ _STATUS_ACTIONS = frozenset({
     "list_recent_messages",
     "database_stats",
     "bio_status",
+    "get_bio",
     "username_status",
     "account_status",
 })
@@ -395,8 +398,11 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action == "database_stats":
         return [{"name": "database_stats", "arguments": {}}]
 
-    if action == "bio_status":
-        return [{"name": "bio_show", "arguments": {}}]
+    if action in ("bio_status", "get_bio"):
+        # bio_status / get_bio both read the CURRENT Telegram bio through the
+        # self client (get_bio). The bio ENGINE state (template/mood/status)
+        # remains available via the bio_show tool for explicit engine queries.
+        return [{"name": "get_bio", "arguments": {}}]
 
     if action == "username_status":
         return [{"name": "username_show", "arguments": {}}]
@@ -517,7 +523,19 @@ _ACCOUNT_WORDS = frozenset({
     "حساب", "حسابم", "حسابی", "پروفایل", "پروفایلم",
     "name", "account", "profile", "first", "last", "identity",
 })
-_BIO_WORDS = frozenset({"بایو", "بیو", "bio"})
+# Bio words are stem-matched so possessive/colloquial forms ("بیوم",
+# "بیوی", "بایوم") resolve to bio retrieval like the plain form.
+_BIO_STEMS = ("بیو", "بایو")
+# Extra qualifiers that make a bio mention a read query even without an
+# explicit status word: "بیو الانم", "بیوی فعلیم", "my bio", "bio now".
+_BIO_QUERY_WORDS = frozenset({
+    "الان", "الانم", "حالا", "فعلی", "فعلیم", "فعلیه", "my", "من", "now",
+})
+
+
+def _has_bio_mention(words: list[str]) -> bool:
+    """True when any token looks like a bio word (Persian stem or English)."""
+    return any(w == "bio" or w.startswith(_BIO_STEMS[0]) or w.startswith(_BIO_STEMS[1]) for w in words)
 _STATUS_WORDS = frozenset({
     "وضعیت", "وضعیتش", "چیه", "چی", "چه", "بگو", "نشون", "ببین", "چطور",
     "چطوره", "هست", "هستن", "status", "show", "what", "current", "state", "info",
@@ -657,7 +675,7 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
     """Deterministically recognize read-only status/query intents.
 
     Returns an executable tool call (list_saves / database_stats /
-    bio_show / account_show) or None. Called only after the imperative
+    get_bio / account_show) or None. Called only after the imperative
     save/delete/review paths fall through.
 
     Account-identity semantics: casual Persian "یوزرنیم"/"username" means
@@ -708,6 +726,18 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
             tool_calls=[{"name": "account_show", "arguments": {"fields": ["username"]}}],
         )
 
+    # Bio retrieval: "وضعیت بایو چیه", "بیوم الان چیه؟", "بیوی فعلیم",
+    # "what is my bio?", "current bio", "my bio". This reads the ACTUAL
+    # Telegram bio via get_bio — never a hallucinated or engine-state value.
+    # It runs BEFORE the account branch so "بیو اکانتم رو بگو" resolves to
+    # bio retrieval, not account identity.
+    if _has_bio_mention(words) and ((wordset & _STATUS_WORDS) or (wordset & _BIO_QUERY_WORDS)):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="get_bio",
+            tool_calls=[{"name": "get_bio", "arguments": {}}],
+        )
+
     # Account identity / FIRST NAME: "وضعیت اسم اکانتم رو بگو",
     # "اسم اکانتم چیه؟", "what is my account name?", "show my first name",
     # AND the casual form "وضعیت یوزرنیمم رو بگو" (Persian "یوزرنیم" =
@@ -719,14 +749,6 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
             action="account_status",
             fields=["first_name"],
             tool_calls=[{"name": "account_show", "arguments": {"fields": ["first_name"]}}],
-        )
-
-    # Bio status: "وضعیت بایو چیه".
-    if (wordset & _BIO_WORDS) and (wordset & _STATUS_WORDS):
-        return ActionParseResult(
-            kind=KIND_EXECUTABLE,
-            action="bio_status",
-            tool_calls=[{"name": "bio_show", "arguments": {}}],
         )
 
     return None

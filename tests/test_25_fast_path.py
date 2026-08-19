@@ -141,6 +141,29 @@ async def test_username_status_runs_fast_path_without_provider():
 
 
 @pytest.mark.asyncio
+async def test_bio_retrieval_runs_fast_path_without_provider():
+    mock_te = _mock_executor([
+        ("get_bio", True, "📝 Bio: همیشه بهروز", {"bio": "همیشه بهروز"}),
+    ])
+    provider = _FakeProvider("test")
+    d, provider = _make_dispatcher(mock_te, provider)
+
+    result = await d.dispatch(AIRequest(
+        session_id="s1", message_id=1, owner_id=123,
+        user_message="بیوم الان چیه؟", chat_id=456,
+    ))
+
+    assert result.success is True
+    assert result.metadata["finish_state"] == "local_fast_path"
+    assert "همیشه بهروز" in result.response
+    tool_calls = mock_te.execute_calls.call_args.args[0]
+    assert tool_calls == [{"name": "get_bio", "arguments": {}}]
+    assert mock_te.execute_calls.await_count == 1
+    # Provider-independent: the real Telegram bio is read without any AI call.
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_delete_last_n_runs_fast_path_exactly_once():
     mock_te = _mock_executor([
         ("delete", True, "Deleted 3 outgoing message(s).", {"count": 3}),

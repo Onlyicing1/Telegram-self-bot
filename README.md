@@ -465,7 +465,8 @@ AI — and it is the reason deterministic operations keep working when
 Groq/Gemini/etc. are rate-limited, misconfigured, or down:
 
 - Read-only status/review: `list_saves`, `search`, `database_stats`,
-  `bio_show`, `username_show`, and account-identity queries
+  `get_bio` (the REAL current Telegram bio via `get_me`), `bio_show` /
+  `username_show` (engine state), account-identity queries
   (`account_show` — actual `get_me` identity, requested fields only),
   plus `list_recent_messages` (real Telegram history).
 - Save: `save` / `save_link` (Deep Save only).
@@ -551,7 +552,7 @@ locally before any execution:
 ```json
 {"action": "save" | "deep_save" | "save_link" | "delete_messages"
           | "list_saved_items" | "search_saved_items" | "list_recent_messages"
-          | "database_stats" | "bio_status" | "username_status" | "account_status",
+          | "database_stats" | "bio_status" | "get_bio" | "username_status" | "account_status",
  "target": "replied_message" | "current_message" | "last_message" | "recent_messages" | "message_id",
  "count": 1..500,
  "link": "https://t.me/...",
@@ -581,8 +582,11 @@ user message + provider output
   `delete_messages_by_ids` flow.
 - Read-only status/query actions map deterministically to existing tools:
   `list_saved_items` → `list_saves`, `search_saved_items` → `search`,
-  `database_stats` → `database_stats`, `bio_status` → `bio_show`,
+  `database_stats` → `database_stats`, `bio_status` / `get_bio` →
+  `get_bio` (reads the actual Telegram bio through the self client),
   `username_status` → `username_show`, `account_status` → `account_show`.
+  `bio_show` remains the bio-ENGINE state panel (template/mood/status) for
+  explicit engine queries.
   The deterministic command parser recognizes "چه چیزایی سیو دارم؟",
   "وضعیت دیتابیس چیه؟", "وضعیت یوزرنیمم رو بگو",
   "وضعیت اسم اکانتم رو بگو", and English equivalents, so these execute

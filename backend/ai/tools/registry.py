@@ -130,7 +130,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     from backend.ai.tools.semantic import ListRecentMessagesTool, DeleteMessagesByIdsTool
     from backend.ai.tools.bio import (
         BioSetTemplateTool, BioSetTextTool, BioSetMoodTool,
-        BioOnTool, BioOffTool, BioShowTool,
+        BioOnTool, BioOffTool, BioShowTool, BioGetTool,
     )
     from backend.ai.tools.username import (
         UsernameSetTemplateTool, UsernameSetTextTool, UsernameSetMoodTool,
@@ -168,6 +168,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(BioOnTool(context))
     registry.register(BioOffTool(context))
     registry.register(BioShowTool(context))
+    registry.register(BioGetTool(context))
     registry.register(UsernameSetTemplateTool(context))
     registry.register(UsernameSetTextTool(context))
     registry.register(UsernameSetMoodTool(context))

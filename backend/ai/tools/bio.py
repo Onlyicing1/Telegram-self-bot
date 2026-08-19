@@ -232,6 +232,65 @@ class BioOffTool(Tool):
             return ToolResult(success=False, message=f"Bio off failed: {exc}")
 
 
+class BioGetTool(Tool):
+    """Read the CURRENT Telegram bio (the account's actual 'about' text).
+
+    This is the real bio retrieval operation: it reads the authenticated
+    self account through ``TelegramAPI.get_me()`` and returns ONLY the bio
+    text — never engine config, phone, account ID, or other metadata.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "get_bio"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read the current Telegram account bio (the 'about' text). "
+            "Answers requests like 'my bio' / 'بیوم چیه' / 'what is my bio?'. "
+            "Returns only the bio text."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {}
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_ONLY
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with only the bio text in message and data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        if context.telegram is None:
+            return ToolResult(success=False, message="Telegram is not available.")
+
+        try:
+            me = await context.telegram.get_me()
+        except Exception as exc:
+            return ToolResult(success=False, message=f"Could not read the bio: {exc}")
+
+        if not me:
+            return ToolResult(success=False, message="Bio is unavailable.")
+
+        # Data minimization: only the bio itself is returned — never phone,
+        # account ID, session, or other account metadata.
+        bio = (me.get("about") or "").strip()
+        if not bio:
+            return ToolResult(success=True, message="📝 Bio: —", data={"bio": ""})
+        return ToolResult(success=True, message=f"📝 Bio: {bio}", data={"bio": bio})
+
+
 class BioShowTool(Tool):
     """Show the current bio engine state."""
 

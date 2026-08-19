@@ -58,6 +58,7 @@ _STATUS_LABELS: dict[str, str] = {
     "list_recent_messages": "📋 Reading messages...",
     "settings_get": "⚙️ Checking settings...",
     "settings_set": "⚙️ Updating settings...",
+    "get_bio": "👤 Reading bio...",
     "bio_show": "👤 Checking bio...",
     "bio_template": "👤 Updating bio...",
     "bio_text": "👤 Updating bio...",
