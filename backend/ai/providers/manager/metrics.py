@@ -20,12 +20,22 @@ class ProviderMetrics:
     last_error: str = ""
     last_error_time: str = ""
     healthy: bool = True
+    #: Semantic quality — an HTTP 200 with no usable content when a structured
+    #: action was required is NOT a successful AI execution.
+    quality_requests: int = 0
+    quality_failures: int = 0
 
     @property
     def success_rate(self) -> float:
         if self.requests == 0:
             return 0.0
         return (self.requests - self.failures) / self.requests
+
+    @property
+    def quality_success_rate(self) -> float:
+        if self.quality_requests == 0:
+            return 1.0
+        return (self.quality_requests - self.quality_failures) / self.quality_requests
 
     @property
     def average_latency(self) -> float:
@@ -43,6 +53,11 @@ class ProviderMetrics:
         else:
             self.healthy = True
 
+    def record_quality(self, ok: bool) -> None:
+        self.quality_requests += 1
+        if not ok:
+            self.quality_failures += 1
+
     def reset(self) -> None:
         self.requests = 0
         self.failures = 0
@@ -50,6 +65,8 @@ class ProviderMetrics:
         self.last_error = ""
         self.last_error_time = ""
         self.healthy = True
+        self.quality_requests = 0
+        self.quality_failures = 0
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -59,6 +76,8 @@ class ProviderMetrics:
             "average_latency": round(self.average_latency, 6),
             "last_error": self.last_error,
             "healthy": self.healthy,
+            "quality_requests": self.quality_requests,
+            "quality_failures": self.quality_failures,
         }
 
 
@@ -77,6 +96,9 @@ class ProviderMetricsRegistry:
 
     def record(self, name: str, *, latency: float, error: str = "") -> None:
         self.get(name).record(latency=latency, error=error)
+
+    def record_quality(self, name: str, ok: bool) -> None:
+        self.get(name).record_quality(ok)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         return {name: m.snapshot() for name, m in self._metrics.items()}

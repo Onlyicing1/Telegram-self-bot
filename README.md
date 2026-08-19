@@ -612,8 +612,13 @@ For `list_recent_messages`, the real chat retrieval is logged as
   network / timeout → one bounded retry (after a short backoff) then
   cooldown, and `404`/invalid model → surfaced as a deterministic config
   error without cooldown or infinite retry. Cooldown expires on a
-  monotonic clock, so a provider is never permanently stuck in
-  `cooling_down`.
+  monotonic clock, and a provider that fails 5 times in a row is
+  quarantined (circuit breaker) and automatically re-admitted after the
+  quarantine window — a provider is never permanently stuck.
+- Providers are chosen by capability-aware scoring (reliability, latency,
+  failure/success streaks, tool-calling support), and every request
+  records a failure matrix showing why each candidate was skipped,
+  failed, or succeeded.
 - `model_not_found` is surfaced with the provider's actual detail (the
   rejected model is identifiable in the message) instead of a generic
   "model not found" string, and the failure is logged with the selected
@@ -653,12 +658,24 @@ The provider layer (`backend/ai/providers/`) abstracts LLM providers
 behind a single interface. The rest of the system never references a
 provider by name — it calls `ProviderManager.chat()`.
 
-### Provider Registry
+### Provider Mesh
 
 All providers are registered in a `ProviderRegistry`. The
-`ProviderManager` routes requests through an ordered candidate list
-(active provider → configured fallback chain → emergency dummy fallback)
-and applies a per-provider health/cooldown state machine.
+`ProviderManager` is a **capability-aware router**, not a fixed ordered
+list: every eligible provider (active provider → configured fallback
+chain → any other registered provider) is scored by capability match,
+recent reliability, latency, and failure/success streaks, then tried in
+score order until one succeeds. The active provider (the user's explicit
+choice) is always preferred when healthy.
+
+- A provider with **no API key**, an **invalid key**, or an **unsupported
+  model** is simply skipped — it never produces a user-visible error.
+- A provider that lacks **tool calling** is skipped when the request
+  requires native tools.
+- A provider-level **circuit breaker** (quarantine) isolates providers
+  that fail repeatedly, and each request records a **failure matrix**
+  (`provider_matrix`) showing why every candidate was skipped, failed,
+  or succeeded — without exposing secrets.
 
 ### Execution Boundary
 
@@ -727,22 +744,24 @@ current model name against your provider account.
 
 ### Rate Limits, Retry & Fallback
 
-`ProviderManager` owns the provider state machine. Providers themselves
-make a **single attempt** — retries, cooldown, and fallback are centralized:
+`ProviderManager` owns the provider state machine (circuit breaker).
+Providers themselves make a **single attempt** — retries, cooldown,
+quarantine, and fallback are centralized:
 
 ```
 healthy
   │ transient failure (network/timeout/5xx)
   ▼
 retry once
-  ├── success ──► healthy
-  └── failure ──► cooling_down
+  ├── success ──► healthy (failure streak reset)
+  └── failure ──► cooling_down (per-category penalty)
 cooling_down
-  │ cooldown expires
+  │ cooldown expires → automatically eligible again (no restart)
   ▼
-probe (next request)
+next request (recovery probe)
   ├── success ──► healthy
-  └── failure ──► cooling_down / disabled
+  └── failure ──► cooling_down (consecutive failures accumulate)
+                  └── ≥ 5 consecutive failures ──► quarantined (10 min)
 ```
 
 - **429 / rate-limit** — reads `Retry-After`, marks the provider
@@ -752,13 +771,27 @@ probe (next request)
   fallback.
 - **401 / 403 (auth)** — the provider is marked `disabled` until
   configuration changes; no wasted requests.
+- **Different failures carry different penalties**: timeout ≈ 30 s,
+  server/network ≈ 60 s, malformed/quality ≈ 120 s.
+- **Quarantine** (circuit opens) after 5 consecutive failures; the
+  provider re-enters the pool automatically after the quarantine window
+  and is trusted again after a success.
 - **Semantic uncertainty** ("I don't understand") is a successful
   clarification response, **not** a failure — the system never fails over
   to another provider to manufacture destructive intent.
+- **Response quality** is scored separately from HTTP success: a `200`
+  with no text and no tool call while tools were requested lowers the
+  provider's reliability score (the same `action=none` signal seen
+  downstream) without cooling it down on a single occurrence.
 
 Cooldown uses `time.monotonic()`. Concurrency is bounded per provider
 (default 4; Z.ai is capped at 2). Provider HTTP requests are individually
 bounded via the existing watchdog (`guarded_await`).
+
+The router emits deterministic logs — `ROUTER_SCORE`, `ROUTER_SELECTED`,
+`PROVIDER_SKIPPED`, `PROVIDER_FALLBACK`, `PROVIDER_COOLDOWN`,
+`PROVIDER_QUARANTINED`, `PROVIDER_RECOVERED` — so a routing decision can
+be diagnosed end-to-end without logging credentials or secrets.
 
 ### Configuration
 

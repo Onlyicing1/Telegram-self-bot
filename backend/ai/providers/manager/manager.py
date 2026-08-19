@@ -90,47 +90,70 @@ class ProviderManager:
     # ── Public API ──
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
-        """Route a request through the provider health/fallback machine. Never raises.
+        """Route a request through the provider mesh. Never raises.
 
-        Providers are tried in order: the active provider first, then the
-        configured fallback chain, then the emergency dummy fallback. Each
-        candidate is checked against the cooldown state machine, given at
-        most ONE immediate retry for transient errors, and marked
-        cooling_down (or disabled on auth failure) so a failing provider is
-        never retried forever. A successful fallback response carries
-        ``fallback`` / ``fallback_from`` / ``fallback_to`` metadata.
+        Eligible providers (the active provider first, then the configured
+        fallback chain, then any other registered provider) are scored by
+        capability match, health, and recent reliability, and tried in score
+        order until one succeeds. Skipped and failed providers are recorded
+        in a failure matrix attached to the returned response metadata so the
+        full routing decision is observable without exposing secrets.
+
+        A successful fallback response carries ``fallback`` / ``fallback_from``
+        / ``fallback_to`` metadata. Each candidate is given at most ONE
+        immediate retry for transient errors and is marked cooling_down,
+        quarantined, or disabled on failure so a dead provider is never
+        retried forever.
         """
-        candidates = self._ordered_candidates()
+        needs_tools = bool(kwargs.get("tools"))
+        candidates = self._ordered_candidates(include_all=True)
 
         # Terminal case: no real provider configured — return the dummy's
         # own "not configured" response instead of a fallback synthesis.
         if candidates and candidates[0][0] == "dummy":
             return await self._call_once(candidates[0][1], messages, kwargs)
 
-        failures: list[str] = []
         first = candidates[0][0] if candidates else ""
+        matrix: list[dict[str, Any]] = []
+        failures: list[str] = []
+        eligible: list[tuple[float, str, BaseProvider]] = []
 
         for name, provider in candidates:
-            if not self._health.is_available(name):
-                failures.append(f"{name}: {self._health.state(name)} (skipped)")
+            if name == "dummy":
                 continue
-            if not self._provider_healthy(provider):
-                failures.append(f"{name}: unhealthy (skipped)")
+            skip = self._skip_reason(name, provider, needs_tools)
+            if skip:
+                matrix.append({"provider": name, "outcome": "skipped", "reason": skip})
+                logger.info("PROVIDER_SKIPPED provider=%s reason=%s", name, skip)
                 continue
+            score = self._score(name, provider)
+            eligible.append((score, name, provider))
+            logger.info("ROUTER_SCORE provider=%s score=%.3f", name, score)
 
+        # The active provider is the user's explicit choice — keep it first
+        # when eligible; the rest are ordered by score (capability ×
+        # reliability × availability × latency). Deterministic and stable.
+        eligible.sort(key=lambda item: (item[1] != first, -item[0]))
+
+        for score, name, provider in eligible:
+            logger.info("ROUTER_SELECTED provider=%s score=%.3f", name, score)
             response = await self._attempt_with_retry(provider, messages, kwargs)
             if response.success:
+                matrix.append({"provider": name, "outcome": "success", "score": round(score, 3)})
                 if name != first:
                     meta = dict(response.metadata or {})
                     meta["fallback"] = True
                     meta["fallback_from"] = first or None
                     meta["fallback_to"] = name
-                    logger.info("ProviderManager: fallback succeeded with '%s' (from '%s')", name, first)
+                    logger.info("PROVIDER_FALLBACK from=%s to=%s", first or "-", name)
                     response = replace(response, metadata=meta)
-                return response
+                meta = dict(response.metadata or {})
+                meta["provider_matrix"] = matrix
+                return replace(response, metadata=meta)
+            matrix.append({"provider": name, "outcome": "failed", "reason": (response.text or "")[:200]})
             failures.append(f"{name}: success=False ({response.text[:200]})")
 
-        return await self._fallback(messages, failures=failures, **kwargs)
+        return await self._fallback(messages, failures=failures, matrix=matrix, **kwargs)
 
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
@@ -293,13 +316,17 @@ class ProviderManager:
 
     # ── Routing helpers ──
 
-    def _ordered_candidates(self) -> list[tuple[str, BaseProvider]]:
+    def _ordered_candidates(self, include_all: bool = False) -> list[tuple[str, BaseProvider]]:
         """Return ordered ``(name, provider)`` pairs: active first, then chain.
 
         The active provider is always included (obtained via
         ``registry.get_active()``, which is also the interface a mock registry
         exposes). The dummy provider is never part of the fallback chain — it
         is only reached as the terminal emergency fallback via ``_fallback()``.
+
+        When ``include_all`` is True, every other registered non-dummy
+        provider is appended as an additional safety net so a mesh with a
+        healthy-but-unconfigured-fallback provider can still route to it.
         """
         candidates: list[tuple[str, BaseProvider]] = []
         active = self._registry.get_active()
@@ -312,6 +339,14 @@ class ProviderManager:
             provider = self._registry.get(name)
             if provider is not None:
                 candidates.append((name, provider))
+
+        if include_all:
+            for name in self._registry.list():
+                if name == "dummy" or any(c[0] == name for c in candidates):
+                    continue
+                provider = self._registry.get(name)
+                if provider is not None:
+                    candidates.append((name, provider))
         return candidates
 
     @staticmethod
@@ -334,6 +369,48 @@ class ProviderManager:
             return bool(provider.health().get("healthy", False))
         except Exception:
             return False
+
+    def _skip_reason(self, name: str, provider: BaseProvider, needs_tools: bool) -> str:
+        """Return a skip reason when a provider is not eligible, else ""."""
+        if not self._health.is_available(name):
+            return f"state={self._health.state(name)}"
+        if not self._provider_healthy(provider):
+            return "unhealthy"
+        if needs_tools and not self._supports_tools(provider):
+            return "capability=no_tool_calls"
+        return ""
+
+    @staticmethod
+    def _supports_tools(provider: BaseProvider) -> bool:
+        """True when the provider declares native tool/function calling."""
+        try:
+            caps = provider.capabilities
+            return bool(caps.supports_tools or caps.supports_function_call)
+        except Exception:
+            return False
+
+    def _score(self, name: str, provider: BaseProvider) -> float:
+        """Deterministic provider score: reliability × latency × streak.
+
+        The formula is deliberately simple and explainable in logs:
+          base 1.0
+          × (0.5 + 0.5 × HTTP success rate)   when the provider has history
+          × latency factor (≤1, lower latency scores higher)
+          − 0.1 per consecutive failure (max 0.5)
+          + 0.05 per consecutive success (max 0.2)
+        """
+        score = 1.0
+        metrics = self._metrics.get(name)
+        if metrics.requests:
+            score *= 0.5 + 0.5 * metrics.success_rate
+            avg = metrics.average_latency
+            if avg > 0:
+                score *= min(1.0, 2.0 / max(0.5, avg))
+            if metrics.quality_requests:
+                score *= 0.5 + 0.5 * metrics.quality_success_rate
+        score -= min(0.5, 0.1 * self._health.consecutive_failures(name))
+        score += min(0.2, 0.05 * self._health.consecutive_successes(name))
+        return round(max(0.0, score), 4)
 
     async def _call_once(
         self,
@@ -396,7 +473,8 @@ class ProviderManager:
         async with self._health.acquire(name):
             response = await self._call_once(provider, messages, kwargs)
             if response.success:
-                self._health.mark_healthy(name)
+                self._health.record_success(name)
+                self._note_response_quality(name, response, kwargs)
                 return response
 
             ftype = self._failure_type(response)
@@ -413,7 +491,8 @@ class ProviderManager:
             await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
             retry_response = await self._call_once(provider, messages, kwargs)
             if retry_response.success:
-                self._health.mark_healthy(name)
+                self._health.record_success(name)
+                self._note_response_quality(name, retry_response, kwargs)
                 logger.info("provider-attempt: '%s' recovered on retry", name)
                 return self._with_retry_metadata(retry_response, 1)
 
@@ -440,15 +519,10 @@ class ProviderManager:
 
     def _apply_failure(self, name: str, ftype: str, response: ProviderResponse) -> None:
         meta = response.metadata or {}
-        if ftype == "rate_limited":
-            try:
-                retry_after = float(meta.get("retry_after", DEFAULT_COOLDOWN_SECONDS))
-            except (TypeError, ValueError):
-                retry_after = DEFAULT_COOLDOWN_SECONDS
-            self._health.mark_cooling_down(name, retry_after)
-        elif ftype in AUTH_FAILURES:
+        if ftype in AUTH_FAILURES:
             self._health.mark_disabled(name)
-        elif ftype in ("request", "model_not_found"):
+            return
+        if ftype in ("request", "model_not_found"):
             # Permanent configuration/request errors (e.g. a model name the
             # API does not recognize). Never retried, never cooled down — the
             # caller advances to the next fallback candidate deterministically.
@@ -456,8 +530,38 @@ class ProviderManager:
                 "provider-health: '%s' config/request error (%s) — not cooling down",
                 name, ftype,
             )
-        else:
-            self._health.mark_cooling_down(name, DEFAULT_COOLDOWN_SECONDS)
+            return
+        retry_after: float | None = None
+        if ftype == "rate_limited":
+            try:
+                retry_after = float(meta.get("retry_after", DEFAULT_COOLDOWN_SECONDS))
+            except (TypeError, ValueError):
+                retry_after = DEFAULT_COOLDOWN_SECONDS
+        # Transient failures feed the circuit breaker: per-category cooldown
+        # now, quarantine after a run of consecutive failures.
+        self._health.record_failure(name, ftype, retry_after)
+
+    def _note_response_quality(
+        self,
+        name: str,
+        response: ProviderResponse,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Record an HTTP-success-but-semantically-empty response.
+
+        A provider that returns ``success=True`` with no text and no tool call
+        while tools were requested is a semantic failure (the same signal that
+        produces ``action=none`` downstream). It is logged and fed into the
+        quality metrics (lowering the router score) but NOT cooled down — a
+        single empty response is recovered by the dispatcher's own bounded
+        retry.
+        """
+        if not kwargs.get("tools"):
+            return
+        ok = bool(response.text or response.tool_calls)
+        self._metrics.record_quality(name, ok)
+        if not ok:
+            logger.info("PROVIDER_RESPONSE_INVALID provider=%s reason=empty_with_tools", name)
 
     @staticmethod
     def _with_retry_metadata(response: ProviderResponse, retry_count: int) -> ProviderResponse:
@@ -473,13 +577,15 @@ class ProviderManager:
         self,
         messages: list[dict[str, Any]],
         failures: list[str] | None = None,
+        matrix: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Emergency fallback — always returns success=False with diagnostics.
 
         Even though the dummy provider "succeeds" deterministically, a
         fallback after real provider failures must NEVER look like a
-        successful AI answer. The original failure information is preserved.
+        successful AI answer. The original failure information (and the
+        provider failure matrix) is preserved.
         """
         fallback = self._registry.get_fallback()
         errors = list(failures or [])
@@ -502,6 +608,7 @@ class ProviderManager:
                 "emergency": True,
                 "fallback_exhausted": True,
                 "errors": errors,
+                "provider_matrix": list(matrix or []),
                 "fallback_chain_tried": list(self._fallback_chain),
             },
         )

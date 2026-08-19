@@ -1,15 +1,23 @@
 """
-Provider health/cooldown state machine.
+Provider health/cooldown state machine with a circuit breaker.
 
 Per-provider availability state with a monotonic cooldown clock. The
 ``ProviderManager`` consults this before routing a request and updates it
-after each failure, so a rate-limited or failing provider is temporarily
-skipped instead of being retried forever.
+after each failure/success, so a rate-limited or failing provider is
+temporarily skipped instead of being retried forever.
 
 States:
     healthy      → available
     cooling_down → skipped until the monotonic deadline passes
+    quarantined  → skipped after a run of consecutive failures
     disabled     → skipped until configuration changes (auth failures)
+
+A provider that fails ``QUARANTINE_AFTER_FAILURES`` times in a row is
+quarantined for ``QUARANTINE_SECONDS``. Failures carry different penalties
+(see ``FAILURE_PENALTIES``): a 429 honors the server's retry-after, a timeout
+is short, a malformed/quality failure is longer. After quarantine expires the
+provider automatically re-enters the pool; ``record_success`` clears the
+failure streak so a recovered provider is fully trusted again.
 
 This is NOT a second supervisor — it is pure per-provider routing state
 owned by the ``ProviderManager``.
@@ -31,15 +39,33 @@ AUTH_FAILURES = frozenset({"auth"})
 DEFAULT_COOLDOWN_SECONDS = 60.0
 MAX_COOLDOWN_SECONDS = 300.0
 
+#: Consecutive failures that push a provider into quarantine (circuit open).
+QUARANTINE_AFTER_FAILURES = 5
+#: How long a quarantined provider stays out of the pool.
+QUARANTINE_SECONDS = 600.0
+
+#: Per-failure-category cooldown penalties. ``rate_limited`` is resolved from
+#: the provider's retry-after by the caller; ``request``/``model_not_found``
+#: are permanent config errors and are never cooled down (see the manager).
+FAILURE_PENALTIES: dict[str, float] = {
+    "timeout": 30.0,
+    "server": 60.0,
+    "network": 60.0,
+    "malformed": 120.0,
+    "quality": 120.0,
+    "unknown": 60.0,
+}
+
 
 class ProviderHealthState:
     HEALTHY = "healthy"
     COOLING_DOWN = "cooling_down"
     DISABLED = "disabled"
+    QUARANTINED = "quarantined"
 
 
 class ProviderHealthTracker:
-    """Tracks per-provider availability and concurrency limits.
+    """Tracks per-provider availability, concurrency, and failure streaks.
 
     The cooldown clock uses ``time.monotonic()`` so it is immune to wall-clock
     jumps. Concurrency is enforced with a per-provider ``asyncio.Semaphore``;
@@ -53,6 +79,9 @@ class ProviderHealthTracker:
         "_default_concurrency",
         "_concurrency_overrides",
         "_semaphores",
+        "_consecutive_failures",
+        "_consecutive_successes",
+        "_quarantine_until",
     )
 
     def __init__(
@@ -65,12 +94,18 @@ class ProviderHealthTracker:
         self._default_concurrency = max(1, default_concurrency)
         self._concurrency_overrides = dict(concurrency_overrides or {})
         self._semaphores: dict[str, asyncio.Semaphore] = {}
+        self._consecutive_failures: dict[str, int] = {}
+        self._consecutive_successes: dict[str, int] = {}
+        self._quarantine_until: dict[str, float] = {}
 
     # ── State ──
 
     def state(self, name: str) -> str:
         if name in self._disabled:
             return ProviderHealthState.DISABLED
+        q_until = self._quarantine_until.get(name)
+        if q_until is not None and time.monotonic() < q_until:
+            return ProviderHealthState.QUARANTINED
         until = self._cooldown_until.get(name)
         if until is not None and time.monotonic() < until:
             return ProviderHealthState.COOLING_DOWN
@@ -82,19 +117,86 @@ class ProviderHealthTracker:
     def mark_cooling_down(self, name: str, seconds: float) -> None:
         seconds = min(max(0.0, float(seconds)), MAX_COOLDOWN_SECONDS)
         self._cooldown_until[name] = time.monotonic() + seconds
-        logger.warning("provider-health: '%s' cooling_down for %.1fs", name, seconds)
+        logger.info("PROVIDER_COOLDOWN provider=%s seconds=%.1f", name, seconds)
 
     def mark_disabled(self, name: str) -> None:
         self._disabled.add(name)
         self._cooldown_until.pop(name, None)
+        self._quarantine_until.pop(name, None)
+        self._consecutive_failures.pop(name, None)
         logger.warning("provider-health: '%s' disabled until configuration changes", name)
 
     def mark_healthy(self, name: str) -> None:
+        """Fully reset a provider's health (cooldown, quarantine, streaks)."""
         self._cooldown_until.pop(name, None)
         self._disabled.discard(name)
+        self._quarantine_until.pop(name, None)
+        self._consecutive_failures.pop(name, None)
+        self._consecutive_successes.pop(name, None)
+
+    # ── Circuit breaker / failure recording ──
+
+    def record_failure(
+        self,
+        name: str,
+        category: str = "unknown",
+        retry_after: float | None = None,
+    ) -> str:
+        """Record a failure and apply a category-specific penalty.
+
+        Returns the new state. Repeated consecutive failures quarantine the
+        provider (circuit opens); a single failure only cools it down with the
+        penalty appropriate for the failure category.
+        """
+        self._consecutive_successes.pop(name, None)
+        n = self._consecutive_failures.get(name, 0) + 1
+        self._consecutive_failures[name] = n
+
+        if n >= QUARANTINE_AFTER_FAILURES:
+            self._quarantine_until[name] = time.monotonic() + QUARANTINE_SECONDS
+            self._cooldown_until.pop(name, None)
+            logger.warning(
+                "PROVIDER_QUARANTINED provider=%s failures=%d seconds=%.0f",
+                name, n, QUARANTINE_SECONDS,
+            )
+            return ProviderHealthState.QUARANTINED
+
+        if category == "rate_limited" and retry_after is not None:
+            seconds = float(retry_after)
+        else:
+            seconds = FAILURE_PENALTIES.get(category, DEFAULT_COOLDOWN_SECONDS)
+        self.mark_cooling_down(name, seconds)
+        return ProviderHealthState.COOLING_DOWN
+
+    def record_success(self, name: str) -> None:
+        """Record a successful request — clears failure streaks and quarantine."""
+        was_quarantined = self._is_quarantined_now(name)
+        self._consecutive_failures.pop(name, None)
+        self._consecutive_successes[name] = self._consecutive_successes.get(name, 0) + 1
+        self._cooldown_until.pop(name, None)
+        self._quarantine_until.pop(name, None)
+        self._disabled.discard(name)
+        if was_quarantined:
+            logger.info("PROVIDER_RECOVERED provider=%s", name)
+
+    def _is_quarantined_now(self, name: str) -> bool:
+        until = self._quarantine_until.get(name)
+        return until is not None and time.monotonic() < until
+
+    def consecutive_failures(self, name: str) -> int:
+        return self._consecutive_failures.get(name, 0)
+
+    def consecutive_successes(self, name: str) -> int:
+        return self._consecutive_successes.get(name, 0)
 
     def cooldown_remaining(self, name: str) -> float:
         until = self._cooldown_until.get(name)
+        if until is None:
+            return 0.0
+        return max(0.0, until - time.monotonic())
+
+    def quarantine_remaining(self, name: str) -> float:
+        until = self._quarantine_until.get(name)
         if until is None:
             return 0.0
         return max(0.0, until - time.monotonic())
@@ -113,10 +215,21 @@ class ProviderHealthTracker:
         now = time.monotonic()
         result: dict[str, dict[str, Any]] = {}
         for name, until in self._cooldown_until.items():
-            result[name] = {
-                "state": ProviderHealthState.COOLING_DOWN,
-                "cooldown_remaining_s": round(max(0.0, until - now), 2),
-            }
+            if now < until:
+                entry: dict[str, Any] = {
+                    "state": ProviderHealthState.COOLING_DOWN,
+                    "cooldown_remaining_s": round(max(0.0, until - now), 2),
+                }
+                if self._consecutive_failures.get(name):
+                    entry["consecutive_failures"] = self._consecutive_failures[name]
+                result[name] = entry
+        for name, until in self._quarantine_until.items():
+            if now < until:
+                result[name] = {
+                    "state": ProviderHealthState.QUARANTINED,
+                    "cooldown_remaining_s": round(max(0.0, until - now), 2),
+                    "consecutive_failures": self._consecutive_failures.get(name, 0),
+                }
         for name in self._disabled:
             result[name] = {
                 "state": ProviderHealthState.DISABLED,
