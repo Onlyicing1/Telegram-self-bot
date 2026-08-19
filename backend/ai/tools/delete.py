@@ -99,6 +99,96 @@ class DeleteTool(Tool):
         )
 
 
+class DeleteRepliedTool(Tool):
+    """Delete the specific message the owner replied to (outgoing-only).
+
+    Resolves the target deterministically from the runtime reply context —
+    the AI never asks the owner for a message ID when "this message" is the
+    replied-to message. Deletion follows the project's outgoing-only rule:
+    only the owner's own sent messages can be deleted.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "delete_replied"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Delete the message the owner replied to in the current chat. "
+            "Use this when the owner says 'delete this message' / 'اینو پاک کن' "
+            "while replying to the target message. Outgoing (owner-sent) messages only."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {}
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.DANGEROUS
+
+    @property
+    def safe(self) -> bool:
+        return False
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with deleted message id in data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        reply_meta = context.extra.get("reply_msg") if context.extra else None
+        if not reply_meta:
+            return ToolResult(
+                success=False,
+                message="No replied message to delete. Reply to a message first.",
+            )
+        chat_id = reply_meta.get("chat_id")
+        message_id = reply_meta.get("message_id")
+        if not chat_id or not message_id:
+            return ToolResult(success=False, message="Could not resolve the replied message target.")
+
+        client = None
+        if context.telegram is not None:
+            client = getattr(context.telegram, "client", None)
+        if client is None:
+            client = context.client
+        if client is None:
+            return ToolResult(success=False, message="No Telegram client available.")
+
+        try:
+            msg = await client.get_messages(chat_id, ids=message_id)
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                message=f"Could not fetch the replied message: {exc}",
+            )
+        if msg is None:
+            return ToolResult(success=False, message="Replied message not found.")
+        if not getattr(msg, "out", False):
+            return ToolResult(
+                success=False,
+                message="That message was not sent by the owner, so it cannot be deleted (outgoing-only).",
+            )
+
+        try:
+            await client.delete_messages(chat_id, [message_id])
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                message=f"Delete failed: {exc}",
+                data={"message_id": message_id, "count": 0},
+            )
+        return ToolResult(
+            success=True,
+            message="Deleted the replied message.",
+            data={"message_id": message_id, "count": 1},
+        )
+
+
 class DeleteByIdTool(Tool):
     """Delete all messages from a given message ID onward.
 

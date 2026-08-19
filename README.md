@@ -417,15 +417,18 @@ Edit triggering message with response
    - Returns an `EngineResult`
 5. The handler edits the triggering message with the AI response.
 
-### AI Execution (Nova is an execution interface, not just chat)
+### AI Execution (Nova is an execution agent, not just chat)
 
 When the owner asks Nova to do something, the AI resolves the intent
-into a **real tool call** on the existing execution layer:
+into a **real tool call** on the existing execution layer. The AI never
+touches Telegram directly — it only decides *what action* and *which
+target*, then the existing service performs it:
 
 ```
-Nova, save this                  → SaveTool  → execute_save()
-Nova, deep save this             → SaveTool  → execute_save() (Deep Save)
-Nova, delete the last 5 messages → DeleteTool → delete_service.do_del_n_counts()
+Nova, save this                  → SaveTool        → execute_save()
+Nova, deep save this             → SaveTool        → execute_save() (Deep Save)
+Nova, delete this message        → DeleteRepliedTool → delete the replied message
+Nova, delete the last 5 messages → DeleteTool      → delete_service.do_del_n_counts()
 ```
 
 The execution pipeline is:
@@ -435,24 +438,62 @@ Natural language (Persian or English)
   → AI trigger / handler
   → provider abstraction (active provider → fallback chain)
   → intent resolution (native tool call)
-  → argument validation
+  → argument + target validation
   → real execution (existing service function)
   → real result (success/failure)
   → AI response based on the REAL result
 ```
+
+AI and the Glass UI converge on the **same** service functions
+(`save_service`, `delete_service`, …) — the AI never reimplements a
+feature and never reports fake success.
+
+### Target Resolution
+
+The AI resolves the target from Telegram context instead of asking for
+message IDs when the target is already clear:
+
+| Owner says | Resolved target |
+|---|---|
+| "this message" / "اینو" / "این پیام" while replying | the replied-to message |
+| "the last message" / "پیام آخر" | the most recent message (delete count=1) |
+| "the last N messages" / "N پیام آخر" | count=N |
+| "save this" / "اینو سیو کن" while replying | the replied-to message |
+
+Deletion follows the project's **outgoing-only** rule: only the owner's
+own sent messages can be deleted. If the target genuinely cannot be
+resolved, the AI asks one clarifying question — clarification is the
+exception, not the default.
 
 Persian, informal/colloquial Persian, and mixed Persian-English commands
 are supported. Persian digits (۰-۹) in numeric arguments are normalized
 before validation. Exact values such as usernames, URLs, and quoted text
 are preserved verbatim.
 
-Nova **never** claims an action succeeded unless the underlying service
-actually returned success. If a save/download/delete fails, the AI
-reports the real failure — it never fabricates a confirmation.
+### Request Lifecycle, Timeouts & Concurrency
 
-Destructive actions (delete) resolve a deterministic target/count from
-the request (e.g. `delete` with `count=5`). If the target or count is
-ambiguous, the AI asks for clarification instead of guessing.
+Every AI request is tracked with a single request id through these
+stages and cleaned up in a `finally` block, so `ai_active` always
+returns to 0:
+
+```
+AI_REQUEST_START → AI_CONFIG_LOAD → AI_PROVIDER_RESOLVE
+  → AI_PROMPT_BUILD → AI_PROVIDER_REQUEST_START → AI_PROVIDER_RESPONSE
+  → AI_TOOL_PARSE → AI_TOOL_EXECUTION_START → AI_TOOL_EXECUTION_END
+  → AI_RESPONSE_SEND_START → AI_RESPONSE_SEND_END → AI_REQUEST_END
+```
+
+- Each AI request is bounded by a 60 s `wait_for`; each provider HTTP
+  request is bounded by a 30 s guard.
+- Concurrency is bounded (default 4; override with
+  `AI_MAX_CONCURRENCY`). Requests beyond the limit fail cleanly rather
+  than piling up.
+- Request telemetry (`last_request_at` / `last_latency_ms`) is a
+  fire-and-forget **targeted update** — normal inference never rewrites
+  the owner's AI configuration.
+- A provider failure, timeout, empty output, parsing failure, tool
+  failure, or Telegram delivery failure all result in a controlled error
+  response and cleanup of the request state.
 
 ### Provider Selection
 

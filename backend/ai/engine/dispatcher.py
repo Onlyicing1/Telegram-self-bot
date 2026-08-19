@@ -125,6 +125,24 @@ class Dispatcher:
         errors: list[str] = []
         metadata: dict[str, Any] = {"stages": []}
 
+        rid = getattr(request, "request_id", "") or ""
+
+        def _stage(stage: str) -> None:
+            if not rid:
+                return
+            try:
+                from backend.ai import diagnostics as ai_diag
+                ai_diag.set_stage(rid, stage)
+            except Exception:
+                pass
+
+        def _mark_success(stage: str) -> None:
+            try:
+                from backend.ai import diagnostics as ai_diag
+                ai_diag.mark_success(stage)
+            except Exception:
+                pass
+
         safe_call(self._hooks, "before_execution", request)
 
         # Native tool definitions are computed once and passed to every
@@ -154,6 +172,8 @@ class Dispatcher:
 
         # ── Stage 2: Prompt Builder ──
         try:
+            _stage("PROMPT_BUILD")
+            logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
             prompt_package = self._prompt_builder.build(self._build_context(request, session))
             # Inject tool schemas into the prompt if a registry is available
             if self._tool_registry and not self._tool_registry.is_empty():
@@ -176,7 +196,14 @@ class Dispatcher:
         # ── Stage 4: Provider + Tool Loop ──
         try:
             messages = self._build_messages(prompt_package)
+            _stage("PROVIDER_REQUEST")
+            logger.info("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
             response: ProviderResponse = await self._provider_manager.chat(messages, **chat_kwargs)
+            _mark_success("PROVIDER_REQUEST")
+            logger.info(
+                "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
+                rid or "-", response.provider_name or provider_name, response.success,
+            )
             safe_call(self._hooks, "after_provider", response)
             metadata["stages"].append("provider")
         except Exception as exc:  # noqa: BLE001
@@ -209,6 +236,13 @@ class Dispatcher:
                 break
 
             try:
+                _stage("TOOL_PARSE")
+                logger.info(
+                    "AI_TOOL_PARSE id=%s tools=%s",
+                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                )
+                _stage("TOOL_EXECUTION")
+                logger.info("AI_TOOL_EXECUTION_START id=%s", rid or "-")
                 per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
                     response.tool_calls,
@@ -217,6 +251,7 @@ class Dispatcher:
                     status_callback=status_callback,
                     context_override=per_request_ctx,
                 )
+                logger.info("AI_TOOL_EXECUTION_END id=%s results=%d", rid or "-", len(exec_results))
                 for er in exec_results:
                     all_tool_results.append(er.as_dict())
                     # Record EVERY tool outcome (success or failure) so tool
@@ -238,7 +273,14 @@ class Dispatcher:
 
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
             try:
+                _stage("PROVIDER_REQUEST")
+                logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", round_num + 2)
                 cont_response: ProviderResponse = await self._provider_manager.chat(continuation_messages, **chat_kwargs)
+                _mark_success("PROVIDER_REQUEST")
+                logger.info(
+                    "AI_PROVIDER_RESPONSE id=%s round=%d success=%s",
+                    rid or "-", round_num + 2, cont_response.success,
+                )
                 safe_call(self._hooks, "after_provider", cont_response)
                 metadata["stages"].append(f"provider_continuation_{round_num + 1}")
             except Exception as exc:  # noqa: BLE001

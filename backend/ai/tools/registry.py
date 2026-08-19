@@ -121,7 +121,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     No other file needs to change.
     """
     from backend.ai.tools.save import SaveTool
-    from backend.ai.tools.delete import DeleteTool, DeleteByIdTool
+    from backend.ai.tools.delete import DeleteTool, DeleteByIdTool, DeleteRepliedTool
     from backend.ai.tools.bio import (
         BioSetTemplateTool, BioSetTextTool, BioSetMoodTool,
         BioOnTool, BioOffTool, BioShowTool,
@@ -149,6 +149,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(SaveTool(context))
     registry.register(DeleteTool(context))
     registry.register(DeleteByIdTool(context))
+    registry.register(DeleteRepliedTool(context))
     registry.register(BioSetTemplateTool(context))
     registry.register(BioSetTextTool(context))
     registry.register(BioSetMoodTool(context))

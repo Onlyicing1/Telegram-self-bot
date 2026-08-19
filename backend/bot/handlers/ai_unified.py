@@ -36,6 +36,7 @@ Oversized responses are safely split and delivered in chunks.
 """
 import asyncio
 import logging
+import os
 import time
 
 from telethon import events
@@ -53,6 +54,25 @@ _tz_str: str = "UTC"
 _trigger_cache: dict[str, str] = {"en": "", "fa": "", "ts": 0.0}
 _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
+_AI_MAX_CONCURRENCY = 4
+_ai_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_concurrency_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide AI concurrency limiter.
+
+    Bounds how many AI requests can run at once so a burst of messages
+    cannot accumulate unbounded ``ai_active`` requests. Overridable via
+    the ``AI_MAX_CONCURRENCY`` environment variable.
+    """
+    global _ai_semaphore
+    if _ai_semaphore is None:
+        try:
+            limit = int(os.getenv("AI_MAX_CONCURRENCY", str(_AI_MAX_CONCURRENCY)))
+        except (TypeError, ValueError):
+            limit = _AI_MAX_CONCURRENCY
+        _ai_semaphore = asyncio.Semaphore(max(1, limit))
+    return _ai_semaphore
 
 
 def configure(engine, owner_id: int, tz_str: str) -> None:
@@ -310,9 +330,18 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
 
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                       tz_str: str, reply_context=None) -> None:
-    """Execute the AI pipeline and deliver the result via centralized delivery."""
+    """Execute the AI pipeline and deliver the result via centralized delivery.
+
+    A single request id tracks the whole lifecycle, and ``register_end`` runs
+    in a ``finally`` block so ``ai_active`` can never leak — whether the
+    provider times out, a tool fails, or Telegram delivery raises.
+    """
     from backend.ai.session.request import AIRequest
     from backend.ai.conversation.context_builder import ReplyContext
+
+    rid = ai_diag.new_request_id()
+    ai_diag.register_start(rid, owner_id=owner_id)
+    logger.info("AI_REQUEST_START id=%s owner=%d", rid, owner_id)
 
     engine = _get_engine()
     if engine is None:
@@ -320,50 +349,75 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             await event.edit(_format_error(prompt_text, trigger_word, "AI engine not available."))
         except Exception as exc:
             logger.error("AI handler: failed to edit error state (no engine): %s", exc)
+        ai_diag.register_end(rid)
+        logger.info("AI_REQUEST_END id=%s", rid)
+        return
+
+    sem = _get_concurrency_semaphore()
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=_AI_TIMEOUT)
+    except asyncio.TimeoutError:
+        ai_diag.register_end(rid)
+        logger.warning("AI handler: rejecting request id=%s (concurrency limit reached)", rid)
+        try:
+            await event.edit(_format_error(
+                prompt_text, trigger_word,
+                "Too many AI requests in progress. Please try again shortly.",
+            ))
+        except Exception:
+            pass
         return
 
     trigger_label = trigger_word
     display_prompt = prompt_text
 
-    rid = ai_diag.new_request_id()
-    ai_diag.register_start(rid, owner_id=owner_id)
-    logger.info("AI_REQUEST_START id=%s owner=%d mode=trigger", rid, owner_id)
+    try:
+        ai_diag.set_stage(rid, "CONFIG_LOAD")
+        logger.info("AI_CONFIG_LOAD_START id=%s", rid)
+        await _restore_config(owner_id)
+        ai_diag.mark_success("CONFIG_LOAD")
+        logger.info("AI_CONFIG_LOAD_END id=%s", rid)
 
-    ai_diag.set_stage(rid, "CONFIG_LOAD")
-    logger.info("AI_CONFIG_LOAD_START id=%s", rid)
-    await _restore_config(owner_id)
-    ai_diag.mark_success("CONFIG_LOAD")
-    logger.info("AI_CONFIG_LOAD_END id=%s", rid)
-
-    session_id = f"owner-{owner_id}"
-    request = AIRequest(
-        session_id=session_id,
-        user_message=prompt_text,
-        owner_id=owner_id,
-        chat_id=event.chat_id,
-        message_id=event.message.id,
-        reply_context=reply_context or ReplyContext(),
-        timezone=tz_str,
-        request_id=rid,
-    )
-
-    async def _status_callback(status: str) -> None:
         try:
-            await event.edit(
-                f"{display_prompt}\n"
-                f"────────────\n"
-                f"🤖 {trigger_label}\n"
-                f"{status}"
-            )
+            pm = engine.provider_manager
+            provider_name = pm.get_active_name()
+            model = ""
+            try:
+                model = pm.get_active().config.default_model or ""
+            except Exception:
+                pass
+            logger.info("AI_PROVIDER_RESOLVE id=%s provider=%s model=%s", rid, provider_name, model)
         except Exception as exc:
-            logger.debug("AI handler: status edit failed: %s", exc)
+            logger.debug("AI handler: provider resolve log failed: %s", exc)
 
-    try:
-        await event.edit(_format_thinking(display_prompt, trigger_label))
-    except Exception as exc:
-        logger.warning("AI handler: failed to edit thinking state: %s", exc)
+        session_id = f"owner-{owner_id}"
+        request = AIRequest(
+            session_id=session_id,
+            user_message=prompt_text,
+            owner_id=owner_id,
+            chat_id=event.chat_id,
+            message_id=event.message.id,
+            reply_context=reply_context or ReplyContext(),
+            timezone=tz_str,
+            request_id=rid,
+        )
 
-    try:
+        async def _status_callback(status: str) -> None:
+            try:
+                await event.edit(
+                    f"{display_prompt}\n"
+                    f"────────────\n"
+                    f"🤖 {trigger_label}\n"
+                    f"{status}"
+                )
+            except Exception as exc:
+                logger.debug("AI handler: status edit failed: %s", exc)
+
+        try:
+            await event.edit(_format_thinking(display_prompt, trigger_label))
+        except Exception as exc:
+            logger.warning("AI handler: failed to edit thinking state: %s", exc)
+
         result = await asyncio.wait_for(
             engine.execute(request, status_callback=_status_callback),
             timeout=_AI_TIMEOUT,
@@ -371,20 +425,23 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         record_event("ai", "execute", 0, "SUCCESS" if result.success else "FAILED",
                      f"provider={result.provider}")
 
+        # Request telemetry is fire-and-forget and writes only the latency
+        # columns — it must never rewrite the full AI config or block the
+        # response path during normal inference.
         if result.success:
             try:
                 from backend.ai.config_store import record_request
-                ai_diag.set_stage(rid, "DB_OPERATION")
-                logger.info("AI_DB_OPERATION_START id=%s", rid)
-                await record_request(owner_id, result.latency * 1000)
-                ai_diag.mark_success("DB_OPERATION")
-                logger.info("AI_DB_OPERATION_END id=%s", rid)
+                from backend.runtime.task_guard import guarded_create_task
+                guarded_create_task(
+                    record_request(owner_id, result.latency * 1000),
+                    name="ai:record-request",
+                )
             except Exception as exc:
-                logger.warning("AI handler: record_request failed: %s", exc)
+                logger.warning("AI handler: scheduling record_request failed: %s", exc)
 
         if result.success and result.response:
             ai_diag.set_stage(rid, "TELEGRAM_REPLY")
-            logger.info("AI_TELEGRAM_REPLY_START id=%s", rid)
+            logger.info("AI_RESPONSE_SEND_START id=%s", rid)
             from backend.ai.tools.delivery import deliver_response
             response_text = result.response
             if result.metadata.get("tool_rounds_exhausted"):
@@ -399,7 +456,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             if delivery_result.success:
                 ai_diag.mark_success("TELEGRAM_REPLY")
             logger.info(
-                "AI_TELEGRAM_REPLY_END id=%s chunks=%d/%d",
+                "AI_RESPONSE_SEND_END id=%s chunks=%d/%d",
                 rid, delivery_result.chunks_delivered, delivery_result.total_chunks,
             )
             from backend.ai.context.reply_resolver import get_resolver
@@ -442,9 +499,8 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 logger.warning("AI handler: failed to edit no-response error: %s", exc)
 
     except asyncio.TimeoutError:
-        ai_diag.register_end(rid)
         trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s", rid=rid)
-        logger.error("AI handler: request timed out after %ss", _AI_TIMEOUT)
+        logger.error("AI handler: request timed out after %ss (id=%s)", _AI_TIMEOUT, rid)
         error_text = _format_error(
             display_prompt, trigger_label,
             f"Request timed out after {int(_AI_TIMEOUT)} seconds.",
@@ -455,18 +511,21 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             logger.error("AI handler: failed to edit timeout error: %s", exc)
 
     except asyncio.CancelledError:
-        ai_diag.register_end(rid)
         raise
 
     except Exception as exc:
-        ai_diag.register_end(rid)
-        logger.exception("AI handler error: %s", exc)
+        logger.exception("AI handler error: %s (id=%s)", exc, rid)
         trace("AI_HANDLER_ERROR", error=str(exc))
         error_text = _format_error(display_prompt, trigger_label, _humanize_error(str(exc)))
         try:
             await event.edit(error_text)
         except Exception as edit_exc:
             logger.error("AI handler: failed to edit error state: %s", edit_exc)
+
+    finally:
+        ai_diag.register_end(rid)
+        sem.release()
+        logger.info("AI_REQUEST_END id=%s", rid)
 
 
 def register(client, owner_id: int, tz_str: str):

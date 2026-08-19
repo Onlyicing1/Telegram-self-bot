@@ -154,12 +154,36 @@ async def update_setting(owner_id: int, key: str, value: Any) -> bool:
     return await save_config(owner_id, config)
 
 
+def _record_request_sync(owner_id: int, latency_ms: float) -> bool:
+    db = _get_db()
+    if not db:
+        return False
+    payload = {
+        "last_request_at": datetime.now(timezone.utc).isoformat(),
+        "last_latency_ms": latency_ms,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        db.table("ai_config").update(payload).eq("owner_id", owner_id).execute()
+        return True
+    except Exception as exc:
+        logger.warning("[AI_CONFIG] record_request DB update failed for owner_id=%s: %s", owner_id, exc)
+        return False
+
+
 async def record_request(owner_id: int, latency_ms: float) -> bool:
-    """Record a successful request with its latency."""
-    config = await get_config(owner_id)
-    config["last_request_at"] = datetime.now(timezone.utc).isoformat()
-    config["last_latency_ms"] = latency_ms
-    return await save_config(owner_id, config)
+    """Record request telemetry via a targeted update (NOT a full config rewrite).
+
+    Normal inference must never rewrite the user's AI configuration (provider,
+    model, system prompt, triggers). This writes only the latency stats columns
+    so the dashboard still sees request activity without persisting config on
+    every AI message. If the owner has no config row yet, this is a no-op.
+    """
+    try:
+        return await _run_sync(_record_request_sync, owner_id, latency_ms)
+    except Exception as exc:
+        logger.warning("[AI_CONFIG] record_request failed for owner_id=%s: %s", owner_id, exc)
+        return False
 
 
 async def is_configured(owner_id: int) -> bool:
