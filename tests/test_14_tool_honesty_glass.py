@@ -45,17 +45,31 @@ def test_result_from_service_preserves_message_and_data():
 
 
 class FakeDeleteClient:
+    """Fake Telethon client with self-owned messages (sender == me)."""
+
+    ME_ID = 111
+
     def __init__(self, ids=(), fail_on_delete=False):
         self.ids = list(ids)
         self.deleted = []
         self.fail_on_delete = fail_on_delete
+        self.me = type("Me", (), {"id": self.ME_ID})()
+
+    @staticmethod
+    def _msg(mid):
+        return type("M", (), {"id": mid, "out": True, "sender_id": FakeDeleteClient.ME_ID})()
 
     async def iter_messages(self, chat_id, **kwargs):
         limit = kwargs.get("limit")
         for mid in self.ids:
-            yield type("M", (), {"id": mid, "out": True})()
+            yield self._msg(mid)
             if limit is not None and len(self.deleted) + 1 >= limit:
                 break
+
+    async def get_messages(self, chat_id, ids):
+        if isinstance(ids, (list, tuple)):
+            return [self._msg(mid) for mid in ids]
+        return self._msg(ids)
 
     async def delete_messages(self, chat_id, ids):
         if self.fail_on_delete:

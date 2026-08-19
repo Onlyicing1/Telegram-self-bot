@@ -188,12 +188,24 @@ class DeleteRepliedTool(Tool):
                 message="That message was not sent by the owner, so it cannot be deleted (outgoing-only).",
             )
 
+        from backend.services import delete_service
+
         try:
-            await client.delete_messages(chat_id, [message_id])
+            deleted, _rejected = await delete_service.delete_verified_self_messages(
+                client, chat_id, [message_id]
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
                 message=f"Delete failed: {exc}",
+                data={"message_id": message_id, "count": 0},
+            )
+        if not deleted:
+            return ToolResult(
+                success=False,
+                message=(
+                    "That message could not be verified as outgoing, so it was not deleted."
+                ),
                 data={"message_id": message_id, "count": 0},
             )
         return ToolResult(
@@ -363,12 +375,25 @@ class DeleteMessageByIdTool(Tool):
                 ),
             )
 
+        from backend.services import delete_service
+
         try:
-            await client.delete_messages(chat_id, [message_id])
+            deleted, _rejected = await delete_service.delete_verified_self_messages(
+                client, chat_id, [message_id]
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
                 message=f"Delete failed: {exc}",
+                data={"message_id": message_id, "count": 0},
+            )
+        if not deleted:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Message {message_id} could not be verified as outgoing, "
+                    "so it was not deleted."
+                ),
                 data={"message_id": message_id, "count": 0},
             )
         return ToolResult(

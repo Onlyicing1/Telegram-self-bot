@@ -18,16 +18,22 @@ async def test_delete_replied_deletes_owner_message():
     from backend.ai.tools.delete import DeleteRepliedTool
 
     class FakeMessage:
+        id = 55
         out = True
+        sender_id = 111
 
     class FakeClient:
         def __init__(self):
             self.deleted = []
             self.fetched = FakeMessage()
+            self.me = type("Me", (), {"id": 111})()
 
         async def get_messages(self, chat_id, ids):
             assert chat_id == -100
-            assert ids == 55
+            if isinstance(ids, (list, tuple)):
+                assert ids == [55]
+            else:
+                assert ids == 55
             return self.fetched
 
         async def delete_messages(self, chat_id, message_ids):
@@ -62,10 +68,12 @@ async def test_delete_replied_refuses_incoming_message():
 
     class FakeMessage:
         out = False
+        sender_id = 222
 
     class FakeClient:
         def __init__(self):
             self.deleted = []
+            self.me = type("Me", (), {"id": 111})()
 
         async def get_messages(self, chat_id, ids):
             return FakeMessage()

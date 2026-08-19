@@ -210,11 +210,14 @@ async def test_delete_message_by_id_deletes_outgoing():
     from backend.ai.tools.delete import DeleteMessageByIdTool
 
     class FakeMessage:
+        id = 77
         out = True
+        sender_id = 111
 
     class FakeClient:
         def __init__(self):
             self.deleted = []
+            self.me = type("Me", (), {"id": 111})()
 
         async def get_messages(self, chat_id, ids):
             return FakeMessage()
@@ -339,19 +342,24 @@ async def test_delete_messages_by_ids_only_deletes_validated_outgoing():
     from backend.ai.tools.semantic import DeleteMessagesByIdsTool
 
     class FakeMessage:
-        def __init__(self, out):
+        def __init__(self, mid, out, sender_id):
+            self.id = mid
             self.out = out
+            self.sender_id = sender_id
 
     class FakeClient:
         def __init__(self):
             self.deleted = []
             self.messages = {
-                1: FakeMessage(True),
-                2: FakeMessage(False),  # incoming
-                3: None,                # not found / invented
+                1: FakeMessage(1, True, 111),   # self-owned → deletable
+                2: FakeMessage(2, False, 222),  # incoming
+                3: None,                        # not found / invented
             }
+            self.me = type("Me", (), {"id": 111})()
 
         async def get_messages(self, chat_id, ids):
+            if isinstance(ids, (list, tuple)):
+                return [self.messages.get(mid) for mid in ids]
             return self.messages.get(ids)
 
         async def delete_messages(self, chat_id, message_ids):

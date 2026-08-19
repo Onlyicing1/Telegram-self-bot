@@ -7,12 +7,115 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_me_id(client) -> int | None:
+    """Best-effort resolution of the authenticated account's numeric user ID.
+
+    Uses Telethon's cached ``client.me`` when available and falls back to a
+    ``get_me()`` RPC. Returns ``None`` when the identity cannot be resolved;
+    ownership verification then relies on the server-authoritative ``out``
+    flag plus a present ``sender_id`` (both are required — see
+    :func:`_is_self_owned`).
+    """
+    try:
+        me = getattr(client, "me", None)
+        me_id = getattr(me, "id", None) if me is not None else None
+        if me_id is None:
+            me = await client.get_me()
+            me_id = getattr(me, "id", None)
+        return me_id
+    except Exception:
+        return None
+
+
+def _is_self_owned(msg, me_id: int | None) -> bool:
+    """True only when ``msg`` is verified as sent by the authenticated account.
+
+    Fail-closed: a missing message, a false ``out`` flag, a missing
+    ``sender_id``, or a sender that is not the connected account all reject.
+    ``out`` is server-authoritative Telegram metadata (only the signed-in
+    account's messages carry it), and ``sender_id`` is compared against the
+    resolved account ID when available.
+    """
+    if msg is None:
+        return False
+    if not getattr(msg, "out", False):
+        return False
+    sender_id = getattr(msg, "sender_id", None)
+    if sender_id is None:
+        return False
+    if me_id is not None and sender_id != me_id:
+        return False
+    return True
+
+
+async def delete_verified_self_messages(
+    client, chat_id, message_ids: list[int]
+) -> tuple[list[int], list[int]]:
+    """Delete ONLY messages verified as belonging to the authenticated account.
+
+    Single authoritative chokepoint for every chat deletion in the Delete
+    system. Each candidate ID is re-fetched from the actual chat immediately
+    before deletion and ownership is verified against Telegram message
+    metadata (server ``out`` flag + sender ID vs the connected account) via
+    :func:`_is_self_owned`. Fail-closed: any candidate whose ownership cannot
+    be verified is rejected and never reaches ``client.delete_messages``.
+
+    Returns ``(deleted_ids, rejected_ids)``. Per-message ownership problems
+    never raise; transport failures propagate to the caller so failures stay
+    honest.
+    """
+    ids = [i for i in message_ids if isinstance(i, int) and i > 0]
+    rejected: list[int] = [i for i in message_ids if not (isinstance(i, int) and i > 0)]
+    if not ids:
+        return [], rejected
+
+    me_id = await _resolve_me_id(client)
+    verified: list[int] = []
+    chunk = 100
+    for start in range(0, len(ids), chunk):
+        part = ids[start:start + chunk]
+        try:
+            fetched = await client.get_messages(chat_id, ids=part)
+        except Exception as exc:
+            logger.warning(
+                "delete_verified_self_messages: fetch failed chat=%s ids=%s: %s",
+                chat_id, part, exc,
+            )
+            rejected.extend(part)
+            continue
+        if fetched is None:
+            rejected.extend(part)
+            continue
+        if not isinstance(fetched, list):
+            fetched = [fetched]
+        by_id: dict[int, Any] = {}
+        for msg in fetched:
+            if msg is None:
+                continue
+            mid = getattr(msg, "id", None)
+            if mid is not None:
+                by_id[mid] = msg
+        for mid in part:
+            if _is_self_owned(by_id.get(mid), me_id):
+                verified.append(mid)
+            else:
+                rejected.append(mid)
+
+    deleted: list[int] = []
+    for start in range(0, len(verified), chunk):
+        batch = verified[start:start + chunk]
+        await client.delete_messages(chat_id, batch)
+        deleted.extend(batch)
+    return deleted, rejected
 
 
 async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | None]:
@@ -32,11 +135,9 @@ async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | Non
             msg_ids.append(msg.id)
             if len(msg_ids) >= n:
                 break
-        deleted = msg_ids[:n]
-        if deleted:
-            await client.delete_messages(chat_id, deleted)
+        deleted_ids, _rejected = await delete_verified_self_messages(client, chat_id, msg_ids[:n])
         record_event("delete", "del n", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
-        return len(deleted), None
+        return len(deleted_ids), None
     except Exception as exc:
         logger.error("del n failed: %s", exc)
         record_event("delete", "del n", 0, "ERROR", str(exc))
@@ -67,15 +168,15 @@ async def do_del_last_n_real(
             recent.append(msg)
             if len(recent) >= n:
                 break
-        deletable = [m.id for m in recent if getattr(m, "out", False)]
-        if deletable:
-            await client.delete_messages(chat_id, deletable)
+        deleted_ids, _rejected = await delete_verified_self_messages(
+            client, chat_id, [m.id for m in recent]
+        )
         record_event(
             "delete", "del last n real",
             (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS",
-            f"{len(deletable)}/{len(recent)}",
+            f"{len(deleted_ids)}/{len(recent)}",
         )
-        return len(recent), len(deletable), None
+        return len(recent), len(deleted_ids), None
     except Exception as exc:
         logger.error("del last n real failed: %s", exc)
         record_event("delete", "del last n real", 0, "ERROR", str(exc))
@@ -95,12 +196,12 @@ async def do_del_id_counts(client, chat_id, start_id: int) -> tuple[int, Excepti
         async for msg in client.iter_messages(chat_id, min_id=start_id - 1, from_user="me"):
             batch.append(msg.id)
             if len(batch) >= settings_service.delete_batch_size():
-                await client.delete_messages(chat_id, batch)
-                total += len(batch)
+                deleted_ids, _rejected = await delete_verified_self_messages(client, chat_id, batch)
+                total += len(deleted_ids)
                 batch = []
         if batch:
-            await client.delete_messages(chat_id, batch)
-            total += len(batch)
+            deleted_ids, _rejected = await delete_verified_self_messages(client, chat_id, batch)
+            total += len(deleted_ids)
         record_event("delete", "del id", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return total, None
     except Exception as exc:

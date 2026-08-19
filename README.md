@@ -620,6 +620,20 @@ user message + provider output
   (outgoing-only) before deleting. Invented/foreign/non-outgoing IDs are
   skipped — a vague request never escalates into an unbounded or
   arbitrary delete.
+- **Self-only deletion is enforced in code, not prompt.** Every AI-driven
+  chat deletion (and every `delete_service` entry point used by the
+  Glass UI) funnels through
+  `delete_service.delete_verified_self_messages` — the single
+  ownership-verification chokepoint immediately before the Telegram
+  delete API. Each candidate ID is re-fetched from the actual chat and
+  must carry the server-side `out` flag AND a sender ID that matches the
+  authenticated account (`client.me`/`get_me`). Fail-closed: a missing
+  message, missing/unknown sender, or a sender that is not the self
+  account is rejected and never reaches `client.delete_messages`. Ranges
+  (last-N, from-ID, time windows, "all messages", semantic targets)
+  define the candidate area; ownership verification defines what may
+  actually be deleted. A replied-to message or user/AI-supplied ID is
+  only ever a reference — it grants no deletion right on its own.
 - `send`, `clean_chat`, and `remember` are recognized but deliberately
   return "unsupported" because no existing executor is wired — the AI
   never fabricates a result.

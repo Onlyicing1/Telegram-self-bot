@@ -260,25 +260,24 @@ class DeleteMessagesByIdsTool(Tool):
         if not chat_id:
             return ToolResult(success=False, message="No chat context available.")
 
+        from backend.services import delete_service
+
         client = _client(context)
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
 
-        valid: list[int] = []
-        rejected: list[int] = []
-        for message_id in ids[:_MAX_DELETE_IDS]:
-            try:
-                msg = await client.get_messages(chat_id, ids=message_id)
-            except Exception as exc:
-                logger.warning("delete_messages_by_ids: fetch %s failed: %s", message_id, exc)
-                rejected.append(message_id)
-                continue
-            if msg is not None and getattr(msg, "out", False):
-                valid.append(message_id)
-            else:
-                rejected.append(message_id)
+        try:
+            deleted, rejected = await delete_service.delete_verified_self_messages(
+                client, chat_id, ids[:_MAX_DELETE_IDS]
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                message=f"Delete failed: {exc}",
+                data={"deleted": [], "rejected": ids},
+            )
 
-        if not valid:
+        if not deleted:
             return ToolResult(
                 success=False,
                 message=(
@@ -288,17 +287,8 @@ class DeleteMessagesByIdsTool(Tool):
                 data={"deleted": [], "rejected": rejected},
             )
 
-        try:
-            await client.delete_messages(chat_id, valid)
-        except Exception as exc:
-            return ToolResult(
-                success=False,
-                message=f"Delete failed: {exc}",
-                data={"deleted": [], "rejected": rejected},
-            )
-
         return ToolResult(
             success=True,
-            message=f"Deleted {len(valid)} outgoing message(s).",
-            data={"deleted": valid, "rejected": rejected},
+            message=f"Deleted {len(deleted)} outgoing message(s).",
+            data={"deleted": deleted, "rejected": rejected},
         )

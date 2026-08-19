@@ -168,22 +168,36 @@ async def test_delete_last_n_includes_all_participants_and_request_message():
         def __init__(self, mid, out):
             self.id = mid
             self.out = out
+            self.sender_id = 111 if out else 222
 
     class FakeClient:
         def __init__(self):
             self.deleted = []
+            self.messages = {
+                100: FakeMessage(100, True),
+                99: FakeMessage(99, True),
+                98: FakeMessage(98, False),
+                97: FakeMessage(97, True),
+                96: FakeMessage(96, False),
+            }
+            self.me = type("Me", (), {"id": 111})()
 
         async def iter_messages(self, chat_id, limit):
             # Telethon returns newest-first; the request message (100) is newest.
             newest_first = [
-                FakeMessage(100, True),   # the owner's "delete last N" request
-                FakeMessage(99, True),    # Nova's own generated/edited message
-                FakeMessage(98, False),   # another participant
-                FakeMessage(97, True),    # owner
-                FakeMessage(96, False),   # another participant
+                self.messages[100],  # the owner's "delete last N" request
+                self.messages[99],   # Nova's own generated/edited message
+                self.messages[98],   # another participant
+                self.messages[97],   # owner
+                self.messages[96],   # another participant
             ]
             for m in newest_first[:limit]:
                 yield m
+
+        async def get_messages(self, chat_id, ids):
+            if isinstance(ids, (list, tuple)):
+                return [self.messages.get(mid) for mid in ids]
+            return self.messages.get(ids)
 
         async def delete_messages(self, chat_id, ids):
             self.deleted.extend(ids)
