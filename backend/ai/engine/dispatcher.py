@@ -26,8 +26,10 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 
+from backend.ai.actions import parse_action_text
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
@@ -209,6 +211,22 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider", start, errors, metadata)
 
+        # ── Structured-action fallback: model prose/JSON → tool calls ──
+        # When the provider does not emit a native tool call, try the
+        # JSON-schema structured-output path. An executable intent becomes
+        # concrete tool calls for the SAME ToolExecutor; clarification and
+        # rejection outcomes become a deterministic text response.
+        structured_action = False
+        if response.success and not response.tool_calls:
+            response = self._apply_structured_action(response, rid)
+            structured_action = bool(response.tool_calls)
+            if response.metadata.get("ai_action"):
+                metadata["ai_action"] = {
+                    "action": response.metadata.get("ai_action"),
+                    "kind": response.metadata.get("ai_action_kind"),
+                    "target": response.metadata.get("ai_action_target"),
+                }
+
         all_tool_results: list[dict[str, Any]] = []
         # Usage accumulation: initial response + every continuation round.
         # Nothing is double-counted and the initial usage is never lost.
@@ -243,6 +261,10 @@ class Dispatcher:
                 )
                 _stage("TOOL_EXECUTION")
                 logger.info("AI_TOOL_EXECUTION_START id=%s", rid or "-")
+                logger.info(
+                    "AI_EXECUTION_START id=%s tools=%s",
+                    rid or "-", [tc.get("name", "") for tc in response.tool_calls],
+                )
                 per_request_ctx = self._build_tool_context(request)
                 exec_results = await self._tool_executor.execute_calls(
                     response.tool_calls,
@@ -253,6 +275,16 @@ class Dispatcher:
                 )
                 logger.info("AI_TOOL_EXECUTION_END id=%s results=%d", rid or "-", len(exec_results))
                 for er in exec_results:
+                    if er.success:
+                        logger.info(
+                            "AI_EXECUTION_RESULT id=%s action=%s success=True",
+                            rid or "-", er.tool_name,
+                        )
+                    else:
+                        logger.info(
+                            "AI_EXECUTION_ERROR id=%s action=%s error=%s",
+                            rid or "-", er.tool_name, er.error or er.message,
+                        )
                     all_tool_results.append(er.as_dict())
                     # Record EVERY tool outcome (success or failure) so tool
                     # failures never silently disappear from history.
@@ -267,6 +299,12 @@ class Dispatcher:
                 metadata["tool_rounds"] = round_num + 1
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
                 tool_rounds_executed = round_num + 1
+
+                # The structured-action path reports the real tool result
+                # directly — it never needs a continuation provider round.
+                if structured_action:
+                    response = replace(response, tool_calls=[], text="")
+                    break
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
                 break
@@ -311,6 +349,15 @@ class Dispatcher:
 
         if accumulated_finish_reasons:
             metadata["continuation_finish_reasons"] = accumulated_finish_reasons
+
+        # ── Real-result response: never fabricate success ──
+        # If tools executed but no final text was produced (the structured
+        # path, or a continuation round that returned empty), build the
+        # response from the ACTUAL tool results.
+        if all_tool_results and not response.text:
+            summary = self._summarize_tool_results(all_tool_results)
+            if summary:
+                response = replace(response, text=summary)
 
         # ── Stage 5: Conversation Update ──
         try:
@@ -432,6 +479,84 @@ class Dispatcher:
             client=base.client,
             extra=extra,
         )
+
+    def _apply_structured_action(
+        self,
+        response: ProviderResponse,
+        rid: str = "",
+    ) -> ProviderResponse:
+        """Bridge prose/JSON model output into the existing tool executor.
+
+        When the provider did not emit a native tool call, apply the
+        JSON-schema structured-output fallback: parse the text as an action
+        object, validate it locally, resolve the target into concrete tool
+        calls, and hand them to the SAME ToolExecutor. Clarification and
+        rejection outcomes become a deterministic text response — the model's
+        output is never trusted as executable code.
+        """
+        text = (response.text or "").strip()
+        if not text:
+            return response
+
+        logger.info("AI_ACTION_PARSE_START id=%s", rid or "-")
+        result = parse_action_text(text)
+        if result.kind == "conversational":
+            logger.info("AI_ACTION_PARSE_RESULT id=%s action=none", rid or "-")
+            return response
+        logger.info(
+            "AI_ACTION_PARSE_RESULT id=%s action=%s count=%s",
+            rid or "-",
+            result.action or result.kind,
+            result.count if result.count is not None else "",
+        )
+
+        meta = dict(response.metadata or {})
+        meta["ai_action"] = result.action
+        meta["ai_action_kind"] = result.kind
+        meta["ai_action_target"] = result.target
+
+        if result.kind == "clarify":
+            logger.info("AI_ACTION_VALIDATION id=%s result=clarify", rid or "-")
+            message = result.reason or "Could you clarify what you'd like me to do?"
+            return replace(response, text=message, metadata=meta)
+
+        if result.kind == "invalid":
+            logger.info(
+                "AI_ACTION_VALIDATION id=%s result=rejected error=%s",
+                rid or "-", result.error,
+            )
+            return replace(response, text=f"❌ {result.error}", metadata=meta)
+
+        if result.kind == "unsupported":
+            logger.info(
+                "AI_ACTION_VALIDATION id=%s result=unsupported action=%s",
+                rid or "-", result.action,
+            )
+            return replace(response, text=f"❌ Unsupported action: {result.action}", metadata=meta)
+
+        logger.info("AI_ACTION_VALIDATION id=%s result=ok action=%s", rid or "-", result.action)
+        logger.info(
+            "AI_TARGET_RESOLUTION id=%s action=%s target=%s tools=%s",
+            rid or "-", result.action, result.target,
+            [tc.get("name") for tc in result.tool_calls],
+        )
+        return replace(response, tool_calls=list(result.tool_calls), text="", metadata=meta)
+
+    @staticmethod
+    def _summarize_tool_results(results: list[dict[str, Any]]) -> str:
+        """Build a concise response from the REAL tool results.
+
+        A failure is reported verbatim; multiple successes are joined. This is
+        the deterministic final answer for the structured-action path and the
+        fallback when a continuation provider round returns no text.
+        """
+        if not results:
+            return ""
+        failures = [r for r in results if not r.get("success")]
+        if failures:
+            return failures[0].get("message") or "Action failed."
+        messages = [r.get("message", "") for r in results if r.get("message")]
+        return " ".join(messages) if messages else "Action completed."
 
     def _build_tool_definitions(self) -> list[dict[str, Any]]:
         """Build native OpenAI-format tool definitions from the registry.

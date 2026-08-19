@@ -470,6 +470,39 @@ are supported. Persian digits (۰-۹) in numeric arguments are normalized
 before validation. Exact values such as usernames, URLs, and quoted text
 are preserved verbatim.
 
+### Structured Action Contract
+
+The AI model is an intent interpreter — never the executor. Its output
+(either a native tool call, or a JSON action object in the text response)
+is normalized into a strict, typed action schema and validated locally
+before any execution:
+
+```json
+{"action": "save" | "deep_save" | "delete_messages",
+ "target": "replied_message" | "current_message" | "last_message" | "recent_messages",
+ "count": 1..500}
+```
+
+```
+model output
+  → parse JSON action
+  → local validation (action / fields / count / target)
+  → target resolution (semantic target → existing tool + args)
+  → existing ToolExecutor → service → Telegram
+  → real result → response
+```
+
+- Unknown actions, unknown fields, invalid counts, and unsupported
+  targets are rejected locally and never reach Telegram.
+- `save` / `deep_save` → the existing Deep Save executor (captions are
+  always preserved). `delete_messages` → `delete` (last N) or
+  `delete_replied` (replied message).
+- `send`, `clean_chat`, and `remember` are recognized but deliberately
+  return "unsupported" because no existing executor is wired — the AI
+  never fabricates a result.
+- If the target is genuinely ambiguous, the system asks one clarifying
+  question instead of guessing.
+
 ### Request Lifecycle, Timeouts & Concurrency
 
 Every AI request is tracked with a single request id through these
@@ -479,7 +512,8 @@ returns to 0:
 ```
 AI_REQUEST_START → AI_CONFIG_LOAD → AI_PROVIDER_RESOLVE
   → AI_PROMPT_BUILD → AI_PROVIDER_REQUEST_START → AI_PROVIDER_RESPONSE
-  → AI_TOOL_PARSE → AI_TOOL_EXECUTION_START → AI_TOOL_EXECUTION_END
+  → AI_ACTION_PARSE_START → AI_ACTION_PARSE_RESULT → AI_ACTION_VALIDATION
+  → AI_TARGET_RESOLUTION → AI_EXECUTION_START → AI_EXECUTION_RESULT/ERROR
   → AI_RESPONSE_SEND_START → AI_RESPONSE_SEND_END → AI_REQUEST_END
 ```
 
