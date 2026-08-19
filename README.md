@@ -625,6 +625,16 @@ user message + provider output
   never fabricates a result.
 - If the target is genuinely ambiguous, the system asks one clarifying
   question instead of guessing.
+- **Silent delete**: a successful pure-delete execution (any of
+  `delete`, `delete_replied`, `delete_by_id`, `delete_message_by_id`,
+  `delete_messages_by_ids`) ends without any Telegram confirmation — no
+  "deleted" / "Deleted successfully" text, no follow-up message, no
+  fallback reply when the delete removed the request message itself.
+  The tool result stays internal (logs, conversation history,
+  telemetry) and the request message is reverted to the owner's
+  original text when it still exists. Failed deletes are NOT silent:
+  the error reaches the user and can never read as a success
+  confirmation. Non-delete AI actions are unaffected.
 
 ### Security boundary
 

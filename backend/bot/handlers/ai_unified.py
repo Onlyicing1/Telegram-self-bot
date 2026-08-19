@@ -57,6 +57,34 @@ _AI_TIMEOUT = 60.0
 _AI_MAX_CONCURRENCY = 4
 _ai_semaphore: asyncio.Semaphore | None = None
 
+# Tools whose successful execution must end silently: the Telegram deletion
+# is the only visible effect, and a confirmation must never become a message.
+_DELETE_TOOL_NAMES = frozenset({
+    "delete",
+    "delete_replied",
+    "delete_by_id",
+    "delete_message_by_id",
+    "delete_messages_by_ids",
+})
+
+
+def _is_silent_delete(result) -> bool:
+    """True when the request executed a pure delete round that fully succeeded.
+
+    Delete runs silently by design: the deletion itself is the only visible
+    effect, so the tool-result confirmation (counts, considered messages)
+    stays internal — logs, conversation history, and telemetry — and never
+    becomes a Telegram message. A failed delete is NOT silent: the error must
+    reach the user and can never be mistaken for a success confirmation.
+    """
+    tool_results = (result.metadata or {}).get("tool_results") or []
+    if not tool_results:
+        return False
+    for item in tool_results:
+        if item.get("tool_name") not in _DELETE_TOOL_NAMES:
+            return False
+    return all(bool(item.get("success")) for item in tool_results)
+
 
 def _get_concurrency_semaphore() -> asyncio.Semaphore:
     """Return the process-wide AI concurrency limiter.
@@ -455,6 +483,36 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 logger.warning("AI handler: scheduling record_request failed: %s", exc)
 
         if result.success and result.response:
+            # ── Silent delete ──
+            # A successful pure-delete execution must not produce any
+            # Telegram confirmation: the deletion is the only visible effect.
+            # Delivering "Deleted N message(s)..." would be spam, and when
+            # the delete removed the request message itself the delivery
+            # fallback would even turn it into a brand-new confirmation
+            # message. The tool result stays internal (logs, history,
+            # telemetry); the request message is reverted to the owner's
+            # original text (best effort — it may already be deleted).
+            if _is_silent_delete(result):
+                tools = ",".join(
+                    item.get("tool_name", "")
+                    for item in (result.metadata or {}).get("tool_results") or []
+                )
+                logger.info("AI_DELETE_SILENT id=%s tools=%s", rid, tools)
+                logger.info(
+                    "AI_EXEC_TRACE request_id=%s stage=delete_silent tools=%s",
+                    rid, tools,
+                )
+                ai_diag.set_stage(rid, "DELETE_SILENT")
+                ai_diag.mark_success("DELETE_SILENT")
+                try:
+                    await event.edit(display_prompt)
+                except Exception as exc:
+                    logger.debug(
+                        "AI handler: silent delete revert edit skipped "
+                        "(request message likely deleted as part of the "
+                        "operation): %s", exc,
+                    )
+                return
             ai_diag.set_stage(rid, "TELEGRAM_REPLY")
             logger.info("AI_RESPONSE_SEND_START id=%s", rid)
             from backend.ai.tools.delivery import deliver_response
