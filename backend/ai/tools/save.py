@@ -105,3 +105,90 @@ class SaveTool(Tool):
         except Exception as exc:
             logger.warning("SaveTool: could not fetch reply message %s/%s: %s", chat_id, message_id, exc)
             return None
+
+
+class SaveByLinkTool(Tool):
+    """Deep-save a Telegram message resolved from a t.me / telegram.me link.
+
+    Reuses ``save_service.execute_link_save`` — the SAME Deep Save pipeline
+    as ``SaveTool`` (download → re-upload as a NEW Saved Messages message).
+    The link is resolved deterministically by the service; the model never
+    rewrites the URL.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "save_by_link"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Deep-save a Telegram message given its t.me / telegram.me message "
+            "link. Resolves the linked message and runs the existing Deep Save "
+            "pipeline (download → re-upload as a NEW Saved Messages message)."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "link": {
+                "type": "string",
+                "description": (
+                    "Exact Telegram message link, e.g. https://t.me/channel/123 "
+                    "or https://t.me/c/123456789/42. Preserve it verbatim."
+                ),
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with save_code and confirmation message in data"
+
+    @property
+    def long_running(self) -> bool:
+        return True
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.services import save_service
+
+        link = str(arguments.get("link", "") or "").strip()
+        if not link:
+            return ToolResult(success=False, message="No link provided.")
+        if not link.lower().startswith("http"):
+            link = "https://" + link
+
+        channel, chat_id, _msg_id = save_service.parse_telegram_link(link)
+        if not channel and not chat_id:
+            return ToolResult(
+                success=False,
+                message="That does not look like a valid Telegram message link.",
+            )
+
+        client = None
+        if context.telegram is not None:
+            client = getattr(context.telegram, "client", None)
+        if client is None:
+            client = context.client
+        if client is None:
+            return ToolResult(success=False, message="No Telegram client available.")
+
+        try:
+            result = await save_service.execute_link_save(
+                client, context.owner_id, link, context.tz_str
+            )
+            return result_from_service(
+                result, data={"mode": "deep", "source": "telegram_link"}
+            )
+        except Exception as exc:
+            return ToolResult(success=False, message=f"Link save failed: {exc}")

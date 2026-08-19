@@ -30,6 +30,7 @@ from backend.ai.persian import coerce_int, normalize_digits
 ACTION_NAMES = frozenset({
     "save",
     "deep_save",
+    "save_link",
     "delete_messages",
     "send",
     "clean_chat",
@@ -37,7 +38,7 @@ ACTION_NAMES = frozenset({
     "clarify",
 })
 
-EXECUTABLE_ACTION_NAMES = frozenset({"save", "deep_save", "delete_messages"})
+EXECUTABLE_ACTION_NAMES = frozenset({"save", "deep_save", "save_link", "delete_messages"})
 
 TARGET_SCOPES = frozenset({
     "replied_message",
@@ -45,17 +46,33 @@ TARGET_SCOPES = frozenset({
     "last_message",
     "recent_messages",
     "saved_item",
+    "message_id",
 })
 
 # Fields the schema accepts. Anything else is rejected so an LLM can never
 # smuggle an unknown field through to execution.
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
-    "content", "reason",
+    "content", "reason", "link", "message_id",
 })
 
 _MIN_DELETE_COUNT = 1
 _MAX_DELETE_COUNT = 500
+
+# A Telegram message link, with or without the https:// scheme. The URL is
+# preserved verbatim — only trailing punctuation is stripped for parsing.
+_TELEGRAM_LINK_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/\S+")
+
+
+def _extract_telegram_link(text: str) -> str | None:
+    """Extract the first Telegram message link from *text* (exact URL)."""
+    if not isinstance(text, str):
+        return None
+    m = _TELEGRAM_LINK_RE.search(text)
+    if not m:
+        return None
+    url = m.group(0).strip()
+    return url.rstrip(".,;:)!?]}>\"'") or None
 
 # ── Parse outcome kinds ──
 
@@ -82,6 +99,8 @@ class ActionParseResult:
     caption: bool = False
     reason: str = ""
     error: str = ""
+    link: str = ""
+    message_id: int | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -165,6 +184,26 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     if action not in EXECUTABLE_ACTION_NAMES:
         return ActionParseResult(kind=KIND_UNSUPPORTED, action=action)
 
+    # Save-by-link: the link is the target. The URL is preserved verbatim and
+    # validated only for the Telegram-link shape — the tool re-validates it
+    # authoritatively before any Telegram call.
+    if action == "save_link":
+        link = raw.get("link", "")
+        if not isinstance(link, str):
+            return ActionParseResult(kind=KIND_INVALID, error="Invalid 'link' field.")
+        url = _extract_telegram_link(link)
+        if not url:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Invalid or missing Telegram link.",
+            )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="telegram_link",
+            link=url,
+        )
+
     target = raw.get("target", "")
     if target:
         if not isinstance(target, str):
@@ -183,6 +222,20 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             )
 
     if action == "delete_messages":
+        # An explicit single-message target must carry a valid message ID.
+        if target == "message_id":
+            message_id = coerce_int(raw.get("message_id"))
+            if message_id is None or message_id <= 0:
+                return ActionParseResult(
+                    kind=KIND_INVALID,
+                    error="Invalid 'message_id' field.",
+                )
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action=action,
+                target=target,
+                message_id=message_id,
+            )
         # A recent_messages deletion (explicit or implied by a bare count)
         # must carry a deterministic count. A bare "delete" with no count and
         # no target is genuinely ambiguous → ask.
@@ -237,7 +290,14 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         # preserved by the existing deep-save pipeline.
         return [{"name": "save", "arguments": {}}]
 
+    if action == "save_link":
+        # The existing execute_link_save() resolves the link and reuses the
+        # SAME Deep Save pipeline. The URL is passed through verbatim.
+        return [{"name": "save_by_link", "arguments": {"link": result.link}}]
+
     if action == "delete_messages":
+        if target == "message_id":
+            return [{"name": "delete_message_by_id", "arguments": {"message_id": result.message_id}}]
         if target in ("replied_message", "current_message"):
             return [{"name": "delete_replied", "arguments": {}}]
         if target == "last_message":
@@ -303,6 +363,7 @@ _LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "las
 _DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
 _MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
 _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
+_ID_TOKENS = frozenset({"id", "msgid", "message_id", "ایدی", "آیدی", "شناسه"})
 
 
 def _tokenize(text: str) -> list[str]:
@@ -363,6 +424,16 @@ def _extract_count(words: list[str]) -> int | None:
     return None
 
 
+def _extract_message_id(words: list[str]) -> int | None:
+    """Extract an explicit message ID near an id/شناسه token (positive int)."""
+    for i, tok in enumerate(words):
+        if tok in _ID_TOKENS:
+            for j in range(max(0, i - 2), min(len(words), i + 3)):
+                if words[j].isdigit() and int(words[j]) > 0:
+                    return int(words[j])
+    return None
+
+
 def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
     """Deterministically parse a Persian/English executable command.
 
@@ -412,6 +483,8 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
     do_delete = delete_pos and not delete_neg
     do_save = save_pos and not save_neg
 
+    link_url = _extract_telegram_link(text)
+
     # Send is recognized but deliberately has no executor wired.
     if send_pos and not do_delete and not do_save:
         return ActionParseResult(kind=KIND_UNSUPPORTED, action="send")
@@ -420,6 +493,17 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         return ActionParseResult(
             kind=KIND_CLARIFY,
             reason="Do you want me to save or delete?",
+        )
+
+    # Save-by-link takes priority over replied-message save when a Telegram
+    # link is present — the URL is preserved exactly.
+    if do_save and link_url:
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="save_link",
+            target="telegram_link",
+            link=link_url,
+            tool_calls=[{"name": "save_by_link", "arguments": {"link": link_url}}],
         )
 
     if do_save:
@@ -438,6 +522,16 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         )
 
     if do_delete:
+        # Explicit message-ID target: "پیام با ID 123 رو پاک کن".
+        message_id = _extract_message_id(words)
+        if message_id is not None:
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target="message_id",
+                message_id=message_id,
+                tool_calls=[{"name": "delete_message_by_id", "arguments": {"message_id": message_id}}],
+            )
         if is_last or count is not None:
             n = count or 1
             target = "last_message" if (is_last and n == 1) else "recent_messages"

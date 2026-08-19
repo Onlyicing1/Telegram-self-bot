@@ -269,3 +269,96 @@ class DeleteByIdTool(Tool):
             message=f"Deleted {deleted} outgoing message(s) starting from ID {message_id}.",
             data={"message_id": message_id, "count": deleted},
         )
+
+
+class DeleteMessageByIdTool(Tool):
+    """Delete exactly one outgoing message identified by its message ID.
+
+    Deterministic single-message target: fetch the ID, enforce the
+    outgoing-only rule, then delete that one message. Unlike
+    ``DeleteByIdTool`` (which deletes from an ID *forward*), this deletes
+    a single explicit target and never escalates into a range.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "delete_message_by_id"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Delete one specific outgoing message by its message ID in the "
+            "current chat. Outgoing (owner-sent) messages only."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "message_id": {
+                "type": "integer",
+                "description": "The concrete message ID to delete (from context, not invented).",
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.DANGEROUS
+
+    @property
+    def safe(self) -> bool:
+        return False
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with deleted message id in data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.persian import coerce_int
+
+        message_id = coerce_int(arguments.get("message_id"))
+        if message_id is None or message_id <= 0:
+            return ToolResult(success=False, message="A valid message ID is required.")
+
+        chat_id = context.extra.get("chat_id") if context.extra else None
+        if chat_id is None:
+            return ToolResult(success=False, message="No chat context for deletion.")
+
+        client = None
+        if context.telegram is not None:
+            client = getattr(context.telegram, "client", None)
+        if client is None:
+            client = context.client
+        if client is None:
+            return ToolResult(success=False, message="No Telegram client available.")
+
+        try:
+            msg = await client.get_messages(chat_id, ids=message_id)
+        except Exception as exc:
+            return ToolResult(success=False, message=f"Could not fetch message {message_id}: {exc}")
+        if msg is None:
+            return ToolResult(success=False, message=f"Message {message_id} not found in this chat.")
+        if not getattr(msg, "out", False):
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Message {message_id} was not sent by the owner, so it cannot "
+                    "be deleted (outgoing-only)."
+                ),
+            )
+
+        try:
+            await client.delete_messages(chat_id, [message_id])
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                message=f"Delete failed: {exc}",
+                data={"message_id": message_id, "count": 0},
+            )
+        return ToolResult(
+            success=True,
+            message=f"Deleted message {message_id}.",
+            data={"message_id": message_id, "count": 1},
+        )

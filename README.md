@@ -425,10 +425,13 @@ touches Telegram directly — it only decides *what action* and *which
 target*, then the existing service performs it:
 
 ```
-Nova, save this                  → SaveTool        → execute_save()
-Nova, deep save this             → SaveTool        → execute_save() (Deep Save)
-Nova, delete this message        → DeleteRepliedTool → delete the replied message
-Nova, delete the last 5 messages → DeleteTool      → delete_service.do_del_n_counts()
+Nova, save this                  → SaveTool            → execute_save()
+Nova, deep save this             → SaveTool            → execute_save() (Deep Save)
+Nova, save this link             → SaveByLinkTool      → execute_link_save() → execute_save()
+Nova, delete this message        → DeleteRepliedTool   → delete the replied message
+Nova, delete the last 5 messages → DeleteTool          → delete_service.do_del_n_counts()
+Nova, delete message ID 123      → DeleteMessageByIdTool → delete that one outgoing message
+Nova, delete messages about X    → ListRecentMessagesTool → DeleteMessagesByIdsTool (bounded + validated)
 ```
 
 The execution pipeline is:
@@ -459,6 +462,9 @@ message IDs when the target is already clear:
 | "the last message" / "پیام آخر" | the most recent message (delete count=1) |
 | "the last N messages" / "N پیام آخر" | count=N |
 | "save this" / "اینو سیو کن" while replying | the replied-to message |
+| "save this link" / "این لینک رو سیو کن" + t.me link | the linked message (Deep Save, URL preserved) |
+| "delete message ID N" / "پیام با ID N رو پاک کن" | that one outgoing message by ID |
+| "delete messages about X" / "پیام‌های مربوط به X رو پاک کن" | bounded candidate list → AI selects → validated delete |
 
 Deletion follows the project's **outgoing-only** rule: only the owner's
 own sent messages can be deleted. If the target genuinely cannot be
@@ -492,9 +498,11 @@ Every path is normalized into a strict, typed action schema and validated
 locally before any execution:
 
 ```json
-{"action": "save" | "deep_save" | "delete_messages",
- "target": "replied_message" | "current_message" | "last_message" | "recent_messages",
- "count": 1..500}
+{"action": "save" | "deep_save" | "save_link" | "delete_messages",
+ "target": "replied_message" | "current_message" | "last_message" | "recent_messages" | "message_id",
+ "count": 1..500,
+ "link": "https://t.me/...",
+ "message_id": <int>}
 ```
 
 ```
@@ -507,15 +515,42 @@ user message + provider output
 ```
 
 - Unknown actions, unknown fields, invalid counts, and unsupported
-  targets are rejected locally and never reach Telegram.
+  targets are rejected locally and never reach Telegram. There is no
+  tool that lets the model invoke an arbitrary Telegram method — the
+  executor is a fixed allowlist of registered tools.
 - `save` / `deep_save` → the existing Deep Save executor (captions are
-  always preserved). `delete_messages` → `delete` (last N) or
-  `delete_replied` (replied message).
+  always preserved). `save_link` → `execute_link_save()` (the same Deep
+  Save pipeline, link preserved verbatim). `delete_messages` → `delete`
+  (last N), `delete_replied` (replied message), `delete_message_by_id`
+  (explicit single ID), or the semantic `list_recent_messages` →
+  `delete_messages_by_ids` flow.
+- Semantic delete is **bounded and validated**: `list_recent_messages`
+  returns a bounded candidate window (default 50, max 100 outgoing
+  messages), the AI selects concrete IDs it actually saw, and
+  `delete_messages_by_ids` re-fetches and validates every ID
+  (outgoing-only) before deleting. Invented/foreign IDs are skipped.
 - `send`, `clean_chat`, and `remember` are recognized but deliberately
   return "unsupported" because no existing executor is wired — the AI
   never fabricates a result.
 - If the target is genuinely ambiguous, the system asks one clarifying
   question instead of guessing.
+
+### Security boundary
+
+The AI is an intent interpreter — never the executor and never an
+arbitrary Telegram controller:
+
+- Only explicitly registered tools may execute. The model cannot invent
+  an action, a Telegram method, a Python/shell command, or a file
+  operation at runtime; unknown tool names are rejected by the executor.
+- Tools receive only the injected client/facade and runtime context —
+  never `StringSession`, `API_ID`/`API_HASH`, Supabase credentials,
+  provider API keys, or environment secrets. Those values never enter
+  the prompt, tool results, or logs.
+- Telegram message content (replied text, search results, candidate
+  messages) is treated as **untrusted DATA**, never instructions. The
+  system prompt forbids the model from following instructions embedded
+  in message content or letting it change rules, scope, or permissions.
 
 ### Request Lifecycle, Timeouts & Concurrency
 

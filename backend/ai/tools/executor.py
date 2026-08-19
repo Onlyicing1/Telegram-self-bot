@@ -46,10 +46,15 @@ TOOL_TIMEOUT_SECONDS = 10
 
 _STATUS_LABELS: dict[str, str] = {
     "save": "💾 Saving...",
+    "save_by_link": "💾 Saving from link...",
     "search": "🔎 Searching saved items...",
     "list_saves": "📋 Loading saved items...",
     "delete": "🗑️ Deleting...",
     "delete_by_id": "🗑️ Deleting saved item...",
+    "delete_replied": "🗑️ Deleting...",
+    "delete_message_by_id": "🗑️ Deleting...",
+    "delete_messages_by_ids": "🗑️ Deleting...",
+    "list_recent_messages": "📋 Reading messages...",
     "settings_get": "⚙️ Checking settings...",
     "settings_set": "⚙️ Updating settings...",
     "bio_show": "👤 Checking bio...",
