@@ -705,6 +705,7 @@ class Dispatcher:
                     and result.count >= 2
                 )
                 or (result.target == "last_message" and result.count == 1)
+                or result.mode in {"all", "until_time", "until_message", "filtered"}
             )
             if not safe_delete:
                 logger.info(

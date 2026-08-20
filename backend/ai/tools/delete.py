@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from backend.ai.persian import coerce_int
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 
@@ -28,7 +29,12 @@ class DeleteTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Delete the last N outgoing messages in the current chat."
+        return (
+            "Delete self-owned messages in the current chat. Use count for the "
+            "last N self messages, mode=all for all self messages, mode=until_time "
+            "for a time range, or mode=until_message for a replied-to boundary. "
+            "The active request message is always excluded."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -37,7 +43,28 @@ class DeleteTool(Tool):
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 500,
-                "description": "Number of messages to delete (required, 1-500).",
+                "description": "Number of self-owned messages to delete (1-500).",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["last_n", "all", "until_time", "until_message", "filtered"],
+                "description": "Optional deletion scope; omit for the last N self messages.",
+            },
+            "until_time": {
+                "type": "string",
+                "description": "ISO timestamp or local HH:MM cutoff (inclusive range end).",
+            },
+            "after_time": {
+                "type": "string",
+                "description": "Optional ISO timestamp or local HH:MM range start.",
+            },
+            "boundary_id": {
+                "type": "integer",
+                "description": "Message ID boundary; the boundary is not permission to delete foreign messages.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional text filter applied before ownership and deletion.",
             },
         }
 
@@ -58,13 +85,38 @@ class DeleteTool(Tool):
         from backend.services import delete_service
 
         count = coerce_int(arguments.get("count"))
-        if count is None or count < 1 or count > 500:
+        mode = str(arguments.get("mode") or "").strip().lower()
+        until_time = arguments.get("until_time")
+        after_time = arguments.get("after_time")
+        query = str(arguments.get("query") or "")
+        boundary_id = coerce_int(arguments.get("boundary_id"))
+        request_message_id = coerce_int(
+            context.extra.get("request_message_id") if context.extra else None
+        )
+        reply_meta = context.extra.get("reply_msg") if context.extra else None
+        if mode == "until_message" and boundary_id is None and reply_meta:
+            boundary_id = coerce_int(reply_meta.get("message_id"))
+        if mode == "until_message" and boundary_id is None:
+            return ToolResult(success=False, message="No message boundary could be resolved; nothing was deleted.")
+        if mode == "until_time" and not until_time:
+            return ToolResult(success=False, message="No cutoff time could be resolved; nothing was deleted.")
+        has_filtered_scope = bool(
+            mode in {"all", "until_time", "until_message", "filtered"}
+            or until_time is not None or after_time is not None
+            or boundary_id is not None or query
+        )
+        if not has_filtered_scope and count is None:
             return ToolResult(
                 success=False,
                 message=(
                     "Delete requires an explicit count between 1 and 500 "
                     "(e.g. 'delete the last 5 messages'). No messages were deleted."
                 ),
+            )
+        if count is not None and (count < 1 or count > 500):
+            return ToolResult(
+                success=False,
+                message="Delete count must be between 1 and 500. No messages were deleted.",
             )
         chat_id = context.extra.get("chat_id") if context.extra else None
         if chat_id is None:
@@ -79,9 +131,25 @@ class DeleteTool(Tool):
             return ToolResult(success=False, message="No Telegram client available.")
 
         try:
-            considered, deleted, error = await delete_service.do_del_last_n_real(
-                client, chat_id, count
-            )
+            if has_filtered_scope or request_message_id is not None:
+                considered, deleted, error = await delete_service.do_del_self_filtered(
+                    client,
+                    chat_id,
+                    count=None if mode == "all" else count,
+                    until_time=until_time,
+                    after_time=after_time,
+                    boundary_id=boundary_id,
+                    query=query,
+                    exclude_message_id=request_message_id,
+                    tz_name=context.tz_str,
+                )
+            else:
+                # Preserve the legacy panel/test contract when no AI request
+                # ID is present; live AI requests always use the self-owned
+                # selector above so the active request cannot be counted.
+                considered, deleted, error = await delete_service.do_del_last_n_real(
+                    client, chat_id, count
+                )
         except Exception as exc:
             return ToolResult(
                 success=False,
@@ -182,6 +250,9 @@ class DeleteRepliedTool(Tool):
             )
         if msg is None:
             return ToolResult(success=False, message="Replied message not found.")
+        request_message_id = context.extra.get("request_message_id") if context.extra else None
+        if request_message_id is not None and message_id == request_message_id:
+            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
         if not getattr(msg, "out", False):
             return ToolResult(
                 success=False,
@@ -192,7 +263,8 @@ class DeleteRepliedTool(Tool):
 
         try:
             deleted, _rejected = await delete_service.delete_verified_self_messages(
-                client, chat_id, [message_id]
+                client, chat_id, [message_id],
+                exclude_message_id=coerce_int(request_message_id),
             )
         except Exception as exc:
             return ToolResult(
@@ -268,9 +340,17 @@ class DeleteByIdTool(Tool):
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")
 
+        request_message_id = coerce_int(
+            context.extra.get("request_message_id") if context.extra else None
+        )
+        if request_message_id is not None and message_id == request_message_id:
+            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
+        client = context.telegram.client if context.telegram is not None else context.client
+        if client is None:
+            return ToolResult(success=False, message="No Telegram client available.")
         try:
             deleted, error = await delete_service.do_del_id_counts(
-                context.telegram.client, chat_id, message_id
+                client, chat_id, message_id, exclude_message_id=request_message_id
             )
         except Exception as exc:
             return ToolResult(
@@ -366,6 +446,9 @@ class DeleteMessageByIdTool(Tool):
             return ToolResult(success=False, message=f"Could not fetch message {message_id}: {exc}")
         if msg is None:
             return ToolResult(success=False, message=f"Message {message_id} not found in this chat.")
+        request_message_id = context.extra.get("request_message_id") if context.extra else None
+        if request_message_id is not None and message_id == request_message_id:
+            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
         if not getattr(msg, "out", False):
             return ToolResult(
                 success=False,
@@ -379,7 +462,8 @@ class DeleteMessageByIdTool(Tool):
 
         try:
             deleted, _rejected = await delete_service.delete_verified_self_messages(
-                client, chat_id, [message_id]
+                client, chat_id, [message_id],
+                exclude_message_id=coerce_int(request_message_id),
             )
         except Exception as exc:
             return ToolResult(

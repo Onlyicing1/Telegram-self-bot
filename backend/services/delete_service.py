@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, time as datetime_time, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
@@ -39,13 +41,12 @@ async def _resolve_me_id(client) -> int | None:
 def _is_self_owned(msg, me_id: int | None) -> bool:
     """True only when ``msg`` is verified as sent by the authenticated account.
 
-    Fail-closed: a missing message, a false ``out`` flag, a missing
-    ``sender_id``, or a sender that is not the connected account all reject.
-    ``out`` is server-authoritative Telegram metadata (only the signed-in
-    account's messages carry it), and ``sender_id`` is compared against the
-    resolved account ID when available.
+    Fail-closed: a missing message, unresolved account identity, a false
+    ``out`` flag, a missing ``sender_id``, or a sender that is not the
+    connected account all reject. ``out`` is server-authoritative Telegram
+    metadata and ``sender_id`` is compared against the resolved account ID.
     """
-    if msg is None:
+    if msg is None or me_id is None:
         return False
     if not getattr(msg, "out", False):
         return False
@@ -58,7 +59,7 @@ def _is_self_owned(msg, me_id: int | None) -> bool:
 
 
 async def delete_verified_self_messages(
-    client, chat_id, message_ids: list[int]
+    client, chat_id, message_ids: list[int], *, exclude_message_id: int | None = None
 ) -> tuple[list[int], list[int]]:
     """Delete ONLY messages verified as belonging to the authenticated account.
 
@@ -73,8 +74,15 @@ async def delete_verified_self_messages(
     never raise; transport failures propagate to the caller so failures stay
     honest.
     """
-    ids = [i for i in message_ids if isinstance(i, int) and i > 0]
-    rejected: list[int] = [i for i in message_ids if not (isinstance(i, int) and i > 0)]
+    ids: list[int] = []
+    rejected: list[int] = []
+    for value in message_ids:
+        if not isinstance(value, int) or value <= 0:
+            rejected.append(value)
+        elif exclude_message_id is not None and value == exclude_message_id:
+            rejected.append(value)
+        elif value not in ids:
+            ids.append(value)
     if not ids:
         return [], rejected
 
@@ -157,6 +165,167 @@ async def delete_verified_self_messages(
     return deleted, rejected
 
 
+async def _parse_cutoff(value: Any, tz_name: str = "UTC") -> datetime | None:
+    """Parse an ISO timestamp or a local HH:MM cutoff without guessing IDs."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        if text.casefold() in {"today", "امروز"}:
+            now = datetime.now(tz)
+            dt = datetime.combine(now.date(), datetime_time.min, tzinfo=tz)
+        elif text.casefold() in {"yesterday", "دیروز"}:
+            from datetime import timedelta
+            now = datetime.now(tz)
+            dt = datetime.combine(now.date() - timedelta(days=1), datetime_time.min, tzinfo=tz)
+        else:
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    parsed = datetime_time.fromisoformat(text)
+                except ValueError:
+                    return None
+                now = datetime.now(tz)
+                dt = datetime.combine(now.date(), parsed, tzinfo=tz)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _message_text(msg) -> str:
+    return str(getattr(msg, "message", None) or getattr(msg, "text", None) or "")
+
+
+async def select_self_owned_message_ids(
+    client,
+    chat_id,
+    *,
+    count: int | None = None,
+    until_time: Any = None,
+    after_time: Any = None,
+    boundary_id: int | None = None,
+    query: str = "",
+    exclude_message_id: int | None = None,
+    tz_name: str = "UTC",
+) -> tuple[list[int], int, Exception | None]:
+    """Select recent self-owned IDs before the final ownership chokepoint.
+
+    Telegram history is scanned newest-first. The active Delete request is
+    excluded before counting, ownership is checked for selection, and the
+    final fetch in ``delete_verified_self_messages`` remains authoritative.
+    """
+    if count is not None and (count < 1 or count > 500):
+        return [], 0, ValueError("count must be between 1 and 500")
+    cutoff = await _parse_cutoff(until_time, tz_name)
+    floor = await _parse_cutoff(after_time, tz_name)
+    if (until_time is not None and cutoff is None) or (after_time is not None and floor is None):
+        return [], 0, ValueError("invalid time range")
+    if boundary_id is not None and boundary_id <= 0:
+        return [], 0, ValueError("invalid boundary message ID")
+    me_id = await _resolve_me_id(client)
+    if me_id is None:
+        return [], 0, RuntimeError("authenticated account identity could not be verified")
+
+    selected: list[int] = []
+    considered = 0
+    needle = query.strip().casefold()
+    boundary_seen = boundary_id is None
+    try:
+        iterator = client.iter_messages(chat_id, limit=None)
+        async for msg in iterator:
+            mid = getattr(msg, "id", None)
+            if not isinstance(mid, int) or mid <= 0:
+                continue
+            if exclude_message_id is not None and mid == exclude_message_id:
+                continue
+
+            msg_date = getattr(msg, "date", None)
+            if msg_date is not None:
+                if not isinstance(msg_date, datetime):
+                    msg_date = None
+                elif msg_date.tzinfo is None:
+                    msg_date = msg_date.replace(tzinfo=timezone.utc)
+                if msg_date is not None and cutoff is not None and msg_date > cutoff:
+                    continue
+                if msg_date is not None and floor is not None and msg_date < floor:
+                    continue
+            elif cutoff is not None or floor is not None:
+                continue
+
+            if boundary_id is not None and not boundary_seen:
+                if mid != boundary_id:
+                    continue
+                boundary_seen = True
+                if _is_self_owned(msg, me_id) and (not needle or needle in _message_text(msg).casefold()):
+                    selected.append(mid)
+                    considered += 1
+                continue
+
+            if needle and needle not in _message_text(msg).casefold():
+                continue
+            if not _is_self_owned(msg, me_id):
+                continue
+            considered += 1
+            selected.append(mid)
+            if count is not None and len(selected) >= count:
+                break
+    except Exception as exc:
+        return selected, considered, exc
+
+    if boundary_id is not None and not boundary_seen:
+        # A missing/foreign boundary is a safe empty result, not permission
+        # to expand the range to the whole chat.
+        return [], considered, None
+    return selected, considered, None
+
+
+async def do_del_self_filtered(
+    client,
+    chat_id,
+    *,
+    count: int | None = None,
+    until_time: Any = None,
+    after_time: Any = None,
+    boundary_id: int | None = None,
+    query: str = "",
+    exclude_message_id: int | None = None,
+    tz_name: str = "UTC",
+) -> tuple[int, int, Exception | None]:
+    """Delete a self-owned range after deterministic candidate selection."""
+    ids, considered, selection_error = await select_self_owned_message_ids(
+        client, chat_id, count=count, until_time=until_time, after_time=after_time,
+        boundary_id=boundary_id, query=query, exclude_message_id=exclude_message_id,
+        tz_name=tz_name,
+    )
+    if selection_error is not None:
+        return considered, 0, selection_error
+    try:
+        deleted, _rejected = await delete_verified_self_messages(
+            client, chat_id, ids, exclude_message_id=exclude_message_id,
+        )
+    except Exception as exc:
+        return considered, 0, exc
+    return considered, len(deleted), None
+
+
+async def do_del_self_last_n(
+    client, chat_id, n: int, *, exclude_message_id: int | None = None, tz_name: str = "UTC"
+) -> tuple[int, int, Exception | None]:
+    """Delete the last N verified self-owned messages before the request."""
+    return await do_del_self_filtered(
+        client, chat_id, count=n, exclude_message_id=exclude_message_id, tz_name=tz_name,
+    )
+
+
 async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | None]:
     """Delete the last ``n`` outgoing messages.
 
@@ -222,7 +391,9 @@ async def do_del_last_n_real(
         return 0, 0, exc
 
 
-async def do_del_id_counts(client, chat_id, start_id: int) -> tuple[int, Exception | None]:
+async def do_del_id_counts(
+    client, chat_id, start_id: int, *, exclude_message_id: int | None = None
+) -> tuple[int, Exception | None]:
     """Delete all outgoing messages from ``start_id`` forward.
 
     Same contract as :func:`do_del_n_counts` — returns the real number of
@@ -233,13 +404,19 @@ async def do_del_id_counts(client, chat_id, start_id: int) -> tuple[int, Excepti
     try:
         batch = []
         async for msg in client.iter_messages(chat_id, min_id=start_id - 1, from_user="me"):
+            if exclude_message_id is not None and getattr(msg, "id", None) == exclude_message_id:
+                continue
             batch.append(msg.id)
             if len(batch) >= settings_service.delete_batch_size():
-                deleted_ids, _rejected = await delete_verified_self_messages(client, chat_id, batch)
+                deleted_ids, _rejected = await delete_verified_self_messages(
+                    client, chat_id, batch, exclude_message_id=exclude_message_id
+                )
                 total += len(deleted_ids)
                 batch = []
         if batch:
-            deleted_ids, _rejected = await delete_verified_self_messages(client, chat_id, batch)
+            deleted_ids, _rejected = await delete_verified_self_messages(
+                client, chat_id, batch, exclude_message_id=exclude_message_id
+            )
             total += len(deleted_ids)
         record_event("delete", "del id", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return total, None

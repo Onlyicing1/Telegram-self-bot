@@ -89,6 +89,7 @@ TARGET_SCOPES = frozenset({
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
     "content", "reason", "link", "message_id", "fields",
+    "until_time", "after_time", "boundary_id",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -142,6 +143,10 @@ class ActionParseResult:
     message_id: int | None = None
     query: str = ""
     fields: list[str] | None = None
+    mode: str = ""
+    until_time: str = ""
+    after_time: str = ""
+    boundary_id: int | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -311,7 +316,32 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                 error=f"Invalid count: {raw.get('count')!r} (must be 1-{_MAX_DELETE_COUNT}).",
             )
 
+    mode = str(raw.get("mode", "") or "").strip().lower()
+    if mode and mode not in {"last_n", "all", "until_time", "until_message", "filtered"}:
+        return ActionParseResult(kind=KIND_INVALID, error=f"Unknown delete mode: {mode}")
+    until_time = raw.get("until_time", "")
+    after_time = raw.get("after_time", "")
+    if until_time and not isinstance(until_time, str):
+        return ActionParseResult(kind=KIND_INVALID, error="Invalid 'until_time' field.")
+    if after_time and not isinstance(after_time, str):
+        return ActionParseResult(kind=KIND_INVALID, error="Invalid 'after_time' field.")
+    query = raw.get("query", "")
+    if query and not isinstance(query, str):
+        return ActionParseResult(kind=KIND_INVALID, error="Invalid 'query' field.")
+    boundary_id = None
+    if "boundary_id" in raw:
+        boundary_id = coerce_int(raw.get("boundary_id"))
+        if boundary_id is None or boundary_id <= 0:
+            return ActionParseResult(kind=KIND_INVALID, error="Invalid 'boundary_id' field.")
     if action == "delete_messages":
+        if mode == "all" and count is not None:
+            return ActionParseResult(kind=KIND_INVALID, error="'all' mode cannot include a count.")
+        if mode == "until_time" and not until_time:
+            return ActionParseResult(kind=KIND_INVALID, error="until_time is required for until_time mode.")
+        if mode == "until_message" and boundary_id is None:
+            # A replied-to boundary is injected by the runtime context, so a
+            # missing boundary is valid only when the tool can resolve it.
+            pass
         # An explicit single-message target must carry a valid message ID.
         if target == "message_id":
             message_id = coerce_int(raw.get("message_id"))
@@ -330,18 +360,30 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         # must carry a deterministic count. A bare "delete" with no count and
         # no target is genuinely ambiguous → ask.
         effective_target = target or ("recent_messages" if count else "")
-        if effective_target == "recent_messages" and count is None:
+        if effective_target == "recent_messages" and count is None and not mode:
             return ActionParseResult(
                 kind=KIND_CLARIFY,
                 action=action,
                 reason="How many messages should I delete?",
             )
-        if not target and not count:
+        if not target and not count and not mode and not until_time and not boundary_id and not query:
             return ActionParseResult(
                 kind=KIND_CLARIFY,
                 action=action,
                 reason="Which message(s) should I delete?",
             )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target=target,
+            count=count,
+            caption=bool(raw.get("caption", False)),
+            mode=mode,
+            until_time=str(until_time or ""),
+            after_time=str(after_time or ""),
+            boundary_id=boundary_id,
+            query=str(query or ""),
+        )
 
     return ActionParseResult(
         kind=KIND_EXECUTABLE,
@@ -349,6 +391,11 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         target=target,
         count=count,
         caption=bool(raw.get("caption", False)),
+        mode=mode,
+        until_time=str(until_time or ""),
+        after_time=str(after_time or ""),
+        boundary_id=boundary_id,
+        query=str(query or ""),
     )
 
 
@@ -414,6 +461,21 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action == "delete_messages":
         if target == "message_id":
             return [{"name": "delete_message_by_id", "arguments": {"message_id": result.message_id}}]
+        if result.mode or result.until_time or result.after_time or result.boundary_id is not None or result.query:
+            args: dict[str, Any] = {}
+            if result.count is not None:
+                args["count"] = result.count
+            if result.mode:
+                args["mode"] = result.mode
+            if result.until_time:
+                args["until_time"] = result.until_time
+            if result.after_time:
+                args["after_time"] = result.after_time
+            if result.boundary_id is not None:
+                args["boundary_id"] = result.boundary_id
+            if result.query:
+                args["query"] = result.query
+            return [{"name": "delete", "arguments": args}]
         if target in ("replied_message", "current_message"):
             return [{"name": "delete_replied", "arguments": {}}]
         if target == "last_message":
@@ -451,6 +513,11 @@ def parse_action_text(text: str) -> ActionParseResult:
             count=result.count,
             caption=result.caption,
             fields=result.fields,
+            mode=result.mode,
+            until_time=result.until_time,
+            after_time=result.after_time,
+            boundary_id=result.boundary_id,
+            query=result.query,
             tool_calls=tool_calls,
         )
     return result
@@ -492,6 +559,8 @@ _SEMANTIC_DELETE_STEMS = ("مربوط", "دعوا", "بحث", "موضوع")
 _DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
 _MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
 _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
+_ALL_DELETE_WORDS = frozenset({"همه", "تمام", "هرچی", "هرچه", "all", "every", "everything"})
+_TODAY_WORDS = frozenset({"امروز", "today"})
 _ID_TOKENS = frozenset({"id", "msgid", "message_id", "ایدی", "آیدی", "شناسه"})
 
 _DEFAULT_LIST_LIMIT = 50
@@ -651,6 +720,55 @@ def _extract_count(words: list[str]) -> int | None:
             if any(w in _COUNT_CONTEXT for w in window):
                 return n
     return None
+
+
+def _extract_until_time(words: list[str]) -> str | None:
+    """Extract a conservative local HH:MM cutoff from natural language."""
+    markers = {"ساعت", "until", "before", "by"}
+    for i, word in enumerate(words[:-1]):
+        if word not in markers:
+            continue
+        value = _parse_number(words, i + 1)
+        if value is not None and 0 <= value <= 23:
+            return f"{value:02d}:00"
+    return None
+
+
+def _extract_after_time(words: list[str]) -> str | None:
+    """Extract a local HH:MM range start from "from ... onwards" wording."""
+    for i, word in enumerate(words[:-1]):
+        if word not in {"از", "from"}:
+            continue
+        j = i + 1
+        if j < len(words) and words[j] == "ساعت":
+            j += 1
+        value = _parse_number(words, j)
+        if value is not None and 0 <= value <= 23:
+            tail = set(words[j + 1:])
+            if tail & {"بعد", "به", "بعدش", "onwards", "after", "forward"}:
+                return f"{value:02d}:00"
+    return None
+
+
+def _has_message_boundary(words: list[str], has_reply: bool) -> bool:
+    """True for an explicit up-to-replied-message request."""
+    if not has_reply:
+        return False
+    joined = " ".join(words)
+    return (
+        "تا این پیام" in joined
+        or "تا اینجا" in joined
+        or "until this message" in joined
+        or "up to this message" in joined
+        or "up through this message" in joined
+    )
+
+
+def _is_all_delete(words: list[str]) -> bool:
+    return any(word in _ALL_DELETE_WORDS for word in words) and any(
+        word in _MESSAGE_TOKENS or word in {"پیامام", "پیامهام", "خودم", "my", "mine", "own"}
+        for word in words
+    )
 
 
 def _extract_message_id(words: list[str]) -> int | None:
@@ -874,12 +992,63 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         )
 
     if do_delete:
-        # Semantic deletes must reach the AI, never the deterministic
-        # parser: "پیام‌های مربوط به دعوای اخیر رو پاک کن" would otherwise be
-        # collapsed into "delete the last message" (count=1), overriding the
-        # model's own semantic resolution and deleting the wrong message.
+        # Topic/content requests, including combinations such as semantic +
+        # time or semantic + N, stay on the AI path so the model can first
+        # inspect real Telegram messages. The list/delete executor still
+        # excludes the active request and enforces self ownership.
         if _is_semantic_delete(words):
             return ActionParseResult(kind=KIND_CONVERSATIONAL)
+
+        # Explicit whole-range, time, and replied-boundary requests are
+        # deterministic scope instructions; the service still enforces
+        # ownership immediately before Telegram deletion.
+        if (
+            _is_all_delete(words)
+            and _extract_until_time(words) is None
+            and not _has_message_boundary(words, has_reply)
+        ):
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target="recent_messages",
+                mode="all",
+                tool_calls=[{"name": "delete", "arguments": {"mode": "all"}}],
+            )
+        until_time = _extract_until_time(words)
+        after_time = "today" if any(word in _TODAY_WORDS for word in words) else ""
+        after_clock = _extract_after_time(words)
+        if after_clock and not after_time:
+            after_time = after_clock
+        if until_time is not None:
+            arguments = {"mode": "until_time", "until_time": until_time}
+            if after_time:
+                arguments["after_time"] = after_time
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target="recent_messages",
+                mode="until_time",
+                until_time=until_time,
+                after_time=after_time,
+                tool_calls=[{"name": "delete", "arguments": arguments}],
+            )
+        if after_clock:
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target="recent_messages",
+                mode="filtered",
+                after_time=after_clock,
+                tool_calls=[{"name": "delete", "arguments": {"mode": "filtered", "after_time": after_clock}}],
+            )
+        if _has_message_boundary(words, has_reply):
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target="replied_message",
+                mode="until_message",
+                tool_calls=[{"name": "delete", "arguments": {"mode": "until_message"}}],
+            )
 
         # Explicit message-ID target: "پیام با ID 123 رو پاک کن".
         message_id = _extract_message_id(words)
