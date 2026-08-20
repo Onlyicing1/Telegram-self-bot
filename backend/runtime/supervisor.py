@@ -63,21 +63,17 @@ from backend.health import (
     set_runtime_state, set_telethon_connected, set_supervisor_ok,
     set_bio_cron_ok, set_username_cron_ok, set_helper_connected, set_last_update,
     set_last_telethon_event, set_last_event_dispatch,
-    set_last_rpc, set_rpc_latency, set_restart_count, increment_restart,
+    set_restart_count, increment_restart,
     set_client_generation, set_last_rebuild_reason, set_task_state,
-    tick_loop, get_stale_loops,
+    mark_started,
 )
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
-_HEARTBEAT_INTERVAL = 30
-_HEARTBEAT_FAILURE_THRESHOLD = 3
 _RPC_TIMEOUT = 15
 _REBUILD_TIMEOUT = 60
 _REGISTER_TIMEOUT = 30
-_LOOP_STALE_THRESHOLD = 90
-_LOOP_STARVATION_MS = 5000
 _RECOVERY_COOLDOWN = 180
 _RECONNECT_COOLDOWN = 60
 _MAX_RECOVERY_ATTEMPTS = 5
@@ -94,9 +90,8 @@ class RuntimeSupervisor:
         "cfg", "api_id", "api_hash", "session_string", "owner_id", "tz_str",
         "bot_token", "helper_enabled", "state", "client", "helper_client",
         "client_generation", "shutdown_event", "_run_task", "_web_task",
-        "_helper_task", "_consecutive_failures", "_reconnect_failures",
-        "_recovery_attempts", "_recovery_lock", "_recovery_cooldown_until",
-        "_reconnect_cooldown_until", "_last_watchdog_tick", "_client_alive",
+        "_helper_task", "_recovery_attempts", "_recovery_lock",
+        "_recovery_cooldown_until", "_reconnect_cooldown_until", "_client_alive",
     )
 
     def __init__(self, cfg: dict) -> None:
@@ -116,13 +111,10 @@ class RuntimeSupervisor:
         self._run_task: asyncio.Task | None = None
         self._web_task: asyncio.Task | None = None
         self._helper_task: asyncio.Task | None = None
-        self._consecutive_failures = 0
-        self._reconnect_failures = 0
         self._recovery_attempts = 0
         self._recovery_lock = asyncio.Lock()
         self._recovery_cooldown_until = 0.0
         self._reconnect_cooldown_until = 0.0
-        self._last_watchdog_tick = 0.0
         self._client_alive = False
 
     @property
@@ -185,6 +177,10 @@ class RuntimeSupervisor:
         trace("SUPERVISOR_START")
         logger.info("RuntimeSupervisor starting")
 
+        # Health lifecycle start marker — gives the failsafe heartbeat-age
+        # signal a real timestamp so its all-signals-frozen check can fire.
+        mark_started()
+
         settings_service.load_all()
 
         self._transition(RuntimeState.CONNECTING)
@@ -228,8 +224,6 @@ class RuntimeSupervisor:
         set_client_generation(self.client_generation)
         set_telethon_connected(True)
         self._client_alive = True
-        self._consecutive_failures = 0
-        self._reconnect_failures = 0
         update_heartbeat_state(
             self_connected=True,
             client_generation=self.client_generation,
@@ -422,9 +416,8 @@ class RuntimeSupervisor:
             if self._in_reconnect_cooldown():
                 return
 
-            self._reconnect_failures += 1
-            trace("WATCHDOG_RECOVERY", reason="reconnect", attempt=self._reconnect_failures)
-            logger.warning("WATCHDOG_RECOVERY — reconnect attempt %d", self._reconnect_failures)
+            trace("WATCHDOG_RECOVERY", reason="reconnect")
+            logger.warning("WATCHDOG_RECOVERY — reconnect triggered")
 
             try:
                 # Single connection ownership: stop the run loop before touching
@@ -448,8 +441,6 @@ class RuntimeSupervisor:
                     raise RuntimeError("Session not authorized after reconnect")
 
                 self._client_alive = True
-                self._consecutive_failures = 0
-                self._reconnect_failures = 0
                 self._reconnect_cooldown_until = time.monotonic() + _RECONNECT_COOLDOWN
                 set_telethon_connected(True)
                 update_heartbeat_state(self_connected=True)
@@ -457,6 +448,27 @@ class RuntimeSupervisor:
                 set_last_telethon_event()
 
                 self._start_run_loop()
+
+                # A lightweight reconnect only heals the self client — if the
+                # helper bot is enabled but dead, restart it in place so the
+                # READY_BUT_DISCONNECTED invariant can resolve.
+                if self.helper_enabled and (
+                    self.helper_client is None
+                    or not self.helper_client.is_connected()
+                ):
+                    logger.warning(
+                        "SELF_RECONNECTED — helper %s, restarting helper bot",
+                        "missing" if self.helper_client is None else "disconnected",
+                    )
+                    await self._stop_helper_loop()
+                    await self._stop_helper()
+                    set_helper_connected(False)
+                    update_heartbeat_state(helper_connected=False)
+                    try:
+                        await self._start_helper()
+                    except Exception as exc:
+                        trace_exception("HELPER_RESTART_FAILED", exc)
+                        logger.error("HELPER_RESTART_FAILED: %s", exc)
 
                 trace("SELF_RECONNECTED", gen=self.client_generation)
                 logger.info("SELF_RECONNECTED (gen=%d)", self.client_generation)
@@ -575,8 +587,6 @@ class RuntimeSupervisor:
             await self._resume_username_cron()
 
             self._recovery_attempts = 0
-            self._consecutive_failures = 0
-            self._reconnect_failures = 0
             self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
             self._transition(RuntimeState.READY)
             set_supervisor_ok(True)
@@ -664,8 +674,6 @@ class RuntimeSupervisor:
                 set_client_generation(self.client_generation)
                 set_telethon_connected(True)
                 self._client_alive = True
-                self._consecutive_failures = 0
-                self._reconnect_failures = 0
                 update_heartbeat_state(
                     self_connected=True,
                     client_generation=self.client_generation,
@@ -732,8 +740,6 @@ class RuntimeSupervisor:
                 await self._start_helper()
 
             self._recovery_attempts = 0
-            self._consecutive_failures = 0
-            self._reconnect_failures = 0
             self._recovery_cooldown_until = time.time() + _RECOVERY_COOLDOWN
             self._transition(RuntimeState.READY)
             set_supervisor_ok(True)
@@ -769,12 +775,12 @@ class RuntimeSupervisor:
     async def _cancel_orphan_tasks(self) -> None:
         current = asyncio.current_task()
         protected_names = {
-            "lifeos-watchdog", "lifeos-web", "lifeos-web-server", "lifeos-heartbeat",
+            "lifeos-web", "lifeos-web-server", "lifeos-heartbeat",
             "lifeos-keepalive", "lifeos-task-supervisor",
             "lifeos-profile-scheduler", "lifeos-tg-supervisor",
             "lifeos-diagnostics", "lifeos-failsafe",
-            "lifeos-helper-supervisor", "lifeos-helper-watchdog",
-            "lifeos-helper", "lifeos-run",
+            "lifeos-helper-supervisor", "lifeos-helper",
+            "lifeos-run",
         }
         to_cancel = []
         for task in asyncio.all_tasks():
@@ -842,163 +848,6 @@ class RuntimeSupervisor:
             await disconnect_helper()
         except Exception:
             pass
-
-    async def _watchdog_loop(self) -> None:
-        logger.info("Watchdog started (interval=%ds)", int(_HEARTBEAT_INTERVAL))
-        while not self.shutdown_event.is_set():
-            t0 = time.monotonic()
-            await asyncio.sleep(_HEARTBEAT_INTERVAL)
-            loop_latency = (time.monotonic() - t0 - _HEARTBEAT_INTERVAL) * 1000
-
-            tick_loop("lifeos-watchdog", state="RUNNING", success=True)
-            self._last_watchdog_tick = time.time()
-
-            if loop_latency > _LOOP_STARVATION_MS:
-                trace(
-                    "EVENT_LOOP_STARVATION",
-                    source="watchdog",
-                    loop_latency_ms=f"{loop_latency:.1f}",
-                )
-                logger.error(
-                    "EVENT_LOOP_STARVATION — watchdog loop latency %.1fms. Blocking code suspected.",
-                    loop_latency,
-                )
-
-            try:
-                from backend.health import update_heartbeat, check_stale, set_heartbeat
-                update_heartbeat()
-                check_stale()
-                set_heartbeat()
-                set_task_state("lifeos-watchdog", "RUNNING")
-            except Exception:
-                pass
-
-            try:
-                import os
-                mem_rss = int(open(f"/proc/{os.getpid()}/status").read().split("VmRSS:")[1].split()[0]) * 1024
-                if mem_rss > 400 * 1024 * 1024:
-                    trace("MEMORY_PRESSURE", rss_bytes=mem_rss, threshold="400MB")
-                    logger.warning("MEMORY_PRESSURE — RSS=%dMB, triggering cleanup", mem_rss // (1024 * 1024))
-                    import gc
-                    collected = gc.collect()
-                    trace("MEMORY_CLEANUP", collected=collected, rss_after="unknown")
-                    logger.info("MEMORY_CLEANUP — gc.collect() freed %d objects", collected)
-            except Exception:
-                pass
-
-            if self._recovery_lock.locked():
-                trace("WATCHDOG_CHECK", status="recovery_in_progress")
-                continue
-
-            stale_loops = get_stale_loops(_LOOP_STALE_THRESHOLD)
-            if stale_loops:
-                trace("LOOP_STALLED", loops=",".join(stale_loops), threshold=f"{_LOOP_STALE_THRESHOLD:.0f}s")
-                logger.warning(
-                    "LOOP_STALLED — loops not progressing for >%ds: %s",
-                    int(_LOOP_STALE_THRESHOLD), ", ".join(stale_loops),
-                )
-                for name in stale_loops:
-                    if name == "lifeos-heartbeat":
-                        logger.warning("LOOP_STALLED — heartbeat stalled, restarting")
-                        start_heartbeat()
-                    elif name == "lifeos-keepalive":
-                        logger.warning("LOOP_STALLED — keepalive stalled, restarting")
-                        start_keepalive()
-                    elif name == "lifeos-profile-scheduler":
-                        if self.client:
-                            logger.warning("LOOP_STALLED — profile scheduler stalled, restarting")
-                            bio_engine.start_cron(self.client, self.owner_id, self.tz_str)
-                            username_engine.start_cron(self.client, self.owner_id, self.tz_str)
-                set_last_rebuild_reason(f"watchdog: loop_stalled ({','.join(stale_loops)})")
-                await self._trigger_reconnect()
-                continue
-
-            # ── Helper health check ──
-            if self.helper_enabled and not self._recovery_lock.locked():
-                helper = self.helper_client
-                helper_alive = (
-                    helper is not None
-                    and helper.is_connected()
-                )
-                if not helper_alive:
-                    trace(
-                        "HELPER_DISCONNECTED",
-                        gen=self.client_generation,
-                        helper_task_alive=(
-                            self._helper_task is not None
-                            and not self._helper_task.done()
-                        ),
-                    )
-                    logger.warning(
-                        "HELPER_DISCONNECTED — restarting helper bot"
-                    )
-                    set_last_rebuild_reason("watchdog: helper disconnected")
-                    set_helper_connected(False)
-                    update_heartbeat_state(helper_connected=False)
-                    await self._stop_helper_loop()
-                    await self._stop_helper()
-                    try:
-                        await self._start_helper()
-                    except Exception as exc:
-                        trace_exception("HELPER_RESTART_FAILED", exc)
-                        logger.error("HELPER_RESTART_FAILED: %s", exc)
-
-            client = self.client
-            if client is None or not self._client_alive:
-                self._consecutive_failures += 1
-                trace(
-                    "WATCHDOG_HEARTBEAT_FAILED",
-                    reason="no_active_client",
-                    consecutive_failures=self._consecutive_failures,
-                    threshold=_HEARTBEAT_FAILURE_THRESHOLD,
-                )
-                logger.warning(
-                    "WATCHDOG_HEARTBEAT_FAILED — no active client "
-                    "(consecutive_failures=%d/%d)",
-                    self._consecutive_failures, _HEARTBEAT_FAILURE_THRESHOLD,
-                )
-                if self._consecutive_failures >= _HEARTBEAT_FAILURE_THRESHOLD:
-                    trace("WATCHDOG_RECOVERY", reason="no_active_client")
-                    logger.warning("WATCHDOG_RECOVERY — no active client")
-                    set_last_rebuild_reason("watchdog: no active client")
-                    await self._trigger_full_recovery()
-                continue
-
-            try:
-                await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
-                self._consecutive_failures = 0
-                set_last_rpc()
-                set_rpc_latency(0)
-                set_task_state("lifeos-watchdog", "RUNNING")
-            except asyncio.TimeoutError:
-                self._consecutive_failures += 1
-                trace(
-                    "WATCHDOG_HEARTBEAT_FAILED",
-                    reason="rpc_timeout",
-                    consecutive_failures=self._consecutive_failures,
-                    threshold=_HEARTBEAT_FAILURE_THRESHOLD,
-                )
-                logger.warning(
-                    "WATCHDOG_HEARTBEAT_FAILED — RPC timeout "
-                    "(consecutive_failures=%d/%d)",
-                    self._consecutive_failures, _HEARTBEAT_FAILURE_THRESHOLD,
-                )
-                if self._consecutive_failures >= _HEARTBEAT_FAILURE_THRESHOLD:
-                    trace("WATCHDOG_RECOVERY", reason="rpc_timeout")
-                    logger.warning("WATCHDOG_RECOVERY — RPC timeout")
-                    set_last_rebuild_reason("watchdog: rpc timeout")
-                    await self._trigger_full_recovery()
-            except Exception as exc:
-                self._consecutive_failures += 1
-                trace_exception("WATCHDOG_HEARTBEAT_ERROR", exc)
-                logger.warning(
-                    "WATCHDOG_HEARTBEAT_ERROR — %s (consecutive_failures=%d/%d)",
-                    exc, self._consecutive_failures, _HEARTBEAT_FAILURE_THRESHOLD,
-                )
-                if self._consecutive_failures >= _HEARTBEAT_FAILURE_THRESHOLD:
-                    trace("WATCHDOG_RECOVERY", reason="rpc_error")
-                    set_last_rebuild_reason(f"watchdog: rpc error: {exc}")
-                    await self._trigger_full_recovery()
 
     def _in_recovery_cooldown(self) -> bool:
         return time.time() < self._recovery_cooldown_until

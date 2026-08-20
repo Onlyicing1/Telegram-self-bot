@@ -35,7 +35,7 @@ _LOOP_STARVATION_MS = 5000.0
 _PERMANENT_TASK_NAMES = frozenset({
     "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",
     "lifeos-diagnostics", "lifeos-memory-cleanup", "lifeos-run",
-    "lifeos-web", "lifeos-helper-watchdog",
+    "lifeos-web",
 })
 _task: asyncio.Task | None = None
 

@@ -61,13 +61,11 @@ async def _keepalive_loop() -> None:
         except asyncio.TimeoutError:
             trace("KEEPALIVE_TIMEOUT", gen=sup.client_generation)
             logger.warning("KEEPALIVE_TIMEOUT — RPC timed out after %ds (gen=%d)", _RPC_TIMEOUT, sup.client_generation)
-            sup._consecutive_failures += 1
             if not sup._recovery_lock.locked():
                 guarded_create_task(sup._trigger_reconnect(), name="lifeos-keepalive-recovery")
         except Exception as exc:
             trace_exception("KEEPALIVE_FAILED", exc, gen=sup.client_generation)
             logger.warning("KEEPALIVE_FAILED — %s (gen=%d)", type(exc).__name__, sup.client_generation)
-            sup._consecutive_failures += 1
             if not sup._recovery_lock.locked():
                 guarded_create_task(sup._trigger_reconnect(), name="lifeos-keepalive-recovery")
 

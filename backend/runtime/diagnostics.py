@@ -45,7 +45,7 @@ _SLOW_HANDLER_PATTERNS = (
 _PERMANENT_TASK_NAMES = frozenset({
     "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",
     "lifeos-diagnostics", "lifeos-memory-cleanup", "lifeos-run",
-    "lifeos-web", "lifeos-helper-watchdog",
+    "lifeos-web",
 })
 _PERMANENT_CORO_PATTERNS = (
     "run_until_disconnected", "run_until_connected",
