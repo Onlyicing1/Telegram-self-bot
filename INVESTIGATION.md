@@ -581,3 +581,103 @@ Do NOT implement this plan now.
 **Single highest-value next investigation:** trace the **helper-bot failure/recovery ownership end-to-end** (from `_start_helper` → heartbeat `READY_BUT_DISCONNECTED` → `_trigger_reconnect` (self-only) → full recovery) and produce a definitive decision on whether helper restart must be added to the lightweight reconnect path or left to full recovery. This is the one area where a dormant watchdog (`_watchdog_loop`), an orphan watchdog (`helper/watchdog.py`), and an active invariant (heartbeat) all overlap on the same responsibility, and it is a live reliability question that static reachability alone cannot fully resolve.
 
 Do not implement this investigation now.
+
+---
+
+## RUNTIME / RECOVERY INVESTIGATION — 2026-08-21
+
+Focused, source-based follow-up that resolves the section-20 recommendation
+(helper-bot recovery ownership) and adds hard evidence for the dormant
+supervisor watchdog. Investigation-only — no production code was modified.
+
+### Metadata
+
+| Field | Value |
+|---|---|
+| Date | 2026-08-21 |
+| Branch | `main` |
+| HEAD | `9423059` (`chore: remove dead config keys and unused watchdog helpers`) |
+| Status | INVESTIGATION ONLY — no code, tests, config, schema, or docs changed |
+| Cleanup context | Since the original audit (HEAD `db927d4`), approved batches removed `managed_task.py`, `helper/watchdog.py`, `helper/pagination.py`, `helper/panel_selftest.py`, root artifacts, and dead config keys (commits `590bf46`, `9423059`). All reachability claims below were re-verified against HEAD `9423059`. |
+
+### 1. `RuntimeSupervisor._watchdog_loop` — reachability
+
+- Definition: `backend/runtime/supervisor.py:846`.
+- **Zero references** to `_watchdog_loop` exist anywhere in the repository (grep over `backend/` and `tests/`): no `immortal_create_task(self._watchdog_loop, ...)`, no dynamic/name-based start, no test, no doc reference beyond this audit.
+- `supervisor.start()` (supervisor.py:178-224) creates exactly these tasks: `lifeos-run` (216), `lifeos-heartbeat` (206), `lifeos-keepalive` (207), `lifeos-failsafe` (208), `lifeos-diagnostics` (210), `lifeos-memory-cleanup` (219), `lifeos-web-server`, `lifeos-helper`. **No watchdog task is created.**
+- `stop()` (supervisor.py:1020-1070) cancels no watchdog task (there is none to cancel).
+- `_last_watchdog_tick`: declared in `__slots__` (supervisor.py:99), initialized to `0.0` (125), written only inside the dormant loop (854). **Zero readers anywhere** — no other module, method, or telemetry path reads it.
+- CONFIRMED: the loop executes zero behavior at runtime. Removing it deletes no executing code; risk is limited to the *intended-but-dormant* behaviors listed below.
+
+### 2. Responsibility-by-responsibility comparison
+
+| # | Behavior inside `_watchdog_loop` (supervisor.py) | Active equivalent | Verdict |
+|---|---|---|---|
+| 1 | Event-loop starvation log, 5000 ms threshold (854-864) | `heartbeat.py:94-105` and `failsafe.py:56-65` (same 5000 ms threshold) | Duplicate diagnostics |
+| 2 | `update_heartbeat()` / `check_stale()` / `set_heartbeat()` (868-872) | **None** — these are the only writers of `health._last_heartbeat`, and they never run | Dead telemetry; see §6 (failsafe inertness) |
+| 3 | RSS > 400 MB → `gc.collect()` (875-886) | None. `memory_cleanup.py` (started supervisor.py:219) expires AI long-memory every 6 h (memory_cleanup.py:30-58); it never reads RSS or calls `gc.collect()`. Heartbeat logs `ru_maxrss` for telemetry only (heartbeat.py:111-115) | Unique but crude mitigation; currently non-executing; low value |
+| 4 | `get_stale_loops` → restart heartbeat/keepalive/profile-scheduler + `_trigger_reconnect` (889-916) | Detection only: `runtime/health_check.py:100` surfaces stale loops for diagnostics (served at `/api/health/snapshot`); **no active code restarts a stalled loop** | Small gap (§5); low severity |
+| 5 | Helper health check + restart (926-944) | **None in the active path** — see §4 | Real gap — must be relocated before removal |
+| 6 | `get_me` RPC + threshold → full recovery (946-1003) | `keepalive.py:42-72` (`get_me`, 15 s timeout) → `_trigger_reconnect` on failure; escalation to full recovery only when the reconnect itself raises (supervisor.py:468-472) | Covered except threshold-based escalation to full recovery |
+
+### 3. Failure counters
+
+- `_consecutive_failures` — active writers: `keepalive.py:64,70` (increment) and supervisor resets at 231 (`_build_and_register`), 451 (reconnect success), 578 (`_do_recovery`), 667/735 (`_hard_reset_runtime`). **Readers exist only inside the dormant `_watchdog_loop`** (supervisor.py:948-998). After watchdog removal it becomes a write-only counter with no functional effect — keepalive triggers recovery directly, not via the counter.
+- `_reconnect_failures` — incremented at supervisor.py:425, reset at 232/452/579/668/736. **Never read for escalation anywhere.** Already write-only today.
+
+### 4. Helper recovery trace
+
+1. `_start_helper` (supervisor.py:278-315) is called from exactly three sites: `start()` (195), `_do_recovery` (571), `_hard_reset_runtime` (732). No other callers.
+2. `_trigger_reconnect` (411-472) is **self-client only**: it stops the run loop, disconnects/connects the self client, verifies authorization. It never touches `helper_client` or `_helper_task` (confirmed by reading the full method).
+3. Detection of a dead helper exists: heartbeat `READY_BUT_DISCONNECTED` fires when `runtime_state == READY` and (`self_connected == False` or (`helper_enabled` and not `helper_connected`)) (heartbeat.py:182-201) → `guarded_create_task(sup._trigger_reconnect())` (heartbeat.py:200).
+4. **Result (CONFIRMED gap):** helper dies while the self client is healthy → the heartbeat re-raises the invariant every 30 s → each pass calls `_trigger_reconnect`, which reconnects a *healthy* self client (throttled to 1/60 s by `_RECONNECT_COOLDOWN` = 60 s, supervisor.py:82) → helper stays down → **no escalation exists on this path** (`_trigger_reconnect` escalates to full recovery only on exception) → the state persists indefinitely. It is **not** eventually self-healing in the general case.
+5. No recovery-loop/deadlock risk: reconnect cooldown + `_recovery_lock` serialize all recovery. The failure mode is a stuck state, not a loop storm.
+6. `backend/helper/watchdog.py` — **already deleted in commit `590bf46`** (it was orphaned: no `start()` caller, no importer, no test). Residual inert tokens: the task-name string `"lifeos-helper-watchdog"` at heartbeat.py:38, supervisor.py:776, runtime/diagnostics.py:48 — no code attaches tasks to those names anymore. KEEP BUT CLEAN (remove the tokens when those protected files are next touched).
+
+**Smallest correct architectural fix location (NOT implemented):** inside `RuntimeSupervisor._trigger_reconnect` — after a successful self reconnect (supervisor.py:451-460), when `self.helper_enabled` and (`self.helper_client is None` or `not self.helper_client.is_connected()`), call `await self._start_helper()`. This keeps the fix inside the single recovery authority, under the already-held `_recovery_lock`, with no new supervisor or watchdog. Alternative: the heartbeat helper-invariant branch calls a new small supervisor method `_recover_helper()` instead of `_trigger_reconnect()`. Either way the helper restart must live in the supervisor — never in handlers/services.
+
+### 5. Event-loop stall and memory handling
+
+- **Blocked event loop:** detected by heartbeat (heartbeat.py:94-105, `EVENT_LOOP_STARVATION` > 5000 ms) and failsafe (failsafe.py:56-65). Covered by active code.
+- **Dispatch stall:** heartbeat `EVENT_DISPATCH_STALLED` (updates arriving, none dispatched > 90 s) → `_trigger_reconnect` (heartbeat.py:216-231). Covered.
+- **Per-loop tick-stale (a loop task died silently while the event loop is fine):** detection exists (`get_stale_loops`, health.py:88; surfaced in health_check.py:100), but **restarting the stalled loop exists only in the dormant watchdog** (supervisor.py:903-916). Gap, low severity — `immortal_create_task` prevents ordinary task death, and failsafe is the intended total-freeze catch-all (currently inert, see §6).
+- **Memory pressure:** no active RSS monitor. `memory_cleanup.py` is AI-memory expiration (6 h interval), not RSS/GC. The watchdog's RSS→`gc.collect()` path is the only RSS-pressure handler and never runs. Removing it loses a crude, low-value mitigation.
+- Unused import confirmed: heartbeat.py:28 imports `get_stale_loops` but never calls it (full 275-line module read).
+
+### 6. NEW — the failsafe hard reset is currently unreachable (P0/P1, pre-existing)
+
+- `health.mark_started()` (health.py:99-104) — the **only** setter of `_started_at` and initial setter of `_last_heartbeat` — has **zero callers** in the repo (grep over `backend/` and `tests/`).
+- `health.update_heartbeat()` / `set_heartbeat()` (health.py:107-115) are called **only** by the dormant `_watchdog_loop` (supervisor.py:869-871).
+- ⇒ `_last_heartbeat` stays `0.0` for the whole process lifetime ⇒ `_heartbeat_age()` always returns `-1.0` (health.py:263-265).
+- failsafe `_get_heartbeat_ts()` maps `age < 0` → `0.0` (failsafe.py:54-66) ⇒ in `_all_frozen()`, `all_initialized = hb > 0 and upd > 0 and rpc > 0 and dsp > 0` (failsafe.py:88) is **always False** ⇒ `_all_frozen()` always returns `False` (failsafe.py:91) ⇒ the failsafe loop can **never** schedule `sup._hard_reset_runtime()` (failsafe.py:157).
+- **Conclusion:** the last-resort hard reset is inert today. The failsafe task is started (failsafe.py:167-171) but its only trigger condition is unreachable.
+- Side effects: `health.snapshot()` reports `process_alive=False`, `status="degraded"`, `heartbeat_age_s=None`, `uptime_s=None` permanently; served at `/api/health/snapshot` (web/app.py:54-57) and consumed by observability/health panels.
+- Related dead telemetry: `set_watchdog_ok` (health.py:194) has zero callers ⇒ `watchdog_ok`/`last_watchdog_check_s` are always `False`/`None` (health.py:320-321); `bot/handlers/misc.py:539` reads a nonexistent `watchdog_running` key ⇒ the health panel always prints "Watchdog: Stopped" (key mismatch + dead source).
+- **Where it should be fixed (NOT implemented):** call `mark_started()` from `RuntimeSupervisor.start()` (or have the heartbeat loop call `update_heartbeat()` each tick). One-line wiring; both locations are inside the existing authority.
+
+### 7. Final classifications
+
+| Item | Classification | Evidence / risk |
+|---|---|---|
+| `RuntimeSupervisor._watchdog_loop` | **SAFE TO REMOVE** — CONFIRMED unreachable; zero live behavior lost | Def-only reference (supervisor.py:846); never started, never cancelled, no tests. Prerequisite companions: relocate helper restart (§4), consciously accept the §5 loop-restart gap, and fix §6 independently (pre-existing bug, not caused by the watchdog). |
+| `RuntimeSupervisor._last_watchdog_tick` | **SAFE TO REMOVE** — CONFIRMED; zero readers | supervisor.py:99/125/854; no read site. Remove the slot, the init, and the write together with the loop. |
+| `backend/helper/watchdog.py` | **ALREADY REMOVED** (commit `590bf46`); residual `lifeos-helper-watchdog` strings → KEEP BUT CLEAN | No runtime contribution; tokens at heartbeat.py:38, supervisor.py:776, runtime/diagnostics.py:48 |
+| Helper restart missing from lightweight reconnect | **CONFIRMED GAP** — fix in supervisor only (§4), do not implement in this investigation | Heartbeat detects (heartbeat.py:182-201); `_trigger_reconnect` never restarts the helper; no escalation on that path |
+| `_consecutive_failures`, `_reconnect_failures` | KEEP BUT CLEAN — become write-only after watchdog removal | Readers exist only in the dormant loop; keepalive triggers recovery directly |
+| Failsafe trigger wiring | KEEP (architecture) — but currently inert; needs `mark_started()` wiring (§6) | failsafe.py:88/91; health.py:99-115; supervisor.py:869-871 |
+| `set_watchdog_ok` / `watchdog_ok` / `misc.py` key | KEEP BUT CLEAN — dead telemetry | health.py:194 (no callers); misc.py:539 key mismatch |
+| `_verify_heartbeat` (supervisor.py:759-766) | KEEP — active | Called by the active `_hard_reset_runtime` failsafe path |
+
+### 8. Constraints honored
+
+- `RuntimeSupervisor` remains the single recovery authority; nothing here proposes a second supervisor or another watchdog architecture.
+- The recommended helper fix is scoped to `_trigger_reconnect` / a supervisor method — no recovery logic moves into handlers or services.
+- No production code, tests, config, schema, or documentation were modified for this section.
+
+### 9. Recommended sequencing when cleanup resumes (do not implement now)
+
+1. **Fix §6** — call `mark_started()` in `supervisor.start()` (restores the last-resort layer; independent of the watchdog).
+2. **Relocate helper restart** into `_trigger_reconnect` (§4) — closes the helper gap.
+3. **Remove** `_watchdog_loop` + `_last_watchdog_tick`; then drop the now-write-only `_consecutive_failures` / `_reconnect_failures` bookkeeping only if the removal is complete.
+
+This section supersedes the earlier section-8 findings #1-3 with hard call-site evidence and resolves the section-20 recommendation. The single biggest reliability finding is §6: the failsafe hard-reset path is unreachable because nothing calls `mark_started()`. Fix that before or with the watchdog removal.
