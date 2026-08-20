@@ -17,11 +17,7 @@ B) BOUNDED OPERATIONS (database queries, short RPC calls, lock acquisition,
      4. Never leaves ``asyncio.Lock`` objects held (the CancelledError
         propagates through ``async with`` which releases the lock).
 
-Usage patterns:
-
-    # Context manager (preferred — guarantees cleanup)
-    async with bounded_operation("db:insert_save", timeout=10):
-        await db.table("saved_items").insert(data).execute()
+Usage pattern:
 
     # One-shot await (for simple coroutine calls)
     result = await guarded_await(coro, name="db:query_save", timeout=10)
@@ -80,86 +76,6 @@ class OperationTimeoutError(asyncio.TimeoutError):
         self.elapsed = elapsed
         self.timeout = timeout
         super().__init__(f"Operation '{name}' timed out after {elapsed:.1f}s (limit={timeout:.1f}s)")
-
-
-class bounded_operation:
-    """Async context manager that bounds an operation's execution time.
-
-    Usage::
-
-        async with bounded_operation("db:insert_save", timeout=10):
-            await db.table("saved_items").insert(data).execute()
-
-    If the body takes longer than ``timeout`` seconds:
-      1. A ``OP_TIMEOUT`` trace event is emitted with full diagnostics.
-      2. The inner task is cancelled via ``asyncio.Task.cancel()``.
-      3. ``CancelledError`` propagates through the body's ``finally`` /
-         ``async with`` blocks, ensuring resource cleanup.
-      4. ``OperationTimeoutError`` is raised to the caller.
-
-    The context manager itself does NOT catch ``CancelledError`` — it
-    propagates naturally so that ``async with`` lock releases and ``finally``
-    blocks execute in the caller's frame.
-
-    Parameters:
-      name:    Human-readable operation name for diagnostics.
-      timeout: Maximum allowed execution time in seconds.
-      cancel:  If True (default), cancel the operation on timeout. If False,
-               only log the diagnostic but do not cancel (useful for
-               operations where cancellation is unsafe).
-    """
-
-    __slots__ = ("_name", "_timeout", "_cancel", "_t0", "_task")
-
-    def __init__(
-        self,
-        name: str,
-        *,
-        timeout: float = _DEFAULT_TIMEOUT,
-        cancel: bool = True,
-    ) -> None:
-        self._name = name
-        self._timeout = timeout
-        self._cancel = cancel
-        self._t0: float = 0.0
-        self._task: asyncio.Task | None = None
-
-    async def __aenter__(self) -> "bounded_operation":
-        self._t0 = time.monotonic()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
-        elapsed = time.monotonic() - self._t0
-
-        if exc_type is asyncio.CancelledError and self._task is not None:
-            _emit_timeout_diagnostic(
-                self._name, elapsed, self._timeout,
-                cancelled=True, cancel_ok=True,
-            )
-            raise OperationTimeoutError(self._name, elapsed, self._timeout) from exc_val
-
-        if exc_type is not None and issubclass(exc_type, OperationTimeoutError):
-            return False
-
-        return False
-
-    def attach_task(self, task: asyncio.Task) -> None:
-        """Associate an asyncio.Task with this operation for cancellation."""
-        self._task = task
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def timeout(self) -> float:
-        return self._timeout
-
-    @property
-    def elapsed(self) -> float:
-        if self._t0:
-            return time.monotonic() - self._t0
-        return 0.0
 
 
 async def guarded_await(

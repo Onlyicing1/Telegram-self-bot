@@ -24,10 +24,6 @@ Environment variables (all optional — AI is off by default):
     OPENAI_API_KEY            → OpenAI API key (alternative)
     AI_OPENROUTER_API_KEY     → OpenRouter API key
     OPENROUTER_API_KEY        → OpenRouter API key (alternative)
-    AI_CLAUDE_API_KEY         → Anthropic/Claude API key
-    CLAUDE_API_KEY            → Anthropic/Claude API key (alternative)
-    AI_GLM_API_KEY            → GLM/ChatGLM API key
-    GLM_API_KEY               → GLM/ChatGLM API key (alternative)
     AI_GROQ_API_KEY           → Groq API key
     GROQ_API_KEY              → Groq API key (alternative)
     AI_CEREBRAS_API_KEY       → Cerebras API key
@@ -39,8 +35,6 @@ Environment variables (all optional — AI is off by default):
     AI_GEMINI_MODEL           → Gemini model name
     AI_OPENAI_MODEL           → OpenAI model name
     AI_OPENROUTER_MODEL       → OpenRouter model name
-    AI_CLAUDE_MODEL           → Claude model name
-    AI_GLM_MODEL              → GLM model name
     AI_GROQ_MODEL             → Groq model name
     AI_CEREBRAS_MODEL         → Cerebras model name
     AI_MISTRAL_MODEL          → Mistral model name
@@ -165,22 +159,6 @@ def load_provider_env_configs() -> dict[str, dict[str, Any]]:
             "api_key": openrouter_key,
             "default_model": os.getenv("AI_OPENROUTER_MODEL", "") or os.getenv("OPENROUTER_MODEL", ""),
             "base_url": os.getenv("AI_OPENROUTER_BASE_URL", "") or os.getenv("OPENROUTER_BASE_URL", ""),
-            "enabled": True,
-        }
-
-    claude_key = os.getenv("AI_CLAUDE_API_KEY", "") or os.getenv("CLAUDE_API_KEY", "")
-    if claude_key:
-        configs["claude"] = {
-            "api_key": claude_key,
-            "default_model": os.getenv("AI_CLAUDE_MODEL", "") or os.getenv("CLAUDE_MODEL", ""),
-            "enabled": True,
-        }
-
-    glm_key = os.getenv("AI_GLM_API_KEY", "") or os.getenv("GLM_API_KEY", "")
-    if glm_key:
-        configs["glm"] = {
-            "api_key": glm_key,
-            "default_model": os.getenv("AI_GLM_MODEL", "") or os.getenv("GLM_MODEL", ""),
             "enabled": True,
         }
 
