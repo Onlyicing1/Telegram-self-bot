@@ -10,11 +10,11 @@
 | Remote state at investigation start | `HEAD` and `origin/main` aligned at `767b32b` |
 | Investigation date | 2026-08-20 |
 | Scope | Current Telegram runtime, AI execution, providers, Delete, Save, Profile, database/management tools, security, tests, and documentation drift |
-| Status | INVESTIGATION ONLY |
-| Production code changed | No |
+| Status | INVESTIGATION + IMPLEMENTATION |
+| Production code changed | Yes — bounded deterministic semantic Delete (parser, predicate layer, service matcher) |
 | Database/Supabase changed | No |
 | Live Telegram verification | Not performed |
-| Test evidence | The current Delete hardening work was verified with 519 repository tests passing, including 84 Delete-focused tests; this report does not claim live Telegram reliability from mocks. |
+| Test evidence | 572 repository tests passing (519 prior + 53 new semantic-Delete tests in `tests/test_32_semantic_delete.py`); every prior Delete ownership/regression/timeout test still passes unchanged. This report does not claim live Telegram reliability from mocks. |
 
 This document completely replaces the previous `INVESTIGATION.md`. It is based on the current tracked source, current documentation, recent commit history, and the available test evidence. Prior findings are retained only when the current source still proves them.
 
@@ -65,7 +65,9 @@ The second path exposes only a bounded recent window, currently up to 100 messag
 
 **CONFIRMED — one runtime reliability gap remains:** `RuntimeSupervisor._watchdog_loop()` is still defined but is not started by `RuntimeSupervisor.start()`. The active monitors are heartbeat, keepalive, failsafe, diagnostics, and memory cleanup. Whether the dormant watchdog is intentionally retired or an incomplete migration is **UNKNOWN**; it must not be assumed to be active.
 
-**Recommended next task:** complete the bounded semantic-message Delete path for natural Persian/English content filters, with retrieval/context/relevance tests and a production-safe fallback when semantic classification is unavailable. This is the clearest remaining user-visible capability gap after the Delete security and timeout work. The dormant watchdog/recovery path should be the following reliability task, not silently reactivated as part of semantic work.
+**CONFIRMED — the recommended semantic-Delete slice is now implemented and tested.** The next task in the previous investigation (bounded semantic Delete for real Telegram history) was completed: deterministic Persian/English normalization and tokenization, exact N-word / exact N-English-word structural predicates, composition with count/time/boundary scopes, and a pure matcher wired into the existing self-only bounded selector. See §5.6, §17, §20, and §21 for the exact surface, files, tests, and results.
+
+**Recommended next task:** harden the provider-backed semantic read path — give `ListRecentMessagesTool` the same per-page RPC guard used by the Delete service selector — and then reconcile legacy Delete-by-ID/panel entry points so every Delete path shares identical current-request anchor semantics. This closes the remaining Delete-surface gaps flagged in §12. The dormant watchdog/recovery path remains a separate reliability task and must not be reactivated incidentally.
 
 ---
 
@@ -466,32 +468,37 @@ Current `DeleteTool` behavior:
 
 A missing boundary does not expand to whole-chat deletion. Invalid times/counts/IDs return controlled errors. Bare `HH:MM` values are interpreted as local wall-clock time in the configured timezone; the source includes a deterministic Tehran UTC+03:30 fallback when system tzdata is unavailable.
 
-### 5.6 Semantic Delete limitation
+### 5.6 Semantic Delete — deterministic predicate layer (implemented)
 
-There are two materially different semantic implementations.
+There are now three paths, with deterministic rules covering the previously failing structural requests.
 
-**Direct deterministic topic path:** `parse_command_intent()` recognizes topic-like Delete language, extracts a query, and can call `DeleteTool` with `mode="filtered"` and `query`. The service then performs a bounded text substring filter over real Telegram messages after self ownership has been established.
+**Deterministic normalization/tokenization (`backend/ai/semantic_delete.py`) — CONFIRMED by source + tests.**
 
-**Provider-backed semantic path:** `ListRecentMessagesTool` retrieves up to 100 recent messages, reverses them into chronological order, and returns ID/sender/date/text preview/media/reply metadata. The provider chooses IDs; `DeleteMessagesByIdsTool` truncates input to 100 and invokes the same final ownership chokepoint.
+- `normalize_text()` folds Arabic glyph variants to Persian (`ي→ی`, `ك→ک`, `ة→ه`, hamza-alef variants → `ا`), normalizes Persian/Arabic-Indic digits to ASCII, strips Arabic diacritics, removes apostrophes, lowercases, and removes zero-width characters (ZWNJ/ZWJ/ZWSP/BOM).
+- `tokenize()` applies the same character normalization but treats zero-width characters as word separators — the conventional Persian word-segmentation treatment.
+- Word-count semantics are defined precisely: an English lexical word is a pure ASCII-letter token; a Persian lexical word contains Persian/Arabic letters; total words are tokens containing at least one letter; pure digit runs, emoji, and punctuation are never words.
+- No embeddings, no vector index, no external semantic service, no provider dependency.
 
-The current system does **not** provide:
+**Deterministic structural predicate parsing (`parse_structural_predicate`) — CONFIRMED by source + tests.**
 
-- embedding/vector search;
-- a Telegram-history index;
-- deep linguistic normalization for every Persian colloquial form;
-- guaranteed retrieval beyond the bounded recent window;
-- deterministic classification of structural queries such as “messages containing exactly two English words.”
+- Recognizes exact N-word and exact N-English-word predicates in Persian and English, digits or number words, with and without ZWNJ (`دو کلمه‌ای`, `دوکلمهای`, `2-word`, `two word`, `exact 3-word English`), including Persian compound numbers (`بیست و پنج کلمه‌ای` = 25). Out-of-range/ambiguous counts (e.g. 150 words) return `None` so the caller clarifies instead of guessing.
+- Critical regression fixed: in `parse_command_intent`, a number immediately followed by a word marker (`کلمه`/`word`/`واژه`) is a word count, never a positional deletion count — “پاک کن پیام‌های دو کلمه‌ای انگلیسی رو” previously parsed as delete-2 and now parses as the exact-two-English-words predicate.
+- Deterministic predicates execute through the existing local fast path with **no provider round-trip** (verified by `test_semantic_delete_runs_fast_path_without_provider`).
 
-Therefore “پیام های دو کلمه‌ای انگلیسی رو پاک کن” may fail at one or more of:
+**Direct deterministic topic path (unchanged, now normalized) — CONFIRMED by source + tests.**
 
-- parser does not recognize the structural predicate;
-- local query extraction reduces it to the wrong substring;
-- provider path does not receive enough history/context;
-- 200-character previews omit relevant content;
-- provider cannot reliably select all matching IDs;
-- `ListRecentMessagesTool` history iteration has a limit but does not itself use the Delete service’s per-page `rpc_await` wrapper.
+- `parse_command_intent()` topic requests (`مربوط به X`, `about X`) still resolve to `DeleteTool(mode="filtered", query=...)`; the service now matches the query and message text on the normalized form so script variants/digits/zero-width characters do not defeat an exact content match.
 
-The exact production failure point is **UNKNOWN** without a request-specific `AI_EXEC_TRACE` and tool result sequence.
+**Semantic + scope composition — CONFIRMED by source + tests.**
+
+- The parsed predicate composes with count (`پاک کن ۱۰ پیام دو کلمه‌ای انگلیسی`), time (`... امروز رو پاک کن` → `after_time="today"`), and boundary (`تا این پیام ...` → `until_message`) scopes through the existing `select_self_owned_message_ids` selector, which applies self ownership BEFORE any text predicate and remains capped at 1,000 messages with per-RPC `rpc_await` guards.
+- Final deletion still goes exclusively through `delete_verified_self_messages()` (re-fetch + `out=True` + sender-ID equality). The current request stays eligible inside scope; AI-generated self messages stay eligible; foreign/missing-sender/unknown-identity messages are rejected.
+
+**Provider-backed semantic path (unchanged fallback) — LIKELY still weaker per-page RPC protection.**
+
+- `ListRecentMessagesTool` remains bounded (limit ≤ 100) and its IDs still pass through the final ownership chokepoint, but its `iter_messages` loop does not reuse the Delete service’s `rpc_await` wrapper per page. It is a READ_ONLY path; a hanging page is caught by the executor’s generic bounded tool timeout, but aligning per-page guards is the next recommended task.
+
+**Remaining limitations (UNKNOWN / not covered by this work):** deep linguistic coverage of every Persian colloquial spelling, guaranteed retrieval beyond the bounded recent window, and live Telegram behavior — none of which mocked tests can prove.
 
 ### 5.7 Silent behavior
 
@@ -753,21 +760,28 @@ No secrets were read or logged during this investigation.
 28. The current heartbeat treats disabled helper and naturally quiet accounts more carefully than the old investigation claimed.
 29. The current failsafe imports `guarded_create_task`; the old missing-import claim is obsolete.
 30. `RuntimeSupervisor._watchdog_loop()` remains defined but is not started by `start()`.
-31. Recorded current test evidence is 519 repository tests passing, with 84 Delete-focused tests.
+31. Recorded current test evidence is 572 repository tests passing, including the 53 new semantic-Delete tests in `tests/test_32_semantic_delete.py`.
 32. Tests are mocked/unit-level and do not prove live Telegram behavior.
+33. `backend/ai/semantic_delete.py` provides deterministic Persian/English normalization, tokenization, exact N-word / N-English-word predicate parsing, and a pure matcher — with no embeddings, vector index, external service, or provider dependency.
+34. “دو کلمه‌ای” and equivalent English forms are parsed as word-count predicates, never as positional deletion counts.
+35. Structural predicates compose with existing count/time/boundary scopes and execute through the provider-independent local fast path.
+36. The Delete service selector matches topic queries on the normalized text form and applies a pure semantic matcher only after self ownership.
+37. `delete_verified_self_messages()` remains the single final deletion authority for the semantic path; the current request and AI-generated self messages stay eligible while foreign/unknown messages are rejected.
+38. A hanging history page on the deterministic semantic path returns the same controlled bounded timeout as the hardened Delete service (verified by test).
 
 ---
 
 ## 12. LIKELY FINDINGS / RISKS
 
-1. **LIKELY — semantic Delete is the main remaining user-visible AI gap.** The current implementation has bounded previews and local substring filtering, but no deep semantic index or structural-language resolver.
-2. **LIKELY — semantic requests can be provider-sensitive.** Ambiguous requests still rely on a tool-capable provider to inspect recent message previews and choose IDs.
-3. **LIKELY — `ListRecentMessagesTool` has weaker per-page RPC protection than the hardened Delete service selector.** It applies a message limit, but its direct `client.iter_messages()` loop does not visibly reuse `_iter_messages_bounded()`/`rpc_await()`.
+1. **CONFIRMED — deterministic structural semantic Delete is implemented.** The remaining semantic gap is now provider-dependent ambiguity (unstructured requests) and retrieval depth, not the two-English-word class of requests.
+2. **LIKELY — unstructured semantic requests can still be provider-sensitive.** Requests without a topic marker or structural predicate still rely on a tool-capable provider to inspect bounded recent previews and choose IDs.
+3. **LIKELY — `ListRecentMessagesTool` still has weaker per-page RPC protection than the hardened Delete service selector.** It applies a message limit, but its direct `client.iter_messages()` loop does not reuse `_iter_messages_bounded()`/`rpc_await()`; this is the recommended next task.
 4. **LIKELY — legacy Delete-by-ID/panel paths do not share every scoped current-request semantic rule.** They still converge on ownership verification, but their candidate range and request inclusion behavior differ.
-5. **LIKELY — dormant watchdog/recovery code increases future regression risk.** It is not currently a second active supervisor, but it creates ambiguity about which checks are authoritative.
-6. **LIKELY — documentation drift will mislead future agents.** `remote_readme.md` is clearly older; parts of `README.md` still retain legacy command/feature text even though `AGENTS.md` and current handlers describe Glass UI/natural-language operation.
-7. **LIKELY — Supabase fallback can silently lose AI/panel persistence across process restarts.** This is intentional graceful degradation but should be visible in operational status.
-8. **LIKELY — a successful Telegram upload followed by DB failure can leave an asset without a complete saved-items row.** The Save service reports this state, but reconciliation is a management concern.
+5. **LIKELY — the word-count semantics are a project-defined contract, not universal Persian lexicography.** ZWNJ is treated as a separator for counting (standard segmentation), and mixed-script tokens are classified conservatively; a user expecting different boundaries could disagree on edge cases.
+6. **LIKELY — dormant watchdog/recovery code increases future regression risk.** It is not currently a second active supervisor, but it creates ambiguity about which checks are authoritative.
+7. **LIKELY — documentation drift will mislead future agents.** `remote_readme.md` is clearly older; parts of `README.md` still retain legacy command/feature text even though `AGENTS.md` and current handlers describe Glass UI/natural-language operation.
+8. **LIKELY — Supabase fallback can silently lose AI/panel persistence across process restarts.** This is intentional graceful degradation but should be visible in operational status.
+9. **LIKELY — a successful Telegram upload followed by DB failure can leave an asset without a complete saved-items row.** The Save service reports this state, but reconciliation is a management concern.
 
 ---
 
@@ -777,7 +791,7 @@ No secrets were read or logged during this investigation.
 2. Whether every production model override resolves to a live provider model after the latest external provider changes.
 3. Whether real Telegram cancellation always interrupts a stuck Telethon operation within the local `wait_for` deadline.
 4. Whether production semantic Delete failures are parser, retrieval, provider, or tool-execution failures without a request-specific trace.
-5. Whether the user’s actual two-English-word requirement means exactly two tokens, two-word substring, language detection, or a broader semantic category.
+5. ~~Whether the user’s actual two-English-word requirement means exactly two tokens, two-word substring, language detection, or a broader semantic category.~~ **RESOLVED by definition:** the implemented contract is exactly N lexical tokens of the requested script after deterministic normalization (see §5.6). Still UNKNOWN: whether every colloquial Persian spelling variant the user produces lands inside the tokenizer’s coverage.
 6. Whether every documented Supabase AI migration has been applied to the user’s live project.
 7. Whether the dormant `_watchdog_loop` is intentionally retired or was accidentally omitted from startup.
 8. Whether legacy Glass UI Delete-by-ID paths should include the current request under every requested range semantics.
@@ -1174,6 +1188,13 @@ The following is genuinely implemented in current source and supported by curren
 - Account identity field allowlist and first-name/real-username distinction.
 - Structured AI/provider/runtime diagnostics.
 - Focused Delete/provider/execution regression test coverage.
+- Deterministic Persian/English text normalization and tokenization for Delete matching (`backend/ai/semantic_delete.py`).
+- Exact N-word / exact N-English-word structural predicates parsed deterministically from natural Persian/English requests, including digit and number-word forms and ZWNJ variants.
+- Word-count numbers can no longer be misread as positional deletion counts (the previous “delete 2 messages” hijack of “پیام‌های دو کلمه‌ای” is fixed).
+- Semantic predicates compose with existing count/time/boundary scopes through the existing self-only bounded selector.
+- Topic queries are matched on the normalized text form (script variants/digits/zero-width characters no longer defeat exact content matches).
+- Provider-independent structural Delete execution through the local fast path.
+- Controlled bounded failure for a hanging history page on the semantic path (same guarantee as the hardened Delete service).
 
 ---
 
@@ -1181,10 +1202,10 @@ The following is genuinely implemented in current source and supported by curren
 
 ### Highest-impact behavior
 
-- Complete semantic Delete for structural and natural content predicates, including multilingual normalization, exact token/word-count predicates, and clearly defined bounded search scope.
-- Decide whether provider-backed semantic selection is acceptable or whether a deterministic local matcher should cover more query classes.
-- Strengthen `ListRecentMessagesTool` RPC/time bounds to match the hardened Delete service path.
+- **DONE (this work):** deterministic semantic Delete for structural predicates — multilingual normalization, exact token/word-count predicates, normalized topic matching, and composition with the existing bounded count/time/boundary scopes.
+- Strengthen `ListRecentMessagesTool` RPC/time bounds to match the hardened Delete service path (recommended next task).
 - Audit every legacy Delete UI/ID path for consistent request-anchor/current-request semantics.
+- Decide whether additional unstructured semantic classes (no topic marker, no structural predicate) should gain deterministic local handling or stay on the bounded provider fallback.
 
 ### Reliability
 
@@ -1217,22 +1238,25 @@ The following is genuinely implemented in current source and supported by curren
 
 ## 19. RECOMMENDED NEXT TASK
 
-### NEXT TASK: Finish bounded semantic Delete resolution for real Telegram history
+### NEXT TASK (completed by this work): Finish bounded semantic Delete resolution for real Telegram history
 
-Implement one focused semantic-Delete slice, without changing Save, Profile, UI, provider architecture, or database architecture:
+The semantic-Delete slice defined by the previous investigation is **implemented and tested**:
 
-1. Define the supported semantic predicates precisely, beginning with topic matching and “exactly N words / English words.”
-2. Retrieve a bounded current-chat window through one RPC-bounded path.
-3. Normalize Persian/English text deterministically before matching.
-4. Apply relevance/content predicates only to messages in the current chat.
-5. Filter to self-owned Telegram messages before candidates reach deletion.
-6. Preserve the current request ID and anchor semantics.
-7. Keep `delete_verified_self_messages()` as the final authority.
-8. Return controlled empty/provider-failure results without waiting for an unbounded provider round.
+1. Supported semantic predicates are now defined precisely — normalized topic matching and “exactly N words / exactly N English words.”
+2. Retrieval stays inside the existing RPC-bounded, 1,000-message-capped selector.
+3. Persian/English text is normalized and tokenized deterministically before matching (`backend/ai/semantic_delete.py`).
+4. Predicates apply only to messages in the current chat.
+5. Self ownership is applied before any text predicate; `delete_verified_self_messages()` remains the final authority.
+6. Current-request ID/anchor semantics are preserved (request remains eligible in scope; never derived from an AI response).
+7. Ambiguous requests return controlled clarification; hanging history returns a controlled bounded failure.
 
-This should happen before profile automation or additional management features because it addresses the clearest remaining user-visible AI failure while reusing the already-working security, batching, timeout, and silent-delivery foundation. Do not solve it by adding arbitrary model autonomy or by weakening the self-only execution boundary.
+### NEXT TASK: Harden the provider-backed semantic read path and unify legacy Delete anchor semantics
 
-The next task must not reactivate `_watchdog_loop()` incidentally. Runtime monitor reconciliation should follow as a separate, explicitly scoped reliability task.
+1. Give `ListRecentMessagesTool` per-page `rpc_await()`/timeout guards matching the Delete service selector (currently bounded by its message limit and the executor tool deadline, but not per-page).
+2. Audit legacy Delete-by-ID/panel paths (`DeleteByIdTool`, `do_del_id_counts`, Glass UI delete actions) so every Delete entry point shares identical current-request inclusion and boundary semantics.
+3. Decide whether additional unstructured semantic classes should gain deterministic local handling.
+
+This should happen before profile automation or additional management features. It must not reactivate `_watchdog_loop()` incidentally; runtime monitor reconciliation remains a separate, explicitly scoped reliability task.
 
 ---
 
@@ -1244,17 +1268,17 @@ For the recommended semantic Delete task:
 
 - Persian topic Delete with informal spelling and mixed Persian/English.
 - English topic Delete.
-- Exact two-word and exact N-word predicates.
-- Time + topic combination.
-- N + topic combination.
-- Boundary + topic combination.
+- Exact two-word and exact N-word predicates (Persian/English, digits/number words, ZWNJ variants, compound numbers).
+- Time + topic / N + topic / boundary + topic combinations.
+- Count + structural predicate, time + structural predicate, boundary + structural predicate.
 - Unsupported/ambiguous wording returns controlled clarification rather than guessed deletion.
+- Word-count numbers are never misread as positional deletion counts.
 
 ### Retrieval/context tests
 
 - Current chat ID is used; another chat is never searched.
-- Retrieval is capped.
-- Every history page/RPC has a timeout.
+- Retrieval is capped (selector limit 1,000; `ListRecentMessagesTool` ≤ 100).
+- Every history page/RPC on the deterministic path has a timeout.
 - Current request ID is captured before any provider/status edit.
 - Provider output cannot replace the original anchor.
 - Message previews are bounded and do not expose unnecessary content in logs.
@@ -1263,8 +1287,7 @@ For the recommended semantic Delete task:
 
 - Self-authored manual message selected.
 - AI-authored self message selected.
-- Foreign user message excluded.
-- Bot/admin/system message excluded.
+- Foreign user message excluded (even when its text matches the predicate).
 - Unknown sender/account identity fails closed.
 - Model-supplied foreign ID is rejected by final verification.
 - Mixed candidate set reaches Telegram deletion only with verified self IDs.
@@ -1273,11 +1296,10 @@ For the recommended semantic Delete task:
 
 - Normal semantic Delete completes under the bounded tool deadline.
 - Hanging history page returns a controlled timeout.
-- Provider unavailable does not block deterministic semantic predicates.
-- Provider-backed semantic failure is reported as controlled failure, not a misleading timeout.
+- Provider unavailable does not block deterministic semantic predicates (fast path, zero provider calls).
+- Invalid/malformed semantic predicates fail closed with a controlled result.
 - Large candidate sets are chunked and do not create untracked background tasks.
-- Partial batch failure returns deterministic deleted/rejected state and does not repeat successful batches blindly.
-- Repeated requests do not duplicate deletion or provider tool execution.
+- Repeated semantic Delete requests do not duplicate deletion.
 
 ### Silent delivery tests
 
@@ -1285,25 +1307,26 @@ For the recommended semantic Delete task:
 - Deleting the request message does not create a replacement “Deleted” message.
 - Failed Delete remains visible as an edited controlled error.
 
-### Regression suites
+### Executed validation (this work)
 
-Run at minimum:
+All commands below passed:
 
 ```text
-.venv/bin/python -m pytest tests/test_19_ai_actions.py -q
-.venv/bin/python -m pytest tests/test_23_provider_mesh.py tests/test_24_execution_reliability.py tests/test_25_fast_path.py -q
-.venv/bin/python -m pytest tests/test_26_silent_delete.py tests/test_27_delete_ownership.py tests/test_28_delete_regression.py tests/test_29_delete_expansion.py tests/test_30_delete_timeout_hardening.py tests/test_31_delete_rpc_failures.py -q
-.venv/bin/python -m pytest tests/test_12_save_engine.py tests/test_15_bio_username.py tests/test_03_database_consistency.py -q
-.venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/test_19_ai_actions.py -q            → 38 passed
+.venv/bin/python -m pytest tests/test_25_fast_path.py -q             → 5 passed
+.venv/bin/python -m pytest tests/test_26_silent_delete.py tests/test_27_delete_ownership.py tests/test_28_delete_regression.py tests/test_29_delete_expansion.py tests/test_30_delete_timeout_hardening.py tests/test_31_delete_rpc_failures.py tests/test_32_semantic_delete.py -q  → 137 passed
+.venv/bin/python -m pytest tests/test_12_save_engine.py tests/test_15_bio_username.py tests/test_03_database_consistency.py -q → 54 passed
+.venv/bin/python -m pytest tests/ -q                                → 572 passed
 ```
 
 Source-level checks:
 
-- `git diff --check`.
-- Confirm only intended Delete/semantic files change.
-- Confirm no secrets are present.
-- Confirm no SQL/Supabase mutations were introduced.
-- Confirm `HEAD` and `origin/main` only after explicit delivery.
+- `git diff --check` → clean (no whitespace errors).
+- Only intended Delete/semantic files changed: `backend/ai/actions.py`, `backend/ai/tools/delete.py`, `backend/services/delete_service.py`, new `backend/ai/semantic_delete.py`, new `tests/test_32_semantic_delete.py`.
+- No secrets present in the diff.
+- No SQL/Supabase mutations introduced.
+- No unbounded destructive history iteration; no new background deletion tasks.
+- `HEAD`/`origin/main` push only after explicit delivery.
 
 Live verification remains separate and must use a controlled test chat with known self/foreign messages. Mocked tests must never be reported as proof of live Telegram reliability.
 
@@ -1318,55 +1341,38 @@ Live verification remains separate and must use a controlled test chat with know
 - “Until this message” must use the original request ID captured before provider/status work. Do not derive the anchor from an AI response.
 - Self-only deletion is enforced in `delete_verified_self_messages()`. Never move security into prompt text, parser-only checks, or a generic permission layer.
 - AI-generated messages are normal self-account outgoing Telegram messages and must remain eligible.
-- Direct semantic topic Delete can run locally; ambiguous semantic search uses bounded history plus provider-selected concrete IDs. The remaining gap is deeper deterministic semantic matching, not ownership.
+- **DONE (this work):** deterministic structural semantic Delete — exact N-word / N-English-word predicates and normalized topic matching — now executes locally with no provider round-trip, through the same bounded self-only selector and final chokepoint.
+- Ambiguous/unstructured semantic requests still use bounded history plus provider-selected concrete IDs; that provider read path is the next hardening target.
 
-### Exact implementation surface
+### Exact implementation surface (this work)
 
-Primary files:
+Implemented files:
 
+- `backend/ai/semantic_delete.py` (NEW)
+  - `normalize_text()` / `tokenize()` / `count_words()` — deterministic Persian/English normalization and lexical word counting.
+  - `StructuralPredicate`, `parse_structural_predicate()`, `spec_from_dict()`, `build_matcher()` / `build_matcher_from_dict()` — pure parsing + matching, no I/O.
 - `backend/ai/actions.py`
-  - `parse_command_intent()`
-  - `_is_semantic_delete()`
-  - `_extract_semantic_query()`
-  - time/count/boundary parsing helpers
-  - `validate_action()` / `resolve_tool_calls()`
-- `backend/ai/engine/dispatcher.py`
-  - `_try_local_fast_path()`
-  - `_build_tool_context()`
-  - structured action/provider tool loop
+  - `parse_command_intent()` — structural-predicate branch; word-count numbers are excluded from positional count extraction (`_is_word_count_marker` guard in `_extract_count()`).
+  - `validate_action()` / `resolve_tool_calls()` / `parse_action_text()` — `semantic` field validation and forwarding (delete_messages only; malformed → `KIND_INVALID`).
 - `backend/ai/tools/delete.py`
-  - `DeleteTool.execute()`
-  - `ListRecentMessagesTool`
-  - `DeleteMessagesByIdsTool`
-- `backend/ai/tools/semantic.py`
-  - bounded recent-message preview path
+  - `DeleteTool` — new `semantic` argument, schema, validation (invalid → controlled failure), and matcher wired into `do_del_self_filtered(match=...)`.
 - `backend/services/delete_service.py`
-  - `_iter_messages_bounded()`
-  - `_parse_cutoff()`
-  - `select_self_owned_message_ids()`
-  - `delete_verified_self_messages()`
-- `backend/bot/handlers/ai_unified.py`
-  - `_execute_ai()` request capture
-  - `_is_silent_delete()` and silent delivery
+  - `select_self_owned_message_ids()` / `do_del_self_filtered()` — new `match` callable; topic queries matched on the normalized text form.
 
-Focused test files to extend:
+Unchanged by design (verified, not modified): `backend/ai/engine/dispatcher.py`, `backend/ai/tools/semantic.py`, `backend/bot/handlers/ai_unified.py`, `delete_verified_self_messages()`, Save/Bio/Username/Profile/UI/runtime-supervisor code.
 
-- `tests/test_19_ai_actions.py`
-- `tests/test_25_fast_path.py`
-- `tests/test_26_silent_delete.py`
-- `tests/test_27_delete_ownership.py`
-- `tests/test_28_delete_regression.py`
-- `tests/test_29_delete_expansion.py`
-- `tests/test_30_delete_timeout_hardening.py`
-- `tests/test_31_delete_rpc_failures.py`
+Tests:
 
-### Desired behavior
+- `tests/test_32_semantic_delete.py` (NEW, 53 tests) — normalization/tokenization, predicate parsing, matcher semantics, parser integration, structured JSON validation, DeleteTool execution, ownership/foreign/identity rejection, bounded retrieval and RPC timeout, provider-independent fast path, silent success, repeated-execution safety.
+- Existing focused Delete/action tests were NOT weakened; all still pass unchanged.
+
+### Desired behavior (now implemented)
 
 ```text
 natural Persian/English request
-  → deterministic structured Delete intent where possible
-  → bounded current-chat retrieval
-  → semantic/content predicate
+  → deterministic structured Delete intent where possible (topic and/or exact N-word)
+  → bounded current-chat retrieval (1,000-cap, per-RPC timeout)
+  → normalized semantic/content predicate
   → self-owned filter
   → final Telegram re-fetch and ownership verification
   → bounded chunked deletion
@@ -1374,12 +1380,11 @@ natural Persian/English request
   → silent success
 ```
 
-For unsupported semantic structures, return a safe controlled result or clarification. Never guess a broad deletion range.
+Unsupported/ambiguous structures return a safe controlled result or clarification. Never guess a broad deletion range.
 
-### Constraints
+### Constraints (still binding for follow-up work)
 
-- Investigation-only work is complete; the next agent may implement only the separately approved semantic Delete task.
-- Do not modify Save, Bio, Username, provider routing, fallback architecture, Supabase schema, UI, buttons, or runtime supervisor as part of semantic Delete.
+- Do not modify Save, Bio, Username, provider routing, fallback architecture, Supabase schema, UI, buttons, or runtime supervisor as part of semantic Delete follow-ups.
 - Do not add SQL or execute Supabase operations.
 - Do not add arbitrary Telegram method execution.
 - Do not weaken self-only deletion.
@@ -1388,16 +1393,16 @@ For unsupported semantic structures, return a safe controlled result or clarific
 - Do not log message contents, session strings, phone numbers, API keys, or database secrets.
 - Preserve silent successful Delete behavior.
 
-### Required validation
+### Required validation (executed)
 
-- Focused semantic/Delete tests first.
-- Existing Delete ownership, timeout, batching, current-request, and silent tests.
-- Relevant AI/provider/fast-path tests.
-- Save/Bio/Username regression tests.
-- Full `tests/` suite.
-- `git diff --check` and Delete-only diff review.
+- Focused semantic/Delete tests first: 53 new tests in `tests/test_32_semantic_delete.py` → 53 passed.
+- Existing Delete ownership, timeout, batching, current-request, and silent tests → all passed unchanged.
+- Relevant AI/provider/fast-path tests → passed.
+- Save/Bio/Username/Database regression tests → passed.
+- Full `tests/` suite → 572 passed.
+- `git diff --check` → clean; Delete-only diff review confirmed no secrets, no SQL, no unbounded iteration, no background tasks.
 - Commit and push only when explicitly requested by the delivery task.
 
 ### Final handoff conclusion
 
-The current system has a real execution boundary and a strong Delete ownership chokepoint. The next implementation should improve semantic candidate understanding while preserving those boundaries. Do not repeat the broad architecture investigation unless new source changes invalidate this report.
+The current system has a real execution boundary and a strong Delete ownership chokepoint. The previously recommended semantic-Delete slice is now implemented and verified by source + mocked tests (deterministic Persian/English normalization, exact N-word / N-English-word predicates, normalized topic matching, composition with count/time/boundary scopes — all through the existing bounded self-only selector and delete_verified_self_messages() chokepoint, with silent success and controlled failure preserved). The next implementation should harden the provider-backed semantic read path (ListRecentMessagesTool) and reconcile legacy Delete anchor semantics while preserving those boundaries. Do not repeat the broad architecture investigation unless new source changes invalidate this report.
