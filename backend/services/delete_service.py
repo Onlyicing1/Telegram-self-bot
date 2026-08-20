@@ -7,18 +7,52 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.helper.rpc_timeout import rpc_await
 from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
 _MAX_DELETE_SCAN_MESSAGES = 1000
 _DELETE_VERIFY_CHUNK = 100
+_DELETE_RPC_TIMEOUT_SECONDS = 5.0
+
+
+async def _telegram_rpc(operation, *, label: str, retries: int = 0):
+    """Run one Telegram operation with a small, explicit retry budget."""
+    for attempt in range(retries + 1):
+        try:
+            return await rpc_await(
+                operation(),
+                timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                label=label,
+            )
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(0.05 * (attempt + 1))
+
+
+async def _iter_messages_bounded(client, chat_id, **kwargs):
+    """Iterate Telegram history with a timeout on every page/RPC."""
+    limit = kwargs.get("limit")
+    if limit is None:
+        limit = _MAX_DELETE_SCAN_MESSAGES
+    iterator = client.iter_messages(chat_id, **kwargs)
+    for _ in range(limit):
+        try:
+            yield await rpc_await(
+                iterator.__anext__(),
+                timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                label="delete.iter_messages",
+            )
+        except StopAsyncIteration:
+            return
 
 
 async def _resolve_me_id(client) -> int | None:
@@ -34,7 +68,10 @@ async def _resolve_me_id(client) -> int | None:
         me = getattr(client, "me", None)
         me_id = getattr(me, "id", None) if me is not None else None
         if me_id is None:
-            me = await client.get_me()
+            me = await _telegram_rpc(
+                lambda: client.get_me(),
+                label="delete.get_me",
+            )
             me_id = getattr(me, "id", None)
         return me_id
     except Exception:
@@ -100,7 +137,11 @@ async def delete_verified_self_messages(
     for start in range(0, len(ids), chunk):
         part = ids[start:start + chunk]
         try:
-            fetched = await client.get_messages(chat_id, ids=part)
+            fetched = await _telegram_rpc(
+                lambda: client.get_messages(chat_id, ids=part),
+                label="delete.ownership_fetch",
+                retries=1,
+            )
         except Exception as exc:
             logger.warning(
                 "DELETE_OWNERSHIP_CHECK chat_id=%s ids=%s result=rejected "
@@ -150,7 +191,10 @@ async def delete_verified_self_messages(
             chat_id, len(batch), batch,
         )
         try:
-            await client.delete_messages(chat_id, batch)
+            await _telegram_rpc(
+                lambda: client.delete_messages(chat_id, batch),
+                label="delete.batch",
+            )
             deleted.extend(batch)
         except Exception as exc:
             delete_errors.append(str(exc))
@@ -191,24 +235,36 @@ async def _parse_cutoff(value: Any, tz_name: str = "UTC") -> datetime | None:
         try:
             tz = ZoneInfo(tz_name)
         except Exception:
-            tz = timezone.utc
+            # Some minimal containers omit the system tzdata package. Tehran
+            # has used a fixed UTC+03:30 offset since its 2022 DST change;
+            # keep local cutoff semantics deterministic there instead of
+            # silently interpreting HH:MM as UTC.
+            if tz_name == "Asia/Tehran":
+                tz = timezone(timedelta(hours=3, minutes=30))
+            else:
+                tz = timezone.utc
         if text.casefold() in {"today", "امروز"}:
             now = datetime.now(tz)
             dt = datetime.combine(now.date(), datetime_time.min, tzinfo=tz)
         elif text.casefold() in {"yesterday", "دیروز"}:
-            from datetime import timedelta
             now = datetime.now(tz)
             dt = datetime.combine(now.date() - timedelta(days=1), datetime_time.min, tzinfo=tz)
         else:
-            try:
-                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            except ValueError:
+            # A bare HH:MM is local wall-clock time in the configured
+            # timezone. Parse it before ISO timestamps because some Python
+            # versions accept "09:00" as a date-time with UTC semantics.
+            if ":" in text and len(text) <= 5:
                 try:
                     parsed = datetime_time.fromisoformat(text)
                 except ValueError:
                     return None
                 now = datetime.now(tz)
                 dt = datetime.combine(now.date(), parsed, tzinfo=tz)
+            else:
+                try:
+                    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
@@ -233,8 +289,8 @@ async def select_self_owned_message_ids(
 ) -> tuple[list[int], int, Exception | None]:
     """Select recent self-owned IDs before the final ownership chokepoint.
 
-    Telegram history is scanned newest-first. The active Delete request is
-    excluded before counting, ownership is checked for selection, and the
+    Telegram history is scanned newest-first. The active Delete request can
+    participate in the requested range, ownership is checked for selection, and the
     final fetch in ``delete_verified_self_messages`` remains authoritative.
     """
     if count is not None and (count < 1 or count > 500):
@@ -257,8 +313,8 @@ async def select_self_owned_message_ids(
         # Never ask Telethon for an unbounded history. The cap is large
         # enough for normal requests while keeping a pathological ``all`` or
         # broad semantic request inside a deterministic execution window.
-        iterator = client.iter_messages(
-            chat_id, limit=_MAX_DELETE_SCAN_MESSAGES,
+        iterator = _iter_messages_bounded(
+            client, chat_id, limit=_MAX_DELETE_SCAN_MESSAGES,
         )
         async for msg in iterator:
             mid = getattr(msg, "id", None)
@@ -379,7 +435,9 @@ async def do_del_n_counts(client, chat_id, n: int) -> tuple[int, Exception | Non
     t0 = asyncio.get_event_loop().time()
     try:
         msg_ids = []
-        async for msg in client.iter_messages(chat_id, limit=n + 5, from_user="me"):
+        async for msg in _iter_messages_bounded(
+            client, chat_id, limit=n + 5, from_user="me"
+        ):
             msg_ids.append(msg.id)
             if len(msg_ids) >= n:
                 break
@@ -412,7 +470,7 @@ async def do_del_last_n_real(
     t0 = asyncio.get_event_loop().time()
     try:
         recent = []
-        async for msg in client.iter_messages(chat_id, limit=n):
+        async for msg in _iter_messages_bounded(client, chat_id, limit=n):
             recent.append(msg)
             if len(recent) >= n:
                 break
@@ -443,7 +501,8 @@ async def do_del_id_counts(
     total = 0
     try:
         batch = []
-        async for msg in client.iter_messages(
+        async for msg in _iter_messages_bounded(
+            client,
             chat_id,
             min_id=start_id - 1,
             from_user="me",

@@ -159,13 +159,10 @@ class ListRecentMessagesTool(Tool):
         try:
             # Telethon iter_messages returns newest → oldest by default; we
             # normalize to chronological order (oldest → newest) for the model.
-            request_message_id = coerce_int(
-                context.extra.get("request_message_id") if context.extra else None
-            )
+            # The active request remains visible because it is a self-owned
+            # message and may be inside the requested deletion range.
             raw: list[Any] = []
             async for msg in client.iter_messages(chat_id, limit=limit):
-                if request_message_id is not None and getattr(msg, "id", None) == request_message_id:
-                    continue
                 raw.append(msg)
 
             raw.reverse()
@@ -272,14 +269,11 @@ class DeleteMessagesByIdsTool(Tool):
             return ToolResult(success=False, message="No Telegram client available.")
 
         try:
-            request_message_id = coerce_int(
-                context.extra.get("request_message_id") if context.extra else None
-            )
             deleted, rejected = await delete_service.delete_verified_self_messages(
                 client,
                 chat_id,
                 ids[:_MAX_DELETE_IDS],
-                exclude_message_id=request_message_id,
+                exclude_message_id=None,
             )
         except Exception as exc:
             return ToolResult(

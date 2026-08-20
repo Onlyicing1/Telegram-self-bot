@@ -523,9 +523,9 @@ async def test_end_to_end_fast_path_delete_reaches_telegram_executor():
 
     assert result.success is True
     assert result.metadata["finish_state"] == "local_fast_path"
-    # The current request (message 1) is explicitly excluded; only the
-    # previous self-owned/Nova messages reach the Telegram delete API.
-    assert sorted(client.deleted) == [3, 5]
+    # The current request is self-owned and inside the requested last-N range;
+    # only self-owned/Nova messages reach the Telegram delete API.
+    assert sorted(client.deleted) == [1, 3, 5]
     # The execution result classifies as a silent delete — no confirmation
     # message is ever produced for a successful delete round.
     from backend.bot.handlers.ai_unified import _is_silent_delete

@@ -6,15 +6,19 @@ confirmation before calling them.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from backend.ai.persian import coerce_int
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
+from backend.helper.rpc_timeout import rpc_await
 
 
 _DELETE_TOOL_TIMEOUT_SECONDS = 30
+_DELETE_OPERATION_TIMEOUT_SECONDS = 25
+_DELETE_RPC_TIMEOUT_SECONDS = 5.0
 logger = logging.getLogger(__name__)
 
 
@@ -37,8 +41,9 @@ class DeleteTool(Tool):
         return (
             "Delete self-owned messages in the current chat. Use count for the "
             "last N self messages, mode=all for all self messages, mode=until_time "
-            "for a time range, or mode=until_message for a replied-to boundary. "
-            "The active request message is always excluded."
+            "for a time range, or mode=until_message for a message boundary. "
+            "The active request is eligible when it falls inside the requested scope; "
+            "for an anchor request it is the boundary, not a permission bypass."
         )
 
     @property
@@ -107,8 +112,8 @@ class DeleteTool(Tool):
         if mode == "until_message" and boundary_id is None and reply_meta:
             boundary_id = coerce_int(reply_meta.get("message_id"))
         # A direct "up to this message" request uses the original request
-        # message as an anchor. It is a boundary only; the selector still
-        # excludes it from the deletion set.
+        # message as an anchor. It remains eligible because it is an
+        # authenticated self-owned message inside the requested range.
         if mode == "until_message" and boundary_id is None:
             boundary_id = request_message_id
         if mode == "until_message" and boundary_id is None:
@@ -154,25 +159,45 @@ class DeleteTool(Tool):
         )
         try:
             if has_filtered_scope or request_message_id is not None:
-                considered, deleted, error = await delete_service.do_del_self_filtered(
-                    client,
-                    chat_id,
-                    count=None if mode == "all" else count,
-                    until_time=until_time,
-                    after_time=after_time,
-                    boundary_id=boundary_id,
-                    query=query,
-                    exclude_message_id=request_message_id,
-                    tz_name=context.tz_str,
-                    request_id=request_id,
+                # The service bounds every Telegram RPC; this outer deadline
+                # also bounds a large sequence of individually responsive
+                # pages/batches and returns a controlled result before the
+                # executor's deadline.
+                considered, deleted, error = await asyncio.wait_for(
+                    delete_service.do_del_self_filtered(
+                        client,
+                        chat_id,
+                        count=None if mode == "all" else count,
+                        until_time=until_time,
+                        after_time=after_time,
+                        boundary_id=boundary_id,
+                        query=query,
+                        # The active request is eligible when it belongs to
+                        # the requested range. For until_message it remains
+                        # the boundary through boundary_id, not an exclusion.
+                        exclude_message_id=None,
+                        tz_name=context.tz_str,
+                        request_id=request_id,
+                    ),
+                    timeout=_DELETE_OPERATION_TIMEOUT_SECONDS,
                 )
             else:
                 # Preserve the legacy panel/test contract when no AI request
                 # ID is present; live AI requests always use the self-owned
-                # selector above so the active request cannot be counted.
+                # selector above so the active request is counted when in scope.
                 considered, deleted, error = await delete_service.do_del_last_n_real(
                     client, chat_id, count
                 )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "DELETE_TIMEOUT request_id=%s chat_id=%s phase=operation",
+                request_id or "-", chat_id,
+            )
+            return ToolResult(
+                success=False,
+                message="Delete timed out while Telegram was processing the bounded operation.",
+                data={"count": 0, "timeout": True},
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
@@ -180,6 +205,16 @@ class DeleteTool(Tool):
                 data={"count": 0},
             )
         if error is not None:
+            if isinstance(error, asyncio.TimeoutError):
+                logger.warning(
+                    "DELETE_TIMEOUT request_id=%s chat_id=%s phase=selection",
+                    request_id or "-", chat_id,
+                )
+                return ToolResult(
+                    success=False,
+                    message="Delete timed out while reading Telegram history.",
+                    data={"count": deleted, "timeout": True},
+                )
             logger.warning(
                 "DELETE_FAILURE request_id=%s chat_id=%s considered=%s deleted=%s error=%s",
                 request_id or "-", chat_id, considered, deleted, error,
@@ -273,7 +308,11 @@ class DeleteRepliedTool(Tool):
             return ToolResult(success=False, message="No Telegram client available.")
 
         try:
-            msg = await client.get_messages(chat_id, ids=message_id)
+            msg = await rpc_await(
+                client.get_messages(chat_id, ids=message_id),
+                timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                label="delete.replied_fetch",
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
@@ -281,9 +320,6 @@ class DeleteRepliedTool(Tool):
             )
         if msg is None:
             return ToolResult(success=False, message="Replied message not found.")
-        request_message_id = context.extra.get("request_message_id") if context.extra else None
-        if request_message_id is not None and message_id == request_message_id:
-            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
         if not getattr(msg, "out", False):
             return ToolResult(
                 success=False,
@@ -295,7 +331,7 @@ class DeleteRepliedTool(Tool):
         try:
             deleted, _rejected = await delete_service.delete_verified_self_messages(
                 client, chat_id, [message_id],
-                exclude_message_id=coerce_int(request_message_id),
+                exclude_message_id=None,
             )
         except Exception as exc:
             return ToolResult(
@@ -376,17 +412,12 @@ class DeleteByIdTool(Tool):
         if chat_id is None:
             return ToolResult(success=False, message="No chat context for deletion.")
 
-        request_message_id = coerce_int(
-            context.extra.get("request_message_id") if context.extra else None
-        )
-        if request_message_id is not None and message_id == request_message_id:
-            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
         client = context.telegram.client if context.telegram is not None else context.client
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
         try:
             deleted, error = await delete_service.do_del_id_counts(
-                client, chat_id, message_id, exclude_message_id=request_message_id
+                client, chat_id, message_id, exclude_message_id=None
             )
         except Exception as exc:
             return ToolResult(
@@ -477,14 +508,15 @@ class DeleteMessageByIdTool(Tool):
             return ToolResult(success=False, message="No Telegram client available.")
 
         try:
-            msg = await client.get_messages(chat_id, ids=message_id)
+            msg = await rpc_await(
+                client.get_messages(chat_id, ids=message_id),
+                timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                label="delete.message_fetch",
+            )
         except Exception as exc:
             return ToolResult(success=False, message=f"Could not fetch message {message_id}: {exc}")
         if msg is None:
             return ToolResult(success=False, message=f"Message {message_id} not found in this chat.")
-        request_message_id = context.extra.get("request_message_id") if context.extra else None
-        if request_message_id is not None and message_id == request_message_id:
-            return ToolResult(success=False, message="The active Delete request cannot be its own target.")
         if not getattr(msg, "out", False):
             return ToolResult(
                 success=False,
@@ -499,7 +531,7 @@ class DeleteMessageByIdTool(Tool):
         try:
             deleted, _rejected = await delete_service.delete_verified_self_messages(
                 client, chat_id, [message_id],
-                exclude_message_id=coerce_int(request_message_id),
+                exclude_message_id=None,
             )
         except Exception as exc:
             return ToolResult(

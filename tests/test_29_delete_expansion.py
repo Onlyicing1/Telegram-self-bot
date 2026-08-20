@@ -61,7 +61,7 @@ def context(client: Client, *, request_id: int | None = None, reply_id: int | No
 
 
 @pytest.mark.asyncio
-async def test_last_self_message_excludes_current_request():
+async def test_last_self_message_includes_current_request_when_in_scope():
     client = Client([
         Message(30, out=True, sender_id=111),  # active Delete request
         Message(29, out=False, sender_id=222),
@@ -71,7 +71,7 @@ async def test_last_self_message_excludes_current_request():
         context(client, request_id=30), {"count": 1}
     )
     assert result.success is True
-    assert client.deleted == [28]
+    assert client.deleted == [30]
 
 
 @pytest.mark.asyncio
@@ -86,7 +86,7 @@ async def test_nova_message_is_self_owned_and_counted():
         context(client, request_id=40), {"count": 2}
     )
     assert result.success is True
-    assert client.deleted == [39, 37]
+    assert client.deleted == [40, 39]
 
 
 @pytest.mark.asyncio
@@ -101,7 +101,7 @@ async def test_delete_all_self_owned_excludes_other_users_and_request():
         context(client, request_id=50), {"mode": "all"}
     )
     assert result.success is True
-    assert client.deleted == [48]
+    assert client.deleted == [50, 48]
 
 
 @pytest.mark.asyncio
@@ -178,7 +178,7 @@ async def test_n_plus_semantic_filter_selects_only_latest_matching_self():
 
 
 @pytest.mark.asyncio
-async def test_semantic_tool_cannot_delete_current_request():
+async def test_semantic_tool_can_delete_current_request_when_selected():
     client = Client([
         Message(100, out=True, sender_id=111),
         Message(99, out=True, sender_id=111),
@@ -188,12 +188,12 @@ async def test_semantic_tool_cannot_delete_current_request():
         context(client, request_id=100), {"message_ids": [100, 99, 98]}
     )
     assert result.success is True
-    assert result.data["deleted"] == [99]
-    assert client.deleted == [99]
+    assert result.data["deleted"] == [100, 99]
+    assert client.deleted == [100, 99]
 
 
 @pytest.mark.asyncio
-async def test_semantic_history_hides_current_request():
+async def test_semantic_history_includes_current_request():
     client = Client([
         Message(110, out=True, sender_id=111, text="delete all"),
         Message(109, out=True, sender_id=111, text="keep"),
@@ -202,7 +202,7 @@ async def test_semantic_history_hides_current_request():
         context(client, request_id=110), {"limit": 50}
     )
     assert result.success is True
-    assert [item["id"] for item in result.data["messages"]] == [109]
+    assert [item["id"] for item in result.data["messages"]] == [109, 110]
 
 
 def test_expanded_persian_and_english_intents_resolve_to_delete_scopes():

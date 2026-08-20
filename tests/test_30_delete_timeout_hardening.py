@@ -64,7 +64,7 @@ def context(client: ChatClient, *, request_id: int | None = None, request_key: s
 
 
 @pytest.mark.asyncio
-async def test_current_request_is_anchor_but_never_deleted():
+async def test_current_request_is_anchor_and_is_deleted_when_in_range():
     client = ChatClient([
         message(10, text="تا این پیامم هر چی هست رو پاک کن"),
         message(9, text="previous self message"),
@@ -75,8 +75,8 @@ async def test_current_request_is_anchor_but_never_deleted():
     result = await DeleteTool(ctx).execute(ctx, {"mode": "until_message"})
 
     assert result.success is True
-    assert client.deleted == [9]
-    assert 10 not in client.deleted
+    assert client.deleted == [10, 9]
+    assert 10 in client.deleted
     assert 8 not in client.deleted
 
 
@@ -125,8 +125,8 @@ async def test_all_delete_is_bounded_and_chunked():
     result = await DeleteTool(ctx).execute(ctx, {"mode": "all"})
 
     assert result.success is True
-    assert 10_000 not in client.deleted
-    assert len(client.deleted) == 205
+    assert 10_000 in client.deleted
+    assert len(client.deleted) == 206
     assert client.iter_kwargs[0]["limit"] == 1000
     assert len(client.delete_batches) == 3
     assert all(len(batch) <= 100 for batch in client.delete_batches)
@@ -171,9 +171,9 @@ async def test_repeated_delete_requests_have_no_unbounded_history_or_confirmatio
     second = await DeleteTool(second_ctx).execute(second_ctx, {"count": 1})
 
     assert first.success is True and second.success is True
-    # The second request excludes its own ID (2) and correctly sees the
-    # previous request (3) as a self-authored eligible message.
-    assert client.deleted == [2, 3]
+    # Each request is self-owned and remains eligible; the newest request is
+    # selected first for the first operation, then the next request is selected.
+    assert client.deleted == [3, 2]
     assert all(item["limit"] == 1000 for item in client.iter_kwargs)
     assert "Deleted" not in first.message or first.data["count"] == 1
     assert "Deleted" not in second.message or second.data["count"] == 1
