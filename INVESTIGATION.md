@@ -1,4 +1,4 @@
-# INVESTIGATION — Comprehensive LifeOS Forensic Report
+# INVESTIGATION
 
 ## INVESTIGATION METADATA
 
@@ -6,820 +6,795 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Current HEAD (at investigation) | `beb018163036b200cb38a257b922c266140e57b4` |
-| Investigation date | 2026-08-18 |
-| Scope | Runtime stability · Save system · AI system · Glass UI / handlers · Cross-subsystem interactions |
-| Status | INVESTIGATION ONLY — no production code modified |
-| Verification status | SOURCE VERIFIED (read-only). No live Telegram, no test run, no remote execution performed for this report. |
+| Current HEAD | `767b32bcee796a6a8c6e30e5d7c3ab751d2e69e4` (`767b32b`) |
+| Remote state at investigation start | `HEAD` and `origin/main` aligned at `767b32b` |
+| Investigation date | 2026-08-20 |
+| Scope | Current Telegram runtime, AI execution, providers, Delete, Save, Profile, database/management tools, security, tests, and documentation drift |
+| Status | INVESTIGATION ONLY |
+| Production code changed | No |
+| Database/Supabase changed | No |
+| Live Telegram verification | Not performed |
+| Test evidence | The current Delete hardening work was verified with 519 repository tests passing, including 84 Delete-focused tests; this report does not claim live Telegram reliability from mocks. |
 
-> This report is the canonical, current investigation and completely replaces the
-> previous investigation. GitHub `main` is the source of truth for the code; this
-> file only reports what was verified in the actual source.
+This document completely replaces the previous `INVESTIGATION.md`. It is based on the current tracked source, current documentation, recent commit history, and the available test evidence. Prior findings are retained only when the current source still proves them.
+
+Classification used throughout:
+
+- **CONFIRMED** — directly shown by current source, tests, or recorded logs.
+- **LIKELY** — strongly indicated by the source but not proven by a live integration run.
+- **UNKNOWN** — the repository does not provide enough evidence.
 
 ---
 
 ## 1. EXECUTIVE SUMMARY
 
-The repository has evolved far beyond the dot-command self-bot described in
-`AGENTS.md`. The current architecture is a **Glass UI (inline panel) first** system:
+The repository is a Python 3.11 Telethon self-bot with a FastAPI dashboard and React/Vite frontend. The backend is a single asyncio process. `RuntimeSupervisor` owns the self-client lifecycle, optional helper bot, recovery, health monitors, web server, and shared profile scheduler. The current source is materially newer than parts of the documentation and the previous investigation.
 
-- The self-bot (Telethon `StringSession`) is the runtime host; an optional
-  helper bot (`BOT_TOKEN`) renders inline panels and receives callback queries.
-- A `RuntimeSupervisor` owns the client, a heartbeat, a keepalive, a failsafe,
-  an asyncio diagnostics loop, a memory-cleanup worker, the web server, and a
-  shared per-minute profile scheduler.
-- Save is **Deep Save only** (download → re-upload). Forward Save is removed.
-- AI is triggered by trigger words / reply-to-AI / `.ai`, dispatched through an
-  Engine → ProviderManager → Provider → ToolExecutor pipeline.
-- Bio and Username share one profile scheduler with per-engine active state.
+The current AI execution boundary is substantially real:
 
-**Highest-confidence runtime-stability defect (CONFIRMED):** the failsafe
-monitor — the "last line" that is supposed to hard-reset a frozen runtime —
-references `guarded_create_task` without importing it, so when its freeze
-condition actually triggers it raises `NameError` and the hard reset never runs.
+```text
+outgoing Telegram message
+  → owner/trigger/reply detection in ai_unified.py
+  → immutable AIRequest with chat/message/reply context
+  → Dispatcher
+  → deterministic local parser when confidence is high
+     OR provider prompt/native tool call/structured action
+  → local action validation
+  → fixed ToolRegistry + ToolExecutor
+  → service layer / Telegram facade / database
+  → real tool result
+  → silent delete or edit-in-place response
+```
 
-**Most likely cause of the reported intermittent freeze/sleep (LIKELY):**
-self-inflicted reconnect churn. The heartbeat treats three benign states as
-"stalled" — `READY_BUT_DISCONNECTED` (fires when the helper bot is legitimately
-disabled), `UPDATE_PIPELINE_STALLED` and `CALLBACK_DISPATCH_STALLED` (fire on a
-naturally idle account) — and calls `_trigger_reconnect()`, which performs a
-full `disconnect()` → `connect()` with no post-success cooldown, while the run
-loop (`run_until_disconnected`) is simultaneously driving the same client.
+**CONFIRMED — the AI is not an unrestricted Telegram controller.** Providers emit text or normalized tool calls. Registered tools are the only executable operations, `ToolExecutor` validates the tool name/arguments/permission level, and services perform the actual side effect.
 
-**Highest-confidence Save/AI cross-defect (CONFIRMED):** Deep Save is correctly
-unbounded at the service layer, but two of its entry points impose blanket
-timeouts that can kill a legitimate large transfer: the Glass UI input listener
-(60 s) and the AI `ToolExecutor` (10 s per tool).
+**CONFIRMED — self-only Delete enforcement exists at the execution boundary.** `delete_service.delete_verified_self_messages()` re-fetches candidate messages immediately before deletion and requires both Telegram's `out` flag and a sender ID matching the authenticated account ID. Unknown identity, missing messages, foreign senders, and non-outgoing messages fail closed.
 
-**Documentation drift (CONFIRMED):** `AGENTS.md` (and several module docstrings)
-still document `.ping`, `.id`, `.help`, `.save f/d`, `.preview`, `.send`,
-`.del`, `.organize`, `.bio`, `.username`, and the `SV-NNNNNN` save-code format —
-none of which exist in the current code. Only `.menu` and `.ai` are registered
-dot commands, plus trigger/reply AI activation.
+**CONFIRMED — the recent Delete timeout defect was addressed in the current commit series.** The current Delete service uses a 1,000-message scan cap, 5-second per-RPC guards, 100-message verification/deletion chunks, bounded retry for ownership reads, and a 25-second operation deadline inside a 30-second Delete tool deadline. The recorded current test result is 519 passing tests, including 84 Delete-focused tests.
+
+**CONFIRMED — current-request handling changed and is now self-inclusive for scoped Delete.** The handler captures the original Telegram message ID before provider/config work. The self-owned selector can include that message when it is inside last-N, all, time, filtered, or anchor scope. For an “until this message” request, the same ID is used as the boundary. Silent delivery avoids creating a replacement confirmation.
+
+**CONFIRMED — semantic Delete is still the least complete part of the AI execution surface.** There are two paths:
+
+1. Direct topic requests recognized by `parse_command_intent()` can use the local self-only text filter in `delete_service` without a provider round-trip.
+2. Ambiguous/search-style semantic requests use `list_recent_messages` so the provider selects concrete IDs, then `delete_messages_by_ids` re-validates them.
+
+The second path exposes only a bounded recent window, currently up to 100 messages, and relies on provider interpretation of short text previews. There is no embedding/indexed semantic search implementation. Therefore a request such as “messages with two English words” can fail because of intent extraction, insufficient retrieval, text-preview limits, or provider reasoning. The exact live failure boundary is **UNKNOWN** without the production request trace and the actual chat history.
+
+**CONFIRMED — several prior investigation findings are obsolete.** The current heartbeat explicitly treats a disabled helper as valid and does not classify a quiet account as an event stall. The current `failsafe.py` imports `guarded_create_task`; the previously reported missing-import `NameError` is not present at `767b32b`.
+
+**CONFIRMED — one runtime reliability gap remains:** `RuntimeSupervisor._watchdog_loop()` is still defined but is not started by `RuntimeSupervisor.start()`. The active monitors are heartbeat, keepalive, failsafe, diagnostics, and memory cleanup. Whether the dormant watchdog is intentionally retired or an incomplete migration is **UNKNOWN**; it must not be assumed to be active.
+
+**Recommended next task:** complete the bounded semantic-message Delete path for natural Persian/English content filters, with retrieval/context/relevance tests and a production-safe fallback when semantic classification is unavailable. This is the clearest remaining user-visible capability gap after the Delete security and timeout work. The dormant watchdog/recovery path should be the following reliability task, not silently reactivated as part of semantic work.
 
 ---
 
-## 2. RUNTIME STABILITY
+## 2. CURRENT ARCHITECTURE
 
-### Architecture
+### 2.1 Process and entry points
 
-Entry point `backend/main.py::main()` → `config.load()` → install crash
-diagnostics → `RuntimeSupervisor(cfg).start()` (up to 5 startup attempts) →
-`supervisor.shutdown_event.wait()` → `supervisor.stop()`.
+**CONFIRMED:** The backend entry point is `python -m backend.main`.
 
-`backend/runtime/supervisor.py::RuntimeSupervisor` owns:
+Current startup path:
 
-- `_build_and_register()` — builds the Telethon client, increments generation,
-  registers handlers, wires AI tools.
-- `_start_helper()` — optional helper bot (only when `helper_enabled`).
-- `_resume_bio_cron()` / `_resume_username_cron()` — resume shared profile scheduler.
-- `_run_loop()` — `client.run_until_disconnected()` in an immortal task.
-- `_trigger_reconnect()` — lightweight disconnect/connect.
-- `_trigger_full_recovery()` / `_do_recovery()` / `_retry_full_recovery()` —
-  rebuild path with backoff and a 180 s cooldown.
-- `_hard_reset_runtime()` — failsafe path (destroys all Telethon tasks, rebuilds).
-- `_watchdog_loop()` — **defined but never started** (see Confirmed Facts).
-- `_start_web_server()` — uvicorn `Server.serve()` in an immortal task.
-
-Three independent monitor tasks run as `immortal_create_task` (from
-`backend/runtime/task_guard.py`): heartbeat (30 s), keepalive (60 s), failsafe
-(15 s check / 120 s freeze threshold), plus an asyncio diagnostics loop (60 s)
-and a memory-cleanup worker (6 h).
-
-### Execution Flow
-
-```
-python -m backend.main
+```text
+backend.main.main()
   → config.load()
-  → install_crash_diagnostics()   (signal handlers, excepthooks, ring buffers)
-  → RuntimeSupervisor.start()
-      → settings_service.load_all()
-      → _build_and_register()     (build_client → register_all → _wire_ai_tools)
-      → _start_helper()           (if helper_enabled)
-      → _resume_bio_cron() / _resume_username_cron()
-      → _start_web_server()
-      → start_heartbeat() / start_keepalive() / start_failsafe() / start_diagnostics()
-      → _run_task = immortal_create_task(self._run_loop)
-      → start_memory_cleanup()
-  → await supervisor.shutdown_event.wait()
+  → install crash diagnostics
+  → RuntimeSupervisor(cfg)
+  → supervisor.start() with startup retry policy
+  → wait on shutdown_event
   → supervisor.stop()
 ```
 
-Monitoring sources that can trigger recovery:
+`backend/config.py` loads required Telegram identity variables and optional Supabase, helper, timezone, profile, port, logging, and AI configuration. `backend/bot/client.py::build_client()` constructs the Telethon self-client with `StringSession`, connects, authorizes, and resolves `get_me()` under bounded startup waits.
 
-1. `heartbeat._heartbeat_loop` — state-invariant + stall detection → `_trigger_reconnect`.
-2. `keepalive._keepalive_loop` — `get_me` RPC probe (15 s) → `_trigger_reconnect`.
-3. `failsafe._failsafe_loop` — all-signals-frozen → `_hard_reset_runtime`.
-4. `supervisor._watchdog_loop` — **dormant** (never started).
+`backend/main.py` also installs signal handlers and uses `guarded_create_task()` for signal-triggered shutdown. The session string and credentials are configuration inputs; the current source does not expose them to the AI tool context.
 
-### Timeout / Watchdog Audit
+### 2.2 Runtime ownership
 
-| Component | Operation protected | Bounded? | Cancellation safe? | Notes |
-|---|---|---|---|---|
-| `build_client` | connect / authorize / get_me | 30/15/15 s via `wait_for` | yes | raises on invalid session |
-| `_trigger_reconnect` | disconnect / connect / authorize | 10/30/15 s | yes | **no post-success cooldown** |
-| `_do_recovery` | helper stop, run task cancel, old client disconnect | 5–10 s each | yes | backoff + 180 s cooldown on success |
-| `_hard_reset_runtime` | build/register/verify | 60/30/15 s | yes | guarded by recovery lock |
-| `keepalive` | `get_me` | 15 s | yes | → `_trigger_reconnect` |
-| `heartbeat` | none (pure state read) | n/a | n/a | → `_trigger_reconnect` on false positives |
-| `failsafe` | all-signal freeze detection | 15 s loop / 120 s threshold | yes | **`NameError` on trigger** (see bugs) |
-| `operation_watchdog.guarded_await` | DB / short RPC | caller-specified (10–30 s) | yes | the only timeout actually used |
-| `operation_watchdog.bounded_operation` | (unused) | **no internal timer** | n/a | dead code |
-| `tg_retry.tg_rpc` | (unused) | 30 s + retries | yes | dead code |
-| `save_service.execute_save` | download / upload | **intentionally unbounded** | yes | correct for large files |
-| `inline_sender._input_listener` | pending-input handler | 60 s | yes (cancels handler) | can kill a long Deep Save |
-| `ai ToolExecutor` | every tool incl. `save` | 10 s | yes (cancels tool) | can kill a long Deep Save |
-| `ai handler` | whole `engine.execute()` | 60 s | yes | bounds AI+tool total |
+`backend/runtime/supervisor.py::RuntimeSupervisor` is the active lifecycle owner. Its current responsibilities include:
 
-### Lock / Cancellation Audit
+- `_build_and_register()` — build the self-client, register handlers, and wire AI tools.
+- `_start_helper()` / `_start_helper_loop()` — optional helper bot.
+- `_resume_bio_cron()` and `_resume_username_cron()` — resume profile engines.
+- `_start_web_server()` — run Uvicorn/FastAPI.
+- `_run_loop()` — await `client.run_until_disconnected()`.
+- `_trigger_reconnect()` — bounded lightweight reconnect under `_recovery_lock`.
+- `_trigger_full_recovery()` / `_do_recovery()` — rebuild and re-register after failure.
+- `_hard_reset_runtime()` — last-resort rebuild path.
+- `stop()` — deterministic shutdown.
 
-- `RuntimeSupervisor._recovery_lock` (`asyncio.Lock`) serializes reconnect /
-  full recovery / hard reset. Acquired via `async with` in reconnect/full
-  recovery (auto-release), but `_hard_reset_runtime` acquires it with
-  `wait_for(..., 10)` and releases it **manually** in several early-return
-  branches and in `finally`. This is fragile but each early return does call
-  `self._recovery_lock.release()` before returning; the `finally` guard is a
-  backstop.
-- `ProfileEngine`/`profile.scheduler` use no lock; the shared scheduler is a
-  single task and updaters are awaited sequentially.
-- `save_service` save-code generation is guarded by `db_client._save_code_lock`
-  (`asyncio.Lock`) — safe.
-- `Panels`/`LifecycleManager` use a single `asyncio.Lock` around all panel
-  lifecycle transitions.
-- `CancelledError` is re-raised in the deep-save `finally` block and in the
-  profile scheduler, keepalive, and failsafe loops. `immortal_create_task`
-  re-raises `CancelledError` so shutdown can cancel immortal tasks.
+Current runtime constants include a 60-second reconnect cooldown, 180-second full-recovery cooldown, bounded connect/register/RPC waits, and a maximum recovery-attempt policy.
 
-### Recovery Audit
+### 2.3 Telegram and helper clients
 
-- `RuntimeSupervisor` **is** the single recovery authority for the self client.
-- `backend/diagnostics.py::recover_stalled` is a dormant, second,
-  supervisor-like recovery function that cancels *every* non-protected task —
-  **it has zero callers** (dead code, not an active second supervisor).
-- `supervisor._watchdog_loop` is a dormant recovery path (never started).
-- The failsafe's hard-reset trigger is broken by a `NameError` (see bugs), so
-  the one "bypass everything and reset" recovery path never actually fires.
+The self-client is the authenticated owner account. A helper bot is optional and is only built when helper configuration enables it. The helper renders Glass UI inline panels; when disabled, the system uses the existing fallback/edit behavior.
 
-### Confirmed Facts
+`backend/bot/router.py::register_all()` registers runtime hooks and feature handlers in isolation:
 
-1. **`supervisor._watchdog_loop` is never started.** `start()` calls
-   `start_heartbeat/start_keepalive/start_failsafe/start_diagnostics` and
-   creates `_run_task`, but never `self._watchdog_loop`. The method exists
-   (`supervisor.py` ~line 802) and contains the RPC check, helper restart,
-   memory-pressure GC, stale-loop restart, and `_trigger_reconnect` logic, but
-   is dead. Evidence: `backend/runtime/supervisor.py::start` has no
-   `_watchdog_loop` reference; `grep _watchdog_loop` returns only the
-   definition and `backend/helper/watchdog.py` (a different helper watchdog).
-2. **Failsafe hard reset raises `NameError`.** `backend/runtime/failsafe.py`
-   imports only `immortal_create_task` (line 28) but calls
-   `guarded_create_task(sup._hard_reset_runtime(), ...)` (line 156) inside the
-   freeze trigger. `guarded_create_task` is undefined in that module, so the
-   call raises `NameError`, is swallowed by the surrounding `except Exception`,
-   and the hard reset never runs. CONFIRMED by source.
-3. **`READY_BUT_DISCONNECTED` fires when the helper bot is disabled.**
-   `backend/runtime/heartbeat.py::_heartbeat_loop`:
-   `if current_state == "READY" and (not self_connected or not helper_connected):`
-   → `_trigger_reconnect()`. When `BOT_TOKEN` is unset,
-   `config.load()` sets `HELPER_BOT_ENABLED=False` and
-   `supervisor.helper_connected` never becomes `True`, so every 30 s heartbeat
-   re-triggers a reconnect. CONFIRMED.
-4. **Idle accounts are treated as stalled.**
-   `heartbeat._heartbeat_loop` emits `UPDATE_PIPELINE_STALLED` when
-   `last_update` age > 90 s while `rpc_healthy` (keepalive refreshes
-   `last_rpc` every 60 s via `get_me`), and `CALLBACK_DISPATCH_STALLED` when no
-   callback for > 90 s while `rpc_healthy`; both call `_trigger_reconnect()`.
-   A quiet account (no messages, no button presses) therefore triggers
-   reconnect every ~90 s. CONFIRMED.
-5. **`_trigger_reconnect` has no post-success cooldown.** Only
-   `_do_recovery` (full rebuild) sets `_recovery_cooldown_until`. A successful
-   lightweight reconnect does not, so the heartbeat/keepalive can re-trigger it
-   repeatedly. CONFIRMED.
-6. **Dual connection ownership.** `_run_loop` runs
-   `client.run_until_disconnected()` while `_trigger_reconnect` independently
-   calls `client.disconnect()`/`client.connect()`. A reconnect's `disconnect()`
-   makes `run_until_disconnected()` return, causing `_run_loop` to mark
-   `_client_alive=False` / `telethon_connected=False`, sleep 2 s, and re-enter
-   `run_until_disconnected()` while the reconnect is still in progress. Two
-   drivers on one client. CONFIRMED (code path); the live interleaving is the
-   LIKELY freeze mechanism.
-7. **`run_startup_checks` is dead code.** `backend/runtime/startup_check.py`
-   defines a full startup validation module, but neither `backend/main.py` nor
-   `backend/runtime/supervisor.py` imports or calls it. `grep run_startup_checks`
-   returns only the module's own docstring/definition. CONFIRMED.
-8. **`recover_stalled` is dead code.** `backend/diagnostics.py::recover_stalled`
-   has zero callers. CONFIRMED.
-9. **`tg_rpc` is dead code.** `backend/runtime/tg_retry.py::tg_rpc` has zero
-   callers; the `telegram_api/*` layer uses `guarded_await` instead. CONFIRMED.
-10. **`bounded_operation` / `attach_task` are dead code and do not enforce a
-    timeout.** `backend/runtime/operation_watchdog.py::bounded_operation` has no
-    internal timer; `__aexit__` only emits a diagnostic when an *external*
-    `CancelledError` arrives and a task was attached. Only `guarded_await`
-    (which uses `asyncio.wait_for`) is used, and only for DB + short RPC.
-    CONFIRMED.
-11. **Supabase cannot block the event loop.** `backend/db/client.py::_run_sync`
-    and `backend/ai/config_store.py::_run_sync` and
-    `backend/ai/persistence.py::_run_sync` all use `asyncio.to_thread` + a
-    10 s timeout. CONFIRMED.
-12. **No sync `requests`/`time.sleep`/`urllib` in backend.** `grep` returns no
-    matches; AI providers use `httpx.AsyncClient`. CONFIRMED.
-
-### Likely Causes / Risks
-
-- **LIKELY — reconnect churn is the freeze/sleep driver.** False-positive
-  heartbeat triggers (items 3, 4) + no reconnect cooldown (item 5) + dual
-  ownership (item 6) combine into repeated `disconnect()/connect()` cycles that
-  drop the connection, invalidate in-flight RPCs (AI calls, saves, edits), and
-  make the bot appear "asleep" while the process is actually alive and busy
-  reconnecting.
-- **LIKELY — the failsafe cannot rescue a real freeze.** Because of the
-  `NameError`, even a genuine all-signals-frozen state cannot trigger the hard
-  reset, so the intended last-resort recovery is unavailable.
-- **SUSPECTED — `bounded_operation` gives a false sense of protection.** The
-  context manager form documents cancellation guarantees but is never used and
-  would not enforce a timeout if it were.
-
-### Ruled Out
-
-- **RULED OUT — silent process death with no diagnostic.** `main.py` +
-  `crash_diagnostics.py` install `sys.excepthook`, `threading.excepthook`,
-  `asyncio` exception handler, signal handlers, an `atexit` handler, and a
-  `PROCESS_EXIT_REASON` trace; every explicit exit records a reason and dumps a
-  crash snapshot. A *dead* process would leave an exit reason in Render logs.
-- **RULED OUT — Supabase blocking the event loop.** `asyncio.to_thread` + 10 s
-  timeouts on all DB access.
-- **RULED OUT — sync AI HTTP blocking the loop.** providers use
-  `httpx.AsyncClient`; `ProviderManager.chat` is `async` and bounded.
-- **RULED OUT — blanket Deep Save timeout at the service layer.** The service
-  correctly leaves `download_media`/`send_file` unbounded. (The blanket
-  timeouts live at the *entry points*, not the service.)
-- **RULED OUT — `recover_stalled` acting as a second active supervisor.** No
-  callers.
-
-### Unknowns
-
-- Actual production env values (`BOT_TOKEN`, Supabase, AI keys) and whether the
-  helper bot is enabled in production.
-- Live Render logs at freeze time — the report infers the freeze mechanism from
-  code; it cannot prove which of the false-positive triggers fired first
-  without logs.
-- Whether a genuine blocking call (a stuck Telethon RPC outside `wait_for`)
-  ever occurs — no thread dump at freeze time was available.
-- Live Telegram behavior for protected/self-destructing media.
-
----
-
-## 3. SAVE SYSTEM
-
-### Current Save Modes
-
-**Deep Save is the only Save mode.** There is no Forward Save, no mode
-selection, and no fallback to forwarding.
-
-Evidence: `backend/services/save_service.py::execute_save` contains no
-`forward_messages` and no `ForwardMessagesRequest`; the module docstring states
-Deep Save is the only method. `grep forward_messages backend/` returns only
-`retrieve_service.py` (retrieval) and the `telegram_api` facade — none in the
-Save path.
-
-### Forward Save
-
-- **Removed from Save.** The old `.save f` path no longer exists.
-- The *only* remaining forward is in `backend/services/retrieve_service.py`
-  (`.send` / "retrieve by code" forwards the saved asset back to a chat), which
-  is a different feature. CONFIRMED.
-- `TelegramAPI.forward_messages` (facade) and
-  `telegram_api/messages.py::forward_messages` still exist as a general
-  Telegram primitive but are not part of Save.
-
-### Deep Save
-
-`backend/services/save_service.py::execute_save(client, owner_id, reply_msg, tz_str)`
-
-1. Generate `save_code` via `db_client.get_next_save_code()` (short format, e.g. `S391`).
-2. Resolve sender (`_resolve_sender` — calls `reply_msg.get_sender()`).
-3. Extract source metadata (`_extract_source_media`).
-4. Enforce `max_deep_save_mb` (default 50 MB) *before* any download.
-5. Build caption (`build_caption` + `_append_original_text`).
-6. Text-only source → `client.send_message("me", caption)` (a NEW message).
-7. Media source → `tempfile.mkdtemp` → `client.download_media(reply_msg, file=tmp_path)`
-   → validate file exists and is non-empty → `client.send_file("me", tmp_path, caption, ...)`
-   with original media attributes preserved.
-8. `finally: shutil.rmtree(tmp_dir)` — temp cleanup on every exit path;
-   `asyncio.CancelledError` is re-raised.
-9. Extract metadata from the **newly uploaded** message
-   (`_extract_uploaded_metadata`), build the DB payload, and
-   `db_client.insert_save(payload)` **after** the Telegram upload succeeds.
-
-CONFIRMED: the pipeline is genuinely download → upload; the DB write happens
-after a successful Telegram operation; `forward_messages` is never called.
-
-### Glass UI Flow
-
-```
-.menu (misc.py pattern r"^\.menu$")
-  → send_inline_panel(client, chat_id, "menu")
-  → helper InlineQuery → menu panel
-  → "📥 Save" (panel:save)
-      → "⬇️ Deep Save" (panel:save:type:d)
-          → "💬 Reply Mode" (action:save_reply)  → set_pending("save_reply")
-          → "🔗 Save using a link" (input:save:link) → execute_link_save
-  → owner replies to target message
-      → _input_listener (inline_sender) matches pending input
-      → _save_reply_wait_handler:
-           client.get_messages(chat_id, ids=reply_msg_id)
-           → target_id = reply.reply_to_msg_id
-           → client.get_messages(chat_id, ids=target_id)
-           → execute_save(client, owner_id, target_msg, tz)
-      → edit inline message with result, delete the owner's reply
+```text
+runtime hooks
+  → misc
+  → save
+  → retrieve
+  → delete
+  → organize
+  → bio
+  → discover
+  → database
+  → username
+  → ai settings panel
+  → ai_unified
 ```
 
-CONFIRMED: target resolution is `reply_to_msg_id` → exact message → Deep Save;
-the user's reply message is never saved.
+Handlers are registered on the self-client and the owner gate is centralized in `backend/bot/handlers/guard.py::is_owner()`.
 
-### Download / Upload Flow
+### 2.4 UI and web surface
 
-- Download to a per-operation temp directory; upload from that temp path.
-- `_upload_kwargs_for_media` preserves photos (no `force_document`) and copies
-  the original document attributes (video/audio/voice/sticker/filename) so the
-  re-upload renders as the same media type.
-- No `BytesIO`; file-based temp storage with `shutil.rmtree` cleanup.
+The Telegram interface is Glass UI first. `backend/helper/` contains panel registries, lifecycle/session management, inline rendering, input state, pagination, callback tracing, and RPC timeout helpers.
 
-### File Handling
+The dashboard is a React 18/Vite/Tailwind application under `src/`. It calls the backend API through `src/lib/api.ts`. The current frontend has Saves, Bio Engine, AI, and Logs views. `backend/web/app.py` serves health, saves, bio, logs, AI provider/model/config/test endpoints, and the built SPA when available.
 
-- Size limit enforced pre-download (`file_size > max_bytes` → honest error).
-- Empty-download and missing-file guards exist.
-- Large transfers are **unbounded** at the service layer (correct), but the
-  entry points impose timeouts (see §2 Timeout Audit and §4/§5).
+### 2.5 Business services
 
-### Metadata
+Handlers and AI tools delegate to services rather than implementing domain logic themselves:
 
-DB payload fields: `save_code`, `save_type="deep"`, `origin_chat_id`,
-`origin_msg_id`, `saved_chat_id`, `saved_msg_id`, `sender_name`, `sender_id`,
-`mime_type` (new-message mime or source mime), `file_id` (new or source),
-`file_size` (`actual_size` or `new_size`), `media_type`, `tags`, `caption`,
-`owner_id`, `created_at`.
+- `backend/services/save_service.py`
+- `retrieve_service.py`
+- `delete_service.py`
+- `discover_service.py`
+- `database_service.py`
+- `settings_service.py`
+- `organize_service.py`
+- `bio_service.py`
+- `username_service.py`
 
-- Metadata refers to the **new** message where available
-  (`_extract_uploaded_metadata`), so retrieval points at the real saved asset.
-- Partially-empty metadata is possible for edge cases (e.g. photo `size` is
-  `None` in the new-message extraction → `file_size` falls back to `actual_size`,
-  `saved_*` ids come from `sent`), but `insert_save` is only reached after a
-  successful upload, so `saved_chat_id`/`saved_msg_id` should be populated.
+The AI tools and Glass UI therefore converge on the same service functions for the domains that are wired.
 
-### Caption
+---
 
-`build_caption` produces:
+## 3. AI EXECUTION ARCHITECTURE
 
+### 3.1 Activation and request capture
+
+**CONFIRMED:** `backend/bot/handlers/ai_unified.py` is the canonical natural-language AI activation path.
+
+It supports:
+
+- English trigger matching, case-insensitive.
+- Persian trigger matching, exact according to the configured trigger.
+- Reply-aware trigger mode.
+- Reply-to-known-AI continuation without requiring a trigger.
+- Skipping dot-prefixed messages through the handler’s activation rules.
+
+`_execute_ai()` captures `event.chat_id` and `event.message.id` before configuration loading, provider selection, status edits, or provider inference. It creates an `AIRequest` containing `chat_id`, `message_id`, `reply_context`, `timezone`, owner ID, and a request ID.
+
+This is important for Delete: provider response messages cannot replace the original request as the execution anchor.
+
+### 3.2 AIRequest and context
+
+`backend/ai/session/request.py::AIRequest` is a frozen dataclass. Relevant fields are:
+
+- `session_id`
+- `user_message`
+- `owner_id`
+- `chat_id`
+- `message_id`
+- `reply_context`
+- `timestamp`
+- `language`
+- `timezone`
+- `metadata`
+- `request_id`
+
+`backend/ai/engine/dispatcher.py::_build_context()` assembles conversation history, memory, runtime context, preferences, reply context, and tool context for prompt construction. The conversation history is AI session history, not Telegram chat history. Real Telegram history is obtained only by Telegram-aware tools such as `ListRecentMessagesTool` or Delete service selectors.
+
+### 3.3 Prompt and tool schemas
+
+Prompt files:
+
+- `backend/ai/prompt/template.py`
+- `backend/ai/prompt/builder.py`
+- `backend/ai/prompt/serializer.py`
+- `backend/ai/prompt/formatter.py`
+- `backend/ai/prompt/validator.py`
+- `backend/ai/prompt/budget.py`
+
+The Dispatcher injects the registry’s tool schemas into the prompt and also sends provider-native OpenAI-style function definitions where supported. `ToolRegistry.list_schemas()` is converted by `Dispatcher._build_tool_definitions()` into object/function schemas.
+
+The default system prompt states that the assistant calls tools, never performs actions directly, responds concisely, and asks for clarification when uncertain. Retrieved Telegram content is intended to be data rather than instructions. This prompt rule is useful, but it is not the final security boundary; the execution layer is.
+
+### 3.4 Intent resolution order
+
+`backend/ai/actions.py` contains the deterministic action contract:
+
+- `ActionParseResult`
+- `extract_json_object()`
+- `validate_action()`
+- `parse_action_text()`
+- `parse_command_intent()`
+- `resolve_tool_calls()`
+
+The current Dispatcher can resolve actions through:
+
+1. Native provider tool calls.
+2. Deterministic parsing of the original user message.
+3. JSON/structured action extraction from provider text.
+4. One bounded action-format recovery retry when prose does not resolve.
+
+Unknown actions, invalid fields, unsupported targets, invalid counts, and malformed tool arguments are rejected before execution.
+
+The deterministic parser contains Persian/English vocabulary, Persian digit coercion, count parsing, all/time/boundary/query scope recognition, save/delete recognition, account-status semantics, and the first-name versus real-`@username` distinction.
+
+### 3.5 Local fast path
+
+`Dispatcher._try_local_fast_path()` runs before provider inference for high-confidence actions. Current examples include:
+
+- Status and account queries.
+- Save/reply and save-by-link.
+- Explicit Delete IDs.
+- Explicit Delete counts.
+- Replied-message Delete.
+- Current-message/anchor and explicit range scopes.
+
+Conversational requests and ambiguous semantic requests are intentionally left to the provider path unless the parser can safely convert a direct topic request into a local Delete query.
+
+**CONFIRMED:** the fast path uses the same `ToolExecutor` as provider-generated calls. It does not create a second execution architecture.
+
+### 3.6 Tool execution and authorization
+
+`backend/ai/tools/base.py` defines tool contracts, `PermissionLevel`, and `ToolResult`. `backend/ai/tools/registry.py` creates the fixed tool allowlist. Current registered tools include:
+
+- Save: `save`, `save_link`.
+- Delete: `delete`, `delete_by_id`, `delete_replied`, `delete_message_by_id`, `list_recent_messages`, `delete_messages_by_ids`.
+- Profile: Bio and Username setters/status tools.
+- Saved content: `search`, `list_saves`.
+- Database/status: `database_stats`.
+- Account: `account_show`.
+- Settings: `settings_get`, `settings_set`.
+- Organize: `organize_list`, `organize_clean`.
+
+`ToolExecutor._execute_single()` performs:
+
+```text
+name/argument shape checks
+  → registry lookup
+  → permission-level decision
+  → bounded tool execution (or explicit long-running exemption)
+  → ToolResult capture
+  → history/telemetry recording
 ```
-{icon} {save_code} · DEEP
-👤 {sender}
-🕒 {YYYY-MM-DD HH:MM}
-🆔 {chat_id}/{msg_id}
-🗂 {media_type} · {size} · {mime}
-📄 {file_name}        (if present)
-#saved #saved_<type> #saved_<year> #saved_<year>_<month> #saved_<year>_<month>_<day>
+
+`MAX_TOOLS_PER_TURN` is 5. Default non-long-running tool timeout is 10 seconds. Tools may expose a tool-specific `timeout_seconds`; Delete exposes a 30-second deadline and internally uses a stricter 25-second operation deadline. Deep Save is explicitly marked long-running and does not use the generic 10-second wrapper.
+
+The current executor auto-executes `READ_ONLY`, `READ_WRITE`, and `DANGEROUS` tools because the owner’s outgoing self-bot message is treated as authorization. `ADMIN_ONLY` and `CONFIRMATION_REQUIRED` remain blocked pending confirmation.
+
+**SECURITY CONFIRMED:** no registered tool accepts an arbitrary Telegram method name, shell command, Python expression, or unrestricted database query.
+
+### 3.7 Result and response delivery
+
+The Dispatcher records real tool results and does not fabricate successful side effects. `backend/bot/handlers/ai_unified.py` uses `backend/ai/tools/delivery.py::deliver_response()` for normal AI replies.
+
+Pure Delete tool names are recognized by `_is_silent_delete()`. On a successful pure Delete result, the handler does not send a new Telegram message. It best-effort edits the original event back to the display prompt; if the request itself was deleted, the edit fails harmlessly. This preserves zero-spam behavior.
+
+A Delete failure is not silently treated as success: it reaches the error path and is rendered/edited as an error when possible.
+
+### 3.8 Provider failure interaction
+
+Provider failures are normalized into controlled `EngineResult`/`ProviderResponse` errors. The Dispatcher has bounded empty-response and action-format recovery paths. A provider failure can still prevent an ambiguous semantic request from reaching a tool if no deterministic local interpretation exists; this is the principal reason direct semantic Delete handling was added.
+
+---
+
+## 4. PROVIDER / FALLBACK ARCHITECTURE
+
+### 4.1 Registered providers
+
+`backend/ai/providers/factory.py` registers these provider classes when their keys are available:
+
+- `dummy`
+- `gemini`
+- `openai`
+- `openrouter`
+- `cerebras`
+- `mistral`
+- `groq`
+- `zai`
+- `sambanova`
+- `nvidia`
+- `cohere`
+- `siliconflow`
+- `fireworks`
+
+Most use `OpenAICompatProvider`; Gemini has its own provider implementation and translates native tool definitions for Gemini’s API shape. The `dummy` provider is always present as the terminal fallback.
+
+The actual active provider set is environment-dependent. Which keys/models are configured in production is **UNKNOWN** from source-only inspection because secrets and production environment values were not read.
+
+### 4.2 Provider manager
+
+`backend/ai/providers/manager/manager.py::ProviderManager` is the routing authority. Its current behavior is:
+
+```text
+active provider
+  → configured fallback chain
+  → other registered non-dummy providers
+  → capability/health/model filtering
+  → reliability/latency scoring
+  → bounded attempt
+  → at most one immediate retry for transient failure
+  → next candidate
+  → controlled failure response through dummy fallback metadata
 ```
 
-`_append_original_text` appends the original message text below. Format is
-consistent between text and media sources (text uses the same builder).
+Providers requiring native tools are skipped when they do not advertise tool/function-call capability. Unconfigured, unhealthy, unavailable-model, disabled, and cooling-down providers are skipped with a reason recorded in a failure matrix.
 
-### Database Interaction
+### 4.3 Timeouts, retries, cooldowns
 
-- `db_client.insert_save` runs through `_run_sync` (thread + 10 s timeout).
-- On insert returning `None`, the save reports "uploaded but DB record failed"
-  and writes a `bot_logs` ERROR entry — honest partial-failure handling.
-- Save codes are short (`S####`) and collision-checked; the legacy
-  `SV-NNNNNN` format documented in `AGENTS.md` no longer exists.
+`ProviderManager._call_once()` uses `guarded_await()` with a 30-second provider RPC timeout. `_attempt_with_retry()` retries at most once for `network`, `timeout`, and `server` categories after a one-second backoff.
 
-### Confirmed Facts
+`backend/ai/providers/manager/health.py::ProviderHealthTracker` uses monotonic cooldown deadlines:
 
-1. Deep Save only; no forward fallback anywhere in Save. CONFIRMED.
-2. DB write occurs after Telegram upload. CONFIRMED.
-3. Temp directory cleanup in `finally`; `CancelledError` re-raised. CONFIRMED.
-4. Forwarding remains only in the retrieval (`.send`) path and the generic
-   `telegram_api` facade. CONFIRMED.
-5. Save code format changed to short codes; `AGENTS.md` is stale. CONFIRMED.
+- Rate limits honor `retry_after` where present.
+- Auth failures disable a provider until configuration changes.
+- 404/model-not-found is marked unavailable for the provider/model TTL and is not hammered every request.
+- Transient failures receive category-specific cooldowns.
+- Five consecutive failures open a 600-second quarantine.
+- Success clears failure state and restores provider availability.
+- Per-provider semaphores bound concurrency; default concurrency is 4 with provider-specific overrides.
 
-### Likely Causes / Risks
+**CONFIRMED:** the routing layer has bounded provider retries and does not retry forever.
 
-- **LIKELY — AI/Glass entry-point timeouts abort legitimate Deep Saves.** The
-  service is correctly unbounded, but the Glass UI input listener (60 s) and the
-  AI `ToolExecutor` (10 s) bound the *entire* operation, so a large download or
-  upload can be cancelled mid-transfer.
+**LIKELY:** real provider availability will vary significantly by API key, model, quota, and tool-calling support. Source and unit tests cannot prove production provider health.
 
-### Ruled Out
+### 4.4 Known provider limitations
 
-- **RULED OUT — Deep Save secretly forwards.** `execute_save` has no
-  `forward_messages` and no exception path to forwarding.
-- **RULED OUT — `BytesIO` leak.** The implementation uses file-based temp
-  storage, not `BytesIO`.
-- **RULED OUT — metadata persisted before upload.** Insert happens last.
-
-### Unknowns
-
-- Live behavior for timed/self-destructing media (depends on Telegram's
-  download permission; code attempts `download_media` and reports honest
-  failure if Telegram blocks it).
-- Whether `reply_msg.get_sender()` (unbounded in `_resolve_sender`) can hang on
-  a protected sender — no live evidence.
+- `AI_ENABLED` defaults to disabled and `dummy` is the default provider.
+- The active model is environment/config selected and may be overridden per provider.
+- Model discovery/test endpoints exist, but a successful model-discovery request does not prove future inference availability.
+- Provider-specific tool-call compatibility is mediated by capabilities and normalization, but live behavior for every provider/model combination is **UNKNOWN**.
+- A semantic Delete request that depends on provider reasoning can still fail if every eligible tool-capable provider is unavailable. Deterministic Delete scopes avoid that dependency.
 
 ---
 
-## 4. AI SYSTEM
+## 5. DELETE ARCHITECTURE
 
-### Architecture
+### 5.1 Tool and service path
 
-```
-outgoing message (trigger word / reply-to-AI / .ai)
-  → ai_unified._execute_ai  OR  ai_cmd
-  → AIRequest
-  → Engine.execute → Dispatcher.dispatch
-      → ConversationManager (session + history)
-      → PromptBuilder
-      → ProviderManager.chat (guarded_await 30 s)
-      → Provider (httpx.AsyncClient)
-      → Tool loop (MAX_TOOL_ROUNDS=3, MAX_TOOLS_PER_TURN=5)
-      → ConversationUpdate
-      → EngineResult
-  → deliver_response (edit-in-place / chunked)
-  → config_store.record_request (last_request_at / last_latency_ms)
+Current deterministic path:
+
+```text
+owner outgoing message
+  → ai_unified.py captures original chat_id/message_id
+  → AIRequest(request_id, chat_id, message_id, timezone, reply_context)
+  → Dispatcher.parse_command_intent / local fast path
+  → DeleteTool arguments
+  → ToolExecutor timeout/permission boundary
+  → delete_service.do_del_self_filtered()
+  → bounded Telegram history scan
+  → self-owned candidate selection
+  → delete_verified_self_messages()
+  → re-fetch ownership verification
+  → chunked client.delete_messages()
+  → ToolResult
+  → silent Telegram delivery for pure successful Delete
 ```
 
-### Execution Flow
+Reply-target path:
 
-- `ai_unified.py` registers `events.NewMessage(outgoing=True)` (no pattern) and
-  matches the first word against `trigger_en`/`trigger_fa`, or detects
-  reply-to-AI. `ai_cmd.py` registers `.ai <text>`. Both wrap
-  `engine.execute()` in `asyncio.wait_for(..., timeout=60)`.
-- `Dispatcher.dispatch` catches every stage exception and returns
-  `EngineResult(success=False)`; it never raises.
-- `ProviderManager.chat` tries the healthy active provider, then the configured
-  fallback chain, then an emergency dummy fallback that **never reports fake
-  success** (`success=False` with preserved errors).
+```text
+reply context
+  → DeleteRepliedTool
+  → bounded get_messages()
+  → outgoing precheck
+  → delete_verified_self_messages()
+  → final sender/out verification
+  → delete_messages()
+```
 
-### Provider / Fallback
+Semantic/provider path:
 
-- Providers: `gemini.py` and `openai_compat.py` (covers OpenAI/OpenRouter/Groq/
-  Cerebras/Mistral style APIs) plus `dummy/provider.py`. All `chat` methods are
-  `async` and use `httpx.AsyncClient`.
-- `ProviderManager` has `_ensure_dummy_fallback`, `_load_env_fallback_chain`
-  (`AI_PROVIDER_FALLBACK`), and `_try_fallback_chain`.
+```text
+natural-language topic request
+  → provider or deterministic semantic interpretation
+  → ListRecentMessagesTool, when provider path is used
+  → provider selects concrete IDs it actually saw
+  → DeleteMessagesByIdsTool
+  → delete_verified_self_messages()
+  → Telegram deletion
+```
 
-### Tool System
+### 5.2 Retrieval bounds and timeout state
 
-- `ToolRegistry` + `create_default_registry` register 22 tools: `save`, `delete`,
-  `delete_by_id`, 6 bio tools, 6 username tools, `search`, `list_saves`,
-  `settings_get`, `settings_set`, `organize_list`, `organize_clean`.
-- `ToolExecutor.execute_calls` is the sole caller of `tool.execute()`.
-- `SaveTool` delegates to `save_service.execute_save` (no duplicated logic).
-- Permission levels: `READ_ONLY`/`READ_WRITE` auto-execute; `DANGEROUS`/
-  `ADMIN_ONLY`/`CONFIRMATION_REQUIRED` would require confirmation (none of the
-  22 default tools use those levels — `SaveTool.safe=True`,
-  `DeleteTool` also safe per registry).
+`backend/services/delete_service.py` defines:
 
-### Memory / History
+- `_MAX_DELETE_SCAN_MESSAGES = 1000`
+- `_DELETE_VERIFY_CHUNK = 100`
+- `_DELETE_RPC_TIMEOUT_SECONDS = 5.0`
 
-- Conversation history lives in `ConversationManager`/`RuntimeSession` (in-memory)
-  with Supabase persistence via `backend/ai/persistence.py` (session/message/
-  memory/tool-history tables), all through `asyncio.to_thread` + 10 s timeout.
-- `ReplyResolver` maps Telegram msg-id → AI response (bounded LRU, 500 entries).
+`_iter_messages_bounded()` wraps each `__anext__()` call with `rpc_await()`. It never requests an unbounded Delete history. `delete_verified_self_messages()` re-fetches ownership in chunks of 100 and deletes verified IDs in chunks of 100.
 
-### Database / Persistence
+Safe ownership reads receive one bounded retry for transport/timeout errors. Delete batch failures are accumulated while subsequent verified batches are attempted, then a deterministic error is returned to the tool.
 
-- `config_store.get_config`/`save_config`/`record_request` upsert the `ai_config`
-  row. `_is_missing_config_response` explicitly handles PostgREST `204` +
-  "Missing response" (`maybe_single` on an empty table) and returns `None`
-  (defaults). CONFIRMED present.
-- `record_request` sets `last_request_at`/`last_latency_ms`.
-- Tool history: `ToolExecutor._record_history` is a no-op in production
-  (`history_repo=None`); the real persistence is the fire-and-forget
-  `guarded_create_task(persistence.record_tool_call(...))`.
+`DeleteTool.execute()` applies `_DELETE_OPERATION_TIMEOUT_SECONDS = 25` around the service operation and exposes `timeout_seconds = 30` to `ToolExecutor`. This is a bounded implementation, not an unlimited timeout exemption.
 
-### Timeout / Cancellation
+**CONFIRMED:** the previous production “Tool 'delete' timed out” path was caused by unbounded/insufficiently guarded Delete history/RPC work being caught by the generic executor deadline. The current commit series adds bounds at the service boundary and tests the timeout/partial-failure behavior.
 
-- `ProviderManager.chat` → `guarded_await(..., timeout=30)`.
-- `ToolExecutor._execute_single` → `asyncio.wait_for(tool.execute(...), timeout=10)`
-  for **every** tool, including `save`.
-- Handler level → `asyncio.wait_for(engine.execute(...), timeout=60)`.
+**UNKNOWN:** live Telegram cancellation behavior under a stuck lower-level socket cannot be proven by mocked tests alone.
 
-### Runtime Relationship
+### 5.3 Ownership enforcement
 
-- AI runs on the same event loop and the same self client. A reconnect
-  (`_trigger_reconnect` → `client.disconnect()`) drops any in-flight AI provider
-  call's Telegram reply/edit and any in-flight Save tool's download/upload.
+`delete_service._resolve_me_id()` uses cached `client.me` when available and otherwise a bounded `get_me()` call. `_is_self_owned()` requires:
 
-### Confirmed Facts
+1. message exists;
+2. authenticated account ID is resolved;
+3. message has Telegram `out=True`;
+4. message has a sender ID;
+5. sender ID equals authenticated account ID.
 
-1. **`ToolExecutor.TOOL_TIMEOUT_SECONDS = 10` applies to the Save tool.**
-   `backend/ai/tools/executor.py` wraps every `tool.execute()` in
-   `asyncio.wait_for(..., timeout=10)`. A Deep Save invoked by the AI that takes
-   > 10 s (any non-trivial download/upload) is cancelled and reported as
-   "timed out". CONFIRMED — a blanket timeout on a large Save operation.
-2. **Three AI handler modules, only two registered.**
-   `backend/bot/router.py` registers `ai`, `ai_cmd`, `ai_unified` — **not**
-   `ai_trigger`. `backend/bot/handlers/ai_trigger.py` (a full trigger handler)
-   is dead code, yet `ai_cmd.py`'s docstring claims "The primary AI activation
-   method is now the trigger-based system in `backend.bot.handlers.ai_trigger`".
-   CONFIRMED inconsistency.
-3. **`ai_cmd` and `ai_unified` are two separate AI entry points** (`.ai`
-   command vs trigger/reply), each with its own duplicated ~200-line
-   `_restore_config`/`_format_*`/`_humanize_error`/timeout logic. CONFIRMED.
-4. **AI DB access is non-blocking** (`to_thread` + 10 s). CONFIRMED.
-5. **`record_request` / `get_config` handle PostgREST 204 "Missing response".**
-   CONFIRMED.
-6. **Tool history repository is never wired** (`history_repo=None`), so the
-   in-executor `_record_history` is inert; DB tool history is written via
-   fire-and-forget `persistence.record_tool_call`. CONFIRMED.
+The final `delete_verified_self_messages()` call re-fetches every candidate from Telegram immediately before deletion. This is the authoritative security boundary. A foreign message, bot/admin message, system message, stale ID, missing sender, missing identity, or unknown ownership is rejected and never reaches `client.delete_messages()`.
 
-### Likely Causes / Risks
+AI-generated responses remain eligible because eligibility uses Telegram metadata, not message text, formatting, reply structure, or AI markers.
 
-- **LIKELY — AI Save is effectively unusable for media.** 10 s tool timeout +
-  60 s total handler timeout make any meaningful Deep Save fail or abort.
-- **LIKELY — duplicated AI handler code drifts.** `ai_cmd`/`ai_unified` (and the
-  dead `ai_trigger`) each re-implement config restore, error formatting, and
-  timeout handling.
+### 5.4 Current request and anchor semantics
 
-### Ruled Out
+`_execute_ai()` captures the original request ID before status edits/provider work. `Dispatcher._build_tool_context()` forwards it as `extra["request_message_id"]` and forwards `request_id`, `chat_id`, and reply metadata.
 
-- **RULED OUT — AI blocks the event loop with sync HTTP.** `httpx.AsyncClient`.
-- **RULED OUT — Dummy provider reports fake success.** `success=False` always.
-- **RULED OUT — AI DB write blocks the loop.** `to_thread` + timeout.
+Current `DeleteTool` behavior:
 
-### Unknowns
+- Last-N/all/time/filtered scopes may include the request if it is self-owned and inside the scope.
+- `until_message` uses a supplied `boundary_id`, replied message boundary, or the original request ID as the boundary.
+- The request is not excluded by a generic “current message” filter in the current scoped Delete path.
+- The final ownership gate still applies to it.
 
-- Whether `ProviderManager.vision()`/`stream()` are ever called (they are sync
-  and inconsistent with the async providers — `openai_compat.vision` is
-  `async def` — but no dispatcher path calls them).
-- Live provider latency/behavior (no credentials exercised).
+`ListRecentMessagesTool` also intentionally exposes the active request if it is inside the bounded recent window.
 
----
+**CONFIRMED:** the AI response cannot become the original anchor because the request ID is captured before provider execution.
 
-## 5. GLASS UI / HANDLER ARCHITECTURE
+**LIKELY limitation:** explicit legacy paths such as `DeleteByIdTool`/`do_del_id_counts()` have different range semantics from the scoped `DeleteTool`; a full request-ID inclusion audit across every legacy panel/ID path is still warranted before claiming identical semantics for all Delete entry points.
 
-### Menu / Navigation
+### 5.5 Last-N, all, time, and boundary selection
 
-- Root panel `menu` registered in `backend/bot/handlers/misc.py`; `.menu`
-  triggers inline mode (`send_inline_panel`).
-- Navigation: `panel:_nav:back|home|close`; root has Close only, submenus have
-  Back/Home/Close (`_finalize_panel`).
+`select_self_owned_message_ids()` scans newest-first and applies:
 
-### Panels
+- count limit, maximum 500 for count-based requests;
+- optional local time floor and cutoff;
+- optional message boundary;
+- optional text query;
+- self ownership before semantic text selection;
+- current request participation when in scope;
+- bounded early stopping when count/time range is satisfied.
 
-Registered panels (from `register_panel`):
+A missing boundary does not expand to whole-chat deletion. Invalid times/counts/IDs return controlled errors. Bare `HH:MM` values are interpreted as local wall-clock time in the configured timezone; the source includes a deterministic Tehran UTC+03:30 fallback when system tzdata is unavailable.
 
-- `menu`, `profile`, `context`, `health`, `settings`, `general` (misc.py)
-- `save` (save.py), `retrieve`, `retrieve_saved`, `retrieve_item`,
-  `retrieve_code` (retrieve.py), `del`, `delfrom` (delete.py)
-- `bio`, `biohelp` (bio.py), `username`, `usernamehelp` (username.py)
-- `list`, `find` (discover.py), `db` (database.py)
-- `ai`, `ai_provider`, `ai_model`, `ai_wizard`, `ai_settings`, `ai_status`,
-  `ai_diagnostics` (ai.py)
+### 5.6 Semantic Delete limitation
 
-### Actions / Callbacks
+There are two materially different semantic implementations.
 
-- Callback routing in `backend/helper/panels.py::_callback_router`:
-  `panel:` → `_handle_panel`, `action:` → `_handle_action`, `input:` →
-  `_handle_input`. All wrapped in try/except; `event.answer()` in `finally`.
-- Owner gating: `settings_service.is_owner_only()` + `is_owner`.
-- Session resolution via `_resolve_session` (chat/msg → inline_message_id).
+**Direct deterministic topic path:** `parse_command_intent()` recognizes topic-like Delete language, extracts a query, and can call `DeleteTool` with `mode="filtered"` and `query`. The service then performs a bounded text substring filter over real Telegram messages after self ownership has been established.
 
-### Inputs / Reply Modes
+**Provider-backed semantic path:** `ListRecentMessagesTool` retrieves up to 100 recent messages, reverses them into chronological order, and returns ID/sender/date/text preview/media/reply metadata. The provider chooses IDs; `DeleteMessagesByIdsTool` truncates input to 100 and invokes the same final ownership chokepoint.
 
-- `backend/helper/input_state.py` — single pending input per owner, 120 s
-  expiry, replaced on new request.
-- `backend/helper/inline_sender.py::_input_listener` — matches owner's next
-  outgoing message in the same chat, skips `.`-prefixed messages, and runs the
-  handler under `asyncio.wait_for(..., timeout=60)`.
-- `target_context.py` — reply-target resolution used by `delete.py`
-  (`delfrom` reply) and `misc.py`.
+The current system does **not** provide:
 
-### Dot Commands
+- embedding/vector search;
+- a Telegram-history index;
+- deep linguistic normalization for every Persian colloquial form;
+- guaranteed retrieval beyond the bounded recent window;
+- deterministic classification of structural queries such as “messages containing exactly two English words.”
 
-Current registered dot commands (CONFIRMED by grep across `backend/bot`):
+Therefore “پیام های دو کلمه‌ای انگلیسی رو پاک کن” may fail at one or more of:
 
-| Command | Handler | Registered? |
-|---|---|---|
-| `.menu` | `misc.py` `r"^\.menu$"` | yes |
-| `.ai <text>` | `ai_cmd.py` `r"^\.ai(?:\s+(.+))?$"` | yes |
-| trigger word | `ai_unified.py` (all outgoing) | yes |
-| reply-to-AI | `ai_unified.py` (all outgoing) | yes |
-| trigger word | `ai_trigger.py` (all outgoing) | **no — dead code** |
+- parser does not recognize the structural predicate;
+- local query extraction reduces it to the wrong substring;
+- provider path does not receive enough history/context;
+- 200-character previews omit relevant content;
+- provider cannot reliably select all matching IDs;
+- `ListRecentMessagesTool` history iteration has a limit but does not itself use the Delete service’s per-page `rpc_await` wrapper.
 
-No `.ping`, `.id`, `.help`, `.kill`, `.health`, `.logs`, `.save`, `.del`,
-`.organize`, `.bio`, `.username`, `.retrieve`, `.preview`, `.send`, `.list`,
-`.find` dot commands exist. These features are exposed only through Glass UI
-panels/actions/inputs and AI tools.
+The exact production failure point is **UNKNOWN** without a request-specific `AI_EXEC_TRACE` and tool result sequence.
 
-### Handler Registration
+### 5.7 Silent behavior
 
-`backend/bot/router.py::register_all` registers, in order:
-`misc, save, retrieve, delete, organize, bio, discover, database, username,
-ai, ai_cmd, ai_unified` — each in its own try/except. `register_runtime_hooks`
-registers health-timestamp hooks first.
+`ai_unified.py::_is_silent_delete()` recognizes pure Delete tool results. On successful pure deletion it does not use `deliver_response()` and does not send “Deleted,” “Done,” or an equivalent confirmation. This preserves the established zero-spam behavior, including when the request message was deleted.
 
-Note: `organize` is imported in the router but `backend/bot/handlers/organize.py`
-registers no dot command (its functionality moved to the `db`/`discover`
-panels + AI `organize_*` tools).
+A failed Delete is not silent success; it follows the error path.
 
-### Service / Engine Flow
+### 5.8 Delete test evidence
 
-- Save → `save_service.execute_save`.
-- Bio/Username → `bio_service`/`username_service` → shared `ProfileEngine` →
-  shared `profile.scheduler`.
-- Delete/Retrieve/Discover/Organize/Database → their `services/*` modules.
-- AI → `Engine` → tools → services.
+Focused tests currently cover ownership, parser/regression behavior, scopes, semantic handling, current-request inclusion, AI-generated self messages, timeout bounds, batching, partial failure, Tehran cutoff handling, repeated requests, and silent delivery:
 
-### Stability Risks
+- `tests/test_26_silent_delete.py`
+- `tests/test_27_delete_ownership.py`
+- `tests/test_28_delete_regression.py`
+- `tests/test_29_delete_expansion.py`
+- `tests/test_30_delete_timeout_hardening.py`
+- `tests/test_31_delete_rpc_failures.py`
 
-- **CONFIRMED — 60 s input-listener timeout bounds Deep Save.** Any pending-input
-  handler (including `_save_reply_wait_handler` → `execute_save`) is cancelled
-  after 60 s by `inline_sender._input_listener`.
-- **CONFIRMED — two SessionManager singletons exist.** `session_manager.py`
-  defines both the `SessionManager` class and a module-level `_manager` with
-  "backward-compatible" functions (`create_session`, `get_session`, `push_nav`,
-  `pop_nav`, ...). `grep` shows none of the module-level functions are used —
-  all panel code uses `get_lifecycle().sessions` (the lifecycle's own instance).
-  The module-level `_manager` is a dormant second session store.
-- **LIKELY — stale documentation invites misuse.** `AGENTS.md` documents many
-  removed dot commands and the removed Forward Save.
-- **SUSPECTED — callback handlers can hang the helper.** `_handle_panel`/
-  `_handle_action`/`_handle_input` run without a per-callback timeout; a slow
-  handler (e.g. AI `fetch_models`, discovery) can delay subsequent callbacks.
-
-### Confirmed Facts
-
-1. Only `.menu` and `.ai` are registered dot commands; `ai_trigger.py` is dead.
-   CONFIRMED.
-2. `AGENTS.md` documents `.ping/.id/.help/.save f/.save d/.preview/.send/.del/
-   .organize/.bio/.username` — none exist. CONFIRMED stale.
-3. `retrieve.py` line 99 says "Save something first with `.save`" — stale. CONFIRMED.
-4. Glass UI Save flow is deterministic reply → `reply_to_msg_id` → target →
-   `execute_save`. CONFIRMED.
-5. `target_context` is used by delete and misc (not dead). CONFIRMED.
-6. Module-level `session_manager` API is unused (second singleton). CONFIRMED.
-
-### Likely Causes / Risks
-
-- **LIKELY — `AGENTS.md` is no longer the source of truth** and will mislead
-  future agents/operators about commands and save semantics.
-- **LIKELY — no per-callback timeout** can make the helper appear unresponsive
-  if a panel/action/input handler performs a slow RPC (model discovery, large
-  DB read) without its own bound.
-
-### Ruled Out
-
-- **RULED OUT — `target_context` is orphaned.** It is used (delete + misc).
-- **RULED OUT — Forward Save still reachable via a hidden dot command.** No
-  `.save` command is registered; the Save panel offers only Deep Save + link save.
-
-### Unknowns
-
-- Whether any callback data exceeds Telegram's 64-byte limit (the system
-  truncates via `truncate_callback_data`), and whether truncation ever causes
-  collisions in practice.
-- Live helper-bot inline latency.
+Recorded current result: 84 Delete-focused tests and 519 repository tests passed. These are mocked/unit-level guarantees; no live Telegram deletion was performed during this investigation.
 
 ---
 
-## 6. CROSS-SUBSYSTEM INTERACTIONS
+## 6. SAVE ARCHITECTURE
 
-| Interaction | Evidence / status |
-|---|---|
-| Runtime ↔ AI | Same event loop + same self client. `_trigger_reconnect`/`disconnect` can drop in-flight AI provider Telegram reply + in-flight Save tool. CONFIRMED coupling. |
-| Runtime ↔ Save | Same client. Reconnect drops download/upload. Entry-point timeouts (60 s input / 10 s tool) abort saves. CONFIRMED. |
-| Runtime ↔ DB | `to_thread` + 10 s — no loop blocking. CONFIRMED safe. |
-| Runtime ↔ Telegram | `_run_loop` vs `_trigger_reconnect` dual ownership. CONFIRMED race. |
-| Glass UI ↔ Save | `.menu` → save panel → reply mode → `execute_save` under 60 s input-listener timeout. CONFIRMED. |
-| Glass UI ↔ AI | AI panels configure provider/model/triggers; AI activation is separate (outgoing-message handler). |
-| Glass UI ↔ Profile | Bio/Username panels call `bio_service`/`username_service` → shared scheduler. CONFIRMED. |
-| AI ↔ Save | `SaveTool` → `execute_save` with 10 s tool timeout. CONFIRMED. |
-| AI ↔ DB | `config_store`/`persistence` via `to_thread` + 10 s. CONFIRMED. |
-| Save ↔ DB | `insert_save` after upload, `to_thread` + 10 s. CONFIRMED. |
-| Save ↔ Telegram | `download_media`/`send_file` unbounded at service. CONFIRMED. |
-| Profile ↔ Runtime | One shared `lifeos-profile-scheduler` task; per-engine active state prevents one engine's stop from killing the other. CONFIRMED (fix present). |
+### 6.1 Deep Save
 
-**Shared resources:** single asyncio event loop, one self client, one helper
-client, one recovery lock, one panel lifecycle lock, one pending-input slot per
-owner, one shared profile scheduler.
+`backend/services/save_service.py::execute_save()` is the current Deep Save implementation:
 
-**Duplicate supervisors:** `RuntimeSupervisor` (active) vs dormant
-`diagnostics.recover_stalled` and dormant `supervisor._watchdog_loop`.
-**Duplicate AI activation:** `ai_cmd` + `ai_unified` (active) + `ai_trigger`
-(dormant).
+```text
+source/reply message
+  → allocate short save code
+  → inspect media and metadata
+  → create safe temporary file when media exists
+  → download_media()
+  → verify file exists/non-empty
+  → send_file() to Saved Messages as a new message
+  → extract new uploaded metadata
+  → persist saved_items row
+  → return honest confirmation/failure
+```
 
----
+Captions preserve original text and include structured save metadata. Media type, MIME type, size, filename, file ID, timestamps, tags, source chat/message IDs, and Saved Messages IDs are recorded where available.
 
-## 7. ARCHITECTURAL COMPLIANCE
+**CONFIRMED:** the Save service does not use `forward_messages()` for Save. `forward_messages()` appears in `retrieve_service.py` for sending an already-saved asset back to a target chat, which is a retrieval operation rather than Save.
 
-| Requirement | Verdict | Evidence |
-|---|---|---|
-| Single-client Self architecture | ✅ | one self client + optional helper bot |
-| Deterministic behavior | ✅ mostly | Save target resolution is exact (`reply_to_msg_id`); scheduler fires at minute boundary |
-| Layer separation (parsing / permission / execution / persistence) | ✅ | handlers → services → db; tools → services |
-| Single handler per feature | ⚠️ partial | AI has 3 handler modules (2 active + 1 dead); bio/username services are near-verbatim mirrors |
-| Zero-spam philosophy | ✅ | edit-in-place for AI; panels edit inline; reply handlers delete the trigger |
-| Resource discipline | ⚠️ | Deep Save temp dir cleaned in `finally`; but input/tool timeouts cancel long work |
-| Scalability | ⚠️ | single pending-input slot; single process; acceptable for single owner |
-| Lifecycle ownership | ⚠️ | supervisor is authoritative, but `_watchdog_loop` is dormant and failsafe hard-reset is broken |
-| ENV authority | ✅ | `config.load()` is the single loader; `HELPER_BOT_ENABLED` derived from `BOT_TOKEN` |
-| Persistence boundaries | ✅ | DB access isolated in `db/client.py`, `ai/config_store.py`, `ai/persistence.py` |
+`SaveTool.long_running = True` prevents the generic 10-second AI tool timeout from cancelling a legitimate large media transfer. The Glass UI Deep Save reply listener uses an unbounded listener timeout, with separate pending-input expiry retained by the helper state system.
 
----
+### 6.2 Save by link
 
-## 8. CONFIRMED BUGS / DEFECTS
+`execute_link_save()` parses Telegram links, resolves the target message, and routes it into the same Deep Save pipeline. Link-origin metadata is preserved. The exact behavior depends on Telegram entity resolution and the target message being accessible.
 
-Source-proven defects:
+### 6.3 Persistence and concurrency
 
-1. **Failsafe hard-reset is a `NameError`.** `backend/runtime/failsafe.py` uses
-   `guarded_create_task` (line 156) but never imports it (only
-   `immortal_create_task`, line 28). The last-resort recovery can never fire.
-2. **`supervisor._watchdog_loop` is never started.** The supervisor's own
-   watchdog (RPC check, helper restart, memory GC, stale-loop restart) is dead.
-3. **Heartbeat `READY_BUT_DISCONNECTED` false positive.** Fires
-   `_trigger_reconnect` whenever the helper bot is disabled
-   (`helper_connected=False` while `helper_enabled=False`).
-4. **Heartbeat idle = stalled false positives.** `UPDATE_PIPELINE_STALLED` and
-   `CALLBACK_DISPATCH_STALLED` treat a naturally idle account as stalled and
-   reconnect.
-5. **No reconnect cooldown on lightweight success.** `_trigger_reconnect`
-   can be re-triggered every 30–60 s.
-6. **Dual connection ownership** between `_run_loop` and `_trigger_reconnect`
-   on the same client.
-7. **`ToolExecutor` 10 s timeout applies to the Save tool.** A blanket timeout
-   on large Deep Save via AI.
-8. **Glass UI input listener 60 s timeout bounds Deep Save.** A blanket timeout
-   on large Deep Save via Reply Mode.
-9. **`ai_trigger.py` dead code** + `ai_cmd.py` docstring pointing to it as
-   "primary", while the actual trigger handler is `ai_unified.py`.
-10. **`AGENTS.md` documents removed commands/save modes** (`.ping/.id/.help/
-    .save f/.save d/.preview/.send/.del/.organize/.bio/.username`,
-    `SV-NNNNNN`), none of which exist.
-11. **`run_startup_checks` dead code** (never called by `main.py` or supervisor).
-12. **`diagnostics.recover_stalled` dead code** (dormant second recovery path).
-13. **`tg_retry.tg_rpc` dead code** (zero callers).
-14. **`operation_watchdog.bounded_operation` / `attach_task` dead code and
-    non-functional as a timeout** (no internal timer; only `guarded_await` is
-    used).
-15. **Second SessionManager singleton** in `session_manager.py` module-level
-    API is unused (dormant divergent session store).
-16. **Bio/Username service duplication** remains (only the engine/scheduler
-    layer was consolidated; `bio_service` and `username_service` are
-    near-verbatim mirrors).
+`backend/db/client.py` uses a singleton Supabase client when URL/service-role configuration is available and an in-memory fallback otherwise. Public database calls are async wrappers around synchronous Supabase work through `asyncio.to_thread()` with a 10-second database timeout.
+
+`get_next_save_code()` uses `_save_code_lock` and generates the current short `S####` style code, with collision handling. Writes are performed after successful Telegram upload; a database failure can leave the uploaded Saved Messages message present without a complete database record, and the service reports this honestly.
+
+### 6.4 Save limitations
+
+- Supabase-unavailable fallback is process-memory-only and is lost on restart.
+- A successful upload followed by DB failure can produce an orphaned Saved Messages asset; the result reports the partial state, but automatic reconciliation is a management concern.
+- Media transfer remains intentionally long-running; end-to-end production timing under large files is **UNKNOWN**.
+- The old `README.md` feature/command sections contain stale legacy references to Forward Save and dot commands even though current source/AGENTS rules describe Deep Save only. `remote_readme.md` is older still and should not be treated as current behavior.
 
 ---
 
-## 9. LIKELY RISKS
+## 7. PROFILE ARCHITECTURE
 
-Strongly supported by source but not proven as an active failure in production:
+### 7.1 Shared engine
 
-1. **Reconnect churn is the intermittent freeze/sleep driver** (defects 3–6
-   interact). Not live-proven without Render logs.
-2. **AI Save cannot complete for media** (defect 7 + 60 s handler timeout).
-3. **AI handler drift** between `ai_cmd`/`ai_unified` duplicated logic.
-4. **Per-callback hang** in the helper bot (no per-callback timeout) when a
-   panel/action performs a slow RPC.
+`backend/profile/engine.py::ProfileEngine` is parameterized by the Telegram field and state keys.
 
----
+- Bio wrapper updates Telegram `about`, persists `bio_state.last_bio`.
+- Username wrapper updates Telegram `first_name`, persists `username_state.last_name`.
 
-## 10. RULED OUT
+Wrappers:
 
-Explicitly investigated and not supported by source:
+- `backend/bio/engine.py`
+- `backend/username/engine.py`
 
-- Supabase / synchronous HTTP blocking the event loop (`to_thread` + timeout).
-- Sync AI HTTP (`httpx.AsyncClient`).
-- Silent process death with no diagnostics (crash diagnostics + exit reasons).
-- `recover_stalled` acting as an active second supervisor (no callers).
-- Deep Save falling back to forwarding (no forward in the Save path).
-- `BytesIO` leak in Deep Save (file-based temp storage).
-- Metadata persisted before upload (insert is last).
-- Blanket Deep Save timeout at the service layer (the service is unbounded;
-  timeouts are at the entry points).
-- `target_context` orphaned (used by delete + misc).
-- `.bio`/`.username`/`.save` dot commands existing (they don't).
+Services:
 
----
+- `backend/services/bio_service.py`
+- `backend/services/username_service.py`
 
-## 11. UNKNOWN / MISSING EVIDENCE
+### 7.2 Shared scheduler
 
-- Actual production env (`BOT_TOKEN` set or not) — determines whether the
-  `READY_BUT_DISCONNECTED` false positive fires every 30 s in production.
-- Live Render logs at freeze time — needed to prove which reconnect trigger
-  fired first and to distinguish "process dead" from "loop blocked" from
-  "reconnect churn".
-- Whether any Telethon RPC outside `wait_for`/`guarded_await` can block
-  indefinitely (e.g. `reply_msg.get_sender()` in `_resolve_sender`, `get_chat`
-  in AI reply extraction) — no live thread dump available.
-- Live Telegram behavior for protected/self-destructing media.
-- Whether `ProviderManager.vision`/`stream` are reachable (they appear dormant
-  but are inconsistent with async providers).
+`backend/profile/scheduler.py` is one minute-boundary scheduler. It registers independent updaters, tracks each engine’s active flag, collects updates, and sends one profile update where possible. `stop_if_idle()` stops only when neither engine is active.
+
+The scheduler uses a bounded Telegram API timeout, retry/backoff handling, timezone conversion, FloodWait handling, supervised task creation, and cancellation cleanup.
+
+**CONFIRMED:** turning Bio off is not supposed to stop Username, and vice versa.
+
+### 7.3 Current profile behavior
+
+Bio supports template/text/mood/state operations. Username uses the same generalized shape but writes `first_name`, not Telegram’s real `@username`. The AI account/status tools distinguish casual “username/account name” requests from explicitly qualified real Telegram `@username` requests. `AccountShowTool` allows only `first_name`, `last_name`, `full_name`, and `username`, and excludes phone/session/credential fields.
+
+The future idea of dynamic Bio mood/text changes and first-name mode changes is not a completed feature. Current source has template, mood, text, and periodic updater primitives, but it does not prove the requested future policy that First Name must change only the mood/mode component while never changing its text component.
+
+**Status:** current Bio/First Name engines are implemented; future dynamic policy is **MISSING/FUTURE**, not a regression.
 
 ---
 
-## 12. EXACT FILES
+## 8. DATABASE / MANAGEMENT TOOLS
 
-Runtime / lifecycle:
+### 8.1 Core database layer
+
+`backend/db/client.py` provides Supabase-or-memory CRUD for saved items, Bio state, Username state, bot logs, and related settings. Heavy synchronous calls are moved to a worker thread with bounded timeout. The backend uses service-role writes; the dashboard reads through backend API routes.
+
+`backend/ai/persistence.py`, `backend/ai/config_store.py`, and `backend/ai/database/` provide AI persistence/config/repository interfaces with in-memory fallbacks. The repository contains schema references and migrations for core data; whether every documented AI table is applied to the user’s live Supabase project is **UNKNOWN** and must not be changed by an agent.
+
+### 8.2 Management/service inventory
+
+| Capability | Source | State | Evidence |
+|---|---|---|---|
+| List saved items | `discover_service.do_list`, `ListSavesTool` | IMPLEMENTED | Uses DB list path and bounded result formatting. |
+| Search saved items | `discover_service.do_find`, `SearchTool` | IMPLEMENTED | Searches saved metadata/caption fields through DB layer. |
+| Retrieve/preview saved item | `retrieve_service.do_preview`, `do_retrieve` | IMPLEMENTED | Preview and resend paths exist; resend uses Telegram forwarding for retrieval. |
+| Rename saved item | `retrieve_service.do_rename` | PARTIALLY IMPLEMENTED | Service exists; AI registration for this management action is not present in the current tool registry. |
+| Move saved item | `retrieve_service.do_move` | PARTIALLY IMPLEMENTED | Service exists; current AI tool registry does not expose a corresponding tool. |
+| Delete saved item record/asset | `retrieve_service.do_delete`, DB delete functions | IMPLEMENTED via service/UI | AI exposure is not the same as chat-message Delete and is not a general arbitrary DB delete. |
+| Database statistics | `database_service.do_stats`, `DatabaseStatsTool` | IMPLEMENTED | Read-only status path. |
+| Orphan cleanup | `database_service.find_orphans`, `do_clean`, `OrganizeCleanTool`/Glass UI paths | PARTIALLY IMPLEMENTED | Service/UI capability exists; exact live Telegram-vs-DB reconciliation behavior needs deployment validation. |
+| Vacuum/maintenance | `database_service.do_vacuum` | IMPLEMENTED in service/UI scope | Not exposed as a separate current AI tool in `ToolRegistry`. |
+| Panel/settings management | `settings_service`, `SettingsGetTool`, `SettingsSetTool` | IMPLEMENTED | Typed settings validation/cache path exists. |
+| Bio/Username state | Profile services and tools | IMPLEMENTED | State reads and mutating tools exist. |
+| Arbitrary SQL execution | None | MISSING by design | No AI SQL executor is registered; agents must not add one or touch user Supabase directly. |
+
+### 8.3 Database constraints for future agents
+
+No investigation or execution agent may run SQL against the user’s Supabase project, alter migrations, or introduce an AI SQL tool as a convenience. A schema requirement must be documented and handed to the user for manual application.
+
+---
+
+## 9. RUNTIME / RELIABILITY
+
+### 9.1 Active long-lived tasks
+
+The current runtime intentionally has long-lived asyncio tasks:
+
+- Telethon self-client run loop.
+- Optional helper-client run loop.
+- FastAPI/Uvicorn server.
+- Heartbeat every 30 seconds.
+- Keepalive every 60 seconds.
+- Failsafe monitor every 15 seconds.
+- Diagnostics/task snapshot loop.
+- Memory cleanup worker.
+- Shared profile scheduler when Bio or Username is active.
+- Helper panel/watchdog tasks when helper UI is enabled.
+
+Long-lived `await` points in Telethon/Uvicorn/task-guard stack traces are not by themselves failures. They are expected for these workers.
+
+### 9.2 Current heartbeat behavior
+
+`backend/runtime/heartbeat.py` records structured runtime snapshots and checks real invariants. Current source explicitly handles helper state:
+
+- Self disconnected while READY is a recovery condition.
+- Helper disconnected is a recovery condition only when `helper_enabled` is true.
+- Disabled helper (`helper_enabled=False`) is valid.
+- A quiet account with no incoming updates/callbacks is not automatically treated as a dispatch stall when there is no evidence that updates are arriving.
+
+This contradicts the old investigation’s claim that a disabled helper or idle account necessarily causes reconnect churn. That old claim is obsolete at `767b32b`.
+
+### 9.3 Keepalive and failsafe
+
+Keepalive probes `client.get_me()` under a 15-second wait and requests supervisor recovery on failure. Failsafe checks loop progress, heartbeat, update, and RPC signals. It calls `guarded_create_task()` for hard reset; the current import exists, so the old missing-import `NameError` finding is obsolete.
+
+### 9.4 Dormant paths
+
+**CONFIRMED:** `RuntimeSupervisor._watchdog_loop()` remains defined but is not started by `start()`. It contains additional stale-loop/RPC/helper/memory checks, but current runtime startup starts heartbeat/keepalive/failsafe/diagnostics instead.
+
+**CONFIRMED:** `runtime/startup_check.py::run_startup_checks()` is defined but is not part of the normal `main()`/`RuntimeSupervisor.start()` path.
+
+**CONFIRMED:** `backend/runtime/tg_retry.py::tg_rpc()` is a tested helper with no production caller in the current Telegram API path; active bounded RPC calls use `helper/rpc_timeout.py::rpc_await()` or `operation_watchdog.guarded_await()`.
+
+**CONFIRMED:** `operation_watchdog.bounded_operation` is defined and documented, but the current production code primarily uses `guarded_await`; a source grep does not prove `bounded_operation` is an active protection layer.
+
+These are dormant/duplicated-looking paths, not evidence that the runtime currently runs two supervisors.
+
+### 9.5 Lock and task observations
+
+- `_recovery_lock` serializes recovery transitions.
+- Task guards name and supervise long-lived/background tasks.
+- AI concurrency is bounded by a semaphore, default 4, with a bounded acquire wait.
+- Tool execution is sequential within a turn and capped at five calls.
+- Supabase sync calls are moved through `asyncio.to_thread()` and bounded.
+- Provider requests use async HTTP and bounded waits.
+
+**LIKELY risk:** the dormant watchdog and duplicated runtime helper modules increase maintenance and observability ambiguity. Re-activating a dormant loop without reconciling ownership would risk a second recovery authority, so this requires a deliberate follow-up rather than an opportunistic change.
+
+### 9.6 Production evidence boundary
+
+The recorded Delete production trace showed the runtime READY and connected while `ToolExecutor` timed out. Current source and tests address the Delete boundary, but no current live trace was available during this investigation. Whether production has additional Telethon cancellation/socket behavior beyond the mocked tests is **UNKNOWN**.
+
+---
+
+## 10. SECURITY
+
+### 10.1 Owner access
+
+Current handlers are outgoing/self-bot handlers and use the centralized owner gate. Helper callbacks also receive owner/context checks through the helper lifecycle path. Non-owner events are intended to be silently ignored.
+
+### 10.2 Tool allowlist
+
+The AI can only call registered tools. Unknown tool names, malformed argument objects, unsupported action names, invalid counts, invalid fields, and unsupported targets do not reach Telegram.
+
+There is no registered arbitrary Telegram method executor, shell executor, file executor, or SQL executor.
+
+### 10.3 Delete security
+
+The Delete security invariant is execution-layer self ownership, not prompt/schema trust. The final gate requires server `out=True` plus sender ID equality with authenticated `get_me()` identity. AI-generated messages are not special-cased as foreign. Unknown ownership fails closed.
+
+This is the strongest confirmed security property in the current AI action layer.
+
+### 10.4 Retrieved-message prompt injection
+
+Telegram message text is passed as data to semantic/history tools and the prompt instructs the model not to follow embedded instructions. This reduces prompt-injection risk, but the model still chooses candidate IDs in the provider semantic path. The final Delete gate prevents foreign-message deletion even if the model is manipulated.
+
+For non-Delete read/write tools, prompt-injection resistance depends more heavily on schemas and service validation. A complete adversarial audit of every tool argument is **UNKNOWN**.
+
+### 10.5 Secrets and identity
+
+Tool contexts contain the Telegram client/facade, owner ID, timezone, chat/reply metadata, and request metadata. Provider keys, StringSession, API hash, Supabase service-role key, and other environment secrets are not intentionally injected into prompts or tool results. The account identity tool allowlist excludes phone/session/credential data.
+
+No secrets were read or logged during this investigation.
+
+---
+
+## 11. CONFIRMED FACTS
+
+1. Current HEAD is `767b32b` on `main`.
+2. The backend source tree is present and contains the Telethon/FastAPI/LifeOS implementation described by current source.
+3. `backend.main` is the backend entry point.
+4. `RuntimeSupervisor` owns the active runtime lifecycle and recovery transitions.
+5. `bot.router.register_all()` wires runtime hooks, Glass UI handlers, AI settings, and `ai_unified`.
+6. AI requests carry immutable chat/message/request context through `AIRequest`.
+7. The original Telegram request ID is captured before provider/config/status work.
+8. Provider output reaches a fixed ToolRegistry/ToolExecutor boundary before side effects.
+9. The provider manager uses capability filtering, scoring, bounded retry, cooldown, and quarantine.
+10. `dummy` is always registered as the terminal provider fallback.
+11. Delete has a final self-only verification chokepoint.
+12. Delete history scans are capped at 1,000 messages in the service selector.
+13. Delete verification/deletion is chunked at 100 IDs.
+14. Delete per-RPC work is guarded by a 5-second RPC timeout in the hardened service path.
+15. Delete has a 25-second operation deadline and a 30-second tool timeout.
+16. Current scoped Delete can include the active request when it is within scope.
+17. “Until this message” can use the original request as the boundary.
+18. Pure successful Delete does not send a replacement Telegram confirmation.
+19. AI-generated outgoing messages are eligible by actual Telegram ownership metadata.
+20. Direct semantic topic Delete can use a local self-only text filter.
+21. Provider-backed semantic Delete uses a bounded recent-message tool and final ID re-validation.
+22. Deep Save downloads and re-uploads a new Saved Messages message; Save does not use forwarding.
+23. Retrieval may use `forward_messages()` to resend a saved asset; this is not Forward Save.
+24. Bio and Username use one parameterized ProfileEngine and one shared scheduler.
+25. Username engine writes Telegram `first_name`, not the real `@username` field.
+26. Supabase access has in-memory fallback and bounded threaded sync calls.
+27. AI management does not include arbitrary SQL execution.
+28. The current heartbeat treats disabled helper and naturally quiet accounts more carefully than the old investigation claimed.
+29. The current failsafe imports `guarded_create_task`; the old missing-import claim is obsolete.
+30. `RuntimeSupervisor._watchdog_loop()` remains defined but is not started by `start()`.
+31. Recorded current test evidence is 519 repository tests passing, with 84 Delete-focused tests.
+32. Tests are mocked/unit-level and do not prove live Telegram behavior.
+
+---
+
+## 12. LIKELY FINDINGS / RISKS
+
+1. **LIKELY — semantic Delete is the main remaining user-visible AI gap.** The current implementation has bounded previews and local substring filtering, but no deep semantic index or structural-language resolver.
+2. **LIKELY — semantic requests can be provider-sensitive.** Ambiguous requests still rely on a tool-capable provider to inspect recent message previews and choose IDs.
+3. **LIKELY — `ListRecentMessagesTool` has weaker per-page RPC protection than the hardened Delete service selector.** It applies a message limit, but its direct `client.iter_messages()` loop does not visibly reuse `_iter_messages_bounded()`/`rpc_await()`.
+4. **LIKELY — legacy Delete-by-ID/panel paths do not share every scoped current-request semantic rule.** They still converge on ownership verification, but their candidate range and request inclusion behavior differ.
+5. **LIKELY — dormant watchdog/recovery code increases future regression risk.** It is not currently a second active supervisor, but it creates ambiguity about which checks are authoritative.
+6. **LIKELY — documentation drift will mislead future agents.** `remote_readme.md` is clearly older; parts of `README.md` still retain legacy command/feature text even though `AGENTS.md` and current handlers describe Glass UI/natural-language operation.
+7. **LIKELY — Supabase fallback can silently lose AI/panel persistence across process restarts.** This is intentional graceful degradation but should be visible in operational status.
+8. **LIKELY — a successful Telegram upload followed by DB failure can leave an asset without a complete saved-items row.** The Save service reports this state, but reconciliation is a management concern.
+
+---
+
+## 13. UNKNOWN / MISSING EVIDENCE
+
+1. Whether every configured production provider currently has a valid key, quota, and tool-capable model.
+2. Whether every production model override resolves to a live provider model after the latest external provider changes.
+3. Whether real Telegram cancellation always interrupts a stuck Telethon operation within the local `wait_for` deadline.
+4. Whether production semantic Delete failures are parser, retrieval, provider, or tool-execution failures without a request-specific trace.
+5. Whether the user’s actual two-English-word requirement means exactly two tokens, two-word substring, language detection, or a broader semantic category.
+6. Whether every documented Supabase AI migration has been applied to the user’s live project.
+7. Whether the dormant `_watchdog_loop` is intentionally retired or was accidentally omitted from startup.
+8. Whether legacy Glass UI Delete-by-ID paths should include the current request under every requested range semantics.
+9. Whether all helper callback authorization paths have been exercised against non-owner callback payloads in a live helper bot.
+10. Whether live Delete batching stays within Telegram FloodWait limits for the user’s actual chat volume.
+11. No live Telegram, Render, or Supabase environment test was run during this investigation.
+
+---
+
+## 14. EXACT FILES
+
+### Runtime and entry
+
 - `backend/main.py`
 - `backend/config.py`
+- `backend/bot/client.py`
+- `backend/bot/router.py`
 - `backend/runtime/supervisor.py`
 - `backend/runtime/heartbeat.py`
 - `backend/runtime/keepalive.py`
@@ -827,342 +802,602 @@ Runtime / lifecycle:
 - `backend/runtime/task_guard.py`
 - `backend/runtime/operation_watchdog.py`
 - `backend/runtime/tg_retry.py`
-- `backend/runtime/managed_task.py`
 - `backend/runtime/diagnostics.py`
-- `backend/runtime/crash_diagnostics.py`
-- `backend/runtime/memory_cleanup.py`
-- `backend/runtime/health_check.py`
-- `backend/runtime/startup_check.py`
-- `backend/runtime/states.py`
 - `backend/runtime/tracer.py`
 - `backend/health.py`
-- `backend/diagnostics.py`
-- `backend/bot/client.py`
-- `backend/helper/client.py`
-- `backend/helper/watchdog.py`
 - `backend/helper/rpc_timeout.py`
-- `backend/helper/lifecycle.py`
 
-Save:
-- `backend/services/save_service.py`
-- `backend/bot/handlers/save.py`
-- `backend/ai/tools/save.py`
-- `backend/telegram_api/api.py`
-- `backend/telegram_api/messages.py`
-- `backend/telegram_api/media.py`
-- `backend/telegram_api/entities.py`
-- `backend/telegram_api/_helpers.py`
-- `backend/db/client.py`
+### AI core
 
-AI:
+- `backend/ai/session/request.py`
 - `backend/ai/engine/engine.py`
 - `backend/ai/engine/dispatcher.py`
-- `backend/ai/providers/manager/manager.py`
-- `backend/ai/providers/gemini.py`
-- `backend/ai/providers/openai_compat.py`
-- `backend/ai/providers/dummy/provider.py`
+- `backend/ai/engine/result.py`
+- `backend/ai/actions.py`
+- `backend/ai/tools/base.py`
+- `backend/ai/tools/context.py`
 - `backend/ai/tools/registry.py`
 - `backend/ai/tools/executor.py`
-- `backend/ai/tools/context.py`
-- `backend/ai/tools/base.py`
-- `backend/ai/config_store.py`
-- `backend/ai/persistence.py`
-- `backend/ai/diagnostics.py`
-- `backend/ai/context/reply_resolver.py`
-- `backend/ai/session/request.py`
-- `backend/bot/handlers/ai.py`
-- `backend/bot/handlers/ai_cmd.py`
-- `backend/bot/handlers/ai_trigger.py`
-- `backend/bot/handlers/ai_unified.py`
+- `backend/ai/tools/delete.py`
+- `backend/ai/tools/semantic.py`
+- `backend/ai/tools/save.py`
+- `backend/ai/tools/retrieve.py`
+- `backend/ai/tools/database.py`
+- `backend/ai/tools/settings.py`
+- `backend/ai/tools/account.py`
+- `backend/ai/tools/bio.py`
+- `backend/ai/tools/username.py`
+- `backend/ai/tools/organize.py`
+- `backend/ai/tools/delivery.py`
+- `backend/ai/prompt/template.py`
+- `backend/ai/prompt/builder.py`
+- `backend/ai/prompt/serializer.py`
+- `backend/ai/prompt/formatter.py`
+- `backend/ai/prompt/validator.py`
+- `backend/ai/prompt/budget.py`
+- `backend/ai/conversation/context_builder.py`
+- `backend/ai/conversation/history.py`
+- `backend/ai/conversation/session.py`
+- `backend/ai/runtime/manager.py`
+- `backend/ai/runtime/session.py`
+- `backend/ai/memory/manager.py`
 
-Glass UI / handlers:
-- `backend/bot/router.py`
-- `backend/bot/handlers/misc.py`
-- `backend/bot/handlers/bio.py`
-- `backend/bot/handlers/username.py`
+### AI providers
+
+- `backend/ai/providers/factory.py`
+- `backend/ai/providers/registry/registry.py`
+- `backend/ai/providers/manager/manager.py`
+- `backend/ai/providers/manager/health.py`
+- `backend/ai/providers/manager/metrics.py`
+- `backend/ai/providers/manager/config_manager.py`
+- `backend/ai/providers/base/contract.py`
+- `backend/ai/providers/base/capabilities.py`
+- `backend/ai/providers/base/config.py`
+- `backend/ai/providers/base/exceptions.py`
+- `backend/ai/providers/openai_compat.py`
+- `backend/ai/providers/openai.py`
+- `backend/ai/providers/gemini.py`
+- `backend/ai/providers/groq.py`
+- `backend/ai/providers/openrouter.py`
+- `backend/ai/providers/cerebras.py`
+- `backend/ai/providers/mistral.py`
+- `backend/ai/providers/zai.py`
+- `backend/ai/providers/sambanova.py`
+- `backend/ai/providers/nvidia.py`
+- `backend/ai/providers/cohere.py`
+- `backend/ai/providers/siliconflow.py`
+- `backend/ai/providers/fireworks.py`
+- `backend/ai/providers/dummy/provider.py`
+- `backend/ai/config/env.py`
+- `backend/ai/config/defaults.py`
+- `backend/ai/config/manager.py`
+- `backend/ai/config/validation.py`
+- `backend/ai/config_store.py`
+
+### Handlers and Telegram facade
+
+- `backend/bot/handlers/guard.py`
+- `backend/bot/handlers/ai_unified.py`
+- `backend/bot/handlers/ai.py`
 - `backend/bot/handlers/delete.py`
+- `backend/bot/handlers/save.py`
 - `backend/bot/handlers/retrieve.py`
 - `backend/bot/handlers/discover.py`
 - `backend/bot/handlers/database.py`
-- `backend/bot/handlers/organize.py`
-- `backend/helper/panels.py`
-- `backend/helper/inline_engine.py`
-- `backend/helper/inline_sender.py`
-- `backend/helper/input_state.py`
-- `backend/helper/target_context.py`
-- `backend/helper/session_manager.py`
-- `backend/helper/panel_registry.py`
-- `backend/helper/panel_render.py`
-- `backend/helper/pagination.py`
+- `backend/bot/handlers/bio.py`
+- `backend/bot/handlers/username.py`
+- `backend/telegram_api/api.py`
+- `backend/telegram_api/messages.py`
+- `backend/telegram_api/media.py`
+- `backend/telegram_api/profile.py`
+- `backend/telegram_api/entities.py`
 
-Profile:
+### Services/profile/database
+
+- `backend/services/delete_service.py`
+- `backend/services/save_service.py`
+- `backend/services/retrieve_service.py`
+- `backend/services/discover_service.py`
+- `backend/services/database_service.py`
+- `backend/services/settings_service.py`
+- `backend/services/organize_service.py`
+- `backend/services/bio_service.py`
+- `backend/services/username_service.py`
 - `backend/profile/engine.py`
 - `backend/profile/scheduler.py`
 - `backend/bio/engine.py`
 - `backend/username/engine.py`
-- `backend/services/bio_service.py`
-- `backend/services/username_service.py`
+- `backend/db/client.py`
+- `backend/ai/persistence.py`
+- `backend/ai/database/manager.py`
 
-Web:
-- `backend/web/app.py`
+### Tests
 
-Docs (stale vs source):
-- `AGENTS.md` (documents removed commands/save modes)
+- `tests/test_17_providers.py`
+- `tests/test_18_ai_execution_agent.py`
+- `tests/test_19_ai_actions.py`
+- `tests/test_20_advanced_execution.py`
+- `tests/test_21_execution_status.py`
+- `tests/test_23_provider_mesh.py`
+- `tests/test_24_execution_reliability.py`
+- `tests/test_25_fast_path.py`
+- `tests/test_26_silent_delete.py`
+- `tests/test_27_delete_ownership.py`
+- `tests/test_28_delete_regression.py`
+- `tests/test_29_delete_expansion.py`
+- `tests/test_30_delete_timeout_hardening.py`
+- `tests/test_31_delete_rpc_failures.py`
+- `tests/test_12_save_engine.py`
+- `tests/test_15_bio_username.py`
+- `tests/test_03_database_consistency.py`
+- `tests/test_11_runtime_wiring.py`
+- `tests/test_22_reliability.py`
 
----
+### Documentation
 
-## 13. EXACT FUNCTIONS / CLASSES
-
-Runtime:
-- `RuntimeSupervisor` — `start`, `_build_and_register`, `_run_loop`,
-  `_trigger_reconnect`, `_trigger_full_recovery`, `_do_recovery`,
-  `_retry_full_recovery`, `_hard_reset_runtime`, `_verify_heartbeat`,
-  `_cancel_orphan_tasks`, `_watchdog_loop` (dormant), `stop`.
-- `heartbeat._heartbeat_loop` (false-positive reconnect triggers).
-- `keepalive._keepalive_loop`.
-- `failsafe._failsafe_loop` / `_all_frozen` (NameError bug).
-- `task_guard.guarded_create_task` / `immortal_create_task`.
-- `operation_watchdog.guarded_await` / `bounded_operation` / `attach_task`.
-- `tg_retry.tg_rpc` (dead).
-- `startup_check.run_startup_checks` (dead).
-- `diagnostics.recover_stalled` (dead).
-
-Save:
-- `save_service.execute_save`, `execute_link_save`, `build_caption`,
-  `_append_original_text`, `_extract_source_media`, `_extract_uploaded_metadata`,
-  `_upload_kwargs_for_media`, `parse_telegram_link`, `build_tags`,
-  `detect_media_type`, `extract_file_name`, `generate_filename`.
-- `save._save_reply_wait_handler`, `_save_link_input_handler`.
-- `ai.tools.save.SaveTool.execute`.
-
-AI:
-- `Engine`, `Dispatcher.dispatch`, `ProviderManager.chat/_try_fallback_chain/
-  _fallback`, `ToolExecutor.execute_calls/_execute_single`,
-  `create_default_registry`, `ToolContext`, `SaveTool.execute`.
-- `config_store.get_config/save_config/record_request/_is_missing_config_response`.
-- `ai_unified._execute_ai/_extract_reply_context/register`,
-  `ai_cmd.register`, `ai_trigger.register` (dead).
-
-Glass UI:
-- `panels._callback_router/_handle_panel/_handle_action/_handle_input/
-  _finalize_panel/register_panel/register_action/register_input`.
-- `inline_sender.send_inline_panel/register_input_listener/_input_listener`.
-- `lifecycle.PanelLifecycleManager.create_panel/try_reuse_panel/_cleanup_locked/
-  shutdown_all`.
-- `session_manager.SessionManager` + unused module-level `_manager`.
-- `input_state.set_pending/get_pending/clear_pending`.
-- `inline_engine.trigger/register_inline_handler`.
-
-Profile:
-- `ProfileEngine.render/updater/start_cron/stop_cron/is_running`.
-- `profile.scheduler._cron_loop/_collect_updates/register_updater/
-  set_engine_active/any_engine_active/stop_if_idle/stop_cron`.
-- `bio_service.*`, `username_service.*` (mirrors).
+- `AGENTS.md`
+- `README.md`
+- `remote_readme.md`
+- `AI_MASTER_DESIGN.md`
+- `DATABASE_ARCHITECTURE.md`
+- `OBSERVABILITY.md`
+- `PRODUCTION_CHECKLIST.md`
+- `PRODUCTION_VERIFICATION.md`
 
 ---
 
-## 14. COMPLETE EXECUTION PATHS
+## 15. EXACT FUNCTIONS / CLASSES
 
-### Runtime startup
+### Runtime
 
+- `main()`
+- `config.load()`
+- `build_client()`
+- `RuntimeSupervisor.start()`
+- `RuntimeSupervisor._build_and_register()`
+- `RuntimeSupervisor._run_loop()`
+- `RuntimeSupervisor._trigger_reconnect()`
+- `RuntimeSupervisor._trigger_full_recovery()`
+- `RuntimeSupervisor._hard_reset_runtime()`
+- `RuntimeSupervisor._watchdog_loop()`
+- `RuntimeSupervisor.stop()`
+- `_heartbeat_loop()`
+- `_keepalive_loop()`
+- `_failsafe_loop()`
+- `guarded_create_task()`
+- `immortal_create_task()`
+- `guarded_await()`
+- `rpc_await()`
+
+### AI and intent
+
+- `AIRequest`
+- `Engine.execute()`
+- `Dispatcher.execute()`
+- `Dispatcher._try_local_fast_path()`
+- `Dispatcher._apply_structured_action()`
+- `Dispatcher._build_context()`
+- `Dispatcher._build_tool_context()`
+- `Dispatcher._build_tool_definitions()`
+- `Dispatcher._build_continuation_messages()`
+- `parse_command_intent()`
+- `validate_action()`
+- `parse_action_text()`
+- `resolve_tool_calls()`
+- `ToolRegistry.register()`
+- `create_default_registry()`
+- `ToolExecutor.execute_calls()`
+- `ToolExecutor._execute_single()`
+- `deliver_response()`
+- `ai_unified.register()`
+- `ai_unified._execute_ai()`
+- `ai_unified._is_silent_delete()`
+
+### Providers
+
+- `ProviderFactory.create_registry()`
+- `ProviderFactory.create_manager()`
+- `ProviderRegistry.register()`
+- `ProviderRegistry.switch_provider()`
+- `ProviderManager.chat()`
+- `ProviderManager._ordered_candidates()`
+- `ProviderManager._skip_reason()`
+- `ProviderManager._score()`
+- `ProviderManager._call_once()`
+- `ProviderManager._attempt_with_retry()`
+- `ProviderManager._apply_failure()`
+- `ProviderHealthTracker.state()`
+- `ProviderHealthTracker.record_failure()`
+- `ProviderHealthTracker.record_success()`
+
+### Delete
+
+- `DeleteTool.execute()`
+- `DeleteRepliedTool.execute()`
+- `DeleteByIdTool.execute()`
+- `DeleteMessageByIdTool.execute()`
+- `ListRecentMessagesTool.execute()`
+- `DeleteMessagesByIdsTool.execute()`
+- `_telegram_rpc()`
+- `_iter_messages_bounded()`
+- `_resolve_me_id()`
+- `_is_self_owned()`
+- `delete_verified_self_messages()`
+- `_parse_cutoff()`
+- `select_self_owned_message_ids()`
+- `do_del_self_filtered()`
+- `do_del_self_last_n()`
+- `do_del_n_counts()`
+- `do_del_last_n_real()`
+- `do_del_id_counts()`
+
+### Save/profile/database
+
+- `execute_save()`
+- `execute_link_save()`
+- `get_next_save_code()`
+- `ProfileEngine`
+- `ProfileEngine.render()`
+- `ProfileEngine.updater()`
+- `ProfileEngine.start_cron()`
+- `ProfileEngine.stop_cron()`
+- `profile.scheduler._cron_loop()`
+- `profile.scheduler.stop_if_idle()`
+- `database_service.find_orphans()`
+- `database_service.do_clean()`
+- `database_service.do_stats()`
+- `database_service.do_vacuum()`
+- `discover_service.do_list()`
+- `discover_service.do_find()`
+- `retrieve_service.do_preview()`
+- `retrieve_service.do_retrieve()`
+
+---
+
+## 16. EXECUTION PATH DIAGRAMS
+
+### 16.1 Normal deterministic AI action
+
+```text
+Telegram outgoing message
+  → ai_unified trigger/reply decision
+  → capture event.chat_id + event.message.id
+  → AIRequest
+  → Dispatcher conversation/context setup
+  → parse_command_intent(original text)
+  → local fast path when high-confidence
+  → ToolExecutor
+  → registered Tool.execute()
+  → service layer
+  → TelegramAPI/client or DB
+  → ToolResult
+  → EngineResult
+  → edit-in-place or silent delete
 ```
-main.main()
-  → cfg_module.load()
-  → install_crash_diagnostics()
-  → RuntimeSupervisor(cfg).start()
-      → settings_service.load_all()
-      → _build_and_register()          # build_client → register_all → _wire_ai_tools
-      → _start_helper()                # if BOT_TOKEN
-      → _resume_bio_cron() / _resume_username_cron()
-      → _start_web_server()            # uvicorn Server.serve()
-      → start_heartbeat(); start_keepalive(); start_failsafe(); start_diagnostics()
-      → _run_task = immortal_create_task(_run_loop)
-      → start_memory_cleanup()
-  → shutdown_event.wait() → stop()
+
+### 16.2 Provider-native action
+
+```text
+AIRequest
+  → prompt builder + tool schemas
+  → ProviderManager capability-aware routing
+  → provider chat/function call
+  → normalized tool call
+  → ToolExecutor validation/permission/timeout
+  → service/tool execution
+  → continuation provider round only when needed
+  → real result summary
+  → delivery
 ```
 
-### Reconnect false positive (the suspected freeze loop)
+### 16.3 Delete scope
 
-```
-heartbeat._heartbeat_loop (30s)
-  → READY && (not self_connected or not helper_connected)   # helper disabled → true
-     → guarded_create_task(supervisor._trigger_reconnect)
-  → or UPDATE_PIPELINE_STALLED / CALLBACK_DISPATCH_STALLED  # idle account → true
-     → guarded_create_task(supervisor._trigger_reconnect)
-
-_trigger_reconnect()
-  → client.disconnect()               # makes run_until_disconnected() return
-  → client.connect()
-  → is_user_authorized()
-  → success → NO cooldown → next heartbeat can repeat it
-```
-
-### Deep Save (Glass UI)
-
-```
-.menu → inline menu panel → Save → Deep Save → Reply Mode
-  → set_pending(owner, "save_reply", _save_reply_wait_handler, chat, ...)
-  → owner replies
-  → inline_sender._input_listener (60s wait_for)
-      → _save_reply_wait_handler
-          → reply_msg = get_messages(chat, reply_id)
-          → target = get_messages(chat, reply_msg.reply_to_msg_id)
-          → save_service.execute_save(client, owner, target, tz)
-              → get_next_save_code()
-              → text? send_message("me", caption)
-              → media? mkdtemp → download_media → validate → send_file
-              → finally rmtree
-              → insert_save(payload)   # AFTER upload
+```text
+Delete natural language
+  → parser/provider structured action
+  → DeleteTool(mode/count/time/boundary/query)
+  → bounded real Telegram history
+  → self-owned candidate selection
+  → final re-fetch per candidate batch
+  → out=True + sender_id == authenticated self ID
+  → delete_messages in batches of 100
+  → ToolResult
+  → no visible success message
 ```
 
-### AI trigger
+### 16.4 Semantic Delete
 
-```
-outgoing message (first word == trigger)
-  → ai_unified._execute_ai
-      → _restore_config (get_config → apply_runtime_selection)
-      → engine.execute(request) [wait_for 60s]
-          → Dispatcher.dispatch
-              → ConversationManager session/history
-              → PromptBuilder
-              → ProviderManager.chat [guarded_await 30s]
-              → tool loop (≤3 rounds, ≤5 tools, each tool wait_for 10s)
-          → EngineResult
-      → record_request(last_request_at/last_latency_ms)
-      → deliver_response (edit-in-place / chunked)
-      → ReplyResolver.register
+```text
+semantic text request
+  → direct local query OR provider semantic path
+  → bounded current-chat message window
+  → content/relevance interpretation
+  → concrete IDs
+  → final ownership re-fetch
+  → self-only delete
 ```
 
-### Profile (Bio + Username shared scheduler)
+### 16.5 Save
 
+```text
+reply/source message
+  → Deep Save service
+  → download media if present
+  → validate local file
+  → send_file as NEW Saved Messages message
+  → extract uploaded metadata
+  → insert saved_items
+  → honest result/edit
 ```
-bio_service.do_on / username_service.do_on
-  → db update is_active=True
-  → ProfileEngine.start_cron
-      → profile.scheduler.set_engine_active(name, True)
-      → profile.scheduler.start_cron  (single "lifeos-profile-scheduler" task)
-  → each minute _cron_loop
-      → _collect_updates (bio.updater + username.updater)
-      → client(UpdateProfileRequest(**merged))  [wait_for 30s]
-      → _record_update_telemetry (about→bio, first_name→username)
 
-bio_service.do_off / username_service.do_off
-  → db update is_active=False
-  → ProfileEngine.stop_cron
-      → set_engine_active(name, False)
-      → stop_if_idle()  # cancels scheduler only when NEITHER engine active
+### 16.6 Runtime startup/recovery
+
+```text
+main
+  → config/crash hooks
+  → RuntimeSupervisor.start
+  → build/register self client
+  → optional helper
+  → profile resume
+  → web server
+  → heartbeat/keepalive/failsafe/diagnostics
+  → supervised Telethon run loop
+  → shutdown or bounded recovery ladder
 ```
 
 ---
 
-## 15. RECOMMENDED FIX SURFACE
+## 17. COMPLETED WORK
 
-Recommendations only — not implemented in this investigation.
+The following is genuinely implemented in current source and supported by current tests/source inspection:
 
-**High priority (runtime stability):**
-1. Fix `failsafe.py` — import `guarded_create_task` (or use
-   `immortal_create_task`) so the hard reset can actually run.
-2. Gate `READY_BUT_DISCONNECTED` on `supervisor.helper_enabled` — do not require
-   `helper_connected=True` when the helper bot is disabled.
-3. Stop treating idle as stalled — only emit `UPDATE_PIPELINE_STALLED` /
-   `CALLBACK_DISPATCH_STALLED` when there is actual evidence the pipeline is
-   stuck (e.g. update queue growing while RPC is healthy), not merely "no
-   updates for 90 s".
-4. Add a post-success cooldown (or a minimum interval) to
-   `_trigger_reconnect` so a lightweight reconnect cannot be re-triggered every
-   30–60 s.
-5. Unify connection ownership — make either `_run_loop` or the reconnect path
-   the single driver of `client.connect()/disconnect()`, and serialize them
-   (the recovery lock already exists; ensure the run loop respects it).
-6. Either wire or delete `supervisor._watchdog_loop`, `startup_check`, and
-   `diagnostics.recover_stalled` to remove dormant recovery/validation paths.
-
-**High priority (Save/AI timeouts):**
-7. Remove the blanket 10 s `ToolExecutor` timeout for the Save tool (use a
-   media budget / progress-based guard, or no timeout for `save`). Never a
-   blanket timeout on large transfers.
-8. Remove or raise the 60 s `_input_listener` timeout for the Save reply mode
-   (or make it configurable per input), so large downloads/uploads are not
-   cancelled.
-9. Consider a bounded-but-generous media transfer budget only if live logs prove
-   a stuck transfer; never a blanket save timeout.
-
-**Medium priority (consolidation / drift):**
-10. Consolidate the duplicated AI handler logic (`ai_cmd` vs `ai_unified`) and
-    remove/register `ai_trigger.py` explicitly.
-11. Update `AGENTS.md` (and `retrieve.py` docstring) to reflect the Glass-UI-only
-    command model and Deep-Save-only Save model + short save codes.
-12. Consider consolidating the near-verbatim `bio_service`/`username_service`
-    duplication (mirrors the already-consolidated `ProfileEngine`).
-
-**Low priority:**
-13. Remove/repurpose the dormant second `SessionManager` module-level API and
-    the non-functional `bounded_operation` context manager / `tg_rpc` dead code.
+- Telethon StringSession self-client startup and owner gating.
+- Glass UI panel/action/input architecture.
+- Optional helper bot with fallback behavior.
+- Deep Save download/re-upload pipeline.
+- Save-by-link routing through Deep Save.
+- Supabase-or-memory core persistence.
+- Shared Bio/First Name ProfileEngine and scheduler.
+- Natural-language AI trigger/reply activation.
+- Immutable request context with original Telegram message ID.
+- Provider abstraction with capability-aware routing and fallback health state.
+- Native tool registry and controlled ToolExecutor.
+- Deterministic Persian/English action parsing for supported scopes.
+- Self-only Delete enforcement at final execution boundary.
+- AI-generated outgoing message eligibility for Delete.
+- Delete all/time/boundary/last-N/filter scope foundation.
+- Delete history/RPC bounds and chunked deletion.
+- Bounded Delete partial-failure result handling.
+- Silent successful pure Delete delivery.
+- Saved-item list/search/status tools.
+- Database status and profile status tools.
+- Account identity field allowlist and first-name/real-username distinction.
+- Structured AI/provider/runtime diagnostics.
+- Focused Delete/provider/execution regression test coverage.
 
 ---
 
-## 16. REMAINING WORK
+## 18. REMAINING WORK
 
-**High priority**
-- Failsafe hard-reset NameError (blocks last-resort recovery).
-- Heartbeat false-positive reconnect triggers (helper-disabled + idle = stalled).
-- Reconnect cooldown + connection-ownership race.
-- AI/Glass entry-point blanket timeouts on Deep Save.
+### Highest-impact behavior
 
-**Medium priority**
-- AI handler consolidation / `ai_trigger` dead-code cleanup.
-- `AGENTS.md` documentation refresh.
-- Bio/Username service consolidation.
+- Complete semantic Delete for structural and natural content predicates, including multilingual normalization, exact token/word-count predicates, and clearly defined bounded search scope.
+- Decide whether provider-backed semantic selection is acceptable or whether a deterministic local matcher should cover more query classes.
+- Strengthen `ListRecentMessagesTool` RPC/time bounds to match the hardened Delete service path.
+- Audit every legacy Delete UI/ID path for consistent request-anchor/current-request semantics.
 
-**Low priority**
-- Dead-code cleanup: `supervisor._watchdog_loop`, `startup_check`,
-  `recover_stalled`, `tg_rpc`, `bounded_operation`, module-level SessionManager.
+### Reliability
 
-**Validation-only**
-- Confirm no regression in the 19 Bio/Username tests after any scheduler change.
-- Confirm Save/AI timeout changes do not regress the save-engine and tool tests.
+- Decide the status of the dormant `RuntimeSupervisor._watchdog_loop()` and either formally retire/document it or deliberately integrate its checks through the single supervisor authority.
+- Add runtime integration tests for actual startup task inventory, recovery lock behavior, and monitor lifecycle.
+- Validate live Telegram RPC cancellation/FloodWait behavior under safe staging conditions.
 
-**Unknown / blocking**
-- Production env values and live Render logs needed to prove the freeze
-  mechanism end-to-end.
+### Providers
 
----
+- Validate configured production provider/model combinations using the existing model-test/status surface.
+- Keep provider-specific capability and model defaults synchronized with live upstream availability.
+- Add production-like tests for provider matrix behavior when all tool-capable providers are unavailable.
 
-## 17. VALIDATION PLAN
+### Persistence/management
 
-After any future fix, perform (in order):
+- Document the exact migration status of AI tables without executing database changes.
+- Improve visibility of in-memory fallback and upload-with-DB-failure states.
+- Decide which service-level management operations should become AI tools; do not expose SQL.
 
-1. **Compile check** — `python -m py_compile` on every modified file.
-2. **Unit/regression tests** —
-   - `tests/test_15_bio_username.py` (shared scheduler both directions:
-     Bio OFF while Username active; Username OFF while Bio active).
-   - `tests/test_12_save_engine.py` (Deep Save download → upload, no forward).
-   - `tests/test_10_tool_calls.py`, `tests/test_14_tool_honesty_glass.py`
-     (tool timeouts / honesty).
-   - `tests/test_11_runtime_wiring.py`, `tests/test_07_diagnostics.py`,
-     `tests/test_08_observability.py` (runtime wiring / observability).
-3. **Full suite** — `python -m pytest -q`.
-4. **Source verification** — grep for:
-   - `forward_messages`/`ForwardMessagesRequest` in the Save path (must be absent).
-   - `guarded_create_task` in `failsafe.py` (must be imported after fix).
-   - heartbeat gating on `helper_enabled`.
-   - no `TOOL_TIMEOUT_SECONDS` blanket on `save`.
-5. **Remote verification** — commit + push; confirm `origin/main` contains the fix.
-6. **Live Telegram verification** — only when a real session/credentials exist:
-   - Helper-disabled idle soak (>5 min) with no reconnect logs.
-   - Bio OFF while Username active (and inverse) with per-minute first_name
-     updates continuing.
-   - A >60 s large Deep Save through Reply Mode completing without cancellation.
+### Documentation
+
+- Reconcile stale command/feature sections in `README.md` and `remote_readme.md` with current source.
+- Keep `AGENTS.md`, README, and investigation reports aligned when architecture changes.
+
+### Future profile automation
+
+- No implementation now. Future work must define how dynamic mood/text changes preserve the existing Bio template and how Username/First Name changes preserve the immutable text component.
 
 ---
 
-## 18. VERIFICATION LEVELS
+## 19. RECOMMENDED NEXT TASK
 
-| Level | Meaning | Used here |
-|---|---|---|
-| SOURCE VERIFIED | Read actual code; direct evidence cited | ✅ this entire report |
-| TEST VERIFIED | Test suite actually executed | ❌ not run for this investigation |
-| REMOTE VERIFIED | `origin/main` confirmed to contain the change | ❌ (no code change made) |
-| LIVE TELEGRAM VERIFIED | Real session/credentials exercised | ❌ not available |
+### NEXT TASK: Finish bounded semantic Delete resolution for real Telegram history
 
-Do not claim a higher verification level than actually performed.
+Implement one focused semantic-Delete slice, without changing Save, Profile, UI, provider architecture, or database architecture:
+
+1. Define the supported semantic predicates precisely, beginning with topic matching and “exactly N words / English words.”
+2. Retrieve a bounded current-chat window through one RPC-bounded path.
+3. Normalize Persian/English text deterministically before matching.
+4. Apply relevance/content predicates only to messages in the current chat.
+5. Filter to self-owned Telegram messages before candidates reach deletion.
+6. Preserve the current request ID and anchor semantics.
+7. Keep `delete_verified_self_messages()` as the final authority.
+8. Return controlled empty/provider-failure results without waiting for an unbounded provider round.
+
+This should happen before profile automation or additional management features because it addresses the clearest remaining user-visible AI failure while reusing the already-working security, batching, timeout, and silent-delivery foundation. Do not solve it by adding arbitrary model autonomy or by weakening the self-only execution boundary.
+
+The next task must not reactivate `_watchdog_loop()` incidentally. Runtime monitor reconciliation should follow as a separate, explicitly scoped reliability task.
+
+---
+
+## 20. VALIDATION PLAN
+
+For the recommended semantic Delete task:
+
+### Parser/action tests
+
+- Persian topic Delete with informal spelling and mixed Persian/English.
+- English topic Delete.
+- Exact two-word and exact N-word predicates.
+- Time + topic combination.
+- N + topic combination.
+- Boundary + topic combination.
+- Unsupported/ambiguous wording returns controlled clarification rather than guessed deletion.
+
+### Retrieval/context tests
+
+- Current chat ID is used; another chat is never searched.
+- Retrieval is capped.
+- Every history page/RPC has a timeout.
+- Current request ID is captured before any provider/status edit.
+- Provider output cannot replace the original anchor.
+- Message previews are bounded and do not expose unnecessary content in logs.
+
+### Security tests
+
+- Self-authored manual message selected.
+- AI-authored self message selected.
+- Foreign user message excluded.
+- Bot/admin/system message excluded.
+- Unknown sender/account identity fails closed.
+- Model-supplied foreign ID is rejected by final verification.
+- Mixed candidate set reaches Telegram deletion only with verified self IDs.
+
+### Execution/reliability tests
+
+- Normal semantic Delete completes under the bounded tool deadline.
+- Hanging history page returns a controlled timeout.
+- Provider unavailable does not block deterministic semantic predicates.
+- Provider-backed semantic failure is reported as controlled failure, not a misleading timeout.
+- Large candidate sets are chunked and do not create untracked background tasks.
+- Partial batch failure returns deterministic deleted/rejected state and does not repeat successful batches blindly.
+- Repeated requests do not duplicate deletion or provider tool execution.
+
+### Silent delivery tests
+
+- Successful pure Delete produces no Telegram reply/send.
+- Deleting the request message does not create a replacement “Deleted” message.
+- Failed Delete remains visible as an edited controlled error.
+
+### Regression suites
+
+Run at minimum:
+
+```text
+.venv/bin/python -m pytest tests/test_19_ai_actions.py -q
+.venv/bin/python -m pytest tests/test_23_provider_mesh.py tests/test_24_execution_reliability.py tests/test_25_fast_path.py -q
+.venv/bin/python -m pytest tests/test_26_silent_delete.py tests/test_27_delete_ownership.py tests/test_28_delete_regression.py tests/test_29_delete_expansion.py tests/test_30_delete_timeout_hardening.py tests/test_31_delete_rpc_failures.py -q
+.venv/bin/python -m pytest tests/test_12_save_engine.py tests/test_15_bio_username.py tests/test_03_database_consistency.py -q
+.venv/bin/python -m pytest tests/ -q
+```
+
+Source-level checks:
+
+- `git diff --check`.
+- Confirm only intended Delete/semantic files change.
+- Confirm no secrets are present.
+- Confirm no SQL/Supabase mutations were introduced.
+- Confirm `HEAD` and `origin/main` only after explicit delivery.
+
+Live verification remains separate and must use a controlled test chat with known self/foreign messages. Mocked tests must never be reported as proof of live Telegram reliability.
+
+---
+
+## 21. HANDOFF FOR EXECUTION AGENT
+
+### Known root causes / current state
+
+- The historical Delete timeout came from unbounded or insufficiently guarded Telegram history/RPC work running inside the generic tool deadline. Current code adds service-level RPC guards, scan/batch bounds, a Delete-specific operation deadline, and partial-failure handling. Do not restore the old unbounded path.
+- Current scoped Delete can include the active request message when it is inside the requested range. Do not reintroduce a blanket request exclusion.
+- “Until this message” must use the original request ID captured before provider/status work. Do not derive the anchor from an AI response.
+- Self-only deletion is enforced in `delete_verified_self_messages()`. Never move security into prompt text, parser-only checks, or a generic permission layer.
+- AI-generated messages are normal self-account outgoing Telegram messages and must remain eligible.
+- Direct semantic topic Delete can run locally; ambiguous semantic search uses bounded history plus provider-selected concrete IDs. The remaining gap is deeper deterministic semantic matching, not ownership.
+
+### Exact implementation surface
+
+Primary files:
+
+- `backend/ai/actions.py`
+  - `parse_command_intent()`
+  - `_is_semantic_delete()`
+  - `_extract_semantic_query()`
+  - time/count/boundary parsing helpers
+  - `validate_action()` / `resolve_tool_calls()`
+- `backend/ai/engine/dispatcher.py`
+  - `_try_local_fast_path()`
+  - `_build_tool_context()`
+  - structured action/provider tool loop
+- `backend/ai/tools/delete.py`
+  - `DeleteTool.execute()`
+  - `ListRecentMessagesTool`
+  - `DeleteMessagesByIdsTool`
+- `backend/ai/tools/semantic.py`
+  - bounded recent-message preview path
+- `backend/services/delete_service.py`
+  - `_iter_messages_bounded()`
+  - `_parse_cutoff()`
+  - `select_self_owned_message_ids()`
+  - `delete_verified_self_messages()`
+- `backend/bot/handlers/ai_unified.py`
+  - `_execute_ai()` request capture
+  - `_is_silent_delete()` and silent delivery
+
+Focused test files to extend:
+
+- `tests/test_19_ai_actions.py`
+- `tests/test_25_fast_path.py`
+- `tests/test_26_silent_delete.py`
+- `tests/test_27_delete_ownership.py`
+- `tests/test_28_delete_regression.py`
+- `tests/test_29_delete_expansion.py`
+- `tests/test_30_delete_timeout_hardening.py`
+- `tests/test_31_delete_rpc_failures.py`
+
+### Desired behavior
+
+```text
+natural Persian/English request
+  → deterministic structured Delete intent where possible
+  → bounded current-chat retrieval
+  → semantic/content predicate
+  → self-owned filter
+  → final Telegram re-fetch and ownership verification
+  → bounded chunked deletion
+  → honest ToolResult
+  → silent success
+```
+
+For unsupported semantic structures, return a safe controlled result or clarification. Never guess a broad deletion range.
+
+### Constraints
+
+- Investigation-only work is complete; the next agent may implement only the separately approved semantic Delete task.
+- Do not modify Save, Bio, Username, provider routing, fallback architecture, Supabase schema, UI, buttons, or runtime supervisor as part of semantic Delete.
+- Do not add SQL or execute Supabase operations.
+- Do not add arbitrary Telegram method execution.
+- Do not weaken self-only deletion.
+- Do not create background deletion tasks that outlive the request.
+- Do not use unbounded `iter_messages()` for destructive selection.
+- Do not log message contents, session strings, phone numbers, API keys, or database secrets.
+- Preserve silent successful Delete behavior.
+
+### Required validation
+
+- Focused semantic/Delete tests first.
+- Existing Delete ownership, timeout, batching, current-request, and silent tests.
+- Relevant AI/provider/fast-path tests.
+- Save/Bio/Username regression tests.
+- Full `tests/` suite.
+- `git diff --check` and Delete-only diff review.
+- Commit and push only when explicitly requested by the delivery task.
+
+### Final handoff conclusion
+
+The current system has a real execution boundary and a strong Delete ownership chokepoint. The next implementation should improve semantic candidate understanding while preserving those boundaries. Do not repeat the broad architecture investigation unless new source changes invalidate this report.
