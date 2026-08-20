@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from backend.ai.semantic_delete import normalize_text
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 from backend.helper.rpc_timeout import rpc_await
@@ -283,6 +285,7 @@ async def select_self_owned_message_ids(
     after_time: Any = None,
     boundary_id: int | None = None,
     query: str = "",
+    match: Callable[[str], bool] | None = None,
     exclude_message_id: int | None = None,
     tz_name: str = "UTC",
     request_id: str = "",
@@ -307,7 +310,12 @@ async def select_self_owned_message_ids(
 
     selected: list[int] = []
     considered = 0
-    needle = query.strip().casefold()
+    # Topic queries are matched on the deterministic normalized form so
+    # Persian/Arabic script variants, digits, and zero-width characters do
+    # not defeat an otherwise exact content match. ``match`` (when present)
+    # is a pure semantic predicate applied AFTER self ownership — it can
+    # never turn a foreign message into a candidate.
+    needle = normalize_text(query.strip()) if query else ""
     boundary_seen = boundary_id is None
     try:
         # Never ask Telethon for an unbounded history. The cap is large
@@ -328,7 +336,8 @@ async def select_self_owned_message_ids(
                 if (
                     _is_self_owned(msg, me_id)
                     and mid != exclude_message_id
-                    and (not needle or needle in _message_text(msg).casefold())
+                    and (not needle or needle in normalize_text(_message_text(msg)))
+                    and (match is None or match(_message_text(msg)))
                 ):
                     selected.append(mid)
                     considered += 1
@@ -359,7 +368,10 @@ async def select_self_owned_message_ids(
             # a deletion candidate, even transiently.
             if not _is_self_owned(msg, me_id):
                 continue
-            if needle and needle not in _message_text(msg).casefold():
+            text = _message_text(msg)
+            if needle and needle not in normalize_text(text):
+                continue
+            if match is not None and not match(text):
                 continue
             considered += 1
             selected.append(mid)
@@ -384,6 +396,7 @@ async def do_del_self_filtered(
     after_time: Any = None,
     boundary_id: int | None = None,
     query: str = "",
+    match: Callable[[str], bool] | None = None,
     exclude_message_id: int | None = None,
     tz_name: str = "UTC",
     request_id: str = "",
@@ -391,7 +404,8 @@ async def do_del_self_filtered(
     """Delete a self-owned range after deterministic candidate selection."""
     ids, considered, selection_error = await select_self_owned_message_ids(
         client, chat_id, count=count, until_time=until_time, after_time=after_time,
-        boundary_id=boundary_id, query=query, exclude_message_id=exclude_message_id,
+        boundary_id=boundary_id, query=query, match=match,
+        exclude_message_id=exclude_message_id,
         tz_name=tz_name, request_id=request_id,
     )
     logger.info(

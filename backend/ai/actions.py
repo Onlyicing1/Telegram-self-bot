@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.ai.persian import coerce_int, normalize_digits
+from backend.ai.semantic_delete import parse_structural_predicate, spec_from_dict
 
 # ── Action vocabulary ──
 
@@ -89,7 +90,7 @@ TARGET_SCOPES = frozenset({
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
     "content", "reason", "link", "message_id", "fields",
-    "until_time", "after_time", "boundary_id",
+    "until_time", "after_time", "boundary_id", "semantic",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -147,6 +148,7 @@ class ActionParseResult:
     until_time: str = ""
     after_time: str = ""
     boundary_id: int | None = None
+    semantic: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -328,6 +330,16 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     query = raw.get("query", "")
     if query and not isinstance(query, str):
         return ActionParseResult(kind=KIND_INVALID, error="Invalid 'query' field.")
+    semantic: dict[str, Any] | None = None
+    if "semantic" in raw:
+        if action != "delete_messages":
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="'semantic' is only valid for the delete_messages action.",
+            )
+        semantic = raw.get("semantic")
+        if not isinstance(semantic, dict) or spec_from_dict(semantic) is None:
+            return ActionParseResult(kind=KIND_INVALID, error="Invalid 'semantic' field.")
     boundary_id = None
     if "boundary_id" in raw:
         boundary_id = coerce_int(raw.get("boundary_id"))
@@ -383,6 +395,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             after_time=str(after_time or ""),
             boundary_id=boundary_id,
             query=str(query or ""),
+            semantic=semantic,
         )
 
     return ActionParseResult(
@@ -396,6 +409,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         after_time=str(after_time or ""),
         boundary_id=boundary_id,
         query=str(query or ""),
+        semantic=semantic,
     )
 
 
@@ -461,7 +475,10 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action == "delete_messages":
         if target == "message_id":
             return [{"name": "delete_message_by_id", "arguments": {"message_id": result.message_id}}]
-        if result.mode or result.until_time or result.after_time or result.boundary_id is not None or result.query:
+        if (
+            result.mode or result.until_time or result.after_time
+            or result.boundary_id is not None or result.query or result.semantic
+        ):
             args: dict[str, Any] = {}
             if result.count is not None:
                 args["count"] = result.count
@@ -475,6 +492,8 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
                 args["boundary_id"] = result.boundary_id
             if result.query:
                 args["query"] = result.query
+            if result.semantic:
+                args["semantic"] = result.semantic
             return [{"name": "delete", "arguments": args}]
         if target in ("replied_message", "current_message"):
             return [{"name": "delete_replied", "arguments": {}}]
@@ -518,6 +537,7 @@ def parse_action_text(text: str) -> ActionParseResult:
             after_time=result.after_time,
             boundary_id=result.boundary_id,
             query=result.query,
+            semantic=result.semantic,
             tool_calls=tool_calls,
         )
     return result
@@ -716,13 +736,28 @@ def _parse_number(words: list[str], i: int) -> int | None:
     return total
 
 
+def _is_word_count_marker(tok: str) -> bool:
+    """True when *tok* makes a preceding number a word-count predicate.
+
+    In "پیام‌های دو کلمه‌ای رو پاک کن" the "دو" is a WORD COUNT (two-word
+    messages), not a deletion count — it must never be parsed as
+    "delete 2 messages". English digits/hyphen forms tokenize the same way
+    ("2-word" → ["2", "word"]), so the same guard covers both.
+    """
+    return tok in ("word", "words") or tok.startswith("کلمه") or tok.startswith("واژه")
+
+
 def _extract_count(words: list[str]) -> int | None:
     """Extract a 1..500 count near a message/last word.
 
     Accepts Persian/Arabic-Indic digits (normalized), ASCII digits, and
-    Persian number words ("ده", "بیست و پنج", ...).
+    Persian number words ("ده", "بیست و پنج", ...). A number that is
+    immediately followed by a word-count marker ("کلمه", "word", ...) is
+    a structural predicate, never a deletion count, and is skipped.
     """
     for i in range(len(words)):
+        if i + 1 < len(words) and _is_word_count_marker(words[i + 1]):
+            continue
         n = _parse_number(words, i)
         if n is not None and 1 <= n <= _MAX_DELETE_COUNT:
             window = words[max(0, i - 2):i + 4]
@@ -1037,13 +1072,22 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         )
 
     if do_delete:
+        # A deterministic structural predicate (exact N words / exact N
+        # English words) is parsed from the ORIGINAL user message and can
+        # never be confused with a positional deletion count: "دو کلمه‌ای"
+        # means two-word messages, not "delete 2 messages".
+        structural = parse_structural_predicate(text)
+        has_structural = structural is not None
         semantic = _is_semantic_delete(words)
         semantic_query = _extract_semantic_query(words) if semantic else ""
-        # A direct topic predicate is deterministic: execute the existing
-        # self-owned selector locally rather than making Delete depend on a
-        # second provider round. Requests that explicitly ask to search/list
-        # remain on the existing semantic tool path.
-        if semantic and semantic_query and not (set(words) & _SEMANTIC_SEARCH_WORDS):
+        # A direct topic predicate or a structural predicate is deterministic:
+        # execute the existing self-owned selector locally rather than making
+        # Delete depend on a second provider round. Requests that explicitly
+        # ask to search/list a topic remain on the existing semantic tool path.
+        if (
+            has_structural
+            or (semantic and semantic_query and not (set(words) & _SEMANTIC_SEARCH_WORDS))
+        ):
             until_time = _extract_until_time(words)
             after_time = "today" if any(word in _TODAY_WORDS for word in words) else ""
             after_clock = _extract_after_time(words)
@@ -1056,7 +1100,17 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
                 mode = "until_time"
             else:
                 mode = "filtered"
-            arguments: dict[str, Any] = {"mode": mode, "query": semantic_query}
+            arguments: dict[str, Any] = {"mode": mode}
+            if has_structural:
+                # The normalized topic (if any) travels inside the semantic
+                # predicate so it is matched with the same deterministic
+                # normalization as the structural rule.
+                semantic_args: dict[str, Any] = structural.to_dict()
+                if semantic_query:
+                    semantic_args["query"] = semantic_query
+                arguments["semantic"] = semantic_args
+            else:
+                arguments["query"] = semantic_query
             if count is not None:
                 arguments["count"] = count
             if until_time is not None:
@@ -1072,6 +1126,7 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
                 until_time=until_time or "",
                 after_time=after_time or after_clock or "",
                 query=semantic_query,
+                semantic=arguments.get("semantic"),
                 tool_calls=[{"name": "delete", "arguments": arguments}],
             )
         if semantic:

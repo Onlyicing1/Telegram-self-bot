@@ -41,7 +41,9 @@ class DeleteTool(Tool):
         return (
             "Delete self-owned messages in the current chat. Use count for the "
             "last N self messages, mode=all for all self messages, mode=until_time "
-            "for a time range, or mode=until_message for a message boundary. "
+            "for a time range, mode=until_message for a message boundary, or "
+            "semantic for a deterministic content predicate (exact word count, "
+            "exact English word count, or a normalized topic filter). "
             "The active request is eligible when it falls inside the requested scope; "
             "for an anchor request it is the boundary, not a permission bypass."
         )
@@ -76,6 +78,18 @@ class DeleteTool(Tool):
                 "type": "string",
                 "description": "Optional text filter applied before ownership and deletion.",
             },
+            "semantic": {
+                "type": "object",
+                "description": ("Optional deterministic content predicate: "
+                                "{\"query\": str, \"word_count\": int, "
+                                "\"english_word_count\": int}. Applied after "
+                                "self ownership; never a permission bypass."),
+                "properties": {
+                    "query": {"type": "string"},
+                    "word_count": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "english_word_count": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
         }
 
     @property
@@ -105,6 +119,14 @@ class DeleteTool(Tool):
         after_time = arguments.get("after_time")
         query = str(arguments.get("query") or "")
         boundary_id = coerce_int(arguments.get("boundary_id"))
+        semantic_raw = arguments.get("semantic")
+        from backend.ai.semantic_delete import build_matcher_from_dict
+        matcher = build_matcher_from_dict(semantic_raw) if semantic_raw is not None else None
+        if semantic_raw is not None and matcher is None:
+            return ToolResult(
+                success=False,
+                message="Invalid semantic filter; no messages were deleted.",
+            )
         request_message_id = coerce_int(
             context.extra.get("request_message_id") if context.extra else None
         )
@@ -123,7 +145,7 @@ class DeleteTool(Tool):
         has_filtered_scope = bool(
             mode in {"all", "until_time", "until_message", "filtered"}
             or until_time is not None or after_time is not None
-            or boundary_id is not None or query
+            or boundary_id is not None or query or semantic_raw is not None
         )
         if not has_filtered_scope and count is None:
             return ToolResult(
@@ -172,6 +194,7 @@ class DeleteTool(Tool):
                         after_time=after_time,
                         boundary_id=boundary_id,
                         query=query,
+                        match=matcher,
                         # The active request is eligible when it belongs to
                         # the requested range. For until_message it remains
                         # the boundary through boundary_id, not an exclusion.
