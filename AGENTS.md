@@ -106,7 +106,7 @@ backend/
 │   ├── inline_sender.py             # send_inline_panel + input listener
 │   ├── input_state.py               # per-owner pending-input state
 │   ├── panel_registry.py, panels.py, panel_render.py, lifecycle.py,
-│   ├── session_manager.py, rpc_timeout.py, watchdog.py
+│   ├── session_manager.py, rpc_timeout.py
 │
 ├── telegram_api/                    # typed RPC wrappers over the self client
 ├── db/client.py                     # Supabase singleton + in-memory fallback
