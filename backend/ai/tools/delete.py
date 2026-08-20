@@ -6,11 +6,16 @@ confirmation before calling them.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from backend.ai.persian import coerce_int
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
+
+
+_DELETE_TOOL_TIMEOUT_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 class DeleteTool(Tool):
@@ -69,6 +74,11 @@ class DeleteTool(Tool):
         }
 
     @property
+    def timeout_seconds(self) -> int:
+        """Bounded deadline for history verification plus delete batches."""
+        return _DELETE_TOOL_TIMEOUT_SECONDS
+
+    @property
     def permission_level(self) -> PermissionLevel:
         return PermissionLevel.DANGEROUS
 
@@ -96,6 +106,11 @@ class DeleteTool(Tool):
         reply_meta = context.extra.get("reply_msg") if context.extra else None
         if mode == "until_message" and boundary_id is None and reply_meta:
             boundary_id = coerce_int(reply_meta.get("message_id"))
+        # A direct "up to this message" request uses the original request
+        # message as an anchor. It is a boundary only; the selector still
+        # excludes it from the deletion set.
+        if mode == "until_message" and boundary_id is None:
+            boundary_id = request_message_id
         if mode == "until_message" and boundary_id is None:
             return ToolResult(success=False, message="No message boundary could be resolved; nothing was deleted.")
         if mode == "until_time" and not until_time:
@@ -130,6 +145,13 @@ class DeleteTool(Tool):
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
 
+        request_id = str(context.extra.get("request_id") or "") if context.extra else ""
+        logger.info(
+            "DELETE_REQUEST_START request_id=%s chat_id=%s mode=%s count=%s "
+            "anchor_id=%s semantic=%s",
+            request_id or "-", chat_id, mode or "last_n", count or "-",
+            request_message_id or "-", bool(query),
+        )
         try:
             if has_filtered_scope or request_message_id is not None:
                 considered, deleted, error = await delete_service.do_del_self_filtered(
@@ -142,6 +164,7 @@ class DeleteTool(Tool):
                     query=query,
                     exclude_message_id=request_message_id,
                     tz_name=context.tz_str,
+                    request_id=request_id,
                 )
             else:
                 # Preserve the legacy panel/test contract when no AI request
@@ -157,11 +180,19 @@ class DeleteTool(Tool):
                 data={"count": 0},
             )
         if error is not None:
+            logger.warning(
+                "DELETE_FAILURE request_id=%s chat_id=%s considered=%s deleted=%s error=%s",
+                request_id or "-", chat_id, considered, deleted, error,
+            )
             return ToolResult(
                 success=False,
                 message=f"Delete failed: {error}",
                 data={"count": deleted},
             )
+        logger.info(
+            "DELETE_SUCCESS request_id=%s chat_id=%s considered=%s deleted=%s",
+            request_id or "-", chat_id, considered, deleted,
+        )
         if deleted == 0:
             return ToolResult(
                 success=True,
@@ -313,6 +344,11 @@ class DeleteByIdTool(Tool):
                 "description": "Starting message ID to delete from.",
             },
         }
+
+    @property
+    def timeout_seconds(self) -> int:
+        """Bounded deadline for history verification plus delete batches."""
+        return _DELETE_TOOL_TIMEOUT_SECONDS
 
     @property
     def permission_level(self) -> PermissionLevel:

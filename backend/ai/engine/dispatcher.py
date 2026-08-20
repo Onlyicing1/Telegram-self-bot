@@ -600,6 +600,7 @@ class Dispatcher:
         extra: dict[str, Any] = dict(base.extra) if base.extra else {}
         extra["chat_id"] = request.chat_id
         extra["request_message_id"] = request.message_id
+        extra["request_id"] = request.request_id
         if request.reply_context and request.reply_context.exists:
             extra["reply_msg"] = {
                 "message_id": request.reply_context.message_id,

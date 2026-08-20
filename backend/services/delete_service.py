@@ -17,6 +17,9 @@ from backend.services import settings_service
 
 logger = logging.getLogger(__name__)
 
+_MAX_DELETE_SCAN_MESSAGES = 1000
+_DELETE_VERIFY_CHUNK = 100
+
 
 async def _resolve_me_id(client) -> int | None:
     """Best-effort resolution of the authenticated account's numeric user ID.
@@ -59,7 +62,12 @@ def _is_self_owned(msg, me_id: int | None) -> bool:
 
 
 async def delete_verified_self_messages(
-    client, chat_id, message_ids: list[int], *, exclude_message_id: int | None = None
+    client,
+    chat_id,
+    message_ids: list[int],
+    *,
+    exclude_message_id: int | None = None,
+    request_id: str = "",
 ) -> tuple[list[int], list[int]]:
     """Delete ONLY messages verified as belonging to the authenticated account.
 
@@ -88,7 +96,7 @@ async def delete_verified_self_messages(
 
     me_id = await _resolve_me_id(client)
     verified: list[int] = []
-    chunk = 100
+    chunk = _DELETE_VERIFY_CHUNK
     for start in range(0, len(ids), chunk):
         part = ids[start:start + chunk]
         try:
@@ -152,8 +160,13 @@ async def delete_verified_self_messages(
             )
             rejected.extend(batch)
     logger.info(
-        "DELETE_EXECUTION_END chat_id=%s deleted=%d rejected=%d",
-        chat_id, len(deleted), len(rejected),
+        "DELETE_EXECUTION_END request_id=%s chat_id=%s deleted=%d rejected=%d",
+        request_id or "-", chat_id, len(deleted), len(rejected),
+    )
+    logger.info(
+        "DELETE_OWNERSHIP_FILTERED request_id=%s chat_id=%s candidates=%d "
+        "self_owned=%d rejected=%d",
+        request_id or "-", chat_id, len(ids), len(verified), len(rejected),
     )
     if delete_errors:
         # Transport failures propagate so callers stay honest — but the loop
@@ -216,6 +229,7 @@ async def select_self_owned_message_ids(
     query: str = "",
     exclude_message_id: int | None = None,
     tz_name: str = "UTC",
+    request_id: str = "",
 ) -> tuple[list[int], int, Exception | None]:
     """Select recent self-owned IDs before the final ownership chokepoint.
 
@@ -240,10 +254,28 @@ async def select_self_owned_message_ids(
     needle = query.strip().casefold()
     boundary_seen = boundary_id is None
     try:
-        iterator = client.iter_messages(chat_id, limit=None)
+        # Never ask Telethon for an unbounded history. The cap is large
+        # enough for normal requests while keeping a pathological ``all`` or
+        # broad semantic request inside a deterministic execution window.
+        iterator = client.iter_messages(
+            chat_id, limit=_MAX_DELETE_SCAN_MESSAGES,
+        )
         async for msg in iterator:
             mid = getattr(msg, "id", None)
             if not isinstance(mid, int) or mid <= 0:
+                continue
+            # A boundary must still be observed when it is the active request
+            # itself. It controls the range but is never selected below.
+            is_boundary = boundary_id is not None and not boundary_seen and mid == boundary_id
+            if is_boundary:
+                boundary_seen = True
+                if (
+                    _is_self_owned(msg, me_id)
+                    and mid != exclude_message_id
+                    and (not needle or needle in _message_text(msg).casefold())
+                ):
+                    selected.append(mid)
+                    considered += 1
                 continue
             if exclude_message_id is not None and mid == exclude_message_id:
                 continue
@@ -257,22 +289,21 @@ async def select_self_owned_message_ids(
                 if msg_date is not None and cutoff is not None and msg_date > cutoff:
                     continue
                 if msg_date is not None and floor is not None and msg_date < floor:
-                    continue
+                    # History is newest-first, so older messages cannot enter
+                    # a bounded time range after this point.
+                    break
             elif cutoff is not None or floor is not None:
                 continue
 
             if boundary_id is not None and not boundary_seen:
-                if mid != boundary_id:
-                    continue
-                boundary_seen = True
-                if _is_self_owned(msg, me_id) and (not needle or needle in _message_text(msg).casefold()):
-                    selected.append(mid)
-                    considered += 1
                 continue
 
-            if needle and needle not in _message_text(msg).casefold():
-                continue
+            # Apply the self-only candidate boundary before any semantic text
+            # predicate. The model/query can never turn a foreign match into
+            # a deletion candidate, even transiently.
             if not _is_self_owned(msg, me_id):
+                continue
+            if needle and needle not in _message_text(msg).casefold():
                 continue
             considered += 1
             selected.append(mid)
@@ -299,18 +330,27 @@ async def do_del_self_filtered(
     query: str = "",
     exclude_message_id: int | None = None,
     tz_name: str = "UTC",
+    request_id: str = "",
 ) -> tuple[int, int, Exception | None]:
     """Delete a self-owned range after deterministic candidate selection."""
     ids, considered, selection_error = await select_self_owned_message_ids(
         client, chat_id, count=count, until_time=until_time, after_time=after_time,
         boundary_id=boundary_id, query=query, exclude_message_id=exclude_message_id,
-        tz_name=tz_name,
+        tz_name=tz_name, request_id=request_id,
+    )
+    logger.info(
+        "DELETE_CANDIDATES_FOUND request_id=%s chat_id=%s mode=%s "
+        "candidate_count=%d considered=%d",
+        request_id or "-", chat_id,
+        "semantic" if query else ("boundary" if boundary_id is not None else "range"),
+        len(ids), considered,
     )
     if selection_error is not None:
         return considered, 0, selection_error
     try:
         deleted, _rejected = await delete_verified_self_messages(
             client, chat_id, ids, exclude_message_id=exclude_message_id,
+            request_id=request_id,
         )
     except Exception as exc:
         return considered, 0, exc
@@ -403,7 +443,12 @@ async def do_del_id_counts(
     total = 0
     try:
         batch = []
-        async for msg in client.iter_messages(chat_id, min_id=start_id - 1, from_user="me"):
+        async for msg in client.iter_messages(
+            chat_id,
+            min_id=start_id - 1,
+            from_user="me",
+            limit=_MAX_DELETE_SCAN_MESSAGES,
+        ):
             if exclude_message_id is not None and getattr(msg, "id", None) == exclude_message_id:
                 continue
             batch.append(msg.id)

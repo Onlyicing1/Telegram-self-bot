@@ -10,9 +10,10 @@ two very different failures:
   B. "Delete was broken before ownership checking"
      (pipeline breakage — must never be reported as an ownership rejection)
 
-They also lock in the semantic-delete contract: a topic/context request
-("پیام‌های مربوط به دعوای اخیر رو پاک کن") must reach the AI, never be
-collapsed by the deterministic parser into "delete the last message".
+They also lock in the semantic-delete contract: a direct topic predicate
+("پیام‌های مربوط به دعوای اخیر رو پاک کن") must use the bounded local selector,
+while explicit search workflows remain on the existing AI semantic path and
+never collapse into "delete the last message".
 """
 from __future__ import annotations
 
@@ -150,15 +151,16 @@ def test_ambiguous_delete_clarifies_not_executes():
     ],
 )
 def test_semantic_delete_is_not_hijacked_into_last_message(text):
-    """A topic/context delete must NOT collapse into 'delete last message'.
+    """A topic/context delete must not collapse into last-message deletion.
 
-    Before this fix, \"اخیر\" inside \"دعوای اخیر\" matched the last-message
-    vocabulary and the deterministic parser returned `delete count=1`,
-    overriding the model's semantic resolution. It must be conversational so
-    the AI resolves WHICH messages to delete.
+    Direct topic predicates use the existing bounded local selector; explicit
+    search/list workflows remain on the provider-backed semantic path.
     """
     r = parse_command_intent(text, has_reply=False)
-    assert r.kind == KIND_CONVERSATIONAL, (text, r.kind, r.action)
+    assert r.kind == KIND_EXECUTABLE, (text, r.kind, r.action)
+    assert r.action == "delete_messages"
+    assert r.mode == "filtered"
+    assert r.tool_calls[0]["name"] == "delete"
 
 
 def test_deterministic_last_message_still_parses():
@@ -447,7 +449,7 @@ async def test_fast_path_skips_semantic_delete_to_provider():
 
     result = await d.dispatch(AIRequest(
         session_id="s1", message_id=1, owner_id=123,
-        user_message="پیام‌های مربوط به دعوای اخیر رو پاک کن", chat_id=456,
+        user_message="پیام‌های مربوط به دعوای اخیر رو پیدا کن و حذفشون کن", chat_id=456,
     ))
 
     assert result.metadata.get("finish_state") != "local_fast_path"

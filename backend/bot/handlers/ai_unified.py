@@ -380,10 +380,18 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     from backend.ai.session.request import AIRequest
     from backend.ai.conversation.context_builder import ReplyContext
 
+    # Capture the immutable Telegram anchor before config/provider work or
+    # any in-place status edit. Delete uses this original message ID as the
+    # active-request exclusion and as the boundary for "up to this message".
+    request_chat_id = getattr(event, "chat_id", None)
+    request_message_id = getattr(getattr(event, "message", None), "id", None)
     rid = ai_diag.new_request_id()
     ai_diag.register_start(rid, owner_id=owner_id)
     logger.info("AI_REQUEST_START id=%s owner=%d", rid, owner_id)
-    logger.info("TELEGRAM_CHAT_RESOLVE id=%s chat_id=%s", rid, getattr(event, "chat_id", None))
+    logger.info(
+        "TELEGRAM_CHAT_RESOLVE id=%s chat_id=%s request_message_id=%s",
+        rid, request_chat_id, request_message_id,
+    )
     logger.info("AI_EXEC_TRACE request_id=%s stage=telegram_received", rid)
 
     engine = _get_engine()
@@ -438,8 +446,8 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             session_id=session_id,
             user_message=prompt_text,
             owner_id=owner_id,
-            chat_id=event.chat_id,
-            message_id=event.message.id,
+            chat_id=request_chat_id,
+            message_id=request_message_id,
             reply_context=reply_context or ReplyContext(),
             timezone=tz_str,
             request_id=rid,

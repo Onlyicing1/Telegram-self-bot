@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOLS_PER_TURN = 5
 TOOL_TIMEOUT_SECONDS = 10
+_DELETE_TOOL_NAMES = frozenset({
+    "delete",
+    "delete_replied",
+    "delete_by_id",
+    "delete_message_by_id",
+    "delete_messages_by_ids",
+})
 
 _STATUS_LABELS: dict[str, str] = {
     "save": "💾 Saving...",
@@ -221,14 +228,17 @@ class ToolExecutor:
         start = time.perf_counter()
         try:
             # Long-running tools (e.g. Deep Save media transfer) must not be
-            # cancelled by the generic short tool timeout. Other tools keep the
-            # bounded timeout so a stuck tool cannot hang a request forever.
+            # cancelled by the generic short tool timeout. Delete has its own
+            # bounded deadline because bounded history verification plus
+            # chunked Telegram deletion can legitimately exceed ten seconds.
+            # The tool remains bounded; this is not an unbounded exemption.
             if getattr(tool, "long_running", False):
                 tool_result: ToolResult = await tool.execute(ctx, arguments)
             else:
+                timeout_seconds = getattr(tool, "timeout_seconds", TOOL_TIMEOUT_SECONDS)
                 tool_result: ToolResult = await asyncio.wait_for(
                     tool.execute(ctx, arguments),
-                    timeout=TOOL_TIMEOUT_SECONDS,
+                    timeout=timeout_seconds,
                 )
             latency_ms = (time.perf_counter() - start) * 1000
 
@@ -253,6 +263,11 @@ class ToolExecutor:
         except asyncio.TimeoutError:
             latency_ms = (time.perf_counter() - start) * 1000
             logger.warning("ToolExecutor: tool '%s' timed out", tool_name)
+            if tool_name in _DELETE_TOOL_NAMES:
+                logger.warning(
+                    "DELETE_TIMEOUT request_id=%s tool=%s elapsed_ms=%.1f",
+                    (ctx.extra or {}).get("request_id", "-"), tool_name, latency_ms,
+                )
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,

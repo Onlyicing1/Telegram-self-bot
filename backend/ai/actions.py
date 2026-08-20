@@ -556,6 +556,15 @@ _SEMANTIC_DELETE_WORDS = frozenset({
     "discussion", "conversation",
 })
 _SEMANTIC_DELETE_STEMS = ("مربوط", "دعوا", "بحث", "موضوع")
+_SEMANTIC_SEARCH_WORDS = frozenset({
+    "پیدا", "جستجو", "لیست", "ببین", "find", "search", "inspect", "list",
+})
+_SEMANTIC_QUERY_STOP_WORDS = frozenset({
+    "به", "را", "رو", "که", "و", "از", "تا", "این", "اون", "اینم", "همین",
+    "پیام", "پیامها", "messages", "message", "my", "mine", "own",
+    "خودم", "من", "مربوط", "درباره", "دربارش", "راجع", "راجب",
+    "related", "about", "regarding", "to", "the",
+})
 _DEEP_TOKENS = frozenset({"عمیق", "deep", "کامل"})
 _MESSAGE_TOKENS = frozenset({"پیام", "پیامها", "message", "messages", "msg", "msgs"})
 _COUNT_CONTEXT = _MESSAGE_TOKENS | _LAST_TOKENS
@@ -726,6 +735,8 @@ def _extract_until_time(words: list[str]) -> str | None:
     """Extract a conservative local HH:MM cutoff from natural language."""
     markers = {"ساعت", "until", "before", "by"}
     for i, word in enumerate(words[:-1]):
+        if word == "ساعت" and i > 0 and words[i - 1] in {"از", "from"}:
+            continue
         if word not in markers:
             continue
         value = _parse_number(words, i + 1)
@@ -751,14 +762,19 @@ def _extract_after_time(words: list[str]) -> str | None:
 
 
 def _has_message_boundary(words: list[str], has_reply: bool) -> bool:
-    """True for an explicit up-to-replied-message request."""
-    if not has_reply:
-        return False
+    """True for an explicit up-to-message request.
+
+    With a reply, the replied-to message is the boundary. Without a reply,
+    the active request message is captured by the handler and injected as the
+    boundary at execution time.
+    """
     joined = " ".join(words)
     return (
         "تا این پیام" in joined
+        or "از این پیام" in joined
         or "تا اینجا" in joined
         or "until this message" in joined
+        or "from this message" in joined
         or "up to this message" in joined
         or "up through this message" in joined
     )
@@ -790,19 +806,48 @@ def _has_save_mention(words: list[str]) -> bool:
 
 
 def _is_semantic_delete(words: list[str]) -> bool:
-    """True when a delete request references a topic/context (semantic).
-
-    "مربوط به X", "دعوای اخیر", "بحث‌ها", "موضوعات" and their English
-    equivalents make the request semantic: the AI must resolve WHICH messages
-    to delete from the conversation. The deterministic parser only owns
-    scope-free positional deletes and must yield to the AI here.
-    """
+    """True when a delete request references a topic/context (semantic)."""
     for w in words:
         if w in _SEMANTIC_DELETE_WORDS:
             return True
         if any(w.startswith(stem) for stem in _SEMANTIC_DELETE_STEMS):
             return True
     return False
+
+
+def _extract_semantic_query(words: list[str]) -> str:
+    """Extract an explicit topic for a local, self-only text filter.
+
+    Direct requests such as ``delete my messages about script`` contain
+    enough information to avoid another provider round. The service still
+    performs the authoritative Telegram ownership check; this helper only
+    extracts a bounded text predicate from the owner's wording.
+    """
+    marker_index = None
+    for i, word in enumerate(words):
+        if word in _SEMANTIC_DELETE_WORDS or any(
+            word.startswith(stem) for stem in _SEMANTIC_DELETE_STEMS
+        ):
+            marker_index = i
+            break
+    if marker_index is None:
+        return ""
+
+    query_words: list[str] = []
+    for offset, word in enumerate(words[marker_index:]):
+        if (
+            offset > 0
+            and word in {"از", "ساعت", "from", "until", "before", "تا"}
+        ):
+            break
+        if word in _SEMANTIC_SEARCH_WORDS or _is_stem_token(word, _DELETE_STEMS):
+            break
+        if word in {"کن", "کنی", "کنید", "کنین", "do", "delete", "remove"}:
+            break
+        if word in _SEMANTIC_QUERY_STOP_WORDS:
+            continue
+        query_words.append(word)
+    return " ".join(query_words).strip()
 
 
 def _en_list_saved(words: list[str]) -> bool:
@@ -992,11 +1037,47 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         )
 
     if do_delete:
-        # Topic/content requests, including combinations such as semantic +
-        # time or semantic + N, stay on the AI path so the model can first
-        # inspect real Telegram messages. The list/delete executor still
-        # excludes the active request and enforces self ownership.
-        if _is_semantic_delete(words):
+        semantic = _is_semantic_delete(words)
+        semantic_query = _extract_semantic_query(words) if semantic else ""
+        # A direct topic predicate is deterministic: execute the existing
+        # self-owned selector locally rather than making Delete depend on a
+        # second provider round. Requests that explicitly ask to search/list
+        # remain on the existing semantic tool path.
+        if semantic and semantic_query and not (set(words) & _SEMANTIC_SEARCH_WORDS):
+            until_time = _extract_until_time(words)
+            after_time = "today" if any(word in _TODAY_WORDS for word in words) else ""
+            after_clock = _extract_after_time(words)
+            if after_clock and not after_time:
+                after_time = after_clock
+            boundary = _has_message_boundary(words, has_reply)
+            if boundary:
+                mode = "until_message"
+            elif until_time is not None:
+                mode = "until_time"
+            else:
+                mode = "filtered"
+            arguments: dict[str, Any] = {"mode": mode, "query": semantic_query}
+            if count is not None:
+                arguments["count"] = count
+            if until_time is not None:
+                arguments["until_time"] = until_time
+            if after_time or after_clock:
+                arguments["after_time"] = after_time or after_clock
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="delete_messages",
+                target=("replied_message" if has_reply and boundary else "current_message" if boundary else "recent_messages"),
+                count=count,
+                mode=mode,
+                until_time=until_time or "",
+                after_time=after_time or after_clock or "",
+                query=semantic_query,
+                tool_calls=[{"name": "delete", "arguments": arguments}],
+            )
+        if semantic:
+            # Ambiguous semantic requests and explicit search/list workflows
+            # remain on the existing provider-backed semantic tool path; they
+            # must never fall through to positional last-message deletion.
             return ActionParseResult(kind=KIND_CONVERSATIONAL)
 
         # Explicit whole-range, time, and replied-boundary requests are
@@ -1042,10 +1123,11 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
                 tool_calls=[{"name": "delete", "arguments": {"mode": "filtered", "after_time": after_clock}}],
             )
         if _has_message_boundary(words, has_reply):
+            boundary_target = "replied_message" if has_reply else "current_message"
             return ActionParseResult(
                 kind=KIND_EXECUTABLE,
                 action="delete_messages",
-                target="replied_message",
+                target=boundary_target,
                 mode="until_message",
                 tool_calls=[{"name": "delete", "arguments": {"mode": "until_message"}}],
             )
