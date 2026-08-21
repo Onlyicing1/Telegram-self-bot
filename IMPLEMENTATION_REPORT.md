@@ -866,19 +866,20 @@ preserved per Execution 6.
 
 ### Commit
 
-Recorded after delivery below.
+`c0b209e1a91dc8087a22567d93da000f8f6971a1`
 
 ### Push Result
 
-Recorded after delivery below.
+Push succeeded: `90eada8..c0b209e main -> main`.
 
 ### Remote Verification
 
-Recorded after delivery below.
+After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
+`c0b209e1a91dc8087a22567d93da000f8f6971a1`.
 
 ### Final Working Tree
 
-Recorded after delivery below.
+`git status --short` was clean after synchronization.
 
 ---
 
