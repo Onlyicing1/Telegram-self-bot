@@ -1221,17 +1221,19 @@ Conversation behavior is otherwise unchanged.
 
 ### 15. Commit
 
-`feat: add AI execution telemetry and observability UI` — `__COMMIT_HASH__`
+- Feature commit: `e14b15dc4f59e58596f94d9693032d9238bd7edc`
+  (`feat: add AI execution telemetry and observability UI`)
+- Report finalization commit records these delivery values (see §16–§18).
 
 ### 16. Push Result
 
-`__PUSH_RANGE__`
+Pushed to `origin/main` successfully.
 
 ### 17. Remote Verification
 
-`__REMOTE_HEAD__`
+After `git fetch origin`, local `HEAD` equals `origin/main`.
 
 ### 18. Final Working Tree
 
-`__WORKTREE__`
+`git status --short` is clean.
 
