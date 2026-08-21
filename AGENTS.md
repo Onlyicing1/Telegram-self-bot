@@ -57,7 +57,7 @@ backend/
 │   ├── keepalive.py                 # RPC keepalive pings
 │   ├── failsafe.py                  # last-resort all-signals-frozen hard reset
 │   ├── task_guard.py                # immortal_create_task / guarded_create_task
-│   ├── operation_watchdog.py        # bounded_operation (dormant — no callers)
+│   ├── operation_watchdog.py        # guarded_await — operation-level timeout utility
 │   ├── tg_retry.py                  # tg_rpc helper (dormant in prod, tested)
 │   ├── startup_check.py             # run_startup_checks (dormant in prod, tested)
 │   ├── crash_diagnostics.py         # exit-reason + crash snapshot capture
@@ -172,11 +172,8 @@ Key facts:
 
 Dormant paths (source-verified, left in place because they contain useful
 logic or are under test — see INVESTIGATION.md):
-- `RuntimeSupervisor._watchdog_loop` (never started in `start()`).
 - `backend/runtime/startup_check.run_startup_checks` (tested, not called in prod).
-- `backend/diagnostics.recover_stalled` (no callers).
 - `backend/runtime/tg_retry.tg_rpc` (tested, not called in prod).
-- `backend/runtime/operation_watchdog.bounded_operation / attach_task` (no callers).
 
 ---
 

@@ -25,7 +25,7 @@ import time
 
 from backend.runtime.tracer import trace
 from backend.runtime.task_guard import immortal_create_task, guarded_create_task
-from backend.health import tick_loop, get_stale_loops
+from backend.health import tick_loop
 
 logger = logging.getLogger("backend.heartbeat")
 

@@ -48,8 +48,6 @@ _client_generation: int = 0
 _last_rebuild_reason: str = ""
 _rpc_latency_ms: float = 0.0
 
-_watchdog_ok: bool = False
-_last_watchdog_check: float = 0.0
 _last_telethon_event: float = 0.0
 _last_bio_update: float = 0.0
 _last_username_update: float = 0.0
@@ -191,12 +189,6 @@ def set_rpc_latency(ms: float) -> None:
     _rpc_latency_ms = round(ms, 1)
 
 
-def set_watchdog_ok(ok: bool) -> None:
-    global _watchdog_ok, _last_watchdog_check
-    _watchdog_ok = bool(ok)
-    _last_watchdog_check = time.time()
-
-
 def set_last_bio_update() -> None:
     global _last_bio_update
     _last_bio_update = time.time()
@@ -317,8 +309,6 @@ def snapshot() -> dict:
         "last_handler_dispatched_s": _age_or_none(_last_handler_dispatched),
         "rpc_latency_ms": _rpc_latency_ms if _rpc_latency_ms else None,
         "task_states": dict(_task_states),
-        "watchdog_ok": _watchdog_ok,
-        "last_watchdog_check_s": _age_or_none(_last_watchdog_check),
         "last_telethon_event_s": _age_or_none(_last_telethon_event),
         "last_bio_update_s": _age_or_none(_last_bio_update),
         "last_username_update_s": _age_or_none(_last_username_update),
