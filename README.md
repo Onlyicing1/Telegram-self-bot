@@ -147,8 +147,8 @@ provider mesh, memory tiers, and security boundary are specified in
   shares one minute-boundary scheduler with Bio.
 - **Runtime Supervisor** — FSM-based self-healing core; heartbeat,
   keepalive, and failsafe run under it as the single recovery authority.
-- **Diagnostics** — in-memory event log, health snapshot, asyncio task
-  dumps (see [OBSERVABILITY.md](OBSERVABILITY.md)).
+- **Diagnostics** — in-memory event log, health snapshot, asyncio
+  task dumps.
 - **Web Dashboard** — read-only React SPA served by FastAPI from
   `dist/` when built.
 
@@ -190,7 +190,7 @@ accepted; a provider without a key is simply unavailable.
 | Model overrides | — | `<PROVIDER>_MODEL` per provider (e.g. `GEMINI_MODEL`) |
 
 The full variable reference lives in `backend/config.py` and
-`backend/ai/config/env.py`.
+`backend/ai/config/`.
 
 ## Deployment (Render)
 
@@ -262,11 +262,8 @@ python -m pytest tests/ --asyncio-mode=auto
 | [AGENTS.md](AGENTS.md) | Authoritative architecture summary, command reference, coding & security rules |
 | [AI_MASTER_DESIGN.md](AI_MASTER_DESIGN.md) | Full AI subsystem specification (engine, providers, memory, tools, budgets, failure recovery) |
 | [DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md) | Complete database schema reference (every table, column, index, RLS policy) |
-| [OBSERVABILITY.md](OBSERVABILITY.md) | Health snapshot fields, trace tags, diagnostics, background workers |
-| [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) | Pre-deployment and post-deployment verification checklist |
-| [PRODUCTION_VERIFICATION.md](PRODUCTION_VERIFICATION.md) | Test-suite verification report |
-| [FREEBUFF_PRE_PUSH_VERIFY.md](FREEBUFF_PRE_PUSH_VERIFY.md) | Pre-push validation procedure |
 | [INVESTIGATION.md](INVESTIGATION.md) | Repository audit: dead-code/duplication findings and cleanup history |
+| [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) | Canonical execution record for every cleanup pass |
 
 ## Troubleshooting
 
