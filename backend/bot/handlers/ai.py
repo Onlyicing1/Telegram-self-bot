@@ -19,7 +19,8 @@ Panels:
   ai_provider    — Provider selection (only available ones shown)
   ai_model       — Model selection (auto-fetched from provider API)
   ai_wizard      — Setup wizard (shown when no provider is configured)
-  ai_settings    — Simple settings (temperature, max_tokens, system prompt)
+  ai_settings    — Personal settings (wake words, reply stats)
+  ai_settings_adv— Advanced (creativity, response length, memory, personality)
   ai_status      — Status screen (provider, model, connected, latency)
   ai_diagnostics — Diagnostics (owner/developer only)
 """
@@ -458,52 +459,83 @@ async def _ai_wizard_inline_builder(event, extra: str) -> list:
 
 
 async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """Personal settings: how you reach the assistant and what replies show.
+
+    Informational state lives in the text; actions live in buttons; the
+    technical knobs live behind Advanced so this surface stays readable.
+    """
     from backend.ai.engine.telemetry import telemetry
 
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     reply_stats = telemetry.get_telemetry_pref(owner_id)
-    lines = [
-        "**⚙️ AI Settings**\n",
-        f"**Temperature:** {config.get('temperature', 1.0)}",
-        f"**Max Tokens:** {config.get('max_tokens', 4096)}",
-        f"**Context Budget:** {config.get('history_budget', 4000)} tokens",
-        f"**Reply stats:** {'On' if reply_stats else 'Off'}",
-    ]
-    prompt = config.get("system_prompt", "")
-    if prompt:
-        lines.append(f"**System Prompt:** Custom ✅")
-    else:
-        lines.append(f"**System Prompt:** Default")
 
-    trigger_en = config.get("trigger_en", "") or ""
-    trigger_fa = config.get("trigger_fa", "") or ""
+    en = (config.get("trigger_en", "") or "").strip()
+    fa = (config.get("trigger_fa", "") or "").strip()
+
+    lines = ["**Settings**", ""]
+    if en and fa:
+        lines.append(f'Say "{en}" (or "{fa}" in Persian) to talk to the assistant.')
+    elif en:
+        lines.append(f'Say "{en}" to talk to the assistant.')
+    elif fa:
+        lines.append(f'Say "{fa}" to talk to the assistant.')
+    else:
+        lines.append("⚠️ No wake word yet — set one to start chatting.")
     lines.append("")
-    lines.append("**Triggers:**")
-    lines.append(f"  English: `{trigger_en or '—'}`")
-    lines.append(f"  Persian: `{trigger_fa or '—'}`")
-    if not trigger_en and not trigger_fa:
-        lines.append("  ⚠️ Set at least one trigger to enable AI.")
+    lines.append(f"Reply stats · {'On' if reply_stats else 'Off'}")
 
     builder = InlinePanelBuilder()
-    builder.add_row("🔤 Set English Trigger", "input:ai_settings:trigger_en")
-    builder.add_row("🇮🇷 Set Persian Trigger", "input:ai_settings:trigger_fa")
-    builder.add_row("🌡 Temperature", "input:ai_settings:temperature")
-    builder.add_row("📦 Max Tokens", "input:ai_settings:max_tokens")
-    builder.add_row("📝 Context Budget", "input:ai_settings:history_budget")
-    builder.add_row("💬 System Prompt", "input:ai_settings:system_prompt")
+    builder.add_row("English wake word", "input:ai_settings:trigger_en")
+    builder.add_row("Persian wake word", "input:ai_settings:trigger_fa")
     builder.add_row(
-        f"📊 Reply stats: {'Off' if reply_stats else 'On'}",
+        f"Turn reply stats {'off' if reply_stats else 'on'}",
         "action:ai_toggle_telemetry",
     )
+    builder.add_row("Advanced", "panel:ai_settings_adv")
     _nav_buttons(builder)
-    return "⚙️ Settings", "\n".join(lines), builder.build()
+    return "Settings", "\n".join(lines), builder.build()
 
 
 async def _ai_settings_inline_builder(event, extra: str) -> list:
     result = await _ai_settings_panel_handler(event, extra)
     if result is None:
         return [render("Settings", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _ai_settings_adv_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """Technical knobs in plain terms, kept out of the personal surface."""
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    temp = config.get("temperature", 1.0)
+    max_tokens = int(config.get("max_tokens", 4096) or 4096)
+    budget = int(config.get("history_budget", 4000) or 4000)
+    prompt = config.get("system_prompt", "")
+
+    lines = [
+        "**Advanced**",
+        "",
+        f"Creativity {temp}",
+        f"Response length up to {max_tokens:,} tokens",
+        f"Remembers about {budget:,} tokens of conversation",
+        f"Personality prompt · {'Custom' if prompt else 'Default'}",
+    ]
+
+    builder = InlinePanelBuilder()
+    builder.add_row("Creativity…", "input:ai_settings:temperature")
+    builder.add_row("Response length…", "input:ai_settings:max_tokens")
+    builder.add_row("Conversation memory…", "input:ai_settings:history_budget")
+    builder.add_row("Personality prompt…", "input:ai_settings:system_prompt")
+    _nav_buttons(builder)
+    return "Advanced", "\n".join(lines), builder.build()
+
+
+async def _ai_settings_adv_inline_builder(event, extra: str) -> list:
+    result = await _ai_settings_adv_panel_handler(event, extra)
+    if result is None:
+        return [render("Advanced", "Error.", [])]
     title, body, buttons = result
     return [render(title, body, buttons)]
 
@@ -973,28 +1005,25 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
     if not trigger_en and not trigger_fa:
-        return "🧠 AI", (
-            "⚠️ No trigger words configured.\n\n"
-            "Tap **Settings** to set your trigger words.\n"
-            "You need at least one trigger to start chatting."
+        return "AI", (
+            "⚠️ No wake word set yet.\n\n"
+            "Set one in Settings — you need it to start chatting."
         ), [
-            [InlinePanelBuilder().add_row("⚙️ Set Triggers", "panel:ai_settings").build()[0][0]],
+            [InlinePanelBuilder().add_row("Set wake word", "panel:ai_settings").build()[0][0]],
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
     trigger_display = []
     if trigger_en:
-        trigger_display.append(f"**English:** `{trigger_en}`")
+        trigger_display.append(f"English: `{trigger_en}`")
     if trigger_fa:
-        trigger_display.append(f"**Persian:** `{trigger_fa}`")
+        trigger_display.append(f"Persian: `{trigger_fa}`")
     triggers = "\n".join(trigger_display)
-    return "🧠 AI", (
-        f"✅ **Ready to chat!**\n\n"
-        f"**Provider:** {provider.title()}\n"
-        f"**Model:** {model}\n"
-        f"**Triggers:**\n{triggers}\n\n"
-        f"Send a message starting with your trigger word.\n"
-        f"Example: `{trigger_en or trigger_fa} Hello, how are you?`\n\n"
-        f"_The trigger word is removed before sending to the AI._"
+    return "AI", (
+        f"**Ready to chat**\n\n"
+        f"Model: {model}\n"
+        f"Wake words:\n{triggers}\n\n"
+        f"Start a message with a wake word.\n"
+        f"Example: `{trigger_en or trigger_fa} Hello, how are you?`"
     ), []
 
 
@@ -1157,174 +1186,169 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
     return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
 
 
-async def _ai_temperature_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+async def _finish_input(
+    notice: str,
+    restore_panel,
+    chat_id: int,
+    msg_id: int,
+    inline_chat_id: int,
+    inline_msg_id: int,
+) -> None:
+    """Close an input flow with ONE edit: confirmation + refreshed panel.
+
+    The reply that carried the value is deleted as before; the panel
+    message is never replaced by a bare "✅" that strands the user —
+    it becomes the updated panel with the notice on top.
+    """
+    from backend.helper.client import get_client
     from backend.helper.inline_engine import _self_client
+    from backend.helper.panel_render import render_edit
+
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        text, buttons = notice, []
+        try:
+            _title, body, raw_buttons = await restore_panel(None, "")
+            text, buttons = render_edit("", f"{notice}\n\n{body}", raw_buttons)
+        except Exception:
+            pass
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, text, buttons=buttons)
+        except Exception:
+            try:
+                await helper.edit_message(inline_chat_id, inline_msg_id, notice)
+            except Exception:
+                pass
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _ai_temperature_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     owner_id = await _get_owner_id()
     try:
         val = float(text.strip())
     except ValueError:
-        result = "❌ Invalid number."
+        result = "❌ Enter a number like 0.7"
     else:
         if 0.0 <= val <= 2.0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "temperature", val)
-            result = f"✅ Temperature set to {val}"
+            result = f"✅ Creativity set to {val}"
         else:
-            result = "❌ Temperature must be 0.0–2.0"
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+            result = "❌ Creativity must be 0.0–2.0"
+    await _finish_input(
+        result, _ai_settings_adv_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 async def _ai_max_tokens_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
     owner_id = await _get_owner_id()
     try:
         val = int(text.strip())
     except ValueError:
-        result = "❌ Invalid number."
+        result = "❌ Enter a number like 4096"
     else:
         if val > 0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "max_tokens", val)
-            result = f"✅ Max tokens set to {val}"
+            result = f"✅ Response length set to {val:,} tokens"
         else:
             result = "❌ Must be positive."
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+    await _finish_input(
+        result, _ai_settings_adv_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 async def _ai_history_budget_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
     owner_id = await _get_owner_id()
     try:
         val = int(text.strip())
     except ValueError:
-        result = "❌ Invalid number."
+        result = "❌ Enter a number like 4000"
     else:
         if val > 0:
             from backend.ai.config_store import update_setting
             await update_setting(owner_id, "history_budget", val)
-            result = f"✅ Context budget set to {val}"
+            result = f"✅ Memory set to {val:,} tokens"
         else:
             result = "❌ Must be positive."
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+    await _finish_input(
+        result, _ai_settings_adv_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 async def _ai_trigger_en_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
-    owner_id = await _get_owner_id()
     text_stripped = text.strip()
     if text_stripped.lower() == "clear":
         from backend.ai.config_store import update_setting
-        await update_setting(owner_id, "trigger_en", "")
-        result = "✅ English trigger cleared."
+        await update_setting(await _get_owner_id(), "trigger_en", "")
+        result = "✅ English wake word cleared."
     elif " " in text_stripped:
-        result = "❌ Trigger must be a single word (no spaces)."
+        result = "❌ Wake word must be a single word."
     else:
-        config = await _get_saved_config(owner_id)
+        config = await _get_saved_config(await _get_owner_id())
         existing_fa = config.get("trigger_fa", "") or ""
         if text_stripped and existing_fa and text_stripped.lower() == existing_fa.lower():
-            result = "❌ English trigger must differ from Persian trigger."
+            result = "❌ English wake word must differ from the Persian one."
         else:
             from backend.ai.config_store import update_setting
-            await update_setting(owner_id, "trigger_en", text_stripped)
-            result = f"✅ English trigger set to: `{text_stripped}`" if text_stripped else "✅ English trigger cleared."
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+            await update_setting(await _get_owner_id(), "trigger_en", text_stripped)
+            result = (
+                f"✅ English wake word set to `{text_stripped}`"
+                if text_stripped else "✅ English wake word cleared."
+            )
+    await _finish_input(
+        result, _ai_settings_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 async def _ai_trigger_fa_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
-    owner_id = await _get_owner_id()
     text_stripped = text.strip()
     if text_stripped.lower() == "clear":
         from backend.ai.config_store import update_setting
-        await update_setting(owner_id, "trigger_fa", "")
-        result = "✅ Persian trigger cleared."
+        await update_setting(await _get_owner_id(), "trigger_fa", "")
+        result = "✅ Persian wake word cleared."
     elif " " in text_stripped:
-        result = "❌ Trigger must be a single word (no spaces)."
+        result = "❌ Wake word must be a single word."
     else:
-        config = await _get_saved_config(owner_id)
+        config = await _get_saved_config(await _get_owner_id())
         existing_en = config.get("trigger_en", "") or ""
         if text_stripped and existing_en and text_stripped.lower() == existing_en.lower():
-            result = "❌ Persian trigger must differ from English trigger."
+            result = "❌ Persian wake word must differ from the English one."
         else:
             from backend.ai.config_store import update_setting
-            await update_setting(owner_id, "trigger_fa", text_stripped)
-            result = f"✅ Persian trigger set to: `{text_stripped}`" if text_stripped else "✅ Persian trigger cleared."
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+            await update_setting(await _get_owner_id(), "trigger_fa", text_stripped)
+            result = (
+                f"✅ Persian wake word set to `{text_stripped}`"
+                if text_stripped else "✅ Persian wake word cleared."
+            )
+    await _finish_input(
+        result, _ai_settings_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 async def _ai_system_prompt_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.helper.inline_engine import _self_client
     owner_id = await _get_owner_id()
     from backend.ai.config_store import update_setting
-    await update_setting(owner_id, "system_prompt", text.strip())
-    result = "✅ System prompt updated."
-    from backend.helper.client import get_client
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception:
-            pass
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
+    stripped = text.strip()
+    if stripped.lower() == "reset":
+        await update_setting(owner_id, "system_prompt", "")
+        result = "✅ Personality prompt reset to default."
+    else:
+        await update_setting(owner_id, "system_prompt", stripped)
+        result = "✅ Personality prompt updated."
+    await _finish_input(
+        result, _ai_settings_adv_panel_handler,
+        chat_id, msg_id, inline_chat_id, inline_msg_id,
+    )
 
 
 def register(client, owner_id: int) -> None:
@@ -1339,6 +1363,8 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_wizard", _ai_wizard_inline_builder)
         register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="⚙️ Settings")
         register_inline_builder("ai_settings", _ai_settings_inline_builder)
+        register_panel("ai_settings_adv", _ai_settings_adv_panel_handler, parent="ai_settings", title="Advanced")
+        register_inline_builder("ai_settings_adv", _ai_settings_adv_inline_builder)
         register_panel("ai_usage", _ai_usage_panel_handler, parent="ai", title="📈 Usage")
         register_inline_builder("ai_usage", _ai_usage_inline_builder)
         register_panel("ai_health", _ai_health_panel_handler, parent="ai", title="🩺 Health")
@@ -1364,27 +1390,27 @@ def register(client, owner_id: int) -> None:
         register_action("ai_toggle_telemetry", _ai_toggle_telemetry_action)
         register_input("ai_settings", "trigger_en", {
             "handler": _ai_trigger_en_input,
-            "prompt": "**🔤 English Trigger**\n\nEnter a single trigger word (case-insensitive):\nOr send 'clear' to remove.\n\n_Reply below._",
+            "prompt": "**English wake word**\n\nOne word, said before your message.\nSend 'clear' to remove.\n\n_Reply below._",
         })
         register_input("ai_settings", "trigger_fa", {
             "handler": _ai_trigger_fa_input,
-            "prompt": "**🇮🇷 Persian Trigger**\n\nEnter a single trigger word (exact match):\nOr send 'clear' to remove.\n\n_Reply below._",
+            "prompt": "**Persian wake word**\n\nOne word, exact match.\nSend 'clear' to remove.\n\n_Reply below._",
         })
         register_input("ai_settings", "temperature", {
             "handler": _ai_temperature_input,
-            "prompt": "**🌡 Temperature**\n\nEnter value (0.0 – 2.0):\n\n_Reply below._",
+            "prompt": "**Creativity**\n\nEnter 0.0 – 2.0.\nLower = focused, higher = creative.\n\n_Reply below._",
         })
         register_input("ai_settings", "max_tokens", {
             "handler": _ai_max_tokens_input,
-            "prompt": "**📦 Max Tokens**\n\nEnter a positive integer:\n\n_Reply below._",
+            "prompt": "**Response length**\n\nMaximum tokens per reply.\nEnter a positive number.\n\n_Reply below._",
         })
         register_input("ai_settings", "history_budget", {
             "handler": _ai_history_budget_input,
-            "prompt": "**📝 Context Budget**\n\nEnter budget in tokens (positive integer):\n\n_Reply below._",
+            "prompt": "**Conversation memory**\n\nHow many recent tokens to keep in mind.\nEnter a positive number.\n\n_Reply below._",
         })
         register_input("ai_settings", "system_prompt", {
             "handler": _ai_system_prompt_input,
-            "prompt": "**💬 System Prompt**\n\nEnter your custom system prompt:\n(or 'reset' to use default)\n\n_Reply below._",
+            "prompt": "**Personality prompt**\n\nDescribe how the assistant should talk.\nSend 'reset' to go back to default.\n\n_Reply below._",
         })
         logger.info("AI panels registered OK (simplified UX)")
     except Exception as exc:

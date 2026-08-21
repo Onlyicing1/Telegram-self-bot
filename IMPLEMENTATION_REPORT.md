@@ -1453,3 +1453,99 @@ Retry behavior: short rate-limit windows now recover in-place (bounded);
 retry/fallback facts are preserved end-to-end. Chat default unchanged;
 failure messages are now human and compact; fallback recoveries get a
 one-line note. No new text commands; no new handlers; no schema change.
+
+---
+
+# Execution Report — AI Settings UX Hierarchy Rework
+
+## Execution 12 — 2026-08-21
+
+### 1. Starting State
+
+- Starting HEAD: `c5e0c877cba43cbb0db9d976cf17e3c064f11036` (== origin/main)
+- Working tree: clean; baseline 626 passed, 0 failed, 1 warning
+
+### 2. Investigation: Element Inventory (before coding)
+
+Audited `_ai_settings_panel_handler` and classified every existing element:
+
+- **User-facing settings:** wake words (EN/FA), reply-stats toggle.
+- **Advanced settings:** Temperature, Max Tokens, Context Budget, System
+  Prompt (developer/LLM knobs).
+- **Informational state:** all current values (temperature, max tokens,
+  budget, prompt status, trigger words), missing-trigger warning.
+- **Navigation:** shared Back/Home buttons.
+- **Developer/internal diagnostics:** none on this panel (separate
+  Diagnostics panel exists).
+
+Problems confirmed: state values rendered as button rows (info mixed with
+actions), technical terminology on the personal surface ("Context Budget",
+"System Prompt", "Temperature"), an emoji prefix on every row, flat
+structure with no hierarchy, and input completion replacing the panel with
+a bare "✅ …" that stranded the user without navigation.
+
+### 3. Redesign (hierarchy, not renaming)
+
+**Settings (personal surface)** — `backend/bot/handlers/ai.py`
+- Text carries STATE: a plain sentence with the wake words ("Say "Nova"
+  (or "…" in Persian) to talk to the assistant."), a warning when none is
+  set, and `Reply stats · On/Off`.
+- Buttons carry ACTIONS only, short natural labels, zero decoration:
+  English wake word · Persian wake word · Turn reply stats off/on ·
+  Advanced. No technical knob remains on this surface.
+
+**Advanced (new panel `ai_settings_adv`, parent=ai_settings)**
+- Text states the four knobs in human terms: Creativity, Response length
+  up to N tokens, Remembers about N tokens of conversation, Personality
+  prompt · Custom/Default.
+- Buttons reuse the EXISTING input keys (`input:ai_settings:*`) — no new
+  input registrations, no duplicate handlers, same single panel registry.
+
+**Input completion (`_finish_input`)** — one edit total: confirmation
+notice on top + refreshed panel body + restored buttons via
+`render_edit` + Telethon `edit_message(..., buttons=...)`; falls back to
+the bare notice if rendering fails. The owner's value reply is still
+deleted (zero spam). Wake-word inputs restore Settings; knob inputs
+restore Advanced.
+
+**Copy pass** — prompts and confirmations use human terms (Creativity,
+Response length, Conversation memory, Personality prompt); error hints
+show examples ("Enter a number like 4096"). Start-chat guidance aligned
+("wake word" wording, no emoji headers). Fixed a broken promise: the
+system-prompt prompt advertised 'reset' but the handler never implemented
+it — 'reset' now clears to default.
+
+### 4. Files Changed
+
+- `backend/bot/handlers/ai.py` — settings hierarchy rework (§3); module
+  docstring updated; registration adds ai_settings_adv (+inline builder)
+- `tests/test_36_ai_settings_ux.py` — NEW, 9 tests
+
+No backend behavior changed beyond the UI copy/flow: same config store,
+same inputs/actions/callback keys, same edit-in-place delivery, no new
+text commands.
+
+### 5. Tests Added
+
+State-in-text/not-in-buttons; technical knobs absent from the personal
+surface (label AND callback scan); no-wake-word warning; Advanced panel
+holds all four controls in plain terms; registration adds the Advanced
+panel with all six inputs still unique; `_finish_input` restores the
+panel in ONE edit with buttons (and degrades to bare notice);
+personality 'reset' clears; multi-word wake word rejected without saving.
+
+### 6. Validation (all actually run)
+
+- `python3 -m compileall -q backend` — PASS
+- `tests/test_36_ai_settings_ux.py` — 9 passed
+- Full suite: **635 passed, 0 failed, 1 warning** (baseline 626 + 9)
+- `npx tsc -b --noEmit` — exit 0
+- `npm run build` — ✓ built
+- `git diff --check` — PASS; protected documents untouched
+
+### 7. Baseline Comparison / Impact
+
+Before: 626 passed → After: **635 passed, 0 failed**, same single warning.
+Database/schema: none. Runtime: settings surfaces only; chat delivery and
+all other panels untouched. No duplicate handlers or second UI
+architecture introduced.
