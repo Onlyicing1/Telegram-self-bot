@@ -1315,3 +1315,141 @@ Chat default unchanged (compact stats still opt-in). Model selector fits ~2×
 models per screen with deterministic ordering. Failed/fallback executions now
 report honest unavailable usage instead of estimated figures.
 
+
+---
+
+# Execution Report — Retry System, Retry/Fallback UX, AI Polish Pass
+
+## Execution 11 — 2026-08-21
+
+### 1. Starting State
+
+- Starting HEAD: `4cbf4015c4bc04a6b915dde1fb3527f57c4d8c68` (== origin/main)
+- Working tree: clean
+- Baseline: 608 passed, 0 failed, 1 warning; tsc + frontend build green
+
+### 2. Investigation Performed
+
+Traced the complete retry lifecycle: request → ProviderManager.chat →
+_attempt_with_retry → failure classification (RETRYABLE_FAILURES /
+AUTH_FAILURES / request / model_not_found / rate_limited) → fallback chain →
+emergency fallback → dispatcher metadata merge → telemetry record →
+ai_unified delivery. Findings:
+
+1. **Rate limits were never retried and Retry-After was only used for the
+   cooldown clock** — a short provider window (Gemini hardcodes 5s;
+   openai_compat reads the header, default 5s) was treated the same as a
+   120s window: instant failover even when waiting 2s would have succeeded.
+2. **Retry counts were lost across the fallback chain** — a failed
+   candidate's bounded retry was not stamped on its failure response, so a
+   later fallback success reported retry_count=0 even though the request
+   had already retried once.
+3. **Failure UX echoed generic text** ("AI is temporarily unavailable…")
+   with no recovery facts, and the raw provider error string was the only
+   classification input on one branch.
+
+### 3. Retry System Changes (backend/ai/providers/manager/manager.py)
+
+- New `_RATE_LIMIT_MAX_WAIT_SECONDS = 5.0` and `_retry_after_seconds()`.
+- `rate_limited` failures now honor a SHORT provider Retry-After (≤5s) with
+  EXACTLY ONE bounded retry after waiting that window; long windows never
+  wait and fail over immediately. Bounded: max 1 rate-limit retry, no
+  storms, deterministic.
+- Transient (network/timeout/server) retry failures now stamp
+  `ai_retry_count=1` on the failed response too (the retry DID happen).
+- `chat()` accumulates `ai_retry_count` across failed candidates and merges
+  the total into the eventual success metadata; `_fallback()` receives
+  `retries=` and stamps it on the terminal response. Telemetry now reports
+  a request's true recovery effort.
+
+### 4. Retry/Fallback UX (backend/bot/handlers/ai_unified.py)
+
+- New `_failure_notice()` + `_format_failure()`: failures render as
+  "✕ Couldn't get a response / Rate limited / ↻ 1 retry · backup tried" —
+  human reasons from the normalized `failure_type`, never HTTP codes,
+  tracebacks, or provider internals. Auth keeps its API-key hint; the
+  legacy no-metadata path keeps `_humanize_error`.
+- Success path appends "_↻ Backup model used_" (one line, edit-in-place)
+  whenever a fallback recovered the request, independent of the stats
+  preference; the optional compact stats line follows the existing
+  preference. No new messages are created — still edit-in-place, still
+  zero-spam.
+
+### 5. AI UI Polish (backend/bot/handlers/ai.py)
+
+- Model selector: 3-line header compressed to one line
+  (`_N models · page 1/3 · Free (8) first_`) — vertical space now belongs
+  to the two-column grid.
+- Details: estimated marker simplified to "≈"; the recovery row is now
+  human ("Backup  Used" / "Backup  —" instead of "Fallback Yes/No").
+- Health: restructured to answer one question — headline ("AI is
+  healthy / degraded / offline"), identity line (model · provider), a
+  one-line cause when degraded/offline, then "Last response · 2.7s · 2.6k
+  tokens" and "Backup · Available". No code block, no developer states.
+- `compact_telemetry_line` docstring updated: recovery stays in the
+  delivery layer so the stats line remains purely latency/tokens.
+
+### 6. Token/Usage Behavior
+
+No changes to token honesty (actual / ≈ estimated / Unavailable contract
+unchanged and still pinned by tests).
+
+### 7. Files Changed
+
+- `backend/ai/providers/manager/manager.py` — retry classification bounds,
+  Retry-After window retry, retry-count preservation (see §3)
+- `backend/bot/handlers/ai_unified.py` — failure notice + backup note (§4)
+- `backend/bot/handlers/ai.py` — selector header, Details, Health (§5)
+- `backend/ai/engine/telemetry.py` — docstring only
+- `tests/test_35_ai_retry_ux.py` — NEW, 18 tests (§8)
+- `tests/test_17_providers.py` — 429 contract updated: long-window case
+  (`retry_after=60`) still asserts no-wait/no-retry/failover/cooldown;
+  short-window behavior intentionally changed by this pass and covered in
+  test_35
+- `tests/test_33_ai_telemetry.py` — Health offline assertion updated to the
+  new "AI is offline" headline (intentional design change)
+- `tests/test_34_ai_model_ui.py` — Details assertions updated to the
+  humanized "Backup/Used" row and "≈" marker (intentional design change)
+
+### 8. Tests Added (tests/test_35_ai_retry_ux.py — 18)
+
+Non-retryable never retries; auth disables without retry; transient
+retries exactly once (success + failure stamping); short Retry-After waits
+and retries once; long window never stalls (no sleep, cooldown instead);
+missing Retry-After fails over immediately; fallback success accumulates
+retry count with fallback_from/to; terminal failure preserves per-provider
+retries + errors; failure notice translates classification without
+internals (no "429"/"HTTP"), pluralizes retries, auth config hint, legacy
+path; failure message hierarchy; Health healthy/degraded/offline with
+causes; end-to-end rate-limited-primary → backup records EXACTLY ONE
+telemetry entry with true retry/fallback facts.
+
+### 9. Validation (all actually run)
+
+- `python3 -m compileall -q backend` — PASS
+- `tests/test_35` + `test_34` + `test_33`: 54 passed
+- Full suite: **626 passed, 0 failed, 1 warning** (baseline 608 + 18 new)
+- `npx tsc -b --noEmit` — exit 0
+- `npm run build` — ✓ built (dist unchanged in repo, gitignored)
+- `git diff --check` — PASS
+- Protected docs (DATABASE_ARCHITECTURE / AI_MASTER_DESIGN / INVESTIGATION /
+  README / OBSERVABILITY set): zero diff
+
+### 10. Baseline Comparison
+
+Before: 608 passed, 0 failed, 1 warning → After: **626 passed, 0 failed,
+1 warning**. The single warning is the pre-existing suite warning. No
+regressions; three test contracts updated to the new intentional design
+(§7) without weakening coverage.
+
+### 11. Database / Schema Impact
+
+None. Telemetry remains bounded in-RAM. No SQL, migration, or Supabase
+change. No protected document touched.
+
+### 12. Runtime Impact
+
+Retry behavior: short rate-limit windows now recover in-place (bounded);
+retry/fallback facts are preserved end-to-end. Chat default unchanged;
+failure messages are now human and compact; fallback recoveries get a
+one-line note. No new text commands; no new handlers; no schema change.

@@ -195,6 +195,45 @@ def _format_error(user_message: str, trigger_label: str, error: str) -> str:
     )
 
 
+def _format_failure(user_message: str, trigger_label: str, notice: str) -> str:
+    return (
+        f"{user_message}\n"
+        f"────────────\n"
+        f"🤖 {trigger_label}\n"
+        f"{notice}"
+    )
+
+
+def _failure_notice(result) -> str:
+    """Compact, human notice for a failed AI execution.
+
+    Reads ONLY the dispatcher's normalized metadata — never raw provider
+    errors, HTTP codes, or tracebacks. Each line answers one question:
+    what happened, why, and whether recovery was attempted.
+    """
+    from backend.ai.engine.telemetry import humanize_failure
+
+    metadata = getattr(result, "metadata", None) or {}
+    errors = getattr(result, "errors", None) or []
+    raw = str(errors[-1]) if errors else str(getattr(result, "response", "") or "")
+    ftype = str(metadata.get("failure_type", "") or "")
+    if not ftype:
+        return _humanize_error(raw)
+    reason = humanize_failure(ftype, raw)
+    recovery: list[str] = []
+    retries = int(metadata.get("retry_count", 0) or 0)
+    if retries > 0:
+        recovery.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
+    if metadata.get("fallback_used"):
+        recovery.append("backup tried")
+    lines = ["✕ Couldn't get a response", reason]
+    if ftype == "auth":
+        lines.append("Check your API key configuration.")
+    if recovery:
+        lines.append(f"↻ {' · '.join(recovery)}")
+    return "\n".join(lines)
+
+
 def _describe_empty_result(result) -> str:
     """Turn an empty EngineResult into a meaningful, deterministic message.
 
@@ -531,14 +570,22 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                     f"{response_text}\n\n⚠️ Tool round limit reached — "
                     f"{pending} pending tool call(s) were not executed."
                 )
-            # Optional compact per-request telemetry (user preference, off by
-            # default). Never invent numbers: the line renders from the
+            # Secondary status under the answer — never a diagnostic block.
+            # A fallback recovery gets its own one-line note (the user should
+            # know a backup model answered); the optional compact per-request
+            # telemetry line follows the owner's preference (off by default).
+            # Neither ever invents numbers: the line renders from the
             # normalized execution record and omits unavailable usage.
             from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
+            notes: list[str] = []
+            if result.metadata.get("fallback_used"):
+                notes.append("_↻ Backup model used_")
             if telemetry.get_telemetry_pref(owner_id):
                 line = compact_telemetry_line(telemetry.last())
                 if line:
-                    response_text = f"{response_text}\n\n_{line}_"
+                    notes.append(f"_{line}_")
+            if notes:
+                response_text = f"{response_text}\n\n" + "\n".join(notes)
             delivery_result = await deliver_response(
                 event, display_prompt, trigger_label, response_text,
             )
@@ -561,28 +608,18 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 provider=result.provider,
                 model=result.model,
             )
-        elif result.errors:
+        elif result.errors or result.response:
             logger.info(
                 "AI_PROVIDER_FAILURE id=%s provider=%s model=%s",
                 rid, result.provider, result.model,
             )
-            error_msg = _humanize_error(result.errors[0])
-            final_text = _format_error(display_prompt, trigger_label, error_msg)
+            final_text = _format_failure(
+                display_prompt, trigger_label, _failure_notice(result)
+            )
             try:
                 await event.edit(final_text)
             except Exception as exc:
                 logger.warning("AI handler: failed to edit error response: %s", exc)
-                try:
-                    await event.reply(final_text)
-                except Exception:
-                    pass
-        elif result.response:
-            error_msg = _humanize_error(result.response)
-            final_text = _format_error(display_prompt, trigger_label, error_msg)
-            try:
-                await event.edit(final_text)
-            except Exception as exc:
-                logger.warning("AI handler: failed to edit provider error: %s", exc)
                 try:
                     await event.reply(final_text)
                 except Exception:

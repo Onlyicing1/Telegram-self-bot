@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 _PROVIDER_RPC_TIMEOUT = 30.0
 _MAX_RETRIES = 1
 _RETRY_BACKOFF_SECONDS = 1.0
+# A rate limit is only worth waiting out when the provider's own Retry-After
+# is short enough that waiting beats failing over to another provider.
+_RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_CONCURRENCY = 4
 _PROVIDER_CONCURRENCY: dict[str, int] = {"zai": 2}
 _MODEL_UNAVAILABLE_TTL = 3600.0
@@ -122,6 +125,10 @@ class ProviderManager:
         first = candidates[0][0] if candidates else ""
         matrix: list[dict[str, Any]] = []
         failures: list[str] = []
+        # Retries experienced by failed candidates before the eventual
+        # success — preserved so telemetry reports the request's true
+        # recovery effort, not just the winning candidate's.
+        total_retries = 0
         eligible: list[tuple[float, str, BaseProvider]] = []
 
         for name, provider in candidates:
@@ -178,12 +185,17 @@ class ProviderManager:
                     )
                     response = replace(response, metadata=meta)
                 meta = dict(response.metadata or {})
+                if total_retries:
+                    meta["ai_retry_count"] = int(meta.get("ai_retry_count", 0) or 0) + total_retries
                 meta["provider_matrix"] = matrix
                 return replace(response, metadata=meta)
+            total_retries += int((response.metadata or {}).get("ai_retry_count", 0) or 0)
             matrix.append({"provider": name, "outcome": "failed", "reason": (response.text or "")[:200]})
             failures.append(f"{name}: success=False ({response.text[:200]})")
 
-        return await self._fallback(messages, failures=failures, matrix=matrix, **kwargs)
+        return await self._fallback(
+            messages, failures=failures, matrix=matrix, retries=total_retries, **kwargs
+        )
 
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
@@ -541,6 +553,30 @@ class ProviderManager:
                 name, model, ftype, ftype in RETRYABLE_FAILURES,
             )
             if ftype not in RETRYABLE_FAILURES:
+                if ftype == "rate_limited":
+                    # Honor a SHORT Retry-After with exactly one retry — a
+                    # brief window is worth waiting out; a long one would
+                    # stall the request, so the caller fails over instead.
+                    wait = self._retry_after_seconds(response)
+                    if 0 < wait <= _RATE_LIMIT_MAX_WAIT_SECONDS:
+                        await asyncio.sleep(wait)
+                        logger.info(
+                            "AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2 reason=rate_limit_window",
+                            name, model,
+                        )
+                        retry_response = await self._call_once(provider, messages, kwargs)
+                        if retry_response.success:
+                            self._health.record_success(name)
+                            self._note_response_quality(name, retry_response, kwargs)
+                            logger.info(
+                                "AI_PROVIDER_FAILURE provider=%s model=%s category=RATE_LIMIT_RECOVERED",
+                                name, model,
+                            )
+                            return self._with_retry_metadata(retry_response, 1)
+                        self._apply_failure(
+                            name, self._failure_type(retry_response), retry_response
+                        )
+                        return self._with_retry_metadata(retry_response, 1)
                 self._apply_failure(name, ftype, response)
                 return response
 
@@ -559,7 +595,17 @@ class ProviderManager:
                 return self._with_retry_metadata(retry_response, 1)
 
             self._apply_failure(name, self._failure_type(retry_response), retry_response)
-            return retry_response
+            # The retry DID happen — stamp it so a later fallback success
+            # (or the terminal failure) can report the true retry count.
+            return self._with_retry_metadata(retry_response, 1)
+
+    @staticmethod
+    def _retry_after_seconds(response: ProviderResponse) -> float:
+        """Provider-advertised Retry-After in seconds, 0 when absent/invalid."""
+        try:
+            return max(0.0, float((response.metadata or {}).get("retry_after", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _failure_type(response: ProviderResponse) -> str:
@@ -668,6 +714,7 @@ class ProviderManager:
         messages: list[dict[str, Any]],
         failures: list[str] | None = None,
         matrix: list[dict[str, Any]] | None = None,
+        retries: int = 0,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Emergency fallback — always returns success=False with diagnostics.
@@ -700,6 +747,7 @@ class ProviderManager:
                 "errors": errors,
                 "provider_matrix": list(matrix or []),
                 "fallback_chain_tried": list(self._fallback_chain),
+                "ai_retry_count": int(retries or 0),
             },
         )
 

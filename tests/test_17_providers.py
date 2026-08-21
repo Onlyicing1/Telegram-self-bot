@@ -192,8 +192,11 @@ async def test_delete_tool_accepts_persian_count():
 
 
 @pytest.mark.asyncio
-async def test_429_cooldown_then_fallback_without_retry():
-    rate = _StubProvider("rate", [_failure("Rate limited.", http_status=429, retry_after=1)])
+async def test_429_long_window_cooldown_then_fallback_without_retry():
+    # A LONG Retry-After must never stall the request: no wait, no retry —
+    # the provider cools down and the chain fails over. (A SHORT window ≤5s
+    # is honored with exactly one bounded retry — see test_35.)
+    rate = _StubProvider("rate", [_failure("Rate limited.", http_status=429, retry_after=60)])
     backup = _StubProvider("backup", [ProviderResponse(text="recovered", provider_name="backup", success=True)])
 
     pm = ProviderManager()

@@ -378,12 +378,12 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     page_models = ordered[start:start + _MODEL_PAGE_SIZE]
     current_model = config.get("model", "")
     free_count = sum(1 for m in ordered if m.is_free)
-    lines = [
-        f"**🤖 Model Selection**\n",
-        f"_{total} models · Page {page + 1}/{total_pages}_\n",
-    ]
+    # One compact header line — vertical space belongs to the model grid,
+    # not to repeated headings.
+    header = f"_{total} models · page {page + 1}/{total_pages}"
     if free_count:
-        lines.append(f"_Free ({free_count}) pinned first_\n")
+        header += f" · Free ({free_count}) first"
+    lines = [header + "_"]
     builder = InlinePanelBuilder()
     # Two-column grid: pairs share one button row, so roughly twice as many
     # models fit per screen. Callbacks carry a stable list INDEX plus a short
@@ -536,7 +536,7 @@ async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] 
         elif record.input_tokens == 0 and record.output_tokens == 0:
             tokens = "Unavailable"
         else:
-            est = " ≈ est." if record.token_source == "estimated" else ""
+            est = " ≈" if record.token_source == "estimated" else ""
             tokens = (
                 f"{format_tokens_exact(record.input_tokens)} in · "
                 f"{format_tokens_exact(record.output_tokens)} out{est}"
@@ -568,7 +568,7 @@ async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] 
             ("Tokens", tokens),
             ("Latency", format_latency_exact(record.latency)),
             ("Retries", str(record.retry_count)),
-            ("Fallback", "Yes" if record.fallback_used else "No"),
+            ("Backup", "Used" if record.fallback_used else "—"),
             ("Tools", str(record.tool_call_count)),
             ("When", format_time_of(record.timestamp)),
         ]
@@ -643,7 +643,11 @@ async def _ai_usage_inline_builder(event, extra: str) -> list:
 
 
 async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    """Answer one question: is my AI working correctly right now?"""
+    """Answer one question: is my AI working correctly right now?
+
+    Three honest states with a one-line cause when something is wrong —
+    diagnostics stay behind Details, never here.
+    """
     from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
 
     owner_id = await _get_owner_id()
@@ -659,8 +663,30 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
         overall = "HEALTHY"
     else:
         overall = "DEGRADED"
+    cause = ""
+    if overall == "OFFLINE":
+        cause = "No provider configured" if not configured else "AI engine unavailable"
+    elif overall == "DEGRADED":
+        if record is not None and record.status == "failed" and engine_info["connected"]:
+            cause = f"Last request failed — {record.error_reason}"
+        else:
+            cause = "Provider unreachable"
     if overall == "HEALTHY" and record is not None and record.status == "failed":
         overall = "DEGRADED"
+        cause = f"Last request failed — {record.error_reason}"
+
+    headline = {
+        "HEALTHY": "AI is healthy",
+        "DEGRADED": "AI is degraded",
+        "OFFLINE": "AI is offline",
+    }[overall]
+    lines = [f"**{headline}**"]
+    if configured:
+        model_name = config.get("model", "—") or engine_info["model"]
+        lines.append(f"{model_name} · {_provider_display(config.get('provider', ''))}")
+    if cause:
+        lines.append(cause)
+    lines.append("")
 
     try:
         available = [p for p in await _discover() if p.status == "available"]
@@ -668,27 +694,13 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
     except Exception:
         fallback_state = "—"
 
-    if record is not None:
-        last_req = compact_telemetry_line(record)
-        if record.status == "failed":
-            last_req = f"Failed — {record.error_reason}"
+    if record is not None and record.status == "success":
+        lines.append(f"Last response · {compact_telemetry_line(record)}")
+    elif record is not None:
+        lines.append(f"Last request failed — {record.error_reason}")
     else:
-        last_req = "—"
-
-    model_name = config.get("model", "—") or engine_info["model"]
-    provider_line = (
-        f"{_provider_display(config.get('provider', ''))} · "
-        f"{'Ready' if engine_info['connected'] else 'Offline'}"
-    )
-    rows = [
-        ("Provider", provider_line),
-        ("Model", model_name or "—"),
-        ("Fallback", fallback_state),
-        ("Last request", last_req),
-    ]
-    width = max(len(label) for label, _ in rows)
-    body = "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
-    lines = ["**AI · Health**\n", f"**{overall}**\n", f"```\n{body}\n```"]
+        lines.append("No requests yet")
+    lines.append(f"Backup · {fallback_state}")
 
     builder = InlinePanelBuilder()
     builder.add_row("🔄 Refresh", "action:ai_health_refresh")

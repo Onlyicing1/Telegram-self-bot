@@ -310,8 +310,9 @@ async def test_details_failed_rate_limited_fallback_shows_unavailable_tokens():
         title, body, buttons = await ai_module._ai_details_panel_handler(None, "")
 
     assert "Failed — Rate limited" in body
-    assert "Fallback" in body
-    assert "Yes" in body
+    # Humanized recovery row: a used backup is stated, never "fallback_used=True".
+    assert "Backup" in body
+    assert "Used" in body
     assert "Unavailable" in body
     # No fabricated usage anywhere; nothing consumed → context unavailable.
     assert "≈ est." not in body
@@ -344,7 +345,7 @@ async def test_details_marks_estimated_usage_and_unknown_limit():
     with patch.object(ai_module, "_resolve_context_limit", AsyncMock(return_value=0)):
         title, body, buttons = await ai_module._ai_details_panel_handler(None, "")
 
-    assert "≈ est." in body
+    assert "≈" in body
     assert "limit unknown" in body
 
 

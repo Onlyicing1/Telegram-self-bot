@@ -153,7 +153,8 @@ def compact_telemetry_line(record: "AIExecutionRecord | None") -> str:
     """One restrained telemetry line for the chat view: "2.7s · 2.6k tokens".
 
     Estimated usage is explicitly marked with "≈"; unavailable usage is
-    omitted entirely rather than invented.
+    omitted entirely rather than invented. Recovery (fallback) is reported
+    separately by the delivery layer so the two signals stay readable.
     """
     if record is None:
         return ""

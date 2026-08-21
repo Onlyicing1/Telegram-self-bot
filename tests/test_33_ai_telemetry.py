@@ -326,7 +326,7 @@ async def test_ai_health_panel_renders_offline_without_config():
         title, body, buttons = await ai_module._ai_health_panel_handler(None, "")
 
     assert title == "AI · Health"
-    assert "OFFLINE" in body
+    assert "AI is offline" in body
 
 
 @pytest.mark.asyncio
