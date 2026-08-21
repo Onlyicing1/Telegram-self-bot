@@ -654,19 +654,20 @@ fields remain intentionally preserved.
 
 ### 10. Commit
 
-`8f7f2d5` (full hash recorded after commit).
+`b39a29f39494ef50c8e36ba1dd94ff9082af338f`.
 
 ### 11. Push Result
 
-Recorded after delivery below.
+Push succeeded: `7abfea6..b39a29f main -> main`.
 
 ### 12. Remote Verification
 
-Recorded after delivery below.
+After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
+`b39a29f39494ef50c8e36ba1dd94ff9082af338f`.
 
 ### 13. Final Working Tree
 
-Recorded after delivery below.
+`git status --short` was clean after synchronization.
 
 ---
 
