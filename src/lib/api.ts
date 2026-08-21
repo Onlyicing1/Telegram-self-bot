@@ -150,8 +150,6 @@ async function fetchJSON<T>(path: string): Promise<T> {
 export const api = {
   saves: (limit = 50, offset = 0) =>
     fetchJSON<{ items: SavedItem[]; total: number }>(`/saves?limit=${limit}&offset=${offset}`),
-  save: (code: string) =>
-    fetchJSON<SavedItem>(`/saves/${code}`),
   bio: () =>
     fetchJSON<BioState>(`/bio`),
   logs: (limit = 100) =>
