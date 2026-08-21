@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import datetime, time as datetime_time, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -224,27 +224,36 @@ async def delete_verified_self_messages(
     return deleted, rejected
 
 
-async def _parse_cutoff(value: Any, tz_name: str = "UTC") -> datetime | None:
-    """Parse an ISO timestamp or a local HH:MM cutoff without guessing IDs."""
+def _load_tz(tz_name: str) -> tzinfo:
+    """Resolve a configured timezone with a deterministic fallback."""
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        # Some minimal containers omit the system tzdata package. Tehran
+        # has used a fixed UTC+03:30 offset since its 2022 DST change;
+        # keep local cutoff semantics deterministic there instead of
+        # silently interpreting HH:MM as UTC.
+        if tz_name == "Asia/Tehran":
+            return timezone(timedelta(hours=3, minutes=30))
+        return timezone.utc
+
+
+async def _parse_cutoff(value: Any, tz_name: str = "UTC") -> tuple[datetime | None, bool]:
+    """Parse an ISO timestamp, a date keyword, or a local HH:MM cutoff.
+
+    Returns ``(cutoff, is_daily)``. ``is_daily`` is True only for a bare
+    HH:MM wall-clock cutoff, which must be anchored to each message's own
+    local date instead of the current date.
+    """
     if value is None:
-        return None
+        return None, False
     if isinstance(value, datetime):
         dt = value
     else:
         text = str(value).strip()
         if not text:
-            return None
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            # Some minimal containers omit the system tzdata package. Tehran
-            # has used a fixed UTC+03:30 offset since its 2022 DST change;
-            # keep local cutoff semantics deterministic there instead of
-            # silently interpreting HH:MM as UTC.
-            if tz_name == "Asia/Tehran":
-                tz = timezone(timedelta(hours=3, minutes=30))
-            else:
-                tz = timezone.utc
+            return None, False
+        tz = _load_tz(tz_name)
         if text.casefold() in {"today", "امروز"}:
             now = datetime.now(tz)
             dt = datetime.combine(now.date(), datetime_time.min, tzinfo=tz)
@@ -259,17 +268,25 @@ async def _parse_cutoff(value: Any, tz_name: str = "UTC") -> datetime | None:
                 try:
                     parsed = datetime_time.fromisoformat(text)
                 except ValueError:
-                    return None
+                    return None, False
                 now = datetime.now(tz)
                 dt = datetime.combine(now.date(), parsed, tzinfo=tz)
-            else:
-                try:
-                    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-                except ValueError:
-                    return None
+                return dt, True
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None, False
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt, False
+
+
+def _daily_cutoff_for(msg_date: datetime, cutoff: datetime, tz_name: str) -> datetime:
+    """Anchor a daily wall-clock cutoff to the message's own local date."""
+    local = msg_date.astimezone(_load_tz(tz_name))
+    return local.replace(
+        hour=cutoff.hour, minute=cutoff.minute, second=0, microsecond=0,
+    )
 
 
 def _message_text(msg) -> str:
@@ -298,8 +315,8 @@ async def select_self_owned_message_ids(
     """
     if count is not None and (count < 1 or count > 500):
         return [], 0, ValueError("count must be between 1 and 500")
-    cutoff = await _parse_cutoff(until_time, tz_name)
-    floor = await _parse_cutoff(after_time, tz_name)
+    cutoff, cutoff_daily = await _parse_cutoff(until_time, tz_name)
+    floor, floor_daily = await _parse_cutoff(after_time, tz_name)
     if (until_time is not None and cutoff is None) or (after_time is not None and floor is None):
         return [], 0, ValueError("invalid time range")
     if boundary_id is not None and boundary_id <= 0:
@@ -351,12 +368,23 @@ async def select_self_owned_message_ids(
                     msg_date = None
                 elif msg_date.tzinfo is None:
                     msg_date = msg_date.replace(tzinfo=timezone.utc)
-                if msg_date is not None and cutoff is not None and msg_date > cutoff:
-                    continue
-                if msg_date is not None and floor is not None and msg_date < floor:
-                    # History is newest-first, so older messages cannot enter
-                    # a bounded time range after this point.
-                    break
+                if msg_date is not None and cutoff is not None:
+                    if cutoff_daily:
+                        if msg_date > _daily_cutoff_for(msg_date, cutoff, tz_name):
+                            continue
+                    elif msg_date > cutoff:
+                        continue
+                if msg_date is not None and floor is not None:
+                    if floor_daily:
+                        if msg_date < _daily_cutoff_for(msg_date, floor, tz_name):
+                            # A daily floor is per-message: older messages on
+                            # earlier dates can still be after the wall-clock
+                            # time, so the newest-first scan must not stop.
+                            continue
+                    elif msg_date < floor:
+                        # History is newest-first, so older messages cannot
+                        # enter a bounded absolute time range after this point.
+                        break
             elif cutoff is not None or floor is not None:
                 continue
 

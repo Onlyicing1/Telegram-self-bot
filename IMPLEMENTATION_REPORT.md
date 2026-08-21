@@ -996,3 +996,102 @@ Recorded after delivery.
 
 Recorded after delivery.
 
+---
+
+# Execution Report — Tehran Local Cutoff Timezone Conversion Fix
+
+## Execution 8 — 2026-08-21
+
+### Execution Summary
+
+Fixed the pre-existing Delete-service timezone failure by correcting how a
+bare HH:MM cutoff is interpreted. The full suite went from
+**571 passed / 1 failed** to **572 passed / 0 failed**.
+
+### Starting State
+
+- Starting HEAD: `4d779b9af2d1d04b2e66343e1a551b3dbde53745`
+- Starting working tree: clean
+- Baseline full suite: **571 passed, 1 failed, 1 warning**
+- Failing test:
+  `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`
+
+### Root Cause
+
+`backend/services/delete_service.py::_parse_cutoff` anchored a bare HH:MM
+cutoff (e.g. `"09:00"`) to `datetime.now(tz).date()` — the current date.
+Messages from earlier dates therefore always compared as "before today
+09:00" and were all considered, instead of each message being compared
+against the cutoff converted to that message's own local date. The test
+specifies the intended semantic: a daily wall-clock cutoff must be converted
+against each message's timezone/date.
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `backend/services/delete_service.py` | Timezone/cutoff fix (only source file changed) |
+| `IMPLEMENTATION_REPORT.md` | Appended this execution record |
+
+### Exact Behavior Fixed
+
+- Extracted the ZoneInfo/fixed-offset resolution into `_load_tz` (one timezone
+  system, unchanged fallback semantics).
+- `_parse_cutoff` now returns `(cutoff, is_daily)`; `is_daily` is True only
+  for a bare HH:MM wall-clock cutoff.
+- New `_daily_cutoff_for` anchors a daily cutoff to each message's own local
+  date (`msg_date.astimezone(tz)` then `replace(hour, minute)`).
+- Absolute timestamps and the `today`/`yesterday` keywords keep their
+  existing absolute semantics unchanged.
+- Daily floors use `continue` (older dates can still be after the wall-clock
+  time); absolute floors keep the newest-first `break`.
+
+### Validation (all actually run)
+
+- `tests/test_31_delete_rpc_failures.py`: **4 passed**.
+- All Delete modules (`test_26` through `test_32`): **137 passed**.
+- Full suite `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`:
+  **572 passed, 0 failed, 1 warning**.
+- `python3 -m compileall -q backend`: passed.
+- `npx tsc -b --noEmit`: passed.
+- `npm run build`: passed (37 modules, static assets emitted to ignored
+  `dist/`).
+- `git diff --check`: passed.
+
+### Baseline Comparison
+
+The previously failing Tehran timezone test now passes; no new failure
+appeared. Expected success state **572 passed, 0 failed, 1 warning** reached.
+
+### Database / Schema Impact
+
+None. No SQL, migration, schema, Supabase code, or DB code changed.
+
+### Protected-Document Verification
+
+None of `AI_MASTER_DESIGN.md`, `DATABASE_ARCHITECTURE.md`,
+`OBSERVABILITY.md`, `PRODUCTION_CHECKLIST.md`, `PRODUCTION_VERIFICATION.md`,
+`FREEBUFF_PRE_PUSH_VERIFY.md`, or `INVESTIGATION.md` changed.
+
+### Runtime / Behavior Impact
+
+Only the timezone/cutoff comparison semantics for bare HH:MM cutoffs
+changed; absolute timestamps and date keywords are unaffected. No other
+runtime behavior changed.
+
+### Commit
+
+Recorded after delivery below.
+
+### Push Result
+
+Recorded after delivery below.
+
+### Remote Verification
+
+Recorded after delivery below.
+
+### Final Working Tree
+
+Recorded after delivery below.
+
