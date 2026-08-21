@@ -555,17 +555,18 @@ intentionally preserved under the prior evidence decisions.
 
 ### 20. Commit
 
-Recorded after delivery below.
+`1cb3844fe6ddf4b12f0197d6de49e9783f637602`
 
 ### 21. Push Result
 
-Recorded after delivery below.
+Push succeeded: `b4bea49..1cb3844 main -> main`.
 
 ### 22. Remote Verification
 
-Recorded after delivery below.
+Local `HEAD` and `origin/main` both resolve to
+`1cb3844fe6ddf4b12f0197d6de49e9783f637602`.
 
 ### 23. Final Working Tree
 
-Recorded after delivery below.
+`git status --short` is clean after the push.
 
