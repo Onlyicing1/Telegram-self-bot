@@ -2,19 +2,15 @@
 .menu    — Mother Panel — the central navigation root of LifeOS.
 Falls back to plain-text edit-in-place when the helper bot is not available.
 """
-import asyncio
 import logging
 import os
-import resource
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telethon import events
 
 from backend import health
 from backend import diagnostics as _diag_runtime
-from backend.bio import engine as bio_engine
 from backend.bot.handlers.guard import is_owner
-from backend.db import client as db_client
 from backend.helper import (
     InlinePanelBuilder,
     register_panel,
@@ -24,11 +20,7 @@ from backend.helper import (
     send_inline_panel,
     render,
     render_edit,
-    to_edit_buttons,
-    TargetContext,
-    set_target,
     get_target,
-    is_auto_close_enabled,
     toggle_auto_close,
 )
 from backend.helper.client import get_client

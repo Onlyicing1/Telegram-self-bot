@@ -77,8 +77,7 @@ backend/
 │       ├── bio.py                   # Bio profile panels
 │       ├── username.py              # Username profile panels
 │       ├── ai.py                    # AI config/status panels + AI trigger config inputs
-│       ├── ai_unified.py            # canonical trigger/reply AI activation
-│       └── organize.py              # no-op stub (moved to other panels)
+│       └── ai_unified.py            # canonical trigger/reply AI activation
 │
 ├── profile/                         # shared Bio/Username engine
 │   ├── engine.py                    # ProfileEngine (parameterized about/first_name)

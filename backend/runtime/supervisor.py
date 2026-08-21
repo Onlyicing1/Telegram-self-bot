@@ -36,13 +36,12 @@ import asyncio
 import logging
 import random
 import time
-from typing import Any
 
 from telethon import TelegramClient
 
 from backend.runtime.states import RuntimeState
 from backend.runtime.tracer import trace, trace_exception
-from backend.runtime.task_guard import immortal_create_task, guarded_create_task, set_runtime_state_ref
+from backend.runtime.task_guard import immortal_create_task, set_runtime_state_ref
 from backend.runtime.heartbeat import start_heartbeat, stop_heartbeat, update_state as update_heartbeat_state, configure as configure_heartbeat
 from backend.runtime.keepalive import start_keepalive, stop_keepalive, configure as configure_keepalive
 from backend.runtime.failsafe import start_failsafe, stop_failsafe, configure as configure_failsafe
@@ -50,14 +49,12 @@ from backend.bio import engine as bio_engine
 from backend.username import engine as username_engine
 from backend.bot.client import build_client
 from backend.bot.router import register_all
-from backend.helper.client import build_helper, disconnect_helper, register_helper_hooks, get_client as get_helper_client
+from backend.helper.client import build_helper, disconnect_helper, register_helper_hooks
 from backend.helper.inline_engine import set_self_client, set_helper_username, set_helper_id, set_owner_id
 from backend.helper.lifecycle import get_lifecycle, configure_lifecycle
 from backend.helper.target_context import clear_all as clear_all_targets
 from backend.helper.callback_trace import configure as configure_callback_trace
-from backend.helper import panels as panels_module
 from backend.helper.inline_sender import register_input_listener
-from backend.profile import scheduler as profile_scheduler
 from backend.diagnostics import record_event
 from backend.health import (
     set_runtime_state, set_telethon_connected, set_supervisor_ok,

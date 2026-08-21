@@ -7,17 +7,14 @@ registration, the error is logged and the remaining handlers still register.
 Runtime hooks are registered before command handlers so the supervisor can
 track last_update timestamps from incoming Telegram events.
 """
-import asyncio
 import logging
 import sys
-import time
 import traceback
 
 from telethon import events
 
-from backend.bot.handlers import misc, save, retrieve, delete, organize, bio, discover, database, username, ai
+from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai
 from backend.bot.handlers import ai_unified
-from backend.runtime.tracer import trace_handler_exception
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +79,6 @@ def register_all(client, owner_id: int, tz_str: str):
         ("save", lambda: save.register(client, owner_id, tz_str)),
         ("retrieve", lambda: retrieve.register(client, owner_id)),
         ("delete", lambda: delete.register(client, owner_id)),
-        ("organize", lambda: organize.register(client, owner_id)),
         ("bio", lambda: bio.register(client, owner_id, tz_str)),
         ("discover", lambda: discover.register(client, owner_id, tz_str)),
         ("database", lambda: database.register(client, owner_id, tz_str)),

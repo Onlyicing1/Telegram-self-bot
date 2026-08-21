@@ -26,7 +26,6 @@ import asyncio
 import logging
 import time
 import traceback
-from collections import deque
 
 from backend.runtime.tracer import trace
 from backend.runtime.task_guard import immortal_create_task

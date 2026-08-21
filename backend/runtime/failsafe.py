@@ -54,7 +54,6 @@ def configure(supervisor) -> None:
 
 def _get_heartbeat_ts() -> float:
     try:
-        from backend.health import _heartbeat_age, _started_at
         import backend.health as _h
         # Compute the actual heartbeat timestamp from age
         age = _h._heartbeat_age()

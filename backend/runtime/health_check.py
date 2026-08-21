@@ -15,12 +15,10 @@ The FastAPI /health endpoint and the .health panel both read from here.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from typing import Any
 
-from backend.health import snapshot as _health_snapshot, get_all_loop_progress, get_stale_loops
+from backend.health import snapshot as _health_snapshot, get_stale_loops
 
 logger = logging.getLogger(__name__)
 
