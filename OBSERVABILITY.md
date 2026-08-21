@@ -23,7 +23,6 @@ Exposes process-level and worker metrics:
 | `pending_tasks` | Number of pending asyncio tasks |
 | `task_states` | Per-task state dict |
 | `background_loops` | Per-loop state and last success time |
-| `watchdog_ok` | Whether the watchdog is healthy |
 | `heartbeat_age_s` | Age of last heartbeat in seconds |
 | `rpc_latency_ms` | Last Telegram RPC latency in ms |
 | `ai_status` | AI subsystem status (engine health, active provider/model, provider count, total requests) |
@@ -65,7 +64,7 @@ Every important runtime event is logged with a `[TRACE]` tag:
 
 ```
 [TRACE] SELF_CONNECTED gen=1 user=Parham id=123456 t=12345678.123
-[TRACE] WATCHDOG_RECOVERY_STARTED attempt=1 backoff_delay=4.0s t=12345695.000
+[TRACE] WATCHDOG_RECOVERY reason=full attempt=1 backoff_delay=4.0s t=12345695.000
 [TRACE] TASK_CRASHED task=lifeos-keepalive exc_type=ConnectionError exc_repr=... t=12345700.000
 ```
 
@@ -225,7 +224,6 @@ The crash is also logged via `tracer.trace_exception()` with the `[TRACE] FATAL_
 | `pending_tasks` | Pending asyncio tasks |
 | `background_loops` | Per-loop state and health |
 | `background_loops_health` | Summary of loop health (total, running, all_healthy) |
-| `watchdog_ok` | Watchdog health |
 | `recent_errors` | Count of recent error events |
 | `total_ai_requests` | Total AI request count |
 | `total_tokens` | Total tokens consumed |

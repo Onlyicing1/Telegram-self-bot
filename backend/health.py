@@ -25,7 +25,6 @@ import time
 
 logger = logging.getLogger(__name__)
 
-_HEARTBEAT_INTERVAL = 5.0
 _STALE_THRESHOLD = 15.0
 
 _started_at: float = 0.0
@@ -100,16 +99,6 @@ def mark_started() -> None:
     _started_at = now
     _last_heartbeat = now
     logger.info("health: process started at %.0f", now)
-
-
-def update_heartbeat() -> None:
-    global _last_heartbeat
-    _last_heartbeat = time.time()
-
-
-def set_heartbeat() -> None:
-    global _last_heartbeat
-    _last_heartbeat = time.time()
 
 
 def set_runtime_state(state: str) -> None:

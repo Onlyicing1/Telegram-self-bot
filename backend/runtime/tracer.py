@@ -7,7 +7,7 @@ so Render logs can be searched by event type:
     [TRACE] SELF_CONNECTED gen=1 user=Parham id=123456 t=12345678.123
     [TRACE] SELF_DISCONNECTED gen=1 reason=run_until_disconnected_returned t=12345690.456
     [TRACE] SELF_RUN_LOOP_EXITED gen=1 t=12345691.789
-    [TRACE] WATCHDOG_RECOVERY_STARTED attempt=1 backoff_delay=4.0s t=12345695.000
+    [TRACE] WATCHDOG_RECOVERY reason=full attempt=1 backoff_delay=4.0s t=12345695.000
     [TRACE] SELF_RECONNECTED gen=2 t=12345710.000
 
 Every event carries a monotonic timestamp (t=<seconds>) so you can compute

@@ -16,7 +16,7 @@ immortal_create_task:
   - CancelledError is re-raised; all other exceptions are logged and
     the loop sleeps with exponential backoff before calling the factory
     again.
-  - Use for every supervisor/watchdog/heartbeat/keepalive loop.
+  - Use for every supervisor/heartbeat/keepalive loop.
 
 Usage:
     from backend.runtime.task_guard import immortal_create_task

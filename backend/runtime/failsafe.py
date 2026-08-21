@@ -9,11 +9,11 @@ Every 15 seconds it checks four independent signals:
 
 If ALL four stay frozen for longer than 120 seconds, the failsafe
 triggers a HARD client reset via the supervisor's _hard_reset_runtime()
-method. This bypasses the normal watchdog/heartbeat/keepalive chain
+method. This bypasses the normal supervisor/heartbeat/keepalive chain
 entirely — those may all be stuck.
 
 Design guarantees:
-  - Does NOT depend on watchdog, heartbeat, or keepalive tasks.
+  - Does NOT depend on supervisor, heartbeat, or keepalive tasks.
   - Uses its own asyncio task (immortal — never dies from exceptions).
   - Every check is bounded — no unbounded await.
   - Calls supervisor._hard_reset_runtime() which has its own timeouts.

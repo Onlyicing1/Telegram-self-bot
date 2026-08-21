@@ -139,7 +139,7 @@ class RuntimeSupervisor:
 
     def _trace_telethon_disconnect(self, reason: str) -> None:
         trace("SELF_DISCONNECTED", gen=self.client_generation, reason=reason)
-        logger.warning("Self-client disconnected — watchdog will detect and recover")
+        logger.warning("Self-client disconnected — recovery system will detect and reconnect")
 
         try:
             from backend.runtime.crash_diagnostics import record_runtime_event, record_exception

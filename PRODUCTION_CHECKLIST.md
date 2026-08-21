@@ -57,7 +57,7 @@
 
 - [ ] RuntimeSupervisor reaches `READY` state
 - [ ] No duplicate supervisor instances
-- [ ] Watchdog running (health check shows `watchdog_ok: true`)
+- [ ] Supervisor healthy (health check shows `supervisor_ok: true`)
 - [ ] Heartbeat running (health check shows `process_alive: true`)
 - [ ] Keepalive running (RPC latency reported in health)
 - [ ] Failsafe monitor running
@@ -128,7 +128,7 @@
 - [ ] Check `[STARTUP CHECK]` log lines — all critical checks passed
 - [ ] Monitor memory usage over first hour — no upward trend
 - [ ] Monitor RPC latency — should stay under 1000ms
-- [ ] Verify watchdog has not triggered recovery (check `restart_count`)
+- [ ] Verify recovery was not unexpectedly triggered (check `restart_count`)
 
 ## Rollback Plan
 

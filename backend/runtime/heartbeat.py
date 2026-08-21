@@ -15,7 +15,7 @@ Loop instrumentation:
   - Reports its own progress via tick_loop("lifeos-heartbeat")
   - If the heartbeat itself can't run on schedule, the supervisor detects it
 
-The heartbeat is separate from the watchdog RPC check — it runs on its own
+The heartbeat is separate from the keepalive RPC check — it runs on its own
 timer and never blocks or interferes with recovery.
 """
 import asyncio

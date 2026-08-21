@@ -57,8 +57,8 @@ becomes available — interactive inline-button panels for every feature.
 ### Key Highlights
 
 - **Headless** — runs as a single `asyncio` process, no interactive login.
-- **Self-healing** — runtime supervisor with watchdog detects
-  disconnections and rebuilds the client automatically.
+- **Self-healing** — runtime supervisor detects disconnections and
+  rebuilds the client automatically.
 - **Resilient** — degrades gracefully when Supabase is unavailable
   (in-memory fallback for every table).
 - **Zero-spam** — all command responses edit the triggering message
@@ -98,7 +98,6 @@ becomes available — interactive inline-button panels for every feature.
 │         │                                                        │
 │  ┌──────┴───────┐  ┌───────────────┐  ┌──────────────────────┐   │
 │  │  DB Client    │  │  Helper Bot   │  │  Runtime Supervisor   │   │
-│  │  (Supabase)   │  │  (Telethon)   │  │  + Watchdog           │   │
 │  └───────────────┘  └───────────────┘  └──────────────────────┘   │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────────┐│
@@ -110,8 +109,8 @@ becomes available — interactive inline-button panels for every feature.
 ```
 
 The entire application runs as a single Python `asyncio` process.
-Telethon, Uvicorn, the profile scheduler, the watchdog, and the
-heartbeat all share one event loop. No threads, no multiprocessing.
+Telethon, Uvicorn, the profile scheduler, and the heartbeat all share
+one event loop. No threads, no multiprocessing.
 
 ---
 
@@ -168,11 +167,9 @@ lifeos/
 │   │
 │   ├── runtime/                # Self-healing runtime
 │   │   ├── supervisor.py       # FSM-based recovery (10 states)
-│   │   ├── watchdog.py         # 30s heartbeat + update staleness
 │   │   ├── heartbeat.py        # Structured system snapshot
 │   │   ├── tracer.py           # @trace decorator for event logging
 │   │   ├── task_guard.py       # Cancelable task wrapper
-│   │   ├── managed_task.py     # Supervised task lifecycle
 │   │   ├── failsafe.py         # Crash boundary
 │   │   ├── keepalive.py        # Keep-alive pings
 │   │   └── states.py           # Runtime FSM state enum
@@ -195,7 +192,6 @@ lifeos/
 │   │   ├── target_context.py   # Reply target resolution
 │   │   ├── context.py          # Helper context types
 │   │   ├── rpc_timeout.py      # RPC timeout guard
-│   │   └── watchdog.py         # Helper bot watchdog
 │   │
 │   ├── telegram_api/           # Telegram API wrappers
 │   │   ├── api.py              # High-level API
@@ -1009,7 +1005,6 @@ event loop:
 | Worker | Module | Schedule | Purpose |
 |---|---|---|---|
 | Profile Scheduler | `profile/scheduler.py` | Every minute at `HH:MM:00` | Merges bio + username updaters into one `UpdateProfileRequest` |
-| Watchdog | `runtime/watchdog.py` | Every 30 seconds | Heartbeat RPC + update staleness detection |
 | Heartbeat | `runtime/heartbeat.py` | Every 30 seconds | Structured system snapshot (memory, CPU, tasks) |
 | Task Diagnostics | `runtime/supervisor.py` | Every 60 seconds | Dumps all asyncio tasks with stack traces |
 | Panel Timers | `helper/panel_timer.py` | Per-panel (default 120s) | Auto-close idle panels |
@@ -1365,10 +1360,11 @@ into a single `UpdateProfileRequest` API call per minute.
 FSM-based self-healing core with 10 states, atomic recovery, and
 limited retries. Signal handling for deterministic shutdown.
 
-### Watchdog
+### Runtime Recovery
 
-30-second heartbeat with update staleness detection. 3 consecutive
-failures → client declared dead → recovery triggered.
+Heartbeat (30s structured snapshot), keepalive (RPC pings + latency
+reporting), and failsafe (last-resort hard reset on total freeze) run
+under the supervisor, which remains the single recovery authority.
 
 ### Diagnostics
 
@@ -1458,7 +1454,8 @@ The following text commands no longer exist and are not hidden aliases:
 
 ### Client keeps disconnecting
 
-- The watchdog automatically detects disconnections and rebuilds.
+- The runtime supervisor detects disconnections (heartbeat/failsafe)
+  and rebuilds automatically.
 - Check the Health Dashboard panel for restart count and last rebuild reason.
 - Check the Diagnostics panel for a full snapshot.
 

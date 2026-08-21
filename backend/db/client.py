@@ -11,7 +11,7 @@ timeout. The supabase-py library uses httpx synchronously — calling
 db.table(...).execute() directly in an asyncio coroutine blocks the
 entire event loop until the HTTP response arrives. If the Supabase
 REST API is slow or the TCP connection stalls, the whole runtime
-freezes (no commands, no watchdog, no heartbeat, no bio updates).
+freezes (no commands, no heartbeat, no bio updates).
 
 By running each DB operation in a thread with a timeout, the event
 loop stays responsive even when Supabase is slow or unreachable.
