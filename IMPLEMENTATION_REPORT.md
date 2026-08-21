@@ -169,16 +169,22 @@ outside this cleanup scope.
 
 ## 15. Commit
 
-Recorded after delivery in the finalization update below.
+- Final execution commit: **`7f48cf4`**
+  (`7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`)
+- Message: `docs: reconcile helper config and SQL inventory`
 
 ## 16. Push Result
 
-Recorded after delivery in the finalization update below.
+Push to `origin/main` succeeded: `6ee961c..7f48cf4 main -> main`.
 
 ## 17. Remote Verification
 
-Recorded after delivery in the finalization update below.
+After `git fetch origin`, both hashes matched:
+
+- local `HEAD`: `7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`
+- `origin/main`: `7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`
 
 ## 18. Final Working Tree
 
-Recorded after delivery in the finalization update below.
+`git status` confirmed a clean working tree and branch up to date with
+`origin/main` before this report finalization edit.
