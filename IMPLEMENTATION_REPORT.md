@@ -395,3 +395,177 @@ After `git fetch origin`, local `HEAD` and `origin/main` both matched:
 `git status` was clean and the branch was up to date with `origin/main`.
 The final report-only update is pushed immediately after this edit.
 
+---
+
+# Execution Report — Documentation, Tooling, and Repository Hygiene Audit
+
+## Execution 3 — 2026-08-21
+
+### 1. Execution Summary
+
+Audited the remaining repository-cleanliness layer after the prior Python,
+configuration, dependency, and frontend-symbol passes: root and directory
+surfaces, non-protected documentation, scripts/tooling, package/build/deploy
+configuration, SQL inventory, test surface, duplication indicators, and
+tracked/generated artifacts.
+
+No tracked file or source surface was proven safe to delete. The repository
+contains no tracked caches, logs, build output, backup files, empty packages,
+or duplicate reports. No source or runtime changes were necessary.
+
+### 2. Baseline
+
+- Starting HEAD: `b4bea49aca4ef2207d0b700baef4dcb4a74e94e1`
+- Starting working tree: clean
+- Baseline full suite: **571 passed, 1 failed, 1 warning**
+- Known failure: `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`
+
+### 3. Files Deleted
+
+None. The local `.pytest_cache/`, `__pycache__/`, and generated
+`tsconfig.tsbuildinfo` artifacts are untracked/regenerable; they were not
+tracked repository content and were not removed as part of this task.
+
+### 4. Files Modified
+
+Only `IMPLEMENTATION_REPORT.md`, to append this execution section and preserve
+all prior execution history. No production source, frontend, dependency,
+configuration, SQL, migration, or protected documentation file changed.
+
+### 5. Dependencies Investigated
+
+- `package.json` / `package-lock.json`: React/ReactDOM, Vite/plugin-react,
+  TypeScript, Tailwind, PostCSS, and autoprefixer all have active imports or
+  build/configuration roles.
+- `backend/requirements.txt`: Telethon, FastAPI, Uvicorn, Supabase, httpx,
+  and aiofiles were reviewed. aiofiles has no application import but remains
+  a Starlette/FastAPI static-file runtime dependency.
+- No dependency was proven dead; none removed.
+
+### 6. Frontend Candidates
+
+- Rooted import/reachability audit previously found all eight frontend files
+  reachable from `src/main.tsx`; this pass found no new unreachable component,
+  hook, utility, or API member.
+- No stale backend/frontend action chain was found.
+- Existing API endpoints not called by the SPA remain valid direct/operational
+  API surfaces and were preserved.
+
+### 7. Test Candidates
+
+All test files remain associated with active behavior or intentionally retained
+coverage for dormant utilities. No duplicate or unreachable test helper was
+proven safe to remove. No tests were deleted or weakened.
+
+### 8. Documentation Candidates
+
+- `README.md`: concise current entry point; no stale deleted-file claims found.
+- `AGENTS.md`: operational/architecture authority; preserved.
+- `AI_MASTER_DESIGN.md`, `DATABASE_ARCHITECTURE.md`, `OBSERVABILITY.md`,
+  `PRODUCTION_CHECKLIST.md`, `PRODUCTION_VERIFICATION.md`,
+  `FREEBUFF_PRE_PUSH_VERIFY.md`, `INVESTIGATION.md`: protected or unique
+  reconstruction/operational history; preserved.
+- `IMPLEMENTATION_REPORT.md`: canonical historical execution record; preserved
+  and extended.
+- `.bolt/skills/.../SKILL.md`: unique agent/tooling stability guidance;
+  preserved.
+- `sql/README.md`: unique runnable SQL inventory; preserved.
+- No disposable duplicate documentation was proven.
+
+### 9. Tooling / SQL / Deployment Candidates
+
+- `Procfile`, `render.yaml`, package/build config, `.bolt/`, SQL scripts, and
+  Supabase migrations all have defensible deployment, tooling, or schema roles.
+- Applied migration filenames were not renamed.
+- No one-off scripts or abandoned deployment helpers exist in the tracked
+  tree.
+
+### 10. Generated Artifact Candidates
+
+`git ls-files -ci --exclude-standard` returned no tracked ignored files.
+Tracked-file inspection found no cache, log, build output, editor metadata,
+backup, accidental export, or duplicate report. Local `.pytest_cache`,
+`__pycache__`, `dist`, and `tsconfig.tsbuildinfo` are regenerable and ignored.
+
+### 11. Candidates Preserved
+
+- All root files/directories: each classified as runtime, deployment/build,
+  schema, tests, documentation, or agent/tooling surface.
+- All non-protected documentation: each has unique operational, historical,
+  SQL inventory, agent-guidance, or execution-report value.
+- All configuration/build files and dependencies: active or framework-required.
+- All tests and dormant-but-protected utilities from prior executions.
+
+### 12. Proof / Reference Analysis
+
+- Root tree and major-directory inventory completed.
+- Non-protected Markdown/text inventory completed.
+- Documentation titles and duplicate report/readme filename search completed.
+- README stale path search for removed modules/features returned no matches.
+- Tracked generated-artifact search returned clean.
+- Package/dependency declarations cross-checked against imports and build
+  configuration.
+- SQL and deployment inventories cross-checked against tracked files.
+- No deletion candidate satisfied the evidence standard.
+
+### 13. Tests and Validation
+
+- Baseline full pytest run before audit changes.
+- Full Python test suite after audit (no source changes).
+- `npx tsc -b --noEmit` passed in the preceding surface validation and no
+  frontend files changed in this execution.
+- `npm run build` passed in the preceding surface validation and no frontend
+  files changed in this execution.
+- Final `git diff`, status, tracked-artifact, documentation, and protected-file
+  checks performed.
+
+### 14. Exact Test Results
+
+- Python: **571 passed, 1 failed, 1 warning** (~13.4 seconds).
+- Failure identity unchanged:
+  `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`.
+- No new typecheck/build run was needed after this execution because no
+  frontend/source files changed; previous validation was successful.
+
+### 15. Baseline Comparison
+
+Final Python result matches baseline exactly: same 571 passes, same single
+pre-existing Delete-service timezone failure, same warning. No regression.
+
+### 16. Documentation Impact
+
+Only this canonical report changed. README and every protected document remain
+untouched. No documentation deletion or stale-reference correction was needed.
+
+### 17. Database / Schema Impact
+
+None. No SQL, migration, schema, or DB client changed.
+
+### 18. Runtime / Behavior Impact
+
+None. No production Python, TypeScript, configuration, dependency, or
+runtime behavior changed.
+
+### 19. Remaining Candidates
+
+No new safe cleanup candidates remain from this surface layer. Local ignored
+caches are regenerable workspace artifacts, not tracked repository clutter.
+Previously preserved dormant utilities and protected documentation remain
+intentionally preserved under the prior evidence decisions.
+
+### 20. Commit
+
+Recorded after delivery below.
+
+### 21. Push Result
+
+Recorded after delivery below.
+
+### 22. Remote Verification
+
+Recorded after delivery below.
+
+### 23. Final Working Tree
+
+Recorded after delivery below.
+
