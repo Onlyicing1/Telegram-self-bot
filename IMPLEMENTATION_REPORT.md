@@ -375,16 +375,23 @@ Execution 1 and were not reworked.
 
 ### 20. Commit
 
-Recorded after delivery below.
+- Cleanup + report commit: **`8ee32c1`**
+  (`8ee32c1a739685b4e1596050eaf04b73c6d4b692`) —
+  `chore: remove unused frontend API surface`
+- This final report update is the only follow-up needed to record the
+  post-push values; its final hash is recorded after the push below.
 
 ### 21. Push Result
 
-Recorded after delivery below.
+Push succeeded: `2ecf835..8ee32c1 main -> main`.
 
 ### 22. Remote Verification
 
-Recorded after delivery below.
+After `git fetch origin`, local `HEAD` and `origin/main` both matched:
+`8ee32c1a739685b4e1596050eaf04b73c6d4b692`.
 
 ### 23. Final Working Tree
 
-Recorded after delivery below.
+`git status` was clean and the branch was up to date with `origin/main`.
+The final report-only update is pushed immediately after this edit.
+
