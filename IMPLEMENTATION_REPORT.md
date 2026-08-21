@@ -570,3 +570,118 @@ Local `HEAD` and `origin/main` both resolve to
 
 `git status --short` is clean after the push.
 
+---
+
+# Execution Report — Control-Flow and Branch Reachability Audit
+
+## Execution 4 — 2026-08-21
+
+### 1. Execution Summary
+
+Completed a forensic control-flow audit without repeating prior import,
+dependency, frontend reachability, artifact, or dynamic-registration sweeps.
+Reviewed constant conditions, configuration-derived flags, fallback/error
+paths, runtime FSM transitions, handler input contracts, AI/provider branches,
+service validation, and dormant tested utilities.
+
+No category-A proven-dead branch or state surface was found. No production
+source change was justified.
+
+### 2. Baseline
+
+- Starting HEAD: `5ed901aa1e50d57d63e4173f72e5954ac2d81706`
+- Starting working tree: clean
+- Local `HEAD` and `origin/main`: synchronized
+- Previously reported suite baseline: **571 passed, 1 failed, 1 warning**
+- Known failure: `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`
+
+### 3. Files Changed / Deleted
+
+- Source files deleted: none.
+- Source files modified: none.
+- `INVESTIGATION.md`: replaced with the latest control-flow handoff.
+- `IMPLEMENTATION_REPORT.md`: appended this execution record.
+
+### 4. Candidates Investigated
+
+- Configuration-derived helper and profile flags: preserved because their
+  values can vary through deployment configuration or persisted state.
+- Runtime supervisor, heartbeat, keepalive, and failsafe conditions: preserved
+  because connection, task, lock, timing, and external RPC states vary.
+- Supabase, provider, API, and Telegram fallback/error branches: preserved
+  because external availability and response contracts are not constant.
+- Runtime FSM enum states that are not all emitted by normal transitions:
+  classified possibly obsolete, but preserved because their documented state
+  vocabulary and external diagnostic/reconstruction value were not disproven.
+- `tg_retry.py`, `startup_check.py`, and `GHOST_ROOM_ID`: intentionally dormant
+  and preserved under the existing tested/operational contract.
+- Delete ownership and validation branches: preserved; the known timezone test
+  failure was not touched.
+
+### 5. Proof / Reference Analysis
+
+- Literal-condition AST scan found no removable constant branch.
+- Terminal-statement scan found no function-level unreachable tail requiring
+  removal.
+- Flag producer/consumer searches covered `BOT_TOKEN`, derived helper state,
+  profile boot flags, Supabase availability, AI enablement, and provider state.
+- Runtime state searches covered all enum values and supervisor transitions.
+- Control-flow searches covered error handling, fallback, validation, and
+  external API branches.
+- No candidate satisfied the category-A evidence standard.
+
+### 6. Preserved Candidates
+
+No suspicious candidate was removed. Preserved surfaces retain runtime,
+test, deployment, operational, diagnostic, or reconstruction value, or lacked
+sufficient proof for behavior-neutral deletion.
+
+### 7. Validation
+
+- `python3 -m compileall -q backend`: passed.
+- Baseline git status/HEAD/remote check: clean and synchronized.
+- Final residual/control-flow searches completed.
+- Protected source/documentation files were not modified.
+- `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`: completed; the
+  known baseline failure reproduced exactly.
+
+### 8. Exact Results
+
+No source candidate was proven dead. No runtime behavior changed. The full
+suite result was **571 passed, 1 failed, 1 warning**. The sole failure was the
+known pre-existing Delete-service Tehran timezone test:
+`tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`.
+
+### 9. Baseline Comparison
+
+No source or test behavior changed, so no regression was introduced by this
+execution. The current audit's compile validation passed.
+
+### 10. Runtime / Schema Impact
+
+No runtime, configuration, dependency, database, SQL, migration, or schema
+impact. Only the investigation handoff and canonical execution report were
+updated.
+
+### 11. Remaining Candidates
+
+No category-A control-flow candidate remains from this audit. FSM states not
+emitted by normal transitions remain a possible-obsolete documentation/runtime
+vocabulary question, not a safe deletion target.
+
+### 12. Commit
+
+Recorded after the combined handoff/report commit.
+
+### 13. Push Result
+
+Recorded after delivery.
+
+### 14. Remote Verification
+
+Recorded after delivery.
+
+### 15. Final Working Tree
+
+Recorded after delivery.
+
