@@ -671,6 +671,104 @@ After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
 
 ---
 
+# Execution Report — Semantic Duplication, Compatibility Shim, and Conflicting Definition Audit
+
+## Execution 6 — 2026-08-21
+
+### 1. Execution Summary
+
+Investigated semantic duplication and conflicting definitions. AST scans over
+all backend modules found exactly one module with shadowed duplicate
+definitions and exactly one duplicate import alias. This stage is
+investigation-only: no production code was modified.
+
+### 2. Baseline
+
+- Starting HEAD: `39adfe4491aeeb869f86a7b0a0f48788365c66d8`
+- Starting working tree: clean
+- Local `HEAD` and `origin/main`: synchronized
+- Prior verified suite: **571 passed, 1 failed, 1 warning** (known Delete
+  timezone failure)
+
+### 3. Files Changed / Deleted
+
+- Source files deleted: none.
+- Source files modified: none.
+- `INVESTIGATION.md`: appended the semantic-duplication execution section.
+- `IMPLEMENTATION_REPORT.md`: appended this execution record.
+
+### 4. Candidates Investigated
+
+- `backend/helper/panel_settings.py`: `reload` and `auto_close_delay` defined
+  twice each; later definition shadows the earlier, byte-identical one.
+- `backend/helper/__init__.py`: `reload as reload_settings` imported twice;
+  the duplicate alias binds an identical function object.
+- Re-exported compatibility names and their runtime consumers.
+- All other labeled compatibility/legacy surfaces repository-wide.
+
+### 5. Evidence
+
+- AST verification of shadowing (identical bodies; second definition always
+  wins).
+- Git history/blame: duplicates present when the file was introduced in
+  commit `db927d4`.
+- Import trace: only `backend/helper/__init__.py` imports the shim module;
+  only `toggle_auto_close` has an internal runtime consumer (misc.py).
+- Zero test imports of the shim or its names.
+- Repository-wide AST scan: no other duplicate definitions or import aliases.
+
+### 6. Classifications
+
+- PROVEN DEAD (recorded, not removed): shadowed first `reload` and
+  `auto_close_delay` definitions; duplicate `reload_settings` alias line.
+- INTENTIONALLY DUPLICATED / COMPATIBILITY: the shim module and its unused
+  re-exports (`is_auto_close_enabled`, `set_auto_close_enabled`,
+  `load_settings`, `reload_settings`).
+- ACTIVE / DISTINCT: effective definitions, `toggle_auto_close` export,
+  task_guard coroutine compat, ToolContext.client, model_tester legacy keys,
+  Cohere compat endpoint, retrieve legacy entry points.
+
+### 7. Validation
+
+No tests were run because this execution was investigation-only and no source
+changed. AST, import, consumer, and git-history checks were completed. The
+previously verified baseline remains **571 passed, 1 failed, 1 warning** with
+the known Delete-service Tehran timezone failure.
+
+### 8. Baseline Comparison
+
+No source or test behavior changed; no regression was possible from this
+execution.
+
+### 9. Database / Schema / Runtime Impact
+
+None. No database, schema, migration, dependency, configuration, or runtime
+behavior changed.
+
+### 10. Remaining Candidates
+
+The three recorded proven-dead duplicate bindings remain for a separate
+implementation pass (with py_compile + full-suite validation). The
+compatibility module and its public exports remain intentionally preserved.
+
+### 11. Commit
+
+Recorded after delivery below.
+
+### 12. Push Result
+
+Recorded after delivery below.
+
+### 13. Remote Verification
+
+Recorded after delivery below.
+
+### 14. Final Working Tree
+
+Recorded after delivery below.
+
+---
+
 # Execution Report — Control-Flow and Branch Reachability Audit
 
 ## Execution 4 — 2026-08-21
