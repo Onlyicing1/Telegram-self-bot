@@ -572,6 +572,104 @@ Local `HEAD` and `origin/main` both resolve to
 
 ---
 
+# Execution Report — Cross-Layer Public API and Contract Reachability Audit
+
+## Execution 5 — 2026-08-21
+
+### 1. Execution Summary
+
+Combined backend public exports, dynamic/registry consumers, tests, API routes,
+frontend callers and types, configuration, serialized fields, deployment
+entry points, and operational contracts. No complete cross-layer dead surface
+was proven and no source behavior was changed.
+
+### 2. Baseline
+
+- Starting HEAD: `7abfea620e3677d19e5d44c40f1d43b78f6d04ab`
+- Starting working tree: clean
+- Local `HEAD` and `origin/main`: synchronized
+- Baseline full suite: **571 passed, 1 failed, 1 warning**
+- Known failure: `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`
+
+### 3. Files Changed / Deleted
+
+- Source files deleted: none.
+- Source files modified: none.
+- `INVESTIGATION.md`: replaced with the current cross-layer handoff.
+- `IMPLEMENTATION_REPORT.md`: appended this execution record.
+
+### 4. Candidates Investigated
+
+- `backend/helper/panel_settings.py` and helper exports: duplicate definitions
+  and duplicate aliases are suspicious, but the compatibility shim has indirect
+  public API value; preserved as possibly obsolete.
+- Frontend API methods/types and FastAPI routes: active callers and operational
+  consumers found; preserved.
+- AI model/provider response contracts: produced and consumed across backend and
+  dashboard; legacy summary keys explicitly retain compatibility value.
+- Config/Render/Procfile/ASGI/static-serving contracts: active or operational;
+  preserved.
+- Dormant startup/retry/ghost-room utilities: intentionally preserved under
+  prior tested/documented decisions.
+
+### 5. Evidence
+
+- Package export searches found helper, AI, and Telegram facade consumers in
+  runtime, handlers, tools, and tests.
+- Frontend API method and type searches found active component callers and
+  matching backend routes/response fields.
+- Backend-only operational endpoints were not treated as dead solely because
+  the current SPA does not call them.
+- Configuration keys were traced through loader, supervisor, provider discovery,
+  Render, startup, and static serving paths.
+- Historical `save_type` values and compatibility summary fields prevented
+  narrowing contracts as behavior-neutral cleanup.
+
+### 6. Validation
+
+- `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto` completed.
+- Exact result: **571 passed, 1 failed, 1 warning**.
+- Failure identity unchanged: the known Delete-service Tehran timezone test.
+- Final source diff review confirmed no production source, SQL, migration,
+  dependency, or protected-document changes.
+- No frontend files changed, so no additional TypeScript/build validation was
+  required beyond the previously established baseline.
+
+### 7. Baseline Comparison
+
+The test result exactly matches the baseline. No new failures or runtime
+regressions were introduced.
+
+### 8. Database / Schema / Runtime Impact
+
+No database, schema, migration, configuration, dependency, or runtime behavior
+impact. Only the persistent investigation and execution report were updated.
+
+### 9. Remaining Candidates
+
+The helper compatibility shim's duplicate definitions/aliases remain the only
+newly identified maintenance candidate, classified possibly obsolete rather
+than proven dead. Historical frontend save-type values and compatibility API
+fields remain intentionally preserved.
+
+### 10. Commit
+
+`8f7f2d5` (full hash recorded after commit).
+
+### 11. Push Result
+
+Recorded after delivery below.
+
+### 12. Remote Verification
+
+Recorded after delivery below.
+
+### 13. Final Working Tree
+
+Recorded after delivery below.
+
+---
+
 # Execution Report — Control-Flow and Branch Reachability Audit
 
 ## Execution 4 — 2026-08-21
