@@ -775,6 +775,113 @@ After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
 
 ---
 
+# Execution Report — Surgical Removal of Proven-Dead Shadowed Bindings
+
+## Execution 7 — 2026-08-21
+
+### Execution Summary
+
+Removed exactly the three proven-dead duplicate/shadowed bindings recorded in
+Execution 6, with no other source, test, dependency, configuration, or
+frontend changes.
+
+### Starting State
+
+- Starting HEAD: `90eada8838126675c6d17933d9a0d56391f70e09`
+- Starting working tree: clean
+- Baseline full suite: **571 passed, 1 failed, 1 warning**
+- Known failure: `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `backend/helper/panel_settings.py` | Removed the first (shadowed) `reload` definition and the first (shadowed) `auto_close_delay` definition |
+| `backend/helper/__init__.py` | Removed the duplicate `reload as reload_settings` import line |
+| `IMPLEMENTATION_REPORT.md` | Appended this execution record |
+
+### Bindings Removed and Proof
+
+1. `backend/helper/panel_settings.py` first `reload` definition: AST-verified
+   byte-identical body to the later definition and no decorators; module
+   execution top-to-bottom rebinds the name, so the first copy is unreachable
+   and removing it leaves the identical effective binding.
+2. `backend/helper/panel_settings.py` first `auto_close_delay` definition:
+   same shadowing proof; the later definition remains unchanged.
+3. `backend/helper/__init__.py` duplicate `reload as reload_settings` import:
+   imports the identical function object from the same module twice; removing
+   one line leaves the same effective binding with no distinct side effect.
+
+No introspection, decorator, class-body, or unusual reference depends on the
+removed bindings (residual search and import sanity check confirmed).
+
+### Files Explicitly Preserved
+
+- The `panel_settings.py` compatibility shim module and its remaining public
+  exports (`load`, `reload`, `is_auto_close_enabled`,
+  `set_auto_close_enabled`, `auto_close_delay`, `toggle_auto_close`).
+- The effective `reload_settings`/`load_settings` package exports.
+- All protected documents, SQL/migrations, Render configuration,
+  dependencies, frontend code, tests, and dormant utilities.
+
+### Validation
+
+- `python3 -m compileall -q backend`: passed.
+- `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`: **571 passed,
+  1 failed, 1 warning** — exact baseline, same known failure.
+- Residual searches: exactly one `def reload`, one `def auto_close_delay`, one
+  `reload as reload_settings`; no `panel_settings.reload`/
+  `panel_settings.auto_close_delay` references anywhere.
+- Import sanity: `backend.helper` and `backend.helper.panel_settings` import
+  cleanly; all effective public names remain callable.
+- `git diff --check`: passed.
+- `git diff`: contains only the three removals plus the appended report.
+
+### Baseline Comparison
+
+The full-suite result exactly matches the baseline: 571 passed, 1 failed, 1
+warning, with the unchanged pre-existing Delete-service Tehran timezone
+failure. No new failures or behavior changes.
+
+### Runtime / Behavior Impact
+
+None. The effective module attributes and package exports are unchanged;
+removal only deletes unreachable duplicate bindings.
+
+### Database / Schema Impact
+
+None. No SQL, migration, schema, or database code changed.
+
+### Protected-Document Verification
+
+None of `AI_MASTER_DESIGN.md`, `DATABASE_ARCHITECTURE.md`,
+`OBSERVABILITY.md`, `PRODUCTION_CHECKLIST.md`, `PRODUCTION_VERIFICATION.md`,
+`FREEBUFF_PRE_PUSH_VERIFY.md`, or `INVESTIGATION.md` changed.
+
+### Remaining Candidates
+
+No new candidates were removed or added during this surgical pass. The
+compatibility shim module and its unused re-exports remain intentionally
+preserved per Execution 6.
+
+### Commit
+
+Recorded after delivery below.
+
+### Push Result
+
+Recorded after delivery below.
+
+### Remote Verification
+
+Recorded after delivery below.
+
+### Final Working Tree
+
+Recorded after delivery below.
+
+---
+
 # Execution Report — Control-Flow and Branch Reachability Audit
 
 ## Execution 4 — 2026-08-21

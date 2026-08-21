@@ -53,5 +53,4 @@ from backend.helper.panel_settings import (
     set_auto_close_enabled,
     toggle_auto_close,
     load as load_settings,
-    reload as reload_settings,
 )
