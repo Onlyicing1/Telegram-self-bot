@@ -1096,3 +1096,142 @@ After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
 
 `git status --short` was clean after synchronization.
 
+---
+
+# Execution Report — AI Core UX / Observability Improvement
+
+## Execution 9 — 2026-08-21
+
+### 1. Execution Summary
+
+Introduced a unified, provider-independent AI execution-telemetry contract and
+a polished, user-facing Telegram UI (Overview / Details / Usage / Health) that
+renders from it. No new text commands were added; all AI transparency is
+reached through the existing visual panel system. Normal chat stays clean
+(default), with an optional compact per-request telemetry line behind a
+Settings toggle.
+
+### 2. Starting HEAD / Baseline
+
+- Starting HEAD: `cd10f87e2cd83210f9de1033294998722317b673`
+- Starting working tree: clean
+- Baseline full suite: **572 passed, 0 failed, 1 warning**
+
+### 3. Architecture Inspected
+
+- `backend/ai/engine/dispatcher.py` — the single dispatch path (provider path
+  and deterministic fast path).
+- `backend/ai/engine/result.py` — `EngineResult` shape.
+- `backend/ai/engine/metrics.py` — existing EngineMetrics (kept, not replaced).
+- `backend/ai/providers/manager/manager.py` + `base/contract.py` — provider
+  response normalization and retry/fallback metadata.
+- `backend/bot/handlers/ai.py` — AI glass panels and registration.
+- `backend/bot/handlers/ai_unified.py` — chat activation and delivery path.
+- `backend/ai/tools/delivery.py` — centralized edit-in-place delivery.
+
+### 4. Files Added
+
+- `backend/ai/engine/telemetry.py` — normalized `AIExecutionRecord` contract,
+  bounded in-RAM `ExecutionTelemetry` store, token/latency/failure formatting
+  helpers, and the RAM-only show-telemetry preference.
+- `tests/test_33_ai_telemetry.py` — 16 focused regression tests.
+
+### 5. Files Modified
+
+- `backend/ai/engine/dispatcher.py` — propagates `token_source`,
+  `retry_count`, `fallback_used`, `tool_call_count`, `context_tokens`, and
+  `failure_type` into result metadata and records every execution (provider
+  and fast path) via `telemetry.record_execution(result, request.owner_id)`.
+- `backend/bot/handlers/ai.py` — reworked the main panel into a compact
+  Overview; added Details/Usage/Health panels; added a reply-stats toggle to
+  Settings; registered the new panels and actions.
+- `backend/bot/handlers/ai_unified.py` — appends the compact per-request
+  telemetry line only when the owner's preference is enabled.
+- `tests/test_11_runtime_wiring.py` — updated the ready-branch button contract
+  to the new intentional Overview set.
+
+### 6. AI Contract Changes
+
+`AIExecutionRecord` is now the single source of truth for AI execution
+telemetry: provider, model, status, input/output/total tokens, token source
+(actual/estimated/unavailable), context tokens, latency, retry count, fallback
+flag, tool-call count, and a human-readable failure reason. Provider-specific
+usage stays normalized upstream into `ProviderResponse.usage` and lands here
+through `EngineResult` — no ad-hoc per-provider status implementations.
+
+### 7. UI Changes
+
+- Overview (Level 1): model, provider · state, last-request latency/tokens,
+  context. Buttons: Start Chat, Usage, Health, Details, Model, Provider,
+  Settings, Test Models.
+- Details (Level 2): precise per-request facts (model, provider, status,
+  context, tokens in/out, latency, retries, fallback, tools, time).
+- Usage: Today / 7 days / 30 days compact aggregation (requests, tokens,
+  input/output, failures, fallbacks).
+- Health: one-line answer (HEALTHY / DEGRADED / OFFLINE) plus provider,
+  model, fallback availability, and last request.
+- Settings: reply-stats on/off toggle.
+
+### 8. Provider Changes
+
+None. Providers are unchanged; their responses were already normalized by the
+provider layer. This execution only consumed that normalized data.
+
+### 9. Token / Usage Behavior
+
+Token accuracy is explicit: `actual` (provider-reported), `estimated`
+(character-based, rendered with `≈`), or `unavailable` (rendered as
+"Unavailable", never invented). No context limit is fabricated; `max_context`
+is `0` when unknown and the UI omits the ratio. Cost is not shown (no reliable
+pricing source).
+
+### 10. Validation Performed
+
+- `python3 -m compileall -q backend`: passed.
+- `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`: see below.
+- `npx tsc -b --noEmit`: exit 0 (no frontend changes; contract check only).
+- `npm run build`: passed (37 modules; `dist/` ignored).
+- `git diff --check`: passed.
+
+### 11. Exact Test Results
+
+**588 passed, 0 failed, 1 warning** in ~14s.
+
+Prior baseline was 572 passed; +16 new telemetry/panel tests, no regressions.
+The single warning is the pre-existing Starlette `python_multipart` deprecation
+warning.
+
+### 12. Visual / UI Verification
+
+Panel bodies use label/value rows (no emoji decoration, no raw internals).
+Normal chat is unchanged by default; the compact line appears only behind the
+Settings toggle. Zero-spam is preserved: delivery still edits the request
+message in place via `deliver_response`.
+
+### 13. Database / Schema Impact
+
+None. Telemetry is a bounded in-RAM deque; the reply-stats preference is
+RAM-only. No SQL, migration, schema, or Supabase code changed.
+
+### 14. Runtime Impact
+
+Each AI execution now writes one normalized in-memory record (bounded to 200).
+Failure handling is wrapped so telemetry can never break an execution.
+Conversation behavior is otherwise unchanged.
+
+### 15. Commit
+
+`feat: add AI execution telemetry and observability UI` — `__COMMIT_HASH__`
+
+### 16. Push Result
+
+`__PUSH_RANGE__`
+
+### 17. Remote Verification
+
+`__REMOTE_HEAD__`
+
+### 18. Final Working Tree
+
+`__WORKTREE__`
+

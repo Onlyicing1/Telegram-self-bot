@@ -33,6 +33,7 @@ from backend.ai.actions import parse_action_text, parse_command_intent
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
+from backend.ai.engine.telemetry import telemetry
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.providers.base import ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
@@ -243,6 +244,18 @@ class Dispatcher:
                 rid or "-", provider_name,
             )
             response: ProviderResponse = await self._provider_manager.chat(messages, **chat_kwargs)
+            # Execution-telemetry facts travel with the FINAL response object;
+            # every later round is max-merged so a retry anywhere in the chain
+            # is never lost.
+            provider_usage_reported = any(
+                int(response.usage.get(k, 0) or 0) > 0
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+            retry_count = int(response.metadata.get("ai_retry_count", 0) or 0)
+            fallback_used = bool(response.metadata.get("fallback"))
+            failure_type = "" if response.success else str(
+                response.metadata.get("failure_type", "") or "unknown"
+            )
             _mark_success("PROVIDER_REQUEST")
             logger.info(
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
@@ -283,10 +296,26 @@ class Dispatcher:
                 retry_response: ProviderResponse = await self._provider_manager.chat(
                     retry_messages, **chat_kwargs
                 )
+                provider_usage_reported = provider_usage_reported or any(
+                    int(retry_response.usage.get(k, 0) or 0) > 0
+                    for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                )
+                retry_count = max(
+                    retry_count, int(retry_response.metadata.get("ai_retry_count", 0) or 0)
+                )
+                fallback_used = fallback_used or bool(retry_response.metadata.get("fallback"))
+                if not failure_type and not retry_response.success:
+                    failure_type = str(
+                        retry_response.metadata.get("failure_type", "") or "unknown"
+                    )
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
                     retry_meta = dict(retry_response.metadata or {})
                     retry_meta["ai_retry_count"] = int(retry_meta.get("ai_retry_count", 0)) + 1
                     retry_response = replace(retry_response, metadata=retry_meta)
+                    # The nudge-retry above is a real retry for telemetry.
+                    retry_count = max(
+                        retry_count, int(retry_meta["ai_retry_count"])
+                    )
                     response = retry_response
                     logger.info("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
 
@@ -467,6 +496,14 @@ class Dispatcher:
                 usage[k] += int(cont_response.usage.get(k, 0))
             if cont_response.metadata.get("finish_reason"):
                 accumulated_finish_reasons.append(cont_response.metadata["finish_reason"])
+            provider_usage_reported = provider_usage_reported or any(
+                int(cont_response.usage.get(k, 0) or 0) > 0
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+            retry_count = max(
+                retry_count, int(cont_response.metadata.get("ai_retry_count", 0) or 0)
+            )
+            fallback_used = fallback_used or bool(cont_response.metadata.get("fallback"))
 
             response = cont_response
             messages = continuation_messages
@@ -549,6 +586,22 @@ class Dispatcher:
             finish_state = "empty"
         metadata["finish_state"] = finish_state
         metadata["finish_reason"] = finish_reason
+        # ── Normalized execution-telemetry facts (single source of truth) ──
+        # The telemetry store reads ONLY these keys; every user-facing AI
+        # surface (Overview/Details/Usage/Health panels, compact chat line)
+        # renders from the normalized record, never from provider internals.
+        if provider_usage_reported:
+            metadata["token_source"] = "actual"
+        elif prompt_tokens > 0 or completion_tokens > 0:
+            metadata["token_source"] = "estimated"
+        else:
+            metadata["token_source"] = "unavailable"
+        metadata["retry_count"] = retry_count
+        metadata["fallback_used"] = fallback_used
+        metadata["tool_call_count"] = len(all_tool_results)
+        metadata["context_tokens"] = prompt_tokens
+        if failure_type:
+            metadata["failure_type"] = failure_type
 
         if all_tool_results:
             tool_errors = [r for r in all_tool_results if not r.get("success")]
@@ -584,6 +637,11 @@ class Dispatcher:
             completion_tokens=completion_tokens,
             error="" if result.success else (errors[-1] if errors else "provider_failed"),
         )
+
+        try:
+            telemetry.record_execution(result, request.owner_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("AI telemetry record failed", exc_info=True)
 
         return result
 
@@ -780,6 +838,11 @@ class Dispatcher:
         latency = time.perf_counter() - start
         meta = dict(metadata)
         meta["finish_state"] = "local_fast_path"
+        meta["token_source"] = "unavailable"
+        meta["retry_count"] = 0
+        meta["fallback_used"] = False
+        meta["tool_call_count"] = len(meta.get("tool_results") or [])
+        meta["context_tokens"] = 0
         # Same shape as the provider structured-action path so diagnostics
         # and tests read a consistent ai_action object.
         meta["ai_action"] = {"action": action, "kind": kind, "target": target}
@@ -811,6 +874,10 @@ class Dispatcher:
             completion_tokens=0,
             error="" if success else text,
         )
+        try:
+            telemetry.record_execution(result, request.owner_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("AI telemetry record failed", exc_info=True)
         return result
 
     def _apply_structured_action(

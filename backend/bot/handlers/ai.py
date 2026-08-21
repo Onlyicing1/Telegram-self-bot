@@ -12,7 +12,10 @@ Everything is discovered automatically. The panel flow is:
   AI → Provider (auto-detected) → Model (auto-listed) → Ready → Start Chat
 
 Panels:
-  ai             — Main panel (status + next action + Start Chat)
+  ai             — Overview (model · provider state · last request · context)
+  ai_usage       — Compact usage summary (requests, tokens, failures, fallbacks)
+  ai_health      — Is the AI working? (overall + one-line causes)
+  ai_details     — Precise per-request facts from the execution record
   ai_provider    — Provider selection (only available ones shown)
   ai_model       — Model selection (auto-fetched from provider API)
   ai_wizard      — Setup wizard (shown when no provider is configured)
@@ -111,6 +114,48 @@ def _status_icon(connected: bool) -> str:
     return "🟢" if connected else "🔴"
 
 
+_PROVIDER_DISPLAY_FALLBACK = {
+    "gemini": "Google",
+    "openai": "OpenAI",
+    "groq": "Groq",
+    "mistral": "Mistral",
+    "cerebras": "Cerebras",
+    "cohere": "Cohere",
+    "nvidia": "NVIDIA",
+    "zai": "Z.ai",
+    "openrouter": "OpenRouter",
+    "sambanova": "SambaNova",
+    "siliconflow": "SiliconFlow",
+    "fireworks": "Fireworks",
+    "dummy": "Built-in",
+}
+
+
+def _provider_display(name: str) -> str:
+    """User-facing provider name — never an internal id when avoidable."""
+    clean = (name or "").strip()
+    if not clean or clean == "—":
+        return "—"
+    try:
+        from backend.ai.discovery import get_provider_info
+        info = get_provider_info(clean)
+        if info and info.get("display_name"):
+            return str(info["display_name"])
+    except Exception:
+        pass
+    return _PROVIDER_DISPLAY_FALLBACK.get(clean.lower(), clean.title())
+
+
+def _context_line(context_tokens: int, max_context: int) -> str:
+    """Honest context usage line — never invents a limit."""
+    if context_tokens <= 0:
+        return "Context unavailable"
+    from backend.ai.engine.telemetry import format_tokens
+    if max_context > 0:
+        return f"{format_tokens(context_tokens)} / {format_tokens(max_context)} context"
+    return f"{format_tokens(context_tokens)} context"
+
+
 def _nav_buttons(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
         ("⬅ Back", "panel:_nav:back"),
@@ -119,52 +164,62 @@ def _nav_buttons(builder: InlinePanelBuilder) -> None:
 
 
 async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """LEVEL 1 — Overview. What the owner most commonly needs, nothing more.
+
+    Renders from the normalized execution record (single source of truth);
+    falls back to the persisted config only for identity when no request
+    has run yet.
+    """
+    from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
+
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     engine_info = _get_engine_info()
-    available = [p for p in await _discover() if p.status == "available"]
     saved_provider = config.get("provider", "") or engine_info["provider"]
     saved_model = config.get("model", "") or engine_info["model"]
-    connected = engine_info["connected"]
-
-    lines = ["**🧠 AI Assistant**\n"]
 
     if not saved_provider or saved_provider == "—":
-        lines.append("⚠️ **No provider configured**")
-        lines.append("")
-        lines.append("_Tap **Provider** to select one._")
+        lines = ["**AI**\n", "⚠️ **No provider configured**", "",
+                 "_Tap **Provider** to select one._"]
         builder = InlinePanelBuilder()
         builder.add_row("🔄 Select Provider", "panel:ai_provider")
         builder.add_row("🧪 Test Models", "action:ai_test_models")
         _nav_buttons(builder)
-        return "🧠 AI", "\n".join(lines), builder.build()
+        return "AI", "\n".join(lines), builder.build()
 
     if not saved_model or saved_model == "—":
-        lines.append(f"**Provider:** {saved_provider.title()}")
-        lines.append("⚠️ **No model selected**")
-        lines.append("")
-        lines.append("_Tap **Model** to select one._")
+        lines = ["**AI**\n",
+                 f"{saved_provider.title()} · ⚠️ **No model selected**", "",
+                 "_Tap **Model** to select one._"]
         builder = InlinePanelBuilder()
         builder.add_row("🤖 Select Model", "panel:ai_model")
         builder.add_row("🔄 Change Provider", "panel:ai_provider")
-        builder.add_row("🧪 Test Models", "action:ai_test_models")
         _nav_buttons(builder)
-        return "🧠 AI", "\n".join(lines), builder.build()
+        return "AI", "\n".join(lines), builder.build()
 
-    lines.append(f"**Provider:** {saved_provider.title()}")
-    lines.append(f"**Model:** {saved_model}")
-    lines.append(f"{_status_icon(connected)} **Status:** Ready")
-    if config.get("last_request_at"):
-        lines.append(f"**Last request:** {config['last_request_at'][:19]}")
+    record = telemetry.last()
+    connected = engine_info["connected"]
+    state_text = "Ready" if connected else "Offline"
+
+    lines = [f"**{saved_model}**"]
+    lines.append(f"{_provider_display(saved_provider)} · {state_text}")
     lines.append("")
-    lines.append("_Tap **Start Chat** to begin._")
+    if record is not None and record.status == "success":
+        lines.append(compact_telemetry_line(record))
+        lines.append(_context_line(record.context_tokens, record.max_context))
+    elif record is not None:
+        lines.append(f"Last request failed — {record.error_reason}")
+    else:
+        lines.append("_No requests yet_")
+
     builder = InlinePanelBuilder()
     builder.add_row("💬 Start Chat", "action:ai_start_chat")
-    builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("🤖 Model", "panel:ai_model"))
-    builder.add_buttons(("📊 Status", "panel:ai_status"), ("⚙️ Settings", "panel:ai_settings"))
+    builder.add_buttons(("📈 Usage", "panel:ai_usage"), ("🩺 Health", "panel:ai_health"))
+    builder.add_buttons(("🔍 Details", "panel:ai_details"), ("🤖 Model", "panel:ai_model"))
+    builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("⚙️ Settings", "panel:ai_settings"))
     builder.add_row("🧪 Test Models", "action:ai_test_models")
     _nav_buttons(builder)
-    return "🧠 AI", "\n".join(lines), builder.build()
+    return "AI", "\n".join(lines), builder.build()
 
 
 async def _ai_main_inline_builder(event, extra: str) -> list:
@@ -327,13 +382,17 @@ async def _ai_wizard_inline_builder(event, extra: str) -> list:
 
 
 async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.ai.engine.telemetry import telemetry
+
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
+    reply_stats = telemetry.get_telemetry_pref(owner_id)
     lines = [
         "**⚙️ AI Settings**\n",
         f"**Temperature:** {config.get('temperature', 1.0)}",
         f"**Max Tokens:** {config.get('max_tokens', 4096)}",
         f"**Context Budget:** {config.get('history_budget', 4000)} tokens",
+        f"**Reply stats:** {'On' if reply_stats else 'Off'}",
     ]
     prompt = config.get("system_prompt", "")
     if prompt:
@@ -357,6 +416,10 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     builder.add_row("📦 Max Tokens", "input:ai_settings:max_tokens")
     builder.add_row("📝 Context Budget", "input:ai_settings:history_budget")
     builder.add_row("💬 System Prompt", "input:ai_settings:system_prompt")
+    builder.add_row(
+        f"📊 Reply stats: {'Off' if reply_stats else 'On'}",
+        "action:ai_toggle_telemetry",
+    )
     _nav_buttons(builder)
     return "⚙️ Settings", "\n".join(lines), builder.build()
 
@@ -367,6 +430,197 @@ async def _ai_settings_inline_builder(event, extra: str) -> list:
         return [render("Settings", "Error.", [])]
     title, body, buttons = result
     return [render(title, body, buttons)]
+
+
+_USAGE_RANGES = (("today", "Today"), ("7d", "7 days"), ("30d", "30 days"))
+
+
+async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """LEVEL 2 — precise per-request facts from the execution record."""
+    from backend.ai.engine.telemetry import (
+        format_latency_exact,
+        format_time_of,
+        format_tokens_exact,
+        telemetry,
+    )
+
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    record = telemetry.last()
+
+    if record is None:
+        lines = ["**AI · Details**\n", "_No AI requests yet._"]
+    else:
+        if record.token_source == "unavailable":
+            tokens = "Unavailable"
+        else:
+            est = "  ≈ est." if record.token_source == "estimated" else ""
+            tokens = (
+                f"{format_tokens_exact(record.input_tokens)} in · "
+                f"{format_tokens_exact(record.output_tokens)} out{est}"
+            )
+        if record.context_tokens > 0:
+            context = format_tokens_exact(record.context_tokens)
+            if record.max_context > 0:
+                context += f" / {format_tokens_exact(record.max_context)}"
+        else:
+            context = "Unavailable"
+        status = "Ready" if record.status == "success" else f"Failed — {record.error_reason}"
+        rows = [
+            ("Model", record.model or config.get("model", "—")),
+            ("Provider", _provider_display(record.provider)),
+            ("Status", status),
+            ("Context", context),
+            ("Tokens", tokens),
+            ("Latency", format_latency_exact(record.latency)),
+            ("Retries", str(record.retry_count)),
+            ("Fallback", "Yes" if record.fallback_used else "No"),
+            ("Tools", str(record.tool_call_count)),
+            ("When", format_time_of(record.timestamp)),
+        ]
+        width = max(len(label) for label, _ in rows)
+        body = "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
+        lines = ["**AI · Details**\n", f"```\n{body}\n```"]
+
+    builder = InlinePanelBuilder()
+    builder.add_buttons(("📈 Usage", "panel:ai_usage"), ("❤️ Health", "panel:ai_health"))
+    _nav_buttons(builder)
+    return "AI · Details", "\n".join(lines), builder.build()
+
+
+async def _ai_details_inline_builder(event, extra: str) -> list:
+    result = await _ai_details_panel_handler(event, extra)
+    if result is None:
+        return [render("AI · Details", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _ai_usage_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """Compact usage summary over a selectable window. RAM-only telemetry."""
+    from backend.ai.engine.telemetry import format_tokens, telemetry
+
+    range_key = (extra or "").strip() or "today"
+    if range_key not in dict(_USAGE_RANGES):
+        range_key = "today"
+    if range_key == "7d":
+        summary = telemetry.summary(hours=24 * 7)
+    elif range_key == "30d":
+        summary = telemetry.summary(hours=24 * 30)
+    else:
+        summary = telemetry.summary(since_midnight_utc=True)
+    label = dict(_USAGE_RANGES)[range_key]
+
+    lines = ["**AI · Usage**\n", f"**{label}**", ""]
+    if summary["requests"] == 0:
+        lines.append("_No AI requests in this period._")
+    else:
+        lines.append(
+            f"{summary['requests']} requests · {format_tokens(summary['total_tokens'])} tokens"
+        )
+        lines.append("")
+        lines.append(
+            f"{format_tokens(summary['input_tokens'])} in · "
+            f"{format_tokens(summary['output_tokens'])} out"
+        )
+        lines.append("")
+        issues = []
+        if summary["failed"]:
+            issues.append(f"{summary['failed']} failed")
+        if summary["fallbacks"]:
+            issues.append(f"{summary['fallbacks']} fallbacks")
+        lines.append(" · ".join(issues) if issues else "No failures")
+
+    builder = InlinePanelBuilder()
+    builder.add_buttons(*[
+        (f"{'✓ ' if key == range_key else ''}{lbl}", f"panel:ai_usage:{key}")
+        for key, lbl in _USAGE_RANGES
+    ])
+    _nav_buttons(builder)
+    return "AI · Usage", "\n".join(lines), builder.build()
+
+
+async def _ai_usage_inline_builder(event, extra: str) -> list:
+    result = await _ai_usage_panel_handler(event, extra)
+    if result is None:
+        return [render("AI · Usage", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """Answer one question: is my AI working correctly right now?"""
+    from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
+
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    engine = _get_engine()
+    engine_info = _get_engine_info()
+    record = telemetry.last()
+    configured = bool(config.get("provider"))
+
+    if engine is None or not configured:
+        overall = "OFFLINE"
+    elif engine_info["connected"]:
+        overall = "HEALTHY"
+    else:
+        overall = "DEGRADED"
+    if overall == "HEALTHY" and record is not None and record.status == "failed":
+        overall = "DEGRADED"
+
+    try:
+        available = [p for p in await _discover() if p.status == "available"]
+        fallback_state = "Available" if len(available) > 1 else "Single provider"
+    except Exception:
+        fallback_state = "—"
+
+    if record is not None:
+        last_req = compact_telemetry_line(record)
+        if record.status == "failed":
+            last_req = f"Failed — {record.error_reason}"
+    else:
+        last_req = "—"
+
+    model_name = config.get("model", "—") or engine_info["model"]
+    provider_line = (
+        f"{_provider_display(config.get('provider', ''))} · "
+        f"{'Ready' if engine_info['connected'] else 'Offline'}"
+    )
+    rows = [
+        ("Provider", provider_line),
+        ("Model", model_name or "—"),
+        ("Fallback", fallback_state),
+        ("Last request", last_req),
+    ]
+    width = max(len(label) for label, _ in rows)
+    body = "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
+    lines = ["**AI · Health**\n", f"**{overall}**\n", f"```\n{body}\n```"]
+
+    builder = InlinePanelBuilder()
+    builder.add_row("🔄 Refresh", "action:ai_health_refresh")
+    _nav_buttons(builder)
+    return "AI · Health", "\n".join(lines), builder.build()
+
+
+async def _ai_health_inline_builder(event, extra: str) -> list:
+    result = await _ai_health_panel_handler(event, extra)
+    if result is None:
+        return [render("AI · Health", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _ai_health_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    return await _ai_health_panel_handler(event, extra)
+
+
+async def _ai_toggle_telemetry_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Flip the compact per-request chat telemetry preference and re-render."""
+    from backend.ai.engine.telemetry import telemetry
+
+    owner_id = await _get_owner_id()
+    telemetry.set_telemetry_pref(owner_id, not telemetry.get_telemetry_pref(owner_id))
+    return await _ai_settings_panel_handler(event, extra)
 
 
 async def _ai_status_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -931,6 +1185,12 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_wizard", _ai_wizard_inline_builder)
         register_panel("ai_settings", _ai_settings_panel_handler, parent="ai", title="⚙️ Settings")
         register_inline_builder("ai_settings", _ai_settings_inline_builder)
+        register_panel("ai_usage", _ai_usage_panel_handler, parent="ai", title="📈 Usage")
+        register_inline_builder("ai_usage", _ai_usage_inline_builder)
+        register_panel("ai_health", _ai_health_panel_handler, parent="ai", title="🩺 Health")
+        register_inline_builder("ai_health", _ai_health_inline_builder)
+        register_panel("ai_details", _ai_details_panel_handler, parent="ai", title="🔍 Details")
+        register_inline_builder("ai_details", _ai_details_inline_builder)
         register_panel("ai_status", _ai_status_panel_handler, parent="ai", title="📊 Status")
         register_inline_builder("ai_status", _ai_status_inline_builder)
         register_panel("ai_diagnostics", _ai_diagnostics_panel_handler, parent="ai", title="🔧 Diagnostics")
@@ -945,6 +1205,8 @@ def register(client, owner_id: int) -> None:
         register_action("ai_test_details", _ai_test_details_action)
         register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
+        register_action("ai_health_refresh", _ai_health_refresh_action)
+        register_action("ai_toggle_telemetry", _ai_toggle_telemetry_action)
         register_input("ai_settings", "trigger_en", {
             "handler": _ai_trigger_en_input,
             "prompt": "**🔤 English Trigger**\n\nEnter a single trigger word (case-insensitive):\nOr send 'clear' to remove.\n\n_Reply below._",

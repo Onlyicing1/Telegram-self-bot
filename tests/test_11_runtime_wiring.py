@@ -709,9 +709,11 @@ async def test_ai_panel_ready_branch_keeps_all_existing_buttons():
     datas = _flatten_button_datas(buttons)
     expected = {
         "action:ai_start_chat",
-        "panel:ai_provider",
+        "panel:ai_usage",
+        "panel:ai_health",
+        "panel:ai_details",
         "panel:ai_model",
-        "panel:ai_status",
+        "panel:ai_provider",
         "panel:ai_settings",
         "action:ai_test_models",
     }

@@ -531,6 +531,14 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                     f"{response_text}\n\n⚠️ Tool round limit reached — "
                     f"{pending} pending tool call(s) were not executed."
                 )
+            # Optional compact per-request telemetry (user preference, off by
+            # default). Never invent numbers: the line renders from the
+            # normalized execution record and omits unavailable usage.
+            from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
+            if telemetry.get_telemetry_pref(owner_id):
+                line = compact_telemetry_line(telemetry.last())
+                if line:
+                    response_text = f"{response_text}\n\n_{line}_"
             delivery_result = await deliver_response(
                 event, display_prompt, trigger_label, response_text,
             )
