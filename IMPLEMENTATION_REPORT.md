@@ -114,7 +114,33 @@ change on any live path; suite confirms.
   decision; revisit only if the owner wants them retired together with their
   tests/docs.
 
-## 13–16. Commit / Push / Remote Verification / Working Tree
+## 13. Commit
 
-Recorded below after delivery (updated in the finalization commit; values
-captured verbatim from `git rev-parse` / `git status`).
+Cleanup commit: **`bf56f85`** (`bf56f85aadd4ba28ff4f169484ac91bf30d407d2`)
+— "chore: remove dead modules, no-op handler stub, and dead imports"
+(11 files changed, 125 insertions(+), 634 deletions(-)). This report's
+finalization update is delivered as the immediately following docs commit
+(a file cannot contain its own commit hash); it is HEAD at push and
+verifiable via `git log --oneline -2` / `git rev-parse HEAD`.
+
+## 14. Push Result
+
+Push to `origin/main` **succeeded** for the cleanup commit:
+`00e871d..bf56f85  main -> main`. The finalization commit is pushed
+immediately after being created — its presence on the remote is the proof
+of a successful push.
+
+## 15. Remote Verification
+
+Verified via `git fetch origin && git rev-parse origin/main HEAD` after the
+cleanup push: local HEAD and origin/main both =
+`bf56f85aadd4ba28ff4f169484ac91bf30d407d2`. The finalization commit is
+verified the same way immediately after its push (result captured in the
+delivery summary).
+
+## 16. Final Working Tree
+
+Before the finalization commit: exactly the ten files of this pass staged
+and committed (`git status` showed only this report modified). After the
+finalization commit + push: **working tree clean**, branch up to date with
+`origin/main` (verified).
