@@ -125,7 +125,6 @@ async def _build_settings_body() -> str:
     lang = settings_service.language()
     dbg = settings_service.is_debug_callbacks()
     oo = settings_service.is_owner_only()
-    uss = settings_service.update_stale_seconds()
 
     def _state(on: bool) -> str:
         return "ON" if on else "OFF"
@@ -141,7 +140,6 @@ async def _build_settings_body() -> str:
         f"**Language:** {lang}",
         f"**Debug callbacks:** {_state(dbg)}",
         f"**Owner only:** {_state(oo)}",
-        f"**Update stale:** {uss}s",
     ]
     return "\n".join(lines)
 
@@ -158,7 +156,6 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
     builder.add_row("Set Log Retention", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
-    builder.add_row("Set Update Stale", "input:settings:update_stale_seconds")
     return "Settings", await _build_settings_body(), builder.build()
 
 
@@ -327,28 +324,6 @@ async def _settings_language_handler(text, chat_id, msg_id, inline_chat_id, inli
             pass
 
 
-async def _settings_update_stale_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services import settings_service
-    from backend.helper.inline_engine import _self_client
-    text = text.strip()
-    if not text.isdigit():
-        result = "Please enter a number between 60 and 3600."
-    else:
-        ok = settings_service.set_update_stale_seconds(int(text))
-        result = f"Update stale threshold set to {text}s" if ok else "Value must be between 60 and 3600."
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("settings update_stale inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
-
-
 def _register_panels() -> None:
     register_panel("settings", _settings_panel_handler, parent="menu", title="Settings")
     register_inline_builder("settings", _settings_inline_builder)
@@ -381,10 +356,6 @@ def _register_panels() -> None:
     register_input("settings", "panel_timeout_seconds", {
         "handler": _settings_panel_timeout_handler,
         "prompt": "**Panel Timeout**\n\nEnter timeout in seconds (30-3600):\n\n_Reply below._",
-    })
-    register_input("settings", "update_stale_seconds", {
-        "handler": _settings_update_stale_handler,
-        "prompt": "**Update Stale Threshold**\n\nEnter threshold in seconds (60-3600):\n\n_Reply below._",
     })
 
 

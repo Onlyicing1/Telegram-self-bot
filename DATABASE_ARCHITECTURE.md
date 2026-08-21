@@ -818,12 +818,11 @@ Cache and DB are never left inconsistent.
 | `language` | str | `"en"` | non-empty string |
 | `debug_callbacks` | bool | `false` | must be boolean |
 | `owner_only` | bool | `true` | must be boolean |
-| `update_stale_seconds` | int | `300` | 60..3600 (seconds) |
 
 ### In-Memory Fallback
 
 If the DB is unavailable, the service uses hardcoded `_DEFAULTS` for
-all 12 settings. The bot continues to function normally — all panel
+all 11 settings. The bot continues to function normally — all panel
 operations work with default values. Every Supabase call that fails
 logs a warning and falls back silently.
 

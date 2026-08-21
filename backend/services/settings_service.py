@@ -30,7 +30,7 @@ Architecture:
    - A default + validator + typed accessor here
    No panel code needs to change.
 
-## Settings (13 columns on panel_settings)
+## Settings (11 columns on panel_settings)
 
 | Column                  | Type    | Default | Range/Constraint        |
 |-------------------------|---------|---------|-------------------------|
@@ -45,7 +45,6 @@ Architecture:
 | language                | str     | "en"    | non-empty string        |
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
-| update_stale_seconds    | int     | 300     | 60..3600 (seconds)      |
 """
 import logging
 from typing import Any, Callable
@@ -66,7 +65,6 @@ _DEFAULTS: dict[str, Any] = {
     "language": "en",
     "debug_callbacks": False,
     "owner_only": True,
-    "update_stale_seconds": 300,
 }
 
 _cache: dict[str, Any] = {}
@@ -105,7 +103,6 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "language": _validate_nonempty_str,
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
-    "update_stale_seconds": _validate_int_range(60, 3600),
 }
 
 
@@ -287,12 +284,3 @@ def language() -> str:
 
 def set_language(value: str) -> bool:
     return set_setting("language", value)
-
-
-def update_stale_seconds() -> int:
-    _ensure_loaded()
-    return int(_cache.get("update_stale_seconds", 300))
-
-
-def set_update_stale_seconds(seconds: int) -> bool:
-    return set_setting("update_stale_seconds", seconds)

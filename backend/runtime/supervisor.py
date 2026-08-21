@@ -117,10 +117,6 @@ class RuntimeSupervisor:
         self._reconnect_cooldown_until = 0.0
         self._client_alive = False
 
-    @property
-    def client_alive(self) -> bool:
-        return self._client_alive
-
     def _transition(self, new_state: RuntimeState) -> None:
         if self.state == new_state:
             return

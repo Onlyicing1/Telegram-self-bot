@@ -84,18 +84,6 @@ def _get_awaited_object(coro) -> str:
         return "unknown"
 
 
-def _get_full_stack(coro, limit: int = 12) -> str:
-    """Extract a full stack trace from a coroutine."""
-    try:
-        frame = coro.cr_frame if hasattr(coro, "cr_frame") else None
-        if frame is None:
-            return "(no frame)"
-        stack_lines = traceback.extract_stack(frame, limit=limit)
-        return "".join(traceback.format_list(stack_lines))
-    except Exception:
-        return "(stack extraction failed)"
-
-
 def _get_await_location(coro) -> str:
     """Get the current file:line where the coroutine is suspended."""
     try:
@@ -217,8 +205,6 @@ def _collect_health_timestamps() -> list[str]:
             lines.append(f"  Last command: {snap['last_command_s']}s ago")
         if snap.get("last_update_s") is not None:
             lines.append(f"  Last update: {snap['last_update_s']}s ago")
-        if snap.get("last_handler_dispatched_s") is not None:
-            lines.append(f"  Last handler dispatched: {snap['last_handler_dispatched_s']}s ago")
         if snap.get("last_telethon_event_s") is not None:
             lines.append(f"  Last Telethon event: {snap['last_telethon_event_s']}s ago")
         if snap.get("last_callback_s") is not None:

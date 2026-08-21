@@ -19,7 +19,6 @@ Every exception trace uses traceback.format_exception() (never str(exc) alone).
 import logging
 import time
 import traceback
-from datetime import datetime, timezone
 
 logger = logging.getLogger("backend.tracer")
 
@@ -92,9 +91,6 @@ def trace_uncaught(exc: BaseException) -> None:
     except Exception:
         pass
 
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def monotonic_seconds() -> float:

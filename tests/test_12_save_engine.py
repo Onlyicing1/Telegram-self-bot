@@ -142,7 +142,7 @@ async def test_settings_panel_renders():
     assert title == "Settings"
     assert "Auto-close" in body
     assert "Max deep save" in body
-    assert len(buttons) == 11
+    assert len(buttons) == 10
 
 
 @pytest.mark.asyncio
