@@ -754,7 +754,7 @@ compatibility module and its public exports remain intentionally preserved.
 ### 11. Commit
 
 - Initial cleanup + handoff commit: `aff4e11eab5c0942b5f78305483e2ccba706f426`
-- Final report commit (records the verified delivery): `e653e146ad8e3393e20c260c4d0b9ba2d1167b01`
+- Final report commit (records the verified delivery): `78ccb14278b51013e65077d258028f7a37b7aa4e`
 
 ### 12. Push Result
 
@@ -762,11 +762,12 @@ compatibility module and its public exports remain intentionally preserved.
 - `aff4e11..e653e14 main -> main`: pushed successfully (the first attempt
   returned a transient stale-ref rejection, and `git fetch origin` confirmed
   the commit was already on the remote).
+- `e653e14..78ccb14 main -> main`: pushed successfully.
 
 ### 13. Remote Verification
 
 After `git fetch origin`, local `HEAD` and `origin/main` both resolve to
-`e653e146ad8e3393e20c260c4d0b9ba2d1167b01`.
+`78ccb14278b51013e65077d258028f7a37b7aa4e`.
 
 ### 14. Final Working Tree
 
