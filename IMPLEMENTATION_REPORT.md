@@ -169,22 +169,28 @@ outside this cleanup scope.
 
 ## 15. Commit
 
-- Final execution commit: **`7f48cf4`**
-  (`7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`)
-- Message: `docs: reconcile helper config and SQL inventory`
+- Cleanup commit: `7f48cf4`
+  (`7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`) —
+  `docs: reconcile helper config and SQL inventory`
+- Final report commit: **`504fd07`**
+  (`504fd070bbd1d0c5dd292f612ed15e3d4d8d6a06`) —
+  `docs: finalize forensic sweep delivery record`
 
 ## 16. Push Result
 
-Push to `origin/main` succeeded: `6ee961c..7f48cf4 main -> main`.
+Both pushes to `origin/main` succeeded:
+
+- `6ee961c..7f48cf4 main -> main`
+- `7f48cf4..504fd07 main -> main`
 
 ## 17. Remote Verification
 
 After `git fetch origin`, both hashes matched:
 
-- local `HEAD`: `7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`
-- `origin/main`: `7f48cf4b4e40ee6bd78ed9690bfdc44ef63e0928`
+- local `HEAD`: `504fd070bbd1d0c5dd292f612ed15e3d4d8d6a06`
+- `origin/main`: `504fd070bbd1d0c5dd292f612ed15e3d4d8d6a06`
 
 ## 18. Final Working Tree
 
 `git status` confirmed a clean working tree and branch up to date with
-`origin/main` before this report finalization edit.
+`origin/main` after the final report commit/push.
