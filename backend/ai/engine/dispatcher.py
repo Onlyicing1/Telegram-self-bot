@@ -550,9 +550,13 @@ class Dispatcher:
         completion_tokens = usage["completion_tokens"]
         total_tokens = usage["total_tokens"]
         if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
-            # Providers that omit usage: fall back to the prompt estimate.
-            prompt_tokens = prompt_package.estimated_tokens.estimated_input_tokens
-            total_tokens = prompt_tokens + completion_tokens
+            # Providers that omit usage: fall back to the prompt estimate —
+            # but ONLY for a successful request. A failed request consumed
+            # nothing, so its token fields stay 0 and telemetry reports
+            # "unavailable" instead of dressing an estimate up as usage.
+            if response.success:
+                prompt_tokens = prompt_package.estimated_tokens.estimated_input_tokens
+                total_tokens = prompt_tokens + completion_tokens
         elif total_tokens == 0:
             total_tokens = prompt_tokens + completion_tokens
         elif total_tokens < prompt_tokens + completion_tokens:
@@ -614,7 +618,15 @@ class Dispatcher:
         result = EngineResult(
             success=bool(response.success),
             provider=response.provider_name or provider_name,
-            model=self._provider_manager.get_active().config.model or response.provider_name or provider_name,
+            # The model that ACTUALLY served: providers stamp the resolved
+            # model into response metadata — authoritative even when a
+            # fallback provider answered instead of the active one.
+            model=(
+                str((response.metadata or {}).get("model") or "")
+                or self._provider_manager.get_active().config.model
+                or response.provider_name
+                or provider_name
+            ),
             latency=latency,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -1259,13 +1271,22 @@ class Dispatcher:
         errors: list[str],
         metadata: dict[str, Any],
     ) -> EngineResult:
-        """Build a failure EngineResult and record metrics."""
+        """Build a failure EngineResult, record metrics AND telemetry."""
         latency = time.perf_counter() - start
         msg = f"{stage}: {exc}"
         errors.append(msg)
         metadata.setdefault("stages", []).append(stage)
         safe_call(self._hooks, "on_error", msg, stage)
         logger.warning("Engine dispatcher failure at %s: %r", stage, exc)
+        # Early-stage failures are real executions too: they must surface in
+        # the AI Details/Health surfaces, so they get a normalized record with
+        # honest unavailable token facts (never values from another request).
+        metadata["token_source"] = "unavailable"
+        metadata["failure_type"] = "internal"
+        metadata["retry_count"] = 0
+        metadata["fallback_used"] = False
+        metadata["tool_call_count"] = 0
+        metadata["context_tokens"] = 0
         result = EngineResult(
             success=False,
             latency=latency,
@@ -1283,4 +1304,8 @@ class Dispatcher:
             completion_tokens=0,
             error=msg,
         )
+        try:
+            telemetry.record_execution(result, 0)
+        except Exception:  # noqa: BLE001
+            logger.debug("AI telemetry record failed", exc_info=True)
         return result

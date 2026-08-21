@@ -44,6 +44,7 @@ _FAILURE_REASONS: dict[str, str] = {
     "network": "Connection failed",
     "request": "Invalid request",
     "blocked": "Blocked",
+    "internal": "System error",
 }
 
 
@@ -114,8 +115,38 @@ def format_latency_exact(seconds: float) -> str:
 
 
 def format_time_of(iso_timestamp: str) -> str:
-    """Short clock time from an ISO timestamp: "...T12:41:33" → "12:41"."""
-    return (iso_timestamp or "")[11:16]
+    """Short local clock time from a UTC ISO timestamp: "...T12:41:33Z" → "16:11".
+
+    Records are stored in UTC; the owner's clock is the configured ``TZ``
+    (default Asia/Tehran). Falls back to the raw UTC slice when the zone is
+    unavailable — never raises.
+    """
+    raw = iso_timestamp or ""
+    if len(raw) < 16:
+        return raw
+    try:
+        ts = datetime.fromisoformat(raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        import os
+        from zoneinfo import ZoneInfo
+        local = ts.astimezone(ZoneInfo(os.getenv("TZ", "Asia/Tehran")))
+        return local.strftime("%H:%M")
+    except Exception:
+        return raw[11:16]
+
+
+def remaining_context(context_tokens: int, max_context: int) -> int | None:
+    """Remaining context capacity, or ``None`` when it cannot be known.
+
+    ``None`` means the limit is unknown (or usage is unknown) — callers
+    must render "unavailable" rather than fabricating a number. Context
+    capacity is a model/window property; provider account quota is a
+    different concept and is never mixed in here.
+    """
+    if context_tokens <= 0 or max_context <= 0:
+        return None
+    return max(0, max_context - context_tokens)
 
 
 def compact_telemetry_line(record: "AIExecutionRecord | None") -> str:

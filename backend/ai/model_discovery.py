@@ -153,6 +153,56 @@ class ModelInfo:
     description: str = ""
     is_alias: bool = False
     capabilities: list[str] = field(default_factory=list)
+    # Metadata-driven ONLY: True when the provider's pricing reports $0 for
+    # both prompt and completion (OpenRouter-style ``pricing`` block). A name
+    # containing "free" alone never sets this — only authoritative pricing.
+    is_free: bool = False
+
+
+def _is_free_pricing(raw_model: dict[str, Any]) -> bool:
+    """True when provider metadata prices BOTH prompt and completion at $0.
+
+    Authoritative-metadata detection only (OpenRouter ``pricing`` block).
+    Anything absent, malformed, or non-zero means NOT free — a model is
+    never labeled free because of its name.
+    """
+    pricing = raw_model.get("pricing")
+    if not isinstance(pricing, dict):
+        return False
+
+    def _zero(key: str) -> bool:
+        try:
+            return float(pricing.get(key)) == 0.0
+        except (TypeError, ValueError):
+            return False
+
+    return _zero("prompt") and _zero("completion")
+
+
+def order_models_for_selector(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Deterministic selector ordering: genuinely-free models pinned first.
+
+    Both groups stay alphabetically sorted by display name; the original
+    list is never mutated and models are never duplicated or dropped.
+    When metadata is unavailable no model carries ``is_free`` and this is
+    a plain alphabetical sort — it degrades gracefully.
+    """
+    free = sorted((m for m in models if m.is_free), key=lambda m: m.name.lower())
+    rest = sorted((m for m in models if not m.is_free), key=lambda m: m.name.lower())
+    return free + rest
+
+
+def get_model_context_length(provider_name: str, model_id: str) -> int:
+    """Authoritative context limit from cached discovery metadata (no I/O).
+
+    Returns 0 when unknown — callers must treat 0 as "limit unavailable"
+    and never invent one. Reads only the in-memory discovery cache; the
+    async UI panels refresh the cache via ``fetch_models`` before calling.
+    """
+    for m in get_cached_models(provider_name):
+        if m.id == model_id and m.context_length > 0:
+            return m.context_length
+    return 0
 
 
 def _build_fallback_models(provider_name: str) -> list[ModelInfo]:
@@ -268,6 +318,7 @@ async def _fetch_openai_compat_models(
                     description=m.get("description", ""),
                     is_alias=bool(m.get("is_alias", False)),
                     capabilities=caps,
+                    is_free=_is_free_pricing(m),
                 ))
 
             models.sort(key=lambda m: m.name.lower())

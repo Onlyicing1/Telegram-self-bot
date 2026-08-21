@@ -1237,3 +1237,81 @@ After `git fetch origin`, local `HEAD` equals `origin/main`.
 
 `git status --short` is clean.
 
+---
+
+# Execution Report — AI Capacity, Free-Model Pinning, Two-Column Selector, Details Integrity
+
+## Execution 10 — 2026-08-21
+
+### 1. Execution Summary
+
+Second AI-core UX/observability pass. Implemented accurate remaining-context
+capacity per model, metadata-driven OpenRouter free-model detection with
+pinning, a two-column model selector with overflow-safe callbacks, and fixed
+the AI Details panel to render exclusively from the latest execution record
+(never stale config identity or fabricated token estimates). Closed the
+telemetry exactly-once gap for early-stage engine failures.
+
+### 2. Baseline
+
+- Starting HEAD: `b3ddc6fbb390d1ed4d07e708f08b1a1ae8dd22da` (== origin/main)
+- Working tree: clean
+- Baseline full suite: **588 passed, 0 failed, 1 warning**
+
+### 3. Architecture Inspected
+
+Dispatcher (both dispatch paths + `_fail`), `EngineResult`, telemetry store,
+ProviderManager routing/fallback/emergency-fallback contract,
+`ProviderResponse.metadata["model"]` provenance (gemini + openai_compat),
+`model_discovery` fetch/cache/fallback catalog, `InlinePanelBuilder`
+two-column support, and Telegram's 64-byte callback-data ceiling
+(`truncate_callback_data` silently truncates — long model ids could
+mis-select).
+
+### 4. Files Modified / Added
+
+| File | Change |
+|---|---|
+| `backend/ai/model_discovery.py` | Added `ModelInfo.is_free` (pricing-metadata-driven only), `_is_free_pricing`, `order_models_for_selector` (free pinned first, alphabetical, deterministic, no dupes), `get_model_context_length` (cache-only lookup; 0 = unknown) |
+| `backend/ai/engine/telemetry.py` | Added pure `remaining_context()` (None = unknowable) and TZ-aware `format_time_of` (UTC records → configured `TZ` clock, default Asia/Tehran); added "internal" → "System error" failure reason |
+| `backend/ai/engine/dispatcher.py` | EngineResult model now prefers the serving provider's stamped `metadata["model"]` (fixes fallback provider/model mismatch); prompt-token estimate fallback is applied ONLY on success (failed requests keep 0/unavailable); `_fail()` now writes normalized metadata AND records telemetry so early-stage failures are visible exactly once |
+| `backend/bot/handlers/ai.py` | Two-column model grid (`_MODEL_PAGE_SIZE=16`), free models pinned first with subtle `·free` tag, current selection marked `✓`; new overflow-safe `action:ai_model_pick_idx:<page>:<idx>:<hash8>` callback (sha1 id hash verified on tap; stale → re-render, never mis-select); Overview context line gains `/ limit · N left`; Details renders only from the record (blank identity → `—`, no config fallback), shows exact used/limit/left or honest Unavailable / limit unknown; `_resolve_context_limit` discovery helper; `local` provider displays as Built-in |
+
+### 5. Token Remaining Implementation
+
+Limits come ONLY from authoritative discovery metadata (Gemini
+`inputTokenLimit`, OpenAI-compatible `context_length`); unknown limits render
+as "limit unknown"/omitted — never invented. Context-used vs limit vs
+remaining are distinct values from one source (`record.context_tokens`,
+discovery limit, `remaining_context`). Provider account quota is not mixed in.
+
+### 6. AI Details Fix
+
+Root causes found: (a) failed requests inherited the success-only prompt
+estimate as "2,630 in ≈ est." plus identical context; (b) Model fell back to
+the persisted config when a record had none (stale other-request identity);
+(c) fallback executions showed the active config's model instead of the
+serving provider's model. All three fixed at the dispatcher/telemetry level;
+Details now reads only the latest `AIExecutionRecord`.
+
+### 7. Validation Performed
+
+- Targeted: `tests/test_34_ai_model_ui.py` — **20 passed**
+- Full suite: `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto` —
+  **608 passed, 0 failed, 1 warning** (baseline 588 + 20 new, zero regressions)
+- `python3 -m compileall -q backend` — pass
+- `npx tsc -b --noEmit` — exit 0
+- `npm run build` — ✓ built
+- `git diff --check` — clean
+
+### 8. Database / Schema Impact
+
+None. Telemetry remains bounded in-RAM. No SQL, migration, or Supabase change.
+No protected document touched.
+
+### 9. Runtime Impact
+
+Chat default unchanged (compact stats still opt-in). Model selector fits ~2×
+models per screen with deterministic ordering. Failed/fallback executions now
+report honest unavailable usage instead of estimated figures.
+

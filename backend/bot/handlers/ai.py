@@ -128,6 +128,7 @@ _PROVIDER_DISPLAY_FALLBACK = {
     "siliconflow": "SiliconFlow",
     "fireworks": "Fireworks",
     "dummy": "Built-in",
+    "local": "Built-in",
 }
 
 
@@ -146,13 +147,42 @@ def _provider_display(name: str) -> str:
     return _PROVIDER_DISPLAY_FALLBACK.get(clean.lower(), clean.title())
 
 
+async def _resolve_context_limit(provider: str, model: str) -> int:
+    """Authoritative context limit for a model, from discovery metadata.
+
+    Uses the discovery cache (refreshing it once if cold). Returns 0 when
+    unknown — callers must show "limit unknown", never invent a number.
+    """
+    if not provider or not model or provider == "local":
+        return 0
+    from backend.ai.model_discovery import (
+        fetch_models,
+        get_api_key_for_provider,
+        get_base_url_for_provider,
+        get_model_context_length,
+    )
+    try:
+        await fetch_models(
+            provider,
+            get_api_key_for_provider(provider),
+            get_base_url_for_provider(provider),
+        )
+    except Exception:
+        pass
+    return get_model_context_length(provider, model)
+
+
 def _context_line(context_tokens: int, max_context: int) -> str:
     """Honest context usage line — never invents a limit."""
     if context_tokens <= 0:
         return "Context unavailable"
-    from backend.ai.engine.telemetry import format_tokens
+    from backend.ai.engine.telemetry import format_tokens, remaining_context
     if max_context > 0:
-        return f"{format_tokens(context_tokens)} / {format_tokens(max_context)} context"
+        line = f"{format_tokens(context_tokens)} / {format_tokens(max_context)} context"
+        left = remaining_context(context_tokens, max_context)
+        if left is not None:
+            line += f" · {format_tokens(left)} left"
+        return line
     return f"{format_tokens(context_tokens)} context"
 
 
@@ -206,7 +236,12 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     lines.append("")
     if record is not None and record.status == "success":
         lines.append(compact_telemetry_line(record))
-        lines.append(_context_line(record.context_tokens, record.max_context))
+        limit = record.max_context
+        if limit <= 0:
+            limit = await _resolve_context_limit(
+                record.provider or saved_provider, record.model or saved_model
+            )
+        lines.append(_context_line(record.context_tokens, limit))
     elif record is not None:
         lines.append(f"Last request failed — {record.error_reason}")
     else:
@@ -278,6 +313,29 @@ async def _ai_provider_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
+_MODEL_PAGE_SIZE = 16  # two-column grid: 8 rows × 2 buttons
+
+
+def _model_callback_hash(model_id: str) -> str:
+    """Stable 8-char id fingerprint so a stale index can never mis-select."""
+    import hashlib
+    return hashlib.sha1((model_id or "").encode("utf-8")).hexdigest()[:8]
+
+
+def _model_button_label(m, current_model: str) -> str:
+    """Compact two-column button label: current mark, name, free/ctx tag."""
+    name = m.name or m.id.split("/")[-1]
+    mark = "✓ " if m.id == current_model else ""
+    label = f"{mark}{name}"
+    if m.is_free:
+        label += " ·free"
+    elif m.context_length > 0:
+        ctx_k = m.context_length // 1000
+        if ctx_k > 0:
+            label += f" ({ctx_k}K)"
+    return label[:34]
+
+
 async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
@@ -288,7 +346,12 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         return "🤖 Model", "⚠️ Select a provider first.", [
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
-    from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
+    from backend.ai.model_discovery import (
+        fetch_models,
+        get_api_key_for_provider,
+        get_base_url_for_provider,
+        order_models_for_selector,
+    )
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
     if not api_key:
@@ -307,25 +370,38 @@ async def _ai_model_panel_handler(event, extra: str) -> tuple[str, str, list] | 
             [InlinePanelBuilder().add_row("🔄 Refresh", "action:ai_refresh_models").build()[0][0]],
             [InlinePanelBuilder().add_row("⬅ Back", "panel:ai").build()[0][0]],
         ]
-    per_page = 8
-    total = len(models)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    start = page * per_page
-    end = start + per_page
-    page_models = models[start:end]
+    ordered = order_models_for_selector(models)
+    total = len(ordered)
+    total_pages = max(1, (total + _MODEL_PAGE_SIZE - 1) // _MODEL_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _MODEL_PAGE_SIZE
+    page_models = ordered[start:start + _MODEL_PAGE_SIZE]
     current_model = config.get("model", "")
+    free_count = sum(1 for m in ordered if m.is_free)
     lines = [
         f"**🤖 Model Selection**\n",
-        f"_{total} models available · Page {page + 1}/{total_pages}_\n",
+        f"_{total} models · Page {page + 1}/{total_pages}_\n",
     ]
+    if free_count:
+        lines.append(f"_Free ({free_count}) pinned first_\n")
     builder = InlinePanelBuilder()
-    for m in page_models:
-        mark = "✅" if m.id == current_model else "  "
-        label = f"{mark} {m.name}"
-        if m.context_length > 0:
-            ctx_k = m.context_length // 1000
-            label += f" ({ctx_k}K)"
-        builder.add_row(label[:60], f"action:ai_select_model:{m.id}")
+    # Two-column grid: pairs share one button row, so roughly twice as many
+    # models fit per screen. Callbacks carry a stable list INDEX plus a short
+    # id hash — never the raw id — so Telegram's 64-byte callback limit can't
+    # truncate long ids into a wrong selection; a stale index/hash simply
+    # re-renders instead of mis-selecting.
+    for i in range(0, len(page_models), 2):
+        pair = []
+        for j in (i, i + 1):
+            if j >= len(page_models):
+                break
+            m = page_models[j]
+            data = (
+                f"action:ai_model_pick_idx:{page}:{start + j}"
+                f":{_model_callback_hash(m.id)}"
+            )
+            pair.append((_model_button_label(m, current_model), data))
+        builder.add_buttons(*pair)
     nav = []
     if page > 0:
         nav.append(("‹ Prev", f"panel:ai_model:page:{page - 1}"))
@@ -436,16 +512,20 @@ _USAGE_RANGES = (("today", "Today"), ("7d", "7 days"), ("30d", "30 days"))
 
 
 async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    """LEVEL 2 — precise per-request facts from the execution record."""
+    """LEVEL 2 — precise per-request facts from the execution record.
+
+    Every value comes ONLY from the latest ``AIExecutionRecord`` — never
+    from the persisted config — so a failed or engine-level execution can
+    never display another request's identity or usage.
+    """
     from backend.ai.engine.telemetry import (
         format_latency_exact,
         format_time_of,
         format_tokens_exact,
+        remaining_context,
         telemetry,
     )
 
-    owner_id = await _get_owner_id()
-    config = await _get_saved_config(owner_id)
     record = telemetry.last()
 
     if record is None:
@@ -453,21 +533,35 @@ async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] 
     else:
         if record.token_source == "unavailable":
             tokens = "Unavailable"
+        elif record.input_tokens == 0 and record.output_tokens == 0:
+            tokens = "Unavailable"
         else:
-            est = "  ≈ est." if record.token_source == "estimated" else ""
+            est = " ≈ est." if record.token_source == "estimated" else ""
             tokens = (
                 f"{format_tokens_exact(record.input_tokens)} in · "
                 f"{format_tokens_exact(record.output_tokens)} out{est}"
             )
+        limit = record.max_context
+        if limit <= 0:
+            limit = await _resolve_context_limit(record.provider, record.model)
         if record.context_tokens > 0:
             context = format_tokens_exact(record.context_tokens)
-            if record.max_context > 0:
-                context += f" / {format_tokens_exact(record.max_context)}"
+            if limit > 0:
+                left = remaining_context(record.context_tokens, limit)
+                context += (
+                    f" / {format_tokens_exact(limit)}"
+                    + (f" · {format_tokens_exact(left)} left" if left is not None else "")
+                )
+            else:
+                context += " · limit unknown"
         else:
             context = "Unavailable"
         status = "Ready" if record.status == "success" else f"Failed — {record.error_reason}"
+        # The deterministic fast path runs no model at all — show that
+        # honestly instead of leaking internal names.
+        model_value = record.model if record.model and record.model != "deterministic" else "—"
         rows = [
-            ("Model", record.model or config.get("model", "—")),
+            ("Model", model_value),
             ("Provider", _provider_display(record.provider)),
             ("Status", status),
             ("Context", context),
@@ -732,6 +826,54 @@ async def _ai_select_model_action(event, extra: str, chat_id: int) -> tuple[str,
     await _save_config(owner_id, config)
     _apply_runtime_selection(config.get("provider", ""), model_id)
     logger.info("[AI_TRACE] select_model SAVED provider='%s' model='%s'", config.get("provider", ""), model_id)
+    return await _ai_main_panel_handler(event, "")
+
+
+async def _ai_model_pick_idx_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Select a model from the two-column grid via a stable list position.
+
+    Callback payload: ``<page>:<ordered-index>:<id-hash>``. The hash is
+    verified against the freshly-resolved ordered list; on any mismatch
+    (cache refreshed between render and tap) the panel re-renders instead
+    of selecting the wrong model.
+    """
+    owner_id = await _get_owner_id()
+    config = await _get_saved_config(owner_id)
+    provider_name = config.get("provider", "")
+    try:
+        page_str, idx_str, received_hash = (extra.split(":") + [""])[:3]
+        page = max(0, int(page_str))
+        idx = int(idx_str)
+    except ValueError:
+        return await _ai_model_panel_handler(event, "")
+
+    from backend.ai.model_discovery import (
+        fetch_models,
+        get_api_key_for_provider,
+        get_base_url_for_provider,
+        order_models_for_selector,
+    )
+    models = await fetch_models(
+        provider_name,
+        get_api_key_for_provider(provider_name),
+        get_base_url_for_provider(provider_name),
+    )
+    ordered = order_models_for_selector(models)
+    if not 0 <= idx < len(ordered):
+        return await _ai_model_panel_handler(event, f"page:{page}")
+    candidate = ordered[idx]
+    if received_hash and _model_callback_hash(candidate.id) != received_hash:
+        logger.info(
+            "[AI_TRACE] pick_idx stale (idx=%d hash=%s) — re-rendering", idx, received_hash
+        )
+        return await _ai_model_panel_handler(event, f"page:{page}")
+
+    config["model"] = candidate.id
+    await _save_config(owner_id, config)
+    _apply_runtime_selection(provider_name, candidate.id)
+    logger.info(
+        "[AI_TRACE] pick_idx SAVED provider='%s' model='%s'", provider_name, candidate.id
+    )
     return await _ai_main_panel_handler(event, "")
 
 
@@ -1197,6 +1339,7 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_diagnostics", _ai_diagnostics_inline_builder)
         register_action("ai_select_provider", _ai_select_provider_action)
         register_action("ai_select_model", _ai_select_model_action)
+        register_action("ai_model_pick_idx", _ai_model_pick_idx_action)
         register_action("ai_pick_model", _ai_pick_model_action)
         register_action("ai_refresh_providers", _ai_refresh_providers_action)
         register_action("ai_refresh_models", _ai_refresh_models_action)
