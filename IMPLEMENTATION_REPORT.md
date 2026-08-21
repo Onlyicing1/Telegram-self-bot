@@ -178,9 +178,12 @@ outside this cleanup scope.
 - Prior report commit: `e58089d`
   (`e58089dcd19bfc0d3ae2873ee3fe23401e1112d2`) —
   `docs: correct final report verification hashes`
-- Final report commit: **`718bea3`**
+- Prior report commit: `718bea3`
   (`718bea34a47e7320b228e9bc5584c7874264286b`) —
   `docs: record final report commit verification`
+- Final report commit: **`42151eb`**
+  (`42151ebb45fd6eb062d7e97c94bf5f49bc99ca2b`) —
+  `docs: finalize forensic sweep report state`
 
 ## 16. Push Result
 
@@ -190,13 +193,14 @@ Both pushes to `origin/main` succeeded:
 - `7f48cf4..504fd07 main -> main`
 - `504fd07..e58089d main -> main`
 - `e58089d..718bea3 main -> main`
+- `718bea3..42151eb main -> main`
 
 ## 17. Remote Verification
 
 After `git fetch origin`, both hashes matched:
 
-- local `HEAD`: `718bea34a47e7320b228e9bc5584c7874264286b`
-- `origin/main`: `718bea34a47e7320b228e9bc5584c7874264286b`
+- local `HEAD`: `42151ebb45fd6eb062d7e97c94bf5f49bc99ca2b`
+- `origin/main`: `42151ebb45fd6eb062d7e97c94bf5f49bc99ca2b`
 
 ## 18. Final Working Tree
 
