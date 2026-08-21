@@ -94,7 +94,6 @@ async def test_performance_report_returns_fields():
     assert "most_expensive_providers" in report
     assert "memory_mb" in report
     assert "background_loops" in report
-    assert "watchdog_ok" in report
     assert isinstance(report["slowest_operations"], list)
     assert isinstance(report["most_expensive_providers"], list)
 

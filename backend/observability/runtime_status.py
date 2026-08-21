@@ -114,7 +114,6 @@ def runtime_status() -> dict[str, Any]:
             }
             for name, info in loops.items()
         },
-        "watchdog_ok": snap.get("watchdog_ok", False),
         "heartbeat_age_s": snap.get("heartbeat_age_s"),
         "rpc_latency_ms": snap.get("rpc_latency_ms"),
         "last_rpc_s": snap.get("last_rpc_s"),

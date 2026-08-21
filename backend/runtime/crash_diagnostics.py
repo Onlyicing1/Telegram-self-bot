@@ -324,7 +324,7 @@ def dump_crash_snapshot(reason: str = "") -> None:
     if snap:
         for key in (
             "runtime_state", "telethon_connected", "supervisor_ok",
-            "helper_connected", "bio_cron_ok", "watchdog_ok",
+            "helper_connected", "bio_cron_ok",
             "heartbeat_age_s", "uptime_s", "restart_count",
             "client_generation", "last_rebuild_reason",
             "rpc_latency_ms", "last_rpc_s", "last_command_s",

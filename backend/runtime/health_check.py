@@ -6,7 +6,7 @@ Consolidates health checks for:
   - Supabase
   - AI providers
   - Memory manager
-  - Background workers (watchdog, heartbeat, keepalive, failsafe, diagnostics)
+  - Background workers (heartbeat, keepalive, failsafe, diagnostics)
   - Runtime manager (conversation sessions)
   - Diagnostics system (event ring)
 
@@ -91,7 +91,6 @@ def check_background_workers() -> dict[str, Any]:
     snap = _health_snapshot()
     task_states = snap.get("task_states", {})
     workers = {
-        "watchdog": snap.get("watchdog_ok", False),
         "heartbeat": snap.get("process_alive", False),
         "supervisor": snap.get("supervisor_ok", False),
         "bio_engine": snap.get("bio_cron_ok", False),

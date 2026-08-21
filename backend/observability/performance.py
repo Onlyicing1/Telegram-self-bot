@@ -53,7 +53,6 @@ def performance_report(owner_id: int = 0) -> dict[str, Any]:
         "pending_tasks": runtime.get("pending_tasks", 0),
         "background_loops": runtime.get("background_loops", {}),
         "background_loops_health": _loop_health_summary(runtime.get("background_loops", {})),
-        "watchdog_ok": runtime.get("watchdog_ok", False),
         "recent_errors": len(error_events),
         "total_ai_requests": metrics.get("total_executions", 0),
         "total_tokens": metrics.get("total_prompt_tokens", 0) + metrics.get("total_completion_tokens", 0),
