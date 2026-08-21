@@ -350,7 +350,7 @@ treated as a disconnect or trigger recovery.
 | `SUPABASE_URL` | `""` | Supabase URL (empty → in-memory fallback) |
 | `SUPABASE_SERVICE_ROLE_KEY` | `""` | Supabase service-role key |
 | `BOT_TOKEN` | `""` | Helper bot token (empty → helper disabled) |
-| `HELPER_BOT_ENABLED` | `false` | Enable the helper bot inline UI |
+| `HELPER_BOT_ENABLED` | derived | Helper enablement is derived from `BOT_TOKEN` presence; an explicit env override is not read |
 | `TZ` | `Asia/Tehran` | Timezone for profile engines + timestamps |
 | `PORT` | `8000` | Web server port |
 | `BIO_UPDATE_ENABLED` | `false` | Auto-start Bio engine on boot |

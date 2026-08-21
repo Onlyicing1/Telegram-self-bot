@@ -11,5 +11,6 @@ independent (no foreign keys exist between tables).
 | `username_state.sql` | `username_state` | Singleton-per-owner username cron state |
 | `bot_logs.sql` | `bot_logs` | Structured activity log |
 | `panel_settings.sql` | `panel_settings` | Global panel auto-close preference |
+| `persist_active_state.sql` | `bio_state`, `username_state` | Idempotent migration adding the `is_active` column to both state tables |
 
 For the full schema reference, see [DATABASE_ARCHITECTURE.md](../DATABASE_ARCHITECTURE.md).
