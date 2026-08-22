@@ -360,22 +360,100 @@ async def _general_id_action(event, extra: str, chat_id: int) -> tuple[str, str,
     client = _self_client
     body_lines = []
     try:
-        chat_id = getattr(event, "chat_id", 0) or 0
-        msg_id = getattr(event, "message_id", 0) or 0
-        body_lines.append(f"**Chat ID:** `{chat_id}`")
-        body_lines.append(f"**Msg ID:** `{msg_id}`")
-        orig = getattr(event, "original_update", None)
-        if orig is not None:
-            reply_msg_id = getattr(orig, "msg_id", None)
-            if reply_msg_id:
+        event_chat_id = chat_id or getattr(event, "chat_id", 0) or 0
+        event_msg_id = getattr(event, "message_id", 0) or 0
+
+        body_lines.append("**Current Chat**")
+        body_lines.append(f"Chat ID: `{event_chat_id}`")
+
+        chat_type = "Unknown"
+        chat_name = ""
+        if client and event_chat_id:
+            try:
+                entity = await client.get_entity(event_chat_id)
+                if hasattr(entity, "broadcast"):
+                    chat_type = "Channel" if entity.broadcast else "Group"
+                elif hasattr(entity, "megagroup") and entity.megagroup:
+                    chat_type = "Supergroup"
+                elif hasattr(entity, "first_name"):
+                    chat_type = "Private"
+                name_parts = []
+                for attr in ("title", "first_name"):
+                    val = getattr(entity, attr, "")
+                    if val:
+                        name_parts.append(val)
+                last = getattr(entity, "last_name", "")
+                if last:
+                    name_parts.append(last)
+                chat_name = " ".join(name_parts).strip()
+            except Exception:
+                pass
+        body_lines.append(f"Type: {chat_type}")
+        if chat_name:
+            body_lines.append(f"Name: {chat_name}")
+        body_lines.append("")
+
+        body_lines.append("**Current Message**")
+        if event_msg_id:
+            body_lines.append(f"Message ID: `{event_msg_id}`")
+        else:
+            body_lines.append("Message ID: Unavailable")
+        body_lines.append(f"Chat ID: `{event_chat_id}`")
+
+        if client and event_chat_id and event_msg_id:
+            try:
+                msg = await client.get_messages(event_chat_id, ids=event_msg_id)
+                if msg is not None and msg.fwd_from:
+                    fwd = msg.fwd_from
+                    fwd_chat_id = getattr(fwd, "from_id", None)
+                    fwd_msg_id = getattr(fwd, "channel_post", None) or getattr(fwd, "msg_id", None)
+                    fwd_name = getattr(fwd, "from_name", "") or ""
+                    body_lines.append("")
+                    body_lines.append("**Forward Source**")
+                    has_fwd_info = False
+                    if fwd_name:
+                        body_lines.append(f"From: {fwd_name}")
+                        has_fwd_info = True
+                    if fwd_chat_id:
+                        fwd_cid = getattr(fwd_chat_id, "channel_id", None) or getattr(fwd_chat_id, "user_id", None) or fwd_chat_id
+                        body_lines.append(f"Source Chat ID: `{fwd_cid}`")
+                        has_fwd_info = True
+                    if fwd_msg_id:
+                        body_lines.append(f"Source Message ID: `{fwd_msg_id}`")
+                        has_fwd_info = True
+                    if not has_fwd_info:
+                        body_lines.append("Unavailable")
+            except Exception:
+                pass
+        body_lines.append("")
+
+        body_lines.append("**Reply Context**")
+        reply_to_msg_id = getattr(event, "_reply_to_msg_id", None)
+        if reply_to_msg_id is None:
+            cq_msg = getattr(event, "message", None)
+            if cq_msg is not None:
+                reply_to_msg_id = getattr(cq_msg, "reply_to_msg_id", None)
+        if not reply_to_msg_id:
+            orig = getattr(event, "original_update", None)
+            if orig is not None:
+                reply_to_msg_id = getattr(orig, "msg_id", None)
+        if reply_to_msg_id:
+            body_lines.append(f"Reply To Msg ID: `{reply_to_msg_id}`")
+            if client:
                 try:
-                    reply = await client.get_messages(chat_id, ids=reply_msg_id)
+                    reply = await client.get_messages(event_chat_id, ids=reply_to_msg_id)
                     if reply:
-                        body_lines.append(f"**Reply Msg ID:** `{reply.id}`")
-                        body_lines.append(f"**Reply Sender ID:** `{reply.sender_id}`")
-                        body_lines.append(f"**Reply Chat ID:** `{reply.chat_id}`")
+                        body_lines.append(f"Reply Chat ID: `{reply.chat_id}`")
+                        body_lines.append(f"Reply Sender ID: `{reply.sender_id}`")
+                        if reply.text:
+                            preview = reply.text[:100].replace("\n", " ")
+                            body_lines.append(f"Preview: {preview}")
+                        if reply.fwd_from:
+                            body_lines.append("_(reply is a forwarded message)_")
                 except Exception:
-                    pass
+                    body_lines.append("_(reply message unavailable)_")
+        else:
+            body_lines.append("No reply context.")
     except Exception as exc:
         body_lines.append(f"Error: {exc}")
     return "Chat & Message IDs", "\n".join(body_lines), _build_general_buttons()
