@@ -24,10 +24,18 @@ from backend.ai.database.memory_repository import (
 )
 from backend.ai.database.message_repository import InMemoryMessageRepository, MessageRepository
 from backend.ai.database.preferences_repository import InMemoryPreferencesRepository, PreferencesRepository
-from backend.ai.database.provider_stats_repository import InMemoryProviderStatsRepository, ProviderStatsRepository
+from backend.ai.database.provider_stats_repository import (
+    InMemoryProviderStatsRepository,
+    ProviderStatsRepository,
+    SupabaseProviderStatsRepository,
+)
 from backend.ai.database.session_repository import InMemorySessionRepository, SessionRepository
 from backend.ai.database.tool_history_repository import InMemoryToolHistoryRepository, ToolHistoryRepository
-from backend.ai.database.usage_repository import InMemoryUsageRepository, UsageRepository
+from backend.ai.database.usage_repository import (
+    InMemoryUsageRepository,
+    SupabaseUsageRepository,
+    UsageRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +64,10 @@ class RepositoryManager:
         self._memory = SupabaseMemoryRepository() if supabase_available else InMemoryMemoryRepository()
         self._session = InMemorySessionRepository()
         self._message = InMemoryMessageRepository()
-        self._provider_stats = InMemoryProviderStatsRepository()
-        self._usage = InMemoryUsageRepository()
+        self._provider_stats = (
+            SupabaseProviderStatsRepository() if supabase_available else InMemoryProviderStatsRepository()
+        )
+        self._usage = SupabaseUsageRepository() if supabase_available else InMemoryUsageRepository()
         self._preferences = InMemoryPreferencesRepository()
         self._tool_history = InMemoryToolHistoryRepository()
 

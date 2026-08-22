@@ -688,14 +688,43 @@ class Dispatcher:
             error="" if result.success else (errors[-1] if errors else "provider_failed"),
         )
 
+        record = None
         try:
-            telemetry.record_execution(result, request.owner_id)
+            record = telemetry.record_execution(result, request.owner_id)
         except Exception:  # noqa: BLE001
             logger.debug("AI telemetry record failed", exc_info=True)
+        self._persist_usage(record, request.session_id)
 
         return result
 
     # ── internal ──
+
+    def _persist_usage(self, record: Any, session_id: str = "") -> None:
+        """Persist the normalized execution record exactly once, off the loop.
+
+        Mirrors the message/tool-history persistence convention
+        (``guarded_create_task``): the async recorder runs the sync repository
+        writes in a worker thread with a bounded timeout, and failures are
+        logged — never raised, never affecting the AI response or telemetry.
+        """
+        if record is None:
+            return
+        try:
+            # Only schedule where an event loop is actually running (the
+            # normal dispatch path). Direct sync callers of the internal
+            # result builders skip persistence rather than leak a task.
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            from backend.ai.database.usage_recorder import record_usage
+            from backend.runtime.task_guard import guarded_create_task
+            guarded_create_task(
+                record_usage(record, session_id=session_id),
+                name="ai:persist-usage",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI usage persistence schedule failed: %r", exc)
 
     def _build_tool_context(self, request: AIRequest) -> ToolContext:
         """Build a per-request ToolContext from the executor's base context.
@@ -924,10 +953,12 @@ class Dispatcher:
             completion_tokens=0,
             error="" if success else text,
         )
+        record = None
         try:
-            telemetry.record_execution(result, request.owner_id)
+            record = telemetry.record_execution(result, request.owner_id)
         except Exception:  # noqa: BLE001
             logger.debug("AI telemetry record failed", exc_info=True)
+        self._persist_usage(record, request.session_id)
         return result
 
     def _apply_structured_action(
@@ -1356,8 +1387,10 @@ class Dispatcher:
             completion_tokens=0,
             error=msg,
         )
+        record = None
         try:
-            telemetry.record_execution(result, 0)
+            record = telemetry.record_execution(result, 0)
         except Exception:  # noqa: BLE001
             logger.debug("AI telemetry record failed", exc_info=True)
+        self._persist_usage(record)
         return result

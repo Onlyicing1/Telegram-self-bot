@@ -636,9 +636,14 @@ RLS should be enabled. Only SELECT is granted to `anon` +
 
 **`backend/ai/database/provider_stats_repository.py`** — interface +
 in-memory fallback (`ProviderStatsRecord`, `ProviderStatsRepository`,
-`InMemoryProviderStatsRepository`). Methods: `get_or_create`,
-`record_request`, `get`, `list_all`. No Supabase-backed implementation
-is wired here yet. No migration has been applied for this table.
+`InMemoryProviderStatsRepository`) plus a Supabase-backed implementation
+(`SupabaseProviderStatsRepository`) wired into `RepositoryManager` when
+Supabase is available. Updates come from
+`backend/ai/database/usage_recorder.py` (read-modify-write upsert per
+(provider, owner)). Methods: `get_or_create`, `record_request`, `get`,
+`list_all`. No migration has been applied for this table yet — the
+migration must be generated from this section (see §20, item 4) and
+applied manually.
 
 ---
 
@@ -659,6 +664,7 @@ Per-request token usage log. One row per AI API call.
 | `completion_tokens` | `integer` | YES | `0` | Completion token count |
 | `total_tokens` | `integer` | YES | `0` | Total token count |
 | `latency_ms` | `real` | YES | `0` | Request latency in milliseconds |
+| `token_source` | `text` | YES | `NULL` | `actual` / `estimated` / `unavailable` — the honesty label for the token counts (never fabricated) |
 | `created_at` | `timestamptz` | YES | `now()` | When the usage was recorded |
 
 ### Indexes
@@ -678,9 +684,13 @@ RLS should be enabled. Only SELECT is granted to `anon` +
 
 **`backend/ai/database/usage_repository.py`** — interface +
 in-memory fallback (`UsageRecord`, `UsageRepository`,
-`InMemoryUsageRepository`). Methods: `create`, `total_tokens`,
-`daily_tokens`, `recent`. No Supabase-backed implementation is wired
-here yet. No migration has been applied for this table.
+`InMemoryUsageRepository`) plus a Supabase-backed implementation
+(`SupabaseUsageRepository`) wired into `RepositoryManager` when Supabase
+is available. Writes come from `backend/ai/database/usage_recorder.py`,
+which persists the normalized `AIExecutionRecord` exactly once per
+request. Methods: `create`, `total_tokens`, `daily_tokens`, `recent`.
+No migration has been applied for this table yet — the migration must be
+generated from this section (see §20, item 5) and applied manually.
 
 ---
 
@@ -996,9 +1006,14 @@ performed after confirming no data of value exists in them.
 implementations but no migration has been applied for any of them.
 The runtime operates entirely in-memory for these tables.
 
-**Resolution [MIGRATION REQUIRED]:** Future migrations must create
-all three tables with the schemas defined in [§12](#12-ai_provider_stats),
-[§13](#13-ai_usage), and [§14](#14-ai_preferences).
+**Resolution [MIGRATION REQUIRED]:** The code now wires Supabase-backed
+implementations for `ai_provider_stats` and `ai_usage` (via
+`RepositoryManager` + `usage_recorder.py`); `ai_preferences` remains
+interface + in-memory only. The runtime degrades to in-memory behavior
+when Supabase is unavailable or the tables are missing. Migrations must
+still be generated from the schemas in [§12](#12-ai_provider_stats),
+[§13](#13-ai_usage), and [§14](#14-ai_preferences) and applied manually
+(see §20, items 4–6).
 
 ### 19.9 AI configuration persistence is non-deterministic
 

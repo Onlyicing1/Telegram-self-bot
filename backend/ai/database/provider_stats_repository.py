@@ -97,3 +97,123 @@ class InMemoryProviderStatsRepository(ProviderStatsRepository):
 
     def list_all(self, owner_id: int) -> list[ProviderStatsRecord]:
         return [v for (pn, oid), v in self._stats.items() if oid == owner_id]
+
+
+def _get_db():
+    from backend.db.client import get_db
+    return get_db()
+
+
+def _row_to_stats(row: dict) -> ProviderStatsRecord | None:
+    try:
+        return ProviderStatsRecord(
+            provider_name=str(row.get("provider_name") or ""),
+            owner_id=int(row.get("owner_id") or 0),
+            total_requests=int(row.get("total_requests") or 0),
+            successful_requests=int(row.get("successful_requests") or 0),
+            failed_requests=int(row.get("failed_requests") or 0),
+            total_prompt_tokens=int(row.get("total_prompt_tokens") or 0),
+            total_completion_tokens=int(row.get("total_completion_tokens") or 0),
+            avg_latency_ms=float(row.get("avg_latency_ms") or 0.0),
+            last_request_at=_parse_dt(row.get("last_request_at")),
+            updated_at=_parse_dt(row.get("updated_at")) or datetime.now(timezone.utc),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+class SupabaseProviderStatsRepository(ProviderStatsRepository):
+    """Supabase-backed provider stats against the ``ai_provider_stats`` table.
+
+    Sync by design — the usage recorder runs these methods off the event
+    loop via ``asyncio.to_thread``. ``record_request`` is a read-modify-write
+    upsert (safe for this single-owner self-bot). Every method degrades to
+    a safe result and logs on failure so persistence can never break AI
+    execution. When Supabase is unavailable (``get_db()`` returns None) the
+    methods return empty results without raising.
+    """
+
+    __slots__ = ()
+
+    def get_or_create(self, provider_name: str, owner_id: int) -> ProviderStatsRecord:
+        found = self.get(provider_name, owner_id)
+        if found is not None:
+            return found
+        return ProviderStatsRecord(provider_name=provider_name, owner_id=owner_id)
+
+    def record_request(self, provider_name: str, owner_id: int, success: bool,
+                       prompt_tokens: int, completion_tokens: int, latency_ms: float) -> bool:
+        db = _get_db()
+        if not db:
+            return False
+        try:
+            existing = self.get(provider_name, owner_id)
+            now = datetime.now(timezone.utc)
+            if existing is None:
+                existing = ProviderStatsRecord(
+                    provider_name=provider_name, owner_id=owner_id,
+                )
+            existing.total_requests += 1
+            if success:
+                existing.successful_requests += 1
+            else:
+                existing.failed_requests += 1
+            existing.total_prompt_tokens += int(prompt_tokens or 0)
+            existing.total_completion_tokens += int(completion_tokens or 0)
+            existing.avg_latency_ms = (
+                (existing.avg_latency_ms * (existing.total_requests - 1) + float(latency_ms))
+                / existing.total_requests
+            )
+            existing.last_request_at = now
+            existing.updated_at = now
+            db.table("ai_provider_stats").upsert(existing.as_dict(), on_conflict="provider_name,owner_id").execute()
+            return True
+        except Exception as exc:
+            logger.warning("AI provider_stats record_request failed: %s", exc)
+            return False
+
+    def get(self, provider_name: str, owner_id: int) -> ProviderStatsRecord | None:
+        db = _get_db()
+        if not db:
+            return None
+        try:
+            result = (
+                db.table("ai_provider_stats")
+                .select("*")
+                .eq("provider_name", provider_name)
+                .eq("owner_id", owner_id)
+                .maybe_single()
+                .execute()
+            )
+            return _row_to_stats(result.data) if result and result.data else None
+        except Exception as exc:
+            logger.warning("AI provider_stats get failed: %s", exc)
+            return None
+
+    def list_all(self, owner_id: int) -> list[ProviderStatsRecord]:
+        db = _get_db()
+        if not db:
+            return []
+        try:
+            result = (
+                db.table("ai_provider_stats")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .execute()
+            )
+            return [r for r in (_row_to_stats(row) for row in (result.data or [])) if r is not None]
+        except Exception as exc:
+            logger.warning("AI provider_stats list_all failed: %s", exc)
+            return []
