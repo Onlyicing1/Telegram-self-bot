@@ -83,7 +83,7 @@ in-memory runtime state + UI.
 
 ### Commit / push / remote verification
 
-- **Commit:** (filled at delivery)
+- **Commit:** `bd00db9`
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
 - **Final working-tree status:** clean.
