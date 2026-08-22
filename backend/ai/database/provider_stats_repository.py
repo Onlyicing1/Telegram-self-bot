@@ -60,6 +60,10 @@ class ProviderStatsRepository:
     def list_all(self, owner_id: int) -> list[ProviderStatsRecord]:
         raise NotImplementedError
 
+    def count(self, owner_id: int) -> int | None:
+        """Return the owner's persisted provider-row count, or None when unavailable."""
+        raise NotImplementedError
+
 
 class InMemoryProviderStatsRepository(ProviderStatsRepository):
     """In-memory fallback for provider stats."""
@@ -97,6 +101,9 @@ class InMemoryProviderStatsRepository(ProviderStatsRepository):
 
     def list_all(self, owner_id: int) -> list[ProviderStatsRecord]:
         return [v for (pn, oid), v in self._stats.items() if oid == owner_id]
+
+    def count(self, owner_id: int) -> int:
+        return sum(1 for (_provider, oid) in self._stats if oid == owner_id)
 
 
 def _get_db():
@@ -217,3 +224,19 @@ class SupabaseProviderStatsRepository(ProviderStatsRepository):
         except Exception as exc:
             logger.warning("AI provider_stats list_all failed: %s", exc)
             return []
+
+    def count(self, owner_id: int) -> int | None:
+        db = _get_db()
+        if not db:
+            return None
+        try:
+            result = (
+                db.table("ai_provider_stats")
+                .select("provider_name", count="exact")
+                .eq("owner_id", owner_id)
+                .execute()
+            )
+            return int(result.count or 0)
+        except Exception as exc:
+            logger.warning("AI provider_stats count failed: %s", exc)
+            return None

@@ -26,8 +26,9 @@ class DatabaseStatsTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Show saved-items database statistics: total items, breakdown by "
-            "media type, size estimate, and oldest/newest save date."
+            "Show database statistics: saved-item totals, media breakdown, "
+            "size estimate, oldest/newest save date, and available AI/Ghost "
+            "Room row counts."
         )
 
     @property

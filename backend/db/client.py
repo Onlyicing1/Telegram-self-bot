@@ -832,6 +832,32 @@ async def count_logs(owner_id: int) -> int:
         return 0
 
 
+# ── optional ghost_chats: stats ──
+
+def _count_ghost_chats_sync() -> int | None:
+    """Count Ghost Room registry rows when the optional table is available."""
+    db = get_db()
+    if not db:
+        return None
+    try:
+        result = db.table("ghost_chats").select("chat_id", count="exact").execute()
+        return int(result.count or 0)
+    except Exception as exc:
+        logger.warning("[SAVE_DB] count_ghost_chats unavailable: %s", exc)
+        return None
+
+
+async def count_ghost_chats() -> int | None:
+    """Return Ghost Room row count, or None when its table is unavailable."""
+    try:
+        return await _run_sync(_count_ghost_chats_sync)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("[SAVE_DB] count_ghost_chats FAILED: %s", exc)
+        return None
+
+
 def _list_logs_sync(owner_id: int, limit: int) -> list:
     db = get_db()
     if db:

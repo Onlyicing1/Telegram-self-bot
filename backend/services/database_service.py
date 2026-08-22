@@ -13,6 +13,8 @@ from backend.diagnostics import record_event
 
 logger = logging.getLogger(__name__)
 
+_AI_STATS_TIMEOUT = 3.0
+
 _MEDIA_ICON = {
     "Photo": "📷",
     "Video": "🎬",
@@ -79,6 +81,34 @@ async def do_clean(client, owner_id: int) -> str:
         return f"❌ Cleanup error: {exc}"
 
 
+async def _ai_database_counts(owner_id: int) -> tuple[int | None, int | None]:
+    """Read optional AI table counts through the repository abstraction."""
+    try:
+        from backend.ai.database.manager import get_repository_manager
+
+        manager = get_repository_manager()
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.to_thread(manager.usage.count, owner_id),
+                asyncio.to_thread(manager.provider_stats.count, owner_id),
+                return_exceptions=True,
+            ),
+            timeout=_AI_STATS_TIMEOUT,
+        )
+        counts: list[int | None] = []
+        for result in results:
+            if isinstance(result, bool) or not isinstance(result, int):
+                counts.append(None)
+            else:
+                counts.append(result)
+        return counts[0], counts[1]
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("AI database row counts unavailable: %s", exc)
+        return None, None
+
+
 async def do_stats(owner_id: int, tz_str: str) -> str:
     t0 = asyncio.get_event_loop().time()
     try:
@@ -108,9 +138,34 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
         lines.append(f"**Oldest save:** {format_date(stats['oldest'], tz_str)}")
         lines.append(f"**Newest save:** {format_date(stats['newest'], tz_str)}")
 
-        await db_client.log(owner_id, "INFO", f"DB stats: {total} items", stats)
+        usage_count, provider_count = await _ai_database_counts(owner_id)
+        ghost_count = await db_client.count_ghost_chats()
+        lines.append(
+            f"\n**AI usage rows:** `{usage_count}`"
+            if usage_count is not None else
+            "\n**AI usage rows:** `Unavailable`"
+        )
+        lines.append(
+            f"**AI provider rows:** `{provider_count}`"
+            if provider_count is not None else
+            "**AI provider rows:** `Unavailable`"
+        )
+        lines.append(
+            f"**Ghost Room chats:** `{ghost_count}`"
+            if ghost_count is not None else
+            "**Ghost Room chats:** `Unavailable`"
+        )
+
+        await db_client.log(owner_id, "INFO", f"DB stats: {total} items", {
+            **stats,
+            "ai_usage_rows": usage_count,
+            "ai_provider_rows": provider_count,
+            "ghost_room_chats": ghost_count,
+        })
         record_event("database", "stats", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return "\n".join(lines)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.error("db stats failed: %s", exc)
         record_event("database", "stats", 0, "ERROR", str(exc))

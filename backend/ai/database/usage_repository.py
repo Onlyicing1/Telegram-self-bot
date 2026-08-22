@@ -63,6 +63,10 @@ class UsageRepository:
     def recent(self, owner_id: int, limit: int = 50) -> list[UsageRecord]:
         raise NotImplementedError
 
+    def count(self, owner_id: int) -> int | None:
+        """Return the owner's persisted row count, or None when unavailable."""
+        raise NotImplementedError
+
 
 class InMemoryUsageRepository(UsageRepository):
     """In-memory fallback for usage tracking."""
@@ -91,6 +95,9 @@ class InMemoryUsageRepository(UsageRepository):
         results = [r for r in self._records if r.owner_id == owner_id]
         results.sort(key=lambda r: r.created_at, reverse=True)
         return results[:limit]
+
+    def count(self, owner_id: int) -> int:
+        return sum(1 for record in self._records if record.owner_id == owner_id)
 
 
 def _get_db():
@@ -213,3 +220,19 @@ class SupabaseUsageRepository(UsageRepository):
         except Exception as exc:
             logger.warning("AI usage recent failed: %s", exc)
             return []
+
+    def count(self, owner_id: int) -> int | None:
+        db = _get_db()
+        if not db:
+            return None
+        try:
+            result = (
+                db.table("ai_usage")
+                .select("id", count="exact")
+                .eq("owner_id", owner_id)
+                .execute()
+            )
+            return int(result.count or 0)
+        except Exception as exc:
+            logger.warning("AI usage count failed: %s", exc)
+            return None
