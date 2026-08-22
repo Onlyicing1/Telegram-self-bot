@@ -92,7 +92,7 @@ serve the same interface.
 
 ### Commit / push / remote verification
 
-- **Commit:** (filled at delivery)
+- **Commit:** `22f04c3`
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
 - **Final git status:** working tree clean.
