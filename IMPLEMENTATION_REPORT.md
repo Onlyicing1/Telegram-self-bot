@@ -1,98 +1,89 @@
 # Implementation Report — LifeOS Telegram Self-Bot
 
-## Execution 17 — AI Usage Read-Side / Observability
+## Execution 18 — Provider Reset / Cooldown Surfacing
 
 ### Task / Result
 
-Implement the read-side consumption of persisted AI usage data
-(`ai_usage` + `ai_provider_stats`) through the existing repository
-abstractions, with honest token-source aggregation and safe degradation.
-**Result: IMPLEMENTED** — the Usage panel now consumes persisted data
-(additively) via a new async reader; live Supabase reads follow the same
-safe-degradation contract as the rest of the persistence layer.
+Expose the provider layer's *proven* rate-limit recovery information
+(cooldown/Retry-After) to the existing AI Health UX — without ever
+fabricating quota/reset times, since providers expose no such metadata.
+**Result: IMPLEMENTED.**
 
-### Files actually changed
+### Exact files changed
 
-- `backend/ai/database/usage_reader.py` — **NEW**. Async read accessor over
-  `RepositoryManager` (never Supabase directly):
-  - `total_tokens(owner_id)`, `daily_tokens(owner_id, date)`,
-    `recent(owner_id, limit)`, `provider_stats(owner_id)`.
-  - `summary(owner_id, *, since, limit)` → `UsageSummary` with a
-    `TokenSourceBreakdown` (actual / estimated / unavailable) and a
-    `sources` tuple that preserves every label actually seen — even at
-    zero counts — so "unavailable" is never lost from aggregation.
-  - Every call runs off the event loop (`asyncio.to_thread`) under a
-    bounded 3s timeout; `CancelledError` re-raised; any other failure
-    logs and returns the safe default (`0` / `[]` / all-zero summary
-    with `available=False`).
-- `backend/bot/handlers/ai.py` — `_ai_usage_panel_handler` now appends a
-  persisted-usage line (`Saved · N requests · X tokens · <source labels>`)
-  when saved data exists for the same window; new helpers
-  `_read_persisted_usage` (window mapping + safe fallback) and
-  `_persisted_usage_line` (honest source suffix; "tokens unavailable"
-  instead of a fabricated zero). Persisted reads are strictly additive —
-  empty or failed reads leave the panel byte-identical to before.
-- `tests/test_40_usage_read_side.py` — **NEW**, 15 tests.
+- `backend/ai/providers/manager/health.py` — `ProviderHealthTracker` now
+  remembers the normalized failure category that triggered the current
+  recovery state (`_last_failure_category`, set in `record_failure`,
+  cleared on `record_success`/`mark_healthy`) and exposes it via
+  `last_failure_category(name)` (empty when unknown — callers must not
+  guess).
+- `backend/ai/providers/manager/manager.py` — new read-only accessor
+  `reset_state(provider) -> {provider, available, state, reason,
+  cooldown_remaining_s, quarantine_remaining_s}`. Only what the tracker
+  can prove; never a quota/credit reset window.
+- `backend/bot/handlers/ai.py` — Health panel appends a compact recovery
+  line when the active provider is actually cooling down:
+  `Rate limited · retry in ~45s` (reason == `rate_limited`) or
+  `Recovering · retry in ~3m` (other proven categories). New helpers
+  `_get_provider_recovery` (defensive, ignores non-dict stubs) and
+  `_format_cooldown` (rounded up so the wait is never understated).
+  Edit-in-place only — zero new messages.
+- `tests/test_41_reset_cooldown.py` — **NEW**, 10 tests.
 - `IMPLEMENTATION_REPORT.md` — replaced with only this report.
 
-### Exact behavior changed
+### Exact implementation behavior
 
-- Persisted usage is now consumable by the application: total usage,
-  daily usage, recent records, and per-provider statistics read through
-  `RepositoryManager` with the same failure-tolerant semantics as the
-  write path.
-- Token honesty preserved end-to-end: aggregation never merges
-  actual/estimated/unavailable into a single unlabeled number; the
-  breakdown is exposed to callers and rendered compactly in the panel
-  (`actual`, `≈`, `unavailable`). Unknown source labels are counted as
-  unlabeled — never as actual.
-- The Usage panel shows the session view (RAM telemetry, unchanged and
-  pinned by existing tests) plus a persisted line when saved data exists.
-  Range windows mirror the existing today / 7d / 30d semantics.
-- Repository/DB read failures degrade to safe defaults and never block
-  the event loop, raise, or affect AI execution or the panel.
+- Rate-limited provider with a real short cooldown → Health shows
+  `Rate limited · retry in ~Ns/Mm` only while the tracker's monotonic
+  cooldown is actually running; after success the reason and line clear.
+- No reset information (healthy/unknown provider, expired cooldown) →
+  `reset_state` reports `available=True`, zero remaining; the panel shows
+  no recovery line. Nothing is fabricated.
+- Existing bounded retry policy untouched: short Retry-After windows
+  (≤5s) still get exactly one bounded retry; long windows still fail
+  over without waiting; cooldowns still clamp to the documented 300s
+  maximum. No new retry loop, no background polling, no provider-specific
+  reset guessing.
 
 ### Intentionally untouched
 
-Provider retry/fallback policy · provider implementations · memory
-implementation · telemetry contract · Save system · Ghost Room · Telegram
-core handlers unrelated to AI usage · frontend · runtime supervisor/
-watchdog · database schema · migrations · DATABASE_ARCHITECTURE.md
-(no schema change was needed this chunk).
+Provider retry policy · provider implementations · memory · ai_usage /
+ai_provider_stats persistence · telemetry contract · token-source
+semantics · Save · Ghost Room · model selector · frontend ·
+RuntimeSupervisor · watchdog · unrelated handlers · database schema ·
+migrations.
 
-### Database impact
+### Database / schema impact
 
-None. No SQL, no migrations, no schema changes. Reads target the
-already-verified `ai_usage` / `ai_provider_stats` tables through the
-existing Supabase repositories; without Supabase the in-memory fallbacks
-serve the same interface.
+None. No SQL, no migrations, no schema changes — this chunk is purely
+in-memory runtime state + UI.
 
 ### Tests actually run and exact results
 
-- `tests/test_40_usage_read_side.py` — **15 passed** (total read, daily
-  read, recent read, provider-stats read, actual/estimated/unavailable
-  preservation, mixed-source non-merging, window filter, failure
-  degradation, no-direct-Supabase guard, panel persisted line, panel
-  unchanged when empty, panel survives read failure, line formatting).
-- Full suite — **678 passed, 0 failed, 1 warning** (baseline 663 + 15;
+- `tests/test_41_reset_cooldown.py` — **10 passed** (rate-limit cooldown
+  honesty, accessor shape + no-quota-key guard, unknown/healthy
+  available, short Retry-After one-retry unchanged, long Retry-After
+  failover unchanged + 300s clamp, retry counts correct + reason cleared
+  on recovery, Health panel rate-limit line, Health panel never
+  fabricates a time, MagicMock engine safety, cooldown formatting).
+- Full suite — **688 passed, 0 failed, 1 warning** (baseline 678 + 10;
   the warning is the pre-existing multipart deprecation).
 - `python3 -m compileall -q backend` — PASS.
 - `git diff --check` — PASS.
+- Stale-call-site search: only the new accessor references; no duplicate
+  functions/handlers.
 
-### Remaining limitations
+### Validation limitations / known remaining work
 
-- Persisted provider stats are all-time aggregates (the
-  `ai_provider_stats` table has no timestamp window); windowed
-  success/failure counts are not derivable from persisted rows because
-  the `ai_usage` schema stores no status column — the session (RAM)
-  block continues to provide failures/fallbacks for the window.
-- Live Supabase reads are covered by the same code path as in-memory;
-  end-to-end verification against live data remains the owner's manual
-  step.
+- The Health panel surfaces cooldown only for the active provider;
+  per-candidate mesh cooldowns remain visible via existing telemetry
+  (Details), not this line.
+- Providers still expose no quota/reset metadata — nothing here can or
+  will claim account-level resets.
 
 ### Commit / push / remote verification
 
-- **Commit:** `22f04c3`
+- **Commit:** (filled at delivery)
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
-- **Final git status:** working tree clean.
+- **Final working-tree status:** clean.

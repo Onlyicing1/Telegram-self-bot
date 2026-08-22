@@ -730,11 +730,41 @@ async def _ai_usage_inline_builder(event, extra: str) -> list:
     return [render(title, body, buttons)]
 
 
+def _format_cooldown(seconds: float) -> str:
+    """Human cooldown, rounded UP so the wait is never understated:
+    45 → "45s", 150 → "3m"."""
+    from math import ceil
+
+    total = max(1, ceil(float(seconds or 0)))
+    if total >= 60:
+        return f"{ceil(total / 60)}m"
+    return f"{total}s"
+
+
+def _get_provider_recovery(engine, provider: str) -> dict:
+    """Read-only recovery info for the active provider; {} on any failure.
+
+    Uses the manager's ``reset_state`` accessor (which never fabricates
+    quota/reset times). Non-dict results — e.g. test stubs — are ignored
+    so the panel never misbehaves on unknown engine shapes.
+    """
+    if engine is None or not provider or provider in ("—", ""):
+        return {}
+    try:
+        mgr = engine.provider_manager
+        result = mgr.reset_state(provider)
+        return result if isinstance(result, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     """Answer one question: is my AI working correctly right now?
 
     Three honest states with a one-line cause when something is wrong —
-    diagnostics stay behind Details, never here.
+    diagnostics stay behind Details, never here. When the active provider
+    is actually cooling down, a compact recovery line states the proven
+    reason and remaining time; no reset time is ever invented.
     """
     from backend.ai.engine.telemetry import compact_telemetry_line, telemetry
 
@@ -789,6 +819,14 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
     else:
         lines.append("No requests yet")
     lines.append(f"Backup · {fallback_state}")
+
+    active_provider = engine_info.get("provider") or config.get("provider", "")
+    recovery = _get_provider_recovery(engine, active_provider)
+    remaining = float(recovery.get("cooldown_remaining_s", 0) or 0) or \
+        float(recovery.get("quarantine_remaining_s", 0) or 0)
+    if not recovery.get("available", True) and remaining > 0:
+        label = "Rate limited" if recovery.get("reason") == "rate_limited" else "Recovering"
+        lines.append(f"{label} · retry in ~{_format_cooldown(remaining)}")
 
     builder = InlinePanelBuilder()
     builder.add_row("🔄 Refresh", "action:ai_health_refresh")

@@ -105,6 +105,7 @@ class ProviderHealthTracker:
         "_consecutive_failures",
         "_consecutive_successes",
         "_quarantine_until",
+        "_last_failure_category",
     )
 
     def __init__(
@@ -120,6 +121,7 @@ class ProviderHealthTracker:
         self._consecutive_failures: dict[str, int] = {}
         self._consecutive_successes: dict[str, int] = {}
         self._quarantine_until: dict[str, float] = {}
+        self._last_failure_category: dict[str, str] = {}
 
     # ── State ──
 
@@ -156,6 +158,7 @@ class ProviderHealthTracker:
         self._quarantine_until.pop(name, None)
         self._consecutive_failures.pop(name, None)
         self._consecutive_successes.pop(name, None)
+        self._last_failure_category.pop(name, None)
 
     # ── Circuit breaker / failure recording ──
 
@@ -169,11 +172,14 @@ class ProviderHealthTracker:
 
         Returns the new state. Repeated consecutive failures quarantine the
         provider (circuit opens); a single failure only cools it down with the
-        penalty appropriate for the failure category.
+        penalty appropriate for the failure category. The triggering category
+        is remembered (``last_failure_category``) so observability can say
+        WHY a provider is cooling down without guessing.
         """
         self._consecutive_successes.pop(name, None)
         n = self._consecutive_failures.get(name, 0) + 1
         self._consecutive_failures[name] = n
+        self._last_failure_category[name] = category
 
         if n >= QUARANTINE_AFTER_FAILURES:
             self._quarantine_until[name] = time.monotonic() + QUARANTINE_SECONDS
@@ -199,6 +205,7 @@ class ProviderHealthTracker:
         self._cooldown_until.pop(name, None)
         self._quarantine_until.pop(name, None)
         self._disabled.discard(name)
+        self._last_failure_category.pop(name, None)
         if was_quarantined:
             logger.info("PROVIDER_RECOVERED provider=%s", name)
 
@@ -223,6 +230,14 @@ class ProviderHealthTracker:
         if until is None:
             return 0.0
         return max(0.0, until - time.monotonic())
+
+    def last_failure_category(self, name: str) -> str:
+        """The normalized category that triggered the current recovery state.
+
+        Empty string when unknown (e.g. the provider was never failed or
+        already recovered) — callers must not guess a reason.
+        """
+        return self._last_failure_category.get(name, "")
 
     # ── Concurrency ──
 

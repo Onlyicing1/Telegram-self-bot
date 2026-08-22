@@ -709,6 +709,26 @@ class ProviderManager:
         """Return per-provider cooldown/disabled state for observability."""
         return self._health.snapshot()
 
+    def reset_state(self, provider: str) -> dict[str, Any]:
+        """Read-only recovery info for one provider.
+
+        Surfaces only what the health tracker can actually prove:
+        availability, state, the normalized failure category that triggered
+        the current recovery, and any remaining cooldown/quarantine time.
+        Providers expose NO quota/credit-reset metadata, so this NEVER
+        fabricates a reset window — an unknown or healthy provider simply
+        reports ``available=True`` with zero remaining time.
+        """
+        health = self._health
+        return {
+            "provider": provider,
+            "available": health.is_available(provider),
+            "state": health.state(provider),
+            "reason": health.last_failure_category(provider),
+            "cooldown_remaining_s": round(health.cooldown_remaining(provider), 1),
+            "quarantine_remaining_s": round(health.quarantine_remaining(provider), 1),
+        }
+
     async def _fallback(
         self,
         messages: list[dict[str, Any]],
