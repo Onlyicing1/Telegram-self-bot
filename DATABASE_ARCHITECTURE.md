@@ -1110,6 +1110,7 @@ documents both the `persistence.py` path and the repository interfaces.
 | 7 | `20260801215007_create_username_state_table.sql` | `username_state` | Applied |
 | 8 | `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` | Applied |
 | 9 | `20260805075707_...create_ai_config_table.sql` | `ai_config` (base columns, no triggers) | Applied (incomplete — see §19.1) |
+| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Room MVP | Pending manual application |
 
 ### Missing Migration Files (referenced in prior docs but never created)
 
@@ -1143,6 +1144,35 @@ the live database in sync with this specification:
 7. **Drop dead `saved_items` columns and indexes** — drop `short_code`,
    `file_name`, and all 5 trigram GIN indexes. (Low priority — only
    after confirming no data of value exists.)
+
+8. **Create `ghost_chats`** — if not yet applied. See [§22](#22-ghost-room).
+
+---
+
+## 22. Ghost Room (ghost_chats)
+
+### 22.1 Table: `ghost_chats`
+
+Durable registry of discovered private chats for the Ghost Room.
+Previews are truncated to 160 chars at write time (PII minimization).
+
+| Column | Type | Nullable | Default | Purpose |
+|---|---|---|---|---|
+| `chat_id` | `bigint` | NO | — | Telegram chat ID (PK) |
+| `display_name` | `text` | NO | `''` | Human-readable sender name |
+| `last_preview` | `text` | NO | `''` | Last message preview (max 160 chars) |
+| `last_message_at` | `timestamptz` | YES | — | Timestamp of most recent message |
+| `unread_count` | `integer` | NO | `0` | Unhandled incoming messages |
+| `created_at` | `timestamptz` | YES | `now()` | Row creation time |
+| `updated_at` | `timestamptz` | YES | `now()` | Row last-update time |
+
+**Indexes:**
+- `idx_ghost_chats_last_message` (btree on `last_message_at DESC`)
+
+**RLS:** Single SELECT policy for `anon`, `authenticated` USING `(true)`.
+All writes go through the service-role key.
+
+**Executable DDL:** see `supabase/migrations/20260822090000_create_ghost_chats_table.sql`.
 
 ---
 
