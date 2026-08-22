@@ -46,12 +46,12 @@ def test_valid_font_selection_persists():
 
 
 def test_reload_read_returns_persisted_font():
-    row = {"key": "global", "dashboard_font": "serif"}
+    row = {"key": "global", "dashboard_font": "fraktur"}
     _load_with(row)
     from backend.services import settings_service as svc
 
-    assert svc.dashboard_font() == "serif"
-    assert svc.get_all()["dashboard_font"] == "serif"
+    assert svc.dashboard_font() == "fraktur"
+    assert svc.get_all()["dashboard_font"] == "fraktur"
 
 
 def test_invalid_font_value_rejected():
@@ -87,10 +87,10 @@ def test_other_settings_remain_unaffected():
     from backend.services import settings_service as svc
 
     before = svc.get_all()
-    assert svc.set_dashboard_font("system") is True
+    assert svc.set_dashboard_font("small_caps") is True
     after = svc.get_all()
 
-    assert after["dashboard_font"] == "system"
+    assert after["dashboard_font"] == "small_caps"
     for key, value in before.items():
         if key != "dashboard_font":
             assert after[key] == value, f"setting '{key}' changed"
@@ -113,13 +113,27 @@ async def test_patch_settings_endpoint_roundtrip():
                return_value=False):
         from backend.services import settings_service as svc
         svc.load_all()
-        result = await update_setting({"key": "dashboard_font", "value": "serif"})
-    assert result["dashboard_font"] == "serif"
+        result = await update_setting({"key": "dashboard_font", "value": "fraktur"})
+    assert result["dashboard_font"] == "fraktur"
 
     with pytest.raises(HTTPException) as exc:
         await update_setting({"key": "dashboard_font", "value": "bogus"})
     assert exc.value.status_code == 400
     assert "Invalid value" in exc.value.detail
+
+
+def test_allow_list_is_the_single_font_style_registry():
+    """The Glass UI font panel and the dashboard setting must share ONE
+    authoritative allow-list (backend/helper/font_style.FONT_KEYS)."""
+    _load_with(None)
+    from backend.services import settings_service as svc
+    from backend.helper.font_style import FONT_KEYS
+
+    assert svc.DASHBOARD_FONTS == FONT_KEYS
+    # The web dashboard tolerates any key with a deterministic fallback.
+    from pathlib import Path
+    app_tsx = Path("src/App.tsx").read_text()
+    assert "?? DASHBOARD_FONT_OPTIONS[0].stack" in app_tsx
 
 
 def test_dashboard_consumes_selected_font():

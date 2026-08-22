@@ -1,18 +1,18 @@
 """
-Execution — Ghost Room Glass UI Entry & Management.
+Execution — Ghost Seen Glass UI Entry & Management.
 
 Focused regression tests for the missing UI integration:
-  1. The main Glass UI menu exposes a visible Ghost Room button.
-  2. The button's callback (`panel:ghost`) opens the EXISTING ghost panel
+  1. The main Glass UI menu exposes a visible Ghost Seen button.
+  2. The button's callback (`panel:ghost_seen`) opens the EXISTING ghost panel
      through the standard panel dispatch (edit-in-place, no new message).
   3. Exactly one `ghost` panel registration and one router registration.
-  4. All existing Ghost Room actions/inputs remain reachable.
+  4. All existing Ghost Seen actions/inputs remain reachable.
   5. Pre-existing menu entries remain intact.
   6. GHOST_ROOM_ID destination routing is untouched by the menu change.
 
 The production change is a single button row in
 `misc._build_menu_buttons()`; these tests pin that invariant so the
-Ghost Room panel can never become unreachable again.
+Ghost Seen panel can never become unreachable again.
 """
 from __future__ import annotations
 
@@ -25,17 +25,17 @@ import pytest
 # ── helpers ──
 
 
-def _register_ghost_room_once() -> None:
-    """Register Ghost Room panels/actions against a dummy client.
+def _register_ghost_seen_once() -> None:
+    """Register Ghost Seen panels/actions against a dummy client.
 
     Idempotent against test ordering: other suites may call ``configure()``
     (setting module globals) without registering panels, so the guard checks
     the live panel registry rather than module state.
     """
     from backend.helper.panel_registry import get_panel_def
-    from backend.bot.handlers import ghost_room
+    from backend.bot.handlers import ghost_seen
 
-    if get_panel_def("ghost") is not None:
+    if get_panel_def("ghost_seen") is not None:
         return
 
     class DummyClient:
@@ -44,7 +44,7 @@ def _register_ghost_room_once() -> None:
                 return fn
             return deco
 
-    ghost_room.register(DummyClient(), 12345, "UTC")
+    ghost_seen.register(DummyClient(), 12345, "UTC")
 
 
 async def _menu_buttons() -> tuple[str, list]:
@@ -59,22 +59,22 @@ async def _menu_buttons() -> tuple[str, list]:
 
 class TestMenuEntry:
     @pytest.mark.asyncio
-    async def test_menu_contains_ghost_room_button(self):
+    async def test_menu_contains_ghost_seen_button(self):
         _title, buttons = await _menu_buttons()
         labels = [b.text for row in buttons for b in row]
-        assert "👻 Ghost Room" in labels
+        assert "👻 Ghost Seen" in labels
 
     @pytest.mark.asyncio
     async def test_entry_callback_is_panel_ghost(self):
         _title, buttons = await _menu_buttons()
         datas = [b.data for row in buttons for b in row]
-        assert any(d == b"panel:ghost" for d in datas)
+        assert any(d == b"panel:ghost_seen" for d in datas)
 
     @pytest.mark.asyncio
     async def test_exactly_one_ghost_entry_in_menu(self):
         _title, buttons = await _menu_buttons()
         datas = [b.data for row in buttons for b in row]
-        assert sum(1 for d in datas if d == b"panel:ghost") == 1
+        assert sum(1 for d in datas if d == b"panel:ghost_seen") == 1
 
     @pytest.mark.asyncio
     async def test_existing_menu_entries_preserved(self):
@@ -100,32 +100,32 @@ class TestRegistrationIntegrity:
         from pathlib import Path
 
         src = (
-            Path("backend/bot/handlers/ghost_room.py").read_text(encoding="utf-8")
+            Path("backend/bot/handlers/ghost_seen.py").read_text(encoding="utf-8")
         )
-        assert src.count('register_panel("ghost"') == 1
+        assert src.count('register_panel("ghost_seen"') == 1
         assert src.count('register_panel("ghost_chat"') == 1
 
-    def test_router_registers_ghost_room_module_once(self):
+    def test_router_registers_ghost_seen_module_once(self):
         from pathlib import Path
 
         src = Path("backend/bot/router.py").read_text(encoding="utf-8")
-        assert src.count("ghost_room.register") == 1
+        assert src.count("ghost_seen.register") == 1
 
     def test_registry_resolves_ghost_to_existing_handler(self):
         from backend.helper.panel_registry import get_panel_def
-        from backend.bot.handlers import ghost_room
+        from backend.bot.handlers import ghost_seen
 
-        _register_ghost_room_once()
+        _register_ghost_seen_once()
 
-        panel_def = get_panel_def("ghost")
+        panel_def = get_panel_def("ghost_seen")
         assert panel_def is not None
-        assert panel_def.render_function is ghost_room._ghost_list_panel_handler
+        assert panel_def.render_function is ghost_seen._ghost_list_panel_handler
         assert panel_def.parent_panel == "menu"
 
     def test_all_ghost_actions_remain_registered(self):
         from backend.helper.panels import get_action
 
-        _register_ghost_room_once()
+        _register_ghost_seen_once()
 
         for action_id in (
             "ghost_open",
@@ -141,7 +141,7 @@ class TestRegistrationIntegrity:
     def test_all_ghost_inputs_remain_registered(self):
         from backend.helper.panels import get_input
 
-        _register_ghost_room_once()
+        _register_ghost_seen_once()
 
         for input_id in ("reply", "reply_no_quote", "ai_prompt"):
             cfg = get_input("ghost_chat", input_id)
@@ -158,7 +158,7 @@ class TestEntryNavigation:
         from backend.helper.panels import _handle_panel
         from backend.helper.lifecycle import get_lifecycle
 
-        _register_ghost_room_once()
+        _register_ghost_seen_once()
 
         rendered: dict = {}
 
@@ -167,7 +167,7 @@ class TestEntryNavigation:
             chat_id = 111
             message_id = 222
             original_update = None
-            data = b"panel:ghost"
+            data = b"panel:ghost_seen"
 
             async def answer(self):
                 pass
@@ -179,9 +179,9 @@ class TestEntryNavigation:
         lifecycle = get_lifecycle()
         lifecycle.sessions.create(111, 222, panel_type="menu", owner_id=12345)
 
-        await _handle_panel(FakeCbEvent(), "ghost", 111, 222, 12345)
+        await _handle_panel(FakeCbEvent(), "ghost_seen", 111, 222, 12345)
 
-        assert "Ghost Room" in rendered.get("text", "")
+        assert "Ghost Seen" in rendered.get("text", "")
 
     @pytest.mark.asyncio
     async def test_navigation_uses_edit_not_new_message(self):
@@ -193,7 +193,7 @@ class TestEntryNavigation:
 
     @pytest.mark.asyncio
     async def test_empty_registry_renders_honest_empty_state(self):
-        from backend.bot.handlers.ghost_room import _ghost_list_panel_handler
+        from backend.bot.handlers.ghost_seen import _ghost_list_panel_handler
 
         old = os.environ.get("GHOST_ROOM_ID")
         try:
@@ -201,7 +201,7 @@ class TestEntryNavigation:
             result = await _ghost_list_panel_handler(None, "")
             assert result is not None
             title, body, _buttons = result
-            assert title == "👻 Ghost Room"
+            assert title == "👻 Ghost Seen"
             assert "No private chats yet." in body
         finally:
             if old is not None:
@@ -218,10 +218,10 @@ class TestDestinationRoutingUntouched:
         misc_src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
         assert "GHOST_ROOM_ID" not in misc_src
         assert "_resolve_ghost_destination" not in misc_src
-        assert "execute_ghost_ai" not in misc_src
+        assert "execute_ghost_seen_ai" not in misc_src
 
     def test_ghost_service_still_owns_destination_resolution(self):
-        from backend.bot.handlers.ghost_room import (
+        from backend.bot.handlers.ghost_seen import (
             _resolve_ghost_destination,
         )
 

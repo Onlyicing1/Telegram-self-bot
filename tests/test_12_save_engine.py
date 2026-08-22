@@ -142,7 +142,8 @@ async def test_settings_panel_renders():
     assert title == "Settings"
     assert "Auto-close" in body
     assert "Max deep save" in body
-    assert len(buttons) == 10
+    # 10 legacy rows + the 🔤 Font row added by the Glass UI font setting.
+    assert len(buttons) == 11
 
 
 @pytest.mark.asyncio

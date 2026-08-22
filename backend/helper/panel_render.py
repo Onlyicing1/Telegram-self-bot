@@ -17,22 +17,42 @@ from backend.helper.context import truncate_callback_data
 logger = logging.getLogger(__name__)
 
 
+def _style(text) -> str:
+    """Apply the persisted Glass UI font to display text.
+
+    Callback data, code spans, URLs, digits and identifiers are never
+    transformed. Any failure falls back to the untouched text so a bad
+    font state can never break rendering.
+    """
+    if not text:
+        return text
+    try:
+        from backend.services import settings_service
+        from backend.helper.font_style import apply_font
+        return apply_font(str(text), settings_service.dashboard_font())
+    except Exception:
+        return str(text)
+
+
 def _normalize_button(btn) -> types.KeyboardButtonCallback:
     if isinstance(btn, tuple):
-        text, data = btn[0], btn[1]
+        text, data = _style(btn[0]), btn[1]
         return Button.inline(text, truncate_callback_data(str(data)))
     if isinstance(btn, types.KeyboardButtonCallback):
+        styled = _style(btn.text)
+        if styled != btn.text:
+            return Button.inline(styled, btn.data)
         return btn
     if isinstance(btn, type(Button.inline("x", "y"))):
         return btn
     if hasattr(btn, "text") and hasattr(btn, "data"):
         return btn
     if hasattr(btn, "text") and hasattr(btn, "url"):
-        return Button.url(btn.text, btn.url)
+        return Button.url(_style(btn.text), btn.url)
     text = getattr(btn, "text", None)
     if not text:
         text = "Button"
-    return Button.inline(str(text), "panel:_nav:close")
+    return Button.inline(_style(str(text)), "panel:_nav:close")
 
 
 def _normalize_row(row) -> list:
@@ -86,11 +106,11 @@ def render(
         buttons = builder.build()
 
     if title and body:
-        message = f"**{title}**\n\n{body}"
+        message = f"**{_style(title)}**\n\n{_style(body)}"
     elif title:
-        message = f"**{title}**"
+        message = f"**{_style(title)}**"
     else:
-        message = body or ""
+        message = _style(body) or ""
 
     markup_rows = _to_inline_rows(buttons) if buttons else None
 
@@ -102,7 +122,7 @@ def render(
     return types.InputBotInlineResult(
         id="0",
         type="article",
-        title=title[:255] if title else "LifeOS",
+        title=_style(title)[:255] if title else "LifeOS",
         send_message=msg,
     )
 
@@ -112,6 +132,7 @@ def render_edit(
     body: str = "",
     buttons: list | None = None,
 ) -> tuple[str, list]:
+    title, body = _style(title), _style(body)
     if title and body:
         text = f"**{title}**\n\n{body}"
     elif title:

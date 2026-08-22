@@ -71,7 +71,7 @@ def _build_menu_buttons() -> list:
         ("Settings", "panel:settings"),
     )
     builder.add_row("🧠 AI", "panel:ai")
-    builder.add_row("👻 Ghost Room", "panel:ghost")
+    builder.add_row("👻 Ghost Seen", "panel:ghost_seen")
     return builder.build()
 
 
@@ -137,6 +137,66 @@ async def _build_settings_body() -> str:
     return "\n".join(lines)
 
 
+_FONT_PAGE_SIZE = 8
+_font_page: int = 0
+
+
+def _font_panel_page(current_key: str) -> tuple[str, str, list]:
+    from backend.helper.font_style import FONT_KEYS, _FONT_BY_KEY
+
+    pages = [FONT_KEYS[i:i + _FONT_PAGE_SIZE] for i in range(0, len(FONT_KEYS), _FONT_PAGE_SIZE)]
+    page = min(max(_font_page, 0), len(pages) - 1) if pages else 0
+    builder = InlinePanelBuilder()
+    for key in pages[page] if pages else ():
+        font = _FONT_BY_KEY[key]
+        mark = "✓" if key == current_key else "·"
+        builder.add_row(f"{mark} {font.label}", f"action:font_set:{key}")
+    if len(pages) > 1:
+        builder.add_buttons(
+            ("◀ Prev", "action:font_page:prev"),
+            (f"{page + 1}/{len(pages)}", "panel:_nav:noop"),
+            ("Next ▶", "action:font_page:next"),
+        )
+    label = _FONT_BY_KEY[current_key].label
+    body = (
+        f"Current: **{label}**\n"
+        "Applies to all Glass UI panels and buttons.\n\n"
+        "English/Latin text is styled; Persian renders normally; "
+        "IDs, code spans and URLs are never restyled."
+    )
+    return "Font", body, builder.build()
+
+
+async def _font_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.font_style import normalize_font_key
+    from backend.services import settings_service
+    return _font_panel_page(normalize_font_key(settings_service.dashboard_font()))
+
+
+async def _font_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.helper.font_style import is_valid_font, normalize_font_key
+    from backend.services import settings_service
+
+    key = extra.strip()
+    if not is_valid_font(key):
+        return "Font", "Invalid selection — keeping the previous font.", []
+    settings_service.set_dashboard_font(key)
+    return _font_panel_page(key)
+
+
+async def _font_page_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    global _font_page
+    from backend.helper.font_style import FONT_KEYS, normalize_font_key
+    from backend.services import settings_service
+
+    total = max(1, (len(FONT_KEYS) + _FONT_PAGE_SIZE - 1) // _FONT_PAGE_SIZE)
+    if extra == "prev":
+        _font_page = max(0, _font_page - 1)
+    elif extra == "next":
+        _font_page = min(total - 1, _font_page + 1)
+    return _font_panel_page(normalize_font_key(settings_service.dashboard_font()))
+
+
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose")
@@ -149,6 +209,7 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Delete Batch Size", "input:settings:delete_batch_size")
     builder.add_row("Set Log Retention", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
+    builder.add_row("🔤 Font", "panel:font")
     return "Settings", await _build_settings_body(), builder.build()
 
 
@@ -322,6 +383,9 @@ def _register_panels() -> None:
     register_inline_builder("settings", _settings_inline_builder)
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
+    register_panel("font", _font_panel_handler, parent="settings", title="Font")
+    register_action("font_set", _font_set_action)
+    register_action("font_page", _font_page_action)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
     register_action("settings_toggle_debug_callbacks", _settings_toggle_debug_callbacks_action)
     register_action("settings_toggle_owner_only", _settings_toggle_owner_only_action)

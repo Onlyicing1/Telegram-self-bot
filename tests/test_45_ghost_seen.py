@@ -37,11 +37,11 @@ def _clear_ghost_room_id() -> None:
 
 class TestGhostRoomConfig:
     def test_disabled_without_env(self):
-        from backend.services.ghost_room_service import _selections
+        from backend.services.ghost_seen_service import _selections
         old = _selections.copy()
         try:
             _clear_ghost_room_id()
-            from backend.bot.handlers.ghost_room import _is_ghost_enabled
+            from backend.bot.handlers.ghost_seen import _is_ghost_enabled
             assert not _is_ghost_enabled()
         finally:
             _selections.clear()
@@ -51,7 +51,7 @@ class TestGhostRoomConfig:
         old = os.environ.get("GHOST_ROOM_ID")
         try:
             _patch_ghost_room_id("12345")
-            from backend.bot.handlers.ghost_room import _is_ghost_enabled
+            from backend.bot.handlers.ghost_seen import _is_ghost_enabled
             assert _is_ghost_enabled()
         finally:
             if old is not None:
@@ -65,7 +65,7 @@ class TestGhostRoomConfig:
 
 class TestGhostRoomSelection:
     def test_toggle_adds_and_removes(self):
-        from backend.services.ghost_room_service import (
+        from backend.services.ghost_seen_service import (
             toggle_selection,
             get_selection,
             clear_selection,
@@ -79,7 +79,7 @@ class TestGhostRoomSelection:
         assert not get_selection(999)
 
     def test_max_selection_bound(self):
-        from backend.services.ghost_room_service import (
+        from backend.services.ghost_seen_service import (
             toggle_selection,
             get_selection,
             clear_selection,
@@ -87,12 +87,12 @@ class TestGhostRoomSelection:
         clear_selection(888)
         for i in range(12):
             toggle_selection(888, i + 1)
-        from backend.services.ghost_room_service import _MAX_SELECTED
+        from backend.services.ghost_seen_service import _MAX_SELECTED
         assert len(get_selection(888)) <= _MAX_SELECTED
         clear_selection(888)
 
     def test_clear_selection(self):
-        from backend.services.ghost_room_service import (
+        from backend.services.ghost_seen_service import (
             toggle_selection,
             get_selection,
             clear_selection,
@@ -109,11 +109,11 @@ class TestGhostRoomSelection:
 
 class TestGhostRoomPage:
     def test_default_page(self):
-        from backend.services.ghost_room_service import get_page
+        from backend.services.ghost_seen_service import get_page
         assert get_page(99999) == 0
 
     def test_set_page(self):
-        from backend.services.ghost_room_service import set_page, get_page
+        from backend.services.ghost_seen_service import set_page, get_page
         set_page(123, 2)
         assert get_page(123) == 2
         set_page(123, -5)
@@ -125,7 +125,7 @@ class TestGhostRoomPage:
 
 class TestGhostRoomFormatting:
     def test_format_chat_list_item(self):
-        from backend.services.ghost_room_service import format_chat_list_item
+        from backend.services.ghost_seen_service import format_chat_list_item
         row = {
             "chat_id": 111,
             "display_name": "Alice",
@@ -139,7 +139,7 @@ class TestGhostRoomFormatting:
         assert "Hello there" in result
 
     def test_format_chat_list_item_no_unread(self):
-        from backend.services.ghost_room_service import format_chat_list_item
+        from backend.services.ghost_seen_service import format_chat_list_item
         row = {
             "chat_id": 222,
             "display_name": "Bob",
@@ -152,27 +152,27 @@ class TestGhostRoomFormatting:
         assert "(0)" not in result
 
     def test_format_chat_view_item_selected(self):
-        from backend.services.ghost_room_service import format_chat_view_item
+        from backend.services.ghost_seen_service import format_chat_view_item
         msg = {
             "id": 1,
             "sender_name": "Alice",
             "text": "Hello, how are you?",
             "date": None,
         }
-        result = format_chat_view_item(msg, True, 1)
+        result = format_chat_view_item(msg, True, 1, 1)
         assert "✓" in result
         assert "Alice" in result
         assert "Hello, how are you?" in result
 
     def test_format_chat_view_item_not_selected(self):
-        from backend.services.ghost_room_service import format_chat_view_item
+        from backend.services.ghost_seen_service import format_chat_view_item
         msg = {
             "id": 2,
             "sender_name": "Bob",
             "text": "Good morning",
             "date": None,
         }
-        result = format_chat_view_item(msg, False, 2)
+        result = format_chat_view_item(msg, False, 2, 1)
         assert "○" in result
         assert "Bob" in result
 
@@ -182,9 +182,9 @@ class TestGhostRoomFormatting:
 
 class TestGhostRoomAIExecution:
     @pytest.mark.asyncio
-    async def test_execute_ghost_ai_uses_engine(self):
+    async def test_execute_ghost_seen_ai_uses_engine(self):
         """Ghost Room AI must go through Engine.execute(), never call provider directly."""
-        from backend.services.ghost_room_service import execute_ghost_ai
+        from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch, AsyncMock
 
         mock_engine = AsyncMock()
@@ -195,11 +195,11 @@ class TestGhostRoomAIExecution:
         )
 
         with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
-            ok, resp = await execute_ghost_ai(
+            ok, resp = await execute_ghost_seen_ai(
                 owner_id=123,
                 chat_id=456,
                 prompt_text="What's up?",
-                selected_messages=[],
+                context_messages=[],
             )
 
         assert ok
@@ -207,9 +207,9 @@ class TestGhostRoomAIExecution:
         mock_engine.execute.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_execute_ghost_ai_with_selected_messages(self):
+    async def test_execute_ghost_seen_ai_with_selected_messages(self):
         """Multi-message payload must build a context block, not inferred context."""
-        from backend.services.ghost_room_service import execute_ghost_ai
+        from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch, AsyncMock
 
         mock_engine = AsyncMock()
@@ -222,48 +222,49 @@ class TestGhostRoomAIExecution:
         ]
 
         with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
-            ok, resp = await execute_ghost_ai(
+            ok, resp = await execute_ghost_seen_ai(
                 owner_id=1, chat_id=2, prompt_text="Summarize",
-                selected_messages=msgs,
+                context_messages=msgs,
             )
 
         assert ok
         call = mock_engine.execute.call_args
         request = call[0][0]
-        assert "Selected messages:" in request.user_message
+        assert "Conversation context:" in request.user_message
         assert "Alice" in request.user_message
         assert "Bob" in request.user_message
+        assert "Task: Summarize" in request.user_message
 
     @pytest.mark.asyncio
-    async def test_execute_ghost_ai_engine_none(self):
-        from backend.services.ghost_room_service import execute_ghost_ai
+    async def test_execute_ghost_seen_ai_engine_none(self):
+        from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch
 
         with patch("backend.ai.engine.engine.get_engine", return_value=None):
-            ok, resp = await execute_ghost_ai(
-                owner_id=1, chat_id=2, prompt_text="Test", selected_messages=[],
+            ok, resp = await execute_ghost_seen_ai(
+                owner_id=1, chat_id=2, prompt_text="Test", context_messages=[],
             )
         assert not ok
         assert "not available" in resp.lower()
 
     @pytest.mark.asyncio
-    async def test_execute_ghost_ai_session_isolation(self):
-        """Ghost Room AI must use a distinct session_id (ghost:<chat_id>) for context isolation."""
-        from backend.services.ghost_room_service import execute_ghost_ai
+    async def test_execute_ghost_seen_ai_session_isolation(self):
+        """Ghost Room AI must use a distinct session_id (ghost_seen:<chat_id>) for context isolation."""
+        from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch, AsyncMock
 
         mock_engine = AsyncMock()
         mock_engine.execute.return_value = AsyncMock(success=True, response="OK", errors=[])
 
         with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
-            await execute_ghost_ai(
+            await execute_ghost_seen_ai(
                 owner_id=123, chat_id=999,
-                prompt_text="Test", selected_messages=[],
+                prompt_text="Test", context_messages=[],
             )
 
         call = mock_engine.execute.call_args
         request = call[0][0]
-        assert request.session_id == "ghost:999"
+        assert request.session_id == "ghost_seen:999"
 
 
 # ── 6. Incoming listener owner exclusion ──
@@ -272,7 +273,7 @@ class TestGhostRoomAIExecution:
 class TestGhostRoomIncoming:
     def test_incoming_listener_registered(self):
         """Incoming listener is registered via events.NewMessage(incoming=True)."""
-        import backend.bot.handlers.ghost_room as gr
+        import backend.bot.handlers.ghost_seen as gr
         assert hasattr(gr, "_register_incoming_listener")
 
 
@@ -283,8 +284,8 @@ class TestGhostRoomNoSecondArchitecture:
     def test_ai_path_is_engine_execute(self):
         """The only AI execution import should be engine.execute."""
         import inspect
-        import backend.services.ghost_room_service as svc
-        src = inspect.getsource(svc.execute_ghost_ai)
+        import backend.services.ghost_seen_service as svc
+        src = inspect.getsource(svc.execute_ghost_seen_ai)
         assert "get_engine" in src
         assert "engine.execute" in src
         assert "ProviderManager" not in src
@@ -295,32 +296,57 @@ class TestGhostRoomNoSecondArchitecture:
 # ── 8. Database availability fallback ──
 
 
-class TestGhostRoomDBFallback:
+class TestGhostSeenRegistryFallback:
     @pytest.mark.asyncio
-    async def test_read_ghost_chats_returns_empty_on_failure(self):
-        from backend.bot.handlers.ghost_room import _read_ghost_chats_sync
+    async def test_read_registry_rows_returns_empty_on_failure(self):
+        from backend.services.ghost_seen_service import read_registry_rows
         from unittest.mock import patch
 
         with patch("backend.db.client.get_db", return_value=None):
-            rows = await _read_ghost_chats_sync()
+            rows = await read_registry_rows()
             assert rows == []
 
     @pytest.mark.asyncio
-    async def test_upsert_does_not_raise(self):
-        from backend.bot.handlers.ghost_room import _upsert_ghost_chat_sync
+    async def test_upsert_source_chat_does_not_raise(self):
+        from backend.services.ghost_seen_service import upsert_source_chat
         from unittest.mock import patch
 
         with patch("backend.db.client.get_db", return_value=None):
-            # Must not raise
-            await _upsert_ghost_chat_sync(1, "Test", "preview", "")
+            await upsert_source_chat(1, "Test", "preview", "")
 
     @pytest.mark.asyncio
     async def test_clear_unread_does_not_raise(self):
-        from backend.bot.handlers.ghost_room import _clear_unread_sync
+        from backend.services.ghost_seen_service import clear_unread
         from unittest.mock import patch
 
         with patch("backend.db.client.get_db", return_value=None):
-            await _clear_unread_sync(1)
+            await clear_unread(1)
+
+
+class TestGhostSeenRetention:
+    def test_apply_retention_expires_only_stale_rows(self):
+        from datetime import datetime, timedelta, timezone
+        from backend.services.ghost_seen_service import apply_retention
+
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"chat_id": 1, "last_message_at": (now - timedelta(days=60)).isoformat()},
+            {"chat_id": 2, "last_message_at": (now - timedelta(days=1)).isoformat()},
+            {"chat_id": 3, "last_message_at": None},
+        ]
+        kept, expired = apply_retention(rows, 30)
+        assert [row["chat_id"] for row in kept] == [2, 3]
+        assert expired == [1]
+
+    def test_apply_retention_clamps_extreme_day_values(self):
+        from datetime import datetime, timezone
+        from backend.services.ghost_seen_service import apply_retention
+
+        row = [{"chat_id": 1, "last_message_at": datetime.now(timezone.utc).isoformat()}]
+        kept, expired = apply_retention(row, 100000)
+        assert kept == row and expired == []
+        kept, expired = apply_retention(row, 0)
+        assert kept == row and expired == []
 
 
 # ── 9. Destination routing (GHOST_ROOM_ID enforcement) ──
@@ -328,7 +354,7 @@ class TestGhostRoomDBFallback:
 
 class TestGhostRoomDestination:
     def setup_method(self):
-        from backend.bot.handlers.ghost_room import _ghost_room_id as orig
+        from backend.bot.handlers.ghost_seen import _ghost_room_id as orig
         self._old_val = os.environ.get("GHOST_ROOM_ID")
 
     def teardown_method(self):
@@ -339,33 +365,33 @@ class TestGhostRoomDestination:
 
     def test_resolve_returns_none_when_missing(self):
         os.environ.pop("GHOST_ROOM_ID", None)
-        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        from backend.bot.handlers.ghost_seen import _resolve_ghost_destination
         assert _resolve_ghost_destination() is None
 
     def test_resolve_returns_none_when_empty(self):
         os.environ["GHOST_ROOM_ID"] = ""
-        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        from backend.bot.handlers.ghost_seen import _resolve_ghost_destination
         assert _resolve_ghost_destination() is None
 
     def test_resolve_returns_none_when_non_numeric(self):
         os.environ["GHOST_ROOM_ID"] = "abc123"
-        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        from backend.bot.handlers.ghost_seen import _resolve_ghost_destination
         assert _resolve_ghost_destination() is None
 
     def test_resolve_returns_none_when_negative(self):
         os.environ["GHOST_ROOM_ID"] = "-5"
-        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        from backend.bot.handlers.ghost_seen import _resolve_ghost_destination
         assert _resolve_ghost_destination() is None
 
     def test_resolve_returns_int_when_valid(self):
         os.environ["GHOST_ROOM_ID"] = "1234567890"
-        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        from backend.bot.handlers.ghost_seen import _resolve_ghost_destination
         assert _resolve_ghost_destination() == 1234567890
 
     @pytest.mark.asyncio
     async def test_reply_blocked_when_ghost_room_id_missing(self):
         """Reply must fail closed when GHOST_ROOM_ID is missing."""
-        from backend.bot.handlers.ghost_room import _ghost_reply_input, configure
+        from backend.bot.handlers.ghost_seen import _ghost_reply_input, configure
         os.environ.pop("GHOST_ROOM_ID", None)
         # configure with a dummy client that will NOT be called
         dummy = object()
@@ -375,7 +401,7 @@ class TestGhostRoomDestination:
 
     @pytest.mark.asyncio
     async def test_reply_no_quote_blocked_when_ghost_room_id_missing(self):
-        from backend.bot.handlers.ghost_room import _ghost_reply_no_quote_input, configure
+        from backend.bot.handlers.ghost_seen import _ghost_reply_no_quote_input, configure
         os.environ.pop("GHOST_ROOM_ID", None)
         dummy = object()
         configure(dummy, 1, "UTC")
@@ -383,7 +409,7 @@ class TestGhostRoomDestination:
 
     @pytest.mark.asyncio
     async def test_ai_blocked_when_ghost_room_id_missing(self):
-        from backend.bot.handlers.ghost_room import _ghost_ai_input, configure
+        from backend.bot.handlers.ghost_seen import _ghost_ai_input, configure
         os.environ.pop("GHOST_ROOM_ID", None)
         dummy = object()
         configure(dummy, 1, "UTC")
@@ -392,10 +418,10 @@ class TestGhostRoomDestination:
     @pytest.mark.asyncio
     async def test_reply_sends_to_ghost_room_id_not_source_chat(self):
         """When GHOST_ROOM_ID is set, reply must send to GHOST_ROOM_ID, not the source chat."""
-        from backend.bot.handlers.ghost_room import (
+        from backend.bot.handlers.ghost_seen import (
             _ghost_reply_input, configure, _set_current_chat,
         )
-        from backend.services.ghost_room_service import toggle_selection, clear_selection
+        from backend.services.ghost_seen_service import toggle_selection, clear_selection
         os.environ["GHOST_ROOM_ID"] = "99999"
         clear_selection(12345)
         toggle_selection(12345, 777)
@@ -417,10 +443,10 @@ class TestGhostRoomDestination:
     @pytest.mark.asyncio
     async def test_ai_sends_to_ghost_room_id_not_source_chat(self):
         """Ghost Room AI response must be delivered to GHOST_ROOM_ID."""
-        from backend.bot.handlers.ghost_room import (
+        from backend.bot.handlers.ghost_seen import (
             _ghost_ai_input, configure, _set_current_chat,
         )
-        from backend.services.ghost_room_service import toggle_selection, clear_selection
+        from backend.services.ghost_seen_service import toggle_selection, clear_selection
         from unittest.mock import patch, AsyncMock
         os.environ["GHOST_ROOM_ID"] = "88888"
         clear_selection(12345)
@@ -434,7 +460,7 @@ class TestGhostRoomDestination:
         mock_engine.execute.return_value = AsyncMock(success=True, response="AI reply")
 
         with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
-            with patch("backend.bot.handlers.ghost_room._self_client", mock_client):
+            with patch("backend.bot.handlers.ghost_seen._self_client", mock_client):
                 await _ghost_ai_input("summarize", 0, 0, 0, 0)
 
         # Must have delivered to 88888, NOT 12345
@@ -446,8 +472,8 @@ class TestGhostRoomDestination:
     def test_no_ghost_chats_fallback_to_destination(self):
         """ghost_chats entries must NEVER be used as the destination."""
         import inspect
-        import backend.bot.handlers.ghost_room as gr
-        import backend.services.ghost_room_service as svc
+        import backend.bot.handlers.ghost_seen as gr
+        import backend.services.ghost_seen_service as svc
 
         # Handler output paths must use _resolve_ghost_destination
         for fn_name in ["_ghost_reply_input", "_ghost_reply_no_quote_input", "_ghost_ai_input"]:
@@ -455,5 +481,5 @@ class TestGhostRoomDestination:
             assert "_resolve_ghost_destination" in src, f"{fn_name} must use _resolve_ghost_destination"
 
         # Service must NOT contain fallback to ghost_chats
-        svc_src = inspect.getsource(svc.execute_ghost_ai)
+        svc_src = inspect.getsource(svc.execute_ghost_seen_ai)
         assert "ghost_chats" not in svc_src

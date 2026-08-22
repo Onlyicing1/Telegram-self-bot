@@ -556,5 +556,10 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
 
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)
-    await _safe_edit(event, prompt, built, chat_id, msg_id)
+    try:
+        from backend.helper.panel_render import _style
+        styled_prompt = _style(prompt)
+    except Exception:
+        styled_prompt = prompt
+    await _safe_edit(event, styled_prompt, built, chat_id, msg_id)
     logger.info("[CALLBACK] _handle_input: prompt sent for panel='%s'", panel_id)

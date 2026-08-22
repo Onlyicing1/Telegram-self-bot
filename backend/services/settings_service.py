@@ -46,14 +46,19 @@ Architecture:
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
+| ghost_seen_retention_days | int   | 30      | 1..365 (days)           |
 """
 import logging
 from typing import Any, Callable
 
-#: Enumerated dashboard font choices (keys only — no arbitrary CSS/font
-#: strings ever reach the DB or the frontend). The frontend maps each key
-#: to a fixed CSS font stack; ``default`` is the existing dashboard stack.
-DASHBOARD_FONTS: tuple[str, ...] = ("default", "system", "mono", "serif")
+from backend.helper.font_style import FONT_KEYS
+
+#: Enumerated Glass UI / dashboard font choices (keys only — no arbitrary
+#: CSS/font strings ever reach the DB or the frontend). The authoritative
+#: allow-list lives in ``backend/helper/font_style.py``; the web dashboard
+#: maps each key to a fixed CSS font stack and the Glass UI maps each key
+#: to a fixed letter-styling transform.
+DASHBOARD_FONTS: tuple[str, ...] = FONT_KEYS
 
 from backend.services import panel_settings_repository as repo
 
@@ -72,6 +77,7 @@ _DEFAULTS: dict[str, Any] = {
     "debug_callbacks": False,
     "owner_only": True,
     "dashboard_font": "default",
+    "ghost_seen_retention_days": 30,
 }
 
 _cache: dict[str, Any] = {}
@@ -102,6 +108,10 @@ def _validate_dashboard_font(value: Any) -> bool:
     return isinstance(value, str) and value in DASHBOARD_FONTS
 
 
+def _validate_ghost_seen_retention(value: Any) -> bool:
+    return _validate_int_range(1, 365)(value)
+
+
 _VALIDATORS: dict[str, ValidatorFn] = {
     "auto_close_enabled": _validate_bool,
     "auto_close_delay": _validate_int_range(5, 3600),
@@ -115,6 +125,7 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
     "dashboard_font": _validate_dashboard_font,
+    "ghost_seen_retention_days": _validate_ghost_seen_retention,
 }
 
 
@@ -308,3 +319,17 @@ def dashboard_font() -> str:
 
 def set_dashboard_font(value: str) -> bool:
     return set_setting("dashboard_font", value)
+
+
+def ghost_seen_retention_days() -> int:
+    """Ghost Seen registry retention window in days (1..365)."""
+    _ensure_loaded()
+    try:
+        value = int(_cache.get("ghost_seen_retention_days", 30))
+    except (TypeError, ValueError):
+        return 30
+    return value if 1 <= value <= 365 else 30
+
+
+def set_ghost_seen_retention_days(days: int) -> bool:
+    return set_setting("ghost_seen_retention_days", days)

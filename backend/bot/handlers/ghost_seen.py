@@ -90,96 +90,30 @@ def _is_ghost_enabled() -> bool:
     return bool(_ghost_room_id())
 
 
-async def _read_ghost_chats_sync() -> list[dict[str, Any]]:
-    """Read ghost_chats rows, falling back to empty list when unavailable."""
-    try:
-        from backend.db.client import get_db
-        db = get_db()
-        if db is None:
-            return []
-        import asyncio
-        from backend.db.client import _run_sync
-
-        def _query():
-            return (
-                db.table("ghost_chats")
-                .select("*")
-                .order("last_message_at", desc=True)
-                .execute()
-            )
-
-        result = await _run_sync(_query)
-        return (result.data or []) if result else []
-    except Exception as exc:
-        logger.warning("Ghost Room: read_ghost_chats failed: %s", exc)
-        return []
-
-
-async def _upsert_ghost_chat_sync(
-    chat_id: int,
-    display_name: str,
-    preview: str,
-    timestamp: str,
-) -> None:
-    """Upsert a ghost_chats row via the db client. Failures are logged, never raised."""
-    try:
-        from backend.db.client import get_db
-        db = get_db()
-        if db is None:
-            return
-        from backend.db.client import _run_sync
-
-        def _upsert():
-            db.table("ghost_chats").upsert({
-                "chat_id": chat_id,
-                "display_name": display_name,
-                "last_preview": preview[:160],
-                "last_message_at": timestamp,
-                "updated_at": timestamp,
-            }, on_conflict="chat_id").execute()
-            db.table("ghost_chats").update({
-                "unread_count": db.raw("unread_count + 1"),
-            }).eq("chat_id", chat_id).execute()
-
-        await _run_sync(_upsert)
-    except Exception as exc:
-        logger.warning("Ghost Room: upsert_ghost_chat failed for chat=%s: %s", chat_id, exc)
-
-
-async def _clear_unread_sync(chat_id: int) -> None:
-    """Reset unread_count to 0 for a chat."""
-    try:
-        from backend.db.client import get_db
-        db = get_db()
-        if db is None:
-            return
-        from backend.db.client import _run_sync
-
-        def _update():
-            db.table("ghost_chats").update({
-                "unread_count": 0,
-            }).eq("chat_id", chat_id).execute()
-
-        await _run_sync(_update)
-    except Exception as exc:
-        logger.debug("Ghost Room: clear_unread failed for chat=%s: %s", chat_id, exc)
-
-
 # ── panel: ghost (chat list) ──
 
 
 async def _ghost_list_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import format_chat_list_item
+    from backend.services import settings_service
+    from backend.services.ghost_seen_service import (
+        apply_retention,
+        delete_expired_rows,
+        format_chat_list_item,
+        read_registry_rows,
+    )
 
-    rows = await _read_ghost_chats_sync()
+    rows = await read_registry_rows()
+    _, expired_ids = apply_retention(rows, settings_service.ghost_seen_retention_days())
+    if expired_ids:
+        await delete_expired_rows(expired_ids)
 
-    lines = ["**👻 Ghost Room**\n"]
+    lines = ["**👻 Ghost Seen**\n"]
     if not rows:
         lines.append("_No private chats yet._")
         lines.append("Incoming messages from private chats appear here automatically.")
         builder = InlinePanelBuilder()
         _nav_buttons(builder)
-        return "👻 Ghost Room", "\n".join(lines), builder.build()
+        return "👻 Ghost Seen", "\n".join(lines), builder.build()
 
     builder = InlinePanelBuilder()
     for row in rows:
@@ -189,14 +123,14 @@ async def _ghost_list_panel_handler(event, extra: str) -> tuple[str, str, list] 
 
     lines.append(f"_{len(rows)} chats_")
     _nav_buttons(builder)
-    return "👻 Ghost Room", "\n".join(lines), builder.build()
+    return "👻 Ghost Seen", "\n".join(lines), builder.build()
 
 
 # ── panel: ghost_chat (five-message page) ──
 
 
 async def _ghost_chat_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import (
+    from backend.services.ghost_seen_service import (
         fetch_chunk,
         get_page,
         get_selection,
@@ -219,7 +153,7 @@ async def _ghost_chat_panel_handler(event, extra: str) -> tuple[str, str, list] 
     for i, msg in enumerate(msgs):
         seq = page * 5 + i + 1
         is_sel = msg.get("id", 0) in selected
-        lines.append(format_chat_view_item(msg, is_sel, seq))
+        lines.append(format_chat_view_item(msg, is_sel, seq, _store_owner_id))
 
     builder = InlinePanelBuilder()
     for msg in msgs:
@@ -250,7 +184,7 @@ async def _ghost_chat_panel_handler(event, extra: str) -> tuple[str, str, list] 
 
 
 async def _ghost_open_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import set_page
+    from backend.services.ghost_seen_service import set_page
     try:
         target = int(extra)
     except ValueError:
@@ -259,12 +193,13 @@ async def _ghost_open_action(event, extra: str, chat_id: int) -> tuple[str, str,
         return "👻 Chat", "Invalid chat id.", builder.build()
 
     set_page(target, 0)
-    await _clear_unread_sync(target)
+    from backend.services.ghost_seen_service import clear_unread as clear_registry_unread
+    await clear_registry_unread(target)
     return await _ghost_chat_panel_handler(event, str(target))
 
 
 async def _ghost_toggle_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import toggle_selection
+    from backend.services.ghost_seen_service import toggle_selection
     try:
         msg_id = int(extra)
     except ValueError:
@@ -276,7 +211,7 @@ async def _ghost_toggle_action(event, extra: str, chat_id: int) -> tuple[str, st
 
 
 async def _ghost_page_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import get_page, set_page
+    from backend.services.ghost_seen_service import get_page, set_page
     panel_chat = _current_chat()
     page = get_page(panel_chat)
     if extra == "prev":
@@ -287,7 +222,7 @@ async def _ghost_page_action(event, extra: str, chat_id: int) -> tuple[str, str,
 
 
 async def _ghost_clear_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import clear_selection
+    from backend.services.ghost_seen_service import clear_selection
     panel_chat = _current_chat()
     clear_selection(panel_chat)
     return await _ghost_chat_panel_handler(event, str(panel_chat))
@@ -298,7 +233,7 @@ async def _ghost_back_action(event, extra: str, chat_id: int) -> tuple[str, str,
 
 
 async def _ghost_ai_single_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import get_selection, execute_ghost_ai
+    from backend.services.ghost_seen_service import get_selection, execute_ghost_seen_ai
     panel_chat = _current_chat()
     sel = get_selection(panel_chat)
     if len(sel) != 1:
@@ -310,7 +245,7 @@ async def _ghost_ai_single_action(event, extra: str, chat_id: int) -> tuple[str,
 
 
 async def _ghost_ai_multi_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_room_service import get_selection
+    from backend.services.ghost_seen_service import get_selection
     panel_chat = _current_chat()
     sel = get_selection(panel_chat)
     if not sel:
@@ -325,7 +260,7 @@ async def _ghost_ai_multi_action(event, extra: str, chat_id: int) -> tuple[str, 
 
 
 async def _ghost_reply_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services.ghost_room_service import get_selection, clear_selection
+    from backend.services.ghost_seen_service import get_selection, clear_selection
     dst = _resolve_ghost_destination()
     if dst is None:
         logger.warning("Ghost Room: reply blocked — GHOST_ROOM_ID missing or invalid")
@@ -343,7 +278,7 @@ async def _ghost_reply_input(text, chat_id, msg_id, inline_chat_id, inline_msg_i
 
 
 async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services.ghost_room_service import get_selection, clear_selection
+    from backend.services.ghost_seen_service import get_selection, clear_selection
     dst = _resolve_ghost_destination()
     if dst is None:
         logger.warning("Ghost Room: reply blocked — GHOST_ROOM_ID missing or invalid")
@@ -360,9 +295,9 @@ async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inl
 
 
 async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services.ghost_room_service import (
+    from backend.services.ghost_seen_service import (
         get_selection,
-        execute_ghost_ai,
+        execute_ghost_seen_ai,
         clear_selection,
     )
     dst = _resolve_ghost_destination()
@@ -384,7 +319,7 @@ async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     except Exception as exc:
         logger.warning("Ghost Room: fetch selected messages failed: %s", exc)
 
-    ok, response = await execute_ghost_ai(
+    ok, response = await execute_ghost_seen_ai(
         _store_owner_id, dst, text,
         selected_msgs, tz_str=_store_tz_str,
     )
@@ -433,7 +368,8 @@ def _register_incoming_listener(client, owner_id: int) -> None:
             except Exception:
                 pass
 
-            await _upsert_ghost_chat_sync(
+            from backend.services.ghost_seen_service import upsert_source_chat
+            await upsert_source_chat(
                 event.chat_id or 0,
                 display_name,
                 preview,
@@ -470,8 +406,8 @@ def register(client, owner_id: int, tz_str: str) -> None:
     configure(client, owner_id, tz_str)
 
     try:
-        register_panel("ghost", _ghost_list_panel_handler, parent="menu", title="👻 Ghost")
-        register_panel("ghost_chat", _ghost_chat_panel_handler, parent="ghost", title="Chat")
+        register_panel("ghost_seen", _ghost_list_panel_handler, parent="menu", title="👻 Ghost Seen")
+        register_panel("ghost_chat", _ghost_chat_panel_handler, parent="ghost_seen", title="Chat")
         register_action("ghost_open", _ghost_open_action)
         register_action("ghost_toggle", _ghost_toggle_action)
         register_action("ghost_page", _ghost_page_action)
