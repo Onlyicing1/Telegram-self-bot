@@ -109,7 +109,7 @@ None. No SQL, no migrations, no schema changes.
 
 ### Commit / push / remote verification
 
-- Commit hash: `7c3a8f1e2d4b5a6c7d8e9f0a1b2c3d4e5f6a7b8c`
+- Commit hash: `5238d0f614c5cca6c48b1db962467568fd09df34`
   - Message: `fix: harden Ghost Room destination routing to GHOST_ROOM_ID only`
 - Push result: pushed to `origin/main`
 - Remote verification: `git fetch origin` confirms local HEAD == `origin/main`
