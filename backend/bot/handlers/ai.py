@@ -623,7 +623,12 @@ async def _ai_details_inline_builder(event, extra: str) -> list:
 
 
 async def _ai_usage_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    """Compact usage summary over a selectable window. RAM-only telemetry."""
+    """Compact usage summary over a selectable window.
+
+    Session view from RAM telemetry; a persisted (Supabase) line is
+    appended when saved usage exists for the same window. Persisted reads
+    are additive only — empty or failed reads leave the panel unchanged.
+    """
     from backend.ai.engine.telemetry import format_tokens, telemetry
 
     range_key = (extra or "").strip() or "today"
@@ -657,6 +662,11 @@ async def _ai_usage_panel_handler(event, extra: str) -> tuple[str, str, list] | 
             issues.append(f"{summary['fallbacks']} fallbacks")
         lines.append(" · ".join(issues) if issues else "No failures")
 
+    persisted = await _read_persisted_usage(range_key)
+    if persisted.requests:
+        lines.append("")
+        lines.append(_persisted_usage_line(persisted))
+
     builder = InlinePanelBuilder()
     builder.add_buttons(*[
         (f"{'✓ ' if key == range_key else ''}{lbl}", f"panel:ai_usage:{key}")
@@ -664,6 +674,52 @@ async def _ai_usage_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     ])
     _nav_buttons(builder)
     return "AI · Usage", "\n".join(lines), builder.build()
+
+
+def _persisted_usage_line(summary) -> str:
+    """One compact persisted-usage line with honest token-source labels."""
+    from backend.ai.engine.telemetry import format_tokens
+
+    ts = summary.token_source
+    head = f"Saved · {summary.requests} requests"
+    if not summary.total_tokens:
+        if "unavailable" in summary.sources:
+            return f"{head} · tokens unavailable"
+        return f"{head} · 0 tokens"
+    tokens = f"{format_tokens(ts.total)} tokens"
+    if ts.actual and not ts.estimated and not ts.unavailable:
+        return f"{head} · {tokens} · actual"
+    detail = []
+    if ts.actual:
+        detail.append(f"{format_tokens(ts.actual)} actual")
+    if ts.estimated:
+        detail.append(f"{format_tokens(ts.estimated)} ≈")
+    if ts.unavailable:
+        detail.append(f"{format_tokens(ts.unavailable)} unavailable")
+    if not detail:
+        return f"{head} · {tokens}"
+    return f"{head} · {tokens} · " + " + ".join(detail)
+
+
+async def _read_persisted_usage(range_key: str):
+    """Windowed persisted-usage summary; safe default on any failure."""
+    from datetime import datetime, timedelta, timezone
+
+    from backend.ai.database import usage_reader
+
+    owner_id = await _get_owner_id()
+    now = datetime.now(timezone.utc)
+    if range_key == "7d":
+        since = now - timedelta(days=7)
+    elif range_key == "30d":
+        since = now - timedelta(days=30)
+    else:
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return await usage_reader.summary(owner_id, since=since)
+    except Exception:  # noqa: BLE001
+        from backend.ai.database.usage_reader import UsageSummary
+        return UsageSummary()
 
 
 async def _ai_usage_inline_builder(event, extra: str) -> list:
