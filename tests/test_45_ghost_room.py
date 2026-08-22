@@ -321,3 +321,139 @@ class TestGhostRoomDBFallback:
 
         with patch("backend.db.client.get_db", return_value=None):
             await _clear_unread_sync(1)
+
+
+# ── 9. Destination routing (GHOST_ROOM_ID enforcement) ──
+
+
+class TestGhostRoomDestination:
+    def setup_method(self):
+        from backend.bot.handlers.ghost_room import _ghost_room_id as orig
+        self._old_val = os.environ.get("GHOST_ROOM_ID")
+
+    def teardown_method(self):
+        if self._old_val is not None:
+            os.environ["GHOST_ROOM_ID"] = self._old_val
+        else:
+            os.environ.pop("GHOST_ROOM_ID", None)
+
+    def test_resolve_returns_none_when_missing(self):
+        os.environ.pop("GHOST_ROOM_ID", None)
+        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        assert _resolve_ghost_destination() is None
+
+    def test_resolve_returns_none_when_empty(self):
+        os.environ["GHOST_ROOM_ID"] = ""
+        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        assert _resolve_ghost_destination() is None
+
+    def test_resolve_returns_none_when_non_numeric(self):
+        os.environ["GHOST_ROOM_ID"] = "abc123"
+        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        assert _resolve_ghost_destination() is None
+
+    def test_resolve_returns_none_when_negative(self):
+        os.environ["GHOST_ROOM_ID"] = "-5"
+        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        assert _resolve_ghost_destination() is None
+
+    def test_resolve_returns_int_when_valid(self):
+        os.environ["GHOST_ROOM_ID"] = "1234567890"
+        from backend.bot.handlers.ghost_room import _resolve_ghost_destination
+        assert _resolve_ghost_destination() == 1234567890
+
+    @pytest.mark.asyncio
+    async def test_reply_blocked_when_ghost_room_id_missing(self):
+        """Reply must fail closed when GHOST_ROOM_ID is missing."""
+        from backend.bot.handlers.ghost_room import _ghost_reply_input, configure
+        os.environ.pop("GHOST_ROOM_ID", None)
+        # configure with a dummy client that will NOT be called
+        dummy = object()
+        configure(dummy, 1, "UTC")
+        # Must not raise; must silently return
+        await _ghost_reply_input("test", 0, 0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reply_no_quote_blocked_when_ghost_room_id_missing(self):
+        from backend.bot.handlers.ghost_room import _ghost_reply_no_quote_input, configure
+        os.environ.pop("GHOST_ROOM_ID", None)
+        dummy = object()
+        configure(dummy, 1, "UTC")
+        await _ghost_reply_no_quote_input("test", 0, 0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_ai_blocked_when_ghost_room_id_missing(self):
+        from backend.bot.handlers.ghost_room import _ghost_ai_input, configure
+        os.environ.pop("GHOST_ROOM_ID", None)
+        dummy = object()
+        configure(dummy, 1, "UTC")
+        await _ghost_ai_input("test", 0, 0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reply_sends_to_ghost_room_id_not_source_chat(self):
+        """When GHOST_ROOM_ID is set, reply must send to GHOST_ROOM_ID, not the source chat."""
+        from backend.bot.handlers.ghost_room import (
+            _ghost_reply_input, configure, _set_current_chat,
+        )
+        from backend.services.ghost_room_service import toggle_selection, clear_selection
+        os.environ["GHOST_ROOM_ID"] = "99999"
+        clear_selection(12345)
+        toggle_selection(12345, 777)
+        _set_current_chat(12345)
+
+        # setup a mock client
+        from unittest.mock import AsyncMock
+        mock_client = AsyncMock()
+        configure(mock_client, 1, "UTC")
+
+        await _ghost_reply_input("hello", 0, 0, 0, 0)
+
+        # Must have sent to 99999, NOT to 12345 (the source chat)
+        mock_client.send_message.assert_called_once()
+        args, kwargs = mock_client.send_message.call_args
+        assert args[0] == 99999
+        clear_selection(12345)
+
+    @pytest.mark.asyncio
+    async def test_ai_sends_to_ghost_room_id_not_source_chat(self):
+        """Ghost Room AI response must be delivered to GHOST_ROOM_ID."""
+        from backend.bot.handlers.ghost_room import (
+            _ghost_ai_input, configure, _set_current_chat,
+        )
+        from backend.services.ghost_room_service import toggle_selection, clear_selection
+        from unittest.mock import patch, AsyncMock
+        os.environ["GHOST_ROOM_ID"] = "88888"
+        clear_selection(12345)
+        toggle_selection(12345, 777)
+        _set_current_chat(12345)
+
+        mock_client = AsyncMock()
+        configure(mock_client, 1, "UTC")
+
+        mock_engine = AsyncMock()
+        mock_engine.execute.return_value = AsyncMock(success=True, response="AI reply")
+
+        with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
+            with patch("backend.bot.handlers.ghost_room._self_client", mock_client):
+                await _ghost_ai_input("summarize", 0, 0, 0, 0)
+
+        # Must have delivered to 88888, NOT 12345
+        mock_client.send_message.assert_called_once()
+        dest = mock_client.send_message.call_args[0][0]
+        assert dest == 88888
+        clear_selection(12345)
+
+    def test_no_ghost_chats_fallback_to_destination(self):
+        """ghost_chats entries must NEVER be used as the destination."""
+        import inspect
+        import backend.bot.handlers.ghost_room as gr
+        import backend.services.ghost_room_service as svc
+
+        # Handler output paths must use _resolve_ghost_destination
+        for fn_name in ["_ghost_reply_input", "_ghost_reply_no_quote_input", "_ghost_ai_input"]:
+            src = inspect.getsource(getattr(gr, fn_name))
+            assert "_resolve_ghost_destination" in src, f"{fn_name} must use _resolve_ghost_destination"
+
+        # Service must NOT contain fallback to ghost_chats
+        svc_src = inspect.getsource(svc.execute_ghost_ai)
+        assert "ghost_chats" not in svc_src

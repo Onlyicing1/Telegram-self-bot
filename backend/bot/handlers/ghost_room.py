@@ -65,6 +65,27 @@ def _ghost_room_id() -> str:
     return os.getenv("GHOST_ROOM_ID", "")
 
 
+def _resolve_ghost_destination() -> int | None:
+    """Resolve the GHOST_ROOM_ID env var to a valid Telegram chat ID.
+
+    This is the SINGLE authoritative destination for all Ghost Room output.
+    Returns None when GHOST_ROOM_ID is missing, empty, or non-numeric —
+    callers must fail closed and never fall back to another chat.
+    """
+    raw = _ghost_room_id()
+    if not raw:
+        return None
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("Ghost Room: GHOST_ROOM_ID=%r is not a valid integer", raw)
+        return None
+    if val < 0:
+        logger.warning("Ghost Room: GHOST_ROOM_ID=%d is negative", val)
+        return None
+    return val
+
+
 def _is_ghost_enabled() -> bool:
     return bool(_ghost_room_id())
 
@@ -305,13 +326,17 @@ async def _ghost_ai_multi_action(event, extra: str, chat_id: int) -> tuple[str, 
 
 async def _ghost_reply_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.services.ghost_room_service import get_selection, clear_selection
+    dst = _resolve_ghost_destination()
+    if dst is None:
+        logger.warning("Ghost Room: reply blocked — GHOST_ROOM_ID missing or invalid")
+        return
     panel_chat = _current_chat()
     sel = get_selection(panel_chat)
     if not sel or not _self_client:
         return
     first_id = sorted(sel)[0]
     try:
-        await _self_client.send_message(panel_chat, text, reply_to=first_id)
+        await _self_client.send_message(dst, text, reply_to=first_id)
     except Exception as exc:
         logger.warning("Ghost Room: reply failed: %s", exc)
     clear_selection(panel_chat)
@@ -319,12 +344,16 @@ async def _ghost_reply_input(text, chat_id, msg_id, inline_chat_id, inline_msg_i
 
 async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
     from backend.services.ghost_room_service import get_selection, clear_selection
+    dst = _resolve_ghost_destination()
+    if dst is None:
+        logger.warning("Ghost Room: reply blocked — GHOST_ROOM_ID missing or invalid")
+        return
     panel_chat = _current_chat()
     sel = get_selection(panel_chat)
     if not sel or not _self_client:
         return
     try:
-        await _self_client.send_message(panel_chat, text)
+        await _self_client.send_message(dst, text)
     except Exception as exc:
         logger.warning("Ghost Room: reply failed: %s", exc)
     clear_selection(panel_chat)
@@ -336,6 +365,10 @@ async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
         execute_ghost_ai,
         clear_selection,
     )
+    dst = _resolve_ghost_destination()
+    if dst is None:
+        logger.warning("Ghost Room: AI blocked — GHOST_ROOM_ID missing or invalid")
+        return
     panel_chat = _current_chat()
     sel = get_selection(panel_chat)
     if not sel:
@@ -352,12 +385,12 @@ async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
         logger.warning("Ghost Room: fetch selected messages failed: %s", exc)
 
     ok, response = await execute_ghost_ai(
-        _store_owner_id, panel_chat, text,
+        _store_owner_id, dst, text,
         selected_msgs, tz_str=_store_tz_str,
     )
     if ok and _self_client:
         try:
-            await _self_client.send_message(panel_chat, response)
+            await _self_client.send_message(dst, response)
         except Exception as exc:
             logger.warning("Ghost Room: AI response delivery failed: %s", exc)
     clear_selection(panel_chat)
