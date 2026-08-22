@@ -71,6 +71,7 @@ def _build_menu_buttons() -> list:
         ("Settings", "panel:settings"),
     )
     builder.add_row("🧠 AI", "panel:ai")
+    builder.add_row("👻 Ghost Room", "panel:ghost")
     return builder.build()
 
 
