@@ -196,7 +196,8 @@ async def save_memory(owner_id: int, tier: str, category: str, content: str,
 
 
 def _query_memories_sync(owner_id: int, tier: str | None = None, limit: int = 20,
-                         min_importance: float = 0.0) -> list[dict]:
+                         min_importance: float = 0.0,
+                         category: str | None = None) -> list[dict]:
     db = _get_db()
     if not db:
         return []
@@ -204,9 +205,18 @@ def _query_memories_sync(owner_id: int, tier: str | None = None, limit: int = 20
         q = db.table("ai_memories").select("*").eq("owner_id", owner_id)
         if tier:
             q = q.eq("tier", tier)
+        if category:
+            q = q.eq("category", category)
         if min_importance > 0:
             q = q.gte("importance", min_importance)
-        result = q.order("importance", desc=True).limit(limit).execute()
+        # Deterministic order: importance first, then recency, then id.
+        result = (
+            q.order("importance", desc=True)
+            .order("created_at", desc=True)
+            .order("id")
+            .limit(limit)
+            .execute()
+        )
         return result.data or []
     except Exception as exc:
         logger.warning("AI query_memories failed: %s", exc)
@@ -240,6 +250,36 @@ async def delete_expired_memories(tier: str) -> int:
         return await _run_sync(_delete_expired_memories_sync, tier)
     except Exception as exc:
         logger.warning("AI delete_expired_memories failed: %s", exc)
+        return 0
+
+
+def _delete_memory_sync(entry_id: str) -> bool:
+    db = _get_db()
+    if not db:
+        return False
+    try:
+        db.table("ai_memories").delete().eq("id", entry_id).execute()
+        return True
+    except Exception as exc:
+        logger.warning("AI delete_memory failed: %s", exc)
+        return False
+
+
+def _count_memories_sync(owner_id: int, tier: str) -> int:
+    db = _get_db()
+    if not db:
+        return 0
+    try:
+        result = (
+            db.table("ai_memories")
+            .select("id", count="exact")
+            .eq("owner_id", owner_id)
+            .eq("tier", tier)
+            .execute()
+        )
+        return result.count or 0
+    except Exception as exc:
+        logger.warning("AI count_memories failed: %s", exc)
         return 0
 
 

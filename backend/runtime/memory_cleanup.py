@@ -38,13 +38,15 @@ async def _cleanup_loop() -> None:
             long_repo = repo_mgr.memory if repo_mgr.supabase_available else None
             perm_repo = repo_mgr.memory if repo_mgr.supabase_available else None
 
+            # Repository calls are synchronous (Supabase HTTP) — run them off
+            # the event loop so maintenance can never stall AI dispatch.
             long_mem = LongMemory(repository=long_repo)
-            removed = long_mem.expire_old()
+            removed = await asyncio.to_thread(long_mem.expire_old)
             if removed > 0:
                 logger.info("Memory cleanup: expired %d long-tier memories", removed)
 
             perm_mem = PermanentMemory(repository=perm_repo)
-            footprint = perm_mem.token_footprint(owner_id=0)
+            footprint = await asyncio.to_thread(perm_mem.token_footprint, 0)
             if footprint > 500:
                 logger.warning("Memory cleanup: permanent memory token footprint=%d exceeds soft cap 500", footprint)
 

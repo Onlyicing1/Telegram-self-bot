@@ -93,7 +93,22 @@ class Engine:
             from backend.ai.tools.context import ToolContext
             ctx = ToolContext(telegram=None, owner_id=0, tz_str="UTC")
             self._tool_executor = ToolExecutor(tool_registry, ctx)
-        self._memory_manager = memory_manager or MemoryManager()
+        if memory_manager is not None:
+            self._memory_manager = memory_manager
+        else:
+            try:
+                # Wire the shared repository into the normal execution path:
+                # Supabase-backed when available, in-memory otherwise. Memory
+                # retrieval stays behind the MemoryManager abstraction — never
+                # direct DB calls from the dispatcher.
+                from backend.ai.database.manager import get_repository_manager
+                repo = get_repository_manager().memory
+                self._memory_manager = MemoryManager(
+                    long_repository=repo, permanent_repository=repo,
+                )
+            except Exception as exc:
+                logger.warning("MemoryManager default construction failed: %s", exc)
+                self._memory_manager = MemoryManager()
         self._dispatcher = Dispatcher(
             conversation=self._conversation,
             prompt_builder=self._prompt_builder,

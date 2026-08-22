@@ -104,10 +104,18 @@ class LongMemory:
             return 0
 
     def as_text(self, entries: list[MemoryEntry]) -> str:
-        """Render long memory entries as a text block for prompt injection."""
-        if not entries:
+        """Render long memory entries as a text block for prompt injection.
+
+        Entries are first fit to the prompt token budget (deterministic
+        prefix of the pre-ranked list) so memory can never silently exceed
+        the allowed context budget.
+        """
+        from backend.ai.memory.limits import fit_entries_to_token_budget
+
+        bounded = fit_entries_to_token_budget(entries)
+        if not bounded:
             return ""
         lines = ["[Long Memory]"]
-        for entry in entries:
+        for entry in bounded:
             lines.append(f"  - ({entry.category.value}, importance={entry.importance:.1f}) {entry.content}")
         return "\n".join(lines)

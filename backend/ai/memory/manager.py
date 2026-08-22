@@ -81,14 +81,16 @@ tiers. The Engine receives this manager and calls ``retrieve_for_prompt()``
             "long":       Relevant long-term memories text block.
             "short":      Current short-term memory text block.
         """
+        from backend.ai.memory.limits import MAX_LONG_RECORDS, RETRIEVAL_MIN_IMPORTANCE
+
         permanent_text = self._permanent.as_text(owner_id)
 
         long_entries = self._long.retrieve(MemoryQuery(
             owner_id=owner_id,
             tier=MemoryTier.LONG,
             query_text=query_text,
-            limit=10,
-            min_importance=0.3,
+            limit=MAX_LONG_RECORDS,
+            min_importance=RETRIEVAL_MIN_IMPORTANCE,
         ))
         long_text = self._long.as_text(long_entries)
 

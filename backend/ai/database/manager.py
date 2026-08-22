@@ -17,7 +17,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from backend.ai.database.memory_repository import InMemoryMemoryRepository, MemoryRepository
+from backend.ai.database.memory_repository import (
+    InMemoryMemoryRepository,
+    MemoryRepository,
+    SupabaseMemoryRepository,
+)
 from backend.ai.database.message_repository import InMemoryMessageRepository, MessageRepository
 from backend.ai.database.preferences_repository import InMemoryPreferencesRepository, PreferencesRepository
 from backend.ai.database.provider_stats_repository import InMemoryProviderStatsRepository, ProviderStatsRepository
@@ -49,7 +53,7 @@ class RepositoryManager:
 
     def __init__(self, supabase_available: bool = False) -> None:
         self._supabase_available = supabase_available
-        self._memory = InMemoryMemoryRepository()
+        self._memory = SupabaseMemoryRepository() if supabase_available else InMemoryMemoryRepository()
         self._session = InMemorySessionRepository()
         self._message = InMemoryMessageRepository()
         self._provider_stats = InMemoryProviderStatsRepository()

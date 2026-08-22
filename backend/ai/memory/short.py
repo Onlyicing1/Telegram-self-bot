@@ -68,10 +68,17 @@ class ShortMemory:
         return len(self._entries)
 
     def as_text(self) -> str:
-        """Render short memory as a text block for prompt injection."""
-        if not self._entries:
+        """Render short memory as a text block for prompt injection.
+
+        Fit to the prompt token budget (deterministic prefix, insertion
+        order) so a long tool-heavy turn can never blow the memory budget.
+        """
+        from backend.ai.memory.limits import fit_entries_to_token_budget
+
+        bounded = fit_entries_to_token_budget(list(self._entries))
+        if not bounded:
             return ""
         lines = ["[Short Memory]"]
-        for entry in self._entries:
+        for entry in bounded:
             lines.append(f"  - ({entry.category.value}) {entry.content}")
         return "\n".join(lines)

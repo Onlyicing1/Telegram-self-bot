@@ -22,6 +22,7 @@ builder, provider manager, hooks, metrics).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -34,6 +35,7 @@ from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
 from backend.ai.engine.telemetry import telemetry
+from backend.ai.memory.limits import MEMORY_READ_TIMEOUT_S
 from backend.ai.prompt.builder import PromptBuilder
 from backend.ai.providers.base import ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
@@ -211,7 +213,7 @@ class Dispatcher:
         try:
             _stage("PROMPT_BUILD")
             logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
-            prompt_package = self._prompt_builder.build(self._build_context(request, session))
+            prompt_package = self._prompt_builder.build(await self._build_context(request, session))
             # Inject tool schemas into the prompt if a registry is available
             if self._tool_registry and not self._tool_registry.is_empty():
                 tool_schemas = self._tool_registry.list_schemas()
@@ -1159,7 +1161,7 @@ class Dispatcher:
 
         return messages
 
-    def _build_context(self, request: AIRequest, session: Any) -> Any:
+    async def _build_context(self, request: AIRequest, session: Any) -> Any:
         """Build a ConversationContext from the runtime session + request.
 
         Uses the Conversation Layer's ContextBuilder so the Prompt
@@ -1185,9 +1187,23 @@ class Dispatcher:
         memory_data: dict[str, str] = {}
         if self._memory_manager is not None:
             try:
-                memory_data = self._memory_manager.retrieve_for_prompt(request.owner_id)
+                # Bounded memory retrieval: off the event loop (repo calls are
+                # synchronous) and hard-capped by time so a slow or hanging
+                # store degrades to empty memory instead of stalling the
+                # request. Cancellation always propagates.
+                memory_data = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._memory_manager.retrieve_for_prompt, request.owner_id
+                    ),
+                    timeout=MEMORY_READ_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Memory retrieval failed for owner %s: %r", request.owner_id, exc)
+                logger.warning(
+                    "Memory retrieval failed for owner %s (timed out or errored): %r",
+                    request.owner_id, exc,
+                )
         return ContextBuilder().build(
             session=self._adapt_session(session, request),
             user_text=request.user_message,

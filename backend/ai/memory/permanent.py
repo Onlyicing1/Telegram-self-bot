@@ -112,8 +112,15 @@ class PermanentMemory:
         return total
 
     def as_text(self, owner_id: int) -> str:
-        """Render all permanent memories as a text block for prompt injection."""
-        entries = self.retrieve_all(owner_id)
+        """Render permanent memories as a text block for prompt injection.
+
+        Entries are fit to the prompt token budget (deterministic prefix of
+        the importance/recency-ranked list) so memory can never silently
+        exceed the allowed context budget.
+        """
+        from backend.ai.memory.limits import fit_entries_to_token_budget
+
+        entries = fit_entries_to_token_budget(self.retrieve_all(owner_id))
         if not entries:
             return ""
         lines = ["[Permanent Memory]"]

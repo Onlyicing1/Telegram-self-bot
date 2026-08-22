@@ -1605,3 +1605,65 @@ architecture introduced.
 
 ### Remaining work (per contract)
 Memory wiring + bounds → token-accumulation fixes → usage persistence (Migrations A/B) → reset-detection surfacing → font setting (Migration C) → `ai_status` removal + per-message Details → DB stats extension → Ghost Room MVP (Migration D). Each step independently shippable with the full suite green.
+
+---
+
+# Execution Report — Memory Wiring + Bounds
+
+## Execution 14 — 2026-08-22
+
+**Task type:** Implementation of the first chunk from the AI Foundation & Ghost Room contract (memory wiring + bounds). Audit-only phase complete; this is the first production implementation.
+
+### Status classification
+**MITIGATED — memory can now be read through the normal AI execution path (Supabase-backed when available, in-memory otherwise), with deterministic bounds; NOT yet a claim of proven live persistence** because the `ai_memories` schema exists in migrations but was not (and will not be, per the DB rule) applied/verified against the live Supabase by this execution.
+
+### Starting state
+- HEAD: `b27215dc5664128379e5eb0edf393e4009b89f29` (contract commit) — clean tree.
+- Baseline: 635 passed / 0 failed / 1 warning.
+
+### Files changed
+- `backend/ai/memory/limits.py` (NEW) — single source of truth for all memory bounds + `fit_entries_to_token_budget`.
+- `backend/ai/database/memory_repository.py` — added `SupabaseMemoryRepository` (wraps existing persistence sync helpers); hardened `InMemoryMemoryRepository` with oversize rejection, content dedup, deterministic (importance, created_at, id) ordering; removed dead `uuid` import.
+- `backend/ai/persistence.py` — `_query_memories_sync` gained `category` filter + deterministic 3-key ordering; added `_delete_memory_sync`, `_count_memories_sync`.
+- `backend/ai/database/manager.py` — `RepositoryManager` wires `SupabaseMemoryRepository` when Supabase is available, in-memory otherwise.
+- `backend/ai/engine/engine.py` — default `MemoryManager` now built from the shared repository (no more repo-less inert manager).
+- `backend/ai/engine/dispatcher.py` — `_build_context` is now `async`; memory retrieval runs via `asyncio.to_thread` with a hard `MEMORY_READ_TIMEOUT_S` (2s) cap; `CancelledError` re-raised, all other failures degrade to empty memory with a warning.
+- `backend/ai/memory/{long,permanent,short}.py` — `as_text` renders through `fit_entries_to_token_budget` (prompt-token bound, deterministic prefix).
+- `backend/ai/memory/manager.py` — retrieval constants sourced from `limits.py`.
+- `backend/runtime/memory_cleanup.py` — blocking repository calls moved off the event loop (`asyncio.to_thread`).
+- `tests/test_37_ai_memory_db.py` (NEW) — 17 tests covering all 14 required behaviors.
+
+### Exact behavior implemented
+- **Reads wired**: Engine → MemoryManager → repositories (Supabase or in-memory) → `Dispatcher._build_context` → `[Memory]` prompt section. Memory is now actually consumable through the normal AIRequest → Dispatcher → Provider flow; owner-scoped; deterministic importance/recency ranking.
+- **Bounds** (all in `memory/limits.py`): `MAX_LONG_RECORDS=10`, `MAX_PERMANENT_RECORDS=100`, `RETRIEVAL_MIN_IMPORTANCE=0.3`, `MAX_MEMORY_PROMPT_TOKENS=1000` (reused from `prompt.budget.DEFAULT_MAX_MEMORY_TOKENS` — no second budget), `MAX_MEMORY_ENTRY_CHARS=2000` (reject, never truncate), `MEMORY_READ_TIMEOUT_S=2.0`.
+- **Duplication safety**: identical (owner, tier, content) writes are idempotent at the repository boundary; no dispatcher write path exists, so provider retries can never multiply writes or re-query memory (verified by test: 3 provider attempts, exactly 2 queries, 0 writes).
+- **Failure behavior**: retrieval failure/timeout → empty memory + warning, request proceeds; write failure → `None`/`False` + warning (honest, never claims persistence); no background tasks created; `CancelledError` propagates.
+
+### Intentionally unchanged
+Delete/Save systems, Ghost Room, provider retry/fallback logic, model selector, telemetry UI, settings UI, frontend, routing, RuntimeSupervisor, watchdog/heartbeat, deployment config, all other database repositories and tables.
+
+### Database/schema impact
+None applied. `ai_memories` already exists in migrations (20260804145402) and is used only through the existing persistence layer when Supabase is configured. No SQL executed, no migrations created, no schema invented. When Supabase is unavailable, the in-memory fallback keeps the bot fully functional.
+
+### Validation (all actually run)
+- `python3 -m py_compile` on all modified files — OK.
+- `tests/test_37_ai_memory_db.py` — 17 passed.
+- Focused memory-adjacent modules (test_01/02/03/04/06) — 63 passed.
+- Full suite: **652 passed, 0 failed, 1 warning** (baseline 635 + 17 new; the warning is the pre-existing starlette `python_multipart` PendingDeprecationWarning).
+- `python3 -m compileall -q backend` — OK.
+- `git diff --check` — OK.
+- Protected docs (DATABASE_ARCHITECTURE.md, INVESTIGATION.md, README.md, IMPLEMENTATION_REPORT.md): only IMPLEMENTATION_REPORT.md appended (this section); no others modified.
+
+### Known limitations
+- `SupabaseMemoryRepository` is exercised only against the in-memory fallback in tests; the Supabase path follows the existing persistence-layer pattern but is not unit-tested against a live table (no network in tests, by design).
+- Memory WRITES remain manual via `MemoryManager.store_long/store_permanent` (auto-memory stays OFF per contract); this chunk wires and bounds the capability, it does not create automatic memory.
+- Token accounting / usage persistence / Ghost Room remain future chunks — not implemented here.
+
+### Commit / push
+- Commit: `fix: wire memory into AI execution path with bounds` (hash recorded after push).
+- Push: origin/main.
+- Remote verification: `git fetch origin` + local HEAD == origin/main.
+- Final working-tree state: clean.
+
+### Next chunks (not part of this execution)
+Token-accounting retry fixes, `ai_usage`/`ai_provider_stats` persistence, provider reset surfacing, dashboard font, `ai_status` removal, per-message Details, Ghost Room MVP.
