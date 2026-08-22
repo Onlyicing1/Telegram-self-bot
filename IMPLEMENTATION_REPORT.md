@@ -91,7 +91,7 @@ default to `"default"` — the bot never breaks.
 
 ### Commit / push / remote verification
 
-- **Commit:** (filled at delivery)
+- **Commit:** `78b329e`
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
 - **Final working-tree status:** clean.
