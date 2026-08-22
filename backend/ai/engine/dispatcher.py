@@ -79,6 +79,15 @@ def _is_truncated_finish(reason: str) -> bool:
     return any(tok in upper for tok in _TRUNCATED_FINISH_TOKENS)
 
 
+def _accumulate_usage(target: dict[str, int], source: dict[str, Any]) -> None:
+    """Add ``source``'s reported usage into ``target`` once.
+
+    Missing/zero fields contribute nothing; nothing is ever invented.
+    """
+    for key in target:
+        target[key] += int(source.get(key, 0) or 0)
+
+
 class Dispatcher:
     """Drives an ``AIRequest`` through every AI layer and returns an ``EngineResult``."""
 
@@ -236,6 +245,14 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider_manager", start, errors, metadata)
 
+        # Provider attempts superseded by a retry/recovery must still
+        # contribute their reported usage. Accumulated here and merged into
+        # the final usage dict so no provider response is ever lost or
+        # double-counted.
+        discarded_usage: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        }
+
         # ── Stage 4: Provider + Tool Loop ──
         try:
             messages = self._build_messages(prompt_package)
@@ -311,6 +328,9 @@ class Dispatcher:
                         retry_response.metadata.get("failure_type", "") or "unknown"
                     )
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
+                    # The superseded empty attempt still consumed provider
+                    # usage — retain it before the response is replaced.
+                    _accumulate_usage(discarded_usage, response.usage)
                     retry_meta = dict(retry_response.metadata or {})
                     retry_meta["ai_retry_count"] = int(retry_meta.get("ai_retry_count", 0)) + 1
                     retry_response = replace(retry_response, metadata=retry_meta)
@@ -365,7 +385,15 @@ class Dispatcher:
                         metadata={"failure_type": "network"},
                     )
 
+                recovery_usage_reported = any(
+                    int(recovery_response.usage.get(k, 0) or 0) > 0
+                    for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                )
                 if recovery_response.success and recovery_response.tool_calls:
+                    # The superseded prose response still consumed provider
+                    # usage — retain it before the response is replaced.
+                    _accumulate_usage(discarded_usage, response.usage)
+                    provider_usage_reported = provider_usage_reported or recovery_usage_reported
                     # Native tool call from the recovery response — use it
                     # directly (the nudge produced the structured output).
                     response = recovery_response
@@ -374,12 +402,16 @@ class Dispatcher:
                 elif recovery_response.success and recovery_response.text:
                     candidate = self._apply_structured_action(recovery_response, request, rid)
                     if candidate.tool_calls:
+                        _accumulate_usage(discarded_usage, response.usage)
+                        provider_usage_reported = provider_usage_reported or recovery_usage_reported
                         response = candidate
                         structured_action = True
                         logger.info("AI_ACTION_RECOVERY_RETRY_RECOVERED id=%s", rid or "-")
                     elif candidate.metadata.get("ai_action"):
                         # A clarify/invalid/unsupported action is a real
                         # deterministic outcome — prefer it over raw prose.
+                        _accumulate_usage(discarded_usage, response.usage)
+                        provider_usage_reported = provider_usage_reported or recovery_usage_reported
                         response = candidate
 
             if response.metadata.get("ai_action"):
@@ -390,12 +422,16 @@ class Dispatcher:
                 }
 
         all_tool_results: list[dict[str, Any]] = []
-        # Usage accumulation: initial response + every continuation round.
-        # Nothing is double-counted and the initial usage is never lost.
+        # Usage accumulation: the final response plus every superseded
+        # retry/recovery attempt, merged with all continuation rounds. Each
+        # provider response is counted exactly once — discarded attempts enter
+        # through ``discarded_usage``, the final response through its own usage
+        # dict, continuation rounds are added below — and nothing is
+        # double-counted.
         usage: dict[str, int] = {
-            "prompt_tokens": int(response.usage.get("prompt_tokens", 0)),
-            "completion_tokens": int(response.usage.get("completion_tokens", 0)),
-            "total_tokens": int(response.usage.get("total_tokens", 0)),
+            "prompt_tokens": int(response.usage.get("prompt_tokens", 0)) + discarded_usage["prompt_tokens"],
+            "completion_tokens": int(response.usage.get("completion_tokens", 0)) + discarded_usage["completion_tokens"],
+            "total_tokens": int(response.usage.get("total_tokens", 0)) + discarded_usage["total_tokens"],
         }
         accumulated_finish_reasons: list[str] = []
         if response.metadata.get("finish_reason"):
