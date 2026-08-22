@@ -89,7 +89,7 @@ None. No SQL, no migrations, no schema changes in this execution. The `ghost_cha
 
 ### Commit / push / remote verification
 
-- Commit: recorded below after push (hash filled in post-push).
+- Commit: `1a7890953df3053c5b0bdcdfa0d2257ed0455023` — "feat: complete Ghost Seen rename and Glass UI font panel".
 - Pushed to `origin/main`; `git fetch origin` performed; local HEAD verified equal to `origin/main`.
 - Working tree clean after commit.
 
