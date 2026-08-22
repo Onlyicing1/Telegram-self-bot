@@ -102,8 +102,12 @@ None. No SQL, no migrations, no schema changes.
 
 ### Commit / push / remote verification
 
-- Commit hash: recorded below after push.
-- Push result / remote verification / final tree state: see final section.
+- Commit hash: `720cdcf31526d23a88826f611b1c2f2d680ad906`
+  (`feat: add Ghost Room entry button to main Glass UI menu`)
+- Push result: pushed to `origin/main` (`7556f52..720cdcf`).
+- Remote verification: after `git fetch origin`, local HEAD ==
+  `origin/main` (`720cdcf…`).
+- Final working-tree state: clean.
 
 ### Stop
 
