@@ -95,7 +95,7 @@ convention.
 
 ### Commit / push / remote verification
 
-- **Commit:** `8480a48`
+- **Commit:** `70315b1`
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
 - **Working tree:** clean.
