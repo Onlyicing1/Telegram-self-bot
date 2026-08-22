@@ -131,10 +131,11 @@ runtime degrades safely (empty reads) until the owner applies it.
 
 ### Commit / push / remote verification
 
-- Implementation commit: TBD after push
-- Push result: TBD
-- Remote verification: TBD
-- Final working-tree state: TBD
+- Implementation commit: `eb5fbeffcc30b57c60f662913e4448f3ab1f1ac7`
+  - Message: `feat: implement Ghost Room MVP`
+- Push result: pushed to `origin/main`
+- Remote verification: `git fetch origin` confirms local HEAD == origin/main
+- Final working-tree state: clean
 
 ### Stop
 
