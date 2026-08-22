@@ -114,7 +114,7 @@ derive entirely from existing in-memory telemetry + ReplyResolver.
 
 ### Commit / push / remote verification
 
-- **Commit:** (filled at delivery)
+- **Commit:** `0db0562`
 - **Push:** pushed to `origin/main`; `git fetch origin` → local HEAD ==
   origin/main.
 - **Final working-tree status:** clean.
