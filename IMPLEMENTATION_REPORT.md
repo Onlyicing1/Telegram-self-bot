@@ -128,11 +128,11 @@ None. No SQL, no migrations, no schema changes.
 
 ### Commit / push / remote verification
 
-- Commit hash: TBD
+- Commit hash: `66100f33478aee5ed54e320b3d13baebd9daf4ea`
 - Message: `feat: expand General → Chat & Message IDs with chat type, forward, reply info`
-- Push result: TBD
-- Remote verification: TBD
-- Final working-tree state: TBD
+- Push result: pushed to `origin/main`
+- Remote verification: `git fetch origin` confirms local HEAD == `origin/main`
+- Final working-tree state: clean
 
 ### Stop
 
