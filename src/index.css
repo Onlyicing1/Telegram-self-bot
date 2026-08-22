@@ -27,7 +27,9 @@
   body {
     background-color: var(--surface);
     color: var(--on-surface);
-    font-family: 'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif;
+    /* Dashboard font setting (App.tsx sets --app-font from the persisted
+       allow-listed key; the fallback is the original dashboard stack). */
+    font-family: var(--app-font, 'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif);
   }
 
   ::-webkit-scrollbar {

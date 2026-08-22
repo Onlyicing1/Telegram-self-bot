@@ -154,6 +154,18 @@ export const api = {
     fetchJSON<BioState>(`/bio`),
   logs: (limit = 100) =>
     fetchJSON<{ logs: BotLog[] }>(`/logs?limit=${limit}`),
+  settings: () =>
+    fetchJSON<Record<string, unknown>>(`/settings`),
+  updateSetting: (key: string, value: string) =>
+    fetch(`${BASE}/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, value }),
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      return data as Record<string, unknown>;
+    }),
   aiProviders: () =>
     fetchJSON<{ providers: ProviderStatus[] }>(`/ai/providers`),
   aiModels: (provider: string) =>

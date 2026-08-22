@@ -119,6 +119,20 @@ async def get_settings():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.patch("/api/settings")
+async def update_setting(body: dict):
+    """Update one panel setting (e.g. dashboard_font). Validates through
+    settings_service; returns the full settings map on success."""
+    key = (body.get("key") or "").strip()
+    value = body.get("value")
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+    ok = settings_service.set_setting(key, value)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Invalid value for '{key}'")
+    return settings_service.get_all()
+
+
 @app.get("/api/logs")
 async def get_logs(limit: int = 100):
     try:

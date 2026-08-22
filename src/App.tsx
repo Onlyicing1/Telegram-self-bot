@@ -8,6 +8,18 @@ import AIConfigPanel from './components/AIConfigPanel';
 
 type Tab = 'saves' | 'bio' | 'ai' | 'logs';
 
+const DASHBOARD_FONT_OPTIONS: { key: string; label: string; stack: string }[] = [
+  { key: 'default', label: 'Default', stack: "'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif" },
+  { key: 'system', label: 'System', stack: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif" },
+  { key: 'mono', label: 'Monospace', stack: "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" },
+  { key: 'serif', label: 'Serif', stack: "Georgia, 'Times New Roman', serif" },
+];
+
+function applyFont(key: string) {
+  const stack = DASHBOARD_FONT_OPTIONS.find((o) => o.key === key)?.stack ?? DASHBOARD_FONT_OPTIONS[0].stack;
+  document.documentElement.style.setProperty('--app-font', stack);
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('saves');
   const [saves, setSaves] = useState<SavedItem[]>([]);
@@ -16,6 +28,33 @@ export default function App() {
   const [logs, setLogs] = useState<BotLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [fontKey, setFontKey] = useState('default');
+
+  useEffect(() => {
+    api.settings()
+      .then((settings) => {
+        const raw = settings.dashboard_font;
+        const key = typeof raw === 'string' && DASHBOARD_FONT_OPTIONS.some((o) => o.key === raw) ? raw : 'default';
+        setFontKey(key);
+        applyFont(key);
+      })
+      .catch(() => {
+        applyFont('default');
+      });
+  }, []);
+
+  const handleFontChange = async (key: string) => {
+    const previous = fontKey;
+    setFontKey(key);
+    applyFont(key);
+    try {
+      await api.updateSetting('dashboard_font', key);
+    } catch (e) {
+      setFontKey(previous);
+      applyFont(previous);
+      setError(e instanceof Error ? e.message : 'Failed to save font');
+    }
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -51,7 +90,7 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen bg-surface text-on-surface font-sans">
+    <div className="min-h-screen bg-surface text-on-surface">
       <header className="border-b border-outline-variant bg-surface-container sticky top-0 z-10">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -63,12 +102,24 @@ export default function App() {
               <p className="text-xs text-on-surface-variant">Telegram Self-Bot Dashboard</p>
             </div>
           </div>
-          <button
-            onClick={load}
-            className="text-xs text-primary hover:text-primary/80 transition-colors px-3 py-1.5 rounded-full border border-primary/30 hover:bg-primary/10"
-          >
-            {loading ? 'Syncing…' : 'Refresh'}
-          </button>
+          <div className="flex items-center gap-2">
+            <select
+              value={fontKey}
+              onChange={(e) => handleFontChange(e.target.value)}
+              aria-label="Dashboard font"
+              className="text-xs text-on-surface-variant bg-surface-variant border border-outline-variant rounded-full px-3 py-1.5 outline-none focus:border-primary"
+            >
+              {DASHBOARD_FONT_OPTIONS.map((o) => (
+                <option key={o.key} value={o.key}>{o.label}</option>
+              ))}
+            </select>
+            <button
+              onClick={load}
+              className="text-xs text-primary hover:text-primary/80 transition-colors px-3 py-1.5 rounded-full border border-primary/30 hover:bg-primary/10"
+            >
+              {loading ? 'Syncing…' : 'Refresh'}
+            </button>
+          </div>
         </div>
 
         <div className="max-w-5xl mx-auto px-4 sm:px-6 flex gap-1 pb-0">

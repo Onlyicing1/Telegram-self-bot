@@ -289,6 +289,7 @@ a key-value store.
 | `language` | `text` | NO | `'en'` | Language code |
 | `debug_callbacks` | `boolean` | NO | `false` | Debug callback tracing |
 | `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
+| `dashboard_font` | `text` | YES | `'default'` | Dashboard font key — one of `default`/`system`/`mono`/`serif` (see `DASHBOARD_FONTS` in `settings_service.py`); never free-text CSS |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
 

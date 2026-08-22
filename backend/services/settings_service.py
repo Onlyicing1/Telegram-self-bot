@@ -45,9 +45,15 @@ Architecture:
 | language                | str     | "en"    | non-empty string        |
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
+| dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
 """
 import logging
 from typing import Any, Callable
+
+#: Enumerated dashboard font choices (keys only — no arbitrary CSS/font
+#: strings ever reach the DB or the frontend). The frontend maps each key
+#: to a fixed CSS font stack; ``default`` is the existing dashboard stack.
+DASHBOARD_FONTS: tuple[str, ...] = ("default", "system", "mono", "serif")
 
 from backend.services import panel_settings_repository as repo
 
@@ -65,6 +71,7 @@ _DEFAULTS: dict[str, Any] = {
     "language": "en",
     "debug_callbacks": False,
     "owner_only": True,
+    "dashboard_font": "default",
 }
 
 _cache: dict[str, Any] = {}
@@ -91,6 +98,10 @@ def _validate_nonempty_str(value: Any) -> bool:
     return isinstance(value, str) and len(value.strip()) > 0
 
 
+def _validate_dashboard_font(value: Any) -> bool:
+    return isinstance(value, str) and value in DASHBOARD_FONTS
+
+
 _VALIDATORS: dict[str, ValidatorFn] = {
     "auto_close_enabled": _validate_bool,
     "auto_close_delay": _validate_int_range(5, 3600),
@@ -103,6 +114,7 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "language": _validate_nonempty_str,
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
+    "dashboard_font": _validate_dashboard_font,
 }
 
 
@@ -284,3 +296,15 @@ def language() -> str:
 
 def set_language(value: str) -> bool:
     return set_setting("language", value)
+
+
+def dashboard_font() -> str:
+    """Selected dashboard font key; deterministic "default" when missing
+    or when the persisted value is not one of the supported choices."""
+    _ensure_loaded()
+    value = _cache.get("dashboard_font", "default")
+    return value if value in DASHBOARD_FONTS else "default"
+
+
+def set_dashboard_font(value: str) -> bool:
+    return set_setting("dashboard_font", value)
