@@ -1549,3 +1549,59 @@ Before: 626 passed → After: **635 passed, 0 failed**, same single warning.
 Database/schema: none. Runtime: settings surfaces only; chat delivery and
 all other panels untouched. No duplicate handlers or second UI
 architecture introduced.
+
+---
+
+# Execution Report — AI Foundation & Ghost Room Implementation Contract
+
+## Execution 13 — 2026-08-22
+
+**Task type:** Architecture audit + authoritative implementation contract (audit-only; no production code, database, or migration changes).
+
+### Starting state
+- HEAD: `8f8aeabdebf6ecec28d22a3842c5f8f18926a000` — clean working tree, synchronized with `origin/main`.
+- Test baseline: 635 passed, 0 failed, 1 warning.
+
+### Architecture inspected (source-verified)
+- AI entry/flow: `backend/bot/handlers/ai_unified.py` (outgoing trigger handler, L698), `backend/ai/session/request.py` (AIRequest), `backend/ai/engine/engine.py` (Engine/get_engine), `backend/ai/engine/dispatcher.py` (dispatch pipeline, `_build_context`, `_fail`).
+- Memory: `backend/ai/memory/{manager,long,permanent}.py`, `backend/ai/database/memory_repository.py`, `backend/ai/persistence.py` (dead `save_memory`/`query_memories`/`delete_expired_memories`).
+- Tokens: `backend/ai/prompt/budget.py`, `backend/ai/runtime/tokens.py`, provider usage extraction (`openai_compat.py`, `gemini.py`), `backend/ai/engine/telemetry.py`.
+- Providers: `backend/ai/providers/manager/manager.py` (retry/`Retry-After`/cooldown), `manager/health.py`, `base/contract.py`.
+- Database: `backend/db/client.py`, `backend/ai/database/manager.py` (in-memory-only repos), `backend/ai/config_store.py`, `backend/services/settings_service.py` + `panel_settings_repository.py`.
+- Schema doc: `DATABASE_ARCHITECTURE.md` (§12 `ai_provider_stats`, §13 `ai_usage`, §19 known inconsistencies, §20 migration status, §21 migration generation rules — doc-first).
+- Fonts: `src/index.css:30` (single hardcoded stack); no Tailwind font config.
+- AI UI: `backend/bot/handlers/ai.py` (panels incl. `ai_status` duplication), `backend/helper/panels.py` (callback routing), `backend/ai/context/reply_resolver.py` (per-message mapping without usage fields).
+- Ghost Room: no implementation — only `GHOST_ROOM_ID` env placeholder (`backend/config.py:41`) + dormant check (`runtime/startup_check.py:231`). Incoming events dispatchable (router runtime hooks prove mechanism).
+- Router/tests: `backend/bot/router.py::register_all`; tests baseline inventory.
+
+### Files added
+- `docs/implementation/ghost-room-ai-foundation-contract.md` — the authoritative implementation contract (16 sections + machine-readable checklist): current architecture, exact files/functions, data flow, DB structure, confirmed problems P1–P9, non-confirmed problems, required schema changes (Migrations A–D: `ai_usage`, `ai_provider_stats`, `panel_settings.dashboard_font`, `ghost_chats`), required code changes (WHERE/REUSE/NEW/DB/INTERACTION/TEST per change), UI changes, Ghost Room normative behavior, required tests, non-goals, risks, implementation order, acceptance criteria.
+
+### Key findings recorded in the contract
+1. Memory plumbing exists but is inert: default `MemoryManager()` has no repositories; nothing writes memories; `[Memory]` prompt section is always empty.
+2. Two token-accounting divergences confirmed: empty-response retry and action-recovery retry replace the response before its usage is accumulated.
+3. `ai_usage`/`ai_provider_stats` are specified in the schema doc but unmigrated and unwired (DATABASE_ARCHITECTURE.md §19.8).
+4. No provider exposes quota/reset metadata — only per-request `Retry-After` cooldowns; reset detection limited to rate-limit cooldown expiry.
+5. `ai_status` panel duplicates Overview/Usage from a third, partly-dead source (`config_store.last_*`, §19.2).
+6. Per-message usage cannot be addressed: `ReplyResolver` entries lack token/latency fields.
+7. Ghost Room is greenfield; design mandates explicit user message selection, never inferred relatedness.
+
+### Validation performed
+- None required (audit-only, no production code changed). Document verified by inspection (`wc -l`, structure review).
+- No compile/test/typecheck/build runs were applicable or performed this execution.
+
+### Runtime / database / schema impact
+- None. No migrations, SQL, Supabase code, dependencies, frontend code, or backend code were modified.
+
+### Protected documents
+- `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`, `README.md` untouched. `IMPLEMENTATION_REPORT.md` appended (this section only).
+- Note: the contract REQUIRES `DATABASE_ARCHITECTURE.md` updates in the future implementation phase (doc-first rule, §21) — not performed here by design.
+
+### Commit / push
+- Commit: `docs: add implementation contract for AI foundation and Ghost Room`
+- Push result: see final summary.
+- Remote verification: `git fetch origin` + `HEAD == origin/main` verified.
+- Final working-tree state: clean.
+
+### Remaining work (per contract)
+Memory wiring + bounds → token-accumulation fixes → usage persistence (Migrations A/B) → reset-detection surfacing → font setting (Migration C) → `ai_status` removal + per-message Details → DB stats extension → Ghost Room MVP (Migration D). Each step independently shippable with the full suite green.
