@@ -21,7 +21,6 @@ Panels:
   ai_wizard      — Setup wizard (shown when no provider is configured)
   ai_settings    — Personal settings (wake words, reply stats)
   ai_settings_adv— Advanced (creativity, response length, memory, personality)
-  ai_status      — Status screen (provider, model, connected, latency)
   ai_diagnostics — Diagnostics (owner/developer only)
 """
 from __future__ import annotations
@@ -543,12 +542,63 @@ async def _ai_settings_adv_inline_builder(event, extra: str) -> list:
 _USAGE_RANGES = (("today", "Today"), ("7d", "7 days"), ("30d", "30 days"))
 
 
+def _parse_msg_id(extra: str) -> int | None:
+    """Parse a positive Telegram message id from a panel extra; None if absent."""
+    value = (extra or "").strip()
+    if not value.isdigit():
+        return None
+    msg_id = int(value)
+    return msg_id if msg_id > 0 else None
+
+
+def _render_per_message_details(resolved) -> tuple[str, str, list]:
+    """Details for ONE specific AI response (from the ReplyResolver entry).
+
+    Only fields the resolver actually carries are shown; anything unknown
+    renders as "Unavailable"/"—" — never a fabricated value.
+    """
+    from backend.ai.engine.telemetry import (
+        format_latency_exact,
+        format_time_of,
+        format_tokens_exact,
+    )
+
+    source = resolved.token_source
+    if source == "unavailable" or (not source and resolved.total_tokens == 0):
+        tokens = "Unavailable"
+    else:
+        est = " ≈" if source == "estimated" else ""
+        tokens = (
+            f"{format_tokens_exact(resolved.input_tokens)} in · "
+            f"{format_tokens_exact(resolved.output_tokens)} out{est}"
+        )
+    rows = [
+        ("Model", resolved.model or "—"),
+        ("Provider", _provider_display(resolved.provider)),
+        ("Status", "Ready"),
+        ("Tokens", tokens),
+        ("Latency", format_latency_exact(resolved.latency_s) if resolved.latency_s > 0 else "—"),
+        ("Retries", str(resolved.retry_count)),
+        ("Backup", "Used" if resolved.fallback_used else "—"),
+        ("When", format_time_of(resolved.timestamp)),
+    ]
+    width = max(len(label) for label, _ in rows)
+    body = "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
+    builder = InlinePanelBuilder()
+    builder.add_buttons(("📈 Usage", "panel:ai_usage"), ("❤️ Health", "panel:ai_health"))
+    _nav_buttons(builder)
+    return "AI · Details", "**AI · Details**\n\n" + f"```\n{body}\n```", builder.build()
+
+
 async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     """LEVEL 2 — precise per-request facts from the execution record.
 
-    Every value comes ONLY from the latest ``AIExecutionRecord`` — never
-    from the persisted config — so a failed or engine-level execution can
-    never display another request's identity or usage.
+    With an ``extra`` Telegram message id (``panel:ai_details:<msg_id>``)
+    it renders THAT AI response's facts from the ReplyResolver mapping;
+    otherwise it renders the latest ``AIExecutionRecord``. Every value
+    comes from the record/mapping — never from the persisted config — so
+    a failed or engine-level execution can never display another
+    request's identity or usage.
     """
     from backend.ai.engine.telemetry import (
         format_latency_exact,
@@ -557,6 +607,13 @@ async def _ai_details_panel_handler(event, extra: str) -> tuple[str, str, list] 
         remaining_context,
         telemetry,
     )
+
+    msg_id = _parse_msg_id(extra)
+    if msg_id is not None:
+        from backend.ai.context.reply_resolver import get_resolver
+        resolved = get_resolver().resolve(msg_id)
+        if resolved is not None:
+            return _render_per_message_details(resolved)
 
     record = telemetry.last()
 
@@ -855,47 +912,6 @@ async def _ai_toggle_telemetry_action(event, extra: str, chat_id: int) -> tuple[
     return await _ai_settings_panel_handler(event, extra)
 
 
-async def _ai_status_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    owner_id = await _get_owner_id()
-    config = await _get_saved_config(owner_id)
-    engine_info = _get_engine_info()
-    lines = [
-        "**📊 AI Status**\n",
-        f"**Provider:** {config.get('provider', '—').title() or '—'}",
-        f"**Model:** {config.get('model', '—')}",
-        f"**Connected:** {'✅ Yes' if engine_info['connected'] else '❌ No'}",
-    ]
-    if config.get("last_request_at"):
-        lines.append(f"**Last Request:** {config['last_request_at'][:19]}")
-    else:
-        lines.append("**Last Request:** Never")
-    latency = config.get("last_latency_ms", 0)
-    if latency > 0:
-        lines.append(f"**Latency:** {latency:.0f}ms")
-    else:
-        lines.append("**Latency:** —")
-    engine = _get_engine()
-    if engine:
-        try:
-            snap = engine.metrics_snapshot()
-            lines.append(f"**Total Requests:** {snap.get('total_executions', 0)}")
-            lines.append(f"**Successful:** {snap.get('successful_executions', 0)}")
-        except Exception:
-            pass
-    builder = InlinePanelBuilder()
-    builder.add_row("🔄 Refresh", "action:ai_status_refresh")
-    _nav_buttons(builder)
-    return "📊 AI Status", "\n".join(lines), builder.build()
-
-
-async def _ai_status_inline_builder(event, extra: str) -> list:
-    result = await _ai_status_panel_handler(event, extra)
-    if result is None:
-        return [render("Status", "Error.", [])]
-    title, body, buttons = result
-    return [render(title, body, buttons)]
-
-
 async def _ai_diagnostics_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     engine = _get_engine()
     lines = ["**🔧 AI Diagnostics**\n"]
@@ -1045,7 +1061,7 @@ async def _ai_pick_model_action(event, extra: str, chat_id: int) -> tuple[str, s
     builder = InlinePanelBuilder()
     builder.add_row("💬 Start Chat", "action:ai_start_chat")
     builder.add_row("🔁 Re-run Tests", "action:ai_test_models")
-    builder.add_row("📊 Status", "panel:ai_status")
+    builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
     return (
         "🧠 AI",
@@ -1071,10 +1087,6 @@ async def _ai_refresh_models_action(event, extra: str, chat_id: int) -> tuple[st
         base_url = get_base_url_for_provider(provider_name)
         await fetch_models(provider_name, api_key, base_url, force_refresh=True)
     return await _ai_model_panel_handler(event, "")
-
-
-async def _ai_status_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    return await _ai_status_panel_handler(event, "")
 
 
 async def _ai_diagnostics_refresh_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -1162,7 +1174,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
         logger.error("[AI_TRACE] test_models action failed: %s", exc)
         builder = InlinePanelBuilder()
         builder.add_row("🔄 Retry", "action:ai_test_models")
-        builder.add_row("📊 Status", "panel:ai_status")
+        builder.add_row("Overview", "panel:ai")
         _nav_buttons(builder)
         return "🧪 Test Models", f"**🧪 Test Models**\n\n❌ Diagnostic run failed: {exc}", builder.build()
 
@@ -1231,7 +1243,7 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     if results:
         builder.add_row("🔍 All Results", "action:ai_test_details")
     builder.add_row("🤖 Pick Model", "panel:ai_model")
-    builder.add_row("📊 Status", "panel:ai_status")
+    builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
     return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
 
@@ -1465,8 +1477,6 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai_health", _ai_health_inline_builder)
         register_panel("ai_details", _ai_details_panel_handler, parent="ai", title="🔍 Details")
         register_inline_builder("ai_details", _ai_details_inline_builder)
-        register_panel("ai_status", _ai_status_panel_handler, parent="ai", title="📊 Status")
-        register_inline_builder("ai_status", _ai_status_inline_builder)
         register_panel("ai_diagnostics", _ai_diagnostics_panel_handler, parent="ai", title="🔧 Diagnostics")
         register_inline_builder("ai_diagnostics", _ai_diagnostics_inline_builder)
         register_action("ai_select_provider", _ai_select_provider_action)
@@ -1478,7 +1488,6 @@ def register(client, owner_id: int) -> None:
         register_action("ai_start_chat", _ai_start_chat_action)
         register_action("ai_test_models", _ai_test_models_action)
         register_action("ai_test_details", _ai_test_details_action)
-        register_action("ai_status_refresh", _ai_status_refresh_action)
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_action("ai_health_refresh", _ai_health_refresh_action)
         register_action("ai_toggle_telemetry", _ai_toggle_telemetry_action)

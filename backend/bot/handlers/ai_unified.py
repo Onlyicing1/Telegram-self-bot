@@ -600,6 +600,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 rid, delivery_result.chunks_delivered, delivery_result.total_chunks,
             )
             from backend.ai.context.reply_resolver import get_resolver
+            meta = result.metadata or {}
             get_resolver().register(
                 telegram_msg_id=event.message.id,
                 session_id=session_id,
@@ -607,6 +608,13 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 content=result.response,
                 provider=result.provider,
                 model=result.model,
+                input_tokens=getattr(result, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(result, "completion_tokens", 0) or 0,
+                total_tokens=getattr(result, "total_tokens", 0) or 0,
+                token_source=str(meta.get("token_source", "") or ""),
+                latency_s=float(getattr(result, "latency", 0.0) or 0.0),
+                retry_count=int(meta.get("retry_count", 0) or 0),
+                fallback_used=bool(meta.get("fallback_used", False)),
             )
         elif result.errors or result.response:
             logger.info(

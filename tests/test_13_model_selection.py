@@ -231,7 +231,9 @@ async def test_ai_test_models_action_shows_usable_buttons_and_keeps_existing():
     # Existing buttons preserved.
     assert "action:ai_test_models" in datas
     assert "panel:ai_model" in datas
-    assert "panel:ai_status" in datas
+    # Obsolete ai_status removed — the entry now points at the Overview.
+    assert "panel:ai" in datas
+    assert "panel:ai_status" not in datas
 
 
 # ── Web API applies selection to the runtime ──

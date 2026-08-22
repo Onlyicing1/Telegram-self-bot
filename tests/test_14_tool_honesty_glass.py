@@ -384,7 +384,9 @@ async def test_glass_test_models_message_is_compact_and_preserves_buttons():
     assert "action:ai_test_models" in datas
     assert "action:ai_test_details" in datas
     assert "panel:ai_model" in datas
-    assert "panel:ai_status" in datas
+    # Obsolete ai_status removed — the entry now points at the Overview.
+    assert "panel:ai" in datas
+    assert "panel:ai_status" not in datas
     assert any(d.startswith("panel:_nav:") for d in datas)
 
 
@@ -435,6 +437,7 @@ def test_glass_register_wires_details_action():
     for action in (
         "ai_select_provider", "ai_select_model", "ai_pick_model",
         "ai_refresh_providers", "ai_refresh_models", "ai_start_chat",
-        "ai_status_refresh", "ai_diagnostics_refresh", "ai_test_models",
+        "ai_diagnostics_refresh", "ai_test_models",
     ):
         assert action in registered_ids, f"action {action} must remain registered"
+    assert "ai_status_refresh" not in registered_ids

@@ -37,6 +37,14 @@ class ResolvedAIContent:
         provider:     Provider name (e.g. ``"gemini"``).
         model:        Model name.
         timestamp:    UTC ISO string when the mapping was registered.
+        input_tokens:  Prompt tokens for this execution (0 when unknown).
+        output_tokens: Completion tokens for this execution (0 when unknown).
+        total_tokens:  Total tokens for this execution.
+        token_source:  Honesty label — ``actual`` / ``estimated`` /
+                       ``unavailable`` (empty when unknown).
+        latency_s:     Wall-clock seconds for this execution.
+        retry_count:   Bounded retries consumed by this execution.
+        fallback_used: Whether a backup provider answered.
     """
 
     session_id: str
@@ -45,13 +53,22 @@ class ResolvedAIContent:
     provider: str
     model: str
     timestamp: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    token_source: str = ""
+    latency_s: float = 0.0
+    retry_count: int = 0
+    fallback_used: bool = False
 
 
 class ReplyResolver:
     """Thread-safe in-memory registry mapping Telegram msg IDs to AI content.
 
     Public API:
-        register(telegram_msg_id, session_id, role, content, provider, model)
+        register(telegram_msg_id, session_id, role, content, provider, model,
+                 input_tokens, output_tokens, total_tokens, token_source,
+                 latency_s, retry_count, fallback_used)
         resolve(telegram_msg_id) → ResolvedAIContent | None
     """
 
@@ -69,12 +86,23 @@ class ReplyResolver:
         content: str,
         provider: str = "",
         model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+        token_source: str = "",
+        latency_s: float = 0.0,
+        retry_count: int = 0,
+        fallback_used: bool = False,
     ) -> None:
         """Record that ``telegram_msg_id`` now contains ``content``.
 
         Called after the AI response is edited into the triggering message.
         If ``telegram_msg_id`` is zero or negative, the call is a no-op
         (the handler could not determine the message ID).
+
+        The optional usage fields come from the normalized execution result
+        and feed the per-message Details surface. Defaults keep every
+        existing caller compiling.
         """
         if telegram_msg_id <= 0:
             return
@@ -85,6 +113,13 @@ class ReplyResolver:
             provider=provider,
             model=model,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            total_tokens=int(total_tokens or 0),
+            token_source=str(token_source or ""),
+            latency_s=float(latency_s or 0.0),
+            retry_count=int(retry_count or 0),
+            fallback_used=bool(fallback_used),
         )
         with self._lock:
             if len(self._map) >= _MAX_ENTRIES and telegram_msg_id not in self._map:
