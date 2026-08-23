@@ -93,11 +93,11 @@ Apply migration #12 to the live database (manual owner action). Dormant `startup
 
 ### Commit / push / remote verification
 
-- Implementation commit: `PENDING`
-- Report commit: `PENDING`
-- Push result: `PENDING`
-- Remote verification: `PENDING`
-- Final working-tree state: `PENDING`
+- Implementation commit: `df63511406cc8ba91d66909d890936a27ea41897` — "feat: streamline Ghost Seen AI flow, duration-based retention, Bio/Username font coverage, PV entity resolution, Menu command"
+- Report commit: this commit (hash recorded post-push; see git log)
+- Push result: SUCCESS — `a2dd18d..df63511  main -> main` to https://github.com/Onlyicing1/Telegram-self-bot.git
+- Remote verification: local HEAD == origin/main == `df63511…` (verified via `git fetch origin` + rev-parse comparison after push); report-hash commit re-verified identically
+- Final working-tree state: clean
 
 ### Stop
 
