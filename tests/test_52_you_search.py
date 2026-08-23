@@ -334,6 +334,15 @@ class TestSearchHTTP:
         assert r["success"] is False
         client.post.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_missing_api_key_rejected_without_network(self):
+        p = _provider(api_key="   ")
+        with patch("backend.ai.providers.you_search.httpx.AsyncClient") as ctor:
+            r = await p.search("q")
+        assert r["success"] is False
+        assert r["metadata"]["failure_type"] == "auth"
+        ctor.assert_not_called()
+
 
 # ── 6–8. Routing exclusion, manager classification, secrecy ──
 
@@ -509,8 +518,6 @@ class TestWebSearchTool:
     async def test_service_formats_sources_honestly(self):
         from backend.services import web_search_service as svc
 
-        ok, text, data = await svc.do_web_search.__wrapped__("never-called") \
-            if hasattr(svc.do_web_search, "__wrapped__") else (None, None, None)
         formatted = svc._format_results({
             "query": "q",
             "results": [

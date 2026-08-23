@@ -108,7 +108,7 @@ class YouSearchProvider(BaseProvider):
     # ── Health ──
 
     def health(self) -> dict[str, Any]:
-        if not self._config.api_key:
+        if not self._config.api_key or not self._config.api_key.strip():
             return {
                 "healthy": False,
                 "provider": self.name,
@@ -150,6 +150,8 @@ class YouSearchProvider(BaseProvider):
         query = (query or "").strip()
         if not query:
             return self._error_result(query or "", "empty query", "request")
+        if not self._config.api_key or not self._config.api_key.strip():
+            return self._error_result(query, "missing API key", "auth")
 
         try:
             count = int(kwargs.get("count") or _DEFAULT_COUNT)

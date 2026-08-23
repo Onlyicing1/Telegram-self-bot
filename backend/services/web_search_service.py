@@ -63,9 +63,8 @@ def _format_results(result: dict[str, Any]) -> str:
         lines.append("_No results found._")
         return "\n".join(lines)
 
-    web = [r for r in items if r.get("kind") == "news"]
-    news = [r for r in items if r.get("kind") == "news"]
     web = [r for r in items if r.get("kind") != "news"]
+    news = [r for r in items if r.get("kind") == "news"]
 
     def _entry(r: dict[str, Any], idx: int) -> list[str]:
         title = str(r.get("title") or "(untitled)")
