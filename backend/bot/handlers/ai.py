@@ -269,8 +269,12 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     results = await _discover()
-    available = [p for p in results if p.status == "available"]
-    invalid = [p for p in results if p.status == "invalid"]
+    chat_results = [p for p in results if p.capability_kind == "chat"]
+    capability_results = [p for p in results if p.capability_kind != "chat"]
+    available = [p for p in chat_results if p.status == "available"]
+    invalid = [p for p in chat_results if p.status == "invalid"]
+    available_capabilities = [p for p in capability_results if p.status == "available"]
+    invalid_capabilities = [p for p in capability_results if p.status == "invalid"]
     current = config.get("provider", "")
 
     lines = ["**🔄 Provider**\n"]
@@ -292,6 +296,19 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
             lines.append(f"  ⚠️ {p.icon} {p.display_name}")
         lines.append("")
 
+    if available_capabilities:
+        lines.append("**Capabilities:**")
+        for p in available_capabilities:
+            caps = ", ".join(p.capabilities) or p.capability_kind
+            lines.append(f"  ✅ {p.icon} {p.display_name} · {caps}")
+        lines.append("")
+
+    if invalid_capabilities:
+        lines.append("**Capability Key Issues:**")
+        for p in invalid_capabilities:
+            lines.append(f"  ⚠️ {p.icon} {p.display_name}")
+        lines.append("")
+
     builder = InlinePanelBuilder()
     if available:
         for p in available:
@@ -299,10 +316,49 @@ async def _ai_provider_panel_handler(event, extra: str) -> tuple[str, str, list]
             builder.add_row(label, f"action:ai_select_provider:{p.name}")
     else:
         builder.add_row("📖 Setup Guide", "panel:ai_wizard")
+    if available_capabilities or invalid_capabilities:
+        builder.add_row("🔎 Search Capability", "panel:ai_web_search")
 
     builder.add_row("🔄 Refresh", "action:ai_refresh_providers")
     _nav_buttons(builder)
     return "🔄 Provider", "\n".join(lines), builder.build()
+
+
+async def _ai_web_search_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    results = await _discover()
+    search = next((p for p in results if p.capability_kind == "web_search"), None)
+    builder = InlinePanelBuilder()
+    _nav_buttons(builder)
+    if search is None:
+        return "🔎 Web Search", "Web-search capability is not registered.", builder.build()
+    if search.status == "available":
+        body = (
+            f"**{search.display_name}**\n\n"
+            f"Status: **Available**\n"
+            f"Capability: `{', '.join(search.capabilities) or search.capability_kind}`\n\n"
+            "It is used by the AI web-search tool and is not selectable as a chat model."
+        )
+    elif search.status == "invalid":
+        body = (
+            f"**{search.display_name}**\n\n"
+            "Status: **Invalid key**\n"
+            f"Environment: `{search.env_var}`"
+        )
+    else:
+        body = (
+            f"**{search.display_name}**\n\n"
+            "Status: **Not configured**\n"
+            f"Set `{search.env_var}` and restart the process, then refresh this panel."
+        )
+    return "🔎 Web Search", body, builder.build()
+
+
+async def _ai_web_search_inline_builder(event, extra: str) -> list:
+    result = await _ai_web_search_panel_handler(event, extra)
+    if result is None:
+        return [render("Web Search", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
 async def _ai_provider_inline_builder(event, extra: str) -> list:
@@ -425,9 +481,9 @@ async def _ai_model_inline_builder(event, extra: str) -> list:
 
 async def _ai_wizard_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     from backend.ai.discovery import get_wizard_info
-    wizard_info = get_wizard_info()
+    wizard_info = [p for p in get_wizard_info() if p.get("capability_kind", "chat") == "chat"]
     results = await _discover()
-    invalid = [p for p in results if p.status == "invalid"]
+    invalid = [p for p in results if p.status == "invalid" and p.capability_kind == "chat"]
     lines = [
         "**🧠 AI Setup**\n",
         "No provider detected.\n",
@@ -1463,6 +1519,8 @@ def register(client, owner_id: int) -> None:
         register_inline_builder("ai", _ai_main_inline_builder)
         register_panel("ai_provider", _ai_provider_panel_handler, parent="ai", title="🔄 Provider")
         register_inline_builder("ai_provider", _ai_provider_inline_builder)
+        register_panel("ai_web_search", _ai_web_search_panel_handler, parent="ai_provider", title="🔎 Web Search")
+        register_inline_builder("ai_web_search", _ai_web_search_inline_builder)
         register_panel("ai_model", _ai_model_panel_handler, parent="ai", title="🤖 Model")
         register_inline_builder("ai_model", _ai_model_inline_builder)
         register_panel("ai_wizard", _ai_wizard_panel_handler, parent="ai", title="Setup")

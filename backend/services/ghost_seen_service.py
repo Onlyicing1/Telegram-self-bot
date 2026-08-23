@@ -85,22 +85,13 @@ def set_page(chat_id: int, page: int) -> None:
 
 
 # ── pending AI reply flow state ──
-# Keyed by chat_id: {"anchor": msg_id, "context_n": int | None}
+# Keyed by chat_id: {"anchor": msg_id, "context_n": int | None,
+#                    "informed": bool | None}
 # Each step of the Glass UI flow writes exactly one field; execution
-# consumes the record once and clears it. There is deliberately NO manual
-# prompt and NO disclosure question: choosing AI Reply and the context
-# size is the complete owner input — the AI drafts the reply itself.
+# consumes the record once and clears it.
 _pending_replies: dict[int, dict[str, Any]] = {}
 
 ALLOWED_CONTEXT_COUNTS = (1, 5, 10, 20)
-
-#: Fixed instruction for the normal AI-reply flow. The anchor message is
-#: the reply target; the context window is the conversation.
-AUTO_REPLY_INSTRUCTION = (
-    "Write a natural, friendly reply to the LAST message in this "
-    "conversation (the one marked as the reply target). Match the "
-    "conversation's language and tone. Output only the reply text."
-)
 
 
 def start_reply_flow(chat_id: int, anchor_msg_id: int) -> None:
@@ -108,6 +99,7 @@ def start_reply_flow(chat_id: int, anchor_msg_id: int) -> None:
         _pending_replies[chat_id] = {
             "anchor": int(anchor_msg_id),
             "context_n": None,
+            "informed": None,
         }
 
 
@@ -126,12 +118,26 @@ def set_reply_context_count(chat_id: int, n: int) -> bool:
     return True
 
 
+def set_reply_disclosure(chat_id: int, informed: bool) -> bool:
+    flow = _pending_replies.get(chat_id)
+    if not flow or flow.get("context_n") is None:
+        return False
+    if not isinstance(informed, bool):
+        return False
+    flow["informed"] = informed
+    return True
+
+
 def consume_reply_flow(chat_id: int) -> dict[str, Any] | None:
     """Return the complete flow record and clear it (single use)."""
     flow = _pending_replies.pop(chat_id, None)
     if not flow:
         return None
-    if flow.get("anchor") and flow.get("context_n"):
+    if (
+        flow.get("anchor")
+        and flow.get("context_n")
+        and flow.get("informed") is not None
+    ):
         return flow
     return None
 
@@ -545,7 +551,10 @@ async def execute_ghost_seen_ai(
         context_block = "\n".join(lines)
         user_message = (
             f"{context_block}\n\n"
-            f"Task: {prompt_text}"
+            "Task: Write a natural reply to the LAST message in the "
+            "conversation (the selected reply target). Match the "
+            "conversation's language and tone.\n"
+            f"Owner instruction: {prompt_text.strip()}"
         )
 
         request = AIRequest(
@@ -578,6 +587,8 @@ async def execute_ghost_seen_ai(
 
 
 # ── formatting helpers ──
+
+AI_DISCLOSURE_SUFFIX = "\n\n🤖 _This reply was drafted with an AI assistant._"
 
 
 def _format_sender(msg: dict[str, Any]) -> str:

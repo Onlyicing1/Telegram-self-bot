@@ -84,13 +84,17 @@ class ProviderRegistry:
                 h = provider.health()
             except Exception:
                 h = {"healthy": False}
+            capability_kind = getattr(type(provider), "CAPABILITY_KIND", "chat") or "chat"
             result.append({
                 "name": name,
+                "display_name": getattr(provider, "display_name", name),
                 "version": provider.provider_version(),
                 "enabled": provider.is_enabled,
                 "healthy": h.get("healthy", False),
+                "configured": h.get("configured", provider.is_enabled),
                 "active": name == self._active_name,
                 "is_fallback": name == self._fallback_name,
+                "capability_kind": capability_kind,
                 "capabilities": provider.capabilities.as_dict(),
             })
         return result

@@ -157,7 +157,10 @@ async def api_ai_models_all():
     from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider
 
     results = await discover_providers()
-    configured = [r for r in results if r.has_key]
+    configured = [
+        r for r in results
+        if r.has_key and r.capability_kind == "chat"
+    ]
 
     async def _load(p):
         api_key = get_api_key_for_provider(p.name)
@@ -181,7 +184,14 @@ async def api_ai_models_all():
 
 @app.get("/api/ai/models/{provider_name}")
 async def api_ai_models(provider_name: str):
+    from backend.ai.discovery import get_provider_info
     from backend.ai.model_discovery import fetch_models, get_api_key_for_provider, get_base_url_for_provider, get_last_fetch_source
+    info = get_provider_info(provider_name)
+    if info and info.get("capability_kind", "chat") != "chat":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider '{provider_name}' does not expose chat models",
+        )
     api_key = get_api_key_for_provider(provider_name)
     base_url = get_base_url_for_provider(provider_name)
     if not api_key:
@@ -212,6 +222,11 @@ async def api_ai_set_provider(body: dict):
     info = get_provider_info(provider)
     if not info:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'")
+    if info.get("capability_kind", "chat") != "chat":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider '{provider}' is a {info['capability_kind']} capability, not a chat provider",
+        )
     ok = await update_provider(_owner_id, provider)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save provider")

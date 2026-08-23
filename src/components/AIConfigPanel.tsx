@@ -204,10 +204,12 @@ export default function AIConfigPanel() {
     );
   }
 
-  const available = providers.filter(p => p.status === 'available');
-  const notConfigured = providers.filter(p => p.status === 'not_configured');
-  const invalid = providers.filter(p => p.status === 'invalid');
-  const configuredProviderNames = new Set(providers.filter(p => p.has_key).map(p => p.name));
+  const chatProviders = providers.filter(p => p.capability_kind === 'chat');
+  const capabilityProviders = providers.filter(p => p.capability_kind !== 'chat');
+  const available = chatProviders.filter(p => p.status === 'available');
+  const notConfigured = chatProviders.filter(p => p.status === 'not_configured');
+  const invalid = chatProviders.filter(p => p.status === 'invalid');
+  const configuredProviderNames = new Set(chatProviders.filter(p => p.has_key).map(p => p.name));
 
   const summary = testResults?.summary;
 
@@ -438,6 +440,38 @@ export default function AIConfigPanel() {
         </div>
       )}
 
+      {/* Capability status — retrieval providers are visible but never selectable as chat models */}
+      {capabilityProviders.length > 0 && (
+        <div>
+          <h3 className="text-sm font-semibold text-on-surface-variant uppercase tracking-widest mb-3">
+            Capabilities
+          </h3>
+          <div className="space-y-2">
+            {capabilityProviders.map(p => (
+              <div key={p.name} className="bg-surface-container rounded-xl px-4 py-3 border border-outline-variant/60">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className="text-lg">{p.icon}</span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-on-surface truncate">{p.display_name}</p>
+                      <p className="text-xs text-on-surface-variant truncate">
+                        {(p.capabilities.length > 0 ? p.capabilities.join(', ') : p.capability_kind)} · not a chat provider
+                      </p>
+                    </div>
+                  </div>
+                  <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${STATUS_STYLES[p.status] || STATUS_STYLES.not_configured}`}>
+                    {STATUS_LABELS[p.status] || p.status}
+                  </span>
+                </div>
+                {p.status !== 'available' && (
+                  <p className="mt-2 text-[11px] text-on-surface-variant font-mono">{p.env_var}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Model Selection — compact multi-column grid, usable-only after a test run */}
       {modelsByProvider.length > 0 && (
         <div>
@@ -574,10 +608,10 @@ export default function AIConfigPanel() {
             Setup Guide
           </h3>
           <p className="text-sm text-on-surface-variant mb-4">
-            No providers detected. Set one API key as an environment variable to enable AI:
+            No chat providers detected. Set an AI provider API key as an environment variable to enable chat:
           </p>
           <div className="space-y-2">
-            {providers.map(p => (
+            {chatProviders.map(p => (
               <div key={p.name} className="flex items-center justify-between px-4 py-3 bg-surface rounded-xl border border-outline-variant/50">
                 <div className="flex items-center gap-3">
                   <span className="text-lg">{p.icon}</span>

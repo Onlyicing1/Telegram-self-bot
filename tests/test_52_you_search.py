@@ -143,6 +143,58 @@ class TestRegistration:
         h = nokey.health()
         assert h["configured"] is False and h["healthy"] is False
 
+    def test_registry_metadata_exposes_capability_kind(self):
+        from backend.ai.providers.registry.registry import ProviderRegistry
+
+        registry = ProviderRegistry()
+        registry.register(_provider())
+        meta = registry.list_metadata()
+        entry = next(m for m in meta if m["name"] == "you")
+        assert entry["capability_kind"] == "web_search"
+        assert entry["configured"] is True
+        assert entry["capabilities"]["supports_web_search"] is True
+
+
+# ── 1b. Discovery / status surface (the user-visible "is it available?" path) ──
+
+
+class TestDiscoveryStatus:
+    @staticmethod
+    def _discover():
+        import asyncio
+        from backend.ai import discovery
+
+        return asyncio.run(discovery.discover_providers(force_refresh=True))
+
+    def test_key_present_marks_search_available(self, monkeypatch):
+        monkeypatch.delenv("YDC_API_KEY", raising=False)
+        with patch.dict("os.environ", {"YDC_API_KEY": FAKE_KEY}):
+            results = self._discover()
+        you = next((r for r in results if r.name == "you"), None)
+        assert you is not None
+        assert you.capability_kind == "web_search"
+        assert you.capabilities == ["web_search"]
+        assert you.has_key is True
+        assert you.status == "available"
+
+    def test_missing_or_blank_key_marks_search_unconfigured(self, monkeypatch):
+        for val in (None, "", "   "):
+            monkeypatch.delenv("YDC_API_KEY", raising=False)
+            if val is not None:
+                monkeypatch.setenv("YDC_API_KEY", val)
+            results = self._discover()
+            you = next((r for r in results if r.name == "you"), None)
+            assert you is not None, repr(val)
+            assert you.status == "not_configured", repr(val)
+            assert you.has_key is False, repr(val)
+
+    def test_discovery_never_exposes_key(self):
+        with patch.dict("os.environ", {"YDC_API_KEY": FAKE_KEY}):
+            results = self._discover()
+        blob = repr([r.__dict__ for r in results])
+        assert FAKE_KEY not in blob
+        assert "X-API-Key" not in blob
+
 
 # ── 2–5. HTTP contract & normalization ──
 

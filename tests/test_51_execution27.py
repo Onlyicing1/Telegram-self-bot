@@ -71,29 +71,29 @@ def _register_once() -> None:
 
 class TestStreamlinedAIReplyFlow:
     @pytest.mark.asyncio
-    async def test_no_prompt_or_disclosure_step_between_context_and_execution(self):
-        """Context-size choice is the LAST owner input: the handler executes
-        immediately. No manual-prompt arming and no disclosure question can
-        exist on that path."""
+    async def test_disclosure_step_between_context_and_prompt(self):
+        """Context-size choice opens the disclosure choice; execution only
+        happens through the dedicated ai_reply_prompt input."""
         import inspect
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services import ghost_seen_service as svc
 
-        # The disclosure API was removed entirely.
-        assert not hasattr(svc, "set_reply_disclosure")
-        assert getattr(gr, "_ghost_inform_action", None) is None
+        # The disclosure API exists and gates the dedicated prompt input.
+        assert hasattr(svc, "set_reply_disclosure")
+        assert getattr(gr, "_ghost_inform_action", None) is not None
 
         src = inspect.getsource(gr._ghost_ctx_action)
         assert "set_pending" not in src, (
             "context choice must never arm a manual prompt input"
         )
-        assert "inform" not in src.lower(), "no disclosure step may exist"
-        assert "consume_reply_flow" in src, "execution follows directly"
+        assert "consume_reply_flow" not in src, (
+            "context choice must not execute — disclosure + prompt come next"
+        )
 
     @pytest.mark.asyncio
-    async def test_full_flow_runs_context_then_executes_immediately(self):
-        """select → AI Reply → context size → automatic execution/delivery."""
+    async def test_full_flow_context_disclosure_then_prompt_executes(self):
+        """select → AI Reply → context size → disclosure → prompt → delivery."""
         _register_once()
         from unittest.mock import patch
         from backend.bot.handlers import ghost_seen as gr
@@ -113,15 +113,25 @@ class TestStreamlinedAIReplyFlow:
         assert "action:ghost_ctx:10" in _datas(buttons)
         client.send_message.assert_not_called()
 
-        # Step 2 — choosing a size executes immediately; the AI output is
-        # delivered verbatim to the GHOST_ROOM_ID destination.
+        # Step 2 — choosing a size opens the disclosure menu; no execution.
+        title, body, buttons = await gr._ghost_ctx_action(None, "10", 0)
+        assert "action:ghost_inform:yes" in _datas(buttons)
+        assert "action:ghost_inform:no" in _datas(buttons)
+        client.send_message.assert_not_called()
+
+        # Step 3 — disclosure arms the dedicated prompt input.
+        title, body, buttons = await gr._ghost_inform_action(None, "no", 0)
+        assert "Type your AI prompt" in body
+        client.send_message.assert_not_called()
+
+        # Step 4 — the prompt executes and delivers verbatim to GHOST_ROOM_ID.
         ctx = [{"id": i, "out": False, "text": "m", "sender_name": "B",
                 "date": None} for i in range(391, 401)]
         with patch("backend.ai.engine.engine.get_engine",
                    return_value=_engine_mock()), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            title, body, buttons = await gr._ghost_ctx_action(None, "10", 0)
+            await gr._ghost_ai_reply_prompt_input("draft it", 0, 0, 0, 0)
 
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
@@ -644,7 +654,7 @@ class TestDestinationInvariants:
         from backend.bot.handlers import ghost_seen as gr
 
         for fn_name in ("_ghost_reply_input", "_ghost_reply_no_quote_input",
-                        "_ghost_ai_input"):
+                        "_ghost_ai_input", "_ghost_ai_reply_prompt_input"):
             src = inspect.getsource(getattr(gr, fn_name))
             assert "_resolve_ghost_destination" in src, fn_name
 
@@ -653,11 +663,12 @@ class TestDestinationInvariants:
         assert "get_dialogs()" not in src.split("def register")[0].split("_resolve_ghost_destination")[0]
 
     @pytest.mark.asyncio
-    async def test_missing_ghost_room_id_blocks_streamlined_flow_too(self):
+    async def test_missing_ghost_room_id_blocks_ai_reply_flow(self):
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
-            start_reply_flow,
+            start_reply_flow, set_reply_context_count, set_reply_disclosure,
+            get_reply_flow,
         )
 
         old_val = os.environ.pop("GHOST_ROOM_ID", None)
@@ -666,6 +677,8 @@ class TestDestinationInvariants:
             gr.configure(client, 12345, "UTC")
             gr._set_current_chat(CHAT)
             start_reply_flow(CHAT, 900)
+            set_reply_context_count(CHAT, 1)
+            set_reply_disclosure(CHAT, False)
 
             ctx = [{"id": 900, "out": False, "text": "m", "sender_name": "B",
                     "date": None}]
@@ -673,10 +686,10 @@ class TestDestinationInvariants:
                        return_value=_engine_mock()), \
                  patch("backend.services.ghost_seen_service.fetch_context_window",
                        new=AsyncMock(return_value=ctx)):
-                title, body, buttons = await gr._ghost_ctx_action(None, "1", 0)
+                await gr._ghost_ai_reply_prompt_input("draft it", 0, 0, 0, 0)
 
             client.send_message.assert_not_called()   # fail closed, always
-            assert "not configured" in body
+            assert get_reply_flow(CHAT) is None
         finally:
             if old_val is not None:
                 os.environ["GHOST_ROOM_ID"] = old_val

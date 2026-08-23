@@ -50,11 +50,13 @@ class ProviderStatus:
     default_model: str
     base_url: str
     icon: str
+    capability_kind: str = "chat"
+    capabilities: list[str] = field(default_factory=list)
 
 
 # ── Provider registry (the ONLY place provider metadata is defined) ──
 
-_PROVIDERS: list[dict[str, str]] = [
+_PROVIDERS: list[dict[str, Any]] = [
     {
         "name": "openrouter",
         "display_name": "OpenRouter",
@@ -175,6 +177,18 @@ _PROVIDERS: list[dict[str, str]] = [
         "default_model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
         "icon": "🎆",
     },
+    {
+        "name": "you",
+        "display_name": "You.com Search",
+        "env_vars": ["YDC_API_KEY"],
+        "model_env": [],
+        "base_url_env": [],
+        "default_base_url": "https://ydc-index.io",
+        "default_model": "",
+        "icon": "🔎",
+        "capability_kind": "web_search",
+        "capabilities": ["web_search"],
+    },
 ]
 
 
@@ -191,6 +205,8 @@ def _scan_provider(p: dict[str, Any]) -> ProviderStatus:
     api_key = _get_env(p["env_vars"])
     model = _get_env(p["model_env"]) or p["default_model"]
     base_url = _get_env(p["base_url_env"]) or p["default_base_url"]
+    capability_kind = p.get("capability_kind", "chat")
+    capabilities = list(p.get("capabilities", []))
 
     if not api_key:
         return ProviderStatus(
@@ -203,18 +219,22 @@ def _scan_provider(p: dict[str, Any]) -> ProviderStatus:
             default_model=model,
             base_url=base_url,
             icon=p["icon"],
+            capability_kind=capability_kind,
+            capabilities=capabilities,
         )
 
     return ProviderStatus(
         name=p["name"],
         display_name=p["display_name"],
         env_var=p["env_vars"][0],
-        status="detected",
+        status="available" if capability_kind != "chat" else "detected",
         has_key=True,
         validated=False,
         default_model=model,
         base_url=base_url,
         icon=p["icon"],
+        capability_kind=capability_kind,
+        capabilities=capabilities,
     )
 
 
@@ -226,6 +246,12 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
     api_key = _get_env(
         next(p["env_vars"] for p in _PROVIDERS if p["name"] == status.name)
     )
+
+    # Retrieval capabilities do not expose an LLM /models endpoint. Their
+    # key is enough for discovery to expose the configured capability; the
+    # runtime ProviderManager performs the real search health check.
+    if status.capability_kind != "chat":
+        return _make_available(status)
 
     try:
         if status.name == "gemini":
@@ -259,6 +285,8 @@ def _make_available(status: ProviderStatus) -> ProviderStatus:
         default_model=status.default_model,
         base_url=status.base_url,
         icon=status.icon,
+        capability_kind=status.capability_kind,
+        capabilities=list(status.capabilities),
     )
 
 
@@ -273,6 +301,8 @@ def _make_invalid(status: ProviderStatus, reason: str) -> ProviderStatus:
         default_model=status.default_model,
         base_url=status.base_url,
         icon=status.icon,
+        capability_kind=status.capability_kind,
+        capabilities=list(status.capabilities),
     )
 
 
@@ -354,6 +384,8 @@ def get_wizard_info() -> list[dict[str, str]]:
             "display_name": p["display_name"],
             "env_var": p["env_vars"][0],
             "icon": p["icon"],
+            "capability_kind": p.get("capability_kind", "chat"),
+            "capabilities": list(p.get("capabilities", [])),
         }
         for p in _PROVIDERS
     ]

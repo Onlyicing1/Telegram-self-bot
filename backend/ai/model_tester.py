@@ -303,6 +303,8 @@ async def _build_targets(
     discovered_models: list[dict[str, Any]] = []
 
     for p in providers_status:
+        if p.capability_kind != "chat":
+            continue
         base = {"provider": p.name, "display_name": p.display_name, "icon": p.icon}
 
         if not p.has_key:

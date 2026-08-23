@@ -49,6 +49,8 @@ export interface ProviderStatus {
   default_model: string;
   base_url: string;
   icon: string;
+  capability_kind: string;
+  capabilities: string[];
 }
 
 export interface ModelInfo {
