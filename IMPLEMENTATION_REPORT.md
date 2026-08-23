@@ -160,15 +160,18 @@ live verification. No Render deployment was triggered.
 
 - Execution-28 completion: `39f9134347a0ea57f67259d27ec7a7e1fc2beb58`
 - You.com implementation: `fb2e7cab449b3c52676b5b5dfd03f8999ecabac9`
-- Resumed hardening commit: `2490f80c46b30c21e8e8a013323699239501646b`
+- **Final implementation commit hash:** `2490f80c46b30c21e8e8a013323699239501646b`
+- Report-delivery commit: `1c3ebba`; this final clarification is
+  documentation-only.
 - `git push origin main` succeeded for the implementation commit:
   `cdf0146..2490f80 main -> main`
-- Final remote verification after this report commit: local `HEAD` and
-  `origin/main` match, with the implementation commit in the remote history.
+- Final remote verification after the final documentation push: `HEAD` and
+  `origin/main` matched, with the final implementation commit in history.
+- **Final working-tree state:** clean.
 
-The implementation commit was pushed first; this report is the follow-on
-documentation commit in the same delivery. Final remote and working-tree
-verification is performed after both commits.
+The implementation commit was pushed first; the report commits are follow-on
+ documentation commits in the same delivery.
+
 
 ### Stop
 
