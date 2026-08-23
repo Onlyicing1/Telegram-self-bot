@@ -64,6 +64,10 @@ class BaseProvider(ABC):
     __slots__ = ("_config",)
     PROVIDER_NAME: str = ""
     PROVIDER_VERSION: str = "0.0.0"
+    # What kind of capability this provider exposes. "chat" providers are
+    # eligible for LLM routing; any other kind (e.g. "web_search") is
+    # never selected as a chat/reasoning engine — it serves its own method.
+    CAPABILITY_KIND: str = "chat"
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         self._config: ProviderConfig = config or ProviderConfig()
@@ -120,6 +124,21 @@ class BaseProvider(ABC):
         returns an empty list so callers can degrade gracefully.
         """
         return []
+
+    async def search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        """Run a web search and return normalized results.
+
+        Only providers with ``CAPABILITY_KIND == "web_search"`` implement
+        this. The default returns the standard failure shape so accidental
+        calls on chat providers degrade instead of raising.
+        """
+        return {
+            "success": False,
+            "query": query,
+            "results": [],
+            "metadata": {},
+            "error": NOT_IMPLEMENTED,
+        }
 
     @abstractmethod
     def count_tokens(self, text: str) -> int: ...

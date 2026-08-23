@@ -307,6 +307,10 @@ error.
 - **Providers**: `openai`, `gemini`, `openrouter`, `groq`, `cerebras`,
   `mistral`, and `dummy`. Provider selection and fallback live in
   `backend/ai/providers/`.
+- **Web search capability**: the `you` provider (You.com Search API,
+  env `YDC_API_KEY`) is a retrieval capability, not a chat LLM — it is
+  never selected as a reasoning engine and serves results only through
+  the `web_search` tool (`backend/ai/tools/websearch.py`).
 - **Tools**: stateless wrappers over services (`save`, `retrieve`, `delete`,
   `bio_*`, `username_*`, `organize_*`, `settings_*`, …). The `ToolExecutor`
   is the sole component that calls `tool.execute()`. The owner's message IS
@@ -358,6 +362,7 @@ treated as a disconnect or trigger recovery.
 | `USERNAME_UPDATE_ENABLED` | `false` | Auto-start Username engine on boot |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `AI_PROVIDER` / AI keys | varies | AI provider selection + credentials (see `backend/ai/config/`) |
+| `YDC_API_KEY` | `""` | You.com Web Search API key; empty → search capability unregistered |
 
 Frontend-only: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (unused by the
 React app; the dashboard reads through the backend API).

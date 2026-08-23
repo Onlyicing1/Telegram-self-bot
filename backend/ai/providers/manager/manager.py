@@ -230,6 +230,89 @@ class ProviderManager:
         except Exception:
             return max(1, len(text) // 4)
 
+    async def web_search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        """Run a web search through a registered retrieval provider.
+
+        Never raises and NEVER routes through chat fallbacks: the first
+        available ``web_search``-kind provider serves the request (single
+        attempt; retries/cooldowns stay owned by the existing health
+        tracker). Failures are classified into the same categories as chat
+        failures so auth errors disable and rate limits cool down exactly
+        like every other provider.
+        """
+        provider: BaseProvider | None = None
+        provider_name = ""
+        for name, candidate in self._ordered_candidates(include_all=True):
+            if (
+                self._capability_kind(candidate) == "web_search"
+                and self._health.is_available(name)
+            ):
+                provider = candidate
+                provider_name = name
+                break
+        if provider is None:
+            return {
+                "success": False,
+                "query": query,
+                "results": [],
+                "metadata": {},
+                "error": "Web search is unavailable — no provider is configured.",
+            }
+
+        started = time.perf_counter()
+        try:
+            result = await guarded_await(
+                provider.search(query, **kwargs),
+                name=f"provider:search:{provider_name}",
+                timeout=_PROVIDER_RPC_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            latency = time.perf_counter() - started
+            self._metrics.record(provider_name, latency=latency, error="timeout")
+            self._health.record_failure(provider_name, "timeout", None)
+            logger.warning("ProviderManager: '%s' timed out during web search", provider_name)
+            return {
+                "success": False,
+                "query": query,
+                "results": [],
+                "metadata": {"failure_type": "timeout"},
+                "error": "Web search request timed out.",
+            }
+        except Exception as exc:
+            latency = time.perf_counter() - started
+            self._metrics.record(
+                provider_name, latency=latency, error=f"{type(exc).__name__}: {exc}",
+            )
+            self._health.record_failure(provider_name, "network", None)
+            logger.warning("ProviderManager: '%s' crashed during web search: %s",
+                           provider_name, type(exc).__name__)
+            return {
+                "success": False,
+                "query": query,
+                "results": [],
+                "metadata": {"failure_type": "network"},
+                "error": "Web search request failed.",
+            }
+
+        latency = time.perf_counter() - started
+        meta = result.get("metadata") or {} if isinstance(result, dict) else {}
+        if isinstance(result, dict) and result.get("success"):
+            self._metrics.record(provider_name, latency=latency, error="")
+            self._health.record_success(provider_name)
+            return result
+
+        # Classify the failure through the SAME machinery as chat so the
+        # cooldown/quarantine rules apply uniformly.
+        error_text = str(result.get("error") or "search failed") if isinstance(result, dict) else "search failed"
+        self._metrics.record(provider_name, latency=latency, error=error_text[:200])
+        self._apply_failure(provider_name, str(meta.get("failure_type") or "unknown"),
+                            ProviderResponse(text=error_text[:200], provider_name=provider_name,
+                                             success=False, metadata=dict(meta)))
+        return result if isinstance(result, dict) else {
+            "success": False, "query": query, "results": [],
+            "metadata": {}, "error": error_text,
+        }
+
     # ── Provider management ──
 
     def register_provider(self, provider: BaseProvider) -> bool:
@@ -412,8 +495,23 @@ class ProviderManager:
         except Exception:
             return False
 
+    def _capability_kind(self, provider: BaseProvider) -> str:
+        """Return a provider's capability kind ('chat' unless declared).
+
+        Read from the CLASS so test doubles without the attribute resolve
+        to 'chat' instead of an auto-mocked object.
+        """
+        try:
+            return getattr(type(provider), "CAPABILITY_KIND", "chat") or "chat"
+        except Exception:
+            return "chat"
+
     def _skip_reason(self, name: str, provider: BaseProvider, needs_tools: bool) -> str:
         """Return a skip reason when a provider is not eligible, else ""."""
+        if self._capability_kind(provider) != "chat":
+            # Retrieval capabilities (e.g. web search) are never candidates
+            # for chat routing regardless of health or selection state.
+            return f"capability={self._capability_kind(provider)}"
         if not self._health.is_available(name):
             return f"state={self._health.state(name)}"
         if not self._provider_healthy(provider):

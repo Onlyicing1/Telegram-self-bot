@@ -35,6 +35,7 @@ from backend.ai.providers.openrouter import OpenRouterProvider
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.providers.sambanova import SambaNovaProvider
 from backend.ai.providers.siliconflow import SiliconFlowProvider
+from backend.ai.providers.you_search import YouSearchProvider
 from backend.ai.providers.zai import ZaiProvider
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "cohere": CohereProvider,
     "siliconflow": SiliconFlowProvider,
     "fireworks": FireworksProvider,
+    "you": YouSearchProvider,
 }
 
 _ENV_KEY_MAP: dict[str, list[str]] = {
@@ -68,6 +70,8 @@ _ENV_KEY_MAP: dict[str, list[str]] = {
     "cohere": ["AI_COHERE_API_KEY", "COHERE_API_KEY"],
     "siliconflow": ["AI_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY"],
     "fireworks": ["AI_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"],
+    # Web-search capability (You.com Search API) — never an LLM key.
+    "you": ["YDC_API_KEY"],
 }
 
 _ENV_MODEL_MAP: dict[str, str] = {
@@ -164,7 +168,13 @@ class ProviderFactory:
                 logger.warning("ProviderFactory: could not create '%s': %s", provider_name, exc)
 
         active = os.getenv("AI_PROVIDER", "dummy").strip()
-        if active and active != "dummy" and registry.has(active):
+        if (
+            active and active != "dummy" and registry.has(active)
+            and _PROVIDER_CLASSES.get(active) is not None
+            and getattr(_PROVIDER_CLASSES[active], "CAPABILITY_KIND", "chat") == "chat"
+        ):
+            # Only chat-capable providers may become the ACTIVE reasoning
+            # engine — a web-search capability is never a chat fallback.
             registry.switch_provider(active)
         elif active == "dummy":
             registry.switch_provider("dummy")

@@ -24,6 +24,11 @@ class ProviderCapabilities:
     supports_json: bool = False
     supports_function_call: bool = False
     supports_long_context: bool = False
+    # Non-LLM capability: the provider retrieves web search results instead
+    # of generating chat completions (You.com Search). Never set alongside
+    # streaming/tools — a provider is either a reasoning engine or a
+    # retrieval source, never both.
+    supports_web_search: bool = False
 
     def as_dict(self) -> dict[str, bool]:
         return {
@@ -34,4 +39,5 @@ class ProviderCapabilities:
             "supports_json": self.supports_json,
             "supports_function_call": self.supports_function_call,
             "supports_long_context": self.supports_long_context,
+            "supports_web_search": self.supports_web_search,
         }

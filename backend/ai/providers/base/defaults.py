@@ -254,6 +254,22 @@ def _custom_default() -> ProviderConfig:
     )
 
 
+def _you_default() -> ProviderConfig:
+    # You.com Web Search — a retrieval capability, not a chat provider.
+    return ProviderConfig(
+        provider_name="you",
+        base_url="https://ydc-index.io",
+        api_key="",
+        default_model="",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=20,
+        retry_count=1,
+        enabled=False,
+    )
+
+
 _PROVIDER_DEFAULTS: dict[str, callable] = {
     "dummy": _dummy_default,
     "gemini": _gemini_default,
@@ -271,6 +287,7 @@ _PROVIDER_DEFAULTS: dict[str, callable] = {
     "cohere": _cohere_default,
     "siliconflow": _siliconflow_default,
     "fireworks": _fireworks_default,
+    "you": _you_default,
 }
 
 
