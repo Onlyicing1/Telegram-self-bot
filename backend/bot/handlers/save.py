@@ -5,7 +5,7 @@ Business logic lives in backend.services.save_service.execute_save, the
 single authoritative Deep Save pipeline (download → re-upload as a NEW
 Saved Messages message). This handler is only the Glass UI wiring:
 
-    .menu → Save → Deep Save → Reply Mode → reply to a message
+    Menu → Save → Deep Save → Reply Mode → reply to a message
 
 The reply's ``reply_to_msg_id`` is resolved to the exact target message,
 which is passed into the shared Save Engine.

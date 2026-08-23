@@ -290,7 +290,7 @@ a key-value store.
 | `debug_callbacks` | `boolean` | NO | `false` | Debug callback tracing |
 | `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
 | `dashboard_font` | `text` | NO | `'default'` | Glass UI / dashboard font key — one of `FONT_KEYS` in `backend/helper/font_style.py` (`DASHBOARD_FONTS` == `FONT_KEYS`); never free-text CSS |
-| `ghost_seen_retention_days` | `integer` | NO | `30` | Ghost Seen registry retention window in days (1–365) |
+| `ghost_seen_retention_seconds` | `bigint` | NO | `2592000` | Ghost Seen registry retention window in seconds (30 min–365 days); presets include sub-day durations |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
 
@@ -324,9 +324,13 @@ columns were supposed to be added by migrations
 migration files do not exist** in the repository. A future migration
 must add all missing columns. Migration
 `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
-(idempotent) now exists and covers `dashboard_font` and
-`ghost_seen_retention_days`; like all recent migrations it is pending
-manual application to the live database. See [§20](#20-migration-status) and
+(idempotent) covers `dashboard_font` and (originally)
+`ghost_seen_retention_days`; it was applied to the live database and
+verified by the project owner. The follow-up migration
+`20260823130000_ghost_seen_retention_duration.sql` (idempotent)
+replaces the days column with `ghost_seen_retention_seconds`
+(backfilling `days × 86400`) to support sub-day retention windows; it
+is pending manual application. See [§20](#20-migration-status) and
 [§19](#19-known-inconsistencies).
 
 ### Removed / phantom columns
@@ -835,7 +839,7 @@ Cache and DB are never left inconsistent.
 | `debug_callbacks` | bool | `false` | must be boolean |
 | `owner_only` | bool | `true` | must be boolean |
 | `dashboard_font` | str | `"default"` | one of `FONT_KEYS` |
-| `ghost_seen_retention_days` | int | `30` | 1..365 (days) |
+| `ghost_seen_retention_seconds` | int | `2592000` | 1800..31536000 (30 min..365 days) |
 
 If the DB is unavailable, the service uses hardcoded `_DEFAULTS` for
 all 13 settings. The bot continues to function normally — all panel
@@ -946,9 +950,12 @@ Settings changes by the user are not persisted.
 listed in [§6](#6-panel_settings).
 
 Migration `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
-now exists and covers `dashboard_font` and
-`ghost_seen_retention_days`; it is pending manual application. The
-remaining columns still have no migration file.
+now exists and covers `dashboard_font` and (originally)
+`ghost_seen_retention_days`; it was applied to the live database and
+verified by the owner. `20260823130000_ghost_seen_retention_duration.sql`
+then migrates that setting to `ghost_seen_retention_seconds`
+(idempotent; backfills and drops the days column) — pending manual
+application. The remaining columns still have no migration file.
 
 ### 19.4 `bot_settings` table — orphaned transition table
 
@@ -1120,8 +1127,9 @@ documents both the `persistence.py` path and the repository interfaces.
 | 7 | `20260801215007_create_username_state_table.sql` | `username_state` | Applied |
 | 8 | `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` | Applied |
 | 9 | `20260805075707_...create_ai_config_table.sql` | `ai_config` (base columns, no triggers) | Applied (incomplete — see §19.1) |
-| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Seen | Pending manual application |
-| 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Pending manual application |
+| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Seen | Applied (verified by owner) |
+| 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Applied (verified by owner) |
+| 12 | `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds` (idempotent backfill + drop) | Pending manual application |
 
 ### Missing Migration Files (referenced in prior docs but never created)
 

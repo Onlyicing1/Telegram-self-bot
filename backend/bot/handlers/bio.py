@@ -104,7 +104,7 @@ async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
         current = state.get("custom_text") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💬 Enter New Text", "input:bio:text")
-        return "Set Text", f"**Current text:** `{current}`\n\nTap the button below, then reply with the new text value.", builder.build()
+        return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
 
     if extra == "mood":
         from backend.helper.inline_engine import _owner_id
@@ -112,7 +112,7 @@ async def _bio_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
         current = state.get("mood") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💭 Enter New Mood", "input:bio:mood")
-        return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
+        return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
 
     return "Bio Engine", "Choose an action:", _build_bio_main_buttons()
 
@@ -204,14 +204,14 @@ async def _biohelp_panel_handler(event, extra: str) -> tuple[str, str, list] | N
             current = state.get("custom_text") or "—"
             builder = InlinePanelBuilder()
             builder.add_row("💬 Enter New Text", "input:biohelp:text")
-            return "Set Text", f"**Current text:** `{current}`\n\nTap the button below, then reply with the new text value.", builder.build()
+            return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
         if sub == "mood":
             from backend.helper.inline_engine import _owner_id
             state = await db_client.get_or_create_bio_state(_owner_id)
             current = state.get("mood") or "—"
             builder = InlinePanelBuilder()
             builder.add_row("💭 Enter New Mood", "input:biohelp:mood")
-            return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
+            return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
         return "Bio Commands", "Unknown command.", _build_commands_menu_buttons()
 
     if extra == "builder":

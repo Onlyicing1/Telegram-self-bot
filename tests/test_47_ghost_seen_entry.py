@@ -249,7 +249,7 @@ class TestDestinationRoutingUntouched:
 
         misc_src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
         ghost_rows = [
-            line for line in misc_src.splitlines() if "panel:ghost" in line
+            line for line in misc_src.splitlines() if "panel:ghost_seen" in line
         ]
         assert len(ghost_rows) == 1
         assert not re.search(r"panel:ghost:\d+", ghost_rows[0])

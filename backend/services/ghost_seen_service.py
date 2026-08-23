@@ -310,17 +310,19 @@ async def delete_expired_rows(expired_ids: list[int]) -> None:
 
 def apply_retention(
     rows: list[dict[str, Any]],
-    retention_days: int,
+    retention_seconds: int,
     now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """Split registry rows into (kept, expired_ids).
 
     Deterministic lazy expiry: a row expires when its ``last_message_at``
-    is older than ``retention_days``. Rows without a timestamp are kept.
+    is older than ``retention_seconds``. Rows without a timestamp are
+    kept. The window is clamped to [30 minutes, 365 days]; registry rows
+    are removed ONLY — Telegram data is never touched.
     """
     now = now or datetime.now(timezone.utc)
-    days = max(1, min(365, int(retention_days)))
-    cutoff = now.timestamp() - days * 86400
+    seconds = max(1800, min(31_536_000, int(retention_seconds)))
+    cutoff = now.timestamp() - seconds
     kept: list[dict[str, Any]] = []
     expired: list[int] = []
     for row in rows:
@@ -351,9 +353,53 @@ def _parse_ts(value: Any) -> datetime | None:
 
 
 # ── read-safe message inspection ──
-# Only passive reads are used (iter_messages / get_messages). No
-# ReadHistoryRequest / send_read_acknowledge / MarkDialogUnread call is
+# Only passive reads are used (iter_messages / get_messages / iter_dialogs).
+# No ReadHistoryRequest / send_read_acknowledge / MarkDialogUnread call is
 # ever made from Ghost Seen paths.
+
+# A StringSession carries no entity map across restarts, so bare-ID lookups
+# (get_messages / iter_messages) raise "Could not find the input entity" for
+# every chat the account has not touched yet in this process lifetime. That
+# is why some valid private chats rendered no messages while others worked:
+# chats seen since startup resolved, older ones did not. One passive dialogs
+# sweep repopulates the session's entity cache from the server exactly when
+# a lookup misses.
+_ENTITY_SWEEP_LIMIT = 500
+
+
+async def ensure_entity(client: Any, chat_id: int) -> bool:
+    """Make ``chat_id`` resolvable for this client session.
+
+    Returns True when the peer resolves. On a cache miss, sweeps regular
+    and archived dialogs once (passive reads) to repopulate the session
+    entity cache, then retries. Never raises.
+    """
+    try:
+        await client.get_input_entity(chat_id)
+        return True
+    except Exception:
+        pass
+    for kwargs in ({"archived": False}, {"archived": True}):
+        try:
+            count = 0
+            async for _dialog in client.iter_dialogs(
+                limit=_ENTITY_SWEEP_LIMIT, **kwargs,
+            ):
+                count += 1
+                if count >= _ENTITY_SWEEP_LIMIT:
+                    break
+        except Exception as exc:
+            logger.debug("Ghost Seen: dialog sweep failed (%s): %s", kwargs, exc)
+            continue
+    try:
+        await client.get_input_entity(chat_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Ghost Seen: entity unresolvable after sweep chat=%s: %s",
+            chat_id, exc,
+        )
+        return False
 
 
 async def fetch_chunk(
@@ -361,8 +407,17 @@ async def fetch_chunk(
     chat_id: int,
     page: int,
     chunk_size: int = _CHUNK_SIZE,
-) -> list[dict[str, Any]]:
-    """Fetch a page of messages for a chat (oldest→newest, no read marking)."""
+) -> tuple[list[dict[str, Any]], str]:
+    """Fetch a page of messages for a chat (oldest→newest, no read marking).
+
+    Returns ``(messages, error)`` where ``error`` distinguishes the honest
+    failure states instead of silently pretending the conversation is empty:
+      ""          — success (possibly zero messages: genuinely empty chat)
+      "entity"    — the chat peer cannot be resolved in this session
+      "fetch"     — Telegram iteration failed
+    """
+    if not await ensure_entity(client, chat_id):
+        return [], "entity"
     limit = (page + 1) * chunk_size
     raw: list[Any] = []
     try:
@@ -375,11 +430,11 @@ async def fetch_chunk(
             "Ghost Seen: iter_messages failed for chat=%s page=%s: %s",
             chat_id, page, exc,
         )
-        return []
+        return [], "fetch"
 
     raw.reverse()
     start = page * chunk_size
-    return [serialize_message(m) for m in raw[start:start + chunk_size]]
+    return [serialize_message(m) for m in raw[start:start + chunk_size]], ""
 
 
 async def fetch_context_window(
@@ -394,6 +449,8 @@ async def fetch_context_window(
     the anchor cannot be resolved.
     """
     n = max(1, int(n))
+    if not await ensure_entity(client, chat_id):
+        return []
     anchor_raw = None
     try:
         anchor_raw = await client.get_messages(chat_id, ids=anchor_msg_id)

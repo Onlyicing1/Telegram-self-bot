@@ -11,7 +11,7 @@ Covers:
     success AND failure, and handles plain text (TEXT → send_message).
   - Deep Save metadata (save_code, mime, actual file_size, ids) refers to
     the NEWLY uploaded message, not the source.
-  - The Glass UI Reply Mode flow: `.menu → Save → Deep Save → Reply Mode`
+  - The Glass UI Reply Mode flow: `Menu → Save → Deep Save → Reply Mode`
     sets a pending state, and the next outgoing reply resolves its
     ``reply_to_msg_id`` to the exact target message before saving it.
 """
@@ -142,8 +142,8 @@ async def test_settings_panel_renders():
     assert title == "Settings"
     assert "Auto-close" in body
     assert "Max deep save" in body
-    # 10 legacy rows + the 🔤 Font row added by the Glass UI font setting.
-    assert len(buttons) == 11
+    # 10 legacy rows + 🔤 Font + ⏳ Ghost Seen Retention.
+    assert len(buttons) == 12
 
 
 @pytest.mark.asyncio

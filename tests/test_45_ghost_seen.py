@@ -334,18 +334,34 @@ class TestGhostSeenRetention:
             {"chat_id": 2, "last_message_at": (now - timedelta(days=1)).isoformat()},
             {"chat_id": 3, "last_message_at": None},
         ]
-        kept, expired = apply_retention(rows, 30)
+        kept, expired = apply_retention(rows, 30 * 86400)
         assert [row["chat_id"] for row in kept] == [2, 3]
         assert expired == [1]
 
-    def test_apply_retention_clamps_extreme_day_values(self):
+    def test_apply_retention_supports_sub_day_windows(self):
+        from datetime import datetime, timedelta, timezone
+        from backend.services.ghost_seen_service import apply_retention
+
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"chat_id": 10, "last_message_at": (now - timedelta(minutes=45)).isoformat()},
+            {"chat_id": 11, "last_message_at": (now - timedelta(minutes=15)).isoformat()},
+        ]
+        kept, expired = apply_retention(rows, 1800)  # 30-minute window
+        assert [row["chat_id"] for row in kept] == [11]
+        assert expired == [10]
+
+    def test_apply_retention_clamps_extreme_values(self):
         from datetime import datetime, timezone
         from backend.services.ghost_seen_service import apply_retention
 
         row = [{"chat_id": 1, "last_message_at": datetime.now(timezone.utc).isoformat()}]
-        kept, expired = apply_retention(row, 100000)
+        kept, expired = apply_retention(row, 100_000_000)
         assert kept == row and expired == []
         kept, expired = apply_retention(row, 0)
+        assert kept == row and expired == []
+        # A sub-clamp value is raised to the 30-minute floor: a fresh row survives.
+        kept, expired = apply_retention(row, 60)
         assert kept == row and expired == []
 
 

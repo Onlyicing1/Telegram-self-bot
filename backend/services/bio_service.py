@@ -52,14 +52,17 @@ async def do_show(owner_id: int, tz_str: str) -> str:
         tz_str,
     )
     status = "ON" if bio_engine.is_running() else "OFF"
+    # Content values render as plain text so the selected Glass UI font
+    # applies to them; the template stays in a code span because its
+    # {variable} tokens must never be restyled.
     return (
         f"**Bio State**\n\n"
         f"Status: `{status}`\n"
         f"Template: `{state.get('template') or '🕒 {time} | 💭 {mood}'}`\n"
-        f"Mood: `{state.get('mood') or '😊'}`\n"
-        f"Text: `{state.get('custom_text') or '—'}`\n"
-        f"Last Bio: `{state.get('last_bio') or '—'}`\n"
-        f"Preview: `{preview}`\n"
+        f"Mood: {state.get('mood') or '😊'}\n"
+        f"Text: {state.get('custom_text') or '—'}\n"
+        f"Last Bio: {state.get('last_bio') or '—'}\n"
+        f"Preview: {preview}\n"
         f"Server Time ({tz_str}): `{now_dt.strftime('%H:%M:%S')}`"
     )
 

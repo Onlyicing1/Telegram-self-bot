@@ -116,7 +116,7 @@ async def _ghost_list_panel_handler(event, extra: str) -> tuple[str, str, list] 
     )
 
     rows = await read_registry_rows()
-    _, expired_ids = apply_retention(rows, settings_service.ghost_seen_retention_days())
+    _, expired_ids = apply_retention(rows, settings_service.ghost_seen_retention_seconds())
     if expired_ids:
         await delete_expired_rows(expired_ids)
 
@@ -152,17 +152,39 @@ async def _ghost_chat_panel_handler(event, extra: str) -> tuple[str, str, list] 
     )
 
     parts = extra.split(":", 1) if extra else []
-    chat_id = int(parts[0]) if parts else 0
+    try:
+        chat_id = int(parts[0]) if parts else 0
+    except ValueError:
+        chat_id = 0
     if not chat_id:
         builder = InlinePanelBuilder()
         _nav_buttons(builder)
         return "👻 Chat", "No chat selected.", builder.build()
 
     page = get_page(chat_id)
-    msgs = await fetch_chunk(_self_client, chat_id, page)
+    msgs, error = await fetch_chunk(_self_client, chat_id, page)
     selected = get_selection(chat_id)
 
     lines = [f"**Chat {chat_id}** — page {page + 1}\n"]
+    if error == "entity":
+        lines.append("_This conversation is temporarily unavailable — its "
+                     "contact could not be resolved in this session. "
+                     "Try again later._")
+        builder = InlinePanelBuilder()
+        _nav_buttons(builder)
+        return f"Chat {chat_id}", "\n".join(lines), builder.build()
+    if error == "fetch":
+        lines.append("_Could not load messages right now. Try again._")
+        builder = InlinePanelBuilder()
+        builder.add_row("🔄 Retry", f"action:ghost_open:{chat_id}")
+        _nav_buttons(builder)
+        return f"Chat {chat_id}", "\n".join(lines), builder.build()
+    if not msgs:
+        lines.append("_No messages in this conversation yet._")
+        builder = InlinePanelBuilder()
+        _nav_buttons(builder)
+        return f"Chat {chat_id}", "\n".join(lines), builder.build()
+
     for i, msg in enumerate(msgs):
         seq = page * 5 + i + 1
         is_sel = msg.get("id", 0) in selected
@@ -265,6 +287,8 @@ async def _ghost_actions_action(event, extra: str, chat_id: int) -> tuple[str, s
         builder.add_row("⬅ Back", "action:ghost_back")
         return "👻 Reply / Actions", "Select exactly one message first.", builder.build()
 
+    from backend.services.ghost_seen_service import ensure_entity
+    await ensure_entity(_self_client, panel_chat)
     anchor_id = sorted(sel)[0]
     anchor: dict[str, Any] = {}
     try:
@@ -342,7 +366,12 @@ async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, 
 
 
 async def _ghost_inform_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Record the disclosure choice, then hand over to the prompt input."""
+    """Record the disclosure choice, then arm the prompt input directly.
+
+    The user has already explicitly chosen Reply with AI, the context
+    count, and the disclosure mode — no further compose/confirmation step
+    is inserted; typing the instruction is the next (and only) action.
+    """
     from backend.services.ghost_seen_service import (
         get_reply_flow,
         set_reply_disclosure,
@@ -363,18 +392,39 @@ async def _ghost_inform_action(event, extra: str, chat_id: int) -> tuple[str, st
         return "👻 AI disclosure", "No pending AI reply. Select a message again.", builder.build()
 
     flow = get_reply_flow(panel_chat) or {}
-    builder = InlinePanelBuilder()
-    builder.add_row("✍️ Compose AI reply", "input:ghost_chat:ai_prompt")
-    builder.add_row("⬅ Back", "action:ghost_back")
+    informed = extra == "yes"
     disclosure = (
         "recipient WILL be told it is AI-generated"
-        if extra == "yes"
+        if informed
         else "recipient will NOT be told it is AI-generated"
     )
     body = (
         f"Context: **{flow.get('context_n')}** message(s) · {disclosure}.\n\n"
-        "Press the button below, then type what the reply should say."
+        "Type your AI instruction now — it will run with the context above "
+        "and the response will be delivered to the Ghost Seen destination."
     )
+
+    # Arm the AI-prompt input exactly like pressing the old compose button
+    # did (same registered handler/prompt), minus that redundant press.
+    try:
+        from backend.helper.input_state import set_pending
+        from backend.helper.inline_engine import _owner_id
+        owner_id = _owner_id or _store_owner_id
+    except Exception:
+        owner_id = _store_owner_id
+    from backend.helper.panels import get_input
+    cfg = get_input("ghost_chat", "ai_prompt") or {}
+    event_chat_id = getattr(event, "chat_id", None) or 0
+    event_msg_id = getattr(event, "message_id", None) or 0
+    set_pending(
+        owner_id, "ghost_chat", cfg.get("handler"), event_chat_id or 0,
+        cfg.get("prompt", "Type your AI prompt."),
+        inline_chat_id=event_chat_id or 0,
+        inline_msg_id=event_msg_id or 0,
+    )
+
+    builder = InlinePanelBuilder()
+    builder.add_row("⬅ Back", "action:ghost_actions")
     return "👻 Compose AI reply", body, builder.build()
 
 

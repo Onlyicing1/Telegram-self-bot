@@ -129,7 +129,7 @@ class TestFontPersistence:
             )
             ss.load_all()
             assert ss.dashboard_font() == "default"
-            assert ss.ghost_seen_retention_days() == 30
+            assert ss.ghost_seen_retention_seconds() == 2_592_000
         finally:
             ss._cache.clear()
             ss._cache.update(old_cache)
@@ -176,21 +176,21 @@ class TestFontPersistence:
             assert ss.set_dashboard_font(None) is False
             assert ss.dashboard_font() == "fraktur"
 
-            assert ss.set_ghost_seen_retention_days(0) is False
-            assert ss.set_ghost_seen_retention_days(366) is False
-            assert ss.ghost_seen_retention_days() == 30
+            assert ss.set_ghost_seen_retention_seconds(60) is False
+            assert ss.set_ghost_seen_retention_seconds(40_000_000) is False
+            assert ss.ghost_seen_retention_seconds() == 2_592_000
 
             # Corrupted cache values still read back deterministically.
             ss._cache["dashboard_font"] = "javascript:alert(1)"
             assert ss.dashboard_font() == "default"
-            ss._cache["ghost_seen_retention_days"] = "garbage"
-            assert ss.ghost_seen_retention_days() == 30
+            ss._cache["ghost_seen_retention_seconds"] = "garbage"
+            assert ss.ghost_seen_retention_seconds() == 2_592_000
         finally:
             ss._cache.clear()
             ss._cache.update(old_cache)
 
 
-# ── 7. `.menu` command dispatch is font-independent ──
+# ── 7. `Menu` command dispatch is font-independent ──
 
 
 class TestMenuCommandIndependence:
@@ -207,7 +207,8 @@ class TestMenuCommandIndependence:
     def test_menu_matches_raw_text_via_regex_pattern(self):
         from pathlib import Path
         src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
-        assert 'pattern=r"^\\.menu$"' in src  # raw incoming text, pre-render
+        assert 'pattern=r"^Menu$"' in src  # raw incoming text, pre-render
+        assert '.menu' not in src  # the legacy dot command is fully removed
 
     def test_dispatch_data_never_passes_through_apply_font(self):
         from pathlib import Path

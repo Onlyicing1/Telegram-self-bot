@@ -101,7 +101,7 @@ async def _username_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         current = state.get("custom_text") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💬 Enter New Text", "input:username:text")
-        return "Set Text", f"**Current text:** `{current}`\n\nTap the button below, then reply with the new text value.", builder.build()
+        return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
 
     if extra == "mood":
         from backend.helper.inline_engine import _owner_id
@@ -109,7 +109,7 @@ async def _username_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         current = state.get("mood") or "—"
         builder = InlinePanelBuilder()
         builder.add_row("💭 Enter New Mood", "input:username:mood")
-        return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
+        return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
 
     return "Username Engine", "Choose an action:", _build_username_main_buttons()
 
@@ -201,14 +201,14 @@ async def _usernamehelp_panel_handler(event, extra: str) -> tuple[str, str, list
             current = state.get("custom_text") or "—"
             builder = InlinePanelBuilder()
             builder.add_row("💬 Enter New Text", "input:usernamehelp:text")
-            return "Set Text", f"**Current text:** `{current}`\n\nTap the button below, then reply with the new text value.", builder.build()
+            return "Set Text", f"**Current text:** {current}\n\nTap the button below, then reply with the new text value.", builder.build()
         if sub == "mood":
             from backend.helper.inline_engine import _owner_id
             state = await db_client.get_or_create_username_state(_owner_id)
             current = state.get("mood") or "—"
             builder = InlinePanelBuilder()
             builder.add_row("💭 Enter New Mood", "input:usernamehelp:mood")
-            return "Set Mood", f"**Current mood:** `{current}`\n\nTap the button below, then reply with the new mood value.", builder.build()
+            return "Set Mood", f"**Current mood:** {current}\n\nTap the button below, then reply with the new mood value.", builder.build()
         return "Username Commands", "Unknown command.", _build_username_commands_menu_buttons()
 
     if extra == "builder":

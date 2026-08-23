@@ -46,7 +46,7 @@ Architecture:
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
-| ghost_seen_retention_days | int   | 30      | 1..365 (days)           |
+| ghost_seen_retention_seconds | int | 2592000 | 1800..31536000 (30 min..365 days) |
 """
 import logging
 from typing import Any, Callable
@@ -77,7 +77,7 @@ _DEFAULTS: dict[str, Any] = {
     "debug_callbacks": False,
     "owner_only": True,
     "dashboard_font": "default",
-    "ghost_seen_retention_days": 30,
+    "ghost_seen_retention_seconds": 2_592_000,
 }
 
 _cache: dict[str, Any] = {}
@@ -109,7 +109,7 @@ def _validate_dashboard_font(value: Any) -> bool:
 
 
 def _validate_ghost_seen_retention(value: Any) -> bool:
-    return _validate_int_range(1, 365)(value)
+    return _validate_int_range(1_800, 31_536_000)(value)
 
 
 _VALIDATORS: dict[str, ValidatorFn] = {
@@ -125,7 +125,7 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
     "dashboard_font": _validate_dashboard_font,
-    "ghost_seen_retention_days": _validate_ghost_seen_retention,
+    "ghost_seen_retention_seconds": _validate_ghost_seen_retention,
 }
 
 
@@ -321,15 +321,54 @@ def set_dashboard_font(value: str) -> bool:
     return set_setting("dashboard_font", value)
 
 
-def ghost_seen_retention_days() -> int:
-    """Ghost Seen registry retention window in days (1..365)."""
+# Ghost Seen retention presets offered in the Glass UI: (label, seconds).
+# Sub-day durations are first-class; the persisted unit is seconds.
+RETENTION_PRESETS: tuple[tuple[str, int], ...] = (
+    ("30 minutes", 1_800),
+    ("2 hours", 7_200),
+    ("12 hours", 43_200),
+    ("1 day", 86_400),
+    ("7 days", 604_800),
+    ("30 days", 2_592_000),
+)
+
+_RETENTION_PRESET_SECONDS = frozenset(s for _, s in RETENTION_PRESETS)
+
+
+def format_duration(seconds: int) -> str:
+    """Human-readable duration for the retention value."""
+    for label, preset in RETENTION_PRESETS:
+        if preset == seconds:
+            return label
+    if seconds % 86_400 == 0:
+        d = seconds // 86_400
+        return f"{d} day{'s' if d != 1 else ''}"
+    if seconds % 3_600 == 0:
+        h = seconds // 3_600
+        return f"{h} hour{'s' if h != 1 else ''}"
+    if seconds % 60 == 0:
+        m = seconds // 60
+        return f"{m} minute{'s' if m != 1 else ''}"
+    return f"{seconds} seconds"
+
+
+def is_retention_preset(value: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value in _RETENTION_PRESET_SECONDS
+
+
+def ghost_seen_retention_seconds() -> int:
+    """Ghost Seen registry retention window in seconds (30 min..365 days).
+
+    Missing or invalid persisted values fall back deterministically to the
+    30-day default; a bad setting can never crash the Ghost Seen panel.
+    """
     _ensure_loaded()
     try:
-        value = int(_cache.get("ghost_seen_retention_days", 30))
+        value = int(_cache.get("ghost_seen_retention_seconds", 2_592_000))
     except (TypeError, ValueError):
-        return 30
-    return value if 1 <= value <= 365 else 30
+        return 2_592_000
+    return value if 1_800 <= value <= 31_536_000 else 2_592_000
 
 
-def set_ghost_seen_retention_days(days: int) -> bool:
-    return set_setting("ghost_seen_retention_days", days)
+def set_ghost_seen_retention_seconds(seconds: int) -> bool:
+    return set_setting("ghost_seen_retention_seconds", seconds)

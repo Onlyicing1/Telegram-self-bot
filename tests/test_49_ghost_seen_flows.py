@@ -188,6 +188,10 @@ class TestContextWindow:
                                       sender_id=55, date=None, media=None)
 
         class C:
+            async def get_input_entity(self, chat_id):
+                # Entity already cached — no sweep needed.
+                return SimpleNamespace(user_id=chat_id)
+
             async def get_messages(self, chat_id, ids=None):
                 return anchor
 
@@ -234,6 +238,9 @@ class TestContextWindow:
         from backend.services.ghost_seen_service import fetch_context_window
 
         class C:
+            async def get_input_entity(self, chat_id):
+                return SimpleNamespace(user_id=chat_id)
+
             async def get_messages(self, chat_id, ids=None):
                 return None
 
@@ -361,9 +368,12 @@ class TestHandlerWiring:
         cancel_reply_flow(CHAT)
 
     @pytest.mark.asyncio
-    async def test_inform_records_disclosure_and_offers_compose(self):
+    async def test_inform_records_disclosure_and_arms_input_directly(self):
+        """No redundant confirmation step: after the disclosure choice the
+        AI-prompt input is already armed — the user just types."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
+        from backend.helper import input_state
         from backend.services.ghost_seen_service import (
             start_reply_flow, set_reply_context_count, get_reply_flow,
             cancel_reply_flow,
@@ -374,9 +384,17 @@ class TestHandlerWiring:
         start_reply_flow(CHAT, 11)
         set_reply_context_count(CHAT, 10)
 
-        title, body, buttons = await gr._ghost_inform_action(None, "yes", 0)
+        event = SimpleNamespace(chat_id=999, message_id=42)
+        title, body, buttons = await gr._ghost_inform_action(event, "yes", 0)
         assert get_reply_flow(CHAT)["informed"] is True
-        assert "input:ghost_chat:ai_prompt" in _button_datas(buttons)
+        # The input is armed directly — no extra compose-button press.
+        assert input_state.has_pending(12345)
+        pending = input_state.get_pending(12345)
+        assert pending["panel_id"] == "ghost_chat"
+        assert pending["inline_msg_id"] == 42
+        input_state.clear_pending(12345)
+        # And the panel offers no redundant AI-prompt button.
+        assert "input:ghost_chat:ai_prompt" not in _button_datas(buttons)
 
         title, body, _ = await gr._ghost_inform_action(None, "banana", 0)
         assert get_reply_flow(CHAT) is None  # invalid choice cancels the flow

@@ -1,176 +1,104 @@
 # Implementation Report — LifeOS Telegram Self-Bot
 
-## Execution 26 — Ghost Seen Completion (Font System, Source Validation, Reply Flows, Disclosure, Removal, Persistence)
+## Execution 27 — AI Flow Streamlining, Retention Durations, Font Coverage, PV-Message Root Cause, `Menu` Command
 
 ### Task / Result
 
-Continued from clean remote state `0b8dc4f` (Execution 25). This execution made the
-remaining Ghost Seen + font behavior REAL in production code:
+Implemented the five requested fixes on top of Execution 26:
 
-1. **Font system hardening** — verified the existing 24-key allow-list registry
-   (`backend/helper/font_style.py`, 23 styled fonts + default), its persistence through
-   the column-per-setting `panel_settings` model, central application to every Glass UI
-   surface via `panel_render._style()`, and added an idempotent migration for its two new
-   settings columns plus focused regression coverage (protected tokens, restart safety,
-   invalid fallbacks, button-label styling with byte-identical callback data,
-   `.menu` dispatch independence).
-2. **Ghost Seen source boundary** — the incoming listener now delegates to the service's
-   authoritative `validate_private_source()`: bots, owner self-chat/Saved Messages,
-   groups/channels/supergroups (non-positive chat ids), chat/sender mismatches, and
-   missing senders are rejected at the REGISTRY boundary (not merely hidden in UI).
-3. **Reply/action flow (Phases 3–4 of the contract)** — selecting exactly one message now
-   opens a Glass UI menu showing an unambiguous REPLY TARGET banner (`format_reply_target`)
-   with explicit choices: Reply myself (quote / no quote) and Reply with AI → context
-   choice (1 / 5 / 10 / 20 messages, target included; N encoded in callback data and
-   re-validated against `ALLOWED_CONTEXT_COUNTS`) → disclosure choice (recipient informed /
-   not informed) → compose prompt. Execution fetches EXACTLY N messages ending at the
-   anchor via `fetch_context_window` (passive reads only), runs through the single existing
-   engine path, and appends `AI_DISCLOSURE_SUFFIX` ONLY when "informed" was chosen. The
-   legacy multi-select AI path is unchanged (no suffix, selected messages as context).
-4. **Registry management (Phase 5)** — "🗑 Remove from list" action deletes the registry
-   row and local UI state only (`remove_chat`); Telegram chats/messages/read state are
-   never touched. Retention stays wired via `ghost_seen_retention_days` (1..365, default 30).
-5. **Real bug fixes found during wiring** — `ghost_open` never recorded the open chat
-   (all toggle/page/clear/actions operated on chat `0`): fixed by `_set_current_chat(target)`;
-   reply buttons pointed at non-existent inputs (`input:ghost_reply`) and silently dropped:
-   repointed to the registered `input:ghost_chat:*` ids; `set_reply_disclosure` accepted
-   non-boolean values: now strictly `isinstance(bool)` validated; migration constraint
-   DDL was not re-runnable: now drops constraints before adding them.
-6. **Naming compliance** — active surfaces renamed Ghost Room→Ghost Seen: database panel
-   text, stats log key (`ghost_seen_chats`), db-client docstrings, handler env-accessor
-   helper (`_ghost_seen_env_id`), migration comment anchors, test labels. `GHOST_ROOM_ID`
-   remains the unchanged deployment variable.
+1. **Ghost Seen AI reply flow** — removed the redundant compose-button confirmation step. Choosing the disclosure option now arms the AI-prompt input directly; the user just types. Context-count selection and disclosure choice remain mandatory steps; nothing about the AI engine/dispatcher path changed.
+2. **Ghost Seen retention** — converted the days-only setting into a seconds-based duration (`ghost_seen_retention_seconds`), added a Glass UI panel (Settings → ⏳ Ghost Seen Retention) with six presets (30 minutes / 2 h / 12 h / 1 d / 7 d / 30 d) plus a custom-minutes input, and wired lazy expiry to the configured window.
+3. **Font coverage** — Bio and Username state/set pages now render their content values (mood, text, last bio/name, preview) as plain stylable text so the selected Glass UI font applies. Templates stay in code spans (`{var}` tokens must never be restyled). AI response text is verified by test to reach the destination byte-identical (default font only).
+4. **Missing-PV-messages root cause** — identified and fixed: with a `StringSession`, the Telethon entity cache is empty after every restart, so bare-ID `get_messages`/`iter_messages` raise "Could not find the input entity" for any chat the account has not touched in this process lifetime. Chats seen since startup worked; older ones silently rendered empty because `fetch_chunk` swallowed all exceptions into `[]`. Fix: new `ensure_entity()` resolves the peer first and, on cache miss, performs one passive regular+archived dialogs sweep to repopulate the session cache before retrying. Fetch failures are no longer disguised as empty conversations — the panel renders honest "temporarily unavailable" / "could not load" / genuinely-empty states.
+5. **`.menu` → `Menu`** — the single textual command is now the literal word `Menu` (`^Menu$`). No hidden `.menu` alias remains in active code. Command matching happens on raw outgoing text and is independent of the selected decorative font.
 
-Fully implemented on the code side. Live Telegram E2E and live Supabase application are
-owner actions (below).
+Fully implemented and validated at the unit/regression level. Live Telegram behavior was NOT exercised (no live client available to this agent).
+
+### Starting commit
+
+`a2dd18defcd488b85651ec86e9285875738371c5` (clean tree, origin/main verified)
 
 ### Files actually changed
 
 Production:
-- `supabase/migrations/20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
-  (NEW) — idempotent: adds `dashboard_font text NOT NULL DEFAULT 'default'` and
-  `ghost_seen_retention_days integer NOT NULL DEFAULT 30` to `panel_settings`,
-  normalizes out-of-range values, seeds the singleton row, adds CHECK constraints
-  (with `DROP CONSTRAINT IF EXISTS` guards so it is safe to run repeatedly).
-- `backend/bot/handlers/ghost_seen.py` — listener now uses `validate_private_source`;
-  `_ghost_open_action` sets the working chat; chat-view controls redesigned
-  (single-selection → "⚡ Reply / Actions"; multi-selection → direct AI-prompt input;
-  remove-from-list always available); NEW actions `ghost_actions`, `ghost_ctx`,
-  `ghost_inform`, `ghost_remove` replacing dead `ghost_ai_single`/`ghost_ai_multi`;
-  `_ghost_ai_input` consumes a complete reply flow (anchor+count+disclosure) via
-  `fetch_context_window`, appends the disclosure suffix only when informed, keeps the
-  legacy selected-messages path byte-for-byte, fails closed on missing `GHOST_ROOM_ID`
-  (and cancels the pending flow); broken input button ids fixed; docstrings/logs renamed.
-- `backend/services/ghost_seen_service.py` — `set_reply_disclosure` strict boolean
-  validation (one-line fix; all other service primitives already existed and were made
-  reachable, not duplicated).
-- `backend/db/client.py` — two docstrings Ghost Room→Ghost Seen (function names were
-  already table-named `count_ghost_chats`).
-- `backend/services/database_service.py` — panel line "**Ghost Seen chats:**";
-  stats-log key `ghost_room_chats`→`ghost_seen_chats`.
-- `supabase/migrations/20260822090000_create_ghost_chats_table.sql` — comment header
-  aligned with the renamed §22 anchor (documentation-only, no DDL change).
-- `DATABASE_ARCHITECTURE.md` — §6 corrected font allow-list reference +
-  `ghost_seen_retention_days` row; §6/§19.3/§20 document migration 20260823120000 as
-  PENDING manual application; §17 settings table completed (13 columns);
-  §22 retitled "Ghost Seen (ghost_chats)" with explicit source-registry-only semantics.
+
+- `backend/services/ghost_seen_service.py` — added `ensure_entity()` (cache check → passive archived+non-archived dialogs sweep → retry); `fetch_chunk()` now returns `(messages, error)` with honest `"entity"`/`"fetch"`/empty states; `fetch_context_window()` resolves the entity before fetching; `apply_retention(rows, retention_seconds)` clamps to [30 min, 365 days]. Registry-only semantics unchanged.
+- `backend/bot/handlers/ghost_seen.py` — list handler passes retention seconds; chat panel renders honest error/empty/retry states (plus non-numeric chat-id guard); reply-target banner path resolves the entity first; `_ghost_inform_action` arms the registered `ai_prompt` pending input directly via `input_state.set_pending` (same handler/prompt as the old button) instead of offering an extra compose-button press.
+- `backend/services/settings_service.py` — replaced `ghost_seen_retention_days` (1..365) with `ghost_seen_retention_seconds` (default 2 592 000 s = 30 days; validator 1800..31 536 000); added `RETENTION_PRESETS`, `format_duration()`, `is_retention_preset()`; deterministic default fallback on missing/corrupt values preserved.
+- `backend/bot/handlers/misc.py` — command pattern `^.menu$` → `^Menu$`; docstring updated; Settings panel gains the ⏳ Ghost Seen Retention row; new `ghostret` panel + `ghostret_set:<seconds>` action (preset allow-list enforced) + `settings:ghostret_minutes` input handler.
+- `backend/services/bio_service.py`, `backend/services/username_service.py` — `do_show` renders mood/text/last-bio(last-name)/preview as plain text (font-stylable); template/status/server-time remain code spans.
+- `backend/bot/handlers/bio.py`, `backend/bot/handlers/username.py` — Set Text / Set Mood current-value lines render plain (stylable) instead of inside backticks.
+
+Database:
+
+- `supabase/migrations/20260823130000_ghost_seen_retention_duration.sql` (NEW) — idempotent: adds `panel_settings.ghost_seen_retention_seconds bigint NOT NULL DEFAULT 2592000`; backfills from legacy `ghost_seen_retention_days × 86400` and drops that column only while it still exists (guarded DO block); clamps out-of-range values; adds CHECK constraint 1800..31536000.
+
+Documentation:
+
+- `DATABASE_ARCHITECTURE.md` — §6 column table updated to seconds; §6 migration-status note, §17 settings table, §19.3 resolution text, §20 inventory: migrations #10/#11 marked Applied (verified by owner), #12 added as Pending manual application.
+- `AGENTS.md` — `.menu` references replaced with the `Menu` command (overview, §5 table incl. pattern + font-independence note, repository layout comment, Save flow).
+- `backend/bot/handlers/save.py` — docstring flow line only.
 
 Tests:
-- `tests/test_49_ghost_seen_flows.py` (NEW, 30 tests) — validator matrix (bot/self/
-  group/mismatch/missing rejected, human private accepted), listener-delegates-to-validator
-  pin, reply-flow state machine, exact-N context counting (+cap, +unresolvable anchor),
-  REPLY TARGET banner honesty, menu callback-state encoding, removal semantics,
-  open-chat regression, AI delivery (informed/uninformed/legacy/fail-closed/failed-fetch),
-  no-second-dispatcher pin.
-- `tests/test_50_font_system.py` (NEW, 14 tests) — ≥20 fonts + default, deterministic
-  transforms, protected tokens across ALL keys (IDs/code/URL/digits/Persian),
-  invalid/missing fallbacks, single-registry pin vs settings, button-label styling with
-  byte-identical callback data, missing-DB defaults, persist-and-reload,
-  invalid-selection rejection, corrupted-cache reads, no-handler-styles-incoming-text,
-  raw-text `.menu` regex pin.
-- `tests/test_47_ghost_seen_entry.py` — pinned action list updated to the four new actions.
-- `tests/test_45_ghost_seen.py` — stale helper import removed; Ghost Room labels updated.
-- `tests/test_44_database_stats.py` — pins updated to renamed panel text/key.
+
+- `tests/test_51_execution27.py` (NEW, 30 tests).
+- `tests/test_45_ghost_seen.py` — retention tests moved to seconds semantics + sub-day-window case.
+- `tests/test_47_ghost_seen_entry.py` — menu-row pin narrowed to `panel:ghost_seen` (the new `panel:ghostret` row is unrelated navigation).
+- `tests/test_49_ghost_seen_flows.py` — compose-button assertion replaced by direct-input arming assertions; context-window fake clients now satisfy the entity-resolution precondition.
+- `tests/test_50_font_system.py` — retention accessor pins moved to seconds; Menu regex source pin updated.
+- `tests/test_12_save_engine.py` — settings-panel row count 11 → 12 (Font + Retention rows); docstring `.menu` → `Menu`.
 
 ### Exact behavior changed
 
-- Incoming private messages from bots/self-chat/non-human sources never create or update
-  `ghost_chats` rows anymore (previously only the owner was excluded).
-- Opening a chat actually tracks the open chat; selection/paging/reply/actions operate on
-  the right conversation (previously chat `0` — silent breakage).
-- Single-message selection opens an explicit menu instead of ambiguous immediate buttons;
-  nothing executes without an explicit choice; AI context count travels in callback data
-  and is re-validated server-side; disclosure is a required explicit choice; the AI-sent
-  message ends with the AI-disclosure notice only when "informed" was selected.
-- Manual replies target `GHOST_ROOM_ID` with correct quote/no-quote modes via registered
-  input ids (previously the buttons silently did nothing).
-- Remove clears the registry row + local state only; retention expiry unchanged.
-- Invalid context sizes / disclosure choices render honest error views and cancel the
-  pending flow deterministically.
-- Database panel shows "**Ghost Seen chats:**" and logs `ghost_seen_chats`.
+- **AI flow**: select message → Reply/Actions → Reply with AI → choose context count (re-validated against the allow-list) → choose disclosure → type instruction immediately (input already armed). Execution, context windowing, disclosure suffix, and GHOST_ROOM_ID delivery are unchanged.
+- **Retention**: expiry window is user-configurable down to 30 minutes; opening/refreshing the Ghost Seen list lazily removes expired registry rows only (Telegram data untouched). Invalid values fail safe to the previous value or the 30-day default; a corrupt value can never crash the panel.
+- **Fonts**: Bio/Username content displays carry the selected font; AI output never does (pinned by test asserting byte-identical delivery under a script font).
+- **PV messages**: previously-failing private chats resolve their entity via one passive dialogs sweep (regular + archived) and render normally; unresolvable chats show an explicit unavailable state; iteration failures show a retryable error state; truly empty chats say so honestly.
+- **Command**: typing `Menu` opens the mother panel exactly as `.menu` did (same inline/fallback delivery); `.menu` no longer matches anything.
+
+### Font behavior
+
+Allow-list, deterministic fallback, restart-safe persistence, protected callback data/IDs/URLs/digits/Persian, byte-identical callback payloads — all preserved and still pinned by tests 42/48/50. New coverage proves Bio/Username display styling and AI-output exemption.
+
+### Ghost Seen behavior
+
+Source boundary (private humans only, bots/self/groups/channels rejected), selection/paging/removal, reply-target banner, context counting, disclosure suffix, fail-closed destination, zero-spam edit-in-place panels — unchanged and regression-tested.
 
 ### Intentionally untouched
 
-- Provider retry/fallback, dispatcher, telemetry, token accounting, memory, Save/Delete/
-  Retrieve, RuntimeSupervisor, watchdog, profile engines, ai_usage/ai_provider_stats paths.
-- Frontend `src/` — zero changes (tolerant unknown-font-key fallback verified in Exec 25
-  and pinned by test).
-- Documented-dormant legacy names kept deliberately: `runtime/startup_check._check_ghost_room`
-  (dormant module per INVESTIGATION.md) and historical documents
-  (`INVESTIGATION.md`, `docs/implementation/ghost-room-ai-foundation-contract.md`).
-  Test helper names derived from the env var (`_patch_ghost_room_id`, …) kept — they
-  manipulate `GHOST_ROOM_ID`, which is the sole sanctioned exception.
+Provider retry/fallback · token accounting · telemetry · ai_usage/ai_provider_stats persistence · memory · Save/Delete engines · RuntimeSupervisor · watchdog · other Telegram handlers · model selector · web dashboard frontend (no src/ change) · `GHOST_ROOM_ID` env name · dormant `runtime/startup_check.py` internal `ghost_room` naming (documented legacy, not called in prod) · live Supabase.
 
 ### Database / schema impact
 
-Migration FILES exist (`20260822090000_create_ghost_chats_table.sql` — pre-existing;
-`20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` — new this execution).
-
-**LIVE SUPABASE MIGRATION WAS NOT EXECUTED BY THIS AGENT.** No SQL was run against any
-live database; no schema was verified live. The runtime degrades safely without both
-(empty registry reads, default font/retention). The owner must apply both migrations
-manually (both are idempotent).
+Migration file `20260823130000_ghost_seen_retention_duration.sql` created (idempotent). **LIVE SUPABASE MIGRATION WAS NOT EXECUTED BY THIS AGENT.** Per the owner's verification recorded in this task, `ghost_chats`, `dashboard_font`, and `ghost_seen_retention_days` exist live; until the new migration is applied manually, the runtime's seconds-backed setting will fall back deterministically to its in-memory/30-day default on the live DB (the repository layer tolerates the missing column; writes degrade to the cache as designed). No SQL was executed against any database by this agent.
 
 ### Validation
 
-- `tests/test_49_ghost_seen_flows.py` — 30 passed
-- `tests/test_50_font_system.py` — 14 passed (standalone AND suite; one order-dependency
-  found and fixed before delivery)
-- Focused set `test_45 + test_47 + test_48 + test_49 + test_50` — 92 passed (pre-fix run:
-  5 failed → root-caused: 3 test bugs, 1 real service validation gap fixed, 1 missing
-  flow precondition in my own test)
-- Full suite — **838 passed, 0 failed, 1 warning** (pre-existing Starlette
-  PendingDeprecationWarning)
+- `tests/test_51_execution27.py` — 30 passed
+- Focused suites (45/47/49/50/42/48/12) — 132 passed (after updates)
+- Full suite `pytest tests/ -q --asyncio-mode=auto` — **869 passed, 0 failed, 1 warning** (pre-existing Starlette deprecation warning)
 - `python3 -m compileall -q backend` — PASS
 - `git diff --check` — PASS
-- Stale-name search — remaining hits limited to documented-dormant `startup_check`,
-  historical docs, and env-var-derived test helper names (justified above); zero active
-  feature identifiers use ghost_room/ghost_sink
-- Duplicate-registration search — exactly one `register_panel("font")`, one
-  `register_panel("ghost_seen")`, one `register_panel("ghost_chat")`; router registers
-  the module once
-- Frontend typecheck/build — NOT RUN: no frontend files changed
+- Stale-reference search: no active `.menu` refs in backend; Ghost Room/Sink/Sync strings only in documented-dormant `startup_check.py`
+- Duplicate-registration search: `menu` and `ghostret` each registered once
+- Frontend typecheck/build — NOT run: no frontend file changed
 
-### Validation limitations / known remaining work
+### Validation limitations
 
-- Live Telegram end-to-end behavior (real incoming chats, real delivery to
-  `GHOST_ROOM_ID`, real panel rendering) unverified — requires the deployed environment.
-- **Owner must apply BOTH pending Supabase migrations manually** (see above); until then
-  Ghost Seen registry rows and font/retention persistence fall back safely.
-- Multi-select (>1) AI retains its pre-existing semantics (selected messages as context,
-  no disclosure prompt) — extending the disclosure flow there was intentionally deferred
-  to keep this execution within its contract.
-- Glass UI font styling is Latin-only by design; Persian renders in the system font
-  (disclosed in-product rather than claimed as Persian support).
+Live Telegram E2E (real entity sweep against production accounts, real helper-bot rendering) not exercised. Live Supabase migration not executed (see above). Order-dependence of the suite re-verified explicitly after fixing the registration guard (test_12 → test_51 ordering reproduced and resolved).
+
+### Known remaining work
+
+Apply migration #12 to the live database (manual owner action). Dormant `startup_check` module still uses internal `ghost_room` naming. Live Telegram smoke test of all five fixes recommended after deploy.
 
 ### Commit / push / remote verification
 
-- Implementation commit: `b58696275975187e4a55ab98c869914f64b67725`
-  ("feat: complete Ghost Seen flows, source validation, and font persistence migration").
-- Report commit: created immediately after this file was finalized with the hash above.
-- Both commits pushed to `origin/main`; `git fetch origin` performed; local HEAD
-  verified equal to `origin/main`; final working tree clean.
+- Implementation commit: `PENDING`
+- Report commit: `PENDING`
+- Push result: `PENDING`
+- Remote verification: `PENDING`
+- Final working-tree state: `PENDING`
 
 ### Stop
 
-Execution 26 complete. No further chunks started.
+Execution 27 complete. Not starting another chunk.

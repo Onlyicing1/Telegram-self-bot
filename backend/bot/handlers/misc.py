@@ -1,6 +1,9 @@
 """
-.menu    — Mother Panel — the central navigation root of LifeOS.
+Menu     — Mother Panel — the central navigation root of LifeOS.
 Falls back to plain-text edit-in-place when the helper bot is not available.
+
+The textual command is the literal word ``Menu`` (raw outgoing text — the
+decorative Glass UI font never applies to command matching).
 """
 import logging
 import os
@@ -197,6 +200,67 @@ async def _font_page_action(event, extra: str, chat_id: int) -> tuple[str, str, 
     return _font_panel_page(normalize_font_key(settings_service.dashboard_font()))
 
 
+# ── Ghost Seen retention panel ──
+
+async def _ghostret_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    current = settings_service.ghost_seen_retention_seconds()
+    label = settings_service.format_duration(current)
+    builder = InlinePanelBuilder()
+    for text, seconds in settings_service.RETENTION_PRESETS:
+        mark = "✓" if seconds == current else "·"
+        builder.add_row(f"{mark} {text}", f"action:ghostret_set:{seconds}")
+    builder.add_row("✏️ Custom (minutes)", "input:settings:ghostret_minutes")
+    builder.add_row("⬅ Back", "panel:settings")
+    body = (
+        f"**Ghost Seen Retention**\n\n"
+        f"Current: **{label}**\n\n"
+        "Private chats leave the Ghost Seen registry automatically after "
+        "this window of inactivity. Only the registry entry is removed — "
+        "Telegram chats, messages, and read state are never touched."
+    )
+    return "Ghost Seen Retention", body, builder.build()
+
+
+async def _ghostret_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services import settings_service
+    try:
+        seconds = int(extra)
+    except (TypeError, ValueError):
+        seconds = -1
+    if not settings_service.is_retention_preset(seconds):
+        return "Ghost Seen Retention", "Invalid duration — keeping the previous value.", []
+    settings_service.set_ghost_seen_retention_seconds(seconds)
+    return await _ghostret_panel_handler(event, extra)
+
+
+async def _settings_ghostret_minutes_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.services import settings_service
+    from backend.helper.inline_engine import _self_client
+    text = text.strip()
+    if not text.isdigit():
+        result = "Please enter a number of minutes between 30 and 525600."
+    else:
+        seconds = int(text) * 60
+        ok = settings_service.set_ghost_seen_retention_seconds(seconds)
+        result = (
+            f"Ghost Seen retention set to {settings_service.format_duration(seconds)}"
+            if ok
+            else "Value must be between 30 minutes and 365 days."
+        )
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("settings ghostret inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose")
@@ -210,6 +274,7 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Log Retention", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
     builder.add_row("🔤 Font", "panel:font")
+    builder.add_row("⏳ Ghost Seen Retention", "panel:ghostret")
     return "Settings", await _build_settings_body(), builder.build()
 
 
@@ -384,6 +449,8 @@ def _register_panels() -> None:
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
     register_panel("font", _font_panel_handler, parent="settings", title="Font")
+    register_panel("ghostret", _ghostret_panel_handler, parent="settings", title="Ghost Seen Retention")
+    register_action("ghostret_set", _ghostret_set_action)
     register_action("font_set", _font_set_action)
     register_action("font_page", _font_page_action)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)
@@ -413,6 +480,10 @@ def _register_panels() -> None:
     register_input("settings", "panel_timeout_seconds", {
         "handler": _settings_panel_timeout_handler,
         "prompt": "**Panel Timeout**\n\nEnter timeout in seconds (30-3600):\n\n_Reply below._",
+    })
+    register_input("settings", "ghostret_minutes", {
+        "handler": _settings_ghostret_minutes_handler,
+        "prompt": "**Ghost Seen Retention**\n\nEnter the window in minutes (30–525600):\n\n_Reply below._",
     })
 
 
@@ -696,7 +767,7 @@ def register(client, owner_id: int):
     except Exception as exc:
         logger.warning("Inline builder registration failed: %s", exc)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.menu$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^Menu$"))
     async def menu_cmd(event):
         if not is_owner(event, owner_id):
             return

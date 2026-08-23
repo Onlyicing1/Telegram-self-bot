@@ -16,10 +16,10 @@ account. A **FastAPI** micro-server runs in the same process to serve
 `/health` (Render/health checks) and a read-only React dashboard.
 
 The user interface is **Glass UI first**: an inline panel system opened via
-`.menu` and rendered through an optional helper bot. There is exactly ONE
-text dot command (`.menu`); everything else is a panel/action/input or a
-natural-language AI request addressed to the assistant (default trigger
-`Nova`).
+`Menu` and rendered through an optional helper bot. There is exactly ONE
+text command (`Menu`, literal word — no dot prefix); everything else is a
+panel/action/input or a natural-language AI request addressed to the
+assistant (default trigger `Nova`).
 
 Core subsystems:
 
@@ -68,7 +68,7 @@ backend/
 │   ├── router.py                    # register_all() wires every handler
 │   └── handlers/
 │       ├── guard.py                 # is_owner() — single permission gate
-│       ├── misc.py                  # .menu (mother panel) + settings/health/context panels
+│       ├── misc.py                  # Menu (mother panel) + settings/health/context panels
 │       ├── save.py                  # Deep Save panels/actions/inputs (no forward)
 │       ├── retrieve.py              # saved-items browser panels (under Save)
 │       ├── delete.py                # delete panels/actions/inputs
@@ -181,14 +181,15 @@ logic or are under test — see INVESTIGATION.md):
 All handlers fire on `events.NewMessage(outgoing=True)`. Every handler calls
 `is_owner(event, owner_id)` first; non-owners are silently ignored.
 
-### Dot command (exactly one)
+### Text command (exactly one)
 
 | Command | Pattern | Behavior |
 |---|---|---|
-| `.menu` | `^\.menu$` | Opens the Glass UI mother panel (inline via helper bot; falls back to edit-in-place text if the helper is unavailable). |
+| `Menu` | `^Menu$` | Opens the Glass UI mother panel (inline via helper bot; falls back to edit-in-place text if the helper is unavailable). Matching happens on the raw outgoing text — the decorative Glass UI font never affects the command. |
 
-There are no other dot commands. Legacy text commands (`.ping`, `.help`,
-`.save`, `.del`, `.bio`, `.username`, `.ai`, ...) have been removed.
+The legacy dot command `.menu` has been removed (no hidden alias).
+Legacy text commands (`.ping`, `.help`, `.save`, `.del`, `.bio`,
+`.username`, `.ai`, ...) have been removed.
 
 ### AI activation (no dot command required)
 
@@ -209,7 +210,7 @@ layer — it is an execution interface, never just a text response.
 
 ### Glass UI (primary interface)
 
-`.menu` opens the mother panel. Registered top-level panels:
+`Menu` opens the mother panel. Registered top-level panels:
 
 - **Save** (`📥`) → **Deep Save** → **Reply Mode** or **link**; plus **Retrieve**.
 - **Delete** (`🗑`) → reply-from / recent / manual-id modes.
@@ -243,7 +244,7 @@ source message
   → return an honest result string
 ```
 
-- **Glass UI flow**: `.menu` → Save → Deep Save → Reply Mode → reply to the
+- **Glass UI flow**: `Menu` → Save → Deep Save → Reply Mode → reply to the
   target message. The handler resolves `reply_to_msg_id` to the exact target
   message and passes that object to `execute_save` — never the user's reply.
 - **Reply-mode timeout**: the pending-input listener uses `timeout=None` for
