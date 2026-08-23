@@ -835,7 +835,7 @@ async def count_logs(owner_id: int) -> int:
 # ── optional ghost_chats: stats ──
 
 def _count_ghost_chats_sync() -> int | None:
-    """Count Ghost Room registry rows when the optional table is available."""
+    """Count Ghost Seen registry rows when the optional table is available."""
     db = get_db()
     if not db:
         return None
@@ -848,7 +848,7 @@ def _count_ghost_chats_sync() -> int | None:
 
 
 async def count_ghost_chats() -> int | None:
-    """Return Ghost Room row count, or None when its table is unavailable."""
+    """Return Ghost Seen row count, or None when its table is unavailable."""
     try:
         return await _run_sync(_count_ghost_chats_sync)
     except asyncio.CancelledError:

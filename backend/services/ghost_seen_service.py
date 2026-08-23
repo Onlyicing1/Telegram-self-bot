@@ -122,7 +122,9 @@ def set_reply_disclosure(chat_id: int, informed: bool) -> bool:
     flow = _pending_replies.get(chat_id)
     if not flow or flow.get("context_n") is None:
         return False
-    flow["informed"] = bool(informed)
+    if not isinstance(informed, bool):
+        return False
+    flow["informed"] = informed
     return True
 
 

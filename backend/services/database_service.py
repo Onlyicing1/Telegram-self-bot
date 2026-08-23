@@ -151,16 +151,16 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
             "**AI provider rows:** `Unavailable`"
         )
         lines.append(
-            f"**Ghost Room chats:** `{ghost_count}`"
+            f"**Ghost Seen chats:** `{ghost_count}`"
             if ghost_count is not None else
-            "**Ghost Room chats:** `Unavailable`"
+            "**Ghost Seen chats:** `Unavailable`"
         )
 
         await db_client.log(owner_id, "INFO", f"DB stats: {total} items", {
             **stats,
             "ai_usage_rows": usage_count,
             "ai_provider_rows": provider_count,
-            "ghost_room_chats": ghost_count,
+            "ghost_seen_chats": ghost_count,
         })
         record_event("database", "stats", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return "\n".join(lines)

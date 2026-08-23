@@ -289,7 +289,8 @@ a key-value store.
 | `language` | `text` | NO | `'en'` | Language code |
 | `debug_callbacks` | `boolean` | NO | `false` | Debug callback tracing |
 | `owner_only` | `boolean` | NO | `true` | Restrict commands to owner only |
-| `dashboard_font` | `text` | YES | `'default'` | Dashboard font key — one of `default`/`system`/`mono`/`serif` (see `DASHBOARD_FONTS` in `settings_service.py`); never free-text CSS |
+| `dashboard_font` | `text` | NO | `'default'` | Glass UI / dashboard font key — one of `FONT_KEYS` in `backend/helper/font_style.py` (`DASHBOARD_FONTS` == `FONT_KEYS`); never free-text CSS |
+| `ghost_seen_retention_days` | `integer` | NO | `30` | Ghost Seen registry retention window in days (1–365) |
 | `update_stale_seconds` | `integer` | NO | `300` | Update staleness threshold (seconds) |
 | `updated_at` | `timestamptz` | YES | `now()` | Last update timestamp |
 
@@ -309,7 +310,7 @@ RLS is enabled. Only SELECT is granted to `anon` + `authenticated`.
 `update_field`, `update_fields`, `reload`.
 
 **`backend/services/settings_service.py`** — cache-first reads,
-write-through cache, 12 typed getters + 12 typed setters, per-setting
+write-through cache, 13 typed getters + 13 typed setters, per-setting
 validators. See [§17 Panel Database](#17-panel-database) for details.
 
 ### Migration Status
@@ -321,7 +322,11 @@ columns were supposed to be added by migrations
 `20260730220000_panel_settings_column_model.sql` and
 `20260730230000_panel_settings_full_13_columns.sql`, but **these
 migration files do not exist** in the repository. A future migration
-must add all missing columns. See [§20](#20-migration-status) and
+must add all missing columns. Migration
+`20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
+(idempotent) now exists and covers `dashboard_font` and
+`ghost_seen_retention_days`; like all recent migrations it is pending
+manual application to the live database. See [§20](#20-migration-status) and
 [§19](#19-known-inconsistencies).
 
 ### Removed / phantom columns
@@ -814,7 +819,7 @@ On any `set_*()` call, the service:
 
 Cache and DB are never left inconsistent.
 
-### Settings (12 typed columns on panel_settings)
+### Settings (13 typed columns on panel_settings)
 
 | Column | Type | Default | Range/Constraint |
 |---|---|---|---|
@@ -829,11 +834,11 @@ Cache and DB are never left inconsistent.
 | `language` | str | `"en"` | non-empty string |
 | `debug_callbacks` | bool | `false` | must be boolean |
 | `owner_only` | bool | `true` | must be boolean |
-
-### In-Memory Fallback
+| `dashboard_font` | str | `"default"` | one of `FONT_KEYS` |
+| `ghost_seen_retention_days` | int | `30` | 1..365 (days) |
 
 If the DB is unavailable, the service uses hardcoded `_DEFAULTS` for
-all 11 settings. The bot continues to function normally — all panel
+all 13 settings. The bot continues to function normally — all panel
 operations work with default values. Every Supabase call that fails
 logs a warning and falls back silently.
 
@@ -939,6 +944,11 @@ Settings changes by the user are not persisted.
 **Resolution [MIGRATION REQUIRED]:** A future migration must add all
 10 missing columns to `panel_settings` with the types and defaults
 listed in [§6](#6-panel_settings).
+
+Migration `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
+now exists and covers `dashboard_font` and
+`ghost_seen_retention_days`; it is pending manual application. The
+remaining columns still have no migration file.
 
 ### 19.4 `bot_settings` table — orphaned transition table
 
@@ -1110,7 +1120,8 @@ documents both the `persistence.py` path and the repository interfaces.
 | 7 | `20260801215007_create_username_state_table.sql` | `username_state` | Applied |
 | 8 | `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` | Applied |
 | 9 | `20260805075707_...create_ai_config_table.sql` | `ai_config` (base columns, no triggers) | Applied (incomplete — see §19.1) |
-| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Room MVP | Pending manual application |
+| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Seen | Pending manual application |
+| 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Pending manual application |
 
 ### Missing Migration Files (referenced in prior docs but never created)
 
@@ -1149,12 +1160,14 @@ the live database in sync with this specification:
 
 ---
 
-## 22. Ghost Room (ghost_chats)
+## 22. Ghost Seen (ghost_chats)
 
 ### 22.1 Table: `ghost_chats`
 
-Durable registry of discovered private chats for the Ghost Room.
-Previews are truncated to 160 chars at write time (PII minimization).
+Durable registry of discovered private one-to-one human conversations for
+Ghost Seen. It is a SOURCE registry only — output routing is owned
+solely by the `GHOST_ROOM_ID` environment variable. Previews are
+truncated to 160 chars at write time (PII minimization).
 
 | Column | Type | Nullable | Default | Purpose |
 |---|---|---|---|---|

@@ -3,7 +3,7 @@ Execution 21 follow-up — database-management statistics extension.
 
 The contract's next unblocked item after per-message Details is the
 additive Database Statistics read surface for AI usage/provider rows and
-an optional Ghost Room registry. These tests keep all reads behind the
+an optional Ghost Seen registry. These tests keep all reads behind the
 existing repository/database abstractions and pin safe degradation.
 """
 from __future__ import annotations
@@ -127,7 +127,7 @@ def test_supabase_repository_count_degrades_when_table_read_fails(repository):
         assert repository.count(7) is None
 
 
-def test_ghost_room_count_reads_exact_rows_when_table_exists():
+def test_ghost_seen_count_reads_exact_rows_when_table_exists():
     from backend.db import client as db_client
 
     fake_db = _FakeDb(counts={"ghost_chats": 5})
@@ -135,7 +135,7 @@ def test_ghost_room_count_reads_exact_rows_when_table_exists():
         assert db_client._count_ghost_chats_sync() == 5
 
 
-def test_ghost_room_count_returns_none_without_available_database():
+def test_ghost_seen_count_returns_none_without_available_database():
     with patch("backend.db.client.get_db", return_value=None):
         from backend.db import client as db_client
         assert db_client._count_ghost_chats_sync() is None
@@ -166,7 +166,7 @@ async def test_database_stats_adds_ai_and_ghost_counts_without_changing_saved_st
     assert "**Database size estimate:** `2.0 KB`" in result
     assert "**AI usage rows:** `1`" in result
     assert "**AI provider rows:** `1`" in result
-    assert "**Ghost Room chats:** `4`" in result
+    assert "**Ghost Seen chats:** `4`" in result
     record_event.assert_called_once()
 
 
@@ -190,7 +190,7 @@ async def test_database_stats_reports_unavailable_optional_tables_and_keeps_lega
     assert "Total saved items: `3`" in result
     assert "**AI usage rows:** `Unavailable`" in result
     assert "**AI provider rows:** `Unavailable`" in result
-    assert "**Ghost Room chats:** `Unavailable`" in result
+    assert "**Ghost Seen chats:** `Unavailable`" in result
     assert "Stats error" not in result
 
 

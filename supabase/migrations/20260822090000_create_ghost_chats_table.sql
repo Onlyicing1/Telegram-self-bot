@@ -1,5 +1,5 @@
--- Migration: CREATE ghost_chats table for Ghost Room feature
--- Doc-first: see DATABASE_ARCHITECTURE.md §22 Ghost Room
+-- Migration: CREATE ghost_chats table for Ghost Seen feature
+-- Doc-first: see DATABASE_ARCHITECTURE.md §22 Ghost Seen
 -- Idempotent: safe to re-run
 
 CREATE TABLE IF NOT EXISTS ghost_chats (

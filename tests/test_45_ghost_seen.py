@@ -1,5 +1,5 @@
 """
-Focused regression tests for Ghost Room MVP.
+Focused regression tests for the Ghost Seen MVP.
 
 Covers:
 1. Config (GHOST_ROOM_ID absent → feature cleanly disabled)
@@ -183,7 +183,7 @@ class TestGhostRoomFormatting:
 class TestGhostRoomAIExecution:
     @pytest.mark.asyncio
     async def test_execute_ghost_seen_ai_uses_engine(self):
-        """Ghost Room AI must go through Engine.execute(), never call provider directly."""
+        """Ghost Seen AI must go through Engine.execute(), never call provider directly."""
         from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch, AsyncMock
 
@@ -249,7 +249,7 @@ class TestGhostRoomAIExecution:
 
     @pytest.mark.asyncio
     async def test_execute_ghost_seen_ai_session_isolation(self):
-        """Ghost Room AI must use a distinct session_id (ghost_seen:<chat_id>) for context isolation."""
+        """Ghost Seen AI must use a distinct session_id (ghost_seen:<chat_id>) for context isolation."""
         from backend.services.ghost_seen_service import execute_ghost_seen_ai
         from unittest.mock import patch, AsyncMock
 
@@ -354,7 +354,7 @@ class TestGhostSeenRetention:
 
 class TestGhostRoomDestination:
     def setup_method(self):
-        from backend.bot.handlers.ghost_seen import _ghost_room_id as orig
+        from backend.bot.handlers import ghost_seen  # noqa: F401 — ensure module is loaded
         self._old_val = os.environ.get("GHOST_ROOM_ID")
 
     def teardown_method(self):
@@ -417,7 +417,7 @@ class TestGhostRoomDestination:
 
     @pytest.mark.asyncio
     async def test_reply_sends_to_ghost_room_id_not_source_chat(self):
-        """When GHOST_ROOM_ID is set, reply must send to GHOST_ROOM_ID, not the source chat."""
+        """When GHOST_ROOM_ID is set, replies must target it — never the source chat."""
         from backend.bot.handlers.ghost_seen import (
             _ghost_reply_input, configure, _set_current_chat,
         )
@@ -442,7 +442,7 @@ class TestGhostRoomDestination:
 
     @pytest.mark.asyncio
     async def test_ai_sends_to_ghost_room_id_not_source_chat(self):
-        """Ghost Room AI response must be delivered to GHOST_ROOM_ID."""
+        """Ghost Seen AI responses must be delivered to GHOST_ROOM_ID only."""
         from backend.bot.handlers.ghost_seen import (
             _ghost_ai_input, configure, _set_current_chat,
         )
