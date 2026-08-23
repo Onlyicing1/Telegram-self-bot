@@ -13,10 +13,12 @@ Actions:
   ghost_actions           — reply/action menu for the single selected
                             message (REPLY TARGET banner + explicit
                             choices; nothing executes on selection)
-  ghost_ctx[:<n>]         — AI context choice (1 / 5 / 10 / 20 messages,
-                            target included); <n> travels in the callback
-                            data and is re-validated by the service
-  ghost_inform:<yes|no>   — AI disclosure choice (recipient informed?)
+  ghost_ctx[:<n>]         — AI Reply: no argument shows the context-size
+                            menu (1 / 5 / 10 / 20 messages, target
+                            included); choosing a size executes the reply
+                            immediately — no manual prompt, no disclosure
+                            question. <n> travels in the callback data and
+                            is re-validated by the service allow-list.
   ghost_remove            — remove the open conversation from the
                             Ghost Seen registry (registry row ONLY —
                             Telegram data is never touched)
@@ -25,10 +27,10 @@ Actions:
 Inputs:
   ghost_chat:reply          — quote-reply with typed text
   ghost_chat:reply_no_quote — reply without quote
-  ghost_chat:ai_prompt      — AI instruction; consumes a complete reply
-                              flow when one exists (context window +
-                              disclosure), else falls back to the
-                              selected-messages context
+  ghost_chat:ai_prompt      — legacy multi-select path only: an explicit
+                              typed instruction over the selected
+                              messages (the normal single-message AI
+                              reply auto-executes from ghost_ctx)
 
 Incoming listener:
   One events.NewMessage(incoming=True) listener that upserts ghost_chats
@@ -311,22 +313,29 @@ async def _ghost_actions_action(event, extra: str, chat_id: int) -> tuple[str, s
     builder = InlinePanelBuilder()
     builder.add_row("💬 Reply myself (quote)", "input:ghost_chat:reply")
     builder.add_row("💬 Reply myself (no quote)", "input:ghost_chat:reply_no_quote")
-    builder.add_row("🤖 Reply with AI", "action:ghost_ctx")
+    builder.add_row("🤖 AI Reply", "action:ghost_ctx")
     builder.add_row("⬅ Back", "action:ghost_back")
     return "👻 Reply / Actions", banner, builder.build()
 
 
 async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """AI context choice: no argument renders the menu; ``<n>`` records it.
+    """AI Reply: no argument renders the context-size menu; ``<n>`` executes.
 
-    The chosen count travels in the callback data and is re-validated
-    against the service allow-list, so execution can never use a value
-    other than one of the offered options.
+    Choosing a size is the LAST owner input. The reply is generated and
+    delivered automatically — no manual prompt composition and no
+    disclosure question exist in this flow. The count travels in the
+    callback data and is re-validated against the server-side allow-list
+    before execution.
     """
     from backend.services.ghost_seen_service import (
         get_reply_flow,
         set_reply_context_count,
+        consume_reply_flow,
+        fetch_context_window,
+        execute_ghost_seen_ai,
+        AUTO_REPLY_INSTRUCTION,
         ALLOWED_CONTEXT_COUNTS,
+        clear_selection,
     )
 
     panel_chat = _current_chat()
@@ -334,7 +343,7 @@ async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, 
     fail_builder = InlinePanelBuilder()
     fail_builder.add_row("⬅ Back", "action:ghost_back")
     if not flow:
-        return "👻 AI context", "Select a reply target first.", fail_builder.build()
+        return "👻 AI Reply", "Select a reply target first.", fail_builder.build()
 
     if not extra:
         builder = InlinePanelBuilder()
@@ -342,7 +351,11 @@ async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, 
             label = "Only this message" if n == 1 else f"{n} messages (target included)"
             builder.add_row(label, f"action:ghost_ctx:{n}")
         builder.add_row("⬅ Back", "action:ghost_actions")
-        return "👻 AI context", "How much context should the AI see?", builder.build()
+        body = (
+            "How much context should the AI see?\n\n"
+            "The AI will draft and send the reply automatically."
+        )
+        return "👻 AI Reply — context", body, builder.build()
 
     try:
         n = int(extra)
@@ -352,80 +365,59 @@ async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, 
         builder = InlinePanelBuilder()
         builder.add_row("⬅ Back", "action:ghost_ctx")
         allowed = ", ".join(str(v) for v in ALLOWED_CONTEXT_COUNTS)
-        return "👻 AI context", f"Invalid context size. Allowed: {allowed}.", builder.build()
+        return "👻 AI Reply", f"Invalid context size. Allowed: {allowed}.", builder.build()
 
-    builder = InlinePanelBuilder()
-    builder.add_row("🤖 Recipient informed", "action:ghost_inform:yes")
-    builder.add_row("🤔 Not informed", "action:ghost_inform:no")
-    builder.add_row("⬅ Back", "action:ghost_ctx")
-    body = (
-        f"AI will see up to **{n}** message(s) ending at the reply target.\n\n"
-        "Should the recipient be told the reply is AI-generated?"
-    )
-    return "👻 AI disclosure", body, builder.build()
+    # Complete flow → execute immediately (single use).
+    complete = consume_reply_flow(panel_chat)
+    if not complete or not _self_client:
+        cancel = InlinePanelBuilder()
+        cancel.add_row("⬅ Back", "action:ghost_back")
+        return "👻 AI Reply", "AI reply flow expired — select the message again.", cancel.build()
 
-
-async def _ghost_inform_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Record the disclosure choice, then arm the prompt input directly.
-
-    The user has already explicitly chosen Reply with AI, the context
-    count, and the disclosure mode — no further compose/confirmation step
-    is inserted; typing the instruction is the next (and only) action.
-    """
-    from backend.services.ghost_seen_service import (
-        get_reply_flow,
-        set_reply_disclosure,
-        cancel_reply_flow,
-    )
-
-    panel_chat = _current_chat()
-    if extra not in ("yes", "no"):
-        cancel_reply_flow(panel_chat)
-        builder = InlinePanelBuilder()
-        builder.add_row("⬅ Back", "action:ghost_actions")
-        return "👻 AI disclosure", "Invalid disclosure choice.", builder.build()
-
-    if not set_reply_disclosure(panel_chat, extra == "yes"):
-        cancel_reply_flow(panel_chat)
-        builder = InlinePanelBuilder()
-        builder.add_row("⬅ Back", "action:ghost_back")
-        return "👻 AI disclosure", "No pending AI reply. Select a message again.", builder.build()
-
-    flow = get_reply_flow(panel_chat) or {}
-    informed = extra == "yes"
-    disclosure = (
-        "recipient WILL be told it is AI-generated"
-        if informed
-        else "recipient will NOT be told it is AI-generated"
-    )
-    body = (
-        f"Context: **{flow.get('context_n')}** message(s) · {disclosure}.\n\n"
-        "Type your AI instruction now — it will run with the context above "
-        "and the response will be delivered to the Ghost Seen destination."
-    )
-
-    # Arm the AI-prompt input exactly like pressing the old compose button
-    # did (same registered handler/prompt), minus that redundant press.
     try:
-        from backend.helper.input_state import set_pending
-        from backend.helper.inline_engine import _owner_id
-        owner_id = _owner_id or _store_owner_id
-    except Exception:
-        owner_id = _store_owner_id
-    from backend.helper.panels import get_input
-    cfg = get_input("ghost_chat", "ai_prompt") or {}
-    event_chat_id = getattr(event, "chat_id", None) or 0
-    event_msg_id = getattr(event, "message_id", None) or 0
-    set_pending(
-        owner_id, "ghost_chat", cfg.get("handler"), event_chat_id or 0,
-        cfg.get("prompt", "Type your AI prompt."),
-        inline_chat_id=event_chat_id or 0,
-        inline_msg_id=event_msg_id or 0,
-    )
+        context_msgs = await fetch_context_window(
+            _self_client, panel_chat, complete["anchor"], complete["context_n"],
+        )
+    except Exception as exc:
+        logger.warning("Ghost Seen: context fetch failed: %s", exc)
+        context_msgs = []
+    if not context_msgs:
+        cancel = InlinePanelBuilder()
+        cancel.add_row("⬅ Back", "action:ghost_actions")
+        return "👻 AI Reply", "Reply-target context unavailable — try again.", cancel.build()
 
-    builder = InlinePanelBuilder()
-    builder.add_row("⬅ Back", "action:ghost_actions")
-    return "👻 Compose AI reply", body, builder.build()
+    dst = _resolve_ghost_destination()
+    if dst is None:
+        logger.warning("Ghost Seen: AI blocked — GHOST_ROOM_ID missing or invalid")
+        cancel = InlinePanelBuilder()
+        cancel.add_row("⬅ Back", "action:ghost_back")
+        return "👻 AI Reply", "AI reply blocked — Ghost Seen destination is not configured.", cancel.build()
+
+    ok, response = await execute_ghost_seen_ai(
+        _store_owner_id, dst, AUTO_REPLY_INSTRUCTION,
+        context_msgs, tz_str=_store_tz_str,
+    )
+    if ok and _self_client:
+        # Delivered verbatim — AI output is never run through the font
+        # system and never annotated with a disclosure suffix.
+        try:
+            await _self_client.send_message(dst, response)
+        except Exception as exc:
+            logger.warning("Ghost Seen: AI response delivery failed: %s", exc)
+            ok = False
+            response = "AI reply could not be delivered."
+    clear_selection(panel_chat)
+
+    done = InlinePanelBuilder()
+    done.add_row("⬅ Back", "action:ghost_back")
+    if ok:
+        body = (
+            f"✅ AI reply sent to chat `{dst}` using {complete['context_n']} "
+            "message(s) of context."
+        )
+    else:
+        body = f"⚠️ AI reply failed: {response}"
+    return "👻 AI Reply", body, done.build()
 
 
 async def _ghost_remove_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -480,66 +472,43 @@ async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inl
 
 
 async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    """Legacy multi-select path: an explicit typed instruction over the
+    selected messages. The normal single-message AI-reply flow never
+    reaches this input anymore (it auto-executes from ``ghost_ctx``)."""
     from backend.services.ghost_seen_service import (
         get_selection,
         clear_selection,
-        consume_reply_flow,
-        cancel_reply_flow,
-        fetch_context_window,
         execute_ghost_seen_ai,
-        AI_DISCLOSURE_SUFFIX,
     )
     panel_chat = _current_chat()
     dst = _resolve_ghost_destination()
     if dst is None:
         logger.warning("Ghost Seen: AI blocked — GHOST_ROOM_ID missing or invalid")
-        cancel_reply_flow(panel_chat)
         return
 
-    # A complete reply flow (anchor + context count + disclosure) takes
-    # priority; its context window is fetched deterministically. Without a
-    # flow, the legacy selected-messages context is used unchanged.
-    flow = consume_reply_flow(panel_chat)
-    if flow:
-        try:
-            context_msgs = await fetch_context_window(
-                _self_client, panel_chat, flow["anchor"], flow["context_n"],
-            )
-        except Exception as exc:
-            logger.warning("Ghost Seen: context fetch failed: %s", exc)
-            context_msgs = []
-        if not context_msgs or not _self_client:
-            cancel_reply_flow(panel_chat)
-            logger.warning("Ghost Seen: AI blocked — reply-target context unavailable")
-            return
-        informed = bool(flow.get("informed"))
-    else:
-        sel = get_selection(panel_chat)
-        if not sel or not _self_client:
-            return
-        sel_list = sorted(sel)
-        try:
-            from backend.telegram_api.messages import get_messages
-            context_msgs = await get_messages(_self_client, panel_chat, sel_list)
-        except Exception as exc:
-            logger.warning("Ghost Seen: fetch selected messages failed: %s", exc)
-            context_msgs = []
-        if not context_msgs:
-            return
-        informed = None
+    sel = get_selection(panel_chat)
+    if not sel or not _self_client:
+        return
+    sel_list = sorted(sel)
+    try:
+        from backend.telegram_api.messages import get_messages
+        context_msgs = await get_messages(_self_client, panel_chat, sel_list)
+    except Exception as exc:
+        logger.warning("Ghost Seen: fetch selected messages failed: %s", exc)
+        context_msgs = []
+    if not context_msgs:
+        return
 
     ok, response = await execute_ghost_seen_ai(
         _store_owner_id, dst, text,
         context_msgs, tz_str=_store_tz_str,
     )
     if ok and _self_client:
-        final_text = response + AI_DISCLOSURE_SUFFIX if informed else response
         try:
-            await _self_client.send_message(dst, final_text)
+            await _self_client.send_message(dst, response)
         except Exception as exc:
             logger.warning("Ghost Seen: AI response delivery failed: %s", exc)
     clear_selection(panel_chat)
-    cancel_reply_flow(panel_chat)
 
 
 # ── incoming listener ──
@@ -619,7 +588,6 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_action("ghost_back", _ghost_back_action)
         register_action("ghost_actions", _ghost_actions_action)
         register_action("ghost_ctx", _ghost_ctx_action)
-        register_action("ghost_inform", _ghost_inform_action)
         register_action("ghost_remove", _ghost_remove_action)
         register_input("ghost_chat", "reply", {
             "handler": _ghost_reply_input,

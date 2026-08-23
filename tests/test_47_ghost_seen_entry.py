@@ -135,7 +135,6 @@ class TestRegistrationIntegrity:
             "ghost_back",
             "ghost_actions",
             "ghost_ctx",
-            "ghost_inform",
             "ghost_remove",
         ):
             assert get_action(action_id) is not None, action_id

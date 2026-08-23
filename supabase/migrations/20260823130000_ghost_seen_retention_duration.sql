@@ -1,6 +1,6 @@
 -- Migration: Ghost Seen retention as a duration (seconds), replacing the
--- days-only column. Sub-day windows (e.g. 30 minutes, 2 hours) are now
--- first-class Glass UI presets.
+-- days-only column. Sub-day windows (e.g. 5 minutes, 1 hour) are now
+-- first-class Glass UI presets and 0 means "Never" (no expiry).
 --
 -- Idempotent: safe to run more than once. The backfill runs only while
 -- the legacy ghost_seen_retention_days column still exists; afterwards
@@ -33,8 +33,9 @@ END $$;
 UPDATE panel_settings
 SET ghost_seen_retention_seconds = 2592000
 WHERE ghost_seen_retention_seconds IS NULL
-   OR ghost_seen_retention_seconds < 1800
-   OR ghost_seen_retention_seconds > 31536000;
+   OR (ghost_seen_retention_seconds <> 0
+       AND (ghost_seen_retention_seconds < 300
+            OR ghost_seen_retention_seconds > 31536000));
 
 INSERT INTO panel_settings (key, ghost_seen_retention_seconds)
 VALUES ('global', 2592000)
@@ -45,4 +46,5 @@ ALTER TABLE panel_settings
 
 ALTER TABLE panel_settings
     ADD CONSTRAINT panel_settings_ghost_seen_retention_seconds_check
-    CHECK (ghost_seen_retention_seconds BETWEEN 1800 AND 31536000);
+    CHECK (ghost_seen_retention_seconds = 0
+           OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000);

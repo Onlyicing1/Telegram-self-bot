@@ -42,6 +42,14 @@ def _ghost_env(monkeypatch):
     cancel_reply_flow(CHAT)
 
 
+def _engine_mock(response="Here you go."):
+    engine = AsyncMock()
+    engine.execute.return_value = SimpleNamespace(
+        success=True, response=response, errors=[],
+    )
+    return engine
+
+
 def _register_once() -> None:
     from backend.helper.panel_registry import get_panel_def
     from backend.bot.handlers import ghost_seen
@@ -63,70 +71,62 @@ def _register_once() -> None:
 
 class TestStreamlinedAIReplyFlow:
     @pytest.mark.asyncio
-    async def test_no_ai_confirmation_between_disclosure_and_prompt(self):
-        """Choosing disclosure arms the prompt input directly — there is no
-        'do you want AI to answer?' style step and no extra button press."""
+    async def test_no_prompt_or_disclosure_step_between_context_and_execution(self):
+        """Context-size choice is the LAST owner input: the handler executes
+        immediately. No manual-prompt arming and no disclosure question can
+        exist on that path."""
+        import inspect
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
-        from backend.helper import input_state
-        from backend.helper.panels import get_input
+        from backend.services import ghost_seen_service as svc
+
+        # The disclosure API was removed entirely.
+        assert not hasattr(svc, "set_reply_disclosure")
+        assert getattr(gr, "_ghost_inform_action", None) is None
+
+        src = inspect.getsource(gr._ghost_ctx_action)
+        assert "set_pending" not in src, (
+            "context choice must never arm a manual prompt input"
+        )
+        assert "inform" not in src.lower(), "no disclosure step may exist"
+        assert "consume_reply_flow" in src, "execution follows directly"
+
+    @pytest.mark.asyncio
+    async def test_full_flow_runs_context_then_executes_immediately(self):
+        """select → AI Reply → context size → automatic execution/delivery."""
+        _register_once()
+        from unittest.mock import patch
+        from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count,
+            start_reply_flow, cancel_reply_flow,
         )
 
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
-        start_reply_flow(CHAT, 300)
-        set_reply_context_count(CHAT, 5)
-
-        event = SimpleNamespace(chat_id=999, message_id=7)
-        title, body, buttons = await gr._ghost_inform_action(event, "no", 0)
-
-        pending = input_state.get_pending(12345)
-        assert pending is not None
-        assert pending["handler"] is get_input("ghost_chat", "ai_prompt")["handler"]
-        input_state.clear_pending(12345)
-
-        datas = [
-            getattr(b, "data", b"").decode("utf-8", errors="replace")
-            for row in buttons for b in row
-        ]
-        assert not any(d.startswith("input:") for d in datas), (
-            "no redundant input/confirmation step may be offered here"
-        )
-
-    @pytest.mark.asyncio
-    async def test_full_flow_still_runs_context_then_disclosure(self):
-        """Context-count selection and disclosure remain mandatory steps."""
-        _register_once()
-        from backend.bot.handlers import ghost_seen as gr
-        from backend.helper import input_state
-        from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, get_reply_flow,
-            cancel_reply_flow,
-        )
-
-        gr.configure(AsyncMock(), 12345, "UTC")
-        gr._set_current_chat(CHAT)
         cancel_reply_flow(CHAT)
         start_reply_flow(CHAT, 400)
 
-        # Step 1 — context count is chosen first (records context_n).
-        title, body, buttons = await gr._ghost_ctx_action(None, "10", 0)
-        assert get_reply_flow(CHAT)["context_n"] == 10
+        # Step 1 — no argument renders the context-size menu only.
+        title, body, buttons = await gr._ghost_ctx_action(None, "", 0)
+        assert "action:ghost_ctx:1" in _datas(buttons)
+        assert "action:ghost_ctx:10" in _datas(buttons)
+        client.send_message.assert_not_called()
 
-        # Step 2 — then disclosure arms the input.
-        event = SimpleNamespace(chat_id=999, message_id=8)
-        title, body, buttons = await gr._ghost_inform_action(event, "yes", 0)
-        flow = get_reply_flow(CHAT)
-        assert flow["context_n"] == 10 and flow["informed"] is True
-        assert input_state.has_pending(12345)
-        input_state.clear_pending(12345)
+        # Step 2 — choosing a size executes immediately; the AI output is
+        # delivered verbatim to the GHOST_ROOM_ID destination.
+        ctx = [{"id": i, "out": False, "text": "m", "sender_name": "B",
+                "date": None} for i in range(391, 401)]
+        with patch("backend.ai.engine.engine.get_engine",
+                   return_value=_engine_mock()), \
+             patch("backend.services.ghost_seen_service.fetch_context_window",
+                   new=AsyncMock(return_value=ctx)):
+            title, body, buttons = await gr._ghost_ctx_action(None, "10", 0)
 
-        ctx_title, ctx_body, ctx_buttons = await gr._ghost_ctx_action(None, "", 0)
-        assert "action:ghost_ctx:1" in _datas(ctx_buttons)
-        assert "action:ghost_ctx:10" in _datas(ctx_buttons)
+        client.send_message.assert_called_once()
+        args, _ = client.send_message.call_args
+        assert args[0] == 88888          # GHOST_ROOM_ID destination
+        assert args[1] == "Here you go."  # verbatim AI output
 
 
 # ── 2. Retention as a user-configurable duration ──
@@ -150,16 +150,24 @@ class TestRetentionSetting:
     def test_preset_examples_from_spec_supported(self):
         from backend.services.settings_service import RETENTION_PRESETS
         seconds = {s for _, s in RETENTION_PRESETS}
-        assert {1800, 7200, 86400, 604800, 2592000} <= seconds  # 30m..30d
-        assert all(s >= 1800 for s in seconds)  # minutes-level floor
+        assert {300, 1800, 3600, 86_400, 604_800, 2_592_000} <= seconds
+        assert 0 in seconds  # "Never" is an explicit preset
+        assert len(seconds) == len(RETENTION_PRESETS)  # no duplicates
 
     def test_invalid_values_fail_safely(self):
         from backend.services import settings_service as ss
 
         old_cache = dict(ss._cache)
         try:
-            for bad in (59, 31_536_001, -1, 0, "30m", None, True):
+            # Only enumerated preset values are accepted; everything else
+            # (arbitrary ints, strings, non-ints) is rejected deterministically.
+            for bad in (59, 301, 31_536_001, -1, 100, "30m", None, True):
                 assert ss.set_ghost_seen_retention_seconds(bad) is False, repr(bad)
+            # "Never" (0) IS valid and reads back as Never.
+            assert ss.set_ghost_seen_retention_seconds(0) is True
+            assert ss.ghost_seen_retention_seconds() == 0
+            ss._cache["ghost_seen_retention_seconds"] = 3_600
+            assert ss.ghost_seen_retention_seconds() == 3_600
             # Corrupted persisted value reads back deterministically.
             ss._cache["ghost_seen_retention_seconds"] = object()
             assert ss.ghost_seen_retention_seconds() == 2_592_000
@@ -648,23 +656,27 @@ class TestDestinationInvariants:
     async def test_missing_ghost_room_id_blocks_streamlined_flow_too(self):
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
-        from backend.helper import input_state
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
+            start_reply_flow,
         )
 
-        monkey_old = os.environ.pop("GHOST_ROOM_ID", None)
+        old_val = os.environ.pop("GHOST_ROOM_ID", None)
         try:
             client = AsyncMock()
             gr.configure(client, 12345, "UTC")
             gr._set_current_chat(CHAT)
             start_reply_flow(CHAT, 900)
-            set_reply_context_count(CHAT, 1)
-            set_reply_disclosure(CHAT, True)
 
-            await gr._ghost_ai_input("hi", 0, 0, 0, 0)
-            client.send_message.assert_not_called()
-            assert not input_state.has_pending(12345)
+            ctx = [{"id": 900, "out": False, "text": "m", "sender_name": "B",
+                    "date": None}]
+            with patch("backend.ai.engine.engine.get_engine",
+                       return_value=_engine_mock()), \
+                 patch("backend.services.ghost_seen_service.fetch_context_window",
+                       new=AsyncMock(return_value=ctx)):
+                title, body, buttons = await gr._ghost_ctx_action(None, "1", 0)
+
+            client.send_message.assert_not_called()   # fail closed, always
+            assert "not configured" in body
         finally:
-            if monkey_old is not None:
-                os.environ["GHOST_ROOM_ID"] = monkey_old
+            if old_val is not None:
+                os.environ["GHOST_ROOM_ID"] = old_val

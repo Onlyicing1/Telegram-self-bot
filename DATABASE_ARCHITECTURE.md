@@ -839,7 +839,7 @@ Cache and DB are never left inconsistent.
 | `debug_callbacks` | bool | `false` | must be boolean |
 | `owner_only` | bool | `true` | must be boolean |
 | `dashboard_font` | str | `"default"` | one of `FONT_KEYS` |
-| `ghost_seen_retention_seconds` | int | `2592000` | 1800..31536000 (30 min..365 days) |
+| `ghost_seen_retention_seconds` | int | `2592000` | `0` (Never) or 300..31536000 (5 min..365 days) |
 
 If the DB is unavailable, the service uses hardcoded `_DEFAULTS` for
 all 13 settings. The bot continues to function normally — all panel

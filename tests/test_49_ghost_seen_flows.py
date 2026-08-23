@@ -1,17 +1,18 @@
 """
-Ghost Seen flows — Execution 26 focused regression tests.
+Ghost Seen flows — Execution 26/28 focused regression tests.
 
 Covers:
 1. Authoritative private-human-only source validation (registry boundary)
 2. Incoming listener delegates to the service validator (no inline bypass)
-3. Reply-flow state machine (anchor → context N → disclosure → single use)
+3. Reply-flow state machine (anchor → context N → auto-execute; single use;
+   NO manual prompt and NO disclosure question exist in the normal flow)
 4. Context window counts exactly N messages ending at the anchor
 5. REPLY TARGET banner is unambiguous and honest
-6. Actions / context / disclosure menus encode state in callback data
+6. Actions / context menus encode state in callback data
 7. Manual removal clears registry + local state only
 8. Opening a chat sets the working chat (state-tracking bug regression)
-9. AI delivery: disclosure suffix only when informed; legacy multi-select
-   unchanged; fail-closed on missing GHOST_ROOM_ID; single send per run
+9. AI delivery: response verbatim (never suffixed/styled); legacy
+   multi-select input unchanged; fail-closed on missing GHOST_ROOM_ID
 10. No second dispatcher: engine.execute remains the only execution path
 """
 from __future__ import annotations
@@ -41,6 +42,14 @@ def _register_once() -> None:
             return deco
 
     ghost_seen.register(DummyClient(), 12345, "UTC")
+
+
+def _engine_mock(response="Here you go."):
+    engine = AsyncMock()
+    engine.execute.return_value = SimpleNamespace(
+        success=True, response=response, errors=[],
+    )
+    return engine
 
 
 def _button_datas(buttons) -> list[str]:
@@ -127,7 +136,7 @@ class TestReplyFlowMachine:
         assert get_reply_flow(CHAT) is None
         start_reply_flow(CHAT, 777)
         flow = get_reply_flow(CHAT)
-        assert flow == {"anchor": 777, "context_n": None, "informed": None}
+        assert flow == {"anchor": 777, "context_n": None}
         cancel_reply_flow(CHAT)
 
     def test_context_count_only_from_allowed_set(self):
@@ -142,21 +151,16 @@ class TestReplyFlowMachine:
         for good in ALLOWED_CONTEXT_COUNTS:
             assert set_reply_context_count(CHAT, good)
 
-    def test_disclosure_requires_context_first(self):
-        from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_disclosure, set_reply_context_count,
-            cancel_reply_flow,
-        )
-        cancel_reply_flow(CHAT)
-        start_reply_flow(CHAT, 5)
-        assert not set_reply_disclosure(CHAT, True)
-        assert set_reply_context_count(CHAT, 5)
-        assert set_reply_disclosure(CHAT, True)
-        assert not set_reply_disclosure(CHAT, "yes")
+    def test_disclosure_api_removed(self):
+        """The disclosure question was removed from the normal flow — no
+        disclosure state, no suffix constant may exist anymore."""
+        import backend.services.ghost_seen_service as svc
+        assert not hasattr(svc, "set_reply_disclosure")
+        assert not hasattr(svc, "AI_DISCLOSURE_SUFFIX")
 
     def test_consume_is_single_use_and_rejects_incomplete(self):
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
+            start_reply_flow, set_reply_context_count,
             consume_reply_flow, cancel_reply_flow,
         )
         cancel_reply_flow(CHAT)
@@ -166,10 +170,8 @@ class TestReplyFlowMachine:
 
         start_reply_flow(CHAT, 9)
         set_reply_context_count(CHAT, 10)
-        set_reply_disclosure(CHAT, False)
         flow = consume_reply_flow(CHAT)
         assert flow["anchor"] == 9 and flow["context_n"] == 10
-        assert flow["informed"] is False
         assert consume_reply_flow(CHAT) is None  # consumed once
 
 
@@ -340,14 +342,16 @@ class TestHandlerWiring:
         cancel_reply_flow(CHAT)
 
     @pytest.mark.asyncio
-    async def test_ctx_menu_offers_allow_list_then_records_choice(self):
+    async def test_ctx_menu_offers_allow_list_then_executes_choice(self):
+        """Choosing a size is the LAST owner input: execution begins
+        immediately — no prompt composition and no disclosure question."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, get_reply_flow,
-            cancel_reply_flow,
+            start_reply_flow, consume_reply_flow, cancel_reply_flow,
         )
-        gr.configure(AsyncMock(), 12345, "UTC")
+        client = AsyncMock()
+        gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
         cancel_reply_flow(CHAT)
         start_reply_flow(CHAT, 777)
@@ -357,47 +361,47 @@ class TestHandlerWiring:
         for n in (1, 5, 10, 20):
             assert f"action:ghost_ctx:{n}" in datas
 
-        title, body, buttons = await gr._ghost_ctx_action(None, "5", 0)
-        assert get_reply_flow(CHAT)["context_n"] == 5
-        datas = _button_datas(buttons)
-        assert "action:ghost_inform:yes" in datas
-        assert "action:ghost_inform:no" in datas
+        ctx = [{"id": 773, "out": False, "text": "m", "sender_name": "B",
+                "date": None},
+               {"id": 777, "out": False, "text": "anchor",
+                "sender_name": "B", "date": None}]
+        with patch("backend.ai.engine.engine.get_engine",
+                   return_value=_engine_mock()), \
+             patch("backend.services.ghost_seen_service.fetch_context_window",
+                   new=AsyncMock(return_value=ctx)):
+            title, body, buttons = await gr._ghost_ctx_action(None, "5", 0)
 
+        client.send_message.assert_called_once()   # executed immediately
+        args, _ = client.send_message.call_args
+        assert args[0] == 88888                    # GHOST_ROOM_ID destination
+        assert consume_reply_flow(CHAT) is None    # flow consumed single-use
+
+        cancel_reply_flow(CHAT)
+        start_reply_flow(CHAT, 777)
         title, body, _ = await gr._ghost_ctx_action(None, "7", 0)
         assert "Invalid context size" in body
+        client.send_message.assert_called_once()   # still only the earlier send
         cancel_reply_flow(CHAT)
 
     @pytest.mark.asyncio
-    async def test_inform_records_disclosure_and_arms_input_directly(self):
-        """No redundant confirmation step: after the disclosure choice the
-        AI-prompt input is already armed — the user just types."""
+    async def test_no_disclosure_step_exists(self):
+        """The actions menu offers Reply-myself / AI-reply / Back only —
+        there is no disclosure choice and no armed prompt input anywhere."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
-        from backend.helper import input_state
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, get_reply_flow,
-            cancel_reply_flow,
+            toggle_selection, start_reply_flow,
         )
+        assert getattr(gr, "_ghost_inform_action", None) is None
+
         gr.configure(AsyncMock(), 12345, "UTC")
         gr._set_current_chat(CHAT)
-        cancel_reply_flow(CHAT)
+        toggle_selection(CHAT, 11)
         start_reply_flow(CHAT, 11)
-        set_reply_context_count(CHAT, 10)
-
-        event = SimpleNamespace(chat_id=999, message_id=42)
-        title, body, buttons = await gr._ghost_inform_action(event, "yes", 0)
-        assert get_reply_flow(CHAT)["informed"] is True
-        # The input is armed directly — no extra compose-button press.
-        assert input_state.has_pending(12345)
-        pending = input_state.get_pending(12345)
-        assert pending["panel_id"] == "ghost_chat"
-        assert pending["inline_msg_id"] == 42
-        input_state.clear_pending(12345)
-        # And the panel offers no redundant AI-prompt button.
-        assert "input:ghost_chat:ai_prompt" not in _button_datas(buttons)
-
-        title, body, _ = await gr._ghost_inform_action(None, "banana", 0)
-        assert get_reply_flow(CHAT) is None  # invalid choice cancels the flow
+        title, body, buttons = await gr._ghost_actions_action(None, "", 0)
+        datas = _button_datas(buttons)
+        assert not any("inform" in d for d in datas)
+        assert "action:ghost_ctx" in datas         # AI reply entry point intact
 
     @pytest.mark.asyncio
     async def test_remove_clears_registry_row_and_local_state_only(self, monkeypatch):
@@ -454,66 +458,37 @@ class TestAIDelivery:
         return engine
 
     @pytest.mark.asyncio
-    async def test_informed_ai_reply_appends_disclosure_suffix(self, monkeypatch):
+    async def test_auto_reply_delivered_verbatim_no_suffix(self):
+        """The normal flow delivers the AI response byte-exact to
+        GHOST_ROOM_ID — never suffixed, never font-styled."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
-            AI_DISCLOSURE_SUFFIX,
+            start_reply_flow, AUTO_REPLY_INSTRUCTION,
         )
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
         start_reply_flow(CHAT, 500)
-        set_reply_context_count(CHAT, 1)
-        set_reply_disclosure(CHAT, True)
 
         ctx = [{"id": 500, "out": False, "text": "anchor",
                 "sender_name": "Bob", "date": None}]
         with patch("backend.ai.engine.engine.get_engine",
-                   return_value=self._engine_mock()), \
+                   return_value=self._engine_mock("Natural reply text.")), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_input("say hi", 0, 0, 0, 0)
+            await gr._ghost_ctx_action(None, "1", 0)
 
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
         assert args[0] == 88888  # GHOST_ROOM_ID, never the source chat
-        assert args[1].endswith(AI_DISCLOSURE_SUFFIX)
+        assert args[1] == "Natural reply text."  # verbatim, no suffix
 
     @pytest.mark.asyncio
-    async def test_uninformed_ai_reply_has_no_suffix(self, monkeypatch):
+    async def test_legacy_multi_select_path_unchanged_verbatim(self, monkeypatch):
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
-        from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
-            AI_DISCLOSURE_SUFFIX,
-        )
-        client = AsyncMock()
-        gr.configure(client, 12345, "UTC")
-        gr._set_current_chat(CHAT)
-        start_reply_flow(CHAT, 500)
-        set_reply_context_count(CHAT, 5)
-        set_reply_disclosure(CHAT, False)
-
-        ctx = [{"id": i, "out": False, "text": "m", "sender_name": "B",
-                "date": None} for i in range(496, 501)]
-        with patch("backend.ai.engine.engine.get_engine",
-                   return_value=self._engine_mock()), \
-             patch("backend.services.ghost_seen_service.fetch_context_window",
-                   new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_input("go", 0, 0, 0, 0)
-
-        args, _ = client.send_message.call_args
-        assert not args[1].endswith(AI_DISCLOSURE_SUFFIX)
-
-    @pytest.mark.asyncio
-    async def test_legacy_multi_select_path_unchanged_no_suffix(self, monkeypatch):
-        _register_once()
-        from backend.bot.handlers import ghost_seen as gr
-        from backend.services.ghost_seen_service import (
-            toggle_selection, AI_DISCLOSURE_SUFFIX,
-        )
+        from backend.services.ghost_seen_service import toggle_selection
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
@@ -533,50 +508,48 @@ class TestAIDelivery:
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
         assert args[0] == 88888
-        assert not args[1].endswith(AI_DISCLOSURE_SUFFIX)
+        assert args[1] == "Here you go."  # verbatim
 
     @pytest.mark.asyncio
     async def test_missing_ghost_room_id_fails_closed_and_cancels_flow(self, monkeypatch):
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
-            get_reply_flow, consume_reply_flow,
+            start_reply_flow, consume_reply_flow,
         )
         monkeypatch.delenv("GHOST_ROOM_ID", raising=False)
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
         start_reply_flow(CHAT, 600)
-        set_reply_context_count(CHAT, 1)
-        set_reply_disclosure(CHAT, True)
 
+        ctx = [{"id": 600, "out": False, "text": "m", "sender_name": "B",
+                "date": None}]
         with patch("backend.ai.engine.engine.get_engine",
-                   return_value=self._engine_mock()):
-            await gr._ghost_ai_input("hi", 0, 0, 0, 0)
+                   return_value=self._engine_mock()), \
+             patch("backend.services.ghost_seen_service.fetch_context_window",
+                   new=AsyncMock(return_value=ctx)):
+            title, body, buttons = await gr._ghost_ctx_action(None, "1", 0)
 
-        client.send_message.assert_not_called()  # no fallback destination ever
-        assert consume_reply_flow(CHAT) is None  # pending flow discarded
+        client.send_message.assert_not_called()   # no fallback destination ever
+        assert "not configured" in body
+        assert consume_reply_flow(CHAT) is None   # pending flow discarded
 
     @pytest.mark.asyncio
     async def test_failed_context_fetch_blocks_send(self, monkeypatch):
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
-        from backend.services.ghost_seen_service import (
-            start_reply_flow, set_reply_context_count, set_reply_disclosure,
-        )
+        from backend.services.ghost_seen_service import start_reply_flow
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
         start_reply_flow(CHAT, 700)
-        set_reply_context_count(CHAT, 1)
-        set_reply_disclosure(CHAT, True)
 
         with patch("backend.ai.engine.engine.get_engine",
                    return_value=self._engine_mock()), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(side_effect=RuntimeError("rpc down"))):
-            await gr._ghost_ai_input("hi", 0, 0, 0, 0)
+            await gr._ghost_ctx_action(None, "1", 0)
 
         client.send_message.assert_not_called()
 

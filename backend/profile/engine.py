@@ -67,12 +67,21 @@ class ProfileEngine:
     def render(self, template: str, mood: str, text: str, tz_str: str) -> str:
         tz = self.get_tz(tz_str)
         now = datetime.now(tz)
-        return (
+        value = (
             (template or self.default_template)
             .replace("{time}", now.strftime("%H:%M"))
             .replace("{mood}", mood or "😊")
             .replace("{text}", text or "")
         )
+        # The owner-selected Glass UI font applies to the visible profile
+        # field (letters and supported digits). Defensive: a bad font state
+        # must never break the profile update.
+        try:
+            from backend.helper.font_style import apply_font
+            from backend.services import settings_service
+            return apply_font(value, settings_service.dashboard_font())
+        except Exception:
+            return value
 
     async def updater(self, owner_id: int, tz_str: str) -> dict[str, str] | None:
         """Called by the shared profile scheduler each minute.

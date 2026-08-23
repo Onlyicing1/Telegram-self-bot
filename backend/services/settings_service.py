@@ -108,8 +108,17 @@ def _validate_dashboard_font(value: Any) -> bool:
     return isinstance(value, str) and value in DASHBOARD_FONTS
 
 
+# Ghost Seen retention: ONE clean enumerated setting. The persisted unit
+# is seconds; 0 means "Never". Arbitrary values are not accepted.
+RETENTION_NEVER = 0
+_RETENTION_MIN_SECONDS = 300
+_DEFAULT_RETENTION = 2_592_000  # 30 days
+
+
 def _validate_ghost_seen_retention(value: Any) -> bool:
-    return _validate_int_range(1_800, 31_536_000)(value)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return value == RETENTION_NEVER or _RETENTION_MIN_SECONDS <= value <= 31_536_000
 
 
 _VALIDATORS: dict[str, ValidatorFn] = {
@@ -321,18 +330,28 @@ def set_dashboard_font(value: str) -> bool:
     return set_setting("dashboard_font", value)
 
 
-# Ghost Seen retention presets offered in the Glass UI: (label, seconds).
-# Sub-day durations are first-class; the persisted unit is seconds.
+# Ghost Seen retention presets offered in the Glass UI.
 RETENTION_PRESETS: tuple[tuple[str, int], ...] = (
+    ("5 minutes", 300),
     ("30 minutes", 1_800),
-    ("2 hours", 7_200),
+    ("1 hour", 3_600),
+    ("6 hours", 21_600),
     ("12 hours", 43_200),
     ("1 day", 86_400),
+    ("3 days", 259_200),
     ("7 days", 604_800),
     ("30 days", 2_592_000),
+    ("Never", RETENTION_NEVER),
 )
 
 _RETENTION_PRESET_SECONDS = frozenset(s for _, s in RETENTION_PRESETS)
+
+
+def set_ghost_seen_retention_seconds(seconds: int) -> bool:
+    # Strictly enumerated: only preset values (incl. Never = 0) are accepted.
+    if not is_retention_preset(seconds):
+        return False
+    return set_setting("ghost_seen_retention_seconds", seconds)
 
 
 def format_duration(seconds: int) -> str:
@@ -353,22 +372,25 @@ def format_duration(seconds: int) -> str:
 
 
 def is_retention_preset(value: int) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value in _RETENTION_PRESET_SECONDS
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value in _RETENTION_PRESET_SECONDS
+    )
 
 
 def ghost_seen_retention_seconds() -> int:
-    """Ghost Seen registry retention window in seconds (30 min..365 days).
+    """Ghost Seen registry retention window in seconds.
 
-    Missing or invalid persisted values fall back deterministically to the
-    30-day default; a bad setting can never crash the Ghost Seen panel.
+    ``0`` means Never. Missing or invalid persisted values fall back
+    deterministically to the 30-day default; a bad setting can never
+    crash the Ghost Seen panel.
     """
     _ensure_loaded()
     try:
-        value = int(_cache.get("ghost_seen_retention_seconds", 2_592_000))
+        value = int(_cache.get("ghost_seen_retention_seconds", _DEFAULT_RETENTION))
     except (TypeError, ValueError):
-        return 2_592_000
-    return value if 1_800 <= value <= 31_536_000 else 2_592_000
-
-
-def set_ghost_seen_retention_seconds(seconds: int) -> bool:
-    return set_setting("ghost_seen_retention_seconds", seconds)
+        return _DEFAULT_RETENTION
+    if value == RETENTION_NEVER:
+        return RETENTION_NEVER
+    return value if _RETENTION_MIN_SECONDS <= value <= 31_536_000 else _DEFAULT_RETENTION

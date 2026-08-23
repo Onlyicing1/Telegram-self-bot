@@ -85,13 +85,22 @@ def set_page(chat_id: int, page: int) -> None:
 
 
 # ── pending AI reply flow state ──
-# Keyed by chat_id: {"anchor": msg_id, "context_n": int | None,
-#                    "informed": bool | None}
+# Keyed by chat_id: {"anchor": msg_id, "context_n": int | None}
 # Each step of the Glass UI flow writes exactly one field; execution
-# consumes the record once and clears it.
+# consumes the record once and clears it. There is deliberately NO manual
+# prompt and NO disclosure question: choosing AI Reply and the context
+# size is the complete owner input — the AI drafts the reply itself.
 _pending_replies: dict[int, dict[str, Any]] = {}
 
 ALLOWED_CONTEXT_COUNTS = (1, 5, 10, 20)
+
+#: Fixed instruction for the normal AI-reply flow. The anchor message is
+#: the reply target; the context window is the conversation.
+AUTO_REPLY_INSTRUCTION = (
+    "Write a natural, friendly reply to the LAST message in this "
+    "conversation (the one marked as the reply target). Match the "
+    "conversation's language and tone. Output only the reply text."
+)
 
 
 def start_reply_flow(chat_id: int, anchor_msg_id: int) -> None:
@@ -99,7 +108,6 @@ def start_reply_flow(chat_id: int, anchor_msg_id: int) -> None:
         _pending_replies[chat_id] = {
             "anchor": int(anchor_msg_id),
             "context_n": None,
-            "informed": None,
         }
 
 
@@ -118,22 +126,12 @@ def set_reply_context_count(chat_id: int, n: int) -> bool:
     return True
 
 
-def set_reply_disclosure(chat_id: int, informed: bool) -> bool:
-    flow = _pending_replies.get(chat_id)
-    if not flow or flow.get("context_n") is None:
-        return False
-    if not isinstance(informed, bool):
-        return False
-    flow["informed"] = informed
-    return True
-
-
 def consume_reply_flow(chat_id: int) -> dict[str, Any] | None:
     """Return the complete flow record and clear it (single use)."""
     flow = _pending_replies.pop(chat_id, None)
     if not flow:
         return None
-    if flow.get("anchor") and flow.get("context_n") and flow.get("informed") is not None:
+    if flow.get("anchor") and flow.get("context_n"):
         return flow
     return None
 
@@ -316,12 +314,15 @@ def apply_retention(
     """Split registry rows into (kept, expired_ids).
 
     Deterministic lazy expiry: a row expires when its ``last_message_at``
-    is older than ``retention_seconds``. Rows without a timestamp are
-    kept. The window is clamped to [30 minutes, 365 days]; registry rows
-    are removed ONLY — Telegram data is never touched.
+    is older than ``retention_seconds``. ``retention_seconds <= 0`` means
+    "Never" — nothing expires. Rows without a timestamp are kept. The
+    window is clamped to [5 minutes, 365 days]. Registry rows are removed
+    ONLY — Telegram data and read state are never touched.
     """
     now = now or datetime.now(timezone.utc)
-    seconds = max(1800, min(31_536_000, int(retention_seconds)))
+    if retention_seconds is None or int(retention_seconds) <= 0:
+        return list(rows), []  # "Never" — nothing expires
+    seconds = max(300, min(31_536_000, int(retention_seconds)))
     cutoff = now.timestamp() - seconds
     kept: list[dict[str, Any]] = []
     expired: list[int] = []
@@ -402,6 +403,33 @@ async def ensure_entity(client: Any, chat_id: int) -> bool:
         return False
 
 
+def _sender_name_of(raw: Any) -> str:
+    """Resolve a display name from a Telethon message's cached sender.
+
+    Passive: reads only the entity the client already resolved. Returns
+    '' when unavailable — the formatter then falls back to the sender ID
+    plus the explicit FROM ME/FROM THEM direction label, so a message is
+    never visually ambiguous about its sender.
+    """
+    sender = getattr(raw, "sender", None)
+    if sender is None:
+        return ""
+    first = getattr(sender, "first_name", "") or ""
+    last = getattr(sender, "last_name", "") or ""
+    name = f"{first} {last}".strip()
+    if not name:
+        name = getattr(sender, "username", "") or ""
+    return name.strip() if isinstance(name, str) else ""
+
+
+def _serialize_with_sender(raw: Any) -> dict[str, Any]:
+    d = serialize_message(raw)
+    name = _sender_name_of(raw)
+    if name:
+        d["sender_name"] = name
+    return d
+
+
 async def fetch_chunk(
     client: Any,
     chat_id: int,
@@ -434,7 +462,7 @@ async def fetch_chunk(
 
     raw.reverse()
     start = page * chunk_size
-    return [serialize_message(m) for m in raw[start:start + chunk_size]], ""
+    return [_serialize_with_sender(m) for m in raw[start:start + chunk_size]], ""
 
 
 async def fetch_context_window(
@@ -478,7 +506,7 @@ async def fetch_context_window(
             )
 
     window = sorted(list(older) + [anchor_raw], key=lambda m: getattr(m, "id", 0))
-    return [serialize_message(m) for m in window]
+    return [_serialize_with_sender(m) for m in window]
 
 
 # ── AI dispatch (existing engine path only) ──
@@ -550,8 +578,6 @@ async def execute_ghost_seen_ai(
 
 
 # ── formatting helpers ──
-
-AI_DISCLOSURE_SUFFIX = "\n\n🤖 _This reply was drafted with an AI assistant._"
 
 
 def _format_sender(msg: dict[str, Any]) -> str:
@@ -628,7 +654,7 @@ def format_chat_view_item(
 
 
 def format_reply_target(anchor: dict[str, Any], owner_id: int) -> str:
-    """Unambiguous reply-target banner for the selected message (Part G)."""
+    """Unambiguous reply-target banner for the selected message."""
     mid = anchor.get("id", 0)
     direction = direction_label(anchor, owner_id)
     sender = _format_sender(anchor)
@@ -640,6 +666,9 @@ def format_reply_target(anchor: dict[str, Any], owner_id: int) -> str:
         f"↩ **Reply target:** #{mid} · {direction}",
         f"Sender: **{sender}**",
     ]
+    ts = format_relative(anchor.get("date"))
+    if ts:
+        lines.append(f"Time: {ts}")
     if text:
         lines.append(f'Content: "{text}"')
     lines.append("_The next manual or AI reply targets this message._")

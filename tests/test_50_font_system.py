@@ -4,7 +4,8 @@ Glass UI font system — Execution 26 focused regression tests.
 Covers:
 1. ≥20 readable font choices in ONE authoritative allow-list
 2. Deterministic transforms; invalid/missing values fall back to default
-3. IDs (`S0001`), digits, code spans, URLs and Persian text are never styled
+3. IDs (`S0001`), code spans, URLs and Persian text are never styled;
+   standalone digit runs ARE styled when the font provides numerals
 4. Buttons inherit the selected font while callback DATA stays byte-identical
 5. Restart safety: missing DB → deterministic defaults; valid value reloads
 6. Invalid selections rejected without changing the persisted value
@@ -39,14 +40,30 @@ class TestFontRegistry:
                 assert first != "Hello", key  # letters actually restyled
 
     def test_protected_tokens_survive_every_font(self):
-        from backend.helper.font_style import FONT_KEYS, apply_font
+        from backend.helper.font_style import (
+            FONT_KEYS, apply_font, font_has_digit_glyphs,
+        )
         for key in FONT_KEYS:
             out = apply_font(SAMPLE, key)
             assert "`S0001`" in out, key          # code span untouched
             assert "https://t.me/x" in out, key   # URL untouched
-            assert "123" in out, key              # digits untouched
             assert "سلام" in out, key             # Persian untouched
-            assert "!" in out and "@" not in out.replace("@t.me", "@t.me"), key
+            if font_has_digit_glyphs(key):
+                assert "123" not in out, key      # standalone digits styled
+            else:
+                assert "123" in out, key          # system digits preserved
+
+    def test_standalone_numbers_are_styled_when_glyphs_exist(self):
+        from backend.helper.font_style import (
+            FONT_KEYS, apply_font, font_has_digit_glyphs,
+        )
+        for key in FONT_KEYS:
+            out = apply_font("12:34", key)
+            if font_has_digit_glyphs(key):
+                assert "12:34" not in out and "34" not in out, key
+                assert ":" in out, key            # punctuation untouched
+            else:
+                assert "12:34" in out, key
 
     def test_bare_mixed_ids_are_never_partially_styled(self):
         from backend.helper.font_style import FONT_KEYS, apply_font

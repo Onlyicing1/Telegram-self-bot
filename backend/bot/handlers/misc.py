@@ -145,15 +145,15 @@ _font_page: int = 0
 
 
 def _font_panel_page(current_key: str) -> tuple[str, str, list]:
-    from backend.helper.font_style import FONT_KEYS, _FONT_BY_KEY
+    from backend.helper.font_style import FONT_KEYS, _FONT_BY_KEY, font_option_label
 
     pages = [FONT_KEYS[i:i + _FONT_PAGE_SIZE] for i in range(0, len(FONT_KEYS), _FONT_PAGE_SIZE)]
     page = min(max(_font_page, 0), len(pages) - 1) if pages else 0
     builder = InlinePanelBuilder()
     for key in pages[page] if pages else ():
-        font = _FONT_BY_KEY[key]
         mark = "✓" if key == current_key else "·"
-        builder.add_row(f"{mark} {font.label}", f"action:font_set:{key}")
+        # Each option demonstrates itself in its own style.
+        builder.add_row(f"{mark} {font_option_label(key)}", f"action:font_set:{key}")
     if len(pages) > 1:
         builder.add_buttons(
             ("◀ Prev", "action:font_page:prev"),
@@ -210,7 +210,6 @@ async def _ghostret_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     for text, seconds in settings_service.RETENTION_PRESETS:
         mark = "✓" if seconds == current else "·"
         builder.add_row(f"{mark} {text}", f"action:ghostret_set:{seconds}")
-    builder.add_row("✏️ Custom (minutes)", "input:settings:ghostret_minutes")
     builder.add_row("⬅ Back", "panel:settings")
     body = (
         f"**Ghost Seen Retention**\n\n"
@@ -232,33 +231,6 @@ async def _ghostret_set_action(event, extra: str, chat_id: int) -> tuple[str, st
         return "Ghost Seen Retention", "Invalid duration — keeping the previous value.", []
     settings_service.set_ghost_seen_retention_seconds(seconds)
     return await _ghostret_panel_handler(event, extra)
-
-
-async def _settings_ghostret_minutes_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    from backend.services import settings_service
-    from backend.helper.inline_engine import _self_client
-    text = text.strip()
-    if not text.isdigit():
-        result = "Please enter a number of minutes between 30 and 525600."
-    else:
-        seconds = int(text) * 60
-        ok = settings_service.set_ghost_seen_retention_seconds(seconds)
-        result = (
-            f"Ghost Seen retention set to {settings_service.format_duration(seconds)}"
-            if ok
-            else "Value must be between 30 minutes and 365 days."
-        )
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            await helper.edit_message(inline_chat_id, inline_msg_id, result)
-        except Exception as exc:
-            logger.warning("settings ghostret inline edit failed: %s", exc)
-    if _self_client:
-        try:
-            await _self_client.delete_messages(chat_id, [msg_id])
-        except Exception:
-            pass
 
 
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -480,10 +452,6 @@ def _register_panels() -> None:
     register_input("settings", "panel_timeout_seconds", {
         "handler": _settings_panel_timeout_handler,
         "prompt": "**Panel Timeout**\n\nEnter timeout in seconds (30-3600):\n\n_Reply below._",
-    })
-    register_input("settings", "ghostret_minutes", {
-        "handler": _settings_ghostret_minutes_handler,
-        "prompt": "**Ghost Seen Retention**\n\nEnter the window in minutes (30–525600):\n\n_Reply below._",
     })
 
 
