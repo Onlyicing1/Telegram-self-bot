@@ -157,8 +157,7 @@ frontend (`src/`) · all other handlers · live database.
 ### Commit hash
 
 - Execution-28 completion: `39f9134`
-- You.com provider implementation + report: see git log for HEAD (hash
-  finalized at push time)
+- You.com provider implementation + report: `fb2e7cab449b3c52676b5b5dfd03f8999ecabac9`
 
 ### Push result
 
