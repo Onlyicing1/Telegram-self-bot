@@ -180,6 +180,7 @@ class TestGhostRoomFormatting:
 # ── 5. AI execution goes through engine ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestGhostRoomAIExecution:
     @pytest.mark.asyncio
     async def test_execute_ghost_seen_ai_uses_engine(self):
@@ -283,6 +284,7 @@ class TestGhostRoomIncoming:
 # ── 7. Integration: no second dispatcher ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestGhostRoomNoSecondArchitecture:
     def test_ai_path_is_engine_execute(self):
         """The only AI execution import should be engine.execute."""
@@ -371,6 +373,7 @@ class TestGhostSeenRetention:
 # ── 9. Destination routing (GHOST_ROOM_ID enforcement) ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestGhostRoomDestination:
     def setup_method(self):
         from backend.bot.handlers import ghost_seen  # noqa: F401 — ensure module is loaded

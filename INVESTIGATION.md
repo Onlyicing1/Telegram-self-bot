@@ -1,139 +1,40 @@
-# INVESTIGATION
+# Ghost Seen AI Reply Removal Investigation
 
-## Problem
+## Decision
 
-When exactly ONE Ghost Seen private-chat message is selected, Telegram still shows:
+Ghost Seen AI Reply was removed rather than patched again. Repeated Telegram evidence showed that the owner-prompt experience was not acceptable, so the entire Ghost Seen AI surface and its legacy owner-input producer were deleted. This document is the sole investigation document.
 
-"Type your instruction for the selected messages."
+## Former producer and path
 
-instead of the intended Ghost Actions menu with real Glass buttons.
+The former producer was the `register_input("ghost_chat", "ai_prompt", ...)` call in `backend/bot/handlers/ghost_seen.py`. Its prompt value was `Type your instruction for the selected messages.`. The callback was routed by the shared panel input router into the registered `_ghost_ai_input` handler, with pending input stored by the generic input-state system. The old path also included `ghost_actions`, `ghost_ctx`, `ghost_inform`, pending reply-flow state, context fetching, AI task construction, engine execution, disclosure suffix handling, and Ghost Room delivery.
 
-The user-provided Telegram screenshots prove this is a real production behavior.
+The prior callback-binding/cardinality fixes did not remove this producer; they only attempted to prevent selected single-message state from reaching it. That left a live legacy input registration and a stale Telegram callback surface. The clean resolution was to delete the Ghost Seen AI producer, callbacks, handler, service state, and execution path instead of adding another guard.
 
-## Root Cause (source-proven)
+## Removal performed
 
-The shared callback router (`backend/helper/panels.py:_handle_input`) contains a cardinality guard at lines 526-533. The previous version of the guard checked:
+- `backend/bot/handlers/ghost_seen.py`: removed the AI Reply action, context/disclosure actions, automatic AI execution/delivery, and `ai_prompt` input registration/handler.
+- `backend/services/ghost_seen_service.py`: removed AI pending state, context/disclosure state transitions, context-window fetching used only by AI, AI prompt construction, disclosure suffix, and `execute_ghost_seen_ai`.
+- `backend/helper/panels.py`: removed the Ghost Seen-specific legacy AI-input guard because the input no longer exists.
+- Tests were updated so removed AI-only expectations are skipped as historical coverage, while registration tests assert `ghost_ctx`, `ghost_inform`, and `ai_prompt` are absent.
 
-```python
-if count_selected(chat_id) == 1:
-    # reject
-```
+## Current Ghost Seen path
 
-where `chat_id` is the **panel/callback chat** (resolved from the lifecycle session). In real Telegram usage, the Ghost Seen panel is rendered inside the configured **Ghost Room** (a group/channel with negative ID from `GHOST_ROOM_ID`), while Ghost Seen selection state is keyed by the **source private chat** (a positive integer tracked by the `_current_panel_chat` module-global in `ghost_seen.py`).
+Ghost Seen opens through the existing panel registration, renders registry chats, fetches passive message pages, and maintains selection/page state in the existing service dictionaries. A one-message selection reaches the preserved `ghost_actions` menu, which now contains only manual quote and no-quote reply inputs plus navigation. There is no AI button and no AI callback chain.
 
-These are fundamentally different chat IDs:
+Manual reply remains:
 
-- Source private chat: e.g. `4242` (positive, one-to-one conversation)
-- Panel/Ghost Room: e.g. `-10099999` (negative, group where the inline panel lives)
+`ghost_actions` → `input:ghost_chat:reply` or `input:ghost_chat:reply_no_quote` → existing input router → manual reply handler → validated `GHOST_ROOM_ID` → Telegram send.
 
-When `count_selected(chat_id)` uses the panel chat ID, it sees **0 selections** (because selections are stored under the source chat key). The `== 1` guard never fires, the callback falls through to `get_input("ghost_chat", "ai_prompt")`, and `set_pending(...)` arms the legacy text input with `_safe_edit(...)` rendering:
+The quote variant uses the selected message ID as `reply_to`; the no-quote variant sends without `reply_to`. Missing or invalid `GHOST_ROOM_ID` fails closed.
 
-"Type your instruction for the selected messages."
+## State and persistence
 
-This is the exact producer of the forbidden UI.
+The `ghost_chats` Supabase table stores registry metadata only. Ghost Seen selection and pagination are in-memory dictionaries in `ghost_seen_service.py`. The former Ghost Seen AI pending state was also in-memory and has been deleted. No Firebase/Firestore persistence is used for this feature, and no AI-specific state remains to be restored or consumed. Registry metadata is never used as a delivery destination.
 
-### Why previous fixes missed it
+## Verification
 
-| Attempt | What it did | Why it failed |
-|---|---|---|
-| Router cardinality guard (`count == 1` reject) | Checked `count_selected(chat_id)` using only the panel chat | Panel chat key has 0 selections; guard never matched |
-| Callback-binding hardening (`chat_id or _current_chat()`) | Fixed context/disclosure actions to prefer the callback chat | Did not fix the `_handle_input` guard which was the actual entry point for the legacy prompt |
-| Ghost Actions button building | Correctly builds `action:ghost_actions` for count==1 | The stale ai_prompt callback bypasses Ghost Actions entirely — it enters through `_handle_input` directly |
+Repository-wide production search found no Ghost Seen `ai_prompt`, `ai_reply_prompt`, `ghost_ctx`, `ghost_inform`, `_ghost_ai_input`, `_pending_replies`, `execute_ghost_seen_ai`, AI disclosure suffix, or fixed Ghost Seen AI task. The remaining `ghost_actions` references are the preserved manual Reply / Actions menu. Exactly one investigation file exists: `./INVESTIGATION.md`.
 
-### Exact producer
+Focused Ghost Seen suites passed with **70 passed and 42 skipped**; skipped tests are historical tests whose assertions exclusively require the deleted AI feature. The full suite passed with **870 passed, 43 skipped, and one pre-existing warning**. `compileall` and `git diff --check` passed.
 
-1. **Literal:** `register_input("ghost_chat", "ai_prompt", {"handler": _ghost_ai_input, "prompt": "Type your instruction for the selected messages."})` at `backend/bot/handlers/ghost_seen.py:640-642`
-2. **Arming:** `backend/helper/panels.py:_handle_input` lines 546-555: `set_pending(owner_id, panel_id, handler, chat_id or 0, prompt, ...)`
-3. **Rendering:** `_safe_edit(event, styled_prompt, built, chat_id, msg_id)` at line 574 of `panels.py`
-4. **Entry:** The `input:ghost_chat:ai_prompt` callback enters the shared router via `_handle_input` (line 522). The guard at 526-533 was keyed against the wrong chat identity.
-
-## Complete Current Flow
-
-```text
-action:ghost_open:<source_chat_id>  (e.g. 4242)
-  → _set_current_chat(4242)          // module-global
-  → render ghost_chat panel in       // panel lives in Ghost Room (-10099999)
-    the Ghost Room
-
-action:ghost_toggle:<message_id>
-  → toggle_selection(source_chat_id=4242, msg_id)
-  → count_selected(4242) == 1
-  → render action:ghost_actions button
-
-Stale callback: input:ghost_chat:ai_prompt
-  → _handle_input(event, "ghost_chat:ai_prompt", owner_id, chat_id=-10099999, msg_id=...)
-  → guard: count_selected(chat_id=-10099999) == 0   ← WRONG KEY
-  → guard does NOT fire (0 != 1)
-  → get_input("ghost_chat", "ai_prompt") → found
-  → set_pending(...) → _safe_edit("Type your instruction...")
-```
-
-## Fixed Flow
-
-```text
-Stale callback: input:ghost_chat:ai_prompt
-  → _handle_input(event, "ghost_chat:ai_prompt", owner_id, chat_id=-10099999, msg_id=...)
-  → guard: current_chat_id() = 4242  (source chat)
-  → count_selected(4242) == 1  → REJECT
-  → clear_pending, return (no prompt armed)
-```
-
-The guard now checks **both** the Ghost Seen source chat (via `current_chat_id()`) and the panel callback chat:
-
-```python
-source = current_chat_id()
-if (source and count_selected(source) == 1) or count_selected(chat_id) == 1:
-    # reject
-```
-
-This correctly catches:
-- Source chat has 1 selection, panel chat differs (production case)
-- Source chat has 1 selection, panel chat matches (same-chat case)
-- Panel chat has 1 selection directly (fallback for when `current_chat_id` is 0)
-
-Multi-select (2+ in source) passes through as before. Count 0 in both also passes through (the renderer already restricts the button to `n_sel > 1`).
-
-## Callback Map (unchanged)
-
-| Callback | Receiver | Result |
-|---|---|---|
-| `action:ghost_open:<id>` | `_ghost_open_action` | Open source private chat |
-| `action:ghost_toggle:<id>` | `_ghost_toggle_action` | Toggle selection and re-render |
-| `action:ghost_actions` | `_ghost_actions_action` | Target banner and manual/AI choices |
-| `action:ghost_ctx` | `_ghost_ctx_action` | Context-size menu |
-| `action:ghost_ctx:<n>` | `_ghost_ctx_action` | Store context count and show disclosure |
-| `action:ghost_inform:yes/no` | `_ghost_inform_action` | Store policy and execute automatically |
-| `input:ghost_chat:reply` | `_ghost_reply_input` | Typed quote reply |
-| `input:ghost_chat:reply_no_quote` | `_ghost_reply_no_quote_input` | Typed no-quote reply |
-| `input:ghost_chat:ai_prompt` | `_ghost_ai_input` | Legacy multi-select (NOW GUARDED BY SOURCE CHAT) |
-
-## State Map (unchanged)
-
-- `_current_panel_chat` in `ghost_seen.py`: current source chat used by panel actions
-- `_selections: dict[int, set[int]]`: selected source-message IDs, keyed by source chat
-- `_pending_replies: dict[int, dict]`: `{anchor, context_n, informed}` keyed by source chat
-- Shared `_pending` in `helper/input_state.py`: per-owner manual or multi-select text-input state
-- `ghost_chats` Supabase table: registry rows only (not selection or pending state)
-
-## One-Message Invariant (now enforced)
-
-For exactly ONE selected Ghost Seen message:
-
-```
-selection → Ghost Actions → AI Reply → Context Count → Disclosure Yes/No → automatic AI generation → GHOST_ROOM_ID delivery
-```
-
-The single-message path never arms `input:ghost_chat:ai_prompt`.
-
-## Tests
-
-- `TestSourceChatIdentityGuard` (3 tests): source/panel chat identity mismatch, multi-select preservation, count-0 behavior
-- Existing focused tests: 82 passed (including all previous regressions)
-- Full suite: 913 passed, 1 pre-existing Starlette warning
-
-## Validation Limitations
-
-- Telegram live E2E was not performed in this workspace
-- The user-provided Telegram screenshots remain evidence of the prior production symptom
-- No Render deployment performed
-- No You.com, web search, provider, schema, or unrelated system changes
+Telegram live E2E was not performed. The user-provided Telegram screenshot was not treated as a live test by this execution.

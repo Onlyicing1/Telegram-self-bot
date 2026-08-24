@@ -32,14 +32,8 @@ CHAT = 4242
 def _ghost_env(monkeypatch):
     monkeypatch.setenv("GHOST_ROOM_ID", "88888")
     yield
-    from backend.services.ghost_seen_service import (
-        clear_selection,
-        cancel_reply_flow,
-        reset_chat_state,
-    )
+    from backend.services.ghost_seen_service import reset_chat_state
     reset_chat_state(CHAT)
-    clear_selection(CHAT)
-    cancel_reply_flow(CHAT)
 
 
 def _engine_mock(response="Here you go."):
@@ -69,6 +63,7 @@ def _register_once() -> None:
 # ── 1. Streamlined AI reply flow ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestStreamlinedAIReplyFlow:
     @pytest.mark.asyncio
     async def test_disclosure_step_precedes_immediate_execution(self):
@@ -399,6 +394,7 @@ class TestFontCoverageBioUsername:
             ss._cache.update(old_cache)
 
     @pytest.mark.asyncio
+    @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
     async def test_ai_response_never_receives_decorative_font(self):
         """AI-generated text must reach the destination byte-identical —
         the selected UI font applies to Glass UI only."""
@@ -615,6 +611,7 @@ class TestEntityResolutionRootCause:
         assert "No messages in this conversation yet." in body
 
     @pytest.mark.asyncio
+    @pytest.mark.skip(reason="Ghost Seen AI Reply action was removed")
     async def test_reply_target_banner_resolves_entity_first(self):
         """The anchor fetch also benefits from the entity-resolution fix."""
         _register_once()
@@ -637,6 +634,7 @@ class TestEntityResolutionRootCause:
 # ── 6. Destination invariants unchanged ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestDestinationInvariants:
     @pytest.mark.asyncio
     async def test_every_output_path_uses_ghost_room_id(self):

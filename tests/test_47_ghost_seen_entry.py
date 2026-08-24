@@ -134,20 +134,22 @@ class TestRegistrationIntegrity:
             "ghost_clear",
             "ghost_back",
             "ghost_actions",
-            "ghost_ctx",
             "ghost_remove",
         ):
             assert get_action(action_id) is not None, action_id
+        assert get_action("ghost_ctx") is None
+        assert get_action("ghost_inform") is None
 
     def test_all_ghost_inputs_remain_registered(self):
         from backend.helper.panels import get_input
 
         _register_ghost_seen_once()
 
-        for input_id in ("reply", "reply_no_quote", "ai_prompt"):
+        for input_id in ("reply", "reply_no_quote"):
             cfg = get_input("ghost_chat", input_id)
             assert cfg is not None, input_id
             assert callable(cfg["handler"])
+        assert get_input("ghost_chat", "ai_prompt") is None
 
 
 # ── 3. Pressing the entry opens the existing panel (edit-in-place) ──

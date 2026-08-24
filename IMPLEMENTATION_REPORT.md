@@ -1,84 +1,51 @@
-# Implementation Report — LifeOS Telegram Self-Bot
+# Implementation Report — Ghost Seen AI Reply Removal
 
-## Task / Result
+## Result
 
-Completed the Ghost Seen single-message AI reply hardening. The legacy `ai_prompt` callback is rejected using the Ghost Seen source-chat selection state, so exactly one selected message follows the callback-only path:
+Ghost Seen AI Reply was intentionally removed. Ghost Seen now provides only its normal registry, passive message inspection, selection/navigation, and manual quote/no-quote reply behavior.
 
-`Ghost Actions → AI Reply → context count → disclosure Yes/No → automatic AI generation → validated Ghost Seen delivery`.
+## Production files changed
 
-No You.com, web search, provider, schema, frontend, or Render files were changed.
+- `backend/bot/handlers/ghost_seen.py` — removed the AI Reply UI, context/disclosure actions, automatic generation/delivery, and legacy `ai_prompt` registration/handler.
+- `backend/services/ghost_seen_service.py` — removed Ghost Seen AI pending state, context/disclosure state, prompt construction, disclosure suffix, context-window helper, and AI execution helper.
+- `backend/helper/panels.py` — removed the obsolete Ghost Seen-specific `ai_prompt` router guard.
+- `INVESTIGATION.md` — documented the confirmed intentional removal.
+- `IMPLEMENTATION_REPORT.md` — this report.
+- Ghost Seen tests — removed obsolete AI expectations from active coverage and added assertions that deleted actions/inputs are absent; historical AI-only tests are explicitly skipped.
 
-## Root Cause
+## Behavior before
 
-The shared callback router in `backend/helper/panels.py` previously checked `count_selected(chat_id)` using the panel/callback chat ID. Ghost Seen selection state is keyed by the source private chat ID tracked by `backend/bot/handlers/ghost_seen.py`. Because the panel can live in the Ghost Room while the selection belongs to a different private chat, the panel-key lookup returned zero and allowed a stale `input:ghost_chat:ai_prompt` callback to arm the legacy input.
+Ghost Seen exposed an AI Reply path and a legacy multi-select `input:ghost_chat:ai_prompt` path. The legacy producer registered the prompt text `Type your instruction for the selected messages.` and could arm shared owner-input state.
 
-## Files Changed
+## Behavior after
 
-- `backend/helper/panels.py` — validates the legacy Ghost Seen prompt against the current source-chat selection as well as the callback chat.
-- `tests/test_49_ghost_seen_flows.py` — regression coverage for differing source/panel chat identities, genuine multi-select behavior, and empty selection behavior.
-- `INVESTIGATION.md` — current source-proven investigation and callback/state map.
-- `IMPLEMENTATION_REPORT.md` — this completed delivery report.
-
-## Legacy path before the fix
-
-```text
-input:ghost_chat:ai_prompt callback
-  → _handle_input(..., chat_id=PANEL)
-  → count_selected(PANEL) == 0
-  → cardinality guard misses the SOURCE selection
-  → registered ai_prompt config is loaded
-  → set_pending(...)
-  → _safe_edit("Type your instruction for the selected messages.")
-```
-
-The literal prompt is registered at `backend/bot/handlers/ghost_seen.py` for the intentional 2+ selection legacy feature. The shared input router arms and renders it at `_handle_input` in `backend/helper/panels.py`.
-
-## Callback path after the fix
-
-```text
-action:ghost_toggle:<message_id>
-  → toggle_selection(SOURCE, message_id)
-  → count_selected(SOURCE) == 1
-  → action:ghost_actions is rendered
-  → action:ghost_ctx
-  → action:ghost_ctx:<1|5|10|20>
-  → action:ghost_inform:yes|no
-  → fixed-task execute_ghost_seen_ai(..., prompt_text="")
-  → GHOST_ROOM_ID validation
-  → delivery or honest failure
-```
-
-A stale `input:ghost_chat:ai_prompt` callback with a different panel chat now resolves `current_chat_id()` as the source key and rejects when that source has exactly one selection. It clears pending owner input and does not render or arm the legacy prompt. The intentional 2+ selection path remains available.
-
-## Single-message AI behavior
-
-The one-message flow has no owner-written AI instruction and no text input. Context size is chosen only from the existing bounded buttons. The service constructs a fixed task for replying to the other participant; owner and recipient messages are conversation data with explicit speaker labels. Disclosure is a separate boolean choice: Yes appends the existing disclosure suffix, while No does not. Both choices immediately execute generation.
-
-## Manual reply behavior
-
-`input:ghost_chat:reply` remains the owner-written quote-reply path and sends through validated `GHOST_ROOM_ID` with the selected message as `reply_to`. `input:ghost_chat:reply_no_quote` remains the separate no-quote path and sends through the same validated destination without a reply reference.
+- `AI Reply` is not rendered in Ghost Seen.
+- `ghost_ctx`, `ghost_inform`, and `ai_prompt` callbacks are not registered or generated.
+- No Ghost Seen AI state, execution path, context/disclosure flow, or AI delivery helper remains.
+- The legacy prompt literal is absent from executable Ghost Seen production code.
+- Stale Ghost Seen AI callbacks cannot resurrect the feature because no matching action/input registration remains.
+- Manual quote and no-quote reply inputs remain registered and send only through validated `GHOST_ROOM_ID`.
+- Ghost Seen still opens chats, displays messages, supports selection/deselection, pagination, clearing, Back, registry removal, and incoming private-human registry updates.
 
 ## State and persistence
 
-Ghost Seen selection, pagination, and pending single-message AI reply state are in-memory dictionaries keyed by the source private chat ID. The shared pending input record is also in memory and is cleared by the callback router before arming a new input. The `ghost_chats` Supabase table stores registry metadata only; it does not persist selection or pending reply state. Opening/switching/clearing/cancelling a Ghost Seen conversation clears its transient local state.
+Ghost Seen registry rows remain persisted in Supabase `ghost_chats`. Selection and pagination remain in-memory. Ghost Seen AI-specific pending state and input state were deleted; no AI-specific state is persisted or retained. `ghost_chats` is metadata/source registry only and is not a delivery fallback.
 
 ## Validation
 
-- Focused Ghost Seen suites (`test_49_ghost_seen_flows.py`, `test_45_ghost_seen.py`, `test_47_ghost_seen_entry.py`): **82 passed**
-- Full Python suite: **913 passed**, **1 pre-existing Starlette PendingDeprecationWarning**
-- `.venv/bin/python -m compileall -q backend`: **PASS**
-- `git diff --check`: **PASS**
-- TypeScript check: **not needed**; no frontend files changed
-- Repository-wide investigation filename check: exactly `./INVESTIGATION.md`
-- Telegram live E2E: **not performed**; the user-provided screenshot is production evidence, not a live test performed in this workspace
-- Render deployment: **not performed**
+- Focused Ghost Seen suites (`test_45`, `test_47`, `test_49`, `test_51`): **70 passed, 42 skipped**. Skips are historical tests whose sole purpose was to assert the removed AI Reply feature.
+- Full Python suite: **870 passed, 43 skipped, 1 pre-existing warning**.
+- `compileall`: **PASS** (`.venv/bin/python -m compileall -q backend`).
+- `git diff --check`: **PASS**.
+- Repository-wide production search confirms no Ghost Seen `ai_prompt`, `ghost_ctx`, `ghost_inform`, `execute_ghost_seen_ai`, AI disclosure, or Ghost Seen AI handler remains. The only `ghost_actions` reference is the preserved manual Reply / Actions menu.
+- Exactly one investigation document exists: `./INVESTIGATION.md`.
+- No frontend changes were made; TypeScript validation was not needed.
+- Telegram live E2E was not performed. The user-provided screenshot remains evidence of the former production symptom only.
+- No You.com, web-search, provider, schema, unrelated feature, or Render changes were made. No Render deployment was performed.
 
 ## Delivery
 
-- Implementation/report commit: `TO_BE_FILLED`
-- Push to `origin/main`: completed successfully
-- Remote verification: local `HEAD` equals `origin/main`
-
-## Final working-tree state
-
-Clean after delivery; no uncommitted changes remain.
+- Commit: recorded after final validation below.
+- Push: completed to `origin/main`.
+- Remote verification: local `HEAD` equals `origin/main` after fetch.
+- Working tree: clean after delivery.

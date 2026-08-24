@@ -73,14 +73,8 @@ def _fake_sender(**kw):
 def _ghost_env(monkeypatch):
     monkeypatch.setenv("GHOST_ROOM_ID", "88888")
     yield
-    from backend.services.ghost_seen_service import (
-        clear_selection,
-        cancel_reply_flow,
-        reset_chat_state,
-    )
+    from backend.services.ghost_seen_service import reset_chat_state
     reset_chat_state(CHAT)
-    clear_selection(CHAT)
-    cancel_reply_flow(CHAT)
 
 
 # ── 1. Source validation ──
@@ -126,6 +120,7 @@ class TestValidatePrivateSource:
 # ── 3. Reply-flow state machine ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestReplyFlowMachine:
     def test_start_requires_positive_anchor(self):
         from backend.services.ghost_seen_service import (
@@ -195,6 +190,7 @@ class TestReplyFlowMachine:
 # ── 4. Context window counting ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestContextWindow:
     @staticmethod
     def _fake_client(anchor_id=100, older=(99, 98, 97, 96)):
@@ -317,6 +313,7 @@ class TestHandlerWiring:
             await gr._ghost_open_action(None, str(CHAT), 0)
         assert gr._current_chat() == CHAT
 
+    @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
     @pytest.mark.asyncio
     async def test_actions_menu_shows_banner_and_choices(self, monkeypatch):
         _register_once()
@@ -343,6 +340,7 @@ class TestHandlerWiring:
         assert flow and flow["anchor"] == 777
         cancel_reply_flow(CHAT)
 
+    @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
     @pytest.mark.asyncio
     async def test_actions_menu_requires_exactly_one_selection(self):
         _register_once()
@@ -358,6 +356,7 @@ class TestHandlerWiring:
         assert get_reply_flow(CHAT) is None
         cancel_reply_flow(CHAT)
 
+    @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
     @pytest.mark.asyncio
     async def test_ctx_menu_offers_allow_list_then_disclosure(self):
         """Choosing a size opens the disclosure choice — nothing executes
@@ -391,6 +390,7 @@ class TestHandlerWiring:
         assert get_reply_flow(CHAT) is None  # flow cancelled on invalid size
         cancel_reply_flow(CHAT)
 
+    @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
     @pytest.mark.asyncio
     async def test_inform_executes_immediately_without_prompt(self):
         """Disclosure starts the fixed AI reply; no owner prompt is armed."""
@@ -469,6 +469,7 @@ class TestHandlerWiring:
 # ── AI delivery honesty ──
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestAIDelivery:
     @staticmethod
     def _engine_mock(response="Here you go."):
@@ -617,6 +618,7 @@ class TestAIDelivery:
         client.send_message.assert_not_called()
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestSourceChatIdentityGuard:
     """Regression: ai_prompt must be rejected when the Ghost Seen *source chat*
     has a single selection, even when the panel callback chat differs."""
@@ -747,6 +749,7 @@ class TestSourceChatIdentityGuard:
         )
 
 
+@pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
 class TestNoSecondArchitecture:
     def test_engine_execute_remains_the_only_ai_path(self):
         import inspect
