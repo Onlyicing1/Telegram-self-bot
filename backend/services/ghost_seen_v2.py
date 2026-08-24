@@ -12,6 +12,7 @@ _PREVIEW_LIMIT = 42
 _NAME_LIMIT = 40
 _MESSAGE_LIMIT = 180
 _selections: dict[int, set[int]] = {}
+_reply_states: dict[int, dict] = {}
 
 
 def get_selected_ids(source_chat_id: int) -> tuple[int, ...]:
@@ -39,6 +40,13 @@ def action_menu_state(source_chat_id: int) -> tuple[int, ...] | None:
     return selected or None
 
 
+def reply_target(source_chat_id: int) -> int | None:
+    """The single valid reply target message ID, or ``None`` unless exactly
+    one message is currently selected in that source chat."""
+    selected = get_selected_ids(source_chat_id)
+    return selected[0] if len(selected) == 1 else None
+
+
 def action_placeholder(action: str, source_chat_id: int, selected_ids: Iterable[int]) -> str:
     current = tuple(sorted(int(value) for value in selected_ids))
     if int(source_chat_id) <= 0 or not current or current != get_selected_ids(source_chat_id):
@@ -46,6 +54,57 @@ def action_placeholder(action: str, source_chat_id: int, selected_ids: Iterable[
     if action not in {"reply", "ai_reply"}:
         return "That action is not available."
     return "Coming in the next stage."
+
+
+def begin_reply(panel_chat_id: int, source_chat_id: int, message_id: int, panel_msg_id: int) -> bool:
+    """Arm a single-message Reply input for the panel chat.
+
+    Stored keyed by the panel chat so a reply typed in another chat can
+    never be consumed for this source. Only an exact one-message selection
+    may begin a Reply.
+    """
+    source_chat_id, message_id = int(source_chat_id), int(message_id)
+    if reply_target(source_chat_id) != message_id:
+        return False
+    _reply_states[int(panel_chat_id)] = {
+        "source": source_chat_id,
+        "message_id": message_id,
+        "panel_msg_id": int(panel_msg_id),
+    }
+    return True
+
+
+def get_reply(panel_chat_id: int) -> tuple[int, int, int] | None:
+    entry = _reply_states.get(int(panel_chat_id))
+    if entry is None:
+        return None
+    return int(entry["source"]), int(entry["message_id"]), int(entry["panel_msg_id"])
+
+
+def consume_reply(panel_chat_id: int) -> tuple[int, int, int] | None:
+    """Atomically take the pending Reply for the panel chat, if any."""
+    entry = _reply_states.pop(int(panel_chat_id), None)
+    if entry is None:
+        return None
+    return int(entry["source"]), int(entry["message_id"]), int(entry["panel_msg_id"])
+
+
+def clear_reply(panel_chat_id: int) -> None:
+    _reply_states.pop(int(panel_chat_id), None)
+
+
+def clear_all_replies() -> None:
+    _reply_states.clear()
+
+
+async def send_reply(client: Any, source_chat_id: int, message_id: int, text: str) -> dict[str, Any]:
+    """Send ``text`` to the source chat as a reply to the exact message.
+
+    Uses the existing typed Telegram send utility; failures surface as
+    exceptions so callers never report fabricated success.
+    """
+    from backend.telegram_api.messages import send_message
+    return await send_message(client, int(source_chat_id), text, reply_to=int(message_id))
 
 
 @dataclass(frozen=True)

@@ -10,8 +10,9 @@ from backend.helper.client import get_client
 from backend.helper.lifecycle import get_lifecycle
 from backend.services.ghost_seen_v2 import (
     BrowserPage, MessageViewerPage, action_menu_state, action_placeholder,
-    clear_selection, get_selected_ids, is_private_user_entity, load_private_chats,
-    load_viewer_messages, render_browser, render_message_viewer,
+    begin_reply, clear_reply, clear_selection, consume_reply, get_selected_ids,
+    is_private_user_entity, load_private_chats, load_viewer_messages,
+    reply_target, render_browser, render_message_viewer, send_reply,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ def _viewer_buttons(view: MessageViewerPage) -> list:
 
 def _action_buttons(source: int, selected: tuple[int, ...]) -> list:
     builder = InlinePanelBuilder()
-    builder.add_row("Reply", f"action:ghost_seen_v2_placeholder:reply:{source}")
+    builder.add_row("Reply", f"action:ghost_seen_v2_reply:{source}")
     builder.add_row("AI Reply", f"action:ghost_seen_v2_placeholder:ai_reply:{source}")
     builder.add_row("‹ Back", f"action:ghost_seen_v2_actions_back:{source}")
     return builder.build()
@@ -122,6 +123,7 @@ async def _open_chat_action(event, extra: str, chat_id: int):
     if selected is None:
         return "👀 Ghost Seen", "That private chat is no longer available.", []
     clear_selection(selected.chat_id)
+    clear_reply(chat_id)
     viewer = await load_viewer_messages(inline_engine.get_self_client(), selected.chat_id)
     msg_id = _event_ids(event)[1]
     session = get_lifecycle().sessions.get(chat_id, msg_id)
@@ -184,9 +186,95 @@ async def _placeholder_action(event, extra: str, chat_id: int):
     return "👀 Ghost Seen", message, []
 
 
+async def _reply_action(event, extra: str, chat_id: int):
+    from backend.helper.input_state import clear_pending, set_pending
+
+    owner = inline_engine.get_owner_id()
+    msg_id = _event_ids(event)[1]
+    source = int(extra) if str(extra).isdigit() else 0
+    message_id = reply_target(source)
+    if message_id is None:
+        if action_menu_state(source) is None:
+            viewer = await load_viewer_messages(inline_engine.get_self_client(), source)
+            state = _session_extra(chat_id, msg_id, _ACTION_ID)
+            _, name, _, _ = _parse_viewer_state(state)
+            return "👀 Ghost Seen", render_message_viewer(name, viewer), _viewer_buttons(viewer)
+        return "👀 Ghost Seen", "Reply needs exactly one selected message.", _action_buttons(source, get_selected_ids(source))
+    state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, msg_id, _ACTION_ID))
+    if source != state_source:
+        return "👀 Ghost Seen", "That selection is no longer available.", []
+    if not begin_reply(chat_id, source, message_id, msg_id):
+        return "👀 Ghost Seen", "That selection is no longer available.", []
+    clear_pending(owner)
+    prompt = (
+        f"**👻 Ghost Seen — Reply**\n"
+        f"💬 {name}\n\n"
+        "Type your reply below.\n"
+        "It will be sent to this chat as a reply to the selected message."
+    )
+    set_pending(
+        owner, _PANEL_ID, _ghost_reply_input_handler,
+        chat_id, prompt,
+        inline_chat_id=chat_id, inline_msg_id=msg_id,
+        extra=f"source={source}", timeout=120.0,
+    )
+    builder = InlinePanelBuilder()
+    builder.add_row("✖ Cancel", f"action:ghost_seen_v2_reply_cancel:{source}")
+    return "👀 Ghost Seen", prompt, builder.build()
+
+
+async def _ghost_reply_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    from backend.helper.inline_engine import _self_client
+
+    state = consume_reply(chat_id)
+    if state is None:
+        result = "👻 The reply window expired. Select a message and try again."
+    else:
+        source, message_id, _panel_msg_id = state
+        if reply_target(source) != message_id:
+            result = "✏️ The selected message changed. Nothing was sent."
+        elif not (text or "").strip():
+            result = "✏ Empty replies are not sent. Select the message and try again."
+        else:
+            try:
+                await send_reply(_self_client, source, message_id, text)
+                clear_selection(source)
+                result = "✅ Reply sent."
+            except Exception as exc:
+                result = f"❌ Reply failed: {exc}"
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result, buttons=[])
+        except Exception as exc:
+            logger.warning("reply result edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _reply_cancel_action(event, extra: str, chat_id: int):
+    from backend.helper.input_state import clear_pending
+
+    clear_pending(inline_engine.get_owner_id())
+    clear_reply(chat_id)
+    source = int(extra) if str(extra).isdigit() else 0
+    selected = action_menu_state(source)
+    if not selected:
+        viewer = await load_viewer_messages(inline_engine.get_self_client(), source)
+        state = _session_extra(chat_id, _event_ids(event)[1], _ACTION_ID)
+        _, name, _, _ = _parse_viewer_state(state)
+        return "👀 Ghost Seen", render_message_viewer(name, viewer), _viewer_buttons(viewer)
+    state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, _event_ids(event)[1], _ACTION_ID))
+    return "👀 Ghost Seen", f"💬 {name} · {len(selected)} selected\n\nChoose an action.", _action_buttons(source, selected)
+
+
 async def _actions_back(event, extra: str, chat_id: int):
     source = int(extra) if str(extra).isdigit() else 0
     selected = get_selected_ids(source)
+    clear_reply(chat_id)
     viewer = await load_viewer_messages(inline_engine.get_self_client(), source)
     state = _session_extra(chat_id, _event_ids(event)[1], _ACTION_ID)
     _, name, _, _ = _parse_viewer_state(state)
@@ -227,6 +315,8 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("ghost_seen_v2_clear", _clear_action)
     register_action("ghost_seen_v2_actions", _actions_action)
     register_action("ghost_seen_v2_placeholder", _placeholder_action)
+    register_action("ghost_seen_v2_reply", _reply_action)
+    register_action("ghost_seen_v2_reply_cancel", _reply_cancel_action)
     register_action("ghost_seen_v2_actions_back", _actions_back)
     register_input(_PANEL_ID, _SEARCH_INPUT_ID, {"handler": _search_input_handler, "prompt": "**Search private chats**\n\nSearch by first name, last name, or username:\n\n_Reply below._"})
 
