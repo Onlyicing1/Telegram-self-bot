@@ -70,7 +70,7 @@ class TestStreamlinedAIReplyFlow:
         assert hasattr(svc, "set_reply_disclosure")
         pytest.skip("Ghost Seen legacy AI flow was intentionally removed")
 
-        src = inspect.getsource(gr._ghost_ctx_action)
+        pytest.skip("Ghost Seen legacy AI flow was intentionally removed")
         assert "set_pending" not in src, (
             "context choice must never arm a manual prompt input"
         )
@@ -92,7 +92,7 @@ class TestStreamlinedAIReplyFlow:
         cancel_reply_flow(CHAT)
         start_reply_flow(CHAT, 400)
 
-        title, body, buttons = await gr._ghost_ctx_action(None, "", 0)
+        pytest.skip("Ghost Seen legacy AI flow was intentionally removed")
         assert "action:ghost_ctx:1" in _datas(buttons)
         assert "action:ghost_ctx:10" in _datas(buttons)
         client.send_message.assert_not_called()

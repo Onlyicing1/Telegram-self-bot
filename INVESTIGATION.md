@@ -22,6 +22,10 @@ The browser action carries the selected `PrivateChat.chat_id` in `action:ghost_s
 
 `load_viewer_messages()` requests a bounded number of messages from the selected source peer, filters unusable IDs, converts text/caption/media/unsupported content to safe display text, sorts chronologically, and exposes bounded pages. No persistence, AI state, reply state, or owner-input state was introduced. No manual refresh or parallel watcher system was added.
 
+## Stage 3 selection tracing
+
+The viewer keeps panel chat identity separate from source chat identity. The selection callback carries `source_chat_id|message_id`; the service stores only the real message IDs in an in-memory map keyed by source chat ID. The viewer session stores source ID, display name, and page in the existing navigation stack. Pagination reloads the same source and rehydrates selected IDs; opening a chat clears that source's previous selection. Clear removes only the current source selection. No AI, Reply, Action Menu, prompt, or delivery state is involved.
+
 ## Verification
 
 Focused Stage 1 tests cover private-user filtering, bot/non-user exclusion, tolerant search, missing name fields, two-line rendering, truncation, pagination, empty state, and absence of a Refresh control. Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md` after completion.

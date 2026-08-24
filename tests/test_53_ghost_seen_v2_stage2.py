@@ -6,7 +6,6 @@ import pytest
 from backend.services.ghost_seen_v2 import (
     MESSAGE_PAGE_SIZE,
     MessageViewerPage,
-    PrivateChat,
     ViewerMessage,
     load_viewer_messages,
     render_message_viewer,

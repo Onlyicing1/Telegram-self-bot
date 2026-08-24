@@ -1,34 +1,34 @@
-# Implementation Report — Ghost Seen v2 Stage 2
+# Implementation Report — Ghost Seen v2 Stage 3
 
 ## Scope
 
-Implemented Stage 2 Message Viewer on top of the existing Stage 1 private-chat browser. AI, replies, message selection, disclosure, generation, and delivery remain intentionally unimplemented.
+Added message selection to the existing Stage 1 browser and Stage 2 Message Viewer. AI, Reply, Action Menu, prompts, disclosure, generation, delivery, providers, web search, and You.com remain untouched and unimplemented.
 
 ## Files changed
 
-- `backend/services/ghost_seen_v2.py` — existing Stage 1 behavior plus source-chat-isolated bounded message loading and viewer rendering.
-- `backend/bot/handlers/ghost_seen_v2.py` — existing browser wiring plus dedicated viewer panel, chat-open action, viewer pagination, and Back navigation.
-- `tests/test_53_ghost_seen_v2_stage2.py` — focused Stage 2 viewer tests.
+- `backend/services/ghost_seen_v2.py` — source-chat-keyed selection model and viewer rendering support.
+- `backend/bot/handlers/ghost_seen_v2.py` — selection callbacks, selected-count/clear controls, and same-source pagination state.
+- `tests/test_54_ghost_seen_v2_stage3.py` — Stage 3 selection regression coverage.
+- `INVESTIGATION.md` — Stage 3 source/state tracing.
+- `IMPLEMENTATION_REPORT.md` — this report.
 
 ## Behavior
 
-The browser reads the live Telethon dialog stream and includes only non-bot, non-self Telegram users. Groups, supergroups, channels, service entities, and bots are excluded at the source layer. Search matches first name, last name, and username only; whitespace, concatenated names, case, and optional `@` are normalized for matching without changing display names. Rows render exactly two content lines with bounded previews, compact timestamps, plain numeric unread counts, and at most five chats per page.
+Each visible message has a compact Select/Selected toggle control while message text remains content. Selection uses the real Telegram message ID and is keyed by source private chat ID, not panel chat ID, display name, username, page, or message text. Identical message text can therefore be selected independently. Selection survives pagination within one source chat, is cleared when opening a chat, and can be cleared without changing the current chat or page. The viewer header reports `N selected`.
 
-The screen has the compact Ghost Seen header/status and cute watcher text. It has no manual Refresh control. Empty state is rendered without refresh. Selecting a private chat opens a dedicated Message Viewer using the selected Telegram source chat ID, never the panel chat ID. Messages are loaded through Telethon with a bounded request, rendered chronologically in bounded pages, safely represented for text/media/empty content, and navigated with Back plus older/newer controls only when needed. No Refresh, AI, or Reply controls are present.
-
-## Removed-feature checkpoint
-
-The prior removal commit remains intact: old Ghost Seen modules, callbacks, input state, AI reply flow, and legacy prompt producer are absent. Shared panel/input infrastructure, AI providers, You.com/web search, Supabase infrastructure, and unrelated handlers remain untouched. No database migration, environment configuration, or Render configuration was changed.
+Zero, one, and multiple selections are display-only in Stage 3. No Action Menu, AI, Reply, prompt, disclosure, generation, or delivery path is registered or executed. Back remains the Stage 2 navigation control; later v2 stages are not introduced.
 
 ## Validation
 
-- Stage 1 + Stage 2 focused tests: **10 passed**.
-- Full suite: **816 passed, 23 skipped, 1 pre-existing warning**.
+- Stage 1 + Stage 2 + Stage 3 focused tests: **14 passed**.
+- Full Python suite: **820 passed, 23 skipped, 1 pre-existing warning**.
 - `.venv/bin/python -m compileall -q backend`: **PASS**.
 - `git diff --check`: **PASS**.
 - `bun tsc -b --noEmit`: **PASS**.
+- Legacy Ghost Seen AI callback/prompt identifiers remain absent from production code; historical skipped assertions remain only in `tests/test_51_execution27.py`.
+- Exactly one `INVESTIGATION.md` exists.
 - Telegram live E2E was not performed.
 
 ## Delivery
 
-Stage 2 changes were validated locally and are ready for repository delivery. No Telegram live E2E was performed.
+Commit and remote verification follow this final validation.

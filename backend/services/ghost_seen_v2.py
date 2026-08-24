@@ -11,6 +11,29 @@ MESSAGE_PAGE_SIZE = 8
 _PREVIEW_LIMIT = 42
 _NAME_LIMIT = 40
 _MESSAGE_LIMIT = 180
+_selections: dict[int, set[int]] = {}
+
+
+def get_selected_ids(source_chat_id: int) -> tuple[int, ...]:
+    return tuple(sorted(_selections.get(int(source_chat_id), set())))
+
+
+def toggle_selection(source_chat_id: int, message_id: int) -> tuple[int, ...]:
+    source_chat_id, message_id = int(source_chat_id), int(message_id)
+    selected = _selections.setdefault(source_chat_id, set())
+    if message_id in selected:
+        selected.remove(message_id)
+    else:
+        selected.add(message_id)
+    if not selected:
+        _selections.pop(source_chat_id, None)
+    return get_selected_ids(source_chat_id)
+
+
+def clear_selection(source_chat_id: int) -> None:
+    _selections.pop(int(source_chat_id), None)
+
+
 
 
 @dataclass(frozen=True)
@@ -51,6 +74,7 @@ class MessageViewerPage:
     messages: tuple[ViewerMessage, ...]
     page: int
     total_pages: int
+    selected_ids: tuple[int, ...] = ()
 
 
 def _entity(value: Any) -> Any:
@@ -234,7 +258,9 @@ def render_browser(chats: Iterable[PrivateChat], page: int = 1, query: str = "",
 
 
 def render_message_viewer(name: str, viewer: MessageViewerPage, now: datetime | None = None) -> str:
-    lines = ["👀 Ghost Seen", f"💬 {_truncate_name(name)}", "", "Ghost is quietly watching the walls.", ""]
+    selected = len(viewer.selected_ids)
+    suffix = f" · {selected} selected" if selected else ""
+    lines = ["👀 Ghost Seen", f"💬 {_truncate_name(name)}{suffix}", "", "Ghost is quietly watching the walls.", ""]
     if not viewer.messages:
         lines.append("👻 Ghost found nothing to see...")
     else:
