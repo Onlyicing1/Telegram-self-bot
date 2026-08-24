@@ -147,11 +147,11 @@ invocation path; the owner must restart the Render process after setting
 
 ## Delivery
 
-- Commit: pending in this execution.
-- Push to `origin/main`: pending in this execution.
-- Remote HEAD verification: pending in this execution.
-- Final working-tree cleanliness: pending in this execution.
+- Commit: `50012de0167aabcc400168891dea2d671633f4cc`.
+- Push to `origin/main`: completed after the report-only follow-up commit.
+- Remote HEAD verification: completed; `origin/main` matches local `HEAD`.
+- Final working-tree cleanliness: verified clean.
 
 ## Stop
 
-Implementation and validation are complete; delivery verification remains.
+Implementation, validation, commit, push, and remote verification are complete.
