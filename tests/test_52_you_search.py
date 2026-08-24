@@ -707,8 +707,9 @@ class TestWebSearchRuntime:
             ))
 
         assert result.success is True
-        assert result.response == "The answer uses the returned live source."
-        assert len(chat_provider.calls) == 2
+        assert result.response
+        assert "Live story" in result.response
+        assert len(chat_provider.calls) == 1
         tool_definitions = chat_provider.calls[0][1]["tools"]
         assert any(
             item["function"]["name"] == "web_search"
@@ -718,6 +719,51 @@ class TestWebSearchRuntime:
             "current AI news", count=1, freshness=None, include_domains=None,
         )
         assert search_call.await_args.args[0] == "current AI news"
+
+    @pytest.mark.asyncio
+    async def test_successful_search_terminates_without_redundant_follow_up(self):
+        from backend.ai.engine.engine import Engine
+        from backend.ai.providers.base.config import ProviderConfig
+        from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+        from backend.ai.providers.base.capabilities import ProviderCapabilities
+        from backend.ai.providers.manager.manager import ProviderManager
+        from backend.ai.providers.registry.registry import ProviderRegistry
+        from backend.ai.session.request import AIRequest
+        from backend.ai.tools.context import ToolContext
+        from backend.ai.tools.registry import ToolRegistry
+        from backend.ai.tools.websearch import WebSearchTool
+
+        class Chat(BaseProvider):
+            PROVIDER_NAME = "chat-loop"
+            PROVIDER_VERSION = "test"
+            def __init__(self):
+                super().__init__(ProviderConfig(provider_name=self.PROVIDER_NAME, api_key="k", enabled=True, default_model="m"))
+                self.calls = 0
+            @property
+            def capabilities(self):
+                return ProviderCapabilities(supports_tools=True, supports_function_call=True)
+            def initialize(self): pass
+            def shutdown(self): pass
+            def health(self): return {"healthy": True}
+            def count_tokens(self, text): return 1
+            async def chat(self, messages, **kwargs):
+                self.calls += 1
+                return ProviderResponse(text="", provider_name=self.name, success=True, tool_calls=[{"id": "s", "name": "web_search", "arguments": {"query": "q"}}])
+
+        chat = Chat()
+        search = WebSearchTool(ToolContext(telegram=None, owner_id=1, tz_str="UTC"))
+        manager = ProviderManager()
+        manager.register_provider(chat)
+        manager.switch_provider("chat-loop")
+        registry = ToolRegistry()
+        registry.register(search)
+        engine = Engine(providers=manager)
+        engine.attach_tools(registry, ToolContext(telegram=None, owner_id=1, tz_str="UTC"))
+        with patch("backend.services.web_search_service.do_web_search", new=AsyncMock(return_value=(True, "🌐 Web results", {"results": [{"title": "Current", "url": "https://example.test"}]}))):
+            result = await engine.execute(AIRequest(session_id="loop", user_message="current", owner_id=1, chat_id=1, message_id=1))
+        assert result.success is True
+        assert "Web results" in result.response
+        assert chat.calls == 1
 
     @pytest.mark.asyncio
     async def test_runtime_tool_reports_unavailable_without_search_provider(self):

@@ -29,7 +29,8 @@ Inputs:
   ghost_chat:reply          — quote-reply with typed text
   ghost_chat:reply_no_quote — reply without quote
   ghost_chat:ai_prompt      — legacy multi-select path only: an explicit
-                              typed instruction over the selected messages.
+                              typed instruction over multiple selected messages;
+                              never exposed for a single selection.
 
 Incoming listener:
   One events.NewMessage(incoming=True) listener that upserts ghost_chats
@@ -491,8 +492,7 @@ async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inl
 
 
 async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    """Legacy multi-select path: an explicit typed instruction over the
-    selected messages. It remains separate from the single-message flow."""
+    """Legacy multi-select path; a single selection fails closed."""
     from backend.services.ghost_seen_service import (
         get_selection,
         clear_selection,
@@ -505,7 +505,9 @@ async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
         return
 
     sel = get_selection(panel_chat)
-    if not sel or not _self_client:
+    if len(sel) < 2 or not _self_client:
+        logger.warning("Ghost Seen: legacy AI prompt blocked for single selection")
+        clear_selection(panel_chat)
         return
     sel_list = sorted(sel)
     try:

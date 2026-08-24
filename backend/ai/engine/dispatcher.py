@@ -518,6 +518,28 @@ class Dispatcher:
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
                 break
 
+            # A successful search result is sufficient evidence for the
+            # current-information tool contract. Do not ask the model to
+            # perform redundant follow-up searches when the provider already
+            # returned usable sources; the model can answer from this result.
+            if (
+                response.tool_calls
+                and exec_results
+                and all(
+                    er.success and er.tool_name == "web_search"
+                    and isinstance(er.data, dict)
+                    and isinstance(er.data.get("results"), list)
+                    and er.data.get("results")
+                    for er in exec_results
+                )
+            ):
+                response = replace(
+                    response,
+                    tool_calls=[],
+                    text=self._summarize_tool_results(all_tool_results),
+                )
+                break
+
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
             try:
                 _stage("PROVIDER_REQUEST")

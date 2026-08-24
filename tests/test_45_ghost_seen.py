@@ -463,7 +463,7 @@ class TestGhostRoomDestination:
     async def test_ai_sends_to_ghost_room_id_not_source_chat(self):
         """Ghost Seen AI responses must be delivered to GHOST_ROOM_ID only."""
         from backend.bot.handlers.ghost_seen import (
-            _ghost_ai_input, configure, _set_current_chat,
+            _ghost_ai_input, _ghost_inform_action, configure, _set_current_chat,
         )
         from backend.services.ghost_seen_service import toggle_selection, clear_selection
         from unittest.mock import patch, AsyncMock
@@ -478,9 +478,13 @@ class TestGhostRoomDestination:
         mock_engine = AsyncMock()
         mock_engine.execute.return_value = AsyncMock(success=True, response="AI reply")
 
+        from backend.services.ghost_seen_service import start_reply_flow, set_reply_context_count, set_reply_disclosure
+        start_reply_flow(12345, 777)
+        set_reply_context_count(12345, 1)
+        set_reply_disclosure(12345, False)
         with patch("backend.ai.engine.engine.get_engine", return_value=mock_engine):
             with patch("backend.bot.handlers.ghost_seen._self_client", mock_client):
-                await _ghost_ai_input("summarize", 0, 0, 0, 0)
+                await _ghost_inform_action(None, "no", 12345)
 
         # Must have delivered to 88888, NOT 12345
         mock_client.send_message.assert_called_once()

@@ -2,156 +2,109 @@
 
 ## Task / Result
 
-Fixed the remaining You.com runtime-capability defect and retained the
-required Ghost Seen automatic-reply behavior.
+Fixed the two runtime failures found during owner live verification:
 
-- **You.com runtime capability:** the web-search tool was registered and
-  visible, but it could resolve the process-global Engine instead of the live
-  Engine/ProviderManager handling the request. The request-scoped live
-  ProviderManager is now carried through `ToolContext` and reaches the
-  existing `ToolRegistry` → `ToolExecutor` → `WebSearchTool` →
-  `WebSearchService` → `ProviderManager.web_search()` → `YouSearchProvider`
-  path. You.com remains a `web_search` capability and is never treated as a
-  chat/LLM provider or allowed to execute Telegram actions.
-- **Ghost Seen single-message AI reply:** after target selection, context
-  count, and mandatory disclosure choice, execution now starts immediately.
-  No owner-written prompt input is opened. The fixed task asks for the next
-  natural reply from the owner to the recipient, with explicit `OWNER` and
-  `RECIPIENT` context roles. Delivery still resolves `GHOST_ROOM_ID` and
-  fails closed when it is missing or invalid.
+- A successful You.com search no longer causes redundant follow-up search calls
+  to exhaust the tool-round limit. When a `web_search` execution succeeds and
+  returns non-empty normalized sources, the dispatcher terminates the tool loop
+  with an evidence-based result from the actual tool output.
+- Ghost Seen's legacy `ai_prompt` input is now explicitly blocked for a single
+  selected message. The single-message route remains the Glass flow:
+  selection → `ghost_actions` → context count → disclosure → automatic AI
+  generation. The legacy typed prompt remains available only for 2+ selected
+  messages.
 
-The earlier You.com discovery/visibility fix is preserved in `4972693`; this
-execution fixes the separate live tool-loop connection that the live check
-exposed.
+## Root causes
 
-## Starting state
+1. The dispatcher always requested another provider continuation after every
+   successful tool call, including a completed web search. A model that kept
+   requesting searches could therefore reach `MAX_TOOL_ROUNDS` even though the
+   first search had usable evidence.
+2. The Ghost Seen registration still contains the intentional legacy
+   `ghost_chat:ai_prompt` input. A stale/legacy single-selection callback could
+   therefore open that prompt directly. The handler now fails closed whenever
+   that input is invoked with fewer than two selected messages.
 
-- `HEAD` was `4972693` (`fix: expose You.com web-search capability and Ghost
-  Seen explicit AI reply flow`) with the runtime-capability and automatic
-  Ghost Seen adjustments uncommitted.
-- Discovery and UI already reported You.com as available when configured, but
-  an actual AI tool call had not been proven to use the request's live
-  ProviderManager.
-- Ghost Seen still had tests and implementation remnants for the removed
-  single-message prompt step.
-- No existing user changes were discarded; no deployment was performed.
+## Exact files changed
 
-## Exact files changed in this execution
+- `backend/ai/engine/dispatcher.py` — terminates after successful, non-empty
+  web-search evidence instead of issuing a redundant continuation.
+- `backend/bot/handlers/ghost_seen.py` — documents and enforces that
+  `ai_prompt` is multi-select-only.
+- `tests/test_45_ghost_seen.py` — updates the destination regression to use the
+  authoritative automatic disclosure flow.
+- `tests/test_52_you_search.py` — adds a full orchestration regression proving
+  one successful search produces a final result without a second model call.
 
-Backend:
+## Exact behavior
 
-- `backend/ai/engine/dispatcher.py` — keeps the live ProviderManager on the
-  Dispatcher and injects it into each per-request ToolContext.
-- `backend/ai/engine/engine.py` — synchronizes the attached ToolRegistry with
-  the Dispatcher during runtime tool wiring.
-- `backend/ai/tools/websearch.py` — passes the request-scoped manager to the
-  web-search service and returns a safe generic failure message.
-- `backend/services/web_search_service.py` — accepts an optional injected
-  ProviderManager while retaining the existing global-engine compatibility
-  path for direct callers.
-- `backend/services/ghost_seen_service.py` — defines the fixed owner-to-
-  recipient reply task and explicit OWNER/RECIPIENT context formatting.
-- `backend/bot/handlers/ghost_seen.py` — removes the single-message prompt
-  registration and makes the disclosure callback execute the automatic AI
-  reply immediately.
+The web-search path remains:
 
-Tests:
+`Engine/Dispatcher → ToolRegistry/ToolExecutor → WebSearchTool →
+WebSearchService → ProviderManager.web_search() → YouSearchProvider`.
 
-- `tests/test_11_runtime_wiring.py` — updates the scripted provider test
-  double to declare native tool support.
-- `tests/test_45_ghost_seen.py` — verifies the fixed role-aware Ghost Seen
-  task text.
-- `tests/test_49_ghost_seen_flows.py` — verifies automatic execution,
-  disclosure handling, delivery, and fail-closed behavior without a prompt.
-- `tests/test_51_execution27.py` — verifies context → disclosure → automatic
-  delivery and destination invariants.
-- `tests/test_52_you_search.py` — adds the full Engine native-tool regression
-  from tool definitions through the injected ProviderManager and mocked
-  YouSearchProvider, plus honest unavailable behavior.
+After a successful web search with non-empty normalized `results`, the
+Dispatcher returns the formatted actual search output and does not call the
+chat provider again for a redundant search. Empty or failed searches do not
+claim success and retain the existing continuation/error behavior.
 
-## Exact architecture and behavior changes
-
-### You.com runtime path
-
-1. `Engine.attach_tools()` wires one ToolRegistry/ToolExecutor into the
-   Dispatcher.
-2. `Dispatcher.dispatch()` builds native definitions from that registry and
-   adds the live `self._provider_manager` to the request ToolContext.
-3. `ToolExecutor` remains the sole caller of `tool.execute()`.
-4. `WebSearchTool` forwards the injected manager to `do_web_search()`.
-5. `WebSearchService` invokes `ProviderManager.web_search()`.
-6. `ProviderManager` selects only a healthy registered `web_search` provider;
-   it never routes retrieval through chat fallbacks.
-7. `YouSearchProvider.search()` performs the existing You.com Search API
-   request and returns normalized results.
-
-When no You.com provider is configured, the same tool returns an honest
-unavailable result; it does not fabricate search results or claim that a
-search occurred. The You.com API key remains runtime-environment-only via
-`YDC_API_KEY`.
-
-### Ghost Seen automatic reply path
-
-`select one incoming message` → `Reply with AI` → `context count` →
-`disclosure choice` → `_execute_single_ghost_ai_reply()` → fixed
-`execute_ghost_seen_ai()` task → delivery to the resolved `GHOST_ROOM_ID`.
-
-The removed `ai_reply_prompt` input is not registered. Informing the recipient
-adds `AI_DISCLOSURE_SUFFIX`; opting out sends the generated text unchanged.
-Missing/invalid `GHOST_ROOM_ID`, missing context, an owner-authored target,
-AI failure, or delivery failure produces no fallback send.
+Ghost Seen exactly-one selection cannot enter `ai_prompt`, even if an old
+callback or stale UI state invokes it. It is cleared and logged instead. The
+normal one-message action menu and automatic AI reply flow are unchanged:
+context selection and mandatory disclosure are followed immediately by fixed
+AI generation, with `OWNER`/`RECIPIENT` role-aware context and
+`GHOST_ROOM_ID` fail-closed delivery.
 
 ## Intentionally untouched
 
-- You.com provider identity, endpoint, authentication, response
-  normalization, discovery registration, capability-only status UI, and
-  chat-provider filtering from the preceding visibility fix.
-- Provider fallback/retry/health implementation and the existing
-  ProviderManager routing boundary.
-- Save, Delete, Retrieve, retention, profile engines, supervisor, and
-  Telegram authorization behavior.
-- `ghost_chats` remains a source/private-chat registry and is never a
-  destination selector.
-- Database tables, migrations, schema, and persistence behavior.
-- Render configuration and deployment; no Render deploy was performed.
+- You.com endpoint, authentication, environment configuration, provider
+  registration, capability-only classification, and health routing.
+- Provider fallback/retry architecture other than the bounded successful-search
+  termination condition.
+- Multi-select Ghost Seen typed prompt behavior for 2+ messages.
+- Save, Delete, Retrieve, profiles, supervisor, Telegram authorization, and
+  database/schema behavior.
+- Render deployment/configuration. No deployment was performed.
 
 ## Database/schema impact
 
-None. No database field, table, migration, or persisted credential was added.
-`YDC_API_KEY` remains environment-backed and is never written to source,
-tests, telemetry, exceptions, or reports.
+None. No schema, migration, database field, or persisted credential changed.
+`YDC_API_KEY` remains runtime-environment-only.
 
 ## Validation
 
-- Focused command:
-  `.venv/bin/python -m pytest tests/test_11_runtime_wiring.py tests/test_52_you_search.py tests/test_49_ghost_seen_flows.py tests/test_45_ghost_seen.py -q --asyncio-mode=auto`
-  — **122 passed**.
-- Full command:
-  `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`
-  — **909 passed, 1 warning**. The warning is the existing Starlette
-  `multipart` PendingDeprecationWarning.
-- `.venv/bin/python -m compileall -q backend` — **PASS**.
-- `git diff --check` — **PASS**.
-- `bun tsc -b --noEmit` — **PASS**.
-- A repository-wide check confirms the single-message
-  `ai_reply_prompt`/`Type your AI prompt` path is no longer registered; the
-  remaining `ai_prompt` is the intentional legacy multi-select input.
+- Focused You.com + Ghost Seen tests: **104 passed**.
+- Full suite: **910 passed, 1 existing Starlette multipart warning**.
+- `bun tsc -b --noEmit`: **PASS**.
+- `.venv/bin/python -m compileall -q backend`: **PASS**.
+- `git diff --check`: **PASS**.
 
-## Live You.com verification
+The new orchestration regression verifies the actual dispatcher boundary: one
+chat-provider tool call, one `web_search` execution, actual result propagation,
+and no redundant second provider call. The Ghost Seen regression verifies that
+single-message automatic execution uses the disclosure route rather than the
+legacy typed prompt.
 
-This workspace reported `YDC_API_KEY=absent` using a secret-safe check. No
-real request was sent to `https://ydc-index.io/v1/search`, and no live API
-success is claimed. The mocked full Engine tool-loop test proves the runtime
-invocation path; the owner must restart the Render process after setting
-`YDC_API_KEY` and perform the live verification there.
+## Live verification limitations
+
+No live You.com request was made in this workspace because `YDC_API_KEY` was
+not available here. The owner’s earlier live verification established that the
+You.com request itself succeeds and exposed the redundant-loop behavior fixed
+in this change. A Render process restart remains required after environment
+changes; live confirmation of the final behavior must be performed there.
+
+The owner should also verify the Ghost Seen callback from a fresh Render
+process/session so no stale inline message remains; any stale single-selection
+`ai_prompt` callback now fails closed rather than opening an owner prompt.
 
 ## Delivery
 
-- Commit: `50012de0167aabcc400168891dea2d671633f4cc`.
-- Push to `origin/main`: completed after the report-only follow-up commit.
-- Remote HEAD verification: completed; `origin/main` matches local `HEAD`.
-- Final working-tree cleanliness: verified clean.
+- Commit: to be recorded after commit.
+- Push: to `origin/main` after commit.
+- Remote HEAD: to be verified after push.
+- Final working-tree state: to be verified after delivery.
 
 ## Stop
 
-Implementation, validation, commit, push, and remote verification are complete.
+Implementation and validation are complete pending commit, push, and remote
+verification.
