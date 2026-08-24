@@ -414,9 +414,47 @@ async def load_private_chats(client: Any, owner_id: int | None = None) -> list[P
 
 async def load_allowed_chats(client: Any, owner_id: int | None = None) -> list[PrivateChat]:
     """Load private chats that are both real user dialogs AND explicitly
-    allowed by the Ghost Seen privacy model."""
+    allowed by the Ghost Seen privacy model.
+
+    Uses ``client.iter_dialogs()`` — suitable only for Manage and broad
+    discovery.  The normal Browser should use ``resolve_allowed_chats``
+    instead (O(allowed), not O(total dialogs)).
+    """
     all_chats = await load_private_chats(client, owner_id)
     return [chat for chat in all_chats if is_chat_allowed(chat.chat_id)]
+
+
+async def resolve_allowed_chats(client: Any, owner_id: int | None = None) -> list[PrivateChat]:
+    """Resolve ONLY the explicitly allowed private chats.
+
+    This is the O(allowed) data path for the normal Ghost Seen Browser.
+    It calls ``client.get_entity()`` only for the specific allowed IDs —
+    it never calls ``client.iter_dialogs()``.
+
+    If the allowed set is empty, returns immediately with zero Telegram
+    RPCs.
+    """
+    _ensure_allowed_loaded()
+    allowed = frozenset(_allowed_chats)
+    if not allowed:
+        return []
+    if client is None:
+        return []
+    result: list[PrivateChat] = []
+    for chat_id in sorted(allowed):
+        try:
+            entity = await client.get_entity(int(chat_id))
+        except Exception:
+            continue
+        if not is_private_user_entity(entity, owner_id):
+            continue
+        result.append(PrivateChat(
+            chat_id=int(chat_id),
+            first_name=_single_line(getattr(entity, "first_name", "") or ""),
+            last_name=_single_line(getattr(entity, "last_name", "") or ""),
+            username=_single_line(getattr(entity, "username", "") or ""),
+        ))
+    return result
 
 
 async def load_viewer_messages(client: Any, source_chat_id: int, page: int = 1) -> MessageViewerPage:

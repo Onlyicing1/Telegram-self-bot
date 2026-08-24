@@ -14,10 +14,10 @@ from backend.helper.lifecycle import get_lifecycle
 from backend.services.ghost_seen_v2 import (
     BrowserPage, MessageViewerPage, action_menu_state, action_placeholder,
     allow_chat, begin_reply, clear_reply, clear_selection, consume_reply,
-    disallow_chat, get_selected_ids, is_chat_allowed,
+    disallow_chat, get_allowed_chats, get_selected_ids, is_chat_allowed,
     is_private_user_entity, load_allowed_chats, load_private_chats,
     load_viewer_messages, manage_page_items, reply_mode, reply_target,
-    render_browser, render_message_viewer,
+    render_browser, render_message_viewer, resolve_allowed_chats,
     send_message_plain, send_reply, truncate_preview,
 )
 
@@ -88,8 +88,9 @@ def _browser_buttons(view: BrowserPage) -> list:
 
 
 async def _render_browser(owner_id: int, page: int = 1, query: str = ""):
-    chats = await load_allowed_chats(inline_engine.get_self_client(), owner_id)
-    body, view = render_browser(chats, page, query, len(chats))
+    chats = await resolve_allowed_chats(inline_engine.get_self_client(), owner_id)
+    watcher_count = len(get_allowed_chats())
+    body, view = render_browser(chats, page, query, watcher_count)
     return "👻 Ghost Seen", body, _browser_buttons(view)
 
 
