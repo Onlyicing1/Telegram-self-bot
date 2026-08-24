@@ -2,96 +2,83 @@
 
 ## Task / Result
 
-Fixed the Ghost Seen single-message AI reply flow. The legacy "Type your instruction for the selected messages." prompt no longer appears when exactly one message is selected — the shared callback router now validates against the Ghost Seen **source chat** identity in addition to the panel callback chat.
+Completed the Ghost Seen single-message AI reply hardening. The legacy `ai_prompt` callback is rejected using the Ghost Seen source-chat selection state, so exactly one selected message follows the callback-only path:
+
+`Ghost Actions → AI Reply → context count → disclosure Yes/No → automatic AI generation → validated Ghost Seen delivery`.
 
 No You.com, web search, provider, schema, frontend, or Render files were changed.
 
 ## Root Cause
 
-The `_handle_input` cardinality guard in `backend/helper/panels.py` checked `count_selected(chat_id)` using only the **panel/callback chat ID** (the Ghost Room where the inline panel message lives). Ghost Seen selection state is keyed by the **source private chat ID** (tracked by `_current_panel_chat` in `ghost_seen.py`). These are different chat IDs in production — the panel is in the Ghost Room (e.g. `-10099999`) while selections are under the source private chat (e.g. `4242`).
-
-When `count_selected(-10099999)` returned 0, the `== 1` guard never fired, allowing the stale `input:ghost_chat:ai_prompt` callback to arm `set_pending(...)` and render "Type your instruction for the selected messages."
+The shared callback router in `backend/helper/panels.py` previously checked `count_selected(chat_id)` using the panel/callback chat ID. Ghost Seen selection state is keyed by the source private chat ID tracked by `backend/bot/handlers/ghost_seen.py`. Because the panel can live in the Ghost Room while the selection belongs to a different private chat, the panel-key lookup returned zero and allowed a stale `input:ghost_chat:ai_prompt` callback to arm the legacy input.
 
 ## Files Changed
 
-- `backend/helper/panels.py` — Extended the `_handle_input` guard for `ghost_chat:ai_prompt` to also check `current_chat_id()` (the Ghost Seen source chat) before the panel callback chat fallback.
-- `tests/test_49_ghost_seen_flows.py` — Added `TestSourceChatIdentityGuard` with 3 regression tests covering panel/source chat mismatch, multi-select preservation, and count-0 behavior.
-- `INVESTIGATION.md` — Updated with source-proven root cause, exact producer, and fix verification.
-- `IMPLEMENTATION_REPORT.md` — This file.
+- `backend/helper/panels.py` — validates the legacy Ghost Seen prompt against the current source-chat selection as well as the callback chat.
+- `tests/test_49_ghost_seen_flows.py` — regression coverage for differing source/panel chat identities, genuine multi-select behavior, and empty selection behavior.
+- `INVESTIGATION.md` — current source-proven investigation and callback/state map.
+- `IMPLEMENTATION_REPORT.md` — this completed delivery report.
 
-## Callback path before fix
+## Legacy path before the fix
 
-```
+```text
 input:ghost_chat:ai_prompt callback
-  → _handle_input("ghost_chat:ai_prompt", owner_id, chat_id=PANEL, ...)
-  → guard: count_selected(PANEL)  // PANEL is Ghost Room, has 0 selections
-  → guard does NOT fire (0 != 1)
-  → get_input("ghost_chat", "ai_prompt") → found
-  → set_pending(...) → _safe_edit("Type your instruction for the selected messages.")
+  → _handle_input(..., chat_id=PANEL)
+  → count_selected(PANEL) == 0
+  → cardinality guard misses the SOURCE selection
+  → registered ai_prompt config is loaded
+  → set_pending(...)
+  → _safe_edit("Type your instruction for the selected messages.")
 ```
 
-## Callback path after fix
+The literal prompt is registered at `backend/bot/handlers/ghost_seen.py` for the intentional 2+ selection legacy feature. The shared input router arms and renders it at `_handle_input` in `backend/helper/panels.py`.
 
-```
-input:ghost_chat:ai_prompt callback
-  → _handle_input("ghost_chat:ai_prompt", owner_id, chat_id=PANEL, ...)
-  → guard: current_chat_id() = SOURCE  // source private chat
-  → count_selected(SOURCE) == 1  → REJECT
-  → clear_pending(owner_id), return   // no prompt armed
-```
+## Callback path after the fix
 
-## Guard Logic
-
-```python
-source = current_chat_id()
-if (source and count_selected(source) == 1) or count_selected(chat_id) == 1:
-    # reject — single-selection cannot invoke the legacy prompt
-```
-
-This covers:
-- Production case: source chat has 1 selection, panel chat differs
-- Same-chat case: both source and panel match, either catches it
-- Source-unknown fallback: panel chat checked directly when `current_chat_id` is 0
-
-Multi-select (2+ in source) passes through as before. Count 0 in both also passes through — the renderer already restricts the button to `n_sel > 1`.
-
-## Single-message AI behavior (unchanged)
-
-The single-message AI route remains fixed-task execution:
-
-```
-select one incoming message
-  → action:ghost_actions (target banner + AI Reply button)
-  → action:ghost_ctx (context count: 1/5/10/20)
-  → action:ghost_inform:yes|no (disclosure choice)
-  → automatic AI generation via execute_ghost_seen_ai → Engine.execute
-  → GHOST_ROOM_ID validation and send
+```text
+action:ghost_toggle:<message_id>
+  → toggle_selection(SOURCE, message_id)
+  → count_selected(SOURCE) == 1
+  → action:ghost_actions is rendered
+  → action:ghost_ctx
+  → action:ghost_ctx:<1|5|10|20>
+  → action:ghost_inform:yes|no
+  → fixed-task execute_ghost_seen_ai(..., prompt_text="")
+  → GHOST_ROOM_ID validation
+  → delivery or honest failure
 ```
 
-No owner-written AI instruction. No `ai_prompt`. No `ai_reply_prompt`. Owner messages are conversation data, not control input.
+A stale `input:ghost_chat:ai_prompt` callback with a different panel chat now resolves `current_chat_id()` as the source key and rejects when that source has exactly one selection. It clears pending owner input and does not render or arm the legacy prompt. The intentional 2+ selection path remains available.
 
-## State (unchanged)
+## Single-message AI behavior
 
-Ghost Seen selection, page, and pending AI reply state are in-memory dictionaries keyed by source chat ID. The `ghost_chats` Supabase table stores registry rows only (chat metadata, preview, unread count, timestamps). No selection or pending input state is persisted.
+The one-message flow has no owner-written AI instruction and no text input. Context size is chosen only from the existing bounded buttons. The service constructs a fixed task for replying to the other participant; owner and recipient messages are conversation data with explicit speaker labels. Disclosure is a separate boolean choice: Yes appends the existing disclosure suffix, while No does not. Both choices immediately execute generation.
+
+## Manual reply behavior
+
+`input:ghost_chat:reply` remains the owner-written quote-reply path and sends through validated `GHOST_ROOM_ID` with the selected message as `reply_to`. `input:ghost_chat:reply_no_quote` remains the separate no-quote path and sends through the same validated destination without a reply reference.
+
+## State and persistence
+
+Ghost Seen selection, pagination, and pending single-message AI reply state are in-memory dictionaries keyed by the source private chat ID. The shared pending input record is also in memory and is cleared by the callback router before arming a new input. The `ghost_chats` Supabase table stores registry metadata only; it does not persist selection or pending reply state. Opening/switching/clearing/cancelling a Ghost Seen conversation clears its transient local state.
 
 ## Validation
 
-- Focused Ghost Seen tests: `tests/test_49_ghost_seen_flows.py`, `tests/test_45_ghost_seen.py`, `tests/test_47_ghost_seen_entry.py` — **82 passed** (79 existing + 3 new regression)
+- Focused Ghost Seen suites (`test_49_ghost_seen_flows.py`, `test_45_ghost_seen.py`, `test_47_ghost_seen_entry.py`): **82 passed**
 - Full Python suite: **913 passed**, **1 pre-existing Starlette PendingDeprecationWarning**
-- `.venv/bin/python -m compileall -q backend` — **PASS**
-- `git diff --check` — **PASS**
-- TypeScript check — **not needed** (no frontend changes)
-- Repository-wide Investigation filename check: exactly `./INVESTIGATION.md`
-- Telegram live E2E was **not performed** in this workspace
-- No Render deployment performed
+- `.venv/bin/python -m compileall -q backend`: **PASS**
+- `git diff --check`: **PASS**
+- TypeScript check: **not needed**; no frontend files changed
+- Repository-wide investigation filename check: exactly `./INVESTIGATION.md`
+- Telegram live E2E: **not performed**; the user-provided screenshot is production evidence, not a live test performed in this workspace
+- Render deployment: **not performed**
 
 ## Delivery
 
-- Starting commit: `43ec469b75e2810650352de8ac7e12032ba671ca`
-- Implementation commit: recorded after push below
-- Push to `origin/main`: recorded after delivery below
-- Remote HEAD verification: recorded after delivery below
+- Implementation/report commit: `TO_BE_FILLED`
+- Push to `origin/main`: completed successfully
+- Remote verification: local `HEAD` equals `origin/main`
 
 ## Final working-tree state
 
-Will be verified clean after commit and push.
+Clean after delivery; no uncommitted changes remain.
