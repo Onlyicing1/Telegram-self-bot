@@ -3,9 +3,9 @@ Ghost Seen flows — Execution 26/28 focused regression tests.
 
 Covers:
 1. Authoritative private-human-only source validation (registry boundary)
-2. Incoming listener delegates to the service validator (no inline bypass)
-3. Reply-flow state machine (anchor → context N → disclosure → dedicated
-   prompt; single use; every step explicit, nothing auto-executes)
+2. Incoming listener delegates to the service validator (no inline bypass)    3. Reply-flow state machine (anchor → context N → disclosure → automatic
+   generation; single use; every step explicit)
+
 4. Context window counts exactly N messages ending at the anchor
 5. REPLY TARGET banner is unambiguous and honest
 6. Actions / context menus encode state in callback data
@@ -185,11 +185,11 @@ class TestReplyFlowMachine:
         assert flow["informed"] is False
         assert consume_reply_flow(CHAT) is None  # consumed once
 
-        # An incomplete flow is consumed destructively (never returned).
+        # An incomplete flow is discarded by the single-use consumer.
         start_reply_flow(CHAT, 9)
         set_reply_context_count(CHAT, 10)
         assert consume_reply_flow(CHAT) is None  # disclosure missing
-        assert get_reply_flow(CHAT) is None      # discarded, not reusable
+        assert get_reply_flow(CHAT) is None
 
 
 # ── 4. Context window counting ──
@@ -480,7 +480,7 @@ class TestAIDelivery:
 
     @pytest.mark.asyncio
     async def test_ai_reply_delivered_verbatim_to_ghost_room(self):
-        """The full flow (context → disclosure → prompt) delivers the AI
+        """The full flow (context → disclosure → automatic generation) delivers the AI
         response byte-exact to GHOST_ROOM_ID when disclosure is declined."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr

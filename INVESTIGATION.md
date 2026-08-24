@@ -1,316 +1,209 @@
 # INVESTIGATION
 
-## INVESTIGATION METADATA
-
-- Repository: LifeOS / Telegram Self-Bot
-- Branch: `main`
-- Current HEAD: `7abfea620e3677d19e5d44c40f1d43b78f6d04ab`
-- Investigation date: 2026-08-21
-- Scope: Cross-layer dead surface, public API, and contract reachability audit
-- Status: Investigation-only; no production source, tests, configuration, dependencies, SQL, migrations, or protected documents were modified.
-
-## 1. EXECUTIVE SUMMARY
-
-The cross-layer audit combined backend public exports, dynamic and registry usage, tests, API routes, frontend callers and types, configuration consumers, data fields, deployment entry points, and operational documentation.
-
-No surface met the complete evidence threshold for behavior-neutral deletion. No source or contract surface was removed.
-
-## 2. SCOPE AUDITED
-
-- Backend public functions/classes and package `__init__.py` exports
-- Helper, AI, and Telegram API re-exports and compatibility aliases
-- FastAPI endpoints and frontend API methods/callers
-- Frontend request/response types and backend response fields
-- Environment variables, config fields, derived settings, and Render startup configuration
-- Dataclass/model and serialized data-contract fields
-- Procfile, Render, ASGI/static serving, package scripts, and SQL/tooling contracts
-- Tests, fixtures, documented operational surfaces, and dormant utilities
-
-## 3. CANDIDATES INVESTIGATED
-
-### `backend/helper/panel_settings.py` and helper package exports — POSSIBLY OBSOLETE
-
-The module contains duplicate definitions of `reload` and `auto_close_delay`, and
-`backend/helper/__init__.py` imports `reload` twice under the same alias. The
-underlying settings functions are active: panel lifecycle/timer code and handler
-settings actions consume the canonical `settings_service` behavior. The module is
-explicitly described as a compatibility shim, and its exported names form an
-indirect public import surface. The duplicate definitions are suspicious, but
-removing or consolidating them would be an API/source change without proof that
-external or historical imports do not depend on the shim. Preserved.
-
-### `src/lib/api.ts` and FastAPI contracts — ACTIVE
-
-All exported frontend types are consumed by components or API method signatures.
-All frontend API methods have current component callers. Backend endpoints used by
-the dashboard were matched to their methods and response fields. Operational and
-diagnostic endpoints not called by the SPA were preserved because direct API and
-operational consumers remain valid. The `SavedItem.save_type` union retains the
-historical `forward` value while current deep-save writes use `deep`; database
-history and retrieval behavior still expose the broader field, so this was not
-proven safe to narrow.
-
-### AI model/provider response contracts — ACTIVE
-
-`ProviderStatus`, `ModelInfo`, `ModelTestResult`, `ModelTestSummary`,
-`ModelTestResponse`, and `ProviderModels` are produced by backend discovery/test
-routes and consumed by the dashboard. Legacy summary keys are explicitly retained
-for compatibility in `model_tester.py`; they were not removed.
-
-### Backend public exports — ACTIVE
-
-`backend.ai`, `backend.helper`, and `backend.telegram_api` exports have runtime,
-handler, test, or facade consumers. The Telegram facade is used by AI tools and
-supervisor wiring. Helper exports are used by handlers and lifecycle code. AI
-exports are used by runtime and tests. No export was proven dead across indirect
-imports and public-contract use.
-
-### Configuration and deployment contracts — ACTIVE / INTENTIONALLY DORMANT
-
-`BOT_TOKEN`-derived helper enablement, profile boot flags, Supabase availability,
-AI provider/model variables, `PORT`, Procfile, Render startup, and static serving
-all participate in runtime or deployment behavior. `AI_ENABLED` is documented and
-retained as a deployment/configuration contract even though current runtime
-provider selection also uses provider keys and persisted config. Dormant startup
-checks and `GHOST_ROOM_ID` remain intentionally retained under prior evidence.
-
-## 4. CLASSIFICATIONS
-
-### PROVEN DEAD
-
-None. No complete producer-to-consumer or public-contract chain was proven absent.
-
-### INTENTIONALLY DORMANT
-
-- `backend/runtime/tg_retry.py`, `backend/runtime/startup_check.py`, and
-  `GHOST_ROOM_ID`: tested/documented dormant surfaces preserved under prior
-  investigations.
-- Crash and diagnostic utilities: retained for operational and reconstruction use.
-- Operational FastAPI endpoints without current SPA callers: retained as direct
-  API/diagnostic surfaces.
-
-### POSSIBLY OBSOLETE
-
-- Duplicate definitions and duplicate import aliases in
-  `backend/helper/panel_settings.py` / `backend/helper/__init__.py`: suspicious
-  maintenance residue, but the compatibility module and exported names prevent a
-  behavior-neutral deletion decision.
-- The historical `forward` member of the frontend `SavedItem.save_type` type:
-  current saves are deep-only, but persisted historical records and retrieval
-  semantics prevent proving the field value impossible.
-- `AI_ENABLED` documentation/configuration: not used as the sole runtime gate in
-  the current path, but retained as a deployment and compatibility contract.
-
-### ACTIVE
-
-- Frontend/backend dashboard methods and response fields
-- AI provider/model discovery and test contracts
-- Public package exports and Telegram/helper facades
-- Render/Procfile/ASGI startup and static asset contracts
-- Supabase fallback/configuration contracts
-- Handler, tool, panel, and test fixture registration surfaces
-
-## 5. PRESERVED SURFACES
-
-Protected architecture and operational documents, SQL/migrations, deployment
-configuration, public package exports, operational endpoints, compatibility
-shims, dormant tested utilities, database-facing fields, frontend response
-models, and runtime configuration were preserved. No source behavior was changed.
-
-## 6. UNKNOWN / NOT PROVEN
-
-The audit did not prove whether any external consumer outside the repository
-imports the compatibility shim, consumes operational endpoints, or depends on
-legacy serialized fields. It also did not prove that historical `forward` save
-records are absent from production data. Those unknowns prevent deletion or
-contract narrowing.
-
-## 7. RECOMMENDED NEXT STEP
-
-No cleanup implementation is justified from this cross-layer audit. The helper
-compatibility shim may be reviewed in a separately scoped API-compatibility task,
-but it should not be altered as dead-code cleanup without an explicit public API
-migration decision and evidence about external consumers.
-
-## 8. VALIDATION
-
-- Baseline git status, local HEAD, and `origin/main`: clean and synchronized at
-  `7abfea620e3677d19e5d44c40f1d43b78f6d04ab`.
-- Baseline full suite: **571 passed, 1 failed, 1 warning**.
-- Export, route, frontend API/type, config, response-field, deployment, and
-  compatibility-reference searches completed.
-- `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`: **571 passed, 1 failed, 1 warning**.
-- Known failure unchanged:
-  `tests/test_31_delete_rpc_failures.py::test_tehran_local_cutoff_is_converted_against_message_timezone`.
-
----
-
-# INVESTIGATION — Semantic Duplication, Compatibility Shim, and Conflicting Definition Audit
-
-## INVESTIGATION METADATA
-
-- Repository: LifeOS / Telegram Self-Bot
-- Branch: `main`
-- Current HEAD: `39adfe4491aeeb869f86a7b0a0f48788365c66d8`
-- Investigation date: 2026-08-21
-- Scope: Semantic duplication, compatibility shims, and conflicting definitions
-- Status: Investigation-only; no production source, tests, configuration, dependencies, SQL, migrations, or protected documents were modified.
-
-## 1. EXECUTIVE SUMMARY
-
-Repository-wide AST scans found exactly one module with shadowed duplicate
-definitions (`backend/helper/panel_settings.py`: `reload` and
-`auto_close_delay` defined twice each) and exactly one duplicate import alias
-(`backend/helper/__init__.py`: `reload as reload_settings` imported twice).
-
-Both shadowed duplicates are provably unreachable as distinct bindings (the
-second identical definition always wins), so they are recorded as
-PROVEN-DEAD maintenance residue. This stage is investigation-only: no
-production code was modified. The surrounding compatibility shim itself and
-the remaining re-exports are INTENTIONALLY DUPLICATED / COMPATIBILITY.
-
-## 2. SCOPE AUDITED
-
-- `backend/helper/panel_settings.py` — full definition/alias/import/export
-  surface and git history
-- `backend/helper/__init__.py` — package re-exports and aliases
-- All direct and indirect importers of the shim and its re-exported names
-- Runtime, test, and dynamic consumers of every re-exported name
-- Repository-wide AST scan for duplicate top-level definitions and duplicate
-  import aliases in every module
-- Other explicitly labeled compatibility/legacy surfaces
-
-## 3. CANDIDATES INVESTIGATED
-
-### 3.1 `backend/helper/panel_settings.py` — duplicate definitions
-
-- The module is a documented compatibility shim delegating to
-  `backend.services.settings_service` (docstring: "remains as a compatibility
-  shim so existing imports (backend.helper.panel_settings) continue to work").
-- AST confirms `reload` defined at lines 16-17 and again at 20-21 (identical
-  bodies), and `auto_close_delay` defined at lines 32-33 and again at 40-41
-  (identical bodies). The later definition always shadows the earlier one, so
-  the first copies are unreachable by construction.
-- Git history (`git log --follow`, `git blame`): the file was introduced in
-  merge commit `db927d4` already containing both duplicates — the duplication
-  is original-file residue, not a later accidental edit.
-- Direct importers: only `backend/helper/__init__.py`. No test imports the
-  module or its names.
-- Classification:
-  - First `reload` and first `auto_close_delay` definitions:
-    **PROVEN DEAD** (shadowed, byte-identical, unreachable; removal
-    behavior-neutral). Recorded for a separate removal decision — not
-    removed in this investigation-only stage.
-  - Second definitions (the effective module attributes): **ACTIVE**.
-
-### 3.2 `backend/helper/__init__.py` — duplicate import alias
-
-- Lines 50-56 import `reload as reload_settings` twice; the second import
-  rebinds the identical function object, so the first alias line is
-  behavior-neutral duplication.
-- AST confirms this is the only duplicate import alias in the entire backend.
-- Classification: the duplicate alias line is **PROVEN DEAD** (identical
-  binding, unreachable as a distinct value). The effective `reload_settings`
-  export is retained.
-
-### 3.3 Re-exported compatibility names
-
-- `toggle_auto_close` is the only panel_settings re-export consumed by
-  runtime code: `backend/bot/handlers/misc.py` imports it from
-  `backend.helper` and calls it.
-- `is_auto_close_enabled`, `set_auto_close_enabled`, `load_settings`, and
-  `reload_settings` have no in-repository runtime consumers (runtime code
-  calls `settings_service` directly). They are exported through the
-  documented compatibility surface, and no proof exists that external or
-  historical importers do not use them.
-- Classification: **INTENTIONALLY DUPLICATED / COMPATIBILITY** — the shim's
-  stated purpose is to keep existing imports working; absence of an internal
-  consumer is not proof of deadness for a public export surface.
-
-### 3.4 Other labeled compatibility surfaces (repository-wide scan)
-
-- `backend/runtime/task_guard.py` coroutine compatibility: documented
-  backward-compatible call form, active and tested. **ACTIVE / DISTINCT**.
-- `backend/ai/tools/context.py` `client` field: documented backward-
-  compatibility field used by tools. **ACTIVE / DISTINCT**.
-- `backend/ai/model_tester.py` legacy summary keys: explicitly retained for
-  compatibility with dashboard consumers. **ACTIVE / DISTINCT**.
-- `backend/ai/providers/cohere.py` / defaults / discovery compat endpoint:
-  real Cohere compatibility API endpoint. **ACTIVE / DISTINCT**.
-- `backend/services/retrieve_service.py` legacy text-command entry points:
-  documented as still working. **ACTIVE / DISTINCT**.
-- No other duplicate top-level definitions or duplicate import aliases exist
-  anywhere in `backend/`.
-
-## 4. CLASSIFICATIONS
-
-### PROVEN DEAD (recorded, not removed — investigation-only)
-
-- `backend/helper/panel_settings.py` lines 16-17: first (shadowed) `reload`
-  definition.
-- `backend/helper/panel_settings.py` lines 32-33: first (shadowed)
-  `auto_close_delay` definition.
-- `backend/helper/__init__.py` line 56: duplicate `reload as reload_settings`
-  import (identical to line 52 binding).
-
-Evidence: AST-verified shadowing with byte-identical bodies, no possible
-reachability as distinct bindings, zero test consumers, and removal would not
-alter any supported behavior. These are proposed removals for a future
-implementation pass; they were NOT changed here.
-
-### INTENTIONALLY DUPLICATED / COMPATIBILITY
-
-- `backend/helper/panel_settings.py` module as a whole (documented shim).
-- Re-exported names without internal consumers (`is_auto_close_enabled`,
-  `set_auto_close_enabled`, `load_settings`, `reload_settings`).
-
-### POSSIBLY OBSOLETE
-
-None newly identified.
-
-### ACTIVE / DISTINCT
-
-- Second (effective) `reload` and `auto_close_delay` definitions.
-- `toggle_auto_close` re-export (consumed by `misc.py`).
-- All other labeled compatibility surfaces (task_guard, ToolContext.client,
-  model_tester legacy keys, Cohere compat endpoint, retrieve legacy entry
-  points).
-
-## 5. PRESERVED SURFACES
-
-No production code was modified. The compatibility shim, all re-exports, the
-effective definitions, protected documentation, SQL, migrations, deployment
-configuration, and tests remain exactly as committed. The three
-proven-dead duplicate bindings are documented for a separate future removal
-pass because this execution is investigation-only.
-
-## 6. UNKNOWN / NOT PROVEN
-
-- Whether external consumers outside the repository import
-  `backend.helper.panel_settings` or its unused re-exports.
-- Whether any historical or generated import depends on the module-level
-  attribute order or the duplicate alias lines specifically.
-
-These unknowns support the investigation-only decision rather than an
-implementation change.
-
-## 7. RECOMMENDED NEXT STEP
-
-A separate implementation pass may remove the three recorded proven-dead
-bindings (shadowed `reload`/`auto_close_delay` copies and the duplicate
-`reload_settings` alias) with py_compile + full-suite validation. The
-compatibility module and its public exports should remain unless an explicit
-public-API migration decision is made.
-
-## 8. VALIDATION
-
-- Baseline: clean tree, `HEAD`/`origin/main` synchronized at
-  `39adfe4491aeeb869f86a7b0a0f48788365c66d8`.
-- AST scans across all backend modules for duplicate top-level definitions
-  and duplicate import aliases: only the three recorded candidates found.
-- Import/consumer traces for every re-exported name completed.
-- Git history/blame of `panel_settings.py` inspected (duplicates present at
-  file introduction, commit `db927d4`).
-- No tests were run in this investigation-only execution; no source changed.
-  The previously verified baseline remains **571 passed, 1 failed, 1 warning**
-  with the known Delete-service Tehran timezone failure.
+## Problem
+
+The current Ghost Seen source has two separate reply surfaces:
+
+1. Single-message selection is intended to use a Glass action flow, but a stale inline callback can still invoke the registered legacy `ghost_chat:ai_prompt` input. The shared callback router creates a pending text-input state before any Ghost Seen action handler runs, producing the forbidden “Type your instruction for the selected messages.”
+2. Manual reply buttons are real input callbacks, but delivery uses the authoritative `GHOST_ROOM_ID`; it must be verified and fail closed rather than assuming the source conversation is the destination.
+
+The repository is authoritative. No You.com, web-search, provider, schema, or unrelated system is in scope.
+
+## Complete Current Flow
+
+```text
+Ghost Seen panel
+  → select a private-chat message (action:ghost_toggle:<message_id>)
+  → handler toggles per-chat selection state and re-renders ghost_chat
+  → exactly one selection renders action:ghost_actions
+     2+ selections render input:ghost_chat:ai_prompt (legacy multi-select only)
+  → single-message action menu resolves the anchor and renders:
+       input:ghost_chat:reply
+       input:ghost_chat:reply_no_quote
+       action:ghost_ctx
+  → manual path arms a text input and sends to GHOST_ROOM_ID
+  → AI path selects bounded context count
+  → disclosure yes/no callback
+  → automatic fixed AI task through execute_ghost_seen_ai → Engine.execute
+  → optional disclosure suffix
+  → GHOST_ROOM_ID validation
+  → send_message(destination)
+```
+
+## Stage-by-Stage Explanation
+
+### 1. Ghost Seen chat list
+
+- User sees `👻 Ghost Seen` and rows sourced from the `ghost_chats` registry.
+- `panel:ghost_seen` reaches `_ghost_list_panel_handler`.
+- Each row emits `action:ghost_open:<chat_id>`.
+- Opening sets the current panel chat, resets page 0, clears registry unread state, and renders the message page.
+- `ghost_chats` is source-chat registry state, not a delivery destination.
+- This stage is active and necessary for selecting a conversation.
+
+### 2. Message page and selection
+
+- User sees up to five messages with explicit direction labels and selection marks.
+- Each message button emits `action:ghost_toggle:<message_id>`.
+- `_ghost_toggle_action` uses the current chat and `toggle_selection(chat_id, msg_id)`, then re-renders `ghost_chat`.
+- Selection state is `_selections[chat_id]`, capped at ten IDs.
+- `count_selected(chat_id)` decides the next control:
+  - exactly one: `⚡ Reply / Actions` → `action:ghost_actions`
+  - two or more: `🤖 AI on selection` → `input:ghost_chat:ai_prompt`
+- The branch is active and is the intended single-vs-multi distinction.
+
+### 3. Single-message action menu
+
+- `_ghost_actions_action` requires exactly one selected ID and a configured self client.
+- It resolves the anchor message, starts `_pending_replies[chat_id]` with `anchor`, `context_n=None`, and `informed=None`, and renders the reply-target banner.
+- Buttons are real Glass callbacks:
+  - `input:ghost_chat:reply` — manual quote reply
+  - `input:ghost_chat:reply_no_quote` — manual no-quote reply
+  - `action:ghost_ctx` — AI context policy menu
+  - `action:ghost_back` — return to list
+- This stage is active and required. The target banner identifies the selected message.
+
+### 4. Manual reply input
+
+- The two manual buttons are registered in `ghost_seen.register` and routed by the shared `input:` branch.
+- `_handle_input` stores a per-owner pending input with the registered handler, panel chat, panel message, prompt, and timeout, then edits the panel to show the input prompt.
+- The next owner message is delivered to `_ghost_reply_input` or `_ghost_reply_no_quote_input`.
+- Both resolve `_resolve_ghost_destination()` from `GHOST_ROOM_ID`; neither uses `ghost_chats` or the current source chat as fallback.
+- Quote mode calls `send_message(dst, text, reply_to=selected_id)`; no-quote mode calls `send_message(dst, text)`.
+- Both clear selection after processing; failures are logged and do not claim success.
+- This stage is active. The manual input behavior is legitimate and distinct from the forbidden AI instruction input.
+
+### 5. AI context policy
+
+- `action:ghost_ctx` reaches `_ghost_ctx_action`.
+- With no argument, it renders buttons for 1, 5, 10, or 20 messages, each using `action:ghost_ctx:<n>`.
+- The service validates the allow-list and stores `context_n` in the pending flow.
+- Choosing a valid count renders exactly two disclosure buttons. No text input is armed.
+- This stage controls context amount and is necessary; it is not an AI instruction.
+
+### 6. Disclosure
+
+- `action:ghost_inform:yes` or `action:ghost_inform:no` reaches `_ghost_inform_action`.
+- It validates and stores the boolean disclosure policy, then immediately calls `_execute_single_ghost_ai_reply`.
+- Invalid values cancel the flow and render an error.
+- Disclosure is delivery policy, not model instruction.
+
+### 7. Automatic AI generation and delivery
+
+- `_execute_single_ghost_ai_reply` consumes the complete flow exactly once.
+- It validates `GHOST_ROOM_ID` before delivery, fetches the bounded context ending at the anchor, and rejects an outgoing anchor because the target must be a recipient message.
+- `execute_ghost_seen_ai` builds explicit `OWNER` / `RECIPIENT` lines, marks the final recipient message as the target in its fixed task, and invokes the existing `Engine.execute(AIRequest)` path with an empty prompt string.
+- On success, the handler appends `AI_DISCLOSURE_SUFFIX` only when disclosure is enabled and sends to the validated `GHOST_ROOM_ID`.
+- Missing/invalid destination, failed context fetch, invalid target direction, AI failure, and send failure all fail closed.
+
+### 8. Back and Cancel
+
+- `action:ghost_back` returns to the list; shared panel navigation clears pending owner input when appropriate.
+- `action:ghost_clear` clears selection and re-renders the chat.
+- Input pages render a `panel:ghost_chat` cancel button; the shared panel route clears pending input and returns to the chat page.
+- The service `cancel_reply_flow` and `reset_chat_state` clear transient reply state.
+
+## Manual Reply Flow
+
+```text
+select one message
+  → action:ghost_actions
+  → input:ghost_chat:reply OR input:ghost_chat:reply_no_quote
+  → shared _handle_input stores pending owner input
+  → owner types reply
+  → _ghost_reply_input / _ghost_reply_no_quote_input
+  → GHOST_ROOM_ID validation
+  → send_message(dst, text, reply_to=anchor) OR send_message(dst, text)
+  → clear selection
+```
+
+The manual flow does not use the AI engine. It is active, callback-registered, and has separate quote/no-quote semantics. The implementation must preserve it while ensuring its destination remains fail closed.
+
+## AI Reply Flow
+
+```text
+select exactly one incoming message
+  → action:ghost_actions with target banner
+  → action:ghost_ctx
+  → action:ghost_ctx:<1|5|10|20>
+  → action:ghost_inform:yes OR action:ghost_inform:no
+  → consume complete reply flow
+  → bounded fetch_context_window
+  → fixed task: generate owner's natural reply to recipient
+  → Engine.execute(AIRequest), no owner prompt
+  → optional suffix
+  → GHOST_ROOM_ID validation and send
+```
+
+The current fixed task constructs `OWNER` and `RECIPIENT` speaker labels. Owner messages are context data, not control input. The selected incoming message is the final target. No `ai_reply_prompt` registration exists in the current handler.
+
+## Callback Map
+
+| Callback | Receiver | Result |
+|---|---|---|
+| `action:ghost_open:<id>` | `_ghost_open_action` | Open source private chat |
+| `action:ghost_toggle:<id>` | `_ghost_toggle_action` | Toggle selection and re-render |
+| `action:ghost_page:prev/next` | `_ghost_page_action` | Change page |
+| `action:ghost_clear` | `_ghost_clear_action` | Clear selection |
+| `action:ghost_actions` | `_ghost_actions_action` | Target banner and manual/AI choices |
+| `action:ghost_ctx` | `_ghost_ctx_action` | Context-size menu |
+| `action:ghost_ctx:<n>` | `_ghost_ctx_action` | Store context count and show disclosure |
+| `action:ghost_inform:yes/no` | `_ghost_inform_action` | Store policy and execute automatically |
+| `action:ghost_remove` | `_ghost_remove_action` | Remove registry row/local state |
+| `action:ghost_back` | `_ghost_back_action` | Return to chat list |
+| `input:ghost_chat:reply` | `_ghost_reply_input` | Typed quote reply |
+| `input:ghost_chat:reply_no_quote` | `_ghost_reply_no_quote_input` | Typed no-quote reply |
+| `input:ghost_chat:ai_prompt` | `_ghost_ai_input` | Legacy multi-select typed AI path; must be blocked for one selection |
+
+All callbacks enter the single shared router in `backend/helper/panels.py`, which resolves the panel session and dispatches by `panel:`, `action:`, or `input:` prefix.
+
+## State Map
+
+- `_current_panel_chat` in `ghost_seen.py`: current source chat used by panel actions.
+- `_selections: dict[int, set[int]]`: selected source-message IDs, keyed by source chat.
+- `_pages: dict[int, int]`: current message page per source chat.
+- `_pending_replies: dict[int, dict]`: `{anchor, context_n, informed}` keyed by source chat; consumed once after disclosure.
+- Shared `_pending` in `helper/input_state.py`: per-owner manual or legacy text-input state, including panel/chat/message binding and timeout.
+- Lifecycle session state in `helper/session_manager.py`: panel message/session lookup used by callback routing.
+
+## Confirmed Problems
+
+1. The shared `_handle_input` route accepted `input:ghost_chat:ai_prompt` without checking selection cardinality. A stale inline button could therefore show the legacy instruction prompt even when one message was selected. This is source-proven.
+2. The legacy `ai_prompt` registration remains necessary for 2+ selections, so removing it globally would break the separate multi-select flow. The guard must be single-selection-specific.
+3. `_ghost_actions_action` and its buttons are registered in the current handler; the source does not show a duplicate Ghost Seen action registration. The observed missing buttons are consistent with stale callback state bypassing this action menu, not with absent button construction.
+
+## Likely Problems
+
+- A previously rendered inline panel or stale callback payload is likely surviving across a runtime/session update and invoking `input:ghost_chat:ai_prompt` directly. The shared router’s lack of a cardinality guard makes this possible.
+- Manual reply “does nothing” may be a stale input panel/session or an unresolved destination; source-level delivery is present and must be covered with router/state tests.
+
+## Unknowns
+
+- The source cannot prove which exact stale Telegram inline message the owner pressed or whether Telegram cached an older panel payload.
+- Actual Telegram API delivery, Telegram client-side button rendering, and current Render process state cannot be verified in this repository-only environment.
+- Whether the configured `GHOST_ROOM_ID` chat accepts `reply_to` for a source-chat message ID depends on Telegram semantics/runtime; the existing architecture treats the configured Ghost Room as the delivery destination and must not guess another destination.
+
+## Required Final Behavior
+
+For exactly one selected incoming private message:
+
+```text
+selection
+  → real rendered Ghost Seen action menu with target banner
+  → Reply myself quote/no-quote OR Reply with AI
+  → optional legitimate bounded context count
+  → exactly two disclosure buttons
+  → immediate automatic AI generation
+  → OWNER/RECIPIENT role-aware context
+  → optional suffix
+  → validated GHOST_ROOM_ID delivery
+```
+
+No single-message path may show or arm `ai_prompt`, `ai_reply_prompt`, “Type your instruction,” or any owner-written AI instruction. Two or more selections may retain the legacy typed multi-select path. Any missing/invalid destination or failed context must fail closed.
+
+## Implementation Plan
+
+1. Add a guard at the shared `input:` routing boundary: when the requested input is `ghost_chat:ai_prompt` and `count_selected(chat_id) == 1`, clear any pending input and drop the callback without showing a prompt.
+2. Add focused tests for the actual rendered one-selection button set, callback routing guard, manual quote/no-quote delivery, automatic AI flow without prompt, disclosure policy, role-aware bounded context, and multi-select preservation.
+3. Run focused Ghost Seen tests, the full suite, `compileall`, and `git diff --check`; review for duplicate callbacks and stale single-message prompt paths.
+4. Update the implementation report accurately, commit only Ghost Seen/investigation/report files, push `origin/main`, and verify local/remote parity and a clean tree.

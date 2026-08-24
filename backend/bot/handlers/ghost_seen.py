@@ -221,7 +221,7 @@ async def _ghost_chat_panel_handler(event, extra: str) -> tuple[str, str, list] 
 
 
 async def _ghost_open_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_seen_service import set_page
+    from backend.services.ghost_seen_service import cancel_reply_flow, clear_selection, set_page
     try:
         target = int(extra)
     except ValueError:
@@ -229,6 +229,12 @@ async def _ghost_open_action(event, extra: str, chat_id: int) -> tuple[str, str,
         _nav_buttons(builder)
         return "👻 Chat", "Invalid chat id.", builder.build()
 
+    previous = _current_chat()
+    if previous:
+        clear_selection(previous)
+        cancel_reply_flow(previous)
+    clear_selection(target)
+    cancel_reply_flow(target)
     set_page(target, 0)
     _set_current_chat(target)
     from backend.services.ghost_seen_service import clear_unread as clear_registry_unread
@@ -243,14 +249,16 @@ async def _ghost_toggle_action(event, extra: str, chat_id: int) -> tuple[str, st
     except ValueError:
         return await _ghost_chat_panel_handler(event, _current_chat_str())
 
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     toggle_selection(panel_chat, msg_id)
+    from backend.services.ghost_seen_service import cancel_reply_flow
+    cancel_reply_flow(panel_chat)
     return await _ghost_chat_panel_handler(event, str(panel_chat))
 
 
 async def _ghost_page_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     from backend.services.ghost_seen_service import get_page, set_page
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     page = get_page(panel_chat)
     if extra == "prev":
         set_page(panel_chat, max(0, page - 1))
@@ -260,13 +268,19 @@ async def _ghost_page_action(event, extra: str, chat_id: int) -> tuple[str, str,
 
 
 async def _ghost_clear_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services.ghost_seen_service import clear_selection
-    panel_chat = _current_chat()
+    from backend.services.ghost_seen_service import cancel_reply_flow, clear_selection
+    panel_chat = _current_chat() or chat_id
     clear_selection(panel_chat)
+    cancel_reply_flow(panel_chat)
     return await _ghost_chat_panel_handler(event, str(panel_chat))
 
 
 async def _ghost_back_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    from backend.services.ghost_seen_service import clear_selection, cancel_reply_flow
+
+    panel_chat = _current_chat() or chat_id
+    clear_selection(panel_chat)
+    cancel_reply_flow(panel_chat)
     return await _ghost_list_panel_handler(event, extra)
 
 
@@ -282,7 +296,7 @@ async def _ghost_actions_action(event, extra: str, chat_id: int) -> tuple[str, s
         format_reply_target,
     )
 
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     sel = get_selection(panel_chat)
     if len(sel) != 1 or not _self_client:
         builder = InlinePanelBuilder()
@@ -448,7 +462,7 @@ async def _ghost_remove_action(event, extra: str, chat_id: int) -> tuple[str, st
     """
     from backend.services.ghost_seen_service import remove_chat
 
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     await remove_chat(panel_chat)
     return await _return_ghost_list_after_action(event)
 
@@ -462,7 +476,7 @@ async def _ghost_reply_input(text, chat_id, msg_id, inline_chat_id, inline_msg_i
     if dst is None:
         logger.warning("Ghost Seen: reply blocked — GHOST_ROOM_ID missing or invalid")
         return
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     sel = get_selection(panel_chat)
     if not sel or not _self_client:
         return
@@ -480,7 +494,7 @@ async def _ghost_reply_no_quote_input(text, chat_id, msg_id, inline_chat_id, inl
     if dst is None:
         logger.warning("Ghost Seen: reply blocked — GHOST_ROOM_ID missing or invalid")
         return
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     sel = get_selection(panel_chat)
     if not sel or not _self_client:
         return
@@ -498,7 +512,7 @@ async def _ghost_ai_input(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
         clear_selection,
         execute_ghost_seen_ai,
     )
-    panel_chat = _current_chat()
+    panel_chat = _current_chat() or chat_id
     dst = _resolve_ghost_destination()
     if dst is None:
         logger.warning("Ghost Seen: AI blocked — GHOST_ROOM_ID missing or invalid")
@@ -584,6 +598,11 @@ def _set_current_chat(chat_id: int) -> None:
 
 
 def _current_chat() -> int:
+    return _current_panel_chat
+
+
+def current_chat_id() -> int:
+    """Return the source private chat currently shown by Ghost Seen."""
     return _current_panel_chat
 
 
