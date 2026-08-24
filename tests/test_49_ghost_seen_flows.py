@@ -617,6 +617,136 @@ class TestAIDelivery:
         client.send_message.assert_not_called()
 
 
+class TestSourceChatIdentityGuard:
+    """Regression: ai_prompt must be rejected when the Ghost Seen *source chat*
+    has a single selection, even when the panel callback chat differs."""
+
+    SOURCE = 4242
+    PANEL = -10099999  # Ghost Room (differs from source)
+
+    @pytest.mark.asyncio
+    async def test_ai_prompt_rejected_when_source_has_one_selection_but_panel_differs(self, monkeypatch):
+        """The shared _handle_input guard must check the Ghost Seen source chat
+        (current_chat_id) in addition to the panel callback chat.
+
+        Before this fix, count_selected(chat_id) used only the panel chat ID
+        and would see count=0 when the actual source chat had exactly 1
+        selection, allowing the legacy prompt through."""
+        _register_once()
+        monkeypatch.setenv("GHOST_ROOM_ID", "88888")
+
+        from backend.bot.handlers import ghost_seen as gr
+        from backend.services.ghost_seen_service import toggle_selection, clear_selection, cancel_reply_flow
+
+        clear_selection(self.SOURCE)
+        cancel_reply_flow(self.SOURCE)
+        toggle_selection(self.SOURCE, 777)
+
+        from backend.services.ghost_seen_service import count_selected
+        assert count_selected(self.SOURCE) == 1
+        assert count_selected(self.PANEL) == 0
+
+        gr._set_current_chat(self.SOURCE)
+        assert gr.current_chat_id() == self.SOURCE
+
+        from backend.helper.panels import _handle_input
+        from backend.helper.input_state import set_pending, clear_pending, get_pending
+        from unittest.mock import AsyncMock
+
+        OWNER = 12345
+        clear_pending(OWNER)
+
+        mock_event = AsyncMock()
+        mock_event.edit = AsyncMock()
+
+        await _handle_input(mock_event, "ghost_chat:ai_prompt", OWNER, self.PANEL, 0)
+
+        pending = get_pending(OWNER)
+        clear_pending(OWNER)
+        assert pending is None, (
+            f"ai_prompt must NOT be armed when the source chat ({self.SOURCE}) "
+            f"has exactly 1 selection, even if the panel chat ({self.PANEL}) has 0"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ai_prompt_allowed_when_source_has_multi_selection(self, monkeypatch):
+        """Two or more selections in the source chat must still allow the
+        legacy typed multi-select flow."""
+        _register_once()
+        monkeypatch.setenv("GHOST_ROOM_ID", "88888")
+
+        from backend.bot.handlers import ghost_seen as gr
+        from backend.services.ghost_seen_service import toggle_selection, clear_selection, cancel_reply_flow
+
+        clear_selection(self.SOURCE)
+        cancel_reply_flow(self.SOURCE)
+        toggle_selection(self.SOURCE, 1)
+        toggle_selection(self.SOURCE, 2)
+
+        from backend.services.ghost_seen_service import count_selected
+        assert count_selected(self.SOURCE) >= 2
+
+        gr._set_current_chat(self.SOURCE)
+
+        from backend.helper.panels import _handle_input
+        from backend.helper.input_state import set_pending, clear_pending, get_pending
+        from unittest.mock import AsyncMock
+
+        OWNER = 12345
+        clear_pending(OWNER)
+
+        mock_event = AsyncMock()
+        mock_event.edit = AsyncMock()
+
+        await _handle_input(mock_event, "ghost_chat:ai_prompt", OWNER, self.SOURCE, 0)
+
+        pending = get_pending(OWNER)
+        clear_pending(OWNER)
+        assert pending is not None, (
+            f"ai_prompt must be armed when the source chat ({self.SOURCE}) "
+            f"has {count_selected(self.SOURCE)} selections (>=2)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ai_prompt_allowed_when_no_source_selection_at_all(self, monkeypatch):
+        """When neither the source chat nor the panel chat has any selection
+        (count 0) and the source chat is unknown (0), the guard falls through —
+        the renderer already restricts the button to n_sel > 1, and
+        _ghost_ai_input itself rejects < 2 selections. This is correct."""
+        _register_once()
+        monkeypatch.setenv("GHOST_ROOM_ID", "88888")
+
+        from backend.bot.handlers import ghost_seen as gr
+        from backend.services.ghost_seen_service import clear_selection, cancel_reply_flow
+
+        PANEL = -10088888
+        clear_selection(PANEL)
+        cancel_reply_flow(PANEL)
+        gr._set_current_chat(0)
+
+        from backend.helper.panels import _handle_input
+        from backend.helper.input_state import clear_pending, get_pending
+        from unittest.mock import AsyncMock
+
+        OWNER = 12345
+        clear_pending(OWNER)
+
+        mock_event = AsyncMock()
+        mock_event.edit = AsyncMock()
+
+        await _handle_input(mock_event, "ghost_chat:ai_prompt", OWNER, PANEL, 0)
+
+        pending = get_pending(OWNER)
+        clear_pending(OWNER)
+        from backend.services.ghost_seen_service import count_selected
+        assert count_selected(PANEL) == 0
+        assert count_selected(0) == 0
+        assert pending is not None, (
+            "ai_prompt is armed when count 0 (no guard match); "
+            "the multi-select renderer and handler already restrict n_sel >= 2"
+        )
+
+
 class TestNoSecondArchitecture:
     def test_engine_execute_remains_the_only_ai_path(self):
         import inspect

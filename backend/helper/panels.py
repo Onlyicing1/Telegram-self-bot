@@ -529,7 +529,9 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
 
     if panel_id == "ghost_chat" and input_id == "ai_prompt":
         from backend.services.ghost_seen_service import count_selected
-        if count_selected(chat_id) == 1:
+        from backend.bot.handlers.ghost_seen import current_chat_id
+        source = current_chat_id()
+        if (source and count_selected(source) == 1) or count_selected(chat_id) == 1:
             logger.warning(
                 "[CALLBACK] REJECT: legacy Ghost Seen ai_prompt for single selection"
             )
