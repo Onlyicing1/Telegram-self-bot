@@ -1,34 +1,21 @@
-# Ghost Seen Removal Investigation
+# Ghost Seen v2 Investigation
 
-## Decision
+## Clean rebuild boundary
 
-The pre-existing Ghost Seen implementation was intentionally removed in this cleanup execution. The next execution will rebuild Ghost Seen v2 from zero; this execution does not add a replacement.
+The previous Ghost Seen implementation was removed before this work. Its dedicated handler/service, legacy callbacks, selection/reply/AI state, input registrations, Ghost Room delivery path, and old UI are not reused. This execution begins the v2 rebuild with Stage 1 only: a private-chat browser.
 
-## Removed footprint
+## Stage 1 source and filtering
 
-- Dedicated production handler: `backend/bot/handlers/ghost_seen.py`.
-- Dedicated production service and all in-memory Ghost Seen selection/pagination/reply state: `backend/services/ghost_seen_service.py`.
-- Router import and `register_all()` registration for Ghost Seen.
-- `Menu`'s Ghost Seen panel entry and Ghost Seen retention panel/actions.
-- `GHOST_ROOM_ID` config exposure and dormant startup-check validation.
-- Ghost Seen database-stat counting helper and its database statistics output.
-- Ghost Seen-specific Supabase migration files.
-- Old Ghost Seen implementation contract and dedicated Ghost Seen test modules.
+`backend/services/ghost_seen_v2.py` is the Stage 1 domain module. It reads actual Telethon dialogs through the self client and filters at the source layer using `is_private_user_dialog()` / `filter_private_dialogs()`. Only Telegram `User` entities that are neither bots nor the owner are eligible. Non-user dialogs, groups, supergroups, channels, service entities, saved messages, and self are excluded.
 
-This removes the old browsing, selection, manual reply, callback, input, AI, and delivery implementation as requested. No compatibility wrapper or stale callback registration remains.
+Search is limited to first name, last name, and username. Matching uses case-folded whitespace normalization, supports concatenated first/last names, and treats `username` and `@username` equivalently. Display values are not mutated. `page_items()` caps pages at five chats and `render_chat_row()` produces two lines with bounded previews, compact times, and plain numeric unread counts.
 
-## AI/input removal
+## UI and lifecycle
 
-The old Ghost Seen AI Reply flow, context/disclosure callbacks, pending reply state, AI execution helpers, and `input:ghost_chat:ai_prompt` producer were already removed in the preceding cleanup commit and are absent from the current production tree. The legacy prompt text `Type your instruction for the selected messages.` has no executable producer. The generic AI provider/engine and generic panel/input infrastructure remain because they serve unrelated features.
+`backend/bot/handlers/ghost_seen_v2.py` registers the Stage 1 panel and loads dialogs from the existing Telethon client. `backend/bot/router.py` wires it into normal registration, and the main menu exposes `panel:ghost_seen_v2`. No AI, reply, message selection, action menu, context, disclosure, delivery, or Message Viewer path exists in Stage 1. No second watcher/event bus or persistence layer was introduced; Stage 1 reads current Telegram dialog state when rendered.
 
-## Persistence and configuration
-
-Ghost Seen's `ghost_chats` table was feature-specific. Its repository migration and runtime database-stat usage were removed, but no destructive operation was executed against an already-provisioned Supabase database; an existing physical table, if present, is now unused by this repository. `GHOST_ROOM_ID` was feature-specific and is no longer read by production configuration or startup checks. No Render environment or deployment configuration was changed.
-
-## Preserved systems
-
-The shared `backend.helper` panel/input/callback infrastructure, generic AI provider architecture, You.com/web-search implementation, Supabase client, unrelated database services, runtime supervisor, and all unrelated handlers remain intact.
+There is exactly one investigation document: this file. The old Ghost Seen database migration/table, if previously applied externally, was not destructively altered by this rebuild. No Ghost Room environment or Render configuration was added.
 
 ## Verification
 
-The dedicated Ghost Seen test modules were removed with the implementation because they tested deleted behavior. The remaining suite must validate the actual post-removal repository. This document is the single canonical investigation document. Telegram live behavior was not tested; old Telegram messages may remain in chat history, but the repository no longer has code that can render or process the old feature.
+Focused Stage 1 tests cover private-user filtering, bot/non-user exclusion, tolerant search, missing name fields, two-line rendering, truncation, pagination, empty state, and absence of a Refresh control. Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md` after completion.
