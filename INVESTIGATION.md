@@ -169,8 +169,9 @@ All callbacks enter the single shared router in `backend/helper/panels.py`, whic
 ## Confirmed Problems
 
 1. The shared `_handle_input` route accepted `input:ghost_chat:ai_prompt` without checking selection cardinality. A stale inline button could therefore show the legacy instruction prompt even when one message was selected. This is source-proven.
-2. The legacy `ai_prompt` registration remains necessary for 2+ selections, so removing it globally would break the separate multi-select flow. The guard must be single-selection-specific.
-3. `_ghost_actions_action` and its buttons are registered in the current handler; the source does not show a duplicate Ghost Seen action registration. The observed missing buttons are consistent with stale callback state bypassing this action menu, not with absent button construction.
+2. The legacy `ai_prompt` registration remains necessary for 2+ selections, so removing it globally would break the separate multi-select flow. The guard is single-selection-specific.
+3. Ghost Seen action handlers historically preferred the module-global `_current_panel_chat`; the callback router's authoritative resolved chat was not used consistently. After an inline session/callback rebinding, this could read the wrong selection/reply-flow key and make valid buttons appear unresponsive. The corrected path uses the callback chat ID first for context/disclosure transitions.
+4. `_ghost_actions_action` and its buttons are registered in the current handler; the source does not show a duplicate Ghost Seen action registration. The observed missing buttons are consistent with stale callback state bypassing this action menu, not with absent button construction.
 
 ## Likely Problems
 
@@ -203,7 +204,8 @@ No single-message path may show or arm `ai_prompt`, `ai_reply_prompt`, “Type y
 
 ## Implementation Plan
 
-1. Add a guard at the shared `input:` routing boundary: when the requested input is `ghost_chat:ai_prompt` and `count_selected(chat_id) == 1`, clear any pending input and drop the callback without showing a prompt.
-2. Add focused tests for the actual rendered one-selection button set, callback routing guard, manual quote/no-quote delivery, automatic AI flow without prompt, disclosure policy, role-aware bounded context, and multi-select preservation.
-3. Run focused Ghost Seen tests, the full suite, `compileall`, and `git diff --check`; review for duplicate callbacks and stale single-message prompt paths.
-4. Update the implementation report accurately, commit only Ghost Seen/investigation/report files, push `origin/main`, and verify local/remote parity and a clean tree.
+1. Keep the shared `input:` cardinality guard: `ghost_chat:ai_prompt` is rejected when exactly one message is selected, while 2+ selections retain the typed legacy flow.
+2. Resolve Ghost Seen context/disclosure state from the callback's authoritative chat ID before the module-global fallback, preventing cross-chat/stale-session routing.
+3. Add focused tests for rendered one-selection buttons, callback routing/state binding, manual quote/no-quote delivery, automatic AI flow without prompt, disclosure policy, role-aware bounded context, and multi-select preservation.
+4. Run focused Ghost Seen tests, the full suite, `compileall`, and `git diff --check`; review for duplicate callbacks and stale single-message prompt paths.
+5. Update the implementation report accurately, commit only Ghost Seen/investigation/report files, push `origin/main`, and verify local/remote parity and a clean tree.

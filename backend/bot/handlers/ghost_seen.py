@@ -341,7 +341,7 @@ async def _ghost_ctx_action(event, extra: str, chat_id: int) -> tuple[str, str, 
         ALLOWED_CONTEXT_COUNTS,
     )
 
-    panel_chat = _current_chat()
+    panel_chat = chat_id or _current_chat()
     flow = get_reply_flow(panel_chat)
     fail_builder = InlinePanelBuilder()
     fail_builder.add_row("⬅ Back", "action:ghost_back")
@@ -436,7 +436,7 @@ async def _ghost_inform_action(event, extra: str, chat_id: int) -> tuple[str, st
     """Record disclosure choice and immediately execute the fixed AI reply."""
     from backend.services.ghost_seen_service import set_reply_disclosure, cancel_reply_flow
 
-    panel_chat = _current_chat() or chat_id
+    panel_chat = chat_id or _current_chat()
     if extra not in ("yes", "no"):
         cancel_reply_flow(panel_chat)
         builder = InlinePanelBuilder()
