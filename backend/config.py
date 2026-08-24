@@ -41,4 +41,6 @@ def load() -> dict:
         "BIO_UPDATE_ENABLED": os.getenv("BIO_UPDATE_ENABLED", "false").lower() == "true",
         "USERNAME_UPDATE_ENABLED": os.getenv("USERNAME_UPDATE_ENABLED", "false").lower() == "true",
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper(),
+        "GHOST_SEEN_DESTINATION_CHAT_ID": int(os.getenv("GHOST_SEEN_DESTINATION_CHAT_ID", "0")),
+        "GHOST_SEEN_DESTINATION_CHAT_NAME": os.getenv("GHOST_SEEN_DESTINATION_CHAT_NAME", ""),
     }

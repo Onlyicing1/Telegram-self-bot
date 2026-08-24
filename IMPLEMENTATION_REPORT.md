@@ -1,63 +1,70 @@
-# Implementation Report — Ghost Seen v2 Stage 5
+# Implementation Report — Ghost Seen v2 Stage 5/6 Hardening
 
 ## Scope
 
-Implemented the real manual Reply flow on top of Stages 1–4. The path is:
-
-Message Viewer → select exactly one message → Action Menu → Reply → owner types reply text → the exact text is sent to the validated SOURCE private chat as a reply (`reply_to=<selected message ID>`) → honest success/failure status → clean state.
-
-AI Reply remains an inert Stage 4 placeholder. No AI generation, prompt, context selection, disclosure, provider call, web search, or You.com usage was added. No legacy Ghost Seen code was resurrected.
+Hardened the existing Stage 1–5 Ghost Seen v2 implementation with per-chat privacy opt-in, newest-first message ordering, improved selection UX, dual reply modes, and configurable destination. No AI was added; no legacy code was resurrected.
 
 ## Files changed
 
-- `backend/services/ghost_seen_v2.py` — `reply_target()`, panel-chat-keyed reply state (`begin_reply` / `get_reply` / `consume_reply` / `clear_reply` / `clear_all_replies`), and `send_reply()` delegating to the existing `backend.telegram_api.messages.send_message` typed wrapper with `reply_to`.
-- `backend/bot/handlers/ghost_seen_v2.py` — Action Menu Reply now routes to `action:ghost_seen_v2_reply:<source>`; `_reply_action` (strict one-selection validation + input arming), `_ghost_reply_input_handler` (validated consumption + Telegram delivery + honest result), `_reply_cancel_action` (clears pending input and reply state, returns to Action Menu/viewer), reply-state cleanup on Actions-Back and on opening another chat.
-- `tests/test_56_ghost_seen_v2_stage5.py` — focused Stage 5 regression tests.
-- `INVESTIGATION.md` — Stage 5 state/callback tracing appended (still the only investigation file).
-- `IMPLEMENTATION_REPORT.md` — this report.
+- `backend/services/ghost_seen_v2.py` — per-chat privacy model (`_allowed_chats` set, `allow_chat`/`disallow_chat`/`is_chat_allowed`, DB persistence via `bot_settings`), `load_allowed_chats()` filter, `get_destination_chat_id()`/`get_destination_chat_name()` env config, `send_message_plain()` for send-without-reply, `begin_reply`/`consume_reply`/`get_reply` now carry `mode` (4th tuple element), viewer sorts newest-first, browser text reflects privacy model.
+- `backend/bot/handlers/ghost_seen_v2.py` — browser uses `load_allowed_chats()`, `⚙ Manage` button → `_MANAGE_ID` panel with ON/OFF toggles per chat, `_toggle_permission_action`, `_send_plain_action` for send-without-reply, `_begin_input_for()` common input setup, `_viewer_buttons` shows message preview in Select labels, `_action_buttons` shows Reply + Send without reply only for single selection, `_open_chat_action`/`_actions_action`/`_begin_input_for` revalidate `is_chat_allowed()`.
+- `backend/config.py` — `GHOST_SEEN_DESTINATION_CHAT_ID` (int) and `GHOST_SEEN_DESTINATION_CHAT_NAME` (str) loaded from env.
+- `tests/test_52_ghost_seen_v2_stage1.py` — updated empty-state assertion for new privacy text.
+- `tests/test_56_ghost_seen_v2_stage5.py` — updated for 4-tuple reply state, privacy prerequisites, new error messages.
+- `tests/test_57_ghost_seen_v2_stage5_6.py` — 42 comprehensive hardening regression tests.
 
-## Exact Reply flow
+## Privacy model
 
-1. Action Menu (`Reply`) → `ghost_seen_v2_reply:<source>`.
-2. `reply_target(source)` must return exactly one selected Telegram message ID; 0 or 2+ fail closed (never arm input).
-3. The viewer session must resolve to the same source chat; otherwise fail closed.
-4. `begin_reply(panel_chat, source, message_id, panel_msg_id)` arms the reply state in-memory, keyed by the PANEL chat (the only chat where the owner's typed reply is consumed).
-5. The shared pending-input system (`set_pending`, owner-keyed) asks the owner for the reply text; the input listener only consumes an outgoing message in that exact panel chat.
-6. On the owner's message: `consume_reply(panel_chat)` atomically takes the state, re-validates that the source still has exactly that one message selected, then sends the exact text unchanged via the existing Telegram send utility with `reply_to=<message_id>`.
-7. Success clears selection + reply state and shows `✅ Reply sent.`; failure consumes the state (never double-sends) and shows an honest `❌ Reply failed: ...`.
-8. Cancel and Actions-Back clear pending input and reply state without sending; opening another chat clears the old reply state.
+- **Default**: all chats are NOT ALLOWED for Ghost Seen.
+- **Enable**: the `⚙ Manage` panel in the Ghost Seen browser shows all private user dialogs with ON/OFF toggle buttons. Tapping OFF → ON calls `allow_chat(chat_id)`.
+- **Disable**: tapping ON → OFF calls `disallow_chat(chat_id)`, which also clears any active selection and reply state for that chat.
+- **Persistence**: allowed chat IDs are stored in the `bot_settings` Supabase table (key `ghost_seen_allowed_chats`, JSON-encoded list). When Supabase is unavailable, the in-memory set is used without persistence.
+- **Source-chat identity**: privacy permission is keyed by the real Telegram source chat ID (integer). Never by display name, username, page, or message text.
 
-## Source-chat identity handling
+## Message ordering
 
-The destination is always the validated Stage 2/3 source private chat from the callback/session state. The panel chat is used only as: (a) the session key, (b) where the typed reply is consumed, and (c) the reply state key. It is never passed to Telethon as the delivery target. Display names, pages, usernames, and row indexes are never used as identities.
+- `load_viewer_messages()` sorts by `message_id` descending (`reverse=True`).
+- Page 1 always contains the newest messages; subsequent pages contain progressively older messages.
+- Telethon's `iter_messages()` returns messages newest-first; the code no longer re-sorts them ascending.
 
-## Selected-message-ID handling
+## Selection UX
 
-The target is the real Telegram `message_id` captured at selection time and re-validated against the current one-message selection before sending. `send_reply` passes `reply_to=int(message_id)`.
+- Each Select button now shows a preview snippet of the message it targets (e.g., `Select ببین فردا میای؟`).
+- When selected, the button changes to `✓ ببین فردا میای؟`.
+- Selection identity remains the real Telegram `message_id` — never a row index or text.
 
-## Input-state behavior
+## Reply modes
 
-Uses the repository's existing generic pending-input infrastructure (`backend/helper/input_state.py` + the chat-scoped input listener in `backend/helper/inline_sender.py`). The only new state is the panel-chat-keyed in-memory reply record in the v2 service module; it is not a new dispatcher or callback architecture.
+- **Reply** (`action:ghost_seen_v2_reply:<source>`): sends the owner's text as `reply_to=<selected_message_id>` via `send_reply()`.
+- **Send without reply** (`action:ghost_seen_v2_send_plain:<source>`): sends the owner's text to the source chat without a reply target via `send_message_plain()`.
+- Both modes require exactly one selected message, validate source-chat permission, consume state exactly once, and deliver to the source private chat.
 
-## Telegram delivery
+## Destination configuration
 
-`backend.telegram_api.messages.send_message(self_client, source_chat_id, text, reply_to=message_id)` — the existing typed Telegram send utility. No second client, no Bot API, no Saved Messages, no GHOST_ROOM_ID, no source-chat fallback. The owner's text is sent exactly as entered; it is never interpreted as an instruction.
+```
+GHOST_SEEN_DESTINATION_CHAT_ID=<numeric Telegram chat ID>
+GHOST_SEEN_DESTINATION_CHAT_NAME=<user-defined display name>
+```
 
-## Confirmations
+- `GHOST_SEEN_DESTINATION_CHAT_ID`: read by `get_destination_chat_id()` in the service module. Numeric Telegram chat ID. Authoritative identity for future notification/Ghost Seen generated flows. Default: `0` (unconfigured).
+- `GHOST_SEEN_DESTINATION_CHAT_NAME`: read by `get_destination_chat_name()`. Display-only label. Never used to locate or send messages. Default: `""` (empty).
+- Both are loaded from environment variables via `os.getenv()` in the service module. Users must configure them in Render → Environment Variables.
 
-- AI Reply remains unimplemented (inert Stage 4 placeholder, "Coming in the next stage.").
-- Stages 1–4 behavior remains intact (all Stage 1–4 tests still pass).
-- No legacy `ai_prompt`/`input:ghost_chat:ai_prompt`/`ghost_actions`/`ghost_ctx`/`ghost_inform`/`GHOST_ROOM_ID` exists in v2 production source (source-verified).
-- Exactly one `INVESTIGATION.md` remains.
+## Security / state isolation
+
+- Source chat ID vs panel chat ID: privacy validation, selection, and reply state are all keyed by source chat ID. Panel chat ID is only used as the session key and the pending-input chat. A stale callback from a disabled source chat is rejected by `is_chat_allowed()`.
+- Reply state keyed by panel chat prevents cross-chat consumption.
+- Every callback revalidates: source chat exists, is allowed, is a real private chat, selection cardinality is valid, and session identity matches.
 
 ## Validation
 
-- Focused Stage 1–5 tests: **32 passed**.
-- Full Python suite: **838 passed, 23 skipped, 1 pre-existing warning**.
-- `.venv/bin/python -m compileall -q backend`: **PASS**.
-- `git diff --check`: **PASS**.
-- `bun tsc -b --noEmit`: **PASS**.
-- Telegram live E2E was **not** performed (the user-provided screenshots are evidence of production behavior only).
+- Focused Ghost Seen v2 tests (Stages 1–5 + 5/6 hardening): **81 passed**
+- Full Python suite: **887 passed, 23 skipped, 1 pre-existing warning**
+- `compileall`: **PASS**
+- `git diff --check`: **PASS**
+- `bun tsc -b --noEmit`: **PASS**
+- Exactly one `INVESTIGATION.md`: **confirmed**
+- Telegram live E2E was **not** performed.
 
 ## Delivery
 

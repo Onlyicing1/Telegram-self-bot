@@ -38,6 +38,16 @@ Delivery uses the existing typed wrapper `backend.telegram_api.messages.send_mes
 
 The old Ghost Seen implementation remains fully removed: no `input:ghost_chat:ai_prompt`, no `ai_prompt`, no `ghost_actions`/`ghost_ctx`/`ghost_inform`, no `GHOST_ROOM_ID`, and no legacy prompt literal exist in the v2 production modules (source-verified).
 
+## Stage 5/6 hardening tracing
+
+Per-chat privacy opt-in: the browser now shows only chats explicitly allowed via `allow_chat()`. The `Manage` panel lists all private user dialogs with ON/OFF toggle buttons. Permission state lives in the `_allowed_chats` in-memory set, persisted to `bot_settings` (key `ghost_seen_allowed_chats`) via the existing Supabase client when available, and falls back to in-memory-only when Supabase is unavailable. Every callback (`_open_chat_action`, `_actions_action`, `_begin_input_for`) revalidates `is_chat_allowed(source)` before proceeding.
+
+Message viewer now sorts newest-first (`messages.sort(key=..., reverse=True)`) so page 1 always shows the most recent messages. Selection buttons show a message preview snippet for visual context. Action Menu now exposes both `Reply` (with `reply_to`) and `Send without reply` (plain text delivery) when exactly one message is selected.
+
+Destination configuration reads `GHOST_SEEN_DESTINATION_CHAT_ID` (numeric, authoritative) and `GHOST_SEEN_DESTINATION_CHAT_NAME` (display-only label) from environment variables, loaded in `backend/config.py`. These are for future notification flows; manual Reply always delivers to the source private chat.
+
+The old Ghost Seen implementation remains fully removed: no `input:ghost_chat:ai_prompt`, no `ai_prompt`, no `ghost_actions`/`ghost_ctx`/`ghost_inform`, no `GHOST_ROOM_ID`, and no legacy prompt literal exist in the v2 production modules (source-verified).
+
 ## Verification
 
-Focused Stage 1 tests cover filtering, search, rendering, pagination, and empty state; Stage 2 covers viewer loading, bounding, and isolation; Stage 3 covers selection; Stage 4 covers the Action Menu placeholders; Stage 5 covers reply-target cardinality, panel-chat keyed reply state, stale-consumption fail-closed, cancellation, and the absence of any legacy prompt path. Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md` after completion.
+Focused tests cover: Stage 1 filtering/rendering/pagination, Stage 2 viewer loading/isolation, Stage 3 selection, Stage 4 Action Menu placeholders, Stage 5 reply-target cardinality/panel-chat keyed reply/cancellation, and Stage 5/6 hardening (42 tests covering privacy, ordering, selection UX, reply modes, destination config, stale callbacks, legacy absence). Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md`.
