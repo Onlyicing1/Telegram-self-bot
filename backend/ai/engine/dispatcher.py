@@ -140,6 +140,10 @@ class Dispatcher:
         """
         self._tool_executor = executor
 
+    def set_tool_registry(self, registry: ToolRegistry | None) -> None:
+        """Attach the registry used for provider tool definitions."""
+        self._tool_registry = registry
+
     async def dispatch(
         self,
         request: AIRequest,
@@ -735,9 +739,15 @@ class Dispatcher:
         """
         base = self._tool_executor._context
         extra: dict[str, Any] = dict(base.extra) if base.extra else {}
+        # Make the registry's tool metadata available even when a provider
+        # returns a prose response that is later converted into an action.
         extra["chat_id"] = request.chat_id
         extra["request_message_id"] = request.message_id
         extra["request_id"] = request.request_id
+        # Capability tools must use the manager owned by this live Engine.
+        # Looking up the process-global engine from inside a tool can route a
+        # request through a stale/unconfigured provider mesh.
+        extra["provider_manager"] = self._provider_manager
         if request.reply_context and request.reply_context.exists:
             extra["reply_msg"] = {
                 "message_id": request.reply_context.message_id,

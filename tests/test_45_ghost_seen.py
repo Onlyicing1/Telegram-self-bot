@@ -233,8 +233,10 @@ class TestGhostRoomAIExecution:
         assert "Conversation context:" in request.user_message
         assert "Alice" in request.user_message
         assert "Bob" in request.user_message
-        assert "Task: Write a natural reply" in request.user_message
-        assert "Owner instruction: Summarize" in request.user_message
+        assert "Generate the next natural reply from the owner to the recipient" in request.user_message
+        assert "OWNER" in request.user_message
+        assert "RECIPIENT" in request.user_message
+        assert "Additional owner instruction: Summarize" in request.user_message
 
     @pytest.mark.asyncio
     async def test_execute_ghost_seen_ai_engine_none(self):

@@ -202,6 +202,7 @@ class Engine:
         )
         self._tool_registry = registry
         self._tool_executor = ToolExecutor(registry, base_ctx)
+        self._dispatcher.set_tool_registry(registry)
         self._dispatcher.set_tool_executor(self._tool_executor)
 
 

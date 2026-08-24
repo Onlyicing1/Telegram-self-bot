@@ -392,16 +392,16 @@ class TestHandlerWiring:
         cancel_reply_flow(CHAT)
 
     @pytest.mark.asyncio
-    async def test_inform_arms_dedicated_prompt_and_fails_closed(self):
-        """ghost_inform records the choice and arms the dedicated
-        ai_reply_prompt input; an invalid choice cancels the flow."""
+    async def test_inform_executes_immediately_without_prompt(self):
+        """Disclosure starts the fixed AI reply; no owner prompt is armed."""
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
         from backend.services.ghost_seen_service import (
             start_reply_flow, set_reply_context_count, get_reply_flow,
             cancel_reply_flow,
         )
-        gr.configure(AsyncMock(), 12345, "UTC")
+        client = AsyncMock()
+        gr.configure(client, 12345, "UTC")
         gr._set_current_chat(CHAT)
         cancel_reply_flow(CHAT)
         start_reply_flow(CHAT, 11)
@@ -413,11 +413,16 @@ class TestHandlerWiring:
 
         start_reply_flow(CHAT, 11)
         set_reply_context_count(CHAT, 1)
-        title, body, buttons = await gr._ghost_inform_action(None, "yes", 0)
-        assert "Type your AI prompt" in body
-        flow = get_reply_flow(CHAT)
-        assert flow and flow["informed"] is True
-        cancel_reply_flow(CHAT)
+        ctx = [{"id": 11, "out": False, "text": "hello", "sender_name": "Bob"}]
+        with patch("backend.ai.engine.engine.get_engine",
+                   return_value=_engine_mock("Automatic reply.")), \
+             patch("backend.services.ghost_seen_service.fetch_context_window",
+                   new=AsyncMock(return_value=ctx)):
+            title, body, buttons = await gr._ghost_inform_action(None, "yes", 0)
+        assert "Type your AI prompt" not in body
+        assert "generated and delivered" in body
+        assert get_reply_flow(CHAT) is None
+        client.send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_remove_clears_registry_row_and_local_state_only(self, monkeypatch):
@@ -495,7 +500,7 @@ class TestAIDelivery:
                    return_value=self._engine_mock("Natural reply text.")), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_reply_prompt_input("Answer it", 0, 0, 0, 0)
+            await gr._execute_single_ghost_ai_reply(CHAT)
 
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
@@ -525,7 +530,7 @@ class TestAIDelivery:
                    return_value=self._engine_mock("Reply text.")), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_reply_prompt_input("Answer it", 0, 0, 0, 0)
+            await gr._execute_single_ghost_ai_reply(CHAT)
 
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
@@ -582,7 +587,7 @@ class TestAIDelivery:
                    return_value=self._engine_mock()), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_reply_prompt_input("Answer it", 0, 0, 0, 0)
+            await gr._execute_single_ghost_ai_reply(CHAT)
 
         client.send_message.assert_not_called()   # no fallback destination ever
         assert get_reply_flow(CHAT) is None       # flow consumed, nothing sent
@@ -607,7 +612,7 @@ class TestAIDelivery:
                    return_value=self._engine_mock()), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(side_effect=RuntimeError("rpc down"))):
-            await gr._ghost_ai_reply_prompt_input("Answer it", 0, 0, 0, 0)
+            await gr._execute_single_ghost_ai_reply(CHAT)
 
         client.send_message.assert_not_called()
 

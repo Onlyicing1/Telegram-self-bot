@@ -21,6 +21,7 @@ async def do_web_search(
     count: int = 10,
     freshness: str | None = None,
     include_domains: list[str] | None = None,
+    provider_manager: Any | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Execute a web search via the existing provider architecture.
 
@@ -28,14 +29,16 @@ async def do_web_search(
     URLs are preserved verbatim; nothing is fabricated when fields are
     missing.
     """
-    from backend.ai.engine.engine import get_engine
+    if provider_manager is None:
+        from backend.ai.engine.engine import get_engine
 
-    engine = get_engine()
-    if engine is None:
-        return False, "❌ Web search unavailable — AI engine is not running.", {}
+        engine = get_engine()
+        if engine is None:
+            return False, "❌ Web search unavailable — AI engine is not running.", {}
+        provider_manager = engine.provider_manager
 
     try:
-        result = await engine.provider_manager.web_search(
+        result = await provider_manager.web_search(
             query,
             count=count,
             freshness=freshness,

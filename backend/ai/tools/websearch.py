@@ -95,11 +95,16 @@ class WebSearchTool(Tool):
         if not isinstance(domains, list):
             domains = None
 
+        runtime_manager = None
+        if context is not None and context.extra:
+            runtime_manager = context.extra.get("provider_manager")
+
         try:
             ok, text, data = await web_search_service.do_web_search(
                 query, count=count, freshness=freshness,
                 include_domains=domains,
+                provider_manager=runtime_manager,
             )
-        except Exception as exc:
-            return ToolResult(success=False, message=f"Web search failed: {exc}")
+        except Exception:
+            return ToolResult(success=False, message="❌ Web search failed.")
         return ToolResult(success=ok, message=text, data=data)

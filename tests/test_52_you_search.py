@@ -590,7 +590,153 @@ class TestWebSearchTool:
         assert "No results found." in empty
 
 
-# ── 10. Architecture invariants ──
+# ── 10. Full AI runtime capability path ──
+
+
+class TestWebSearchRuntime:
+    @pytest.mark.asyncio
+    async def test_ai_tool_loop_reaches_live_manager_and_you_provider(self):
+        """A native AI tool call reaches the request's ProviderManager and You.com."""
+        from backend.ai.engine.engine import Engine
+        from backend.ai.providers.base.capabilities import ProviderCapabilities
+        from backend.ai.providers.base.config import ProviderConfig
+        from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+        from backend.ai.providers.manager.manager import ProviderManager
+        from backend.ai.providers.registry.registry import ProviderRegistry
+        from backend.ai.session.request import AIRequest
+        from backend.ai.tools.context import ToolContext
+        from backend.ai.tools.registry import ToolRegistry
+        from backend.ai.tools.websearch import WebSearchTool
+        from backend.ai.providers.you_search import YouSearchProvider
+
+        class ChatProvider(BaseProvider):
+            PROVIDER_NAME = "runtime-chat"
+            PROVIDER_VERSION = "test"
+
+            def __init__(self):
+                super().__init__(ProviderConfig(
+                    provider_name=self.PROVIDER_NAME,
+                    api_key="chat-key",
+                    default_model="chat-model",
+                    enabled=True,
+                ))
+                self.calls = []
+
+            @property
+            def capabilities(self):
+                return ProviderCapabilities(
+                    supports_tools=True,
+                    supports_function_call=True,
+                )
+
+            def initialize(self):
+                pass
+
+            def shutdown(self):
+                pass
+
+            def health(self):
+                return {"healthy": True, "provider": self.name, "enabled": True}
+
+            async def chat(self, messages, **kwargs):
+                self.calls.append((messages, kwargs))
+                if len(self.calls) == 1:
+                    return ProviderResponse(
+                        text="",
+                        provider_name=self.name,
+                        success=True,
+                        tool_calls=[{
+                            "id": "search-1",
+                            "name": "web_search",
+                            "arguments": {"query": "current AI news", "count": 1},
+                        }],
+                    )
+                return ProviderResponse(
+                    text="The answer uses the returned live source.",
+                    provider_name=self.name,
+                    success=True,
+                )
+
+            def count_tokens(self, text):
+                return max(1, len(text) // 4)
+
+        chat_provider = ChatProvider()
+        search_provider = YouSearchProvider(ProviderConfig(
+            provider_name="you",
+            base_url="https://ydc-index.io",
+            api_key=FAKE_KEY,
+            enabled=True,
+        ))
+        search_result = {
+            "success": True,
+            "query": "current AI news",
+            "results": [{
+                "kind": "news",
+                "title": "Live story",
+                "url": "https://example.test/live",
+                "description": "Returned by the configured search provider.",
+            }],
+            "metadata": {"search_uuid": "test-search"},
+            "error": "",
+        }
+        search_call = AsyncMock(return_value=search_result)
+        search_provider.search = search_call
+
+        providers = ProviderRegistry()
+        providers.register(chat_provider)
+        providers.register(search_provider)
+        manager = ProviderManager(providers)
+
+        registry = ToolRegistry()
+        registry.register(WebSearchTool(ToolContext(
+            telegram=None, owner_id=1, tz_str="UTC",
+        )))
+        engine = Engine(providers=manager)
+        engine.attach_tools(registry, ToolContext(
+            telegram=None, owner_id=1, tz_str="UTC",
+        ))
+
+        with patch("backend.ai.engine.engine.get_engine",
+                   side_effect=AssertionError("tool used a global engine fallback")):
+            result = await engine.execute(AIRequest(
+                session_id="runtime-search",
+                user_message="What is current AI news?",
+                owner_id=1,
+                chat_id=2,
+                message_id=3,
+            ))
+
+        assert result.success is True
+        assert result.response == "The answer uses the returned live source."
+        assert len(chat_provider.calls) == 2
+        tool_definitions = chat_provider.calls[0][1]["tools"]
+        assert any(
+            item["function"]["name"] == "web_search"
+            for item in tool_definitions
+        )
+        search_call.assert_awaited_once_with(
+            "current AI news", count=1, freshness=None, include_domains=None,
+        )
+        assert search_call.await_args.args[0] == "current AI news"
+
+    @pytest.mark.asyncio
+    async def test_runtime_tool_reports_unavailable_without_search_provider(self):
+        from backend.ai.providers.manager.manager import ProviderManager
+        from backend.ai.tools.context import ToolContext
+        from backend.ai.tools.websearch import WebSearchTool
+
+        manager = ProviderManager()
+        context = ToolContext(
+            telegram=None, owner_id=1, tz_str="UTC",
+            extra={"provider_manager": manager},
+        )
+        result = await WebSearchTool(context).execute(context, {"query": "current facts"})
+        assert result.success is False
+        assert "unavailable" in result.message.lower()
+        assert "searched" not in result.message.lower()
+
+
+# ── 11. Architecture invariants ──
 
 
 class TestNoSecondArchitecture:

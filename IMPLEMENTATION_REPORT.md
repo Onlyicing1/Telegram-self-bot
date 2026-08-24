@@ -2,136 +2,156 @@
 
 ## Task / Result
 
-Two real production problems reported after Execution-29 were fixed:
+Fixed the remaining You.com runtime-capability defect and retained the
+required Ghost Seen automatic-reply behavior.
 
-1. **You.com provider was not visible/available** — the provider itself was
-   registered correctly at process start from `YDC_API_KEY`, but the
-   discovery/status surfaces classified and displayed every provider as a
-   chat/LLM provider. The capability was therefore hidden from the user
-   (and the `you` entry could even appear in generic provider/model lists).
-   Discovery, the Telegram AI panel, the dashboard, model testing, and the
-   selection API are now capability-aware: `you` is exposed as a
-   **web_search capability** everywhere, is never selectable as a chat
-   provider, and shows an explicit Available / Not configured status.
-2. **Ghost Seen single-message AI reply flow was wrong** — it still opened
-   the legacy generic multi-select prompt. The flow now follows the required
-   explicit sequence: select one message → action menu with an unambiguous
-   REPLY TARGET banner → Reply myself (quote / no quote) or AI Reply →
-   context-size menu → disclosure choice (inform recipient yes/no) →
-   dedicated single-message AI prompt input armed only after those choices.
-   Every output path still resolves `GHOST_ROOM_ID` and fails closed when it
-   is missing/invalid; `ghost_chats` is never a destination.
+- **You.com runtime capability:** the web-search tool was registered and
+  visible, but it could resolve the process-global Engine instead of the live
+  Engine/ProviderManager handling the request. The request-scoped live
+  ProviderManager is now carried through `ToolContext` and reaches the
+  existing `ToolRegistry` → `ToolExecutor` → `WebSearchTool` →
+  `WebSearchService` → `ProviderManager.web_search()` → `YouSearchProvider`
+  path. You.com remains a `web_search` capability and is never treated as a
+  chat/LLM provider or allowed to execute Telegram actions.
+- **Ghost Seen single-message AI reply:** after target selection, context
+  count, and mandatory disclosure choice, execution now starts immediately.
+  No owner-written prompt input is opened. The fixed task asks for the next
+  natural reply from the owner to the recipient, with explicit `OWNER` and
+  `RECIPIENT` context roles. Delivery still resolves `GHOST_ROOM_ID` and
+  fails closed when it is missing or invalid.
+
+The earlier You.com discovery/visibility fix is preserved in `4972693`; this
+execution fixes the separate live tool-loop connection that the live check
+exposed.
 
 ## Starting state
 
-- Working tree contained uncommitted Execution-28/29 continuation work
-  (capability-aware discovery/registry edits and the new Ghost Seen flow),
-  with the old auto-execute/no-disclosure tests still failing (7 failures
-  in `tests/test_49_ghost_seen_flows.py`).
-- All prior commits preserved; nothing was discarded.
+- `HEAD` was `4972693` (`fix: expose You.com web-search capability and Ghost
+  Seen explicit AI reply flow`) with the runtime-capability and automatic
+  Ghost Seen adjustments uncommitted.
+- Discovery and UI already reported You.com as available when configured, but
+  an actual AI tool call had not been proven to use the request's live
+  ProviderManager.
+- Ghost Seen still had tests and implementation remnants for the removed
+  single-message prompt step.
+- No existing user changes were discarded; no deployment was performed.
 
-## Exact files changed
+## Exact files changed in this execution
 
 Backend:
-- `backend/ai/discovery.py` — `ProviderStatus` gains `capability_kind` +
-  `capabilities`; the `you` provider metadata declares
-  `capability_kind="web_search"`; capability providers with a key are
-  reported `available` without an LLM `/models` validation call; all status
-  constructors and `get_wizard_info()` propagate the fields.
-- `backend/ai/model_tester.py` — model-test targets skip non-chat providers.
-- `backend/ai/providers/registry/registry.py` — `list_metadata()` exposes
-  `display_name`, `configured`, and `capability_kind` per provider.
-- `backend/bot/handlers/ai.py` — provider panel splits chat vs capability
-  providers; new `🔎 Web Search` panel (`panel:ai_web_search`) shows
-  You.com status and its env var; wizard list filters to chat providers.
-- `backend/bot/handlers/ghost_seen.py` — `ghost_ctx` renders the context
-  menu then the disclosure menu (never auto-executes); new
-  `ghost_inform:<yes|no>` action records the choice and arms the dedicated
-  `ai_reply_prompt` input; new `_ghost_ai_reply_prompt_input` executes the
-  AI reply with fail-closed `GHOST_ROOM_ID` resolution and the optional
-  disclosure suffix; disclosure prompt is bound to the resolved panel chat.
-- `backend/services/ghost_seen_service.py` — reply-flow state gains
-  `informed`; `set_reply_disclosure()` validates context-then-disclosure
-  ordering; `consume_reply_flow()` requires all three fields; removed
-  `AUTO_REPLY_INSTRUCTION`, added `AI_DISCLOSURE_SUFFIX`; the engine prompt
-  now uses a fixed reply task + `Owner instruction: <prompt>`.
-- `backend/web/app.py` — `/api/ai/models`, `/api/ai/models/{provider}` and
-  `/api/ai/provider` reject/ignore non-chat providers.
 
-Frontend:
-- `src/lib/api.ts` — `ProviderStatus` gains `capability_kind`/`capabilities`.
-- `src/components/AIConfigPanel.tsx` — providers split into chat vs
-  capability sections; new **Capabilities** section shows You.com Search
-  status (and env var when not available) with no select buttons; setup
-  guide/wizard wording is chat-scoped.
+- `backend/ai/engine/dispatcher.py` — keeps the live ProviderManager on the
+  Dispatcher and injects it into each per-request ToolContext.
+- `backend/ai/engine/engine.py` — synchronizes the attached ToolRegistry with
+  the Dispatcher during runtime tool wiring.
+- `backend/ai/tools/websearch.py` — passes the request-scoped manager to the
+  web-search service and returns a safe generic failure message.
+- `backend/services/web_search_service.py` — accepts an optional injected
+  ProviderManager while retaining the existing global-engine compatibility
+  path for direct callers.
+- `backend/services/ghost_seen_service.py` — defines the fixed owner-to-
+  recipient reply task and explicit OWNER/RECIPIENT context formatting.
+- `backend/bot/handlers/ghost_seen.py` — removes the single-message prompt
+  registration and makes the disclosure callback execute the automatic AI
+  reply immediately.
 
 Tests:
-- `tests/test_52_you_search.py` — added `TestDiscoveryStatus`
-  (key present → `you` `available` as web_search; missing/blank →
-  `not_configured`, no key leak in discovery output) and registry-metadata
-  capability assertions.
-- `tests/test_49_ghost_seen_flows.py`, `tests/test_51_execution27.py`,
-  `tests/test_45_ghost_seen.py` — stale auto-execute/no-disclosure
-  assertions replaced with regressions for the explicit
-  target → context → disclosure → prompt contract, verbatim delivery,
-  disclosure-suffix opt-in, invalid-choice fail-closed, missing
-  `GHOST_ROOM_ID` fail-closed, and context-fetch failure blocking sends.
 
-## Exact behavior changed
+- `tests/test_11_runtime_wiring.py` — updates the scripted provider test
+  double to declare native tool support.
+- `tests/test_45_ghost_seen.py` — verifies the fixed role-aware Ghost Seen
+  task text.
+- `tests/test_49_ghost_seen_flows.py` — verifies automatic execution,
+  disclosure handling, delivery, and fail-closed behavior without a prompt.
+- `tests/test_51_execution27.py` — verifies context → disclosure → automatic
+  delivery and destination invariants.
+- `tests/test_52_you_search.py` — adds the full Engine native-tool regression
+  from tool definitions through the injected ProviderManager and mocked
+  YouSearchProvider, plus honest unavailable behavior.
 
-- `you` is a web-search capability: visible in status surfaces, never a
-  chat provider, never selectable via the chat-provider APIs, never queried
-  for chat models.
-- Ghost Seen single-message AI reply requires the full explicit sequence;
-  the legacy generic prompt no longer opens for a single selection. The
-  dedicated prompt is armed only after context + disclosure, bound to the
-  panel chat, and delivery honors the disclosure choice.
-- When `GHOST_ROOM_ID` is missing/invalid, no Ghost Seen send occurs on any
-  path (reply, no-quote reply, single-message AI reply, legacy multi-select
-  AI) — fail closed, never a fallback chat.
+## Exact architecture and behavior changes
+
+### You.com runtime path
+
+1. `Engine.attach_tools()` wires one ToolRegistry/ToolExecutor into the
+   Dispatcher.
+2. `Dispatcher.dispatch()` builds native definitions from that registry and
+   adds the live `self._provider_manager` to the request ToolContext.
+3. `ToolExecutor` remains the sole caller of `tool.execute()`.
+4. `WebSearchTool` forwards the injected manager to `do_web_search()`.
+5. `WebSearchService` invokes `ProviderManager.web_search()`.
+6. `ProviderManager` selects only a healthy registered `web_search` provider;
+   it never routes retrieval through chat fallbacks.
+7. `YouSearchProvider.search()` performs the existing You.com Search API
+   request and returns normalized results.
+
+When no You.com provider is configured, the same tool returns an honest
+unavailable result; it does not fabricate search results or claim that a
+search occurred. The You.com API key remains runtime-environment-only via
+`YDC_API_KEY`.
+
+### Ghost Seen automatic reply path
+
+`select one incoming message` → `Reply with AI` → `context count` →
+`disclosure choice` → `_execute_single_ghost_ai_reply()` → fixed
+`execute_ghost_seen_ai()` task → delivery to the resolved `GHOST_ROOM_ID`.
+
+The removed `ai_reply_prompt` input is not registered. Informing the recipient
+adds `AI_DISCLOSURE_SUFFIX`; opting out sends the generated text unchanged.
+Missing/invalid `GHOST_ROOM_ID`, missing context, an owner-authored target,
+AI failure, or delivery failure produces no fallback send.
 
 ## Intentionally untouched
 
-- Provider architecture (BaseProvider / ProviderManager / fallback / health
-  tracker), AI engine/dispatcher/ToolExecutor, and web-search tool paths.
-- Save, Delete, Retrieve, retention, fonts, profile engines, supervisor.
-- Database/schema, migrations, and Render deployment configuration.
-- `GHOST_ROOM_ID` remains ENV-backed; no second configuration system.
+- You.com provider identity, endpoint, authentication, response
+  normalization, discovery registration, capability-only status UI, and
+  chat-provider filtering from the preceding visibility fix.
+- Provider fallback/retry/health implementation and the existing
+  ProviderManager routing boundary.
+- Save, Delete, Retrieve, retention, profile engines, supervisor, and
+  Telegram authorization behavior.
+- `ghost_chats` remains a source/private-chat registry and is never a
+  destination selector.
+- Database tables, migrations, schema, and persistence behavior.
+- Render configuration and deployment; no Render deploy was performed.
 
 ## Database/schema impact
 
-None. No migration, table, or field added; `YDC_API_KEY` remains
-environment-backed.
+None. No database field, table, migration, or persisted credential was added.
+`YDC_API_KEY` remains environment-backed and is never written to source,
+tests, telemetry, exceptions, or reports.
 
 ## Validation
 
-- Focused suites (Ghost Seen flows, Execution-27, You.com, Ghost Seen entry):
-  **146 passed**.
-- Full suite: **907 passed, 1 warning** (pre-existing Starlette
-  `multipart` deprecation).
-- `python -m compileall -q backend`: **PASS**.
-- `git diff --check`: **PASS**.
-- `bun tsc -b --noEmit`: **PASS**.
+- Focused command:
+  `.venv/bin/python -m pytest tests/test_11_runtime_wiring.py tests/test_52_you_search.py tests/test_49_ghost_seen_flows.py tests/test_45_ghost_seen.py -q --asyncio-mode=auto`
+  — **122 passed**.
+- Full command:
+  `.venv/bin/python -m pytest tests/ -q --asyncio-mode=auto`
+  — **909 passed, 1 warning**. The warning is the existing Starlette
+  `multipart` PendingDeprecationWarning.
+- `.venv/bin/python -m compileall -q backend` — **PASS**.
+- `git diff --check` — **PASS**.
+- `bun tsc -b --noEmit` — **PASS**.
+- A repository-wide check confirms the single-message
+  `ai_reply_prompt`/`Type your AI prompt` path is no longer registered; the
+  remaining `ai_prompt` is the intentional legacy multi-select input.
 
-## Operational requirement
+## Live You.com verification
 
-The provider registry is built once at process start. A newly added
-Render environment variable (`YDC_API_KEY`) requires a **process restart**
-before `YouSearchProvider` is registered; the AI panel's Refresh action
-only re-scans discovery, it cannot reload env vars into the running
-process. The dashboard and Telegram `🔎 Web Search` panel show
-`YDC_API_KEY` as the required env var and the panel text notes the restart
-requirement. No live You.com call was made; `YDC_API_KEY` was not present
-in this environment.
+This workspace reported `YDC_API_KEY=absent` using a secret-safe check. No
+real request was sent to `https://ydc-index.io/v1/search`, and no live API
+success is claimed. The mocked full Engine tool-loop test proves the runtime
+invocation path; the owner must restart the Render process after setting
+`YDC_API_KEY` and perform the live verification there.
 
-## Remaining limitations
+## Delivery
 
-- Live You.com verification remains an owner/Render action (set
-  `YDC_API_KEY`, restart, then issue a web-search request through the AI).
-- The legacy multi-select `ai_prompt` input still exists for 2+ selected
-  messages and is unchanged.
+- Commit: pending in this execution.
+- Push to `origin/main`: pending in this execution.
+- Remote HEAD verification: pending in this execution.
+- Final working-tree cleanliness: pending in this execution.
 
 ## Stop
 
-Both reported production problems are fixed, tested, and validated. No
-unrelated system was changed.
+Implementation and validation are complete; delivery verification remains.

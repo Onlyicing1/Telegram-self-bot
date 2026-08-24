@@ -71,9 +71,8 @@ def _register_once() -> None:
 
 class TestStreamlinedAIReplyFlow:
     @pytest.mark.asyncio
-    async def test_disclosure_step_between_context_and_prompt(self):
-        """Context-size choice opens the disclosure choice; execution only
-        happens through the dedicated ai_reply_prompt input."""
+    async def test_disclosure_step_precedes_immediate_execution(self):
+        """Context-size choice opens disclosure; disclosure starts execution."""
         import inspect
         _register_once()
         from backend.bot.handlers import ghost_seen as gr
@@ -92,14 +91,12 @@ class TestStreamlinedAIReplyFlow:
         )
 
     @pytest.mark.asyncio
-    async def test_full_flow_context_disclosure_then_prompt_executes(self):
-        """select → AI Reply → context size → disclosure → prompt → delivery."""
+    async def test_full_flow_context_disclosure_then_automatic_delivery(self):
+        """select → AI Reply → context size → disclosure → automatic delivery."""
         _register_once()
         from unittest.mock import patch
         from backend.bot.handlers import ghost_seen as gr
-        from backend.services.ghost_seen_service import (
-            start_reply_flow, cancel_reply_flow,
-        )
+        from backend.services.ghost_seen_service import start_reply_flow, cancel_reply_flow
 
         client = AsyncMock()
         gr.configure(client, 12345, "UTC")
@@ -107,32 +104,26 @@ class TestStreamlinedAIReplyFlow:
         cancel_reply_flow(CHAT)
         start_reply_flow(CHAT, 400)
 
-        # Step 1 — no argument renders the context-size menu only.
         title, body, buttons = await gr._ghost_ctx_action(None, "", 0)
         assert "action:ghost_ctx:1" in _datas(buttons)
         assert "action:ghost_ctx:10" in _datas(buttons)
         client.send_message.assert_not_called()
 
-        # Step 2 — choosing a size opens the disclosure menu; no execution.
         title, body, buttons = await gr._ghost_ctx_action(None, "10", 0)
         assert "action:ghost_inform:yes" in _datas(buttons)
         assert "action:ghost_inform:no" in _datas(buttons)
         client.send_message.assert_not_called()
 
-        # Step 3 — disclosure arms the dedicated prompt input.
-        title, body, buttons = await gr._ghost_inform_action(None, "no", 0)
-        assert "Type your AI prompt" in body
-        client.send_message.assert_not_called()
-
-        # Step 4 — the prompt executes and delivers verbatim to GHOST_ROOM_ID.
-        ctx = [{"id": i, "out": False, "text": "m", "sender_name": "B",
-                "date": None} for i in range(391, 401)]
+        ctx = [{"id": i, "out": False, "text": "m", "sender_name": "B"}
+               for i in range(391, 401)]
         with patch("backend.ai.engine.engine.get_engine",
                    return_value=_engine_mock()), \
              patch("backend.services.ghost_seen_service.fetch_context_window",
                    new=AsyncMock(return_value=ctx)):
-            await gr._ghost_ai_reply_prompt_input("draft it", 0, 0, 0, 0)
+            title, body, buttons = await gr._ghost_inform_action(None, "no", 0)
 
+        assert "Type your AI prompt" not in body
+        assert "generated and delivered" in body
         client.send_message.assert_called_once()
         args, _ = client.send_message.call_args
         assert args[0] == 88888          # GHOST_ROOM_ID destination
@@ -654,7 +645,7 @@ class TestDestinationInvariants:
         from backend.bot.handlers import ghost_seen as gr
 
         for fn_name in ("_ghost_reply_input", "_ghost_reply_no_quote_input",
-                        "_ghost_ai_input", "_ghost_ai_reply_prompt_input"):
+                        "_ghost_ai_input", "_execute_single_ghost_ai_reply"):
             src = inspect.getsource(getattr(gr, fn_name))
             assert "_resolve_ghost_destination" in src, fn_name
 
@@ -686,7 +677,7 @@ class TestDestinationInvariants:
                        return_value=_engine_mock()), \
                  patch("backend.services.ghost_seen_service.fetch_context_window",
                        new=AsyncMock(return_value=ctx)):
-                await gr._ghost_ai_reply_prompt_input("draft it", 0, 0, 0, 0)
+                await gr._execute_single_ghost_ai_reply(CHAT)
 
             client.send_message.assert_not_called()   # fail closed, always
             assert get_reply_flow(CHAT) is None

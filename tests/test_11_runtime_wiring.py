@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
@@ -102,6 +103,10 @@ class ScriptedProvider(BaseProvider):
 
     def shutdown(self) -> None:
         pass
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_tools=True, supports_function_call=True)
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         self.received.append(messages)
