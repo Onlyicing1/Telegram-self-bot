@@ -1,4 +1,4 @@
-"""Ghost Seen v2 private-chat browser and bounded message viewer."""
+"""Ghost Seen v2 private-chat browser, bounded viewer, and selection model."""
 from __future__ import annotations
 
 import re
@@ -34,6 +34,18 @@ def clear_selection(source_chat_id: int) -> None:
     _selections.pop(int(source_chat_id), None)
 
 
+def action_menu_state(source_chat_id: int) -> tuple[int, ...] | None:
+    selected = get_selected_ids(source_chat_id)
+    return selected or None
+
+
+def action_placeholder(action: str, source_chat_id: int, selected_ids: Iterable[int]) -> str:
+    current = tuple(sorted(int(value) for value in selected_ids))
+    if int(source_chat_id) <= 0 or not current or current != get_selected_ids(source_chat_id):
+        return "That selection is no longer available."
+    if action not in {"reply", "ai_reply"}:
+        return "That action is not available."
+    return "Coming in the next stage."
 
 
 @dataclass(frozen=True)
@@ -138,24 +150,16 @@ def matches_search(chat: PrivateChat, query: str) -> bool:
     first = _normalize(chat.first_name)
     last = _normalize(chat.last_name)
     full_name = _normalize(f"{chat.first_name} {chat.last_name}")
-    return (
-        normalized_query in (first, last, full_name)
-        or normalized_query in first
-        or normalized_query in last
-        or bool(full_name and _compact(normalized_query) in _compact(full_name))
-    )
+    return normalized_query in (first, last, full_name) or normalized_query in first or normalized_query in last or bool(full_name and _compact(normalized_query) in _compact(full_name))
 
 
 def _sort_key(chat: PrivateChat) -> float:
     if chat.timestamp is None:
         return float("-inf")
-    try:
-        value = chat.timestamp
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.timestamp()
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return float("-inf")
+    value = chat.timestamp
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
 
 
 def page_items(chats: Iterable[PrivateChat], page: int = 1, query: str = "") -> BrowserPage:
@@ -195,15 +199,7 @@ def private_chat_from_dialog(dialog: Any, owner_id: int | None = None) -> Privat
         return None
     entity = _entity(dialog)
     message = getattr(dialog, "message", None)
-    return PrivateChat(
-        chat_id=int(entity.id),
-        first_name=_single_line(getattr(entity, "first_name", "") or ""),
-        last_name=_single_line(getattr(entity, "last_name", "") or ""),
-        username=_single_line(getattr(entity, "username", "") or ""),
-        preview=_message_preview(message),
-        timestamp=getattr(message, "date", None),
-        unread_count=max(0, int(getattr(dialog, "unread_count", 0) or 0)),
-    )
+    return PrivateChat(int(entity.id), _single_line(getattr(entity, "first_name", "") or ""), _single_line(getattr(entity, "last_name", "") or ""), _single_line(getattr(entity, "username", "") or ""), _message_preview(message), getattr(message, "date", None), max(0, int(getattr(dialog, "unread_count", 0) or 0)))
 
 
 async def load_private_chats(client: Any, owner_id: int | None = None) -> list[PrivateChat]:
@@ -218,31 +214,27 @@ async def load_private_chats(client: Any, owner_id: int | None = None) -> list[P
 
 
 async def load_viewer_messages(client: Any, source_chat_id: int, page: int = 1) -> MessageViewerPage:
-    """Load only bounded messages from the explicitly selected source peer."""
     if client is None or int(source_chat_id) <= 0:
-        return MessageViewerPage(int(source_chat_id), (), 1, 1)
-    all_messages = []
+        return MessageViewerPage(int(source_chat_id), (), 1, 1, get_selected_ids(source_chat_id))
+    messages = []
     async for message in client.iter_messages(int(source_chat_id), limit=MESSAGE_PAGE_SIZE * 20):
-        msg_id = int(getattr(message, "id", 0) or 0)
-        if msg_id <= 0:
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id <= 0:
             continue
-        text = _message_preview(message) or "Unsupported message"
-        all_messages.append(ViewerMessage(msg_id, int(source_chat_id), truncate_preview(text, _MESSAGE_LIMIT), getattr(message, "date", None)))
-    all_messages.sort(key=lambda item: item.message_id)
-    total_pages = max(1, (len(all_messages) + MESSAGE_PAGE_SIZE - 1) // MESSAGE_PAGE_SIZE)
+        messages.append(ViewerMessage(message_id, int(source_chat_id), truncate_preview(_message_preview(message) or "Unsupported message", _MESSAGE_LIMIT), getattr(message, "date", None)))
+    messages.sort(key=lambda item: item.message_id)
+    total_pages = max(1, (len(messages) + MESSAGE_PAGE_SIZE - 1) // MESSAGE_PAGE_SIZE)
     current_page = min(max(int(page), 1), total_pages)
     start = (current_page - 1) * MESSAGE_PAGE_SIZE
-    return MessageViewerPage(int(source_chat_id), tuple(all_messages[start:start + MESSAGE_PAGE_SIZE]), current_page, total_pages)
+    return MessageViewerPage(int(source_chat_id), tuple(messages[start:start + MESSAGE_PAGE_SIZE]), current_page, total_pages, get_selected_ids(source_chat_id))
 
 
 def render_chat_row(chat: PrivateChat, now: datetime | None = None) -> str:
-    name = _truncate_name(chat.display_name)
     right = format_time(chat.timestamp, now)
     if chat.unread_count > 0:
         right = f"{right}  {chat.unread_count}".strip()
-    available_preview = max(8, 56 - len(right))
-    second = f"   {truncate_preview(chat.preview, available_preview):<{available_preview}}  {right}".rstrip()
-    return f"💬 {name}\n{second}"
+    available = max(8, 56 - len(right))
+    return f"💬 {_truncate_name(chat.display_name)}\n   {truncate_preview(chat.preview, available):<{available}}  {right}".rstrip()
 
 
 def render_browser(chats: Iterable[PrivateChat], page: int = 1, query: str = "", watcher_count: int = 0, now: datetime | None = None) -> tuple[str, BrowserPage]:
@@ -258,15 +250,14 @@ def render_browser(chats: Iterable[PrivateChat], page: int = 1, query: str = "",
 
 
 def render_message_viewer(name: str, viewer: MessageViewerPage, now: datetime | None = None) -> str:
-    selected = len(viewer.selected_ids)
-    suffix = f" · {selected} selected" if selected else ""
+    suffix = f" · {len(viewer.selected_ids)} selected" if viewer.selected_ids else ""
     lines = ["👀 Ghost Seen", f"💬 {_truncate_name(name)}{suffix}", "", "Ghost is quietly watching the walls.", ""]
     if not viewer.messages:
         lines.append("👻 Ghost found nothing to see...")
     else:
         for item in viewer.messages:
-            stamp = format_time(item.timestamp, now)
             lines.append(f"«{item.text}»")
+            stamp = format_time(item.timestamp, now)
             if stamp:
                 lines.append(stamp)
     return "\n".join(lines)

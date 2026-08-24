@@ -1,34 +1,30 @@
-# Implementation Report — Ghost Seen v2 Stage 3
+# Implementation Report — Ghost Seen v2 Stage 4
 
 ## Scope
 
-Added message selection to the existing Stage 1 browser and Stage 2 Message Viewer. AI, Reply, Action Menu, prompts, disclosure, generation, delivery, providers, web search, and You.com remain untouched and unimplemented.
+Added the explicit Action Menu after Stage 3 message selection. Stage 1 browser, Stage 2 Message Viewer, and Stage 3 selection were preserved. Reply and AI Reply are visible but inert next-stage placeholders; no execution, input, provider call, generation, or delivery was added.
 
 ## Files changed
 
-- `backend/services/ghost_seen_v2.py` — source-chat-keyed selection model and viewer rendering support.
-- `backend/bot/handlers/ghost_seen_v2.py` — selection callbacks, selected-count/clear controls, and same-source pagination state.
-- `tests/test_54_ghost_seen_v2_stage3.py` — Stage 3 selection regression coverage.
-- `INVESTIGATION.md` — Stage 3 source/state tracing.
+- `backend/services/ghost_seen_v2.py` — source-keyed selection validation and inert action placeholder helpers.
+- `backend/bot/handlers/ghost_seen_v2.py` — Action Menu panel, action callbacks, stale-selection checks, Back navigation, and Reply/AI Reply placeholders.
+- `tests/test_55_ghost_seen_v2_stage4.py` — focused Action Menu state/placeholder tests.
+- `INVESTIGATION.md` — Stage 4 callback/state tracing.
 - `IMPLEMENTATION_REPORT.md` — this report.
 
 ## Behavior
 
-Each visible message has a compact Select/Selected toggle control while message text remains content. Selection uses the real Telegram message ID and is keyed by source private chat ID, not panel chat ID, display name, username, page, or message text. Identical message text can therefore be selected independently. Selection survives pagination within one source chat, is cleared when opening a chat, and can be cleared without changing the current chat or page. The viewer header reports `N selected`.
-
-Zero, one, and multiple selections are display-only in Stage 3. No Action Menu, AI, Reply, prompt, disclosure, generation, or delivery path is registered or executed. Back remains the Stage 2 navigation control; later v2 stages are not introduced.
+The viewer shows an explicit `Actions (N)` control only when current source-chat selection exists. The Action Menu preserves the source chat and complete selected message IDs, handles one or multiple selections, and fails closed when selection is absent, stale, or from another source. Reply and AI Reply return `Coming in the next stage.` without creating input state or performing any Telegram/AI operation. Back returns to the viewer. No legacy `ai_prompt` callback or prompt text was restored, and no Refresh control was introduced.
 
 ## Validation
 
-- Stage 1 + Stage 2 + Stage 3 focused tests: **14 passed**.
-- Full Python suite: **820 passed, 23 skipped, 1 pre-existing warning**.
+- Stage 1 + Stage 2 + Stage 3 + Stage 4 focused tests: **17 passed**.
+- Full Python suite: **823 passed, 23 skipped, 1 pre-existing warning**.
 - `.venv/bin/python -m compileall -q backend`: **PASS**.
 - `git diff --check`: **PASS**.
 - `bun tsc -b --noEmit`: **PASS**.
-- Legacy Ghost Seen AI callback/prompt identifiers remain absent from production code; historical skipped assertions remain only in `tests/test_51_execution27.py`.
-- Exactly one `INVESTIGATION.md` exists.
 - Telegram live E2E was not performed.
 
 ## Delivery
 
-Commit and remote verification follow this final validation.
+Commit and remote verification are completed after this validation.

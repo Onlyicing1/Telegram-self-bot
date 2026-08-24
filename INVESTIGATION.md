@@ -26,6 +26,10 @@ The browser action carries the selected `PrivateChat.chat_id` in `action:ghost_s
 
 The viewer keeps panel chat identity separate from source chat identity. The selection callback carries `source_chat_id|message_id`; the service stores only the real message IDs in an in-memory map keyed by source chat ID. The viewer session stores source ID, display name, and page in the existing navigation stack. Pagination reloads the same source and rehydrates selected IDs; opening a chat clears that source's previous selection. Clear removes only the current source selection. No AI, Reply, Action Menu, prompt, or delivery state is involved.
 
+## Stage 4 Action Menu tracing
+
+The viewer exposes `action:ghost_seen_v2_actions:<source_chat_id>` only when the source-keyed selection map is non-empty. The callback validates that the source has current selected IDs and that the viewer session resolves to the same source before pushing the Action Menu view. The menu carries the source ID and selected ID set in the existing session navigation stack. Reply and AI Reply callbacks call only `action_placeholder()`; they do not create input state, invoke AI, or send Telegram messages. An invalid or stale action callback returns a safe closed state. Back returns to the viewer without changing selection.
+
 ## Verification
 
 Focused Stage 1 tests cover private-user filtering, bot/non-user exclusion, tolerant search, missing name fields, two-line rendering, truncation, pagination, empty state, and absence of a Refresh control. Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md` after completion.
