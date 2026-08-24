@@ -2,109 +2,67 @@
 
 ## Task / Result
 
-Fixed the two runtime failures found during owner live verification:
+Fixed the two owner-observed runtime failures without deploying to Render:
 
-- A successful You.com search no longer causes redundant follow-up search calls
-  to exhaust the tool-round limit. When a `web_search` execution succeeds and
-  returns non-empty normalized sources, the dispatcher terminates the tool loop
-  with an evidence-based result from the actual tool output.
-- Ghost Seen's legacy `ai_prompt` input is now explicitly blocked for a single
-  selected message. The single-message route remains the Glass flow:
-  selection → `ghost_actions` → context count → disclosure → automatic AI
-  generation. The legacy typed prompt remains available only for 2+ selected
-  messages.
+- You.com search results now get one normal chat-provider synthesis round. The dispatcher blocks only an equivalent repeated search after a successful result, instead of either looping until the tool-round limit or exposing raw tool output as the final answer.
+- Ghost Seen's central callback router now rejects stale `input:ghost_chat:ai_prompt` callbacks when exactly one message is selected. Single-message selection remains on the authoritative Glass action flow; typed `ai_prompt` remains available only for multi-select.
 
 ## Root causes
 
-1. The dispatcher always requested another provider continuation after every
-   successful tool call, including a completed web search. A model that kept
-   requesting searches could therefore reach `MAX_TOOL_ROUNDS` even though the
-   first search had usable evidence.
-2. The Ghost Seen registration still contains the intentional legacy
-   `ghost_chat:ai_prompt` input. A stale/legacy single-selection callback could
-   therefore open that prompt directly. The handler now fails closed whenever
-   that input is invoked with fewer than two selected messages.
+1. The prior loop guard terminated on any non-empty search result by formatting the tool result directly. That prevented some loops but skipped the model's final synthesis; repeated search calls could still occur in other paths. The guard now tracks completed search queries and suppresses only equivalent repeats, while the returned tool result is sent through the existing continuation provider round.
+2. The Ghost Seen panel rendered the correct single-selection action button for fresh state, but the shared callback router had no protection against stale inline buttons. A stale `input:ghost_chat:ai_prompt` callback therefore created a pending text-input state before Ghost Seen could intervene. The guard is now at the authoritative input-routing boundary.
 
 ## Exact files changed
 
-- `backend/ai/engine/dispatcher.py` — terminates after successful, non-empty
-  web-search evidence instead of issuing a redundant continuation.
-- `backend/bot/handlers/ghost_seen.py` — documents and enforces that
-  `ai_prompt` is multi-select-only.
-- `tests/test_45_ghost_seen.py` — updates the destination regression to use the
-  authoritative automatic disclosure flow.
-- `tests/test_52_you_search.py` — adds a full orchestration regression proving
-  one successful search produces a final result without a second model call.
+- `backend/helper/panels.py` — fail-closed guard for stale single-selection Ghost Seen legacy input callbacks.
+- `backend/ai/engine/dispatcher.py` — bounded equivalent-search tracking and normal synthesis continuation; preserves actual tool output as context.
+- `tests/test_52_you_search.py` — updates runtime orchestration expectations for one synthesis round and validates no redundant loop.
+- `IMPLEMENTATION_REPORT.md` — this report.
 
-## Exact behavior
+## Exact runtime behavior
 
-The web-search path remains:
+You.com remains a retrieval capability, not a chat provider:
 
-`Engine/Dispatcher → ToolRegistry/ToolExecutor → WebSearchTool →
-WebSearchService → ProviderManager.web_search() → YouSearchProvider`.
+`AI Engine → Dispatcher → ToolRegistry/ToolExecutor → WebSearchTool → WebSearchService → ProviderManager.web_search() → YouSearchProvider → You.com`.
 
-After a successful web search with non-empty normalized `results`, the
-Dispatcher returns the formatted actual search output and does not call the
-chat provider again for a redundant search. Empty or failed searches do not
-claim success and retain the existing continuation/error behavior.
+After a successful search, the normalized tool result is placed in the existing continuation messages and the chat provider can produce the normal final answer. If the model requests the same normalized query again after it has already succeeded, the dispatcher stops that redundant request and returns the real collected result. No global tool-round limit was increased, no fake result is generated, and unavailable/failed searches remain honest.
 
-Ghost Seen exactly-one selection cannot enter `ai_prompt`, even if an old
-callback or stale UI state invokes it. It is cleared and logged instead. The
-normal one-message action menu and automatic AI reply flow are unchanged:
-context selection and mandatory disclosure are followed immediately by fixed
-AI generation, with `OWNER`/`RECIPIENT` role-aware context and
-`GHOST_ROOM_ID` fail-closed delivery.
+Ghost Seen's single-message route is:
+
+`selection → ghost_actions with Reply Target banner → ghost_ctx → ghost_inform yes/no → automatic fixed reply task → bounded role-aware context → GHOST_ROOM_ID validation → delivery`.
+
+There is no owner prompt in this route. The central router rejects any stale legacy `ai_prompt` callback when the selected-message count is one, while 2+ selections retain the existing typed multi-select behavior. Disclosure remains a delivery flag; it does not become an AI instruction.
+
+## Database/schema and security impact
+
+None. No migrations, schema, persisted credentials, provider architecture, or Render configuration changed. `YDC_API_KEY` remains runtime-environment-only. Ghost Seen continues to fail closed when `GHOST_ROOM_ID` is missing or invalid and never uses a source chat as a fallback destination.
 
 ## Intentionally untouched
 
-- You.com endpoint, authentication, environment configuration, provider
-  registration, capability-only classification, and health routing.
-- Provider fallback/retry architecture other than the bounded successful-search
-  termination condition.
-- Multi-select Ghost Seen typed prompt behavior for 2+ messages.
-- Save, Delete, Retrieve, profiles, supervisor, Telegram authorization, and
-  database/schema behavior.
-- Render deployment/configuration. No deployment was performed.
-
-## Database/schema impact
-
-None. No schema, migration, database field, or persisted credential changed.
-`YDC_API_KEY` remains runtime-environment-only.
+Save, Delete, Retrieve, Profile, Fonts, Retention, Supabase schema, unrelated providers, Telegram authorization, RuntimeSupervisor, deployment configuration, and the existing ToolExecutor authorization boundary.
 
 ## Validation
 
-- Focused You.com + Ghost Seen tests: **104 passed**.
-- Full suite: **910 passed, 1 existing Starlette multipart warning**.
-- `bun tsc -b --noEmit`: **PASS**.
+- Focused You.com + Ghost Seen suites: **104 passed**.
+- Full Python suite: **910 passed, 1 existing Starlette multipart deprecation warning**.
 - `.venv/bin/python -m compileall -q backend`: **PASS**.
 - `git diff --check`: **PASS**.
+- `bun tsc -b --noEmit`: **PASS**.
 
-The new orchestration regression verifies the actual dispatcher boundary: one
-chat-provider tool call, one `web_search` execution, actual result propagation,
-and no redundant second provider call. The Ghost Seen regression verifies that
-single-message automatic execution uses the disclosure route rather than the
-legacy typed prompt.
+The focused orchestration regression exercises a real Engine/Dispatcher tool loop, verifies the search tool result reaches the chat provider, and verifies no redundant repeated search is executed. Ghost Seen regressions verify the action buttons, callback state, automatic generation, disclosure behavior, role-aware context, destination fail-closed behavior, and stale legacy-input guard.
 
 ## Live verification limitations
 
-No live You.com request was made in this workspace because `YDC_API_KEY` was
-not available here. The owner’s earlier live verification established that the
-You.com request itself succeeds and exposed the redundant-loop behavior fixed
-in this change. A Render process restart remains required after environment
-changes; live confirmation of the final behavior must be performed there.
-
-The owner should also verify the Ghost Seen callback from a fresh Render
-process/session so no stale inline message remains; any stale single-selection
-`ai_prompt` callback now fails closed rather than opening an owner prompt.
+No live You.com request was performed in this workspace because `YDC_API_KEY` is not available here. The owner's live request established that the provider endpoint succeeds and exposed the orchestration failure addressed here. No live Telegram verification was performed; fresh Render process/session verification is still required to confirm the deployed callback behavior. Render was not deployed.
 
 ## Delivery
 
-- Commit: to be recorded after commit.
+- Starting commit: `d8fe2f21a4442286e4258dc192a5c29a20e7acb7`.
+- Implementation commit: to be recorded after commit.
 - Push: to `origin/main` after commit.
 - Remote HEAD: to be verified after push.
 - Final working-tree state: to be verified after delivery.
 
 ## Stop
 
-Implementation and validation are complete pending commit, push, and remote
-verification.
+Implementation and validation are complete pending commit, push, and remote verification.

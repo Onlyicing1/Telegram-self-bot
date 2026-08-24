@@ -426,6 +426,7 @@ class Dispatcher:
                 }
 
         all_tool_results: list[dict[str, Any]] = []
+        completed_search_queries: set[str] = set()
         # Usage accumulation: the final response plus every superseded
         # retry/recovery attempt, merged with all continuation rounds. Each
         # provider response is counted exactly once — discarded attempts enter
@@ -494,7 +495,10 @@ class Dispatcher:
                             "AI_EXECUTION_ERROR id=%s action=%s error=%s",
                             rid or "-", er.tool_name, er.error or er.message,
                         )
-                    all_tool_results.append(er.as_dict())
+                    result_dict = er.as_dict()
+                    if er.tool_name == "web_search" and isinstance(er.data, dict):
+                        result_dict["query"] = er.data.get("query", "")
+                    all_tool_results.append(result_dict)
                     # Record EVERY tool outcome (success or failure) so tool
                     # failures never silently disappear from history.
                     marker = "✅" if er.success else "❌"
@@ -518,27 +522,18 @@ class Dispatcher:
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
                 break
 
-            # A successful search result is sufficient evidence for the
-            # current-information tool contract. Do not ask the model to
-            # perform redundant follow-up searches when the provider already
-            # returned usable sources; the model can answer from this result.
-            if (
-                response.tool_calls
-                and exec_results
-                and all(
-                    er.success and er.tool_name == "web_search"
-                    and isinstance(er.data, dict)
-                    and isinstance(er.data.get("results"), list)
-                    and er.data.get("results")
-                    for er in exec_results
-                )
-            ):
-                response = replace(
-                    response,
-                    tool_calls=[],
-                    text=self._summarize_tool_results(all_tool_results),
-                )
+            # A successful search is now available to the model through the
+            # normal tool-result continuation. Prevent only equivalent repeat
+            # searches; the chat provider still gets one synthesis round so it
+            # can answer naturally and evaluate freshness/relevance.
+            if self._has_redundant_search_call(response.tool_calls, exec_results, completed_search_queries):
+                response = replace(response, tool_calls=[], text=self._summarize_tool_results(all_tool_results))
                 break
+            completed_search_queries.update(
+                str((tc.get("arguments") or {}).get("query") or "").strip().casefold()
+                for tc in response.tool_calls
+                if tc.get("name") == "web_search"
+            )
 
             continuation_messages = self._build_continuation_messages(messages, response, exec_results)
             try:
@@ -1070,6 +1065,25 @@ class Dispatcher:
             [tc.get("name") for tc in result.tool_calls],
         )
         return replace(response, tool_calls=list(result.tool_calls), text="", metadata=meta)
+
+    @staticmethod
+    def _has_redundant_search_call(
+        tool_calls: list[dict[str, Any]],
+        exec_results: list[Any],
+        prior_results: set[str],
+    ) -> bool:
+        """Stop only an equivalent successful search, not normal synthesis."""
+        if not exec_results or not all(
+            er.success and er.tool_name == "web_search" for er in exec_results
+        ):
+            return False
+        queries = [
+            str((tc.get("arguments") or {}).get("query") or "").strip().casefold()
+            for tc in tool_calls
+        ]
+        if not queries or any(not query for query in queries):
+            return False
+        return bool(prior_results.intersection(queries))
 
     @staticmethod
     def _summarize_tool_results(results: list[dict[str, Any]]) -> str:

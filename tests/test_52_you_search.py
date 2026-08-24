@@ -708,8 +708,8 @@ class TestWebSearchRuntime:
 
         assert result.success is True
         assert result.response
-        assert "Live story" in result.response
-        assert len(chat_provider.calls) == 1
+        assert "returned live source" in result.response
+        assert len(chat_provider.calls) == 2
         tool_definitions = chat_provider.calls[0][1]["tools"]
         assert any(
             item["function"]["name"] == "web_search"
@@ -763,7 +763,7 @@ class TestWebSearchRuntime:
             result = await engine.execute(AIRequest(session_id="loop", user_message="current", owner_id=1, chat_id=1, message_id=1))
         assert result.success is True
         assert "Web results" in result.response
-        assert chat.calls == 1
+        assert chat.calls == 2
 
     @pytest.mark.asyncio
     async def test_runtime_tool_reports_unavailable_without_search_provider(self):
