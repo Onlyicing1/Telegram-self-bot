@@ -74,7 +74,6 @@ def _build_menu_buttons() -> list:
         ("Settings", "panel:settings"),
     )
     builder.add_row("🧠 AI", "panel:ai")
-    builder.add_row("👻 Ghost Seen", "panel:ghost_seen")
     return builder.build()
 
 
@@ -200,39 +199,6 @@ async def _font_page_action(event, extra: str, chat_id: int) -> tuple[str, str, 
     return _font_panel_page(normalize_font_key(settings_service.dashboard_font()))
 
 
-# ── Ghost Seen retention panel ──
-
-async def _ghostret_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
-    from backend.services import settings_service
-    current = settings_service.ghost_seen_retention_seconds()
-    label = settings_service.format_duration(current)
-    builder = InlinePanelBuilder()
-    for text, seconds in settings_service.RETENTION_PRESETS:
-        mark = "✓" if seconds == current else "·"
-        builder.add_row(f"{mark} {text}", f"action:ghostret_set:{seconds}")
-    builder.add_row("⬅ Back", "panel:settings")
-    body = (
-        f"**Ghost Seen Retention**\n\n"
-        f"Current: **{label}**\n\n"
-        "Private chats leave the Ghost Seen registry automatically after "
-        "this window of inactivity. Only the registry entry is removed — "
-        "Telegram chats, messages, and read state are never touched."
-    )
-    return "Ghost Seen Retention", body, builder.build()
-
-
-async def _ghostret_set_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    from backend.services import settings_service
-    try:
-        seconds = int(extra)
-    except (TypeError, ValueError):
-        seconds = -1
-    if not settings_service.is_retention_preset(seconds):
-        return "Ghost Seen Retention", "Invalid duration — keeping the previous value.", []
-    settings_service.set_ghost_seen_retention_seconds(seconds)
-    return await _ghostret_panel_handler(event, extra)
-
-
 async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
     builder = InlinePanelBuilder()
     builder.add_row("Toggle Auto-close", "action:settings_toggle_autoclose")
@@ -246,7 +212,6 @@ async def _settings_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     builder.add_row("Set Log Retention", "input:settings:log_retention_days")
     builder.add_row("Set Panel Timeout", "input:settings:panel_timeout_seconds")
     builder.add_row("🔤 Font", "panel:font")
-    builder.add_row("⏳ Ghost Seen Retention", "panel:ghostret")
     return "Settings", await _build_settings_body(), builder.build()
 
 
@@ -421,8 +386,6 @@ def _register_panels() -> None:
     register_panel("general", _general_panel_handler, parent="menu", title="General")
     register_inline_builder("general", _general_inline_builder)
     register_panel("font", _font_panel_handler, parent="settings", title="Font")
-    register_panel("ghostret", _ghostret_panel_handler, parent="settings", title="Ghost Seen Retention")
-    register_action("ghostret_set", _ghostret_set_action)
     register_action("font_set", _font_set_action)
     register_action("font_page", _font_page_action)
     register_action("settings_toggle_autoclose", _settings_toggle_autoclose_action)

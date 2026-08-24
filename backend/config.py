@@ -38,7 +38,6 @@ def load() -> dict:
         "SUPABASE_AVAILABLE": bool(supabase_url and supabase_key),
         "TZ": os.getenv("TZ", "Asia/Tehran"),
         "PORT": int(os.getenv("PORT", "8000")),
-        "GHOST_ROOM_ID": os.getenv("GHOST_ROOM_ID", ""),
         "BIO_UPDATE_ENABLED": os.getenv("BIO_UPDATE_ENABLED", "false").lower() == "true",
         "USERNAME_UPDATE_ENABLED": os.getenv("USERNAME_UPDATE_ENABLED", "false").lower() == "true",
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper(),

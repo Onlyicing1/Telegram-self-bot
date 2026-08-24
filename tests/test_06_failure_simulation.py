@@ -164,7 +164,6 @@ async def test_startup_check_passes_with_valid_env():
         "SUPABASE_URL": "",
         "SUPABASE_KEY": "",
         "SUPABASE_AVAILABLE": False,
-        "GHOST_ROOM_ID": "",
     }
     report = run_startup_checks(cfg)
     assert report.ok is True

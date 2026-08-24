@@ -228,14 +228,6 @@ def _check_ai_providers(cfg: dict) -> CheckResult:
         return CheckResult("ai_providers", "WARNING", False, f"Provider check failed: {exc}")
 
 
-def _check_ghost_room(cfg: dict) -> CheckResult:
-    ghost = cfg.get("GHOST_ROOM_ID", "")
-    if not ghost:
-        return CheckResult("ghost_room", "WARNING", False,
-                           "GHOST_ROOM_ID not set — feature unavailable")
-    return CheckResult("ghost_room", "WARNING", True, "Ghost Room configured")
-
-
 def _check_directories() -> CheckResult:
     try:
         tmp = tempfile.gettempdir()
@@ -268,7 +260,6 @@ def run_startup_checks(cfg: dict) -> StartupReport:
     report.add(_check_core_tables(cfg))
     report.add(_check_ai_tables(cfg))
     report.add(_check_ai_providers(cfg))
-    report.add(_check_ghost_room(cfg))
     report.add(_check_directories())
 
     for r in report.results:

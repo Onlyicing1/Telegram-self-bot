@@ -139,7 +139,6 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
         lines.append(f"**Newest save:** {format_date(stats['newest'], tz_str)}")
 
         usage_count, provider_count = await _ai_database_counts(owner_id)
-        ghost_count = await db_client.count_ghost_chats()
         lines.append(
             f"\n**AI usage rows:** `{usage_count}`"
             if usage_count is not None else
@@ -150,17 +149,11 @@ async def do_stats(owner_id: int, tz_str: str) -> str:
             if provider_count is not None else
             "**AI provider rows:** `Unavailable`"
         )
-        lines.append(
-            f"**Ghost Seen chats:** `{ghost_count}`"
-            if ghost_count is not None else
-            "**Ghost Seen chats:** `Unavailable`"
-        )
 
         await db_client.log(owner_id, "INFO", f"DB stats: {total} items", {
             **stats,
             "ai_usage_rows": usage_count,
             "ai_provider_rows": provider_count,
-            "ghost_seen_chats": ghost_count,
         })
         record_event("database", "stats", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
         return "\n".join(lines)

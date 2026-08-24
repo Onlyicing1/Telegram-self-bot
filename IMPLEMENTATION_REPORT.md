@@ -1,51 +1,54 @@
-# Implementation Report — Ghost Seen AI Reply Removal
+# Implementation Report — Ghost Seen Full Removal
 
 ## Result
 
-Ghost Seen AI Reply was intentionally removed. Ghost Seen now provides only its normal registry, passive message inspection, selection/navigation, and manual quote/no-quote reply behavior.
+The old Ghost Seen implementation was removed completely in preparation for a clean v2 rebuild. No replacement Ghost Seen feature was added.
 
-## Production files changed
+## Files removed
 
-- `backend/bot/handlers/ghost_seen.py` — removed the AI Reply UI, context/disclosure actions, automatic generation/delivery, and legacy `ai_prompt` registration/handler.
-- `backend/services/ghost_seen_service.py` — removed Ghost Seen AI pending state, context/disclosure state, prompt construction, disclosure suffix, context-window helper, and AI execution helper.
-- `backend/helper/panels.py` — removed the obsolete Ghost Seen-specific `ai_prompt` router guard.
-- `INVESTIGATION.md` — documented the confirmed intentional removal.
-- `IMPLEMENTATION_REPORT.md` — this report.
-- Ghost Seen tests — removed obsolete AI expectations from active coverage and added assertions that deleted actions/inputs are absent; historical AI-only tests are explicitly skipped.
+- `backend/bot/handlers/ghost_seen.py`
+- `backend/services/ghost_seen_service.py`
+- `tests/test_45_ghost_seen.py`
+- `tests/test_47_ghost_seen_entry.py`
+- `tests/test_49_ghost_seen_flows.py`
+- `docs/implementation/ghost-room-ai-foundation-contract.md`
 
-## Behavior before
+## Production wiring removed
 
-Ghost Seen exposed an AI Reply path and a legacy multi-select `input:ghost_chat:ai_prompt` path. The legacy producer registered the prompt text `Type your instruction for the selected messages.` and could arm shared owner-input state.
+- `backend/bot/router.py`: Ghost Seen import and `register_all()` registration.
+- `backend/bot/handlers/misc.py`: Ghost Seen menu entry, retention panel, retention action, and retention setting UI.
+- `backend/config.py`: `GHOST_ROOM_ID` configuration exposure.
+- `backend/runtime/startup_check.py`: dormant Ghost Room startup check.
+- `backend/services/database_service.py`: Ghost Seen row count in database statistics.
+- `backend/db/client.py`: `count_ghost_chats()` database helper.
+- `backend/services/settings_service.py`: Ghost Seen retention setting and accessors.
 
-## Behavior after
+## Old paths removed
 
-- `AI Reply` is not rendered in Ghost Seen.
-- `ghost_ctx`, `ghost_inform`, and `ai_prompt` callbacks are not registered or generated.
-- No Ghost Seen AI state, execution path, context/disclosure flow, or AI delivery helper remains.
-- The legacy prompt literal is absent from executable Ghost Seen production code.
-- Stale Ghost Seen AI callbacks cannot resurrect the feature because no matching action/input registration remains.
-- Manual quote and no-quote reply inputs remain registered and send only through validated `GHOST_ROOM_ID`.
-- Ghost Seen still opens chats, displays messages, supports selection/deselection, pagination, clearing, Back, registry removal, and incoming private-human registry updates.
+The old `ghost_open`, `ghost_toggle`, `ghost_actions`, `ghost_ctx`, `ghost_inform`, manual Ghost Seen reply, legacy `input:ghost_chat:ai_prompt`, AI Reply, context/disclosure, automatic generation, Ghost Seen delivery, and all Ghost Seen-specific state paths are no longer registered or executable. The old prompt producer and its literal are gone from production code. No compatibility callback or wrapper remains.
 
-## State and persistence
+## Preserved shared infrastructure
 
-Ghost Seen registry rows remain persisted in Supabase `ghost_chats`. Selection and pagination remain in-memory. Ghost Seen AI-specific pending state and input state were deleted; no AI-specific state is persisted or retained. `ghost_chats` is metadata/source registry only and is not a delivery fallback.
+Generic panel registration, callback routing, input-state helpers, Telegram utilities, Supabase client infrastructure, the general AI engine/provider architecture, You.com/web search, Save/Delete/Retrieve/Profile, RuntimeSupervisor/watchdogs, frontend infrastructure, and deployment configuration were not modified. The mixed `tests/test_51_execution27.py` file and shared dashboard/schema migrations were preserved; only obsolete Ghost Seen-only tests/assertions were removed or skipped.
+
+## Database and environment status
+
+`ghost_chats` was exclusively Ghost Seen-specific in this repository. Its dedicated migration was removed from the repository and no destructive database operation was performed; an already-provisioned physical table, if present, remains unused. `GHOST_ROOM_ID` was exclusively Ghost Seen-specific and is no longer read by repository production code. The shared dashboard-font migration and pre-existing schema documentation remain unchanged. Render configuration and production environment settings were not changed.
 
 ## Validation
 
-- Focused Ghost Seen suites (`test_45`, `test_47`, `test_49`, `test_51`): **70 passed, 42 skipped**. Skips are historical tests whose sole purpose was to assert the removed AI Reply feature.
-- Full Python suite: **870 passed, 43 skipped, 1 pre-existing warning**.
-- `compileall`: **PASS** (`.venv/bin/python -m compileall -q backend`).
+- Full Python suite: **806 passed, 23 skipped, 1 pre-existing warning**.
+- `.venv/bin/python -m compileall -q backend`: **PASS**.
 - `git diff --check`: **PASS**.
-- Repository-wide production search confirms no Ghost Seen `ai_prompt`, `ghost_ctx`, `ghost_inform`, `execute_ghost_seen_ai`, AI disclosure, or Ghost Seen AI handler remains. The only `ghost_actions` reference is the preserved manual Reply / Actions menu.
+- Repository-wide executable Python search: no old Ghost Seen imports, registrations, callbacks, input paths, state symbols, or prompt producers remain. The generic `AI_PROMPT_BUILD` logger is unrelated to Ghost Seen.
 - Exactly one investigation document exists: `./INVESTIGATION.md`.
-- No frontend changes were made; TypeScript validation was not needed.
-- Telegram live E2E was not performed. The user-provided screenshot remains evidence of the former production symptom only.
-- No You.com, web-search, provider, schema, unrelated feature, or Render changes were made. No Render deployment was performed.
+- No frontend files changed; TypeScript validation was not needed.
+- Telegram live E2E was not performed; old Telegram messages may remain in chat history, but the repository no longer has code that can render/process the removed feature.
+- No You.com, web-search, provider, unrelated schema, or Render changes were made. No Render deployment was performed.
 
 ## Delivery
 
-- Commit: recorded after final validation below.
-- Push: completed to `origin/main`.
-- Remote verification: local `HEAD` equals `origin/main` after fetch.
-- Working tree: clean after delivery.
+- Commit: to be created after final diff review.
+- Push: to `origin/main` after commit.
+- Remote verification: `HEAD` must equal `origin/main` after fetch.
+- Working tree: must be clean after delivery.

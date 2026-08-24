@@ -15,7 +15,6 @@ from telethon import events
 
 from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai
 from backend.bot.handlers import ai_unified
-from backend.bot.handlers import ghost_seen
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +85,6 @@ def register_all(client, owner_id: int, tz_str: str):
         ("username", lambda: username.register(client, owner_id, tz_str)),
         ("ai", lambda: ai.register(client, owner_id)),
         ("ai_unified", lambda: ai_unified.register(client, owner_id, tz_str)),
-        ("ghost_seen", lambda: ghost_seen.register(client, owner_id, tz_str)),
     ]
 
     for name, fn in handlers:

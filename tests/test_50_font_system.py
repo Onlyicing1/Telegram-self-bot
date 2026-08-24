@@ -146,7 +146,6 @@ class TestFontPersistence:
             )
             ss.load_all()
             assert ss.dashboard_font() == "default"
-            assert ss.ghost_seen_retention_seconds() == 2_592_000
         finally:
             ss._cache.clear()
             ss._cache.update(old_cache)
@@ -193,15 +192,9 @@ class TestFontPersistence:
             assert ss.set_dashboard_font(None) is False
             assert ss.dashboard_font() == "fraktur"
 
-            assert ss.set_ghost_seen_retention_seconds(60) is False
-            assert ss.set_ghost_seen_retention_seconds(40_000_000) is False
-            assert ss.ghost_seen_retention_seconds() == 2_592_000
-
             # Corrupted cache values still read back deterministically.
             ss._cache["dashboard_font"] = "javascript:alert(1)"
             assert ss.dashboard_font() == "default"
-            ss._cache["ghost_seen_retention_seconds"] = "garbage"
-            assert ss.ghost_seen_retention_seconds() == 2_592_000
         finally:
             ss._cache.clear()
             ss._cache.update(old_cache)

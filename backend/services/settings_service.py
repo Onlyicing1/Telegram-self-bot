@@ -46,7 +46,6 @@ Architecture:
 | debug_callbacks        | bool    | false   | must be boolean         |
 | owner_only              | bool    | true    | must be boolean         |
 | dashboard_font          | str     | "default" | one of DASHBOARD_FONTS  |
-| ghost_seen_retention_seconds | int | 2592000 | 1800..31536000 (30 min..365 days) |
 """
 import logging
 from typing import Any, Callable
@@ -77,7 +76,6 @@ _DEFAULTS: dict[str, Any] = {
     "debug_callbacks": False,
     "owner_only": True,
     "dashboard_font": "default",
-    "ghost_seen_retention_seconds": 2_592_000,
 }
 
 _cache: dict[str, Any] = {}
@@ -108,18 +106,6 @@ def _validate_dashboard_font(value: Any) -> bool:
     return isinstance(value, str) and value in DASHBOARD_FONTS
 
 
-# Ghost Seen retention: ONE clean enumerated setting. The persisted unit
-# is seconds; 0 means "Never". Arbitrary values are not accepted.
-RETENTION_NEVER = 0
-_RETENTION_MIN_SECONDS = 300
-_DEFAULT_RETENTION = 2_592_000  # 30 days
-
-
-def _validate_ghost_seen_retention(value: Any) -> bool:
-    if not isinstance(value, int) or isinstance(value, bool):
-        return False
-    return value == RETENTION_NEVER or _RETENTION_MIN_SECONDS <= value <= 31_536_000
-
 
 _VALIDATORS: dict[str, ValidatorFn] = {
     "auto_close_enabled": _validate_bool,
@@ -134,7 +120,6 @@ _VALIDATORS: dict[str, ValidatorFn] = {
     "debug_callbacks": _validate_bool,
     "owner_only": _validate_bool,
     "dashboard_font": _validate_dashboard_font,
-    "ghost_seen_retention_seconds": _validate_ghost_seen_retention,
 }
 
 
@@ -328,69 +313,3 @@ def dashboard_font() -> str:
 
 def set_dashboard_font(value: str) -> bool:
     return set_setting("dashboard_font", value)
-
-
-# Ghost Seen retention presets offered in the Glass UI.
-RETENTION_PRESETS: tuple[tuple[str, int], ...] = (
-    ("5 minutes", 300),
-    ("30 minutes", 1_800),
-    ("1 hour", 3_600),
-    ("6 hours", 21_600),
-    ("12 hours", 43_200),
-    ("1 day", 86_400),
-    ("3 days", 259_200),
-    ("7 days", 604_800),
-    ("30 days", 2_592_000),
-    ("Never", RETENTION_NEVER),
-)
-
-_RETENTION_PRESET_SECONDS = frozenset(s for _, s in RETENTION_PRESETS)
-
-
-def set_ghost_seen_retention_seconds(seconds: int) -> bool:
-    # Strictly enumerated: only preset values (incl. Never = 0) are accepted.
-    if not is_retention_preset(seconds):
-        return False
-    return set_setting("ghost_seen_retention_seconds", seconds)
-
-
-def format_duration(seconds: int) -> str:
-    """Human-readable duration for the retention value."""
-    for label, preset in RETENTION_PRESETS:
-        if preset == seconds:
-            return label
-    if seconds % 86_400 == 0:
-        d = seconds // 86_400
-        return f"{d} day{'s' if d != 1 else ''}"
-    if seconds % 3_600 == 0:
-        h = seconds // 3_600
-        return f"{h} hour{'s' if h != 1 else ''}"
-    if seconds % 60 == 0:
-        m = seconds // 60
-        return f"{m} minute{'s' if m != 1 else ''}"
-    return f"{seconds} seconds"
-
-
-def is_retention_preset(value: int) -> bool:
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value in _RETENTION_PRESET_SECONDS
-    )
-
-
-def ghost_seen_retention_seconds() -> int:
-    """Ghost Seen registry retention window in seconds.
-
-    ``0`` means Never. Missing or invalid persisted values fall back
-    deterministically to the 30-day default; a bad setting can never
-    crash the Ghost Seen panel.
-    """
-    _ensure_loaded()
-    try:
-        value = int(_cache.get("ghost_seen_retention_seconds", _DEFAULT_RETENTION))
-    except (TypeError, ValueError):
-        return _DEFAULT_RETENTION
-    if value == RETENTION_NEVER:
-        return RETENTION_NEVER
-    return value if _RETENTION_MIN_SECONDS <= value <= 31_536_000 else _DEFAULT_RETENTION

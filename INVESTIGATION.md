@@ -1,40 +1,34 @@
-# Ghost Seen AI Reply Removal Investigation
+# Ghost Seen Removal Investigation
 
 ## Decision
 
-Ghost Seen AI Reply was removed rather than patched again. Repeated Telegram evidence showed that the owner-prompt experience was not acceptable, so the entire Ghost Seen AI surface and its legacy owner-input producer were deleted. This document is the sole investigation document.
+The pre-existing Ghost Seen implementation was intentionally removed in this cleanup execution. The next execution will rebuild Ghost Seen v2 from zero; this execution does not add a replacement.
 
-## Former producer and path
+## Removed footprint
 
-The former producer was the `register_input("ghost_chat", "ai_prompt", ...)` call in `backend/bot/handlers/ghost_seen.py`. Its prompt value was `Type your instruction for the selected messages.`. The callback was routed by the shared panel input router into the registered `_ghost_ai_input` handler, with pending input stored by the generic input-state system. The old path also included `ghost_actions`, `ghost_ctx`, `ghost_inform`, pending reply-flow state, context fetching, AI task construction, engine execution, disclosure suffix handling, and Ghost Room delivery.
+- Dedicated production handler: `backend/bot/handlers/ghost_seen.py`.
+- Dedicated production service and all in-memory Ghost Seen selection/pagination/reply state: `backend/services/ghost_seen_service.py`.
+- Router import and `register_all()` registration for Ghost Seen.
+- `Menu`'s Ghost Seen panel entry and Ghost Seen retention panel/actions.
+- `GHOST_ROOM_ID` config exposure and dormant startup-check validation.
+- Ghost Seen database-stat counting helper and its database statistics output.
+- Ghost Seen-specific Supabase migration files.
+- Old Ghost Seen implementation contract and dedicated Ghost Seen test modules.
 
-The prior callback-binding/cardinality fixes did not remove this producer; they only attempted to prevent selected single-message state from reaching it. That left a live legacy input registration and a stale Telegram callback surface. The clean resolution was to delete the Ghost Seen AI producer, callbacks, handler, service state, and execution path instead of adding another guard.
+This removes the old browsing, selection, manual reply, callback, input, AI, and delivery implementation as requested. No compatibility wrapper or stale callback registration remains.
 
-## Removal performed
+## AI/input removal
 
-- `backend/bot/handlers/ghost_seen.py`: removed the AI Reply action, context/disclosure actions, automatic AI execution/delivery, and `ai_prompt` input registration/handler.
-- `backend/services/ghost_seen_service.py`: removed AI pending state, context/disclosure state transitions, context-window fetching used only by AI, AI prompt construction, disclosure suffix, and `execute_ghost_seen_ai`.
-- `backend/helper/panels.py`: removed the Ghost Seen-specific legacy AI-input guard because the input no longer exists.
-- Tests were updated so removed AI-only expectations are skipped as historical coverage, while registration tests assert `ghost_ctx`, `ghost_inform`, and `ai_prompt` are absent.
+The old Ghost Seen AI Reply flow, context/disclosure callbacks, pending reply state, AI execution helpers, and `input:ghost_chat:ai_prompt` producer were already removed in the preceding cleanup commit and are absent from the current production tree. The legacy prompt text `Type your instruction for the selected messages.` has no executable producer. The generic AI provider/engine and generic panel/input infrastructure remain because they serve unrelated features.
 
-## Current Ghost Seen path
+## Persistence and configuration
 
-Ghost Seen opens through the existing panel registration, renders registry chats, fetches passive message pages, and maintains selection/page state in the existing service dictionaries. A one-message selection reaches the preserved `ghost_actions` menu, which now contains only manual quote and no-quote reply inputs plus navigation. There is no AI button and no AI callback chain.
+Ghost Seen's `ghost_chats` table was feature-specific. Its repository migration and runtime database-stat usage were removed, but no destructive operation was executed against an already-provisioned Supabase database; an existing physical table, if present, is now unused by this repository. `GHOST_ROOM_ID` was feature-specific and is no longer read by production configuration or startup checks. No Render environment or deployment configuration was changed.
 
-Manual reply remains:
+## Preserved systems
 
-`ghost_actions` → `input:ghost_chat:reply` or `input:ghost_chat:reply_no_quote` → existing input router → manual reply handler → validated `GHOST_ROOM_ID` → Telegram send.
-
-The quote variant uses the selected message ID as `reply_to`; the no-quote variant sends without `reply_to`. Missing or invalid `GHOST_ROOM_ID` fails closed.
-
-## State and persistence
-
-The `ghost_chats` Supabase table stores registry metadata only. Ghost Seen selection and pagination are in-memory dictionaries in `ghost_seen_service.py`. The former Ghost Seen AI pending state was also in-memory and has been deleted. No Firebase/Firestore persistence is used for this feature, and no AI-specific state remains to be restored or consumed. Registry metadata is never used as a delivery destination.
+The shared `backend.helper` panel/input/callback infrastructure, generic AI provider architecture, You.com/web-search implementation, Supabase client, unrelated database services, runtime supervisor, and all unrelated handlers remain intact.
 
 ## Verification
 
-Repository-wide production search found no Ghost Seen `ai_prompt`, `ai_reply_prompt`, `ghost_ctx`, `ghost_inform`, `_ghost_ai_input`, `_pending_replies`, `execute_ghost_seen_ai`, AI disclosure suffix, or fixed Ghost Seen AI task. The remaining `ghost_actions` references are the preserved manual Reply / Actions menu. Exactly one investigation file exists: `./INVESTIGATION.md`.
-
-Focused Ghost Seen suites passed with **70 passed and 42 skipped**; skipped tests are historical tests whose assertions exclusively require the deleted AI feature. The full suite passed with **870 passed, 43 skipped, and one pre-existing warning**. `compileall` and `git diff --check` passed.
-
-Telegram live E2E was not performed. The user-provided Telegram screenshot was not treated as a live test by this execution.
+The dedicated Ghost Seen test modules were removed with the implementation because they tested deleted behavior. The remaining suite must validate the actual post-removal repository. This document is the single canonical investigation document. Telegram live behavior was not tested; old Telegram messages may remain in chat history, but the repository no longer has code that can render or process the old feature.

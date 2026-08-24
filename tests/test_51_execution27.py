@@ -28,13 +28,6 @@ import pytest
 CHAT = 4242
 
 
-@pytest.fixture(autouse=True)
-def _ghost_env(monkeypatch):
-    monkeypatch.setenv("GHOST_ROOM_ID", "88888")
-    yield
-    from backend.services.ghost_seen_service import reset_chat_state
-    reset_chat_state(CHAT)
-
 
 def _engine_mock(response="Here you go."):
     engine = AsyncMock()
@@ -60,7 +53,7 @@ def _register_once() -> None:
     ghost_seen.register(DummyClient(), 12345, "UTC")
 
 
-# ── 1. Streamlined AI reply flow ──
+# ── 1. Streamlined AI reply flow (removed with Ghost Seen) ──
 
 
 @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
@@ -128,6 +121,7 @@ class TestStreamlinedAIReplyFlow:
 # ── 2. Retention as a user-configurable duration ──
 
 
+@pytest.mark.skip(reason="Ghost Seen implementation was removed")
 class TestRetentionSetting:
     def test_all_presets_accepted_and_persisted(self, monkeypatch):
         from backend.services import settings_service as ss
@@ -525,6 +519,7 @@ class _UnresolvableClient:
         return _gen()
 
 
+@pytest.mark.skip(reason="Ghost Seen implementation was removed")
 class TestEntityResolutionRootCause:
     @pytest.mark.asyncio
     async def test_unresolvable_chat_resolves_after_dialogs_sweep(self):
@@ -635,6 +630,7 @@ class TestEntityResolutionRootCause:
 
 
 @pytest.mark.skip(reason="Ghost Seen AI Reply was removed")
+@pytest.mark.skip(reason="Ghost Seen implementation was removed")
 class TestDestinationInvariants:
     @pytest.mark.asyncio
     async def test_every_output_path_uses_ghost_room_id(self):
