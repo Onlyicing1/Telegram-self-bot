@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 PAGE_SIZE = 5
 MESSAGE_PAGE_SIZE = 8
+MANAGE_PAGE_SIZE = 8
 _PREVIEW_LIMIT = 42
 _NAME_LIMIT = 40
 _MESSAGE_LIMIT = 180
@@ -351,6 +352,21 @@ def page_items(chats: Iterable[PrivateChat], page: int = 1, query: str = "") -> 
     current_page = min(max(int(page), 1), total_pages)
     start = (current_page - 1) * PAGE_SIZE
     return BrowserPage(tuple(filtered[start:start + PAGE_SIZE]), current_page, total_pages, _single_line(query))
+
+
+def manage_page_items(chats: Iterable[PrivateChat], page: int = 1, query: str = "") -> BrowserPage:
+    """Bounded Manage pagination: at most ``MANAGE_PAGE_SIZE`` rows per page.
+
+    Sorted by display name so the toggle list is stable and searchable.
+    """
+    filtered = sorted(
+        (chat for chat in chats if matches_search(chat, query)),
+        key=lambda chat: _normalize(chat.display_name),
+    )
+    total_pages = max(1, (len(filtered) + MANAGE_PAGE_SIZE - 1) // MANAGE_PAGE_SIZE)
+    current_page = min(max(int(page), 1), total_pages)
+    start = (current_page - 1) * MANAGE_PAGE_SIZE
+    return BrowserPage(tuple(filtered[start:start + MANAGE_PAGE_SIZE]), current_page, total_pages, _single_line(query))
 
 
 def format_time(value: datetime | None, now: datetime | None = None) -> str:

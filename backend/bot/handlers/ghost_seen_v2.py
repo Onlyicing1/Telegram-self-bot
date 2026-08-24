@@ -16,9 +16,9 @@ from backend.services.ghost_seen_v2 import (
     allow_chat, begin_reply, clear_reply, clear_selection, consume_reply,
     disallow_chat, get_selected_ids, is_chat_allowed,
     is_private_user_entity, load_allowed_chats, load_private_chats,
-    load_viewer_messages, reply_mode, reply_target,
+    load_viewer_messages, manage_page_items, reply_mode, reply_target,
     render_browser, render_message_viewer,
-    send_message_plain, send_reply,
+    send_message_plain, send_reply, truncate_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,44 +342,86 @@ async def _actions_back(event, extra: str, chat_id: int):
     return "👀 Ghost Seen", render_message_viewer(name, viewer), _viewer_buttons(viewer)
 
 
-# ── Manage Permissions ──
+# ── Manage Permissions (bounded, paginated, searchable) ──
+
+_MANAGE_SEARCH_ID = "search"
 
 
-def _render_manage(chats: list) -> tuple[str, str, list]:
+def _manage_buttons(view: BrowserPage) -> list:
+    """Manage keyboard with at most ``MANAGE_PAGE_SIZE`` chat rows plus
+    navigation, search, and Back — never the full private-chat list."""
     builder = InlinePanelBuilder()
-    if not chats:
-        return "⚙ Ghost Seen Permissions", "No private chats found.", builder.build()
-    for chat in chats:
-        allowed = is_chat_allowed(chat.chat_id)
-        if allowed:
-            builder.add_row(f"ON  {chat.display_name}", f"action:ghost_seen_v2_toggle:{chat.chat_id}")
-        else:
-            builder.add_row(f"OFF {chat.display_name}", f"action:ghost_seen_v2_toggle:{chat.chat_id}")
-    builder.add_row("‹ Back", "panel:ghost_seen_v2")
-    return "⚙ Ghost Seen Permissions", "Enable or disable Ghost Seen for each chat.", builder.build()
+    for index, chat in enumerate(view.chats, start=1):
+        state = "ON" if is_chat_allowed(chat.chat_id) else "OFF"
+        builder.add_row(f"{index}. 💬 {chat.display_name}  {state}", f"action:ghost_seen_v2_toggle:{chat.chat_id}")
+    if view.total_pages > 1:
+        nav = []
+        if view.page > 1:
+            nav.append(("‹ Previous", f"action:ghost_seen_v2_manage_page:{view.page - 1}"))
+        nav.append((f"{view.page}/{view.total_pages}", "panel:_nav:noop"))
+        if view.page < view.total_pages:
+            nav.append(("Next ›", f"action:ghost_seen_v2_manage_page:{view.page + 1}"))
+        builder.add_buttons(*nav)
+    builder.add_row("🔎 Search", f"input:{_MANAGE_ID}:{_MANAGE_SEARCH_ID}")
+    builder.add_row("← Back", "panel:ghost_seen_v2")
+    return builder.build()
+
+
+def _render_manage(chats: list, page: int = 1, query: str = "") -> tuple[str, str, list]:
+    view = manage_page_items(chats, page, query)
+    body = "Choose which private chats Ghost Seen is allowed to watch."
+    if view.query:
+        body = f"{body}\n\nSearch: {truncate_preview(view.query, 32)}"
+    if not view.chats:
+        body = "No private chats match." if view.query else "No private chats found."
+    return "⚙ Ghost Seen Permissions", body, _manage_buttons(view)
 
 
 async def _manage_panel_handler(event, extra: str, owner_id: int):
+    page, query = _decode_state(extra)
     chats = await load_private_chats(inline_engine.get_self_client(), owner_id)
-    return _render_manage(chats)
+    return _render_manage(chats, page, query)
 
 
 async def _manage_inline_builder(event, extra: str):
+    page, query = _decode_state(extra)
     chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
-    title, body, buttons = _render_manage(chats)
+    title, body, buttons = _render_manage(chats, page, query)
     return [render(title, body, buttons)]
 
 
+async def _manage_page_action(event, extra: str, chat_id: int):
+    page, query = _decode_state(_session_extra(chat_id, _event_ids(event)[1], _MANAGE_ID))
+    page = max(1, int(extra)) if str(extra).isdigit() else page
+    _set_extra(chat_id, _event_ids(event)[1], f"p={page}&q={quote(query, safe='')}")
+    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    return _render_manage(chats, page, query)
+
+
 async def _toggle_permission_action(event, extra: str, chat_id: int):
-    source = int(extra) if str(extra).isdigit() else 0
+    source = int(extra) if str(extra).lstrip("-").isdigit() else 0
     if source <= 0:
         return "⚙ Permissions", "Invalid chat.", []
     if is_chat_allowed(source):
         disallow_chat(source)
     else:
         allow_chat(source)
+    page, query = _decode_state(_session_extra(chat_id, _event_ids(event)[1], _MANAGE_ID))
     chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
-    return _render_manage(chats)
+    return _render_manage(chats, page, query)
+
+
+async def _manage_search_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
+    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    title, body, buttons = _render_manage(chats, 1, (text or "").strip())
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        from backend.helper.panel_render import render_edit
+        rendered, built = render_edit(title, body, buttons)
+        await helper.edit_message(inline_chat_id, inline_msg_id, message=rendered, buttons=built)
+    client = inline_engine.get_self_client()
+    if client is not None:
+        await client.delete_messages(chat_id, [msg_id])
 
 
 # ── Search ──
@@ -419,8 +461,10 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("ghost_seen_v2_send_plain", _send_plain_action)
     register_action("ghost_seen_v2_reply_cancel", _reply_cancel_action)
     register_action("ghost_seen_v2_toggle", _toggle_permission_action)
+    register_action("ghost_seen_v2_manage_page", _manage_page_action)
     register_action("ghost_seen_v2_actions_back", _actions_back)
     register_input(_PANEL_ID, _SEARCH_INPUT_ID, {"handler": _search_input_handler, "prompt": "**Search private chats**\n\nSearch by first name, last name, or username:\n\n_Reply below._"})
+    register_input(_MANAGE_ID, _MANAGE_SEARCH_ID, {"handler": _manage_search_input_handler, "prompt": "**Search private chats**\n\nSearch by first name, last name, or username:\n\n_Reply below._"})
 
 
 # ── Panel handlers (registered, called by panels.py) ──

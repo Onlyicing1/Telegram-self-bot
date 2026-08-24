@@ -48,6 +48,10 @@ Destination configuration reads `GHOST_SEEN_DESTINATION_CHAT_ID` (numeric, autho
 
 The old Ghost Seen implementation remains fully removed: no `input:ghost_chat:ai_prompt`, no `ai_prompt`, no `ghost_actions`/`ghost_ctx`/`ghost_inform`, no `GHOST_ROOM_ID`, and no legacy prompt literal exist in the v2 production modules (source-verified).
 
+## Manage UI boundedness tracing
+
+The Stage 5/6 hardening added a `⚙ Manage` panel that rendered one inline button per private chat (`for chat in chats: builder.add_row(...)`), producing ~500 buttons in a single Telegram message for large accounts. This was replaced with a bounded paginated Manage UI: `manage_page_items()` in `backend/services/ghost_seen_v2.py` caps each page at `MANAGE_PAGE_SIZE = 8` rows (sorted by display name, reusing the existing tolerant `matches_search`), and `_manage_buttons()` in `backend/bot/handlers/ghost_seen_v2.py` renders only those rows plus Previous/Next navigation, a Search input, and Back. `_toggle_permission_action()` now preserves the current Manage page/query via `_session_extra`. A 500-chat account now renders 63 pages of 8 rows instead of 500 buttons in one message. No Refresh button was added; the Stage 1 browser search input remains panel-scoped and unchanged.
+
 ## Verification
 
-Focused tests cover: Stage 1 filtering/rendering/pagination, Stage 2 viewer loading/isolation, Stage 3 selection, Stage 4 Action Menu placeholders, Stage 5 reply-target cardinality/panel-chat keyed reply/cancellation, and Stage 5/6 hardening (42 tests covering privacy, ordering, selection UX, reply modes, destination config, stale callbacks, legacy absence). Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md`.
+Focused tests cover: Stage 1 filtering/rendering/pagination, Stage 2 viewer loading/isolation, Stage 3 selection, Stage 4 Action Menu placeholders, Stage 5 reply-target cardinality/panel-chat keyed reply/cancellation, Stage 5/6 hardening (42 tests covering privacy, ordering, selection UX, reply modes, destination config, stale callbacks, legacy absence), and the bounded Manage UI (21 tests covering the 8-row cap, pagination, search, ON/OFF state, nav, and legacy/Refresh absence). Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md`.

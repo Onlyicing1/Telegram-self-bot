@@ -1,70 +1,49 @@
-# Implementation Report — Ghost Seen v2 Stage 5/6 Hardening
+# Implementation Report — Ghost Seen v2 Bounded Manage UI
 
 ## Scope
 
-Hardened the existing Stage 1–5 Ghost Seen v2 implementation with per-chat privacy opt-in, newest-first message ordering, improved selection UX, dual reply modes, and configurable destination. No AI was added; no legacy code was resurrected.
+Replaced the unbounded `⚙ Manage` permission panel (which rendered roughly one inline button per private chat — ~500 buttons in one Telegram message) with a bounded, paginated, searchable Manage UI. At most 8 chat rows render per page. No AI, no legacy code, no provider/web-search/You.com changes.
 
 ## Files changed
 
-- `backend/services/ghost_seen_v2.py` — per-chat privacy model (`_allowed_chats` set, `allow_chat`/`disallow_chat`/`is_chat_allowed`, DB persistence via `bot_settings`), `load_allowed_chats()` filter, `get_destination_chat_id()`/`get_destination_chat_name()` env config, `send_message_plain()` for send-without-reply, `begin_reply`/`consume_reply`/`get_reply` now carry `mode` (4th tuple element), viewer sorts newest-first, browser text reflects privacy model.
-- `backend/bot/handlers/ghost_seen_v2.py` — browser uses `load_allowed_chats()`, `⚙ Manage` button → `_MANAGE_ID` panel with ON/OFF toggles per chat, `_toggle_permission_action`, `_send_plain_action` for send-without-reply, `_begin_input_for()` common input setup, `_viewer_buttons` shows message preview in Select labels, `_action_buttons` shows Reply + Send without reply only for single selection, `_open_chat_action`/`_actions_action`/`_begin_input_for` revalidate `is_chat_allowed()`.
-- `backend/config.py` — `GHOST_SEEN_DESTINATION_CHAT_ID` (int) and `GHOST_SEEN_DESTINATION_CHAT_NAME` (str) loaded from env.
-- `tests/test_52_ghost_seen_v2_stage1.py` — updated empty-state assertion for new privacy text.
-- `tests/test_56_ghost_seen_v2_stage5.py` — updated for 4-tuple reply state, privacy prerequisites, new error messages.
-- `tests/test_57_ghost_seen_v2_stage5_6.py` — 42 comprehensive hardening regression tests.
+- `backend/services/ghost_seen_v2.py` — added `MANAGE_PAGE_SIZE = 8` and `manage_page_items()` (bounded pagination, sorted by display name, reuses the existing `matches_search` tolerant search).
+- `backend/bot/handlers/ghost_seen_v2.py` — Manage section rewritten: `_manage_buttons()` (≤8 chat rows + nav/search/back), `_render_manage()` (bounded body + buttons), `_manage_page_action()` (Previous/Next), `_manage_search_input_handler()` (panel-scoped `input:ghost_seen_v2_manage:search`), `_toggle_permission_action()` now preserves the current Manage page and query; `register()` wires `action:ghost_seen_v2_manage_page` and the Manage search input.
+- `tests/test_58_ghost_seen_v2_manage_bounded.py` — 21 focused regression tests.
 
-## Privacy model
+## Bounded Manage behavior
 
-- **Default**: all chats are NOT ALLOWED for Ghost Seen.
-- **Enable**: the `⚙ Manage` panel in the Ghost Seen browser shows all private user dialogs with ON/OFF toggle buttons. Tapping OFF → ON calls `allow_chat(chat_id)`.
-- **Disable**: tapping ON → OFF calls `disallow_chat(chat_id)`, which also clears any active selection and reply state for that chat.
-- **Persistence**: allowed chat IDs are stored in the `bot_settings` Supabase table (key `ghost_seen_allowed_chats`, JSON-encoded list). When Supabase is unavailable, the in-memory set is used without persistence.
-- **Source-chat identity**: privacy permission is keyed by the real Telegram source chat ID (integer). Never by display name, username, page, or message text.
+- **Never the full list**: one Manage page contains at most `MANAGE_PAGE_SIZE` (8) chat rows. A 500-chat account renders 63 pages, not 500 buttons.
+- **Rows**: `N. 💬 <name>  ON|OFF` — numbered, with the current permission state.
+- **Navigation**: `‹ Previous   p/total   Next ›` only when more than one page exists.
+- **Search**: `🔎 Search` opens the existing tolerant search input (first/last name, username, `@`, case-insensitive, whitespace-tolerant) scoped to the Manage panel. Search results are also bounded/paginated.
+- **Back**: `← Back` returns to the Stage 1 browser.
+- **Toggle**: ON↔OFF preserves the current Manage page and query (reads `_session_extra` for `p=`/`q=`).
+- **No Refresh button** anywhere in Manage.
 
-## Message ordering
+## Preserved behavior
 
-- `load_viewer_messages()` sorts by `message_id` descending (`reverse=True`).
-- Page 1 always contains the newest messages; subsequent pages contain progressively older messages.
-- Telethon's `iter_messages()` returns messages newest-first; the code no longer re-sorts them ascending.
+Stages 1–5 (browser, viewer, selection, Action Menu, Reply + Send-without-reply), per-chat privacy opt-in with `bot_settings` persistence, newest-first viewer ordering, source-chat identity, reply state, destination env vars, no manual Refresh, no legacy Ghost Seen (`input:ghost_chat:ai_prompt`, `ai_prompt`, `GHOST_ROOM_ID`, `ghost_actions`, `ghost_ctx`, `ghost_inform`), no AI, no provider/web-search/You.com changes.
 
-## Selection UX
-
-- Each Select button now shows a preview snippet of the message it targets (e.g., `Select ببین فردا میای؟`).
-- When selected, the button changes to `✓ ببین فردا میای؟`.
-- Selection identity remains the real Telegram `message_id` — never a row index or text.
-
-## Reply modes
-
-- **Reply** (`action:ghost_seen_v2_reply:<source>`): sends the owner's text as `reply_to=<selected_message_id>` via `send_reply()`.
-- **Send without reply** (`action:ghost_seen_v2_send_plain:<source>`): sends the owner's text to the source chat without a reply target via `send_message_plain()`.
-- Both modes require exactly one selected message, validate source-chat permission, consume state exactly once, and deliver to the source private chat.
-
-## Destination configuration
+## Destination configuration (unchanged)
 
 ```
 GHOST_SEEN_DESTINATION_CHAT_ID=<numeric Telegram chat ID>
 GHOST_SEEN_DESTINATION_CHAT_NAME=<user-defined display name>
 ```
 
-- `GHOST_SEEN_DESTINATION_CHAT_ID`: read by `get_destination_chat_id()` in the service module. Numeric Telegram chat ID. Authoritative identity for future notification/Ghost Seen generated flows. Default: `0` (unconfigured).
-- `GHOST_SEEN_DESTINATION_CHAT_NAME`: read by `get_destination_chat_name()`. Display-only label. Never used to locate or send messages. Default: `""` (empty).
-- Both are loaded from environment variables via `os.getenv()` in the service module. Users must configure them in Render → Environment Variables.
+`GHOST_SEEN_DESTINATION_CHAT_ID` is the authoritative numeric Telegram chat ID; `GHOST_SEEN_DESTINATION_CHAT_NAME` is display-only. Both are read from environment variables in `backend/config.py` and must be configured by the user in Render → Environment Variables. No deployment was performed.
 
-## Security / state isolation
+## Validation results
 
-- Source chat ID vs panel chat ID: privacy validation, selection, and reply state are all keyed by source chat ID. Panel chat ID is only used as the session key and the pending-input chat. A stale callback from a disabled source chat is rejected by `is_chat_allowed()`.
-- Reply state keyed by panel chat prevents cross-chat consumption.
-- Every callback revalidates: source chat exists, is allowed, is a real private chat, selection cardinality is valid, and session identity matches.
-
-## Validation
-
-- Focused Ghost Seen v2 tests (Stages 1–5 + 5/6 hardening): **81 passed**
-- Full Python suite: **887 passed, 23 skipped, 1 pre-existing warning**
+- Focused Ghost Seen v2 tests (Stages 1–5 + hardening + Manage bounded): **102 passed**
+- New Manage regression tests (`test_58`): **21 passed**
+- Full Python suite: **908 passed, 23 skipped, 1 pre-existing warning**
 - `compileall`: **PASS**
 - `git diff --check`: **PASS**
 - `bun tsc -b --noEmit`: **PASS**
+- Legacy-identifier scan of v2 production modules: **clean**
 - Exactly one `INVESTIGATION.md`: **confirmed**
-- Telegram live E2E was **not** performed.
+- Telegram live E2E: **not performed**
 
 ## Delivery
 
