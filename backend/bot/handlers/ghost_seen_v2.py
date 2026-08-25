@@ -1,7 +1,9 @@
 """Ghost Seen v2 — browser, viewer, actions, reply modes, and privacy."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from urllib.parse import quote, unquote
 
 from backend.helper import (
@@ -11,12 +13,14 @@ from backend.helper import (
 from backend.helper import inline_engine
 from backend.helper.client import get_client
 from backend.helper.lifecycle import get_lifecycle
+from backend.services import ghost_seen_v2 as service
 from backend.services.ghost_seen_v2 import (
     BrowserPage, MessageViewerPage, _ensure_allowed_loaded_async,
     action_menu_state, action_placeholder, allow_chat, begin_reply,
     clear_reply, clear_selection, consume_reply, disallow_chat,
     get_allowed_chats, get_selected_ids, is_chat_allowed,
-    is_private_user_entity, load_manage_directory, load_viewer_messages,
+    is_private_user_entity,    build_ai_reply_prompt, load_context_messages, load_manage_directory, load_viewer_messages,
+
     manage_page_items, reply_mode, reply_target, render_browser,
     render_message_viewer, resolve_allowed_chats, send_message_plain,
     send_reply, truncate_preview,
@@ -27,6 +31,7 @@ _PANEL_ID = "ghost_seen_v2"
 _VIEWER_ID = "ghost_seen_v2_viewer"
 _ACTION_ID = "ghost_seen_v2_actions"
 _MANAGE_ID = "ghost_seen_v2_manage"
+_ai_states: dict[int, dict] = {}
 _SEARCH_INPUT_ID = "search"
 
 
@@ -201,7 +206,8 @@ def _action_buttons(source: int, selected: tuple[int, ...]) -> list:
     if len(selected) == 1:
         builder.add_row("Reply", f"action:ghost_seen_v2_reply:{source}")
         builder.add_row("Send without reply", f"action:ghost_seen_v2_send_plain:{source}")
-    builder.add_row("AI Reply", f"action:ghost_seen_v2_placeholder:ai_reply:{source}")
+    if len(selected) == 1:
+        builder.add_row("AI Reply", f"action:ghost_seen_v2_ai_reply:{source}")
     builder.add_row("‹ Back", f"action:ghost_seen_v2_actions_back:{source}")
     return builder.build()
 
@@ -220,6 +226,57 @@ async def _actions_action(event, extra: str, chat_id: int):
     if session is not None and session.nav_stack:
         session.nav_stack.append((_ACTION_ID, f"source={source}&name={quote(name, safe='')}&ids={','.join(map(str, selected))}"))
     return "👀 Ghost Seen", f"💬 {name} · {len(selected)} selected\n\nChoose an action.", _action_buttons(source, selected)
+
+
+async def _ai_reply_action(event, extra: str, chat_id: int):
+    source = int(extra) if str(extra).isdigit() else 0
+    target_id = reply_target(source)
+    state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, _event_ids(event)[1], _ACTION_ID))
+    if target_id is None or source != state_source or not is_chat_allowed(source):
+        return "👀 Ghost Seen", "AI Reply needs exactly one allowed selected message.", []
+    return "👀 Ghost Seen · AI Reply", f"💬 {name}\n\nChoose conversation context before generating a candidate reply.", _context_buttons(source)
+
+
+def _context_buttons(source: int) -> list:
+    builder = InlinePanelBuilder()
+    for count in (1, 5, 10, 20):
+        builder.add_row(str(count), f"action:ghost_seen_v2_ai_generate:{source}:{count}")
+    builder.add_row("← Back", f"action:ghost_seen_v2_actions_back:{source}")
+    return builder.build()
+
+
+async def _ai_generate_action(event, extra: str, chat_id: int):
+    parts = str(extra).split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return "👀 Ghost Seen", "Invalid context selection.", []
+    source, count = map(int, parts)
+    target_id = reply_target(source)
+    state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, _event_ids(event)[1], _ACTION_ID))
+    if target_id is None or source != state_source or not is_chat_allowed(source):
+        return "👀 Ghost Seen", "That AI selection is no longer available.", []
+    context = await load_context_messages(inline_engine.get_self_client(), source, target_id, count)
+    target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
+    if target is None:
+        target = service.ViewerMessage(target_id, source, "Target message")
+    request_id = uuid.uuid4().hex
+    _ai_states[chat_id] = {"panel_chat_id": chat_id, "source_chat_id": source, "selected_message_id": target_id, "context_count": count, "request_id": request_id, "status": "prepared", "prompt": build_ai_reply_prompt(context, target, inline_engine.get_owner_id())}
+    return "👀 Ghost Seen · AI Reply", "Candidate reply preparation ready.\n\nNo message has been sent.", _candidate_buttons(source)
+
+
+async def _load_target_message(client, source: int, target_id: int):
+    if client is None:
+        return None
+    async for item in client.iter_messages(source, limit=1, min_id=target_id - 1, max_id=target_id + 1):
+        if int(getattr(item, "id", 0) or 0) == target_id:
+            return service.ViewerMessage(target_id, source, service._message_preview(item) or "Unsupported message", getattr(item, "date", None))
+    return None
+
+
+def _candidate_buttons(source: int) -> list:
+    builder = InlinePanelBuilder()
+    builder.add_row("Retry", f"action:ghost_seen_v2_ai_generate:{source}:5")
+    builder.add_row("← Back", f"action:ghost_seen_v2_actions_back:{source}")
+    return builder.build()
 
 
 async def _placeholder_action(event, extra: str, chat_id: int):
@@ -467,6 +524,8 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("ghost_seen_v2_clear", _clear_action)
     register_action("ghost_seen_v2_actions", _actions_action)
     register_action("ghost_seen_v2_placeholder", _placeholder_action)
+    register_action("ghost_seen_v2_ai_reply", _ai_reply_action)
+    register_action("ghost_seen_v2_ai_generate", _ai_generate_action)
     register_action("ghost_seen_v2_reply", _reply_action)
     register_action("ghost_seen_v2_send_plain", _send_plain_action)
     register_action("ghost_seen_v2_reply_cancel", _reply_cancel_action)

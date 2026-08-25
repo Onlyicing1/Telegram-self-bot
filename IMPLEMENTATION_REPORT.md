@@ -1,4 +1,13 @@
-# Implementation Report — Ghost Seen v2 Manage/Search/Navigation Performance Repair
+# Implementation Report — Ghost Seen v2 Stage 6 AI Reply Foundation
+
+## Stage 6
+
+Added the bounded AI Reply foundation without Telegram delivery. The Action Menu now exposes AI Reply only for exactly one selected message, opens compact Context Selection (1/5/10/20 previous messages), loads bounded same-source context, builds an explicitly delimited untrusted-data prompt, and stores source-aware candidate preparation state. Retry remains a fresh preparation request; no provider call or Telegram send is performed in this stage.
+
+Production file changed: `backend/services/ghost_seen_v2.py` (bounded context retrieval and injection-resistant prompt construction); `backend/bot/handlers/ghost_seen_v2.py` (AI Reply registration, context UI, source/selection validation, candidate state, and retry/back controls). Test file added: `tests/test_61_ghost_seen_v2_stage6.py`.
+
+The existing Stages 1–5 behavior, privacy, Browser/Manage performance paths, reply modes, and destination configuration remain preserved. The existing Engine/Dispatcher/provider architecture was inspected and remains untouched; Stage 6 prepares the request boundary for the next execution step rather than implementing delivery or a second provider path.
+
 
 ## Scope
 
