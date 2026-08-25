@@ -19,7 +19,7 @@ from backend.services.ghost_seen_v2 import (
     action_menu_state, action_placeholder, allow_chat, begin_reply,
     clear_reply, clear_selection, consume_reply, disallow_chat,
     get_allowed_chats, get_selected_ids, is_chat_allowed,
-    is_private_user_entity,    build_ai_reply_prompt, load_context_messages, load_manage_directory, load_viewer_messages,
+    is_private_user_entity, build_ai_reply_prompt, load_context_messages, load_manage_directory, load_viewer_messages,
 
     manage_page_items, reply_mode, reply_target, render_browser,
     render_message_viewer, resolve_allowed_chats, send_message_plain,
@@ -234,7 +234,7 @@ async def _ai_reply_action(event, extra: str, chat_id: int):
     state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, _event_ids(event)[1], _ACTION_ID))
     if target_id is None or source != state_source or not is_chat_allowed(source):
         return "👀 Ghost Seen", "AI Reply needs exactly one allowed selected message.", []
-    return "👀 Ghost Seen · AI Reply", f"💬 {name}\n\nChoose conversation context before generating a candidate reply.", _context_buttons(source)
+    return "👀 Ghost Seen · AI Reply", f"💬 {name}\n\nHow much conversation should Ghost use?", _context_buttons(source)
 
 
 def _context_buttons(source: int) -> list:
@@ -258,9 +258,12 @@ async def _ai_generate_action(event, extra: str, chat_id: int):
     target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
     if target is None:
         target = service.ViewerMessage(target_id, source, "Target message")
-    request_id = uuid.uuid4().hex
-    _ai_states[chat_id] = {"panel_chat_id": chat_id, "source_chat_id": source, "selected_message_id": target_id, "context_count": count, "request_id": request_id, "status": "prepared", "prompt": build_ai_reply_prompt(context, target, inline_engine.get_owner_id())}
-    return "👀 Ghost Seen · AI Reply", "Candidate reply preparation ready.\n\nNo message has been sent.", _candidate_buttons(source)
+    _ai_states[chat_id] = {"panel_chat_id": chat_id, "source_chat_id": source, "selected_message_id": target_id, "context_count": count, "name": name}
+    builder = InlinePanelBuilder()
+    builder.add_row("Yes", f"action:ghost_seen_v2_ai_disclosure:yes:{source}")
+    builder.add_row("No", f"action:ghost_seen_v2_ai_disclosure:no:{source}")
+    builder.add_row("← Back", f"action:ghost_seen_v2_ai_reply:{source}")
+    return "👀 Ghost Seen · AI Reply", "Should the recipient be told this reply was written by AI?", builder.build()
 
 
 async def _load_target_message(client, source: int, target_id: int):
@@ -272,11 +275,44 @@ async def _load_target_message(client, source: int, target_id: int):
     return None
 
 
-def _candidate_buttons(source: int) -> list:
-    builder = InlinePanelBuilder()
-    builder.add_row("Retry", f"action:ghost_seen_v2_ai_generate:{source}:5")
-    builder.add_row("← Back", f"action:ghost_seen_v2_actions_back:{source}")
-    return builder.build()
+async def _ai_disclosure_action(event, extra: str, chat_id: int):
+    parts = str(extra).split(":")
+    if len(parts) != 2 or parts[0] not in {"yes", "no"} or not parts[1].isdigit():
+        return "👀 Ghost Seen", "Invalid disclosure choice.", []
+    disclosure, source = parts[0] == "yes", int(parts[1])
+    state = _ai_states.get(chat_id)
+    if not state or state.get("source_chat_id") != source:
+        return "👀 Ghost Seen", "That AI selection is no longer available.", []
+    return await _run_ai_reply(chat_id, source, int(state["selected_message_id"]), int(state["context_count"]), disclosure, str(state.get("name", "Unknown")))
+
+
+async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, disclosure: bool, name: str):
+    if not is_chat_allowed(source) or reply_target(source) != target_id:
+        return "👀 Ghost Seen", "That AI selection is no longer available.", []
+    context = await load_context_messages(inline_engine.get_self_client(), source, target_id, count)
+    target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
+    if target is None:
+        return "👀 Ghost Seen", "The selected message is no longer available.", []
+    request_id = uuid.uuid4().hex
+    _ai_states[chat_id] = {"panel_chat_id": chat_id, "source_chat_id": source, "selected_message_id": target_id, "context_count": count, "disclosure": disclosure, "request_id": request_id, "status": "generating", "name": name}
+    prompt = build_ai_reply_prompt(context, target, inline_engine.get_owner_id())
+    engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
+    from backend.ai.session.request import AIRequest
+    result = await engine.execute(AIRequest(session_id=request_id, request_id=request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id))
+    if not result.success or not result.response:
+        _ai_states.pop(chat_id, None)
+        return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+    reply_text = result.response
+    if disclosure:
+        reply_text += "\n\n— Written with AI assistance."
+    try:
+        await send_reply(inline_engine.get_self_client(), source, target_id, reply_text)
+    except Exception:
+        _ai_states.pop(chat_id, None)
+        return "👀 Ghost Seen", "✕ Couldn't send the reply.", []
+    _ai_states.pop(chat_id, None)
+    clear_selection(source)
+    return "👀 Ghost Seen", "✓ Reply sent.", []
 
 
 async def _placeholder_action(event, extra: str, chat_id: int):
@@ -526,6 +562,7 @@ def register(client, owner_id: int, tz_str: str = "UTC") -> None:
     register_action("ghost_seen_v2_placeholder", _placeholder_action)
     register_action("ghost_seen_v2_ai_reply", _ai_reply_action)
     register_action("ghost_seen_v2_ai_generate", _ai_generate_action)
+    register_action("ghost_seen_v2_ai_disclosure", _ai_disclosure_action)
     register_action("ghost_seen_v2_reply", _reply_action)
     register_action("ghost_seen_v2_send_plain", _send_plain_action)
     register_action("ghost_seen_v2_reply_cancel", _reply_cancel_action)

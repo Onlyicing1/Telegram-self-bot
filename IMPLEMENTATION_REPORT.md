@@ -1,12 +1,12 @@
 # Implementation Report — Ghost Seen v2 Stage 6 AI Reply Foundation
 
-## Stage 6
+## Stage 6 correction
 
-Added the bounded AI Reply foundation without Telegram delivery. The Action Menu now exposes AI Reply only for exactly one selected message, opens compact Context Selection (1/5/10/20 previous messages), loads bounded same-source context, builds an explicitly delimited untrusted-data prompt, and stores source-aware candidate preparation state. Retry remains a fresh preparation request; no provider call or Telegram send is performed in this stage.
+The user-facing flow is exactly: `AI Reply → Context (1/5/10/20) → Disclosure (Yes/No) → automatic generation and delivery`. Prompt preparation, prompt preview, prompt confirmation, owner-written instructions, provider/model selection, and extra confirmation stages are not exposed. After disclosure, the handler reconstructs an internal bounded request, calls the existing Engine/Dispatcher/provider architecture, validates the result, and delivers through the existing source-chat reply boundary. Disclosure controls only the established AI disclosure suffix. Failures are reported honestly and no fake Send control is shown.
 
 Production file changed: `backend/services/ghost_seen_v2.py` (bounded context retrieval and injection-resistant prompt construction); `backend/bot/handlers/ghost_seen_v2.py` (AI Reply registration, context UI, source/selection validation, candidate state, and retry/back controls). Test file added: `tests/test_61_ghost_seen_v2_stage6.py`.
 
-The existing Stages 1–5 behavior, privacy, Browser/Manage performance paths, reply modes, and destination configuration remain preserved. The existing Engine/Dispatcher/provider architecture was inspected and remains untouched; Stage 6 prepares the request boundary for the next execution step rather than implementing delivery or a second provider path.
+The existing Stages 1–5 behavior, privacy, Browser/Manage performance paths, reply modes, and destination configuration remain preserved. The existing Engine/Dispatcher/provider architecture is reused without modification or duplication. No AI prompt input or pending prompt state exists. AI context uses the validated source chat and real selected message ID; panel chat identity is never used as the delivery destination.
 
 
 ## Scope

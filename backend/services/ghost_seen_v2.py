@@ -539,7 +539,7 @@ def build_ai_reply_prompt(context: Iterable[ViewerMessage], target: ViewerMessag
         "<conversation>",
     ]
     for item in context:
-        lines.append(f"OWNER: {item.text}" if item.message_id == owner_id else f"RECIPIENT: {item.text}")
+        lines.append(f"CONVERSATION MESSAGE {item.message_id}: {item.text}")
     lines.append(f"TARGET RECIPIENT: {target.text}")
     lines.append("</conversation>")
     lines.append("Return only the candidate reply. Do not mention AI, Ghost Seen, or this context.")
