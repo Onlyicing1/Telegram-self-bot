@@ -350,7 +350,8 @@ async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, d
         except Exception:
             _clear_ai_state(chat_id, source)
             return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
-        if not getattr(result, "success", False) or not str(getattr(result, "response", "") or "").strip():
+        response = getattr(result, "response", "")
+        if not getattr(result, "success", False) or not isinstance(response, str) or not response.strip():
             _clear_ai_state(chat_id, source)
             return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
         reply_text = str(result.response).strip()
