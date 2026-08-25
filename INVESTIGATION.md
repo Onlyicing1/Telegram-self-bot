@@ -59,3 +59,35 @@ The original Browser data path called `load_allowed_chats()` → `load_private_c
 ## Verification
 
 Focused tests cover: Stage 1 filtering/rendering/pagination, Stage 2 viewer loading/isolation, Stage 3 selection, Stage 4 Action Menu placeholders, Stage 5 reply-target cardinality/panel-chat keyed reply/cancellation, Stage 5/6 hardening (42 tests covering privacy, ordering, selection UX, reply modes, destination config, stale callbacks, legacy absence), the bounded Manage UI (21 tests covering the 8-row cap, pagination, search, ON/OFF state, nav, and legacy/Refresh absence), and performance regression (15 tests proving zero `iter_dialogs` for zero/one/multiple allowed chats, 500-dialogs+2-allowed bounded resolution, watcher count from allowed set, bot/self exclusion, failed entity graceful skip, no Refresh, no legacy identifiers). Telegram live E2E was not performed. Full-suite validation and delivery are recorded in `IMPLEMENTATION_REPORT.md`.
+
+## Manage/Search/Navigation performance repair tracing
+
+### 1. Direct Ghost Seen navigation failure
+
+The main menu exposes `panel:ghost_seen_v2` directly. Tapping it runs `_handle_panel` → `_browser_panel_handler` → `_render_browser` → `resolve_allowed_chats`. The old privacy loader (`_load_allowed_from_db`) performed a **synchronous, unbounded Supabase HTTP call (`db.table(...).execute()`) directly on the asyncio event loop** from the render path. Per `backend/db/client.py`'s own warning, a direct `.execute()` blocks the entire loop until the HTTP response arrives; a slow/cold Supabase call froze the first Browser open, so the panel never updated until the user navigated elsewhere (the DB call then completed) and returned. The old loader also guarded on `is_available()` which is `False` before `get_db()` initializes, so the allow-list was effectively never read from the DB after a restart.
+
+Fix: privacy loading is now `async def _ensure_allowed_loaded_async()` which runs the Supabase read in a worker thread via `asyncio.to_thread` (never blocking the loop), calls `get_db()` directly (fixing the `is_available()` init bug), and union-merges into the in-memory `_allowed_chats` set. It loads at most once per process (cached). `register()` also preloads it in the background via `guarded_create_task` so the first Browser open never does DB work.
+
+### 2. Manage Search crash — `edit_message()` signature
+
+Production log: `TypeError: MessageMethods.edit_message() got multiple values for argument 'message'` at `_manage_search_input_handler`. Telethon's real signature is `edit_message(entity, message=None, text=None, *, buttons=None)`. The buggy call `helper.edit_message(inline_chat_id, inline_msg_id, message=rendered, buttons=built)` bound `inline_msg_id` positionally to `message`, then passed `message=rendered` as a keyword → duplicate `message`. Fix: pass the rendered text positionally — `helper.edit_message(inline_chat_id, inline_msg_id, rendered, buttons=built)` — which binds to `text`. Applied to both `_manage_search_input_handler` and the browser `_search_input_handler` (same latent bug).
+
+### 3. Manage performance — repeated `iter_dialogs()`
+
+Every Manage interaction (`_manage_panel_handler`, `_manage_inline_builder`, `_manage_page_action`, `_toggle_permission_action`, `_manage_search_input_handler`) called `load_private_chats()` → `client.iter_dialogs()` and streamed the entire dialog list. Production logs show ~8.8s to open Manage and ~5.8s per page click. The previous performance fix deliberately left this broad path in place for Manage; that design proved too slow.
+
+Fix: new `load_manage_directory()` in `backend/services/ghost_seen_v2.py` caches the private-chat directory in-memory for `_MANAGE_DIRECTORY_TTL_S = 60s`. Broad discovery happens at most once per TTL; subsequent Manage page/search/toggle operations reuse the cached set (local filtering + one lightweight panel edit). `invalidate_manage_directory()` drops the cache. `_toggle_permission_action` also awaits `_ensure_allowed_loaded_async()` before mutating so persistence always writes the full allow-list.
+
+### 4. New data paths
+
+```
+Browser open → _render_browser → resolve_allowed_chats → get_entity(allowed_id)…   (O(allowed), no iter_dialogs)
+Manage open → load_manage_directory → iter_dialogs once per 60s TTL, then cached
+Manage Next/Prev/Search/Toggle → load_manage_directory (cache hit) → local filter/paginate
+```
+
+`iter_dialogs()` now exists only inside `load_private_chats()` (the broad-discovery primitive) and in docstrings; the normal Browser never calls it. Manage is the only intentional broad-discovery path, and it is now bounded by the directory cache.
+
+### 5. Verification
+
+27 new regression tests in `tests/test_60_ghost_seen_v2_nav_search_perf.py` prove: direct panel registration under the menu, Browser open with zero `iter_dialogs` and no Manage-data load, empty-allowed zero-RPC open, Search reaching its handler without the `edit_message()` TypeError (positional text), first/last/username/whitespace/concat/@-search, ON/OFF preservation, bounded+paginated results, query replacement, Back routing, directory caching (no re-enumeration on repeat/page/toggle/search), cache invalidation, 500-dialogs+2-allowed bounded Manage, disallowed-chat fail-closed for viewer/reply/send, numeric-ID keying, and legacy/Refresh/AI absence. Full suite: 950 passed, 23 skipped, 1 pre-existing warning. Telegram live E2E was not performed.

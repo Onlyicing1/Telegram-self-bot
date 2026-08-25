@@ -12,13 +12,14 @@ from backend.helper import inline_engine
 from backend.helper.client import get_client
 from backend.helper.lifecycle import get_lifecycle
 from backend.services.ghost_seen_v2 import (
-    BrowserPage, MessageViewerPage, action_menu_state, action_placeholder,
-    allow_chat, begin_reply, clear_reply, clear_selection, consume_reply,
-    disallow_chat, get_allowed_chats, get_selected_ids, is_chat_allowed,
-    is_private_user_entity, load_allowed_chats, load_private_chats,
-    load_viewer_messages, manage_page_items, reply_mode, reply_target,
-    render_browser, render_message_viewer, resolve_allowed_chats,
-    send_message_plain, send_reply, truncate_preview,
+    BrowserPage, MessageViewerPage, _ensure_allowed_loaded_async,
+    action_menu_state, action_placeholder, allow_chat, begin_reply,
+    clear_reply, clear_selection, consume_reply, disallow_chat,
+    get_allowed_chats, get_selected_ids, is_chat_allowed,
+    is_private_user_entity, load_manage_directory, load_viewer_messages,
+    manage_page_items, reply_mode, reply_target, render_browser,
+    render_message_viewer, resolve_allowed_chats, send_message_plain,
+    send_reply, truncate_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ async def _open_chat_action(event, extra: str, chat_id: int):
     selected_id = int(extra) if str(extra).lstrip("-").isdigit() else 0
     if not is_chat_allowed(selected_id):
         return "👀 Ghost Seen", "This chat is not allowed. Use ⚙ Manage to enable it.", []
-    chats = await load_allowed_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    chats = await resolve_allowed_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
     selected = next((chat for chat in chats if chat.chat_id == selected_id), None)
     if selected is None:
         return "👀 Ghost Seen", "That private chat is no longer available.", []
@@ -380,13 +381,13 @@ def _render_manage(chats: list, page: int = 1, query: str = "") -> tuple[str, st
 
 async def _manage_panel_handler(event, extra: str, owner_id: int):
     page, query = _decode_state(extra)
-    chats = await load_private_chats(inline_engine.get_self_client(), owner_id)
+    chats = await load_manage_directory(inline_engine.get_self_client(), owner_id)
     return _render_manage(chats, page, query)
 
 
 async def _manage_inline_builder(event, extra: str):
     page, query = _decode_state(extra)
-    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    chats = await load_manage_directory(inline_engine.get_self_client(), inline_engine.get_owner_id())
     title, body, buttons = _render_manage(chats, page, query)
     return [render(title, body, buttons)]
 
@@ -395,11 +396,12 @@ async def _manage_page_action(event, extra: str, chat_id: int):
     page, query = _decode_state(_session_extra(chat_id, _event_ids(event)[1], _MANAGE_ID))
     page = max(1, int(extra)) if str(extra).isdigit() else page
     _set_extra(chat_id, _event_ids(event)[1], f"p={page}&q={quote(query, safe='')}")
-    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    chats = await load_manage_directory(inline_engine.get_self_client(), inline_engine.get_owner_id())
     return _render_manage(chats, page, query)
 
 
 async def _toggle_permission_action(event, extra: str, chat_id: int):
+    await _ensure_allowed_loaded_async()
     source = int(extra) if str(extra).lstrip("-").isdigit() else 0
     if source <= 0:
         return "⚙ Permissions", "Invalid chat.", []
@@ -408,18 +410,18 @@ async def _toggle_permission_action(event, extra: str, chat_id: int):
     else:
         allow_chat(source)
     page, query = _decode_state(_session_extra(chat_id, _event_ids(event)[1], _MANAGE_ID))
-    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    chats = await load_manage_directory(inline_engine.get_self_client(), inline_engine.get_owner_id())
     return _render_manage(chats, page, query)
 
 
 async def _manage_search_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    chats = await load_private_chats(inline_engine.get_self_client(), inline_engine.get_owner_id())
+    chats = await load_manage_directory(inline_engine.get_self_client(), inline_engine.get_owner_id())
     title, body, buttons = _render_manage(chats, 1, (text or "").strip())
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         from backend.helper.panel_render import render_edit
         rendered, built = render_edit(title, body, buttons)
-        await helper.edit_message(inline_chat_id, inline_msg_id, message=rendered, buttons=built)
+        await helper.edit_message(inline_chat_id, inline_msg_id, rendered, buttons=built)
     client = inline_engine.get_self_client()
     if client is not None:
         await client.delete_messages(chat_id, [msg_id])
@@ -434,7 +436,7 @@ async def _search_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
     if helper and inline_chat_id and inline_msg_id:
         from backend.helper.panel_render import render_edit
         rendered, built = render_edit(title, body, buttons)
-        await helper.edit_message(inline_chat_id, inline_msg_id, message=rendered, buttons=built)
+        await helper.edit_message(inline_chat_id, inline_msg_id, rendered, buttons=built)
     client = inline_engine.get_self_client()
     if client is not None:
         await client.delete_messages(chat_id, [msg_id])
@@ -444,6 +446,13 @@ async def _search_input_handler(text, chat_id, msg_id, inline_chat_id, inline_ms
 
 
 def register(client, owner_id: int, tz_str: str = "UTC") -> None:
+    # Preload the privacy allow-list in the background so the first Browser
+    # open never performs a DB read on the render path.
+    try:
+        from backend.runtime.task_guard import guarded_create_task
+        guarded_create_task(_ensure_allowed_loaded_async(), name="ghost_seen_v2:preload_allowed")
+    except Exception:
+        pass
     register_panel(_PANEL_ID, lambda event, extra: _browser_panel_handler(event, extra, owner_id), parent="menu", title="👻 Ghost Seen")
     register_panel(_VIEWER_ID, lambda event, extra: _viewer_panel_handler(event, extra, owner_id), parent=_PANEL_ID, title="👀 Ghost Seen")
     register_panel(_ACTION_ID, lambda event, extra: _actions_panel_handler(event, extra, owner_id), parent=_VIEWER_ID, title="👀 Ghost Seen")

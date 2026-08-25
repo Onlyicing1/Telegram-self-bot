@@ -1,10 +1,14 @@
 """Ghost Seen v2 private-chat browser, bounded viewer, and selection model."""
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 5
 MESSAGE_PAGE_SIZE = 8
@@ -12,10 +16,13 @@ MANAGE_PAGE_SIZE = 8
 _PREVIEW_LIMIT = 42
 _NAME_LIMIT = 40
 _MESSAGE_LIMIT = 180
+_MANAGE_DIRECTORY_TTL_S = 60.0
 _selections: dict[int, set[int]] = {}
 _reply_states: dict[int, dict] = {}
 _allowed_chats: set[int] = set()
 _allowed_loaded = False
+_manage_directory: list[Any] | None = None
+_manage_directory_at: float = 0.0
 
 
 # ── Destination configuration ──
@@ -126,56 +133,80 @@ def clear_all_replies() -> None:
 
 # ── Privacy: per-chat opt-in model ──
 
-def _load_allowed_from_db() -> None:
-    """Load the persisted allowed-chat set from the ``bot_settings`` table.
+async def _ensure_allowed_loaded_async() -> None:
+    """Load the persisted allowed-chat set from ``bot_settings``.
 
-    Uses the existing Supabase-or-fallback DB client. If Supabase is
-    unavailable the in-memory set is left empty (all chats blocked by
-    default).
+    Runs the Supabase read in a worker thread via ``asyncio.to_thread`` so
+    the event loop is never blocked on the render path. Loads at most once
+    per process; in-memory additions made during a load race are preserved
+    by unioning into the existing set.
     """
     global _allowed_loaded
+    if _allowed_loaded:
+        return
     _allowed_loaded = True
     try:
-        from backend.db.client import get_db, is_available
-        if not is_available():
-            return
-        db = get_db()
-        if db is None:
-            return
-        row = db.table("bot_settings").select("value").eq("key", "ghost_seen_allowed_chats").execute()
-        data = getattr(row, "data", None) or []
-        if data and data[0].get("value"):
-            import json
-            ids = json.loads(data[0]["value"])
-            _allowed_chats.update(int(x) for x in ids)
+        import asyncio
+        import json
+
+        from backend.db.client import get_db
+
+        def _load_sync() -> None:
+            db = get_db()
+            if db is None:
+                return
+            row = db.table("bot_settings").select("value").eq("key", "ghost_seen_allowed_chats").maybe_single().execute()
+            data = getattr(row, "data", None)
+            if data and data.get("value"):
+                _allowed_chats.update(int(x) for x in json.loads(data["value"]))
+
+        await asyncio.to_thread(_load_sync)
     except Exception as exc:
         logger.warning("ghost_seen_v2: failed to load allowed chats from DB: %s", exc)
 
 
 def _persist_allowed_to_db() -> None:
-    """Persist the current allowed-chat set to ``bot_settings``."""
+    """Persist the current allowed-chat set to ``bot_settings``.
+
+    Runs the Supabase write in a background daemon thread so a slow DB
+    never blocks the event loop or a Manage toggle callback.
+    """
     try:
-        from backend.db.client import get_db, is_available
-        if not is_available():
-            return
+        import json
+        import threading
+
+        from backend.db.client import get_db
         db = get_db()
         if db is None:
             return
-        import json
         value = json.dumps(sorted(_allowed_chats))
-        existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
-        data = getattr(existing, "data", None) or []
-        if data:
-            db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
-        else:
-            db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
+
+        def _write_sync() -> None:
+            try:
+                existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
+                data = getattr(existing, "data", None) or []
+                if data:
+                    db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
+                else:
+                    db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
+            except Exception as exc:
+                logger.warning("ghost_seen_v2: failed to persist allowed chats to DB: %s", exc)
+
+        threading.Thread(target=_write_sync, daemon=True).start()
     except Exception as exc:
         logger.warning("ghost_seen_v2: failed to persist allowed chats to DB: %s", exc)
 
 
 def _ensure_allowed_loaded() -> None:
+    """Cheap flag check — never performs I/O.
+
+    The actual DB read is triggered from async entry points via
+    ``_ensure_allowed_loaded_async`` (Browser open, Manage open, toggle).
+    Until that runs the in-memory set is empty, which is the correct
+    privacy default (nothing allowed).
+    """
     if not _allowed_loaded:
-        _load_allowed_from_db()
+        logger.debug("ghost_seen_v2: allowed set not loaded yet — defaulting to empty")
 
 
 def is_chat_allowed(source_chat_id: int) -> bool:
@@ -424,6 +455,33 @@ async def load_allowed_chats(client: Any, owner_id: int | None = None) -> list[P
     return [chat for chat in all_chats if is_chat_allowed(chat.chat_id)]
 
 
+async def load_manage_directory(client: Any, owner_id: int | None = None) -> list[PrivateChat]:
+    """Load the private-chat directory for the Manage UI, cached for a TTL.
+
+    Broad dialog discovery (``iter_dialogs``) happens at most once per
+    ``_MANAGE_DIRECTORY_TTL_S``. Repeated Manage page/search/toggle
+    operations reuse the cached set, so they never re-enumerate the whole
+    dialog list. Also ensures the privacy allow-list is loaded so toggles
+    persist the full set.
+    """
+    await _ensure_allowed_loaded_async()
+    global _manage_directory, _manage_directory_at
+    now = time.monotonic()
+    if _manage_directory is not None and (now - _manage_directory_at) < _MANAGE_DIRECTORY_TTL_S:
+        return _manage_directory
+    chats = await load_private_chats(client, owner_id)
+    _manage_directory = chats
+    _manage_directory_at = now
+    return chats
+
+
+def invalidate_manage_directory() -> None:
+    """Drop the cached Manage directory (used on refresh and in tests)."""
+    global _manage_directory, _manage_directory_at
+    _manage_directory = None
+    _manage_directory_at = 0.0
+
+
 async def resolve_allowed_chats(client: Any, owner_id: int | None = None) -> list[PrivateChat]:
     """Resolve ONLY the explicitly allowed private chats.
 
@@ -432,9 +490,10 @@ async def resolve_allowed_chats(client: Any, owner_id: int | None = None) -> lis
     it never calls ``client.iter_dialogs()``.
 
     If the allowed set is empty, returns immediately with zero Telegram
-    RPCs.
+    RPCs. The privacy allow-list is loaded asynchronously (never blocking
+    the event loop) before any entity resolution.
     """
-    _ensure_allowed_loaded()
+    await _ensure_allowed_loaded_async()
     allowed = frozenset(_allowed_chats)
     if not allowed:
         return []

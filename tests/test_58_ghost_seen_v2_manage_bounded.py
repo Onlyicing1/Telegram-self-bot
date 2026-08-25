@@ -162,9 +162,10 @@ def test_16_manage_buttons_always_have_back_and_search():
 
 
 def test_17_manage_page_action_navigates():
-    with patch.object(handler_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
+    with patch.object(service_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
         with patch.object(handler_module, "_session_extra", return_value="p=1&q="):
             with patch.object(handler_module, "_set_extra") as set_extra:
+                service_module.invalidate_manage_directory()
                 title, body, buttons = _run(handler_module._manage_page_action(_event(3, 1), "2", 3))
                 texts = _button_texts(buttons)
                 page_two_names = [c.display_name for c in manage_page(_chats(30), page=2).chats]
@@ -174,9 +175,10 @@ def test_17_manage_page_action_navigates():
 
 
 def test_18_toggle_preserves_page_and_query():
-    with patch.object(handler_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
+    with patch.object(service_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
         with patch.object(handler_module, "_session_extra", return_value="p=2&q="):
             reset_allowed()
+            service_module.invalidate_manage_directory()
             target = manage_page(_chats(30), page=2).chats[0].chat_id
             title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
             texts = _button_texts(buttons)
@@ -185,9 +187,10 @@ def test_18_toggle_preserves_page_and_query():
 
 
 def test_19_toggle_off_removes_chat_from_page():
-    with patch.object(handler_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
+    with patch.object(service_module, "load_private_chats", new=AsyncMock(return_value=_chats(30))):
         with patch.object(handler_module, "_session_extra", return_value="p=1&q="):
             reset_allowed()
+            service_module.invalidate_manage_directory()
             target = _chats(30)[0].chat_id  # User0 → page 1
             allow_chat(target)
             title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
