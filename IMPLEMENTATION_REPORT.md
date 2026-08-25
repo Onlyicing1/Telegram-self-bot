@@ -1,5 +1,54 @@
 # Implementation Report — Ghost Seen v2
 
+## AI tool isolation and main Search action repair
+
+### Root causes
+
+- Ghost Seen AI Reply constructed a normal `AIRequest`, while `Dispatcher.dispatch()` unconditionally exposed tool schemas, ran the deterministic local fast path, parsed structured actions, and executed provider-emitted tool calls. The existing general AI path therefore had no request-specific capability boundary.
+- Main Browser Search rendered valid `action:ghost_seen_v2_open:<source_chat_id>` callbacks, but its direct input-handler edit did not persist the active Browser query in the lifecycle session. The open action also used the raw callback event message ID instead of the lifecycle-resolved panel message ID for inline callbacks. The registered action was present; the failure was session/state continuity, not a missing or duplicate action.
+
+### Implementation
+
+- Added immutable `AIRequest.allow_tools`, defaulting to `True` so normal owner AI requests retain existing tool access.
+- Ghost Seen AI Reply now passes `allow_tools=False` through the existing Engine -> Dispatcher -> ProviderManager path.
+- Dispatcher tool schemas, deterministic fast path, structured-action/recovery handling, and ToolExecutor execution are gated by the request capability. Provider tool calls that arrive despite a disabled request are converted to an honest failed result and never reach a tool executor.
+- Main Search now stores the query in the existing Browser session before editing the results. The existing `ghost_seen_v2_open` action resolves the active lifecycle session message while retaining the numeric real source chat ID in its callback payload.
+- No new provider path, ToolRegistry, action, handler, Telegram client, prompt UI, or user-facing AI step was added.
+
+### Files changed
+
+- `backend/ai/session/request.py`
+- `backend/ai/engine/dispatcher.py`
+- `backend/bot/handlers/ghost_seen_v2.py`
+- `tests/test_64_ghost_seen_v2_tool_isolation_search.py`
+- `IMPLEMENTATION_REPORT.md`
+
+### Regression coverage
+
+- Ghost Seen AI requests disable tools and provider-emitted tool calls cannot execute Telegram or local tools.
+- Normal owner AI requests still receive the existing tool definitions.
+- Ghost Seen still generates and delivers a normal text reply with existing disclosure behavior.
+- Search results preserve the active query, emit distinct source-chat callbacks, reach the single registered `ghost_seen_v2_open` action, resolve the real source chat, and navigate using the lifecycle panel session.
+
+### Validation
+
+- New focused regression tests: **5 passed**
+- Ghost Seen v2 tests: **174 passed**
+- Selected AI/tool and new capability-boundary tests: **66 passed**
+- Full Python suite: **980 passed, 23 skipped, 1 warning**
+- `python -m compileall -q backend`: PASS
+- `git diff --check`: PASS
+- `bun tsc -b --noEmit`: PASS
+- Exactly one `INVESTIGATION.md` remains.
+- No database schema, SQL, migration, deployment, or unrelated-system changes.
+- Live Telegram/UI E2E was **not performed**; the Search callback was verified through the registered action/router boundary with mocked clients and lifecycle state.
+
+### Git status
+
+Changes are pending final commit and remote verification.
+
+---
+
 ## Stage 8 — AI Reply execution-boundary verification and hardening
 
 ### Summary

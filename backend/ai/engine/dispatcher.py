@@ -176,14 +176,16 @@ class Dispatcher:
         safe_call(self._hooks, "before_execution", request)
 
         # Native tool definitions are computed once and passed to every
-        # provider round so the model can emit real tool calls (save,
-        # delete, search, ...). Providers translate this OpenAI-format list
-        # into their own API shape (e.g. Gemini functionDeclarations).
-        tool_definitions = self._build_tool_definitions()
+        # provider round only when this request permits tools. Providers
+        # translate this OpenAI-format list into their own API shape (e.g.
+        # Gemini functionDeclarations).
+        tools_allowed = bool(getattr(request, "allow_tools", True))
+        tool_definitions = self._build_tool_definitions() if tools_allowed else []
         chat_kwargs: dict[str, Any] = {"tools": tool_definitions} if tool_definitions else {}
         logger.info(
-            "AI_TOOL_AVAILABILITY id=%s tools=%d names=%s",
+            "AI_TOOL_AVAILABILITY id=%s enabled=%s tools=%d names=%s",
             rid or "-",
+            tools_allowed,
             len(tool_definitions),
             [d["function"]["name"] for d in tool_definitions],
         )
@@ -215,7 +217,7 @@ class Dispatcher:
         # It is NOT a keyword command parser replacing the AI: only the
         # narrow, high-confidence command vocabulary resolves here; every
         # conversational and semantic request continues to the provider.
-        if self._tool_executor is not None:
+        if tools_allowed and self._tool_executor is not None:
             fast = await self._try_local_fast_path(
                 request, rid, status_callback, start, metadata,
             )
@@ -228,7 +230,7 @@ class Dispatcher:
             logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
             prompt_package = self._prompt_builder.build(await self._build_context(request, session))
             # Inject tool schemas into the prompt if a registry is available
-            if self._tool_registry and not self._tool_registry.is_empty():
+            if tools_allowed and self._tool_registry and not self._tool_registry.is_empty():
                 tool_schemas = self._tool_registry.list_schemas()
                 tool_block = self._render_tool_schemas(tool_schemas)
                 if tool_block:
@@ -279,6 +281,31 @@ class Dispatcher:
             failure_type = "" if response.success else str(
                 response.metadata.get("failure_type", "") or "unknown"
             )
+
+            def _reject_disabled_tool_calls(candidate: ProviderResponse) -> ProviderResponse:
+                nonlocal failure_type
+                if tools_allowed or not candidate.tool_calls:
+                    return candidate
+                errors.append("AI tools are disabled for this request")
+                failure_type = "tools_disabled"
+                blocked_metadata = dict(candidate.metadata or {})
+                blocked_metadata["failure_type"] = "tools_disabled"
+                blocked_metadata["tool_calls_blocked"] = len(candidate.tool_calls)
+                metadata["tool_calls_blocked"] = blocked_metadata["tool_calls_blocked"]
+                logger.warning(
+                    "AI_TOOL_CALL_BLOCKED id=%s provider=%s count=%d",
+                    rid or "-", candidate.provider_name or provider_name,
+                    blocked_metadata["tool_calls_blocked"],
+                )
+                return replace(
+                    candidate,
+                    text="",
+                    success=False,
+                    tool_calls=[],
+                    metadata=blocked_metadata,
+                )
+
+            response = _reject_disabled_tool_calls(response)
             _mark_success("PROVIDER_REQUEST")
             logger.info(
                 "AI_PROVIDER_RESPONSE id=%s provider=%s success=%s",
@@ -342,7 +369,7 @@ class Dispatcher:
                     retry_count = max(
                         retry_count, int(retry_meta["ai_retry_count"])
                     )
-                    response = retry_response
+                    response = _reject_disabled_tool_calls(retry_response)
                     logger.info("AI_PROVIDER_EMPTY_RESPONSE_RETRY_RECOVERED id=%s", rid or "-")
 
             safe_call(self._hooks, "after_provider", response)
@@ -350,13 +377,33 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "provider", start, errors, metadata)
 
+        # A provider retry must obey the same request capability boundary as
+        # the first response. This final guard also covers custom providers
+        # that attach tool calls outside the normal initial response path.
+        if not tools_allowed and response.tool_calls:
+            blocked_count = len(response.tool_calls)
+            response = replace(
+                response,
+                text="",
+                success=False,
+                tool_calls=[],
+                metadata={
+                    **(response.metadata or {}),
+                    "failure_type": "tools_disabled",
+                    "tool_calls_blocked": blocked_count,
+                },
+            )
+            metadata["tool_calls_blocked"] = blocked_count
+            failure_type = "tools_disabled"
+            errors.append("AI tools are disabled for this request")
+
         # ── Structured-action fallback: model prose/JSON → tool calls ──
         # When the provider does not emit a native tool call, try the
         # JSON-schema structured-output path. An executable intent becomes
         # concrete tool calls for the SAME ToolExecutor; clarification and
         # rejection outcomes become a deterministic text response.
         structured_action = False
-        if response.success and not response.tool_calls:
+        if tools_allowed and response.success and not response.tool_calls:
             response = self._apply_structured_action(response, request, rid)
             structured_action = bool(response.tool_calls)
 
@@ -805,6 +852,9 @@ class Dispatcher:
         down — and it proves (via AI_EXEC_TRACE) that the live Telegram
         request reaches the real tool executor, not just a unit test.
         """
+        if not getattr(request, "allow_tools", True):
+            return None
+
         has_reply = bool(request.reply_context and request.reply_context.exists)
         result = parse_command_intent(request.user_message, has_reply=has_reply)
 

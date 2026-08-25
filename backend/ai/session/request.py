@@ -21,6 +21,7 @@ Fields (from AI_MASTER_DESIGN.md §25):
   language:      Owner's language (e.g. ``"English"``).
   timezone:      Owner's timezone string (e.g. ``"Asia/Tehran"``).
   metadata:      Arbitrary extra metadata (future use).
+  allow_tools:   Whether this request may expose or execute AI tools.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ class AIRequest:
         language:       Owner's language.
         timezone:       Owner's timezone string.
         metadata:       Arbitrary extra metadata for future use.
+        allow_tools:    Whether this request may expose or execute AI tools.
     """
 
     session_id: str
@@ -61,3 +63,4 @@ class AIRequest:
     timezone: str = "UTC"
     metadata: dict[str, Any] = field(default_factory=dict)
     request_id: str = ""
+    allow_tools: bool = True

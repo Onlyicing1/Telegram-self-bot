@@ -78,6 +78,14 @@ def _event_ids(event) -> tuple[int, int]:
     return int(getattr(event, "chat_id", 0) or 0), int(getattr(event, "message_id", 0) or 0)
 
 
+def _panel_message_id(chat_id: int, event) -> int:
+    """Resolve the active inline panel message, including inline callbacks."""
+    session = get_lifecycle().sessions.find_by_chat(int(chat_id))
+    if session is not None:
+        return int(session.msg_id)
+    return _event_ids(event)[1]
+
+
 def _session_extra(chat_id: int, msg_id: int, panel_id: str) -> str:
     nav = get_lifecycle().sessions.current_nav(chat_id, msg_id)
     return nav[1] if nav and nav[0] == panel_id else ""
@@ -184,7 +192,7 @@ async def _open_chat_action(event, extra: str, chat_id: int):
     clear_selection(selected.chat_id)
     clear_reply(chat_id)
     viewer = await load_viewer_messages(inline_engine.get_self_client(), selected.chat_id)
-    msg_id = _event_ids(event)[1]
+    msg_id = _panel_message_id(chat_id, event)
     session = get_lifecycle().sessions.get(chat_id, msg_id)
     if session is not None:
         session.nav_stack.append((_VIEWER_ID, f"source={selected.chat_id}&name={quote(selected.display_name, safe='')}&page={viewer.page}"))
@@ -338,7 +346,7 @@ async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, d
         from backend.ai.session.request import AIRequest
         try:
             result = await asyncio.wait_for(
-                engine.execute(AIRequest(session_id=operation.request_id, request_id=operation.request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id)),
+                engine.execute(AIRequest(session_id=operation.request_id, request_id=operation.request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id, allow_tools=False)),
                 timeout=_AI_TIMEOUT_S,
             )
         except asyncio.CancelledError:
@@ -584,7 +592,10 @@ async def _manage_search_input_handler(text, chat_id, msg_id, inline_chat_id, in
 
 
 async def _search_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id):
-    title, body, buttons = await _render_browser(inline_engine.get_owner_id(), 1, (text or "").strip())
+    query = (text or "").strip()
+    title, body, buttons = await _render_browser(inline_engine.get_owner_id(), 1, query)
+    if inline_chat_id and inline_msg_id:
+        _set_extra(inline_chat_id, inline_msg_id, f"p=1&q={quote(query, safe='')}")
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         from backend.helper.panel_render import render_edit
