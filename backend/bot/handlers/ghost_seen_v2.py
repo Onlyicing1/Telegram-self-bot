@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
 from backend.helper import (
@@ -31,8 +32,35 @@ _PANEL_ID = "ghost_seen_v2"
 _VIEWER_ID = "ghost_seen_v2_viewer"
 _ACTION_ID = "ghost_seen_v2_actions"
 _MANAGE_ID = "ghost_seen_v2_manage"
+_AI_TIMEOUT_S = 45.0
+_TELEGRAM_TEXT_LIMIT = 4096
 _ai_states: dict[int, dict] = {}
+_ai_locks: dict[int, asyncio.Lock] = {}
 _SEARCH_INPUT_ID = "search"
+
+
+@dataclass(frozen=True)
+class _AIReplyOperation:
+    panel_chat_id: int
+    source_chat_id: int
+    selected_message_id: int
+    context_count: int
+    disclosure: bool
+    request_id: str
+
+
+def _ai_lock(panel_chat_id: int) -> asyncio.Lock:
+    return _ai_locks.setdefault(int(panel_chat_id), asyncio.Lock())
+
+
+def _clear_ai_state(panel_chat_id: int, source_chat_id: int | None = None) -> None:
+    _ai_states.pop(int(panel_chat_id), None)
+    if source_chat_id is not None:
+        clear_selection(int(source_chat_id))
+
+
+def _valid_context_count(value: int) -> bool:
+    return int(value) in {1, 5, 10, 20}
 
 
 def _decode_state(value: str) -> tuple[int, str]:
@@ -250,6 +278,8 @@ async def _ai_generate_action(event, extra: str, chat_id: int):
     if len(parts) != 2 or not all(part.isdigit() for part in parts):
         return "👀 Ghost Seen", "Invalid context selection.", []
     source, count = map(int, parts)
+    if not _valid_context_count(count):
+        return "👀 Ghost Seen", "Invalid context selection.", []
     target_id = reply_target(source)
     state_source, name, _, _ = _parse_viewer_state(_session_extra(chat_id, _event_ids(event)[1], _ACTION_ID))
     if target_id is None or source != state_source or not is_chat_allowed(source):
@@ -287,32 +317,61 @@ async def _ai_disclosure_action(event, extra: str, chat_id: int):
 
 
 async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, disclosure: bool, name: str):
-    if not is_chat_allowed(source) or reply_target(source) != target_id:
+    if not _valid_context_count(count) or not is_chat_allowed(source) or reply_target(source) != target_id:
         return "👀 Ghost Seen", "That AI selection is no longer available.", []
-    context = await load_context_messages(inline_engine.get_self_client(), source, target_id, count)
-    target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
-    if target is None:
-        return "👀 Ghost Seen", "The selected message is no longer available.", []
-    request_id = uuid.uuid4().hex
-    _ai_states[chat_id] = {"panel_chat_id": chat_id, "source_chat_id": source, "selected_message_id": target_id, "context_count": count, "disclosure": disclosure, "request_id": request_id, "status": "generating", "name": name}
-    prompt = build_ai_reply_prompt(context, target, inline_engine.get_owner_id())
-    engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
-    from backend.ai.session.request import AIRequest
-    result = await engine.execute(AIRequest(session_id=request_id, request_id=request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id))
-    if not getattr(result, "success", False) or not str(getattr(result, "response", "") or "").strip():
-        _ai_states.pop(chat_id, None)
-        return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
-    reply_text = str(result.response).strip()
-    if disclosure:
-        reply_text += "\n\n— Written with AI assistance."
-    try:
-        await send_reply(inline_engine.get_self_client(), source, target_id, reply_text)
-    except Exception:
-        _ai_states.pop(chat_id, None)
-        return "👀 Ghost Seen", "✕ Couldn't send the reply.", []
-    _ai_states.pop(chat_id, None)
-    clear_selection(source)
-    return "👀 Ghost Seen", "✓ Reply sent.", []
+    lock = _ai_lock(chat_id)
+    if lock.locked():
+        return "👀 Ghost Seen", "That AI reply is already being processed.", []
+    async with lock:
+        if not is_chat_allowed(source) or reply_target(source) != target_id:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "That AI selection is no longer available.", []
+        context = await load_context_messages(inline_engine.get_self_client(), source, target_id, count)
+        target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
+        if target is None:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "The selected message is no longer available.", []
+        operation = _AIReplyOperation(chat_id, source, target_id, count, disclosure, uuid.uuid4().hex)
+        _ai_states[chat_id] = {**operation.__dict__, "status": "generating", "name": name}
+        prompt = build_ai_reply_prompt(context, target, inline_engine.get_owner_id())
+        engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
+        from backend.ai.session.request import AIRequest
+        try:
+            result = await asyncio.wait_for(
+                engine.execute(AIRequest(session_id=operation.request_id, request_id=operation.request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id)),
+                timeout=_AI_TIMEOUT_S,
+            )
+        except asyncio.CancelledError:
+            _clear_ai_state(chat_id, source)
+            raise
+        except asyncio.TimeoutError:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ AI generation timed out.", []
+        except Exception:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+        if not getattr(result, "success", False) or not str(getattr(result, "response", "") or "").strip():
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+        reply_text = str(result.response).strip()
+        if disclosure:
+            reply_text += "\n\n— Written with AI assistance."
+        if len(reply_text) > _TELEGRAM_TEXT_LIMIT:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ The generated reply is too long to send.", []
+        if not is_chat_allowed(source) or reply_target(source) != target_id:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ The AI selection changed before delivery.", []
+        try:
+            await send_reply(inline_engine.get_self_client(), source, target_id, reply_text)
+        except asyncio.CancelledError:
+            _clear_ai_state(chat_id, source)
+            raise
+        except Exception:
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✕ Couldn't send the reply.", []
+        _clear_ai_state(chat_id, source)
+        return "👀 Ghost Seen", "✓ Reply sent.", []
 
 
 async def _placeholder_action(event, extra: str, chat_id: int):
