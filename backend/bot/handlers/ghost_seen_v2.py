@@ -299,10 +299,10 @@ async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, d
     engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
     from backend.ai.session.request import AIRequest
     result = await engine.execute(AIRequest(session_id=request_id, request_id=request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id))
-    if not result.success or not result.response:
+    if not getattr(result, "success", False) or not str(getattr(result, "response", "") or "").strip():
         _ai_states.pop(chat_id, None)
         return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
-    reply_text = result.response
+    reply_text = str(result.response).strip()
     if disclosure:
         reply_text += "\n\n— Written with AI assistance."
     try:
