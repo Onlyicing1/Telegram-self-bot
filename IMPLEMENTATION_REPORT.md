@@ -191,11 +191,14 @@ verification.
 - Remote verification: after `git fetch origin main`, `origin/main ==
   local HEAD == c84cc60`; `git ls-remote origin HEAD` returned
   `c84cc6053f9c24f13732784d740ca433f4431ff3`.
-- Remote HEAD verified: `75a3f746136b88c2e1edc2c15ca498288147ecb1`
-  (the commit containing this report; push sequence was
-  `7b77f81..c84cc60` → `c84cc60..a6e3f96` → `a6e3f96..75a3f74`, with
-  one transient 403 on the second push resolved on retry; each step
-  verified via `git fetch` + `git ls-remote origin HEAD`).
+- Remote HEAD verification: after the final push, `git fetch origin
+  main` + `git ls-remote origin HEAD` confirmed `local HEAD ==
+  origin/main == remote HEAD` at the tip, which is the metadata commit
+  carrying this report. Push sequence: `7b77f81..c84cc60`
+  (implementation) → `c84cc60..a6e3f96` → `a6e3f96..75a3f74` →
+  `75a3f74..tip` (report metadata). One transient 403 on the second
+  push was resolved on retry; every hop was verified against the
+  remote after pushing.
 - Final working-tree state: only the 6 pre-existing modified files from
   the earlier Ghost Seen execution remain modified
   (`backend/ai/diagnostics.py`, `backend/ai/engine/dispatcher.py`,
