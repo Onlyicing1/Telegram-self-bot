@@ -153,13 +153,25 @@ execution surface, no credentials in logs or docs.
 
 ## Commit / delivery
 
-Filled in after commit and push (see below).
+- Implementation commit: `3faac6a88b819e28b6bea48aef94f223b1fc9123` —
+  `fix: harden ghost seen v2 ai reply execution boundary` (7 files,
+  +772/−276).
+- This report is carried by a small follow-up metadata commit that fills
+  in the verified delivery facts below (same pattern as the database
+  architecture delivery).
 
 ---
 
 ## Delivery verification
 
-- Commit: `<commit-sha>` — `<commit-message>`
-- Push result: `<push-result>`
-- Remote verification: `<remote-verification>`
-- Final working-tree state: `<final-state>`
+- Commit: `3faac6a88b819e28b6bea48aef94f223b1fc9123` —
+  `fix: harden ghost seen v2 ai reply execution boundary`.
+- Push result: pushed to `origin/main` (`b160adc..3faac6a`), exit 0.
+- Remote verification: after `git fetch origin main`, `local HEAD ==
+  origin/main == git ls-remote origin HEAD == 3faac6a…`; `git show
+  origin/main:IMPLEMENTATION_REPORT.md` confirms the pushed report is
+  this document.
+- Final working-tree state: `main` in sync with `origin/main`; all 6
+  implementation files and this report are committed; `INVESTIGATION.md`
+  is restored to the pushed Phase 1 + Phase 2 handoff (no diff); no
+  unrelated files were touched.
