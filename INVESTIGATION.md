@@ -1037,3 +1037,578 @@ The next phase (schema reconciliation against `DATABASE_ARCHITECTURE.md`
 and the confirmed fixes from §10/§12) is **not** part of this phase.
 
 *End of Phase 1.*
+
+---
+
+# Phase 2 — Database Architecture Reconciliation
+
+**Phase:** 2 of N — database architecture reconciliation (investigation only)
+**Date:** 2026-08-26
+
+> This section reconciles three sources: (1) the actual repository
+> implementation, (2) `DATABASE_ARCHITECTURE.md`, and (3) the Phase 1
+> findings recorded above. Every conclusion was re-verified against the
+> current source and migrations during this phase; Phase 1 was treated as
+> a set of claims to prove, not truth. Per the canonical-handoff rule this
+> section is appended to `INVESTIGATION.md` — no parallel reconciliation
+> document is created.
+
+---
+
+## 1. Phase 2 Scope
+
+This phase is **investigation and reconciliation only**:
+
+- Read `INVESTIGATION.md` (Phase 1) completely; Phase 1 content above is
+  preserved intact.
+- Read `DATABASE_ARCHITECTURE.md` (1,737 lines) completely.
+- Inspected all 12 migration files verbatim.
+- Re-verified code producers/consumers for every disputed entity
+  (`backend/db/client.py`, `backend/services/*`, `backend/ai/*`,
+  `backend/profile/*`, `backend/helper/*`, `backend/web/app.py`,
+  `src/App.tsx`).
+- No application code changed; no migration changed or created; no SQL
+  executed; no live Supabase mutation; no production behavior changed.
+- The only repository modification is this Phase 2 section appended to
+  `INVESTIGATION.md`.
+
+Findings use the reconciliation classification set:
+
+| Label | Meaning |
+|---|---|
+| **AGREES** | Architecture and implementation describe the same contract. |
+| **CODE > ARCHITECTURE** | Code has a real database requirement the architecture does not describe. |
+| **ARCHITECTURE > CODE** | Architecture defines something current code does not consume/produce. |
+| **CONFLICT** | Both sources describe the same entity but disagree on contract. |
+| **OBSOLETE DOCUMENTATION** | Architecture/migration comments describe a replaced implementation. |
+| **ORPHANED SCHEMA** | Migrated object exists with no current code consumer. |
+| **CODE-WIRED / SCHEMA-MISSING** | Production code requires durable storage the schema layer does not define. |
+| **UNCERTAIN / REQUIRES SOURCE VERIFICATION** | Repository cannot establish the intended contract. |
+
+---
+
+## 2. Sources Inspected
+
+- `INVESTIGATION.md` — full Phase 1 report (preserved above).
+- `DATABASE_ARCHITECTURE.md` — full document (sections 1–26; note the
+  file stores §22 before §21 — a section-ordering artifact, see §8).
+- All 12 migrations in `supabase/migrations/` (read verbatim):
+  `20260712234229_lifeos_schema.sql`,
+  `20260714111706_create_lifeos_tables.sql`,
+  `20260718143752_20260718_save_ux_redesign.sql.sql`,
+  `20260726143924_create_panel_settings_table.sql`,
+  `20260729213959_20260729120000_create_bot_settings_table.sql`,
+  `20260730210551_20260730235000_add_update_stale_seconds.sql`,
+  `20260801215007_create_username_state_table.sql`,
+  `20260804145402_create_ai_tables.sql`,
+  `20260805075707_20260805120000_create_ai_config_table.sql.sql`,
+  `20260822090000_create_ghost_chats_table.sql`,
+  `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`,
+  `20260823130000_ghost_seen_retention_duration.sql`.
+- Persistence code: `backend/db/client.py`, `backend/services/save_service.py`,
+  `retrieve_service.py`, `delete_service.py`, `discover_service.py`,
+  `database_service.py`, `organize_service.py`, `settings_service.py`,
+  `panel_settings_repository.py`, `ghost_seen_v2.py`,
+  `backend/profile/engine.py`, `backend/profile/scheduler.py`,
+  `backend/bio/engine.py`, `backend/username/engine.py`,
+  `backend/ai/config_store.py`, `backend/ai/persistence.py`,
+  `backend/ai/database/*.py` (usage/provider-stats/preferences/
+  memory/session/message/tool-history repos, `usage_recorder.py`),
+  `backend/ai/runtime/manager.py`, `backend/ai/engine/dispatcher.py`,
+  `backend/ai/engine/engine.py`, `backend/ai/tools/executor.py`,
+  `backend/ai/providers/manager/manager.py` + `health.py`,
+  `backend/helper/font_style.py`, `backend/config.py`,
+  `backend/web/app.py`.
+- Frontend read path: `src/lib/api.ts`, `src/App.tsx`.
+
+---
+
+## 3. Executive Verdict
+
+**The architecture document is substantially accurate and agrees with
+the code, but the schema layer is behind both.** Concretely:
+
+- **Architecture partially diverges from code in 4 contract points, all
+  of which the document itself already flags** (§19.1 missing
+  `ai_config` trigger columns, §19.3 missing `panel_settings` columns,
+  §19.5 missing `ai_messages.tool_calls`, §19.8 missing `ai_usage` /
+  `ai_provider_stats` / `ai_preferences` migrations). Verified true in
+  the migrations.
+- **Schema is behind code** for exactly those objects: production code
+  writes `ai_usage`, `ai_provider_stats`, `panel_settings` (10 columns),
+  `ai_config` (2 trigger columns), and `ai_messages` (`tool_calls` in
+  the record interface) — none of which the migrations create.
+- **One real CONFLICT the document does not flag:** `ai_usage.id`.
+  `DATABASE_ARCHITECTURE.md §13` specifies `bigserial`, but the live
+  producer `backend/ai/database/usage_recorder.py` generates
+  `id=str(uuid.uuid4())`. A migration generated from §13 as written
+  would be incompatible with the writer.
+- **Orphaned schema confirmed:** `ghost_chats` (migrated, zero code
+  consumers) and two `panel_settings` columns (`update_stale_seconds`,
+  `ghost_seen_retention_seconds`) with zero consumers.
+- **RLS posture:** the two core-table migrations *appear* to conflict
+  (full CRUD vs SELECT-only) but the later migration explicitly DROPs
+  the write policies, so the effective posture is **SELECT-only** when
+  both apply in order. The live-DB state cannot be proven from the
+  repository (see §7).
+- **Unresolved areas:** the intended fate of `ghost_chats` /
+  `bot_settings` consolidation, `ai_preferences`, and AI-table retention
+  policy remain open decisions (see §14–§16).
+
+---
+
+## 4. Complete Entity Reconciliation Matrix
+
+"Current Code" describes actual read/write behavior. Classification
+labels per §1. Phase 1 statuses are from the Phase 1 section above.
+
+| Entity | Phase 1 Status | Architecture Status | Current Code | Current Migration | Classification | Action Needed |
+|---|---|---|---|---|---|---|
+| `saved_items` | EXISTING live | CURRENT | `db/client.py` CRUD; `save_service` insert (`save_type='deep'`, `S####` codes); retrieve/delete/discover/database-service reads | 3 migrations (`20260712234229`, `20260714111706`, `20260718143752`) | **AGREES** (dead `short_code`/`file_name` documented by both) | none beyond documented cleanup (§19.7) |
+| `bio_state` | EXISTING live | CURRENT | `db/client.py` get/create/update; `profile/engine.py` per-minute dedup | `20260712234229` + `20260714111706` | **AGREES** | none |
+| `username_state` | EXISTING live | CURRENT | `db/client.py` get/create/update; `profile/engine.py` per-minute dedup | `20260801215007` | **AGREES** | none |
+| `bot_logs` | EXISTING live | CURRENT | `db/client.py::log` append; `organize_service` age-trim (`log_retention_days`); `startup_check` probe | `20260712234229` + `20260714111706` | **AGREES** | none |
+| `panel_settings` | EXISTING live (12 accessors; 10 columns missing) | CURRENT (12 wired; §19.3 documents missing columns) | `settings_service` reads/writes 12 typed settings via `panel_settings_repository` (`key='global'`) | 4 migrations create only: `key`, `auto_close_enabled`, `updated_at`, `update_stale_seconds`, `dashboard_font`, `ghost_seen_retention_days`→`ghost_seen_retention_seconds` | **CODE-WIRED / SCHEMA-MISSING** (10 columns) | migration to add 10 columns (§19.3) |
+| `bot_settings` | EXISTING live (one key) | CURRENT (allow-list; §19.4 corrected) | `ghost_seen_v2` reads/writes key `ghost_seen_allowed_chats` only | `20260729213959` (also seeds 5 legacy default rows no code reads) | **AGREES** (doc corrected) + **OBSOLETE DOCUMENTATION** (migration comments claim it replaces `panel_settings`) | decide consolidation with `ghost_chats` (§20 items 8–9) |
+| `ai_config` | EXISTING live (trigger columns missing) | CURRENT (§19.1 flagged) | `config_store` writes/reads `trigger_en`/`trigger_fa` (payload verified) + all base columns + `last_request_at`/`last_latency_ms` | `20260805075707` — base columns + `last_request_at`/`last_latency_ms`; **no triggers** | **CODE-WIRED / SCHEMA-MISSING** for trigger columns; §19.2 resolved | migration for `trigger_en`/`trigger_fa` |
+| `ai_sessions` | EXISTING live | CURRENT (§19.19 acknowledged) | `ai/persistence.py` create/update by `session_id`; ConversationManager | `20260804145402` — `id bigserial PK`, `session_id UNIQUE` | **CONFLICT** (doc §8 PK = `session_id` vs migration `id` PK; doc acknowledges in §19.19) | decide PK promotion (§19.19) |
+| `ai_messages` | EXISTING live (tool_calls missing) | CURRENT (§19.5 flagged) | `ai/persistence.py` add/get by `session_id`; restore-after-restart | `20260804145402` — no `tool_calls` column; role CHECK has 4 values incl. `tool` | **CODE-WIRED / SCHEMA-MISSING** (`tool_calls` in `MessageRecord`, not in schema) | migration for `tool_calls` (§19.5) |
+| `ai_memories` | EXISTING live | CURRENT | `SupabaseMemoryRepository` via Engine; `memory_cleanup` expiry sweep | `20260804145402` | **AGREES** | none |
+| `ai_tool_history` | EXISTING live | CURRENT (§19.6 flagged) | `ai/tools/executor.py` → `persistence.record_tool_call` (never writes `result_data`) | `20260804145402` — includes `result_data` column | **AGREES** (doc documents the never-populated column) | optional code fix (§19.6) |
+| `ai_usage` | PROPOSED (code-wired, no migration) | PROPOSED (§13, §19.8) | `dispatcher` → `usage_recorder` → `SupabaseUsageRepository.create` with **uuid4 `id`**; `usage_reader` reads | **none** | **CODE > ARCHITECTURE** — and **CONFLICT** on `id` type (§13 `bigserial` vs code `uuid4` str) | migration with corrected `id` type (P0 decision) |
+| `ai_provider_stats` | PROPOSED (code-wired, no migration) | PROPOSED (§12, §19.8) | `usage_recorder` → `SupabaseProviderStatsRepository.record_request` upsert on `(provider_name, owner_id)` | **none** | **CODE > ARCHITECTURE** (no schema) | migration from §12 |
+| `ai_preferences` | PROPOSED/OPTIONAL (in-memory only) | PROPOSED (§14, §19.17) | `InMemoryPreferencesRepository` only; dispatcher `get_or_create`; no producer/UI | **none** | **AGREES** (both: no producer, no migration) | decide: wire fully or remove (§19.17) |
+| `ghost_chats` | EXISTING/ORPHAN | PROPOSED corrected (§22.2: `owner_id` + `allowed`) | **zero** references in `backend/` | `20260822090000` — `chat_id` PK + display metadata, no `owner_id`/`allowed` | **ORPHANED SCHEMA** | decide repurpose vs drop (§19.12, §22) |
+
+---
+
+## 5. Column-Level Differences
+
+Verified discrepancies between `DATABASE_ARCHITECTURE.md`, the
+migrations, and code. Unused columns are NOT recommended for removal —
+the doc explicitly reserves some for compatibility; each is classified.
+
+| Table | Column | Architecture | Migration | Code usage | Classification | Recommendation |
+|---|---|---|---|---|---|---|
+| `ai_usage` | `id` | `bigserial` PK (§13) | **no migration** | `usage_recorder.py → UsageRecord(id=str(uuid.uuid4()))` inserts a UUID string | **CONFLICT** — doc spec incompatible with the live writer | fix §13 to `uuid`/`text` PK before generating the migration |
+| `ai_config` | `trigger_en` / `trigger_fa` | present (§7) | **absent** (`20260805075707` has no trigger columns) | `config_store._save_config_sync` writes them (`or None`); `update_triggers`/`match_trigger` read them | **CODE-WIRED / SCHEMA-MISSING** | add columns (§19.1) |
+| `ai_config` | `temperature` | `double precision` (§7) | `real` | code writes float | **CONFLICT (cosmetic)** — `real` is 4-byte float vs 8-byte `double precision` | align doc to `real` (or promote column) |
+| `ai_config` | `last_request_at` / `last_latency_ms` | "currently never persisted" note (§7) — **contradicted by §19.2** | both columns exist (`timestamptz`, `real DEFAULT 0`) | `config_store.record_request` targeted update; `_save_config_sync` includes them | **AGREES with §19.2** — §7's inline note is stale | remove the stale note (doc fix) |
+| `panel_settings` | 10 columns (`auto_close_delay`, `max_deep_save_mb`, `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `language`, `debug_callbacks`, `owner_only`) | present (§6/§17) | **absent** — migrations create only `key`, `auto_close_enabled`, `updated_at`, `update_stale_seconds`, `dashboard_font`, retention | `settings_service` reads/writes all 12 (incl. `dashboard_font`) | **CODE-WIRED / SCHEMA-MISSING** | add 10 columns (§19.3) |
+| `panel_settings` | `update_stale_seconds` | present (§6), §19.14 says unconsumed | present (`20260730210551`, default 300) | **zero readers** — heartbeat hardcodes `_STALL_THRESHOLD = 90.0` | **ORPHANED SCHEMA (column)** | wire or drop (§19.14) |
+| `panel_settings` | `ghost_seen_retention_seconds` | present (§6/§17), §19.13 says unconsumed | present (`20260823130000`, default 2592000; drops `days`) | **zero readers** in `backend/` | **ORPHANED SCHEMA (column)** | wire or drop (§19.13) |
+| `saved_items` | `short_code` / `file_name` | Dead Columns (§2) | present (`20260718143752`) + 5 trigram GIN indexes | never read/written; lookups use `save_code` | **ORPHANED SCHEMA (columns)** — legacy, reserved as documented | drop with indexes (§19.7) |
+| `saved_items` | `owner_id` default | `0` (§2/§3/§4/§5) | **no DEFAULT** in any migration | code always supplies `owner_id` | **CONFLICT (doc inaccuracy)** — no default exists | fix doc defaults (cosmetic) |
+| `ai_sessions` | PK | `session_id` (§8) | `id bigserial PK` + `session_id UNIQUE` | addressed by `session_id` in `persistence.py` | **CONFLICT** (acknowledged §19.19) | optionally promote `session_id` to PK |
+| `ai_sessions` | `status` values | note lists `active/closed/error` (§8) | CHECK has 4 values: `active, completed, error, closed` | code uses `'active'`/`'closed'` | **CONFLICT (doc note incomplete)** | fix doc note |
+| `ai_messages` | `tool_calls` | listed with caveat (§9), §19.5 | **absent** | `MessageRecord` field; `persistence.py` never writes it | **CODE-WIRED / SCHEMA-MISSING** | add column (§19.5) |
+| `ai_messages` | `role` values | note lists `user/assistant/system` (§9) | CHECK has 4 values incl. `tool` | writes `system/user/assistant/tool` roles | **CONFLICT (doc note incomplete)** | fix doc note |
+| `ai_tool_history` | `result_data` | present (§11), §19.6 says never written | present (`jsonb DEFAULT '{}'`) | `persistence.record_tool_call` never includes it | **AGREES** (doc documents it) | optional code fix |
+| `ai_tool_history` | `session_id` | nullable (§11) | `DEFAULT ''` (effectively NOT NULL with default) | code inserts `session_id` | **CONFLICT (cosmetic)** — default vs nullable | align doc/migration |
+| `bot_settings` | legacy seed rows | §6 "Removed/phantom columns" names `panel_auto_close_seconds`, `log_cleanup_days` | migration seeds 5 rows: `auto_close_enabled`, `panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`, `log_cleanup_days` | **zero readers** — only `ghost_seen_allowed_chats` is read | **OBSOLETE DOCUMENTATION / dead rows** | cleanup with `bot_settings` retirement decision |
+| `ghost_chats` | `owner_id` / `allowed` | proposed (§22.2) | **absent** | no consumers at all | **ORPHANED SCHEMA** | decide repurpose vs drop |
+
+---
+
+## 6. Ownership Reconciliation
+
+Verified ownership semantics:
+
+- **`BOT_OWNER_ID`** (`backend/config.py`, REQUIRED) + `is_owner` guard
+  (`backend/bot/handlers/guard.py`) define the single owner. There is no
+  users table; `owner_id bigint` (Telegram user ID) is the universal
+  scope column on every owner-owned table. **AGREES** between doc §15
+  and code.
+- **Owner-scoped tables (all carry `owner_id`):** `saved_items`,
+  `bio_state` (UNIQUE), `username_state` (UNIQUE), `bot_logs`,
+  `ai_config` (UNIQUE), `ai_sessions`, `ai_messages`, `ai_memories`,
+  `ai_tool_history`, plus the unmigrated `ai_usage`,
+  `ai_provider_stats`, `ai_preferences`. Verified in migrations and
+  repository payloads. **AGREES.**
+- **Global/singleton rows (no `owner_id`, by design):**
+  `panel_settings` (`key='global'`), `bot_settings` (KV),
+  `ghost_chats` today. Doc §24-H states this is intended for
+  `panel_settings`; `bot_settings`/`ghost_chats` are the Ghost Seen
+  exception the doc proposes to fix by adding `owner_id` to
+  `ghost_chats` (§22.2).
+- **`save_code` scoping — inconsistency:** `db/client.py`'s
+  `_count_saves_sync` counts without an `owner_id` filter, so the
+  `S####` sequence is **global, not owner-scoped**. Harmless in a
+  single-owner bot; neither doc nor code documents it as intentional.
+  **UNCERTAIN / REQUIRES SOURCE VERIFICATION** if multi-owner is ever
+  intended.
+- **Ghost Seen allow-list scoping:** stored as one global
+  `bot_settings` row (no `owner_id`) — consistent with single-tenant
+  but inconsistent with every other owner-scoped table. Doc §22.2
+  proposes `ghost_chats.owner_id`. **ARCHITECTURE > CODE** (doc ahead).
+- **RLS does not enforce owner boundaries** (SELECT `USING (true)` for
+  anon/authenticated). The doc (§16) explicitly accepts this for the
+  single-tenant dashboard. See §7.
+
+---
+
+## 7. RLS Reconciliation
+
+Inspected chronologically. **Effective posture: SELECT-only for
+`anon`/`authenticated`, all writes via service-role key** — *if* the
+migrations apply in repository order.
+
+- `20260712234229_lifeos_schema.sql` creates `saved_items`,
+  `bio_state`, `bot_logs` with RLS enabled and **full CRUD policies**
+  (`anon_select/insert/update/delete_*`, all `USING (true)` /
+  `WITH CHECK (true)`).
+- `20260714111706_create_lifeos_tables.sql` re-creates the same tables
+  (`IF NOT EXISTS`, so skipped) and then **`DROP POLICY IF EXISTS` on
+  all four verbs** before creating only `anon_select_*` policies.
+- **Verdict on the apparent conflict:** it is real as written, but it is
+  **resolved by migration order** — the later migration removes the
+  write policies by name. If both applied in sequence, the final state
+  is exactly what `DATABASE_ARCHITECTURE.md §16` describes: one SELECT
+  policy per table, `USING (true)`, no anon/authenticated writes.
+- **Caveat (UNCERTAIN):** the live-DB state cannot be proven from the
+  repository. If only the first migration was ever applied, full CRUD
+  would still be granted. The doc's §20 table says #2 is "Applied
+  (authoritative)" — under that documented history the effective state
+  is SELECT-only. Verification against the live Supabase project is
+  required before any migration work (P0 decision).
+- All other tables (`panel_settings`, `bot_settings`, `username_state`,
+  `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`,
+  `ai_tool_history`, `ghost_chats`) have exactly one SELECT policy and
+  RLS enabled. The unmigrated tables (`ai_usage`, `ai_provider_stats`,
+  `ai_preferences`) have no policies because they have no migrations —
+  the doc (§16) correctly requires SELECT-only policies in their future
+  creation migrations.
+- **Summary table:**
+
+| Table | SELECT | INSERT | UPDATE | DELETE | Service-role bypass relied on? | `owner_id` enforced at DB level? |
+|---|---|---|---|---|---|---|
+| `saved_items`, `bio_state`, `bot_logs` | anon+authenticated | none (after #2) | none (after #2) | none (after #2) | yes | no — `USING (true)` |
+| `username_state`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ghost_chats` | anon+authenticated | none | none | none | yes | no — `USING (true)` |
+| `ai_usage`, `ai_provider_stats`, `ai_preferences` | n/a (no migration) | n/a | n/a | n/a | yes (when tables exist) | no |
+
+No migration uses `FOR ALL`; no migration uses `auth.uid()`; writes are
+never granted to `anon`/`authenticated` in the final posture. **AGREES**
+with doc §16 (and §21 rules) under ordered application.
+
+---
+
+## 8. Migration History Reconciliation
+
+| # | Migration | Adds | Modifies | Duplicates? | Comments still true? | Dead schema? | Filename artifact? |
+|---|---|---|---|---|---|---|---|
+| 1 | `20260712234229_lifeos_schema.sql` | `saved_items`, `bio_state`, `bot_logs` + full CRUD RLS | — | Superseded by #2 (same tables) | No — full-CRUD policies are removed by #2 | no | no |
+| 2 | `20260714111706_create_lifeos_tables.sql` | same 3 tables (authoritative) + SELECT-only RLS | — | Duplicates #1 (intentional re-create) | Yes (except header comment says `SV-000001` code format — stale, code uses `S####`) | no | no |
+| 3 | `20260718143752_20260718_save_ux_redesign.sql.sql` | `short_code`, `file_name` + 5 trigram GIN indexes | `saved_items` | — | **No** — comments claim "new saves get a short_code"; code never writes it | **yes** (2 dead columns + 5 dead indexes, §19.7) | yes (`.sql.sql`) |
+| 4 | `20260726143924_create_panel_settings_table.sql` | `panel_settings` (`key`, `auto_close_enabled`, `updated_at`) | — | — | Partially — doc §19.3 documents the missing 10 columns | no | no |
+| 5 | `20260729213959_..._create_bot_settings_table.sql` | `bot_settings` + 5 legacy seed rows | — | — | **No** — claims it "replaces `panel_settings`" and that `settings_service` reads it; current code reads `panel_settings` (§19.4) | **yes** (5 seed rows never read) | no |
+| 6 | `20260730210551_..._add_update_stale_seconds.sql` | `panel_settings.update_stale_seconds` (default 300) | `panel_settings` | — | **No** — claims "the watchdog reads this value via settings_service on every tick"; heartbeat hardcodes 90s (§19.14) | **yes** (column unconsumed) | no |
+| 7 | `20260801215007_create_username_state_table.sql` | `username_state` | — | — | Yes | no | no |
+| 8 | `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` | — | — | Mostly — role CHECK includes `tool` (doc note omits it); `result_data` created but never written (§19.6) | partial (`result_data` never populated) | no |
+| 9 | `20260805075707_..._create_ai_config_table.sql.sql` | `ai_config` (no trigger columns) | — | — | No — omits `trigger_en`/`trigger_fa` the code writes (§19.1) | no | yes (`.sql.sql`) |
+| 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` | — | — | Header says "Doc-first: see DATABASE_ARCHITECTURE.md §22" — the doc has since been rewritten; the table is orphaned (§19.12) | **yes** (whole table) | no |
+| 11 | `20260823120000_..._dashboard_font_and_ghost_seen_settings.sql` | `dashboard_font` (23-key CHECK), `ghost_seen_retention_days` | `panel_settings` | — | Yes (font) / superseded (days→seconds by #12) | partial | no |
+| 12 | `20260823130000_ghost_seen_retention_duration.sql` | `ghost_seen_retention_seconds` (bigint, CHECK 0 or 300..31536000), backfill, drops `days` | `panel_settings` | — | Yes (includes an honest "pending manual application" note) | **yes** (column unconsumed, §19.13) | no |
+
+**Structural notes:**
+
+- Migrations #1/#2 duplicate table creation; #2 intentionally supersedes
+  #1 and neutralizes its RLS (see §7). Both remain historical — do NOT
+  rewrite history.
+- Two filenames end in `.sql.sql` (double extension artifacts).
+- The document stores §22 before §21 in the file; the TOC lists them in
+  the correct order. Cosmetic ordering artifact.
+- Migration #5's seed rows (`auto_close_enabled`,
+  `panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`,
+  `log_cleanup_days`) are dead in current code — only
+  `ghost_seen_allowed_chats` is ever read from `bot_settings`.
+
+---
+
+## 9. Ghost Seen Reconciliation
+
+**Definitive source-based finding** (traced end-to-end in
+`backend/services/ghost_seen_v2.py` and
+`backend/bot/handlers/ghost_seen_v2.py`):
+
+1. **Durable today (1 item):** the per-chat privacy allow-list —
+   `_allowed_chats` set, loaded once per process by
+   `_ensure_allowed_loaded_async()` from `bot_settings` key
+   `ghost_seen_allowed_chats` (JSON array of chat IDs), written on every
+   `allow_chat`/`disallow_chat` by `_persist_allowed_to_db()`
+   (update-or-insert). Survives restart **only when Supabase is
+   available**; in-memory-only otherwise.
+2. **Transient by design (never persisted):** `_selections`
+   (`dict[chat_id, set[msg_id]]`), `_reply_states`, AI Reply candidate
+   state/locks (handler), `_manage_directory` (60s TTL cache),
+   browser/viewer page & query (lifecycle session nav). Nothing reads
+   them back after restart. **No per-message Ghost table is justified —
+   do not create one.**
+3. **Architecture expectation:** `ghost_chats` repurposed as the
+   authoritative per-chat table with additive `owner_id` + `allowed`,
+   backfill from `bot_settings`, then drop `bot_settings` (§22.2, §20
+   items 8–9). This is **ARCHITECTURE > CODE** — a committed design,
+   not yet implemented.
+4. **`ghost_chats` status:** **ORPHANED SCHEMA** — migrated
+   (`20260822090000`), zero references in `backend/` (grep-verified),
+   referenced only by skipped legacy tests. The doc's corrected design
+   makes it the intended home for the allow-list; alternatively it can
+   be dropped and `bot_settings` kept. Both are open decisions (D5).
+5. **Retention settings:** `panel_settings.ghost_seen_retention_days`
+   was created by migration #11 and is **dropped by migration #12**
+   (which adds `ghost_seen_retention_seconds`, default 2592000, CHECK 0
+   or 300..31536000). Neither the seconds column nor its predecessor has
+   **any consumer** — no accessor in `settings_service` (absent from
+   `_DEFAULTS`/`_VALIDATORS`), no retention job. **UNCERTAIN** whether
+   the registry/retention feature will be built (doc decision J.2).
+6. **Destination configuration:** `GHOST_SEEN_DESTINATION_CHAT_ID` /
+   `_NAME` are loaded in `config.py` and surfaced by
+   `get_destination_chat_id/name` but have **zero callers** — dead env
+   configuration, not database state (§19.15). Manual Reply / AI Reply
+   deliver to the source private chat only.
+
+---
+
+## 10. AI Persistence Reconciliation
+
+Traced producer → repository → table for every AI persistence object:
+
+| Object | Producer (verified) | Repository | Durable requirement | Migration | Retention | Ownership | Classification |
+|---|---|---|---|---|---|---|---|
+| `ai_config` | `config_store.save_config/update_provider/update_model/update_setting/update_triggers/record_request` | `config_store` (direct) | **Yes** — config must survive restart | yes (base cols; **no triggers**) | none (never deleted) | owner (UNIQUE) | **CODE-WIRED / SCHEMA-MISSING** (triggers) |
+| `ai_sessions` | `ai/runtime/manager.py` (ConversationManager) → `persistence.create_session/update_session` | `persistence` direct + `InMemorySessionRepository` | **Yes** — session continuity | yes (`id` PK + `session_id` UNIQUE) | none | owner | **CONFLICT** (PK per §19.19) |
+| `ai_messages` | `ConversationManager._add_message` → `persistence.add_message`; `restore_history` reads | `persistence` direct + `InMemoryMessageRepository` | **Yes** — explicit restart recovery (`restore_history` rebuilds from `ai_messages`) | yes (no `tool_calls`) | none | owner | **CODE-WIRED / SCHEMA-MISSING** (`tool_calls`) |
+| `ai_memories` | `engine` → `SupabaseMemoryRepository` (wired) | `SupabaseMemoryRepository` + `InMemoryMemoryRepository` | **Yes** (per design; auto-memory off by default — opt-in writes only) | yes | expiry-driven (`memory_cleanup`) | owner | **AGREES** |
+| `ai_tool_history` | `ai/tools/executor.py` → `persistence.record_tool_call` | `persistence` direct + `InMemoryToolHistoryRepository` | audit value (DATABASE_USEFUL) | yes (`result_data` never populated) | none | owner | **AGREES** (§19.6 optional) |
+| `ai_usage` | `ai/engine/dispatcher.py` → `usage_recorder.record_usage` → `SupabaseUsageRepository.create` | `SupabaseUsageRepository` (wired) + `InMemoryUsageRepository` | **Yes** (per design; analytics) — **fails silently without the table** | **none** | none | owner | **CODE > ARCHITECTURE** + **CONFLICT** on `id` (uuid4 vs bigserial) |
+| `ai_provider_stats` | `usage_recorder` → `SupabaseProviderStatsRepository.record_request` (upsert `on_conflict=provider_name,owner_id`) | `SupabaseProviderStatsRepository` (wired) + in-memory | **Yes** (per design) — **fails silently without the table** | **none** | none | owner | **CODE > ARCHITECTURE** |
+| `ai_preferences` | **no producer** — dispatcher `_load_preferences` reads `get_or_create` only | `InMemoryPreferencesRepository` (always) | per design only | **none** | none | owner | **AGREES** (in-memory only, §19.17) |
+
+Key proofs:
+- `backend/ai/database/usage_recorder.py → UsageRecord(id=str(uuid.uuid4()))`
+  — the `ai_usage.id` contract conflict (§5).
+- `backend/ai/config_store.py::_save_config_sync` payload includes
+  `trigger_en`/`trigger_fa` — §19.1 confirmed at code level.
+- `backend/ai/database/manager.py` wires Supabase-backed repos for
+  `memory`, `provider_stats`, `usage` only; `session`, `message`,
+  `preferences`, `tool_history` remain in-memory there, while
+  `persistence.py` handles sessions/messages/tool-history directly
+  (§19.11 — documented in the doc, matches code).
+
+---
+
+## 11. Retention Reconciliation
+
+| Table | Retention implemented? | Expiration? | Cleanup? | Documented? | Doc vs code |
+|---|---|---|---|---|---|
+| `bot_logs` | **yes** — `log_retention_days` (default 7), `clean_logs(owner_id, days)`, consumed by `organize_service` | no (age-based delete) | yes | yes (§5) | **AGREES** |
+| `ai_sessions` | no | no | no | no | **AGREES** (both silent) — unresolved |
+| `ai_messages` | no | no | no | no | **AGREES** — unresolved |
+| `ai_memories` | **yes** — `expires_at` per row; `runtime/memory_cleanup.py` prunes expired; `_delete_expired_memories_sync` | yes (per-row) | yes | yes (§10) | **AGREES** |
+| `ai_tool_history` | no | no | no | no | **AGREES** — unresolved |
+| `ai_usage` | no (append-only) | no | no | doc §13 says append-only; no retention stated | **AGREES** — unresolved |
+| `ai_provider_stats` | no (upsert per request; row count bounded per provider) | no | no | doc §12 silent | **AGREES** — unresolved |
+| `ghost_chats` | setting exists (`ghost_seen_retention_seconds`) but **no consumer** | no | no | doc §19.13 flags it | **AGREES** (both flag unconsumed) |
+| `bot_settings` (allow-list) | no (never expires — correct for permissions) | no | n/a | n/a | **AGREES** |
+
+Retention is **documented where implemented** (`bot_logs`, `ai_memories`)
+and **undefined everywhere else** — marked unresolved, not invented.
+
+---
+
+## 12. Dead / Orphaned Schema
+
+Confirmed objects with zero current consumers:
+
+| Object | Kind | Consumers today | Classification |
+|---|---|---|---|
+| `ghost_chats` table | whole table | none (migration-only) | legacy (Ghost Room) → future-compatible under §22.2; decision required |
+| `panel_settings.update_stale_seconds` | column | none (heartbeat hardcodes 90s) | architecture-only (migration comment describes a feature never wired) |
+| `panel_settings.ghost_seen_retention_seconds` | column | none (no accessor, no job) | future-compatible (doc §17 reserves presets) — decision required |
+| `saved_items.short_code` | column | none | legacy — doc reserves for cleanup (§19.7) |
+| `saved_items.file_name` | column | none | legacy — doc reserves for cleanup (§19.7) |
+| 5 trigram GIN indexes on `saved_items` | indexes | none (no trigram search queries) | legacy — depend on dead columns |
+| `ai_tool_history.result_data` | column | never written (exists in schema + record) | accidental (schema ahead of code) — optional code fix |
+| `bot_settings` seed rows (`auto_close_enabled`, `panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`, `log_cleanup_days`) | rows | none (only `ghost_seen_allowed_chats` read) | obsolete documentation artifact |
+| `GHOST_SEEN_DESTINATION_CHAT_ID` / `_NAME` | env config | none (getters uncalled) | architecture-only — not DB state |
+
+None are removed in this phase; §15–§16 sequence them.
+
+---
+
+## 13. Confirmed Issues
+
+All proven by source inspection during this phase:
+
+1. **`panel_settings` — 10 typed columns have no migration.** Verified:
+   `settings_service.py::_DEFAULTS` (12 keys) vs the 4 migrations, which
+   create only `key`, `auto_close_enabled`, `updated_at`,
+   `update_stale_seconds`, `dashboard_font`,
+   `ghost_seen_retention_days`→`seconds`. User settings do not persist
+   for those 10 columns. (§19.3 confirmed)
+2. **`ai_config.trigger_en` / `trigger_fa` have no migration.** Verified:
+   `config_store._save_config_sync` writes them; `20260805075707` does
+   not create them. Trigger words are lost on restart when the DB write
+   fails. (§19.1 confirmed)
+3. **`ai_usage` / `ai_provider_stats` are written by production code but
+   unmigrated.** Verified chain:
+   `dispatcher → usage_recorder → SupabaseUsageRepository.create` /
+   `SupabaseProviderStatsRepository.record_request`. (§19.8 confirmed)
+4. **`ai_usage.id` contract conflict.** Doc §13 says `bigserial`;
+   `usage_recorder` writes `str(uuid.uuid4())`. A migration generated
+   from §13 verbatim would reject the writer. **Not flagged in §19.**
+5. **`ai_messages.tool_calls` missing from schema.** Verified:
+   `MessageRecord` defines it; migration lacks it; `persistence` never
+   writes it. (§19.5 confirmed)
+6. **`ghost_chats` fully orphaned** (grep-verified, zero backend
+   references). (§19.12 confirmed)
+7. **`bot_settings` migration comments are obsolete.** They claim it
+   "replaces `panel_settings`" and that `settings_service` reads it;
+   current code reads `panel_settings` via
+   `panel_settings_repository`, and `bot_settings` hosts only the Ghost
+   Seen allow-list. (§19.4 confirmed)
+8. **`panel_settings.update_stale_seconds` / `ghost_seen_retention_seconds`
+   unconsumed** — no accessor in `settings_service`, no consumer
+   anywhere in `backend/`. (§19.13/§19.14 confirmed)
+9. **`saved_items.short_code` / `file_name` + 5 trigram indexes dead.**
+   (§19.7 confirmed)
+10. **RLS posture ambiguity between migrations #1/#2** — resolved to
+    SELECT-only under ordered application, but live-DB state unverifiable
+    from the repo (§7).
+11. **`save_code` sequence is global** (`_count_saves_sync` has no
+    `owner_id` filter) — ownership inconsistency, harmless single-owner.
+12. **`ai_sessions` PK drift** (`id` vs `session_id`), **`status`/`role`
+    CHECK sets wider than doc notes** (§8/§9/§19.19).
+13. **`ai_tool_history.result_data` never populated** (§19.6 confirmed).
+14. **Doc inaccuracies to fix (no schema impact):** `owner_id` "default
+    `0`" (no default in migrations); `ai_config.temperature` type
+    (`real` vs `double precision`); §7 stale "never persisted" note on
+    `last_request_at`/`last_latency_ms` (contradicted by §19.2 and the
+    migration); §17 omits `update_stale_seconds` from its settings list;
+    §13 `ai_usage.id` type.
+
+---
+
+## 14. Unresolved Questions
+
+1. **Live RLS state** — were both core migrations (#1 and #2) actually
+   applied to the production Supabase project? The effective posture
+   depends on it. Cannot be proven from the repository.
+   (`UNCERTAIN / REQUIRES SOURCE VERIFICATION`)
+2. **`ghost_chats` fate** — repurpose as the per-chat Ghost PV table
+   (§22.2: `owner_id` + `allowed`, backfill, drop `bot_settings`) or
+   drop it and keep the KV key? The doc commits to repurpose; no code
+   requires it either way.
+3. **`ai_preferences`** — wire fully (migration + producer + UI) or
+   remove until a producer exists? Interface + dispatcher consumer exist;
+   no durable producer.
+4. **AI-table retention policy** — `ai_sessions`, `ai_messages`,
+   `ai_tool_history`, `ai_usage`, `ai_provider_stats` have no cleanup.
+   Accept unbounded growth or define retention?
+5. **Ghost Seen registry feature** — is the dormant `ghost_chats`
+   preview/unread metadata (and `ghost_seen_retention_seconds`)
+   intended to be built? If not, drop the setting and keep the table
+   permission-only.
+6. **`update_stale_seconds`** — wire into the heartbeat (changes
+   recovery behavior; default 300 vs hardcoded 90) or drop the column?
+7. **`GHOST_SEEN_DESTINATION_CHAT_ID/_NAME`** — build the notification
+   flow or remove the env vars/getters?
+8. **`save_code` scoping** — is the global sequence acceptable, or
+   should it be owner-scoped?
+9. **`ai_usage.id`** — accept UUID PK (matches the writer) or change the
+   writer to bigserial? Must be decided before the migration.
+10. **Dashboard font key surface** — align frontend options with the
+    backend 23-key allow-list (§19.16)?
+
+---
+
+## 15. Phase 3 Decision Queue
+
+Prioritized decisions that MUST be made before any implementation.
+Nothing here is implemented in this phase.
+
+### P0 — Security / correctness
+
+1. **`panel_settings` 10 missing columns migration** — user settings
+   currently do not persist for 10 of 12 typed settings. Highest
+   user-visible correctness gap.
+2. **`ai_config.trigger_en`/`trigger_fa` migration** — AI trigger words
+   are lost on restart.
+3. **`ai_usage` / `ai_provider_stats`** — decide the `ai_usage.id`
+   contract first (uuid vs bigserial), then generate both migrations.
+4. **Live RLS verification** — confirm the effective policy posture on
+   the production project (migration #1/#2 ordering) before touching
+   anything.
+
+### P1 — Schema correctness
+
+5. **`ai_messages.tool_calls` column** — add, and decide whether
+   `persistence.py` should populate it.
+6. **`ghost_chats` repurpose vs drop** — pick one; the paired
+   `bot_settings` retirement follows.
+7. **`ai_preferences`** — wire fully or remove from the spec.
+
+### P2 — Cleanup / consistency
+
+8. **Dead `saved_items` columns + trigram indexes** (§19.7) — after
+   confirming no valuable data.
+9. **Unconsumed `panel_settings` columns** — wire or drop
+   (`update_stale_seconds`, `ghost_seen_retention_seconds`).
+10. **`bot_settings` legacy seed rows + obsolete migration comments** —
+    clean up with the retirement decision.
+11. **Document fixes** — §13 `ai_usage.id` type, §2–§5 `owner_id`
+    defaults, §7 temperature type + stale last-request note, §8/§9
+    status/role CHECK values, §17 missing `update_stale_seconds` row,
+    §19.19 PK note, `.sql.sql` filename artifacts (leave filenames
+    historical; do not rewrite history).
+
+### P3 — Optional future architecture
+
+12. **`ai_sessions` PK promotion** to `session_id` (§19.19).
+13. **`ai_messages.telegram_msg_id`** for cross-restart reply resolution
+    (§19.10) — optional enhancement, code must not depend on it.
+14. **AI-table retention policy** for the five append-only AI tables.
+15. **`ai_tool_history.result_data` population** (§19.6).
+16. **`GHOST_SEEN_DESTINATION_*` flow or removal** (§19.15).
+17. **Dashboard font surface alignment** (§19.16).
+
+---
+
+## 16. Recommended Implementation Order
+
+Recommendation only — for a future Phase 3+.
+
+1. **Verify live RLS state** against the production Supabase project
+   (P0-4) before any migration is written.
+2. **P0 schema fixes:** `panel_settings` 10 columns → `ai_config`
+   trigger columns → `ai_usage`/`ai_provider_stats` (after the `id`
+   decision) → `ai_messages.tool_calls`.
+3. **Decision gates:** `ghost_chats` repurpose vs drop (P1-6), then the
+   paired `bot_settings` retirement (backfill + drop) if repurposing;
+   `ai_preferences` wire-vs-remove (P1-7).
+4. **P2 cleanup:** dead `saved_items` columns/indexes, unconsumed
+   `panel_settings` columns (wire or drop), `bot_settings` seed rows,
+   then the document corrections.
+5. **P3 optional items** only after P0–P2 are closed, each gated on the
+   corresponding §14 decision.
+6. Every migration follows `DATABASE_ARCHITECTURE.md §21` rules
+   (doc-first, idempotent, SELECT-only RLS, one logical change per
+   migration) and is logged in §20.
+
+---
+
+## 17. Phase 2 Boundary
+
+This phase performed **reconciliation and reporting only**:
+
+- ✅ No application code changed (Python, TypeScript/React).
+- ✅ No migration changed or created; no SQL written or executed.
+- ✅ No Supabase/schema state changed; no tables/columns/indexes/RLS
+  altered.
+- ✅ No production behavior changed; no ownership semantics changed.
+- ✅ `DATABASE_ARCHITECTURE.md` not modified in this phase.
+- ✅ `IMPLEMENTATION_REPORT.md` not modified (investigation-only phase).
+- ✅ Phase 1 content above preserved intact; Phase 2 appended to
+  `INVESTIGATION.md` (the only repository file modified).
+- ⛔ Phase 3 (decision implementation) was NOT started.
+
+*End of Phase 2.*
