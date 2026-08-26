@@ -191,10 +191,11 @@ verification.
 - Remote verification: after `git fetch origin main`, `origin/main ==
   local HEAD == c84cc60`; `git ls-remote origin HEAD` returned
   `c84cc6053f9c24f13732784d740ca433f4431ff3`.
-- Final remote HEAD: `a6e3f968e0e83df2795f4ac1acfc82e27a4ef507` (this
-  report-metadata commit, pushed as `c84cc60..a6e3f96`; one transient
-  403 was resolved on retry, then verified via `git fetch` +
-  `git ls-remote origin HEAD`).
+- Remote HEAD verified: `75a3f746136b88c2e1edc2c15ca498288147ecb1`
+  (the commit containing this report; push sequence was
+  `7b77f81..c84cc60` → `c84cc60..a6e3f96` → `a6e3f96..75a3f74`, with
+  one transient 403 on the second push resolved on retry; each step
+  verified via `git fetch` + `git ls-remote origin HEAD`).
 - Final working-tree state: only the 6 pre-existing modified files from
   the earlier Ghost Seen execution remain modified
   (`backend/ai/diagnostics.py`, `backend/ai/engine/dispatcher.py`,
