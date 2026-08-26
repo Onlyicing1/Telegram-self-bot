@@ -185,8 +185,18 @@ verification.
 
 ## Delivery verification (this execution)
 
-- Implementation commit: `__COMMIT_HASH__`
-- Push result: `__PUSH_RESULT__`
-- Remote verification: `__REMOTE_VERIFICATION__`
-- Final remote HEAD: `__REMOTE_HEAD__`
-- Final working-tree state: `__WORKTREE_STATE__`
+- Implementation commit: `c84cc6053f9c24f13732784d740ca433f4431ff3`
+  (`docs: align database architecture with self bot persistence`)
+- Push result: pushed to `origin/main` (`7b77f81..c84cc60`), exit 0.
+- Remote verification: after `git fetch origin main`, `origin/main ==
+  local HEAD == c84cc60`; `git ls-remote origin HEAD` returned
+  `c84cc6053f9c24f13732784d740ca433f4431ff3`.
+- Final remote HEAD: `c84cc6053f9c24f13732784d740ca433f4431ff3`
+  (before this report-metadata commit; final HEAD recorded below).
+- Final working-tree state: only the 6 pre-existing modified files from
+  the earlier Ghost Seen execution remain modified
+  (`backend/ai/diagnostics.py`, `backend/ai/engine/dispatcher.py`,
+  `backend/bot/handlers/ghost_seen_v2.py`,
+  `backend/services/ghost_seen_v2.py`, `tests/test_60_*`,
+  `tests/test_63_*`); they are unrelated to this task and were left
+  untouched and uncommitted.
