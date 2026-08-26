@@ -293,6 +293,7 @@ class ViewerMessage:
     source_chat_id: int
     text: str
     timestamp: datetime | None = None
+    outgoing: bool = False
 
 
 @dataclass(frozen=True)
@@ -424,6 +425,11 @@ def _message_preview(message: Any) -> str:
     return "Media" if getattr(message, "media", None) is not None else ""
 
 
+def _message_is_outgoing(message: Any) -> bool:
+    """Use Telethon's direction bit for the authenticated account."""
+    return bool(getattr(message, "out", getattr(message, "outgoing", False)))
+
+
 def private_chat_from_dialog(dialog: Any, owner_id: int | None = None) -> PrivateChat | None:
     if not is_private_user_dialog(dialog, owner_id):
         return None
@@ -526,7 +532,13 @@ async def load_context_messages(client: Any, source_chat_id: int, target_message
     async for message in client.iter_messages(source_chat_id, limit=previous_count + 1, max_id=target_message_id):
         message_id = int(getattr(message, "id", 0) or 0)
         if 0 < message_id < target_message_id:
-            messages.append(ViewerMessage(message_id, source_chat_id, truncate_preview(_message_preview(message) or "Unsupported message", _MESSAGE_LIMIT), getattr(message, "date", None)))
+            messages.append(ViewerMessage(
+                message_id,
+                source_chat_id,
+                truncate_preview(_message_preview(message) or "Unsupported message", _MESSAGE_LIMIT),
+                getattr(message, "date", None),
+                _message_is_outgoing(message),
+            ))
     messages.sort(key=lambda item: item.message_id)
     return messages[-previous_count:] if previous_count else []
 
@@ -554,7 +566,13 @@ async def load_viewer_messages(client: Any, source_chat_id: int, page: int = 1) 
         message_id = int(getattr(message, "id", 0) or 0)
         if message_id <= 0:
             continue
-        messages.append(ViewerMessage(message_id, int(source_chat_id), truncate_preview(_message_preview(message) or "Unsupported message", _MESSAGE_LIMIT), getattr(message, "date", None)))
+        messages.append(ViewerMessage(
+            message_id,
+            int(source_chat_id),
+            truncate_preview(_message_preview(message) or "Unsupported message", _MESSAGE_LIMIT),
+            getattr(message, "date", None),
+            _message_is_outgoing(message),
+        ))
     messages.sort(key=lambda item: item.message_id, reverse=True)
     total_pages = max(1, (len(messages) + MESSAGE_PAGE_SIZE - 1) // MESSAGE_PAGE_SIZE)
     current_page = min(max(int(page), 1), total_pages)
@@ -590,7 +608,8 @@ def render_message_viewer(name: str, viewer: MessageViewerPage, now: datetime | 
     else:
         for item in viewer.messages:
             stamp = format_time(item.timestamp, now)
-            lines.append(f"«{item.text}»")
+            sender = "You (outgoing)" if item.outgoing else f"{_truncate_name(name)} (incoming)"
+            lines.append(f"{sender}: «{item.text}»")
             if stamp:
                 lines.append(stamp)
     return "\n".join(lines)

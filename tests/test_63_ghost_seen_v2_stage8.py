@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import asyncio
 import pytest
 
+from backend.ai import diagnostics as ai_diag
 from backend.bot.handlers import ghost_seen_v2 as handler
 from backend.services import ghost_seen_v2 as service
 
@@ -25,10 +26,14 @@ def clean():
     service.clear_selection(123)
     handler._ai_states.clear()
     handler._ai_locks.clear()
+    ai_diag._active.clear()
+    ai_diag._request_details.clear()
     yield
     service.clear_selection(123)
     handler._ai_states.clear()
     handler._ai_locks.clear()
+    ai_diag._active.clear()
+    ai_diag._request_details.clear()
 
 
 def _arm():
@@ -80,6 +85,29 @@ async def test_duplicate_rejection_does_not_clear_active_operation():
 
 
 @pytest.mark.asyncio
+async def test_timeout_discards_cancellation_resistant_late_result():
+    _arm()
+    release = asyncio.Event()
+
+    async def cancellation_resistant(_):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await release.wait()
+            return _result("late")
+
+    send = AsyncMock(return_value={})
+    contexts = _patch_run(SimpleNamespace(execute=cancellation_resistant), send)
+    with contexts[0], contexts[1], contexts[2], contexts[3], contexts[4], patch.object(handler, "_AI_TIMEOUT_S", 0.001), patch.object(handler, "_AI_CANCEL_GRACE_S", 0.001):
+        outcome = await handler._run_ai_reply(50, 123, 10, 1, False, "A")
+    assert "timed out" in outcome[1]
+    assert send.await_count == 0
+    assert 50 not in handler._ai_states
+    release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_timeout_then_fresh_operation_can_run():
     _arm()
     async def slow(_):
@@ -90,6 +118,13 @@ async def test_timeout_then_fresh_operation_can_run():
         outcome = await handler._run_ai_reply(50, 123, 10, 1, False, "A")
     assert "timed out" in outcome[1]
     assert send.await_count == 0
+    details = next(iter(ai_diag.request_details().values()))
+    assert details["timeout_occurred"] is True
+    assert details["cancellation_requested"] is True
+    assert details["cancellation_completed"] is True
+    assert details["engine_result_status"] == "timeout"
+    assert details["delivery_reached"] is False
+    assert details["final_failure_reason"] == "ai_timeout"
     service.toggle_selection(123, 10)
 
     engine = SimpleNamespace(execute=AsyncMock(return_value=_result("fresh")))
@@ -140,6 +175,21 @@ async def test_disclosure_only_changes_delivery_suffix(disclosure):
     delivered = send.await_args.args[3]
     assert "same" not in prompt
     assert ("Written with AI assistance" in delivered) is disclosure
+
+
+def test_sender_direction_is_explicit():
+    viewer = service.MessageViewerPage(
+        123,
+        (
+            service.ViewerMessage(10, 123, "incoming", outgoing=False),
+            service.ViewerMessage(11, 123, "outgoing", outgoing=True),
+        ),
+        1,
+        1,
+    )
+    rendered = service.render_message_viewer("Alice", viewer)
+    assert "Alice (incoming): «incoming»" in rendered
+    assert "You (outgoing): «outgoing»" in rendered
 
 
 def test_context_and_disclosure_controls_remain_bounded():

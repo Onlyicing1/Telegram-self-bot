@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
+import time
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
@@ -11,6 +11,7 @@ from backend.helper import (
     InlinePanelBuilder, register_action, register_inline_builder,
     register_input, register_panel, render,
 )
+from backend.ai import diagnostics as ai_diag
 from backend.helper import inline_engine
 from backend.helper.client import get_client
 from backend.helper.lifecycle import get_lifecycle
@@ -33,6 +34,7 @@ _VIEWER_ID = "ghost_seen_v2_viewer"
 _ACTION_ID = "ghost_seen_v2_actions"
 _MANAGE_ID = "ghost_seen_v2_manage"
 _AI_TIMEOUT_S = 45.0
+_AI_CANCEL_GRACE_S = 0.1
 _TELEGRAM_TEXT_LIMIT = 4096
 _ai_states: dict[int, dict] = {}
 _ai_locks: dict[int, asyncio.Lock] = {}
@@ -57,6 +59,18 @@ def _clear_ai_state(panel_chat_id: int, source_chat_id: int | None = None) -> No
     _ai_states.pop(int(panel_chat_id), None)
     if source_chat_id is not None:
         clear_selection(int(source_chat_id))
+
+
+def _consume_late_engine_task(task: asyncio.Task, request_id: str) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning(
+            "GHOST_SEEN_AI_LATE_ENGINE_FAILURE request_id=%s exception_type=%s",
+            request_id, type(exc).__name__,
+        )
 
 
 def _valid_context_count(value: int) -> bool:
@@ -309,7 +323,13 @@ async def _load_target_message(client, source: int, target_id: int):
         return None
     async for item in client.iter_messages(source, limit=1, min_id=target_id - 1, max_id=target_id + 1):
         if int(getattr(item, "id", 0) or 0) == target_id:
-            return service.ViewerMessage(target_id, source, service._message_preview(item) or "Unsupported message", getattr(item, "date", None))
+            return service.ViewerMessage(
+                target_id,
+                source,
+                service._message_preview(item) or "Unsupported message",
+                getattr(item, "date", None),
+                service._message_is_outgoing(item),
+            )
     return None
 
 
@@ -334,53 +354,340 @@ async def _run_ai_reply(chat_id: int, source: int, target_id: int, count: int, d
         if not is_chat_allowed(source) or reply_target(source) != target_id:
             _clear_ai_state(chat_id, source)
             return "👀 Ghost Seen", "That AI selection is no longer available.", []
-        context = await load_context_messages(inline_engine.get_self_client(), source, target_id, count)
-        target = await _load_target_message(inline_engine.get_self_client(), source, target_id)
-        if target is None:
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "The selected message is no longer available.", []
-        operation = _AIReplyOperation(chat_id, source, target_id, count, disclosure, uuid.uuid4().hex)
-        _ai_states[chat_id] = {**operation.__dict__, "status": "generating", "name": name}
-        prompt = build_ai_reply_prompt(context, target, inline_engine.get_owner_id())
-        engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
-        from backend.ai.session.request import AIRequest
+
+        owner_id = inline_engine.get_owner_id()
+        operation = _AIReplyOperation(
+            chat_id, source, target_id, count, disclosure, ai_diag.new_request_id()
+        )
+        _ai_states[chat_id] = {**operation.__dict__, "status": "loading", "name": name}
+        ai_diag.register_start(
+            operation.request_id,
+            owner_id=owner_id,
+            details={
+                "feature": "ghost_seen_ai_reply",
+                "source_chat_id": source,
+                "selected_message_id": target_id,
+                "context_count": count,
+                "disclosure": disclosure,
+                "delivery_reached": False,
+                "delivery_succeeded": False,
+                "final_failure_reason": "",
+            },
+        )
+        started = time.perf_counter()
+        logger.info(
+            "GHOST_SEEN_AI_START request_id=%s source_chat_id=%s selected_message_id=%s context_count=%s disclosure=%s",
+            operation.request_id, source, target_id, count, disclosure,
+        )
         try:
-            result = await asyncio.wait_for(
-                engine.execute(AIRequest(session_id=operation.request_id, request_id=operation.request_id, user_message=prompt, owner_id=inline_engine.get_owner_id(), chat_id=source, message_id=target_id, allow_tools=False)),
-                timeout=_AI_TIMEOUT_S,
+            ai_diag.set_stage(operation.request_id, "CONTEXT_LOAD")
+            context = await load_context_messages(
+                inline_engine.get_self_client(), source, target_id, count
             )
+            target = await _load_target_message(
+                inline_engine.get_self_client(), source, target_id
+            )
+            if target is None:
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason="selected_message_unavailable",
+                    delivery_reached=False,
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "The selected message is no longer available.", []
+
+            _ai_states[chat_id] = {**operation.__dict__, "status": "generating", "name": name}
+            prompt = build_ai_reply_prompt(context, target, owner_id)
+            engine = __import__("backend.ai.engine.engine", fromlist=["get_engine"]).get_engine()
+            provider_name = ""
+            model_name = ""
+            try:
+                provider_manager = getattr(engine, "provider_manager", None)
+                provider_name = str(
+                    provider_manager.get_active_name() if provider_manager is not None else ""
+                )
+                active_provider = (
+                    provider_manager.get_active() if provider_manager is not None else None
+                )
+                model_name = str(
+                    getattr(getattr(active_provider, "config", None), "default_model", "") or ""
+                )
+            except Exception:
+                provider_name = ""
+                model_name = ""
+            ai_diag.update_request(
+                operation.request_id,
+                provider=provider_name,
+                model=model_name,
+                ai_stage="engine_start",
+                engine_started_at=time.time(),
+            )
+            ai_diag.set_stage(operation.request_id, "ENGINE_EXECUTION")
+            logger.info(
+                "GHOST_SEEN_AI_ENGINE_START request_id=%s provider=%s model=%s",
+                operation.request_id, provider_name or "-", model_name or "-",
+            )
+            from backend.ai.session.request import AIRequest
+            engine_task = asyncio.create_task(
+                engine.execute(
+                    AIRequest(
+                        session_id=operation.request_id,
+                        request_id=operation.request_id,
+                        user_message=prompt,
+                        owner_id=owner_id,
+                        chat_id=source,
+                        message_id=target_id,
+                        allow_tools=False,
+                    )
+                )
+            )
+            engine_task.add_done_callback(
+                lambda task: _consume_late_engine_task(task, operation.request_id)
+            )
+            try:
+                result = await asyncio.wait_for(asyncio.shield(engine_task), timeout=_AI_TIMEOUT_S)
+            except asyncio.CancelledError:
+                ai_diag.update_request(
+                    operation.request_id,
+                    cancellation_requested=True,
+                    cancellation_completed=False,
+                    engine_elapsed_s=round(time.perf_counter() - started, 3),
+                    final_failure_reason="cancelled",
+                )
+                _clear_ai_state(chat_id, source)
+                raise
+            except asyncio.TimeoutError:
+                engine_task.cancel()
+                cancellation_completed = False
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(engine_task), timeout=_AI_CANCEL_GRACE_S
+                    )
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
+                    cancellation_completed = engine_task.cancelled()
+                except asyncio.TimeoutError:
+                    cancellation_completed = engine_task.cancelled()
+                except Exception as exc:
+                    logger.warning(
+                        "GHOST_SEEN_AI_CANCELLED_ENGINE_FAILURE request_id=%s exception_type=%s",
+                        operation.request_id, type(exc).__name__,
+                    )
+                    cancellation_completed = engine_task.done()
+                else:
+                    cancellation_completed = engine_task.cancelled()
+                elapsed = round(time.perf_counter() - started, 3)
+                ai_diag.update_request(
+                    operation.request_id,
+                    timeout_occurred=True,
+                    cancellation_requested=True,
+                    cancellation_completed=cancellation_completed,
+                    engine_result_status="timeout",
+                    engine_elapsed_s=elapsed,
+                    delivery_reached=False,
+                    final_failure_reason="ai_timeout",
+                )
+                logger.warning(
+                    "GHOST_SEEN_AI_TIMEOUT request_id=%s elapsed_s=%s timeout_s=%s",
+                    operation.request_id, elapsed, _AI_TIMEOUT_S,
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ AI generation timed out.", []
+            except Exception as exc:
+                ai_diag.update_request(
+                    operation.request_id,
+                    engine_exception_type=type(exc).__name__,
+                    engine_result_status="exception",
+                    engine_elapsed_s=round(time.perf_counter() - started, 3),
+                    delivery_reached=False,
+                    final_failure_reason="engine_exception",
+                )
+                logger.warning(
+                    "GHOST_SEEN_AI_ENGINE_FAILURE request_id=%s exception_type=%s",
+                    operation.request_id, type(exc).__name__,
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+
+            result_metadata = getattr(result, "metadata", {}) or {}
+            response = getattr(result, "response", None)
+            response_length = len(response) if isinstance(response, str) else -1
+            final_provider = str(getattr(result, "provider", "") or provider_name)
+            final_model = str(getattr(result, "model", "") or model_name)
+            failure_type = str(
+                result_metadata.get("failure_type")
+                or result_metadata.get("provider_failure_type")
+                or result_metadata.get("finish_state")
+                or ""
+            )
+            provider_elapsed_value = result_metadata.get("provider_elapsed_s", 0)
+            provider_elapsed = (
+                round(float(provider_elapsed_value), 3)
+                if isinstance(provider_elapsed_value, (int, float))
+                else 0.0
+            )
+            provider_calls_value = result_metadata.get("provider_call_count", 0)
+            provider_calls = (
+                int(provider_calls_value)
+                if isinstance(provider_calls_value, (int, float))
+                else 0
+            )
+            provider_matrix = result_metadata.get("provider_matrix")
+            provider_matrix_size = (
+                len(provider_matrix)
+                if isinstance(provider_matrix, list)
+                else int(result_metadata.get("provider_matrix_size", 0) or 0)
+            )
+            ai_diag.update_request(
+                operation.request_id,
+                provider=final_provider,
+                model=final_model,
+                engine_result_status="success" if getattr(result, "success", False) else "failure",
+                engine_result_response_length=response_length,
+                engine_result_failure_type=failure_type,
+                fallback_used=bool(
+                    result_metadata.get("fallback_used")
+                    or result_metadata.get("fallback")
+                ),
+                fallback_exhausted=bool(result_metadata.get("fallback_exhausted")),
+                provider_call_count=provider_calls,
+                provider_elapsed_s=provider_elapsed,
+                provider_failure_type=str(
+                    result_metadata.get("provider_failure_type") or failure_type
+                ),
+                provider_matrix_size=provider_matrix_size,
+                engine_elapsed_s=round(time.perf_counter() - started, 3),
+                delivery_reached=False,
+            )
+            logger.info(
+                "GHOST_SEEN_AI_ENGINE_RESULT request_id=%s success=%s provider=%s model=%s response_length=%s failure_type=%s fallback_used=%s",
+                operation.request_id,
+                bool(getattr(result, "success", False)),
+                final_provider or "-",
+                final_model or "-",
+                response_length,
+                failure_type or "-",
+                bool(result_metadata.get("fallback_used")),
+            )
+            if not getattr(result, "success", False):
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason=failure_type or "engine_result_failure",
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+            if not isinstance(response, str):
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason="invalid_response_type",
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+            if not response.strip():
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason="empty_response",
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
+
+            reply_text = response.strip()
+            if disclosure:
+                reply_text += "\n\n— Written with AI assistance."
+            ai_diag.update_request(
+                operation.request_id,
+                delivery_text_length=len(reply_text),
+            )
+            if len(reply_text) > _TELEGRAM_TEXT_LIMIT:
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason="response_oversized",
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ The generated reply is too long to send.", []
+            if not is_chat_allowed(source) or reply_target(source) != target_id:
+                ai_diag.update_request(
+                    operation.request_id,
+                    final_failure_reason="selection_changed_before_delivery",
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ The AI selection changed before delivery.", []
+
+            ai_diag.set_stage(operation.request_id, "TELEGRAM_REPLY")
+            ai_diag.update_request(
+                operation.request_id,
+                delivery_reached=True,
+                delivery_started_at=time.time(),
+            )
+            logger.info(
+                "GHOST_SEEN_AI_DELIVERY_START request_id=%s source_chat_id=%s selected_message_id=%s response_length=%s",
+                operation.request_id, source, target_id, len(reply_text),
+            )
+            try:
+                await send_reply(
+                    inline_engine.get_self_client(), source, target_id, reply_text
+                )
+            except asyncio.CancelledError:
+                ai_diag.update_request(
+                    operation.request_id,
+                    cancellation_requested=True,
+                    cancellation_completed=False,
+                    delivery_succeeded=False,
+                    final_failure_reason="delivery_cancelled",
+                )
+                _clear_ai_state(chat_id, source)
+                raise
+            except Exception as exc:
+                ai_diag.update_request(
+                    operation.request_id,
+                    delivery_succeeded=False,
+                    delivery_exception_type=type(exc).__name__,
+                    final_failure_reason="delivery_failure",
+                )
+                logger.warning(
+                    "GHOST_SEEN_AI_DELIVERY_FAILURE request_id=%s exception_type=%s",
+                    operation.request_id, type(exc).__name__,
+                )
+                _clear_ai_state(chat_id, source)
+                return "👀 Ghost Seen", "✕ Couldn't send the reply.", []
+            ai_diag.mark_success("TELEGRAM_REPLY")
+            ai_diag.update_request(
+                operation.request_id,
+                delivery_succeeded=True,
+                final_status="success",
+                final_failure_reason="",
+            )
+            logger.info("GHOST_SEEN_AI_DELIVERY_SUCCESS request_id=%s", operation.request_id)
+            _clear_ai_state(chat_id, source)
+            return "👀 Ghost Seen", "✓ Reply sent.", []
         except asyncio.CancelledError:
+            ai_diag.update_request(
+                operation.request_id,
+                cancellation_requested=True,
+                cancellation_completed=False,
+                final_failure_reason="cancelled",
+            )
             _clear_ai_state(chat_id, source)
             raise
-        except asyncio.TimeoutError:
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "✕ AI generation timed out.", []
-        except Exception:
+        except Exception as exc:
+            ai_diag.update_request(
+                operation.request_id,
+                engine_exception_type=type(exc).__name__,
+                engine_result_status="exception",
+                engine_elapsed_s=round(time.perf_counter() - started, 3),
+                delivery_reached=False,
+                final_failure_reason="ghost_seen_execution_exception",
+            )
+            logger.exception(
+                "GHOST_SEEN_AI_UNHANDLED request_id=%s exception_type=%s",
+                operation.request_id, type(exc).__name__,
+            )
             _clear_ai_state(chat_id, source)
             return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
-        response = getattr(result, "response", "")
-        if not getattr(result, "success", False) or not isinstance(response, str) or not response.strip():
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "✕ Couldn't generate the reply.", []
-        reply_text = str(result.response).strip()
-        if disclosure:
-            reply_text += "\n\n— Written with AI assistance."
-        if len(reply_text) > _TELEGRAM_TEXT_LIMIT:
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "✕ The generated reply is too long to send.", []
-        if not is_chat_allowed(source) or reply_target(source) != target_id:
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "✕ The AI selection changed before delivery.", []
-        try:
-            await send_reply(inline_engine.get_self_client(), source, target_id, reply_text)
-        except asyncio.CancelledError:
-            _clear_ai_state(chat_id, source)
-            raise
-        except Exception:
-            _clear_ai_state(chat_id, source)
-            return "👀 Ghost Seen", "✕ Couldn't send the reply.", []
-        _clear_ai_state(chat_id, source)
-        return "👀 Ghost Seen", "✓ Reply sent.", []
+        finally:
+            ai_diag.register_end(operation.request_id)
 
 
 async def _placeholder_action(event, extra: str, chat_id: int):

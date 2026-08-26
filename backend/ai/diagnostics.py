@@ -28,6 +28,11 @@ _active: dict[str, dict[str, Any]] = {}
 # ── Last successful stage timestamps (wall-clock) ──
 _last_success: dict[str, float] = {}
 
+# The latest correlated request facts are intentionally bounded to one record
+# per request id and contain no prompt text, message content, or credentials.
+_request_details: dict[str, dict[str, Any]] = {}
+_MAX_REQUEST_DETAILS = 32
+
 # ── Stage names ──
 STAGES = (
     "CONFIG_LOAD",
@@ -47,13 +52,18 @@ def new_request_id() -> str:
         return f"ai-{int(time.time() * 1000) % 1000000:06d}"
 
 
-def register_start(request_id: str, owner_id: int = 0) -> None:
+def register_start(request_id: str, owner_id: int = 0, details: dict[str, Any] | None = None) -> None:
     try:
         _active[request_id] = {
             "started_at": time.monotonic(),
             "stage": "INIT",
             "owner_id": owner_id,
         }
+        record = dict(details or {})
+        record.update({"request_id": request_id, "owner_id": int(owner_id), "stage": "INIT"})
+        _request_details[request_id] = record
+        while len(_request_details) > _MAX_REQUEST_DETAILS:
+            _request_details.pop(next(iter(_request_details)))
     except Exception:
         pass
 
@@ -63,8 +73,31 @@ def set_stage(request_id: str, stage: str) -> None:
         entry = _active.get(request_id)
         if entry is not None:
             entry["stage"] = stage
+        record = _request_details.get(request_id)
+        if record is not None:
+            record["stage"] = stage
     except Exception:
         pass
+
+
+def update_request(request_id: str, **fields: Any) -> None:
+    """Update correlated, non-sensitive facts for one AI request."""
+    try:
+        record = _request_details.get(request_id)
+        if record is not None:
+            record.update(fields)
+    except Exception:
+        pass
+
+
+def request_details(request_id: str = "") -> dict[str, Any] | dict[str, dict[str, Any]]:
+    """Return a defensive copy of one or all correlated request facts."""
+    try:
+        if request_id:
+            return dict(_request_details.get(request_id, {}))
+        return {key: dict(value) for key, value in _request_details.items()}
+    except Exception:
+        return {} if request_id else {}
 
 
 def mark_success(stage: str) -> None:
@@ -132,6 +165,7 @@ def snapshot() -> dict[str, Any]:
             "ai_last_provider_s": round(last_success_age_s("PROVIDER_REQUEST"), 0),
             "ai_last_db_s": round(last_success_age_s("DB_OPERATION"), 0),
             "ai_last_tg_reply_s": round(last_success_age_s("TELEGRAM_REPLY"), 0),
+            "ai_last_request": dict(next(reversed(_request_details.values()), {})),
         }
     except Exception:
         return {
@@ -141,4 +175,5 @@ def snapshot() -> dict[str, Any]:
             "ai_last_provider_s": -1,
             "ai_last_db_s": -1,
             "ai_last_tg_reply_s": -1,
+            "ai_last_request": {},
         }

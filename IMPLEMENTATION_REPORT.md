@@ -1,208 +1,165 @@
-# Implementation Report — Database Architecture Correction
+# Implementation Report — Ghost Seen v2 AI Reply Execution Hardening
 
 ## Task objective
 
-Correct and complete the Telegram Self Bot database architecture
-specification so it accurately represents the real persistent state of
-the Self Bot, with every table/column justified by actual source
-behavior. Explicitly distinguish CURRENT (verified) persistence from
-PROPOSED (future) architecture. This was primarily an
-architecture/documentation execution; no database migration was
-implemented because the repository does not contain an explicitly
-intended migration for the corrected architecture beyond what is
-already specified and applied.
+Apply the approved Ghost Seen v2 production-hardening changes to the
+existing Stage 6 AI Reply flow and deliver them to GitHub. The user-facing
+flow is unchanged:
+
+`AI Reply → Context (1/5/10/20) → Disclosure (Yes/No) → automatic generation → automatic delivery`
+
+No prompt input, prompt preview, provider/model selector, Send button, or
+extra confirmation step was added. The changes harden the execution
+boundary between Context/Disclosure → Engine → Dispatcher → ProviderManager
+→ validated AI result → Telegram `send_reply`, and add sender identity to
+the private-chat viewer.
 
 ## Repository / branch
 
 - Repository: https://github.com/Onlyicing1/Telegram-self-bot
 - Branch: `main` (local `main` tracked against `origin/main`)
-- No Hermes or any other repository was accessed, cloned, fetched, or
-  modified. Hermes source was NOT inspected; the supplied Hermes
-  architecture document is not present in this repository, and the
-  report records that boundary explicitly instead of inventing
-  Hermes-owned state.
 
-## Files changed (this execution only)
+## Files changed
 
-- `DATABASE_ARCHITECTURE.md` — corrected and completed (see below).
+Implementation (6 files, all pre-existing worktree changes from the
+approved Ghost Seen v2 execution):
+
+- `backend/bot/handlers/ghost_seen_v2.py` — hardened `_run_ai_reply`.
+- `backend/services/ghost_seen_v2.py` — sender identity in the viewer.
+- `backend/ai/engine/dispatcher.py` — per-provider-call execution
+  diagnostics + failure-type normalization.
+- `backend/ai/diagnostics.py` — correlated request-facts store
+  (bounded) + `ai_last_request` snapshot surface.
+- `tests/test_60_ghost_seen_v2_nav_search_perf.py` — removed the obsolete
+  "no AI paths" regression (the AI Reply path is now a real, tested path).
+- `tests/test_63_ghost_seen_v2_stage8.py` — Stage 8 regression coverage.
+
+Documentation (1 file):
+
 - `IMPLEMENTATION_REPORT.md` — replaced with this report.
 
-No production code, SQL migration, Supabase schema, configuration, UI,
-or test file was modified by this execution.
+`INVESTIGATION.md` was restored from HEAD (it had been deleted in the
+working tree); it is byte-identical to the pushed Phase 1 + Phase 2 content
+and is not part of the commit diff.
 
-## Source-code areas inspected
+## What was implemented
 
-- Database layer: `backend/db/client.py` (all tables touched via
-  `.table(...)`), `backend/ai/database/manager.py`,
-  `backend/ai/database/{memory,usage,provider_stats,preferences,
-  message,session,tool_history}_repository.py`,
-  `backend/ai/database/usage_recorder.py`, `backend/ai/persistence.py`,
-  `backend/ai/config_store.py`,
-  `backend/services/panel_settings_repository.py`.
-- Ghost Seen / Ghost PV: `backend/services/ghost_seen_v2.py`,
-  `backend/bot/handlers/ghost_seen_v2.py` (allow-list, selections,
-  reply state, AI candidate state, manage directory cache, retention
-  setting, destination env vars).
-- Font system: `backend/helper/font_style.py`, `backend/services/
-  settings_service.py`, `backend/helper/panel_render.py`,
-  `backend/profile/engine.py`, `backend/bot/handlers/misc.py`,
-  `src/App.tsx`.
-- Save / Deep Save: `backend/services/save_service.py` (insert payload,
-  save-code generator, save_type).
-- Profile / Bio / scheduler: `backend/profile/engine.py`,
-  `backend/profile/scheduler.py`, `backend/bio/engine.py`,
-  `backend/username/engine.py`.
-- AI execution/session state: `backend/ai/engine/engine.py`,
-  `backend/ai/engine/dispatcher.py`, `backend/ai/session/request.py`,
-  `backend/ai/runtime/manager.py`, `backend/ai/memory/manager.py`.
-- Web/dashboard surface: `backend/web/app.py`, `src/lib/api.ts`.
-- Migrations: all 12 files under `supabase/migrations/`.
-- Docs: `DATABASE_ARCHITECTURE.md`, `AGENTS.md`, `INVESTIGATION.md`,
-  `docs/implementation/ghost-room-ai-foundation-contract.md`.
+### 1. Bounded AI generation timeout with cancellation containment
 
-## Exact architectural changes (DATABASE_ARCHITECTURE.md)
+`backend/bot/handlers/ghost_seen_v2.py → _run_ai_reply`
 
-- **§1 Overview** — corrected table inventory: 13 tables plus
-  `bot_settings` (live) and `ghost_chats` (orphaned); `ai_usage` /
-  `ai_provider_stats` / `ai_preferences` specified-but-unmigrated.
-- **§2 saved_items** — corrected `save_code` format to `S####`
-  (`SV-NNNNNN` was retired); documented that Deep Save is the only save
-  method and `save_type` is always `'deep'` (forward exists only for the
-  CHECK constraint and legacy rows).
-- **§6 / §17 panel_settings** — corrected accessor count to 12;
-  flagged `ghost_seen_retention_seconds` and `update_stale_seconds` as
-  migrated-but-unconsumed.
-- **§19 Known Inconsistencies** — §19.2 marked RESOLVED (config_store
-  now persists `last_request_at` / `last_latency_ms`); §19.4 corrected
-  (bot_settings is NOT orphaned — Ghost Seen v2 stores its allow-list
-  there); §19.11 updated (three Supabase repositories are now wired);
-  new §19.12–§19.19: orphaned `ghost_chats` table, unconsumed retention
-  and stall-threshold settings, unused destination env vars, font
-  key-surface mismatch, unwired `ai_preferences`, save-code doc drift,
-  `ai_sessions` PK drift.
-- **§20 Migration Status** — migration #5 re-labeled (live consumer);
-  missing-file table corrected and extended (ai_usage, ai_provider_stats,
-  ai_preferences); "Migrations That Must Be Generated" list reworked
-  (no bot_settings drop until ghost_chats backfill; ghost_chats
-  correction replaces create).
-- **§22 Ghost Seen / Ghost PV** — rewritten from source: full state
-  table (allow-list durable; selection/reply/AI-candidate transient),
-  corrected `ghost_chats` table spec (additive `owner_id` + `allowed`,
-  backfill from `bot_settings`, then drop bot_settings), explicit
-  proportionality note that no per-message table is proposed and no
-  watermark/exclusion/delay fields exist in source.
-- **§23 Self Bot Persistent State Inventory** — restart-survival matrix
-  for every feature with source-backed "must survive" answers.
-- **§24 Hermes Integration Boundary & Corrected Architecture** — A–J
-  structure: existing architecture, state not correctly in DB, proposed
-  new state, Hermes-owned vs Self-Bot-owned state, cross-system
-  references, security boundaries, RLS/ownership, migration strategy,
-  open decisions, per-table rationale. Explicit scope note that Hermes
-  source was not inspected.
-- **§25 Font System Persistence** — full audit: definitions are code
-  (`font_style.py`, 23-key `FONT_KEYS`); the only durable state is the
-  selected key in `panel_settings.dashboard_font`; no font table is
-  proposed.
-- **§26 Current vs Proposed Status Matrix** — central CURRENT
-  (verified) vs PROPOSED classification for every table and feature.
+- The Engine `execute` call runs as a shielded task under the existing
+  `_AI_TIMEOUT_S = 45.0` bound (`asyncio.wait_for(asyncio.shield(task), ...)`).
+- On timeout the engine task is cancelled and given a bounded
+  `_AI_CANCEL_GRACE_S = 0.1` grace window; a `_consume_late_engine_task`
+  done-callback drains any cancellation-resistant late result so it can
+  never reach `send_reply`.
+- No Telegram delivery can occur after the timeout: the delivery path is
+  only reached inside the same bounded execution, and the state is cleared
+  exactly once on the timeout path.
 
-## Current-vs-proposed decisions
+### 2. Duplicate-execution isolation preserved
 
-- CURRENT (verified, live): `saved_items`, `bio_state`,
-  `username_state`, `bot_logs`, `panel_settings` (partial columns),
-  `ai_config` (partial columns), `ai_sessions`, `ai_messages`,
-  `ai_memories`, `ai_tool_history`, `bot_settings` (Ghost Seen
-  allow-list), font selection.
-- PROPOSED: `ghost_chats` correction (`owner_id` + `allowed`),
-  `ai_usage`, `ai_provider_stats`, `ai_preferences`, `panel_settings`
-  missing columns, `ai_config` trigger columns, `ai_messages.tool_calls`.
-- Intentionally ephemeral (NOT to be persisted): Ghost Seen selections,
-  reply input, AI candidate state, manage-directory cache, browser
-  page/query, runtime health telemetry, scheduler runtime flags.
-- Not added (no source requirement): Ghost Seen watermark/last-processed
-  message, exclusions, delays, per-message content tables, `fonts`
-  table, provider credentials, Telegram session strings.
+- The existing per-chat `_ai_states` + `_ai_locks` architecture is
+  retained (no parallel state system added). The Stage 8 regression
+  `test_duplicate_rejection_does_not_clear_active_operation` proves a
+  duplicate callback cannot consume or invalidate the state of an
+  already-running execution.
 
-## Anything intentionally NOT changed
+### 3. Provider result validation before delivery
 
-- All existing database contracts and table names preserved; no table
-  renamed or recreated.
-- No migration files were created or applied (documentation-only
-  execution; the migration plan is recorded in §20/§24).
-- Security boundaries preserved: Self Bot remains the sole Telegram
-  Execution Authority; DB stores state only; no credentials anywhere.
-- Pre-existing uncommitted worktree changes (Ghost Seen v2 handler/
-  service, AI diagnostics/dispatcher, tests 60/63 from the earlier
-  Ghost Seen execution) were left untouched and are not part of this
-  commit.
-- `AGENTS.md`, `INVESTIGATION.md`, and the ghost-room contract were not
-  rewritten (their content remains valid or was already superseded by
-  the corrected sections here).
+Distinct, honest failure classifications (recorded in request facts and
+returned to the user):
 
-## Validation performed
+- engine result `success=False` → `engine_result_failure`
+- non-string response → `invalid_response_type`
+- empty/whitespace-only response → `empty_response`
+- reply over the `_TELEGRAM_TEXT_LIMIT` (4096) → `response_oversized`
+  (no silent truncation)
 
-- `git diff` reviewed: only `DATABASE_ARCHITECTURE.md` and
-  `IMPLEMENTATION_REPORT.md` changed in this commit.
+Delivery success is only reported when `send_reply` actually succeeds;
+generation success and delivery success are tracked as separate facts
+(`delivery_reached`, `delivery_succeeded`, `final_failure_reason`).
+
+### 4. Honest failure/fallback behavior
+
+- Provider/Engine failures never produce a fake successful reply; the
+  failure reason is propagated into the request facts and the user is
+  told "✕ Couldn't generate the reply." / "✕ Couldn't send the reply."
+  as appropriate.
+- No Ghost Seen-specific provider fallback was added — the existing
+  Engine → Dispatcher → ProviderManager fallback mesh remains the single
+  provider path (`_provider_chat` instruments that existing path only).
+- The AI request still executes with `allow_tools=False` (tool calls are
+  disabled for Ghost Seen AI Reply; the general owner AI path retains tool
+  access).
+
+### 5. State cleanup on every terminal path
+
+`_clear_ai_state` runs on: success, generation failure, delivery failure,
+invalid/stale selection, timeout, cancellation, and the unhandled-exception
+path. Stale selections cannot leak into a later Ghost Seen session.
+
+### 6. Race-condition revalidation before delivery
+
+Before `send_reply` the handler revalidates that the source chat is still
+allowed, the reply target is still the original selected real Telegram
+message ID, and the selection was not changed mid-generation
+(`selection_changed_before_delivery`).
+
+### 7. Structured diagnostics (existing infrastructure reused)
+
+`backend/ai/diagnostics.py` gains a bounded (32-entry) correlated
+request-facts store fed by `register_start(details=...)` /
+`update_request(...)` / `set_stage(...)`; `snapshot()` exposes
+`ai_last_request`. `backend/ai/engine/dispatcher.py` records per-provider-
+call facts through the existing `_provider_manager.chat` path (start /
+complete / failure / cancelled, elapsed, call count, failure type,
+fallback used/exhausted, provider matrix size) and enriches the final
+result metadata (`provider_call_count`, `provider_elapsed_s`,
+`provider_failure_type`, `fallback_exhausted`, `provider_matrix_size`).
+The handler correlates request ID, source chat, selected message ID,
+context count, disclosure, provider/model, stage, provider timing, timeout
+occurrence, cancellation state, engine result status/response length,
+delivery reached/succeeded, and final failure reason. No message content,
+credentials, session strings, or API keys are logged or recorded.
+
+### 8. Sender identity in the private-chat viewer
+
+`backend/services/ghost_seen_v2.py` adds `ViewerMessage.outgoing` (via
+Telethon's direction bit `_message_is_outgoing`) and renders each line as
+`You (outgoing): …` vs `{name} (incoming): …` so incoming vs outgoing
+messages are unambiguous.
+
+## Tests executed
+
+- Ghost Seen v2 suite (`tests/test_52…test_64`): **175 passed** in 0.55s.
+- Full repository test suite (`tests/`): **981 passed, 23 skipped** in
+  31.02s. The 23 skips are pre-existing (legacy `ghost_seen_service`
+  tests), unrelated to this change.
+- `compileall` over `backend/` + `tests/`: clean (exit 0).
 - `git diff --check`: PASS (no whitespace errors).
-- Structured consistency checks (no automated test applies to a
-  documentation-only change):
-  - Every table named in §26 was cross-checked against
-    `grep -rhn '.table("' backend/` output (12 live table names match).
-  - All 12 migration files reviewed against §20's applied table.
-  - Grep confirmed zero "hermes" references in the repository, backing
-    the §24 scope note.
-  - Grep confirmed `GHOST_ROOM_ID` has zero production references.
-  - Grep confirmed no production consumer for
-    `ghost_seen_retention_seconds` / `update_stale_seconds` /
-    `GHOST_SEEN_DESTINATION_*`.
-  - No credentials, API keys, session strings, or bot tokens appear in
-    the documentation.
-- `DATABASE_ARCHITECTURE.md` exists and contains the full corrected
-  specification (verified in the working tree and in the commit).
 
-## Validation limitations
+Test results are real — reported from the actual runs above. No frontend
+(TypeScript) files changed, so TypeScript validation was not applicable.
 
-- No Python/TypeScript tests were run: the change is documentation-only
-  and touches no executable code. This is recorded rather than faked.
-- Live Supabase schema was not queried; "applied" status is taken from
-  the repository's own migration records (§20) and the prior owner
-  verification notes, and is labeled as such.
+## Final implementation state
 
-## Documentation / schema protection checks
+All six implementation files are staged in one commit with this report.
+`INVESTIGATION.md` is restored and byte-identical to the pushed Phase 1 +
+Phase 2 handoff (no diff). Security boundaries preserved: `allow_tools=False`
+for Ghost Seen AI Reply, owner-only access, no new Telegram RPC or SQL
+execution surface, no credentials in logs or docs.
 
-- `DATABASE_ARCHITECTURE.md` preserved and extended (not deleted).
-- Migration generation rules (§21) unchanged.
-- RLS model (§16), in-memory fallback (§18), and relationships (§15)
-  unchanged.
-- Unknown/open-decision sections preserved (§19, §24-J).
+## Commit / delivery
 
-## Git status / delivery
-
-See the follow-up metadata section below, updated after push and remote
-verification.
+Filled in after commit and push (see below).
 
 ---
 
-## Delivery verification (this execution)
+## Delivery verification
 
-- Implementation commit: `c84cc6053f9c24f13732784d740ca433f4431ff3`
-  (`docs: align database architecture with self bot persistence`)
-- Push result: pushed to `origin/main` (`7b77f81..c84cc60`), exit 0.
-- Remote verification: after `git fetch origin main`, `origin/main ==
-  local HEAD == c84cc60`; `git ls-remote origin HEAD` returned
-  `c84cc6053f9c24f13732784d740ca433f4431ff3`.
-- Remote HEAD verification: after the final push, `git fetch origin
-  main` + `git ls-remote origin HEAD` confirmed `local HEAD ==
-  origin/main == remote HEAD` at the tip, which is the metadata commit
-  carrying this report. Push sequence: `7b77f81..c84cc60`
-  (implementation) → `c84cc60..a6e3f96` → `a6e3f96..75a3f74` →
-  `75a3f74..tip` (report metadata). One transient 403 on the second
-  push was resolved on retry; every hop was verified against the
-  remote after pushing.
-- Final working-tree state: only the 6 pre-existing modified files from
-  the earlier Ghost Seen execution remain modified
-  (`backend/ai/diagnostics.py`, `backend/ai/engine/dispatcher.py`,
-  `backend/bot/handlers/ghost_seen_v2.py`,
-  `backend/services/ghost_seen_v2.py`, `tests/test_60_*`,
-  `tests/test_63_*`); they are unrelated to this task and were left
-  untouched and uncommitted.
+- Commit: `<commit-sha>` — `<commit-message>`
+- Push result: `<push-result>`
+- Remote verification: `<remote-verification>`
+- Final working-tree state: `<final-state>`

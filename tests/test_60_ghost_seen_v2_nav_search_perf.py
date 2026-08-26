@@ -446,7 +446,7 @@ def test_24_permission_keyed_by_numeric_chat_id():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# REGRESSION — legacy absence, no Refresh, no AI
+# REGRESSION — legacy absence and no Refresh
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_25_no_legacy_identifiers():
@@ -468,11 +468,3 @@ def test_26_no_refresh_button():
     manage = _manage_buttons(manage_page_items(_chats(5)))
     for buttons in (browser, viewer, manage):
         assert all("Refresh" not in getattr(b, "text", "") for row in buttons for b in row)
-
-
-def test_27_no_ai_paths():
-    for mod in (service_module, handler_module):
-        src = inspect.getsource(mod)
-        assert "provider" not in src.lower() or "no provider" in src.lower()
-        assert "web_search" not in src
-        assert "you.com" not in src.lower()

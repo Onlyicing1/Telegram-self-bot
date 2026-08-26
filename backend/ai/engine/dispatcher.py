@@ -173,6 +173,131 @@ class Dispatcher:
             except Exception:
                 pass
 
+        def _provider_failure_type(candidate: ProviderResponse) -> str:
+            candidate_metadata = candidate.metadata or {}
+            if candidate_metadata.get("failure_type"):
+                return str(candidate_metadata["failure_type"])
+            if candidate_metadata.get("fallback_exhausted"):
+                return "fallback_exhausted"
+            return "provider_failure" if not candidate.success else ""
+
+        provider_call_count = 0
+        provider_total_elapsed = 0.0
+        provider_first_started_at = 0.0
+
+        async def _provider_chat(
+            provider_messages: list[dict[str, Any]],
+            *,
+            call_label: str,
+            **kwargs: Any,
+        ) -> ProviderResponse:
+            """Call the existing provider mesh and update one request record."""
+            nonlocal provider_call_count, provider_total_elapsed, provider_first_started_at
+            provider_call_count += 1
+            started_at = time.perf_counter()
+            started_wall = time.time()
+            if provider_first_started_at == 0.0:
+                provider_first_started_at = started_wall
+            try:
+                from backend.ai import diagnostics as ai_diag
+                ai_diag.update_request(
+                    rid,
+                    provider_started_at=provider_first_started_at,
+                    provider_last_started_at=started_wall,
+                    provider_call_count=provider_call_count,
+                    provider_call_label=call_label,
+                )
+            except Exception:
+                pass
+            logger.info(
+                "AI_PROVIDER_CALL_START id=%s call=%s attempt=%d",
+                rid or "-", call_label, provider_call_count,
+            )
+            try:
+                candidate = await self._provider_manager.chat(provider_messages, **kwargs)
+            except asyncio.CancelledError:
+                elapsed = time.perf_counter() - started_at
+                provider_total_elapsed += elapsed
+                try:
+                    from backend.ai import diagnostics as ai_diag
+                    ai_diag.update_request(
+                        rid,
+                        provider_completed=False,
+                        provider_cancelled=True,
+                        provider_cancellation_requested=True,
+                        provider_cancellation_completed=True,
+                        provider_last_elapsed_s=round(elapsed, 3),
+                        provider_elapsed_s=round(provider_total_elapsed, 3),
+                        provider_failure_type="cancelled",
+                        provider_failed_at=time.time(),
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    "AI_PROVIDER_CALL_CANCELLED id=%s call=%s elapsed_s=%.3f",
+                    rid or "-", call_label, elapsed,
+                )
+                raise
+            except Exception as exc:
+                elapsed = time.perf_counter() - started_at
+                provider_total_elapsed += elapsed
+                try:
+                    from backend.ai import diagnostics as ai_diag
+                    ai_diag.update_request(
+                        rid,
+                        provider_completed=False,
+                        provider_failed=True,
+                        provider_last_elapsed_s=round(elapsed, 3),
+                        provider_elapsed_s=round(provider_total_elapsed, 3),
+                        provider_failure_type="exception",
+                        provider_exception_type=type(exc).__name__,
+                        provider_failed_at=time.time(),
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    "AI_PROVIDER_CALL_FAILURE id=%s call=%s exception_type=%s elapsed_s=%.3f",
+                    rid or "-", call_label, type(exc).__name__, elapsed,
+                )
+                raise
+
+            elapsed = time.perf_counter() - started_at
+            provider_total_elapsed += elapsed
+            candidate_metadata = candidate.metadata or {}
+            candidate_failure = _provider_failure_type(candidate)
+            try:
+                from backend.ai import diagnostics as ai_diag
+                ai_diag.update_request(
+                    rid,
+                    provider_completed=True,
+                    provider_failed=not candidate.success,
+                    provider_last_completed_at=time.time(),
+                    provider_last_elapsed_s=round(elapsed, 3),
+                    provider_elapsed_s=round(provider_total_elapsed, 3),
+                    provider_result_status="success" if candidate.success else "failure",
+                    provider_failure_type=candidate_failure,
+                    provider_fallback_used=bool(candidate_metadata.get("fallback")),
+                    fallback_exhausted=bool(candidate_metadata.get("fallback_exhausted")),
+                    provider_matrix_size=(
+                        len(candidate_metadata.get("provider_matrix", []))
+                        if isinstance(candidate_metadata.get("provider_matrix"), list)
+                        else 0
+                    ),
+                )
+            except Exception:
+                pass
+            logger.info(
+                "AI_PROVIDER_CALL_COMPLETE id=%s call=%s provider=%s success=%s elapsed_s=%.3f failure_type=%s fallback=%s",
+                rid or "-",
+                call_label,
+                candidate.provider_name or "-",
+                candidate.success,
+                elapsed,
+                candidate_failure or "-",
+                bool(candidate_metadata.get("fallback") or candidate_metadata.get("fallback_exhausted")),
+            )
+            return candidate
+
         safe_call(self._hooks, "before_execution", request)
 
         # Native tool definitions are computed once and passed to every
@@ -268,7 +393,9 @@ class Dispatcher:
                 "AI_EXEC_TRACE request_id=%s stage=provider_request provider=%s",
                 rid or "-", provider_name,
             )
-            response: ProviderResponse = await self._provider_manager.chat(messages, **chat_kwargs)
+            response: ProviderResponse = await _provider_chat(
+                messages, call_label="initial", **chat_kwargs
+            )
             # Execution-telemetry facts travel with the FINAL response object;
             # every later round is max-merged so a retry anywhere in the chain
             # is never lost.
@@ -278,9 +405,7 @@ class Dispatcher:
             )
             retry_count = int(response.metadata.get("ai_retry_count", 0) or 0)
             fallback_used = bool(response.metadata.get("fallback"))
-            failure_type = "" if response.success else str(
-                response.metadata.get("failure_type", "") or "unknown"
-            )
+            failure_type = _provider_failure_type(response)
 
             def _reject_disabled_tool_calls(candidate: ProviderResponse) -> ProviderResponse:
                 nonlocal failure_type
@@ -343,8 +468,8 @@ class Dispatcher:
                     rid or "-", response.provider_name or provider_name,
                 )
                 retry_messages = self._append_action_nudge(messages)
-                retry_response: ProviderResponse = await self._provider_manager.chat(
-                    retry_messages, **chat_kwargs
+                retry_response: ProviderResponse = await _provider_chat(
+                    retry_messages, call_label="empty_retry", **chat_kwargs
                 )
                 provider_usage_reported = provider_usage_reported or any(
                     int(retry_response.usage.get(k, 0) or 0) > 0
@@ -354,10 +479,8 @@ class Dispatcher:
                     retry_count, int(retry_response.metadata.get("ai_retry_count", 0) or 0)
                 )
                 fallback_used = fallback_used or bool(retry_response.metadata.get("fallback"))
-                if not failure_type and not retry_response.success:
-                    failure_type = str(
-                        retry_response.metadata.get("failure_type", "") or "unknown"
-                    )
+                if not retry_response.success:
+                    failure_type = _provider_failure_type(retry_response)
                 if retry_response.success and (retry_response.text or retry_response.tool_calls):
                     # The superseded empty attempt still consumed provider
                     # usage — retain it before the response is replaced.
@@ -424,8 +547,8 @@ class Dispatcher:
                 )
                 try:
                     recovery_messages = self._append_action_nudge(messages)
-                    recovery_response: ProviderResponse = await self._provider_manager.chat(
-                        recovery_messages, **chat_kwargs
+                    recovery_response: ProviderResponse = await _provider_chat(
+                        recovery_messages, call_label="action_recovery", **chat_kwargs
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -586,7 +709,11 @@ class Dispatcher:
             try:
                 _stage("PROVIDER_REQUEST")
                 logger.info("AI_PROVIDER_REQUEST_START id=%s round=%d", rid or "-", round_num + 2)
-                cont_response: ProviderResponse = await self._provider_manager.chat(continuation_messages, **chat_kwargs)
+                cont_response: ProviderResponse = await _provider_chat(
+                    continuation_messages,
+                    call_label=f"continuation_{round_num + 1}",
+                    **chat_kwargs,
+                )
                 _mark_success("PROVIDER_REQUEST")
                 logger.info(
                     "AI_PROVIDER_RESPONSE id=%s round=%d success=%s",
@@ -610,6 +737,8 @@ class Dispatcher:
                 retry_count, int(cont_response.metadata.get("ai_retry_count", 0) or 0)
             )
             fallback_used = fallback_used or bool(cont_response.metadata.get("fallback"))
+            if not cont_response.success:
+                failure_type = _provider_failure_type(cont_response)
 
             response = cont_response
             messages = continuation_messages
@@ -708,6 +837,13 @@ class Dispatcher:
             metadata["token_source"] = "unavailable"
         metadata["retry_count"] = retry_count
         metadata["fallback_used"] = fallback_used
+        metadata["provider_call_count"] = provider_call_count
+        metadata["provider_elapsed_s"] = round(provider_total_elapsed, 3)
+        metadata["provider_failure_type"] = failure_type
+        response_metadata = response.metadata or {}
+        metadata["fallback_exhausted"] = bool(response_metadata.get("fallback_exhausted"))
+        if isinstance(response_metadata.get("provider_matrix"), list):
+            metadata["provider_matrix_size"] = len(response_metadata["provider_matrix"])
         metadata["tool_call_count"] = len(all_tool_results)
         metadata["context_tokens"] = prompt_tokens
         if failure_type:
