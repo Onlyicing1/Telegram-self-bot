@@ -48,9 +48,11 @@
 
 The database contains **13 tables** in the `public` schema — 5 core
 LifeOS tables and 8 AI subsystem tables. Two additional tables exist in
-migrations (`bot_settings`, `ghost_chats`) and three AI tables
-(`ai_usage`, `ai_provider_stats`, `ai_preferences`) are specified here
-and implemented in code but have **no applied migration**. The exact
+migrations (`bot_settings`, `ghost_chats`). `ai_usage` and
+`ai_provider_stats` have migration files (`20260827000003` /
+`20260827000004`) pending manual application; `ai_preferences` is
+specified here and implemented in code but has **no applied migration**.
+The exact
 status of every table is in [§19](#19-known-inconsistencies),
 [§20](#20-migration-status), and [§23](#23-self-bot-persistent-state-inventory).
 
@@ -83,8 +85,8 @@ status of every table is in [§19](#19-known-inconsistencies),
 |---|---|---|---|
 | `bot_settings` | `20260729213959` | `ghost_seen_v2` (key `ghost_seen_allowed_chats`) | **Live** — NOT orphaned. See §19.4. |
 | `ghost_chats` | `20260822090000` | none | **Orphaned** — no code reads or writes it. See §19.12. |
-| `ai_usage` | none | `SupabaseUsageRepository` + `usage_recorder` | Specified (§13) + code wired, **no migration applied**. |
-| `ai_provider_stats` | none | `SupabaseProviderStatsRepository` + `usage_recorder` | Specified (§12) + code wired, **no migration applied**. |
+| `ai_usage` | `20260827000003` | `SupabaseUsageRepository` + `usage_recorder` | Migration created, **pending manual application** (§13). |
+| `ai_provider_stats` | `20260827000004` | `SupabaseProviderStatsRepository` + `usage_recorder` | Migration created, **pending manual application** (§12). |
 | `ai_preferences` | none | interface + in-memory only | Specified (§14), **no producer, no migration**. |
 
 ### Access Model
@@ -355,8 +357,10 @@ The initial migration (`20260726143924`) created only 3 columns
 columns were supposed to be added by migrations
 `20260730220000_panel_settings_column_model.sql` and
 `20260730230000_panel_settings_full_13_columns.sql`, but **these
-migration files do not exist** in the repository. A future migration
-must add all missing columns. Migration
+migration files do not exist** in the repository. Migration
+`20260827000001_add_missing_panel_settings_columns.sql` now adds all
+10 missing columns (idempotent, with CHECK constraints mirroring the
+`settings_service` validators) — pending manual application. Migration
 `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
 (idempotent) covers `dashboard_font` and (originally)
 `ghost_seen_retention_days`; it was applied to the live database and
@@ -393,9 +397,11 @@ parameters.
 > **Current status:** The `ai_config` table is referenced by
 > `backend/ai/config_store.py` but may not exist in the live database.
 > The initial migration (`20260805075707`) creates the base columns but
-> does NOT include `trigger_en` or `trigger_fa`. No migration file
-> exists that adds these columns. The runtime silently falls back to
-> in-memory storage when the table or columns are missing. See
+> does NOT include `trigger_en` or `trigger_fa`. Migration
+> `20260827000002_add_ai_config_trigger_columns.sql` (idempotent) now
+> adds them — pending manual application. Until it is applied, the
+> runtime silently falls back to in-memory storage when the table or
+> columns are missing. See
 > [§19 Known Inconsistencies](#19-known-inconsistencies).
 
 ### Columns
@@ -685,9 +691,9 @@ in-memory fallback (`ProviderStatsRecord`, `ProviderStatsRepository`,
 Supabase is available. Updates come from
 `backend/ai/database/usage_recorder.py` (read-modify-write upsert per
 (provider, owner)). Methods: `get_or_create`, `record_request`, `get`,
-`list_all`. No migration has been applied for this table yet — the
-migration must be generated from this section (see §20, item 4) and
-applied manually.
+`list_all`. Migration `20260827000004_create_ai_provider_stats_table.sql`
+has been generated from this section (the composite PK matches the
+writer's upsert conflict target) — pending manual application.
 
 ---
 
@@ -733,8 +739,9 @@ in-memory fallback (`UsageRecord`, `UsageRepository`,
 is available. Writes come from `backend/ai/database/usage_recorder.py`,
 which persists the normalized `AIExecutionRecord` exactly once per
 request. Methods: `create`, `total_tokens`, `daily_tokens`, `recent`.
-No migration has been applied for this table yet — the migration must be
-generated from this section (see §20, item 5) and applied manually.
+Migration `20260827000003_create_ai_usage_table.sql` has been generated
+from this section (bigserial `id` — the Supabase writer never sends
+`id`) — pending manual application.
 
 ---
 
@@ -818,9 +825,10 @@ The `USING (true)` is acceptable because:
 2. The dashboard is read-only and has no sign-in screen.
 3. All writes go through the backend service-role key (bypasses RLS).
 
-Tables that do not yet have RLS enabled (`ai_provider_stats`,
-`ai_usage`, `ai_preferences`) MUST have RLS enabled and a SELECT policy
-added in their creation migration.
+Tables that do not yet have RLS enabled (`ai_preferences`) MUST have
+RLS enabled and a SELECT policy added in their creation migration.
+`ai_usage` and `ai_provider_stats` receive RLS + SELECT policies in
+their creation migrations (`20260827000003` / `20260827000004`).
 
 ---
 
@@ -940,9 +948,10 @@ the Supabase API will either error (column does not exist) or silently
 ignore the fields. The in-memory fallback catches the error, so the
 bot continues running, but trigger words are lost on restart.
 
-**Resolution [MIGRATION REQUIRED]:** A future migration must add
+**Resolution [MIGRATION CREATED]:** Migration
+`20260827000002_add_ai_config_trigger_columns.sql` adds
 `trigger_en TEXT DEFAULT NULL` and `trigger_fa TEXT DEFAULT NULL` to
-the `ai_config` table.
+the `ai_config` table — pending manual application.
 
 ### 19.2 `ai_config` — `last_request_at` / `last_latency_ms` (RESOLVED in code)
 
@@ -976,9 +985,11 @@ be absent from the response dict. The `settings_service` cache-first
 approach will fall back to hardcoded defaults for all missing columns.
 Settings changes by the user are not persisted.
 
-**Resolution [MIGRATION REQUIRED]:** A future migration must add all
+**Resolution [MIGRATION CREATED]:** Migration
+`20260827000001_add_missing_panel_settings_columns.sql` adds all
 10 missing columns to `panel_settings` with the types and defaults
-listed in [§6](#6-panel_settings).
+listed in [§6](#6-panel_settings) (plus CHECK constraints mirroring the
+`settings_service` validators) — pending manual application.
 
 Migration `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql`
 now exists and covers `dashboard_font` and (originally)
@@ -1063,10 +1074,11 @@ The runtime operates entirely in-memory for these tables.
 implementations for `ai_provider_stats` and `ai_usage` (via
 `RepositoryManager` + `usage_recorder.py`); `ai_preferences` remains
 interface + in-memory only. The runtime degrades to in-memory behavior
-when Supabase is unavailable or the tables are missing. Migrations must
-still be generated from the schemas in [§12](#12-ai_provider_stats),
-[§13](#13-ai_usage), and [§14](#14-ai_preferences) and applied manually
-(see §20, items 4–6).
+when Supabase is unavailable or the tables are missing. Migrations for
+`ai_provider_stats` (`20260827000004`) and `ai_usage` (`20260827000003`)
+have been generated and are pending manual application;
+`ai_preferences` ([§14](#14-ai_preferences)) still has no migration
+(see §20, item 6).
 
 ### 19.9 AI configuration persistence is non-deterministic
 
