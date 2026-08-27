@@ -260,3 +260,12 @@ manually, persistence resumes working.
   were intentionally not touched.
 - `INVESTIGATION.md` was not modified (it is the Phase 3-only canonical
   handoff by explicit instruction); this report is the delivery record.
+
+## Delivery verification
+
+- Implementation commit: `775b010` — `fix: add p0 schema reconciliation
+  migrations` (6 files, +320/−26).
+- Push result: pushed to `origin/main` (`470769c..775b010`), exit 0.
+- Final working-tree state: `main` in sync with `origin/main`; the four
+  migration files, `DATABASE_ARCHITECTURE.md`, and this report are
+  committed; no unrelated files were touched.
