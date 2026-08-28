@@ -203,8 +203,9 @@ by the earlier evidence gate and would need explicit product-level acceptance.
 
 ## Commit / delivery status
 - Base commit (start of audit): `a9bd036dffa41856e09a9ad9affe2c42cd6efd07`
-- Local HEAD == `origin/main` == remote `main` == `a9bd036…` (verified via
-  `git fetch origin main`).
 - Working tree at end of audit: only `IMPLEMENTATION_REPORT.md` modified (the
   report replacement); no production/test/database code changed.
-- Commit/push facts will be recorded after the report delivery.
+- Audit report commit: `a0eff8efa8401901dc8ed8c25e63664ff8c0b7d0` — `docs: record post-repair delivery audit (no actionable defect)`
+- Push result: pushed to `origin/main` (`a9bd036..a0eff8e`)
+- Remote verification: local HEAD == `origin/main` == remote `main` == `a0eff8efa8401901dc8ed8c25e63664ff8c0b7d0` (verified via `git fetch origin main`)
+- Final working-tree state: clean.
