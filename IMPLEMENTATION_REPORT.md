@@ -794,3 +794,68 @@ Markdown is currently rendered as safe plain text rather than sent as Telegram e
 ## Delivery status
 
 This report section is being committed with the implementation and tests; commit and remote verification are recorded after commit.
+
+---
+
+# AI Output Repair — Word-Boundary Emphasis Preservation — 2026-08-28
+
+## Objective
+
+Implement the single deterministic repair rule justified by the investigation: stop the centralized Markdown degradation from silently deleting legitimate `*` / `_` / `__` punctuation inside ordinary prose (snake_case identifiers, math expressions).
+
+## Exact defect addressed
+
+`backend/ai/tools/delivery.py::_render_markdown` stripped emphasis delimiters with no word-boundary constraint, so any balanced pair of `*`, `_`, or `__` inside a word was deleted. Reproduced against the pre-fix source:
+
+- `2*3*4` → `234` (math expression corrupted)
+- `some_word_here` → `somewordhere` (snake_case corrupted)
+- `some__word__here` → `somewordhere`
+
+Clearly delimited emphasis (`*italic*`, `_italic_`, `**bold**`) was and remains stripped correctly.
+
+## Why the repair is safe
+
+The rule keeps the existing behavior for unambiguous, word-boundary-delimited emphasis and only refuses to interpret ambiguous intraword delimiters as formatting — it preserves the literal characters instead. It is deterministic, idempotent, meaning-preserving, requires no intent inference, invents no content, and runs synchronously with no network/database/provider/AI call. Protected regions (URLs, usernames, commands, inline/fenced code) are held out by the existing `_protect()` / `_restore()` mechanism before the emphasis stage, so they are untouched.
+
+## Exact repair rule
+
+Emphasis delimiters are stripped only when the opening delimiter is not preceded by a word character (`(?<!\w)`) and the closing delimiter is not followed by a word character (`(?!\w)`), in addition to the existing whitespace constraints. Applied to both bold (`**`/`__`) and italic (`*`/`_`) patterns in `_render_markdown`.
+
+## Files changed
+
+- `backend/ai/tools/delivery.py` — word-boundary constraints on the two emphasis regexes (6 lines changed).
+- `tests/test_67_ai_output_pipeline.py` — six focused regression tests added.
+- `IMPLEMENTATION_REPORT.md` — this section.
+
+## Tests added
+
+- `test_intraword_emphasis_delimiters_are_preserved` — the exact defective cases stay literal.
+- `test_word_boundary_emphasis_still_degrades` — clearly delimited Markdown still renders.
+- `test_emphasis_repair_is_idempotent` — `process_output(process_output(x).text) == process_output(x).text`.
+- `test_emphasis_repair_keeps_multilingual_text_unchanged` — Persian, Arabic, Cyrillic, CJK, mixed RTL/LTR, emoji.
+- `test_emphasis_repair_preserves_protected_tokens` — URLs, usernames, commands, code unchanged.
+- `test_integration_delivery_uses_repaired_output` — `deliver_response()` delivers the preserved text.
+
+## Verification
+
+- Focused: `python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header` — **33 passed**.
+- Full suite: `python3 -m pytest tests/ -q --no-header` — **1023 passed, 23 skipped, 1 warning** (pre-existing warning; skips are the pre-existing legacy Ghost Seen tests).
+- `python3 -m compileall -q backend tests` — passed.
+- `git diff --check` — passed.
+- Final diff inspected: only `backend/ai/tools/delivery.py`, `tests/test_67_ai_output_pipeline.py`, and this report changed.
+
+## Security / architecture boundary
+
+No ProviderManager, Dispatcher, Engine, EngineResult, provider, tool, authorization, or Telegram execution change. No new delivery path. No message content, credentials, or session data logged. Failure containment unchanged: if `process_output` raises, `deliver_response` still falls back to the original validated response.
+
+## Database / schema impact
+
+None. `DATABASE_ARCHITECTURE.md`, migrations, SQL, and Supabase were not modified. No live Telegram or live Supabase access was performed.
+
+## Limitations
+
+A delimiter pair at a true word boundary (e.g. a bolded line) is still treated as formatting, which matches standard Markdown semantics; genuinely ambiguous cases remain conservative. UTF-16-aware chunk sizing remains a separate delivery-size concern and was intentionally not included in this chunk.
+
+## Delivery status
+
+Commit, push result, remote SHA verification, and final working-tree state are recorded after commit.

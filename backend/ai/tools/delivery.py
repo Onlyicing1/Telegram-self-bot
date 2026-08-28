@@ -88,8 +88,10 @@ def _normalize_plain(text: str) -> str:
 def _render_markdown(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", text)
     text, tokens = _protect(text)
-    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), text, flags=re.S)
-    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*|(?<!_)_(?!\s)(.+?)(?<!\s)_", lambda m: m.group(1) or m.group(2), text, flags=re.S)
+    # Emphasis is stripped only at word boundaries; intraword delimiters
+    # (snake_case, math like 2*3*4) are ambiguous and must stay literal.
+    text = re.sub(r"(?<!\w)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\w)|(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)", lambda m: m.group(1) or m.group(2), text, flags=re.S)
+    text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)|(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", lambda m: m.group(1) or m.group(2), text, flags=re.S)
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)
     text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.M)
     text = re.sub(r"^\s*>\s?", "▎ ", text, flags=re.M)

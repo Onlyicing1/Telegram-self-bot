@@ -98,6 +98,74 @@ def test_telegram_length_is_enforced_in_utf16_units():
     assert all(len(chunk.encode("utf-16-le")) // 2 <= SAFE_LIMIT * 2 for chunk in chunks)
 
 
+def test_intraword_emphasis_delimiters_are_preserved():
+    for text in [
+        "2*3*4",
+        "a*b",
+        "some_word_here",
+        "some__word__here",
+        "foo_bar_baz",
+        "a*b*c",
+        "x_1 = 5",
+        "the file_name is set",
+    ]:
+        assert process_output(text).text == text
+
+
+def test_word_boundary_emphasis_still_degrades():
+    assert process_output("*italic* and **bold**").text == "italic and bold"
+    assert process_output("say _italic_ now").text == "say italic now"
+    assert process_output("__bold__").text == "bold"
+    assert process_output("***bold***").text == "bold"
+
+
+def test_emphasis_repair_is_idempotent():
+    for text in [
+        "2*3*4",
+        "some_word_here",
+        "*italic* and **bold**",
+        "say _italic_ now",
+        "سلام، حالت چطوره؟",
+        "mixed _word_ here",
+    ]:
+        once = process_output(text).text
+        assert process_output(once).text == once
+
+
+def test_emphasis_repair_keeps_multilingual_text_unchanged():
+    for text in [
+        "سلام، حالت چطوره؟",
+        "مرحبا، كيف حالك؟",
+        "Привет, как дела?",
+        "你好，世界。",
+        "こんにちは。",
+        "안녕하세요.",
+        "قیمت 125 USD است",
+        "🙂 a*b 🙂",
+    ]:
+        assert process_output(text).text == text
+
+
+def test_emphasis_repair_preserves_protected_tokens():
+    text = "see https://example.com/a_b?x=1 @user /cmd `a*b` ```x_y```"
+    assert process_output(text).text == text
+
+
+@pytest.mark.asyncio
+async def test_integration_delivery_uses_repaired_output():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text): replies.append(text)
+    from backend.ai.tools.delivery import deliver_response
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "Nova hi", "Nova",
+        "set the file_name to 2*3*4",
+    )
+    assert result.success
+    assert edits == ["Nova hi\n────────────\n🤖 Nova\nset the file_name to 2*3*4"]
+    assert replies == []
+
+
 def test_empty_output_is_rejected():
     with pytest.raises(ValueError):
         process_output("   ")
