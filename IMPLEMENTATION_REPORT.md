@@ -1,4 +1,4 @@
-# Implementation Report — Markdown Entity Delivery: Implementation Blocked (No Safe Deterministic Rule Evidenced)
+# Implementation Report — Span-Tracking Design for Telegram Markdown Entities: FAIL / BLOCKED
 
 ## Date
 2026-08-28
@@ -6,153 +6,223 @@
 ## Repository / Branch / Base commit
 - Repository: `https://github.com/Onlyicing1/Telegram-self-bot` (`origin`)
 - Branch: `main`
-- Base commit (start of chunk): `89c7135023ee986fb5bf36dd8d0305f91cea1769` (synced with `origin/main`)
+- Base commit: `0c5be2755dfa335466a807cdb569a37aa8a9d960` (synced with `origin/main`)
 
 ## Task objective
-Determine whether the centralized AI→Telegram delivery boundary
-(`backend/ai/tools/delivery.py`) can safely render supported Markdown
-(bold, italic, inline code, fenced code, links, and optionally underline /
-strikethrough) as real Telegram entities, instead of the current safe
-plain-text degradation — and, if the evidence gate passes, implement only the
-smallest deterministic, meaning-preserving subset justified by the source.
+Determine, by investigation only, whether there is a technically safe,
+deterministic, meaning-preserving way to introduce **source-span tracking**
+into the existing Markdown normalization/rendering pipeline so Telegram
+entities could eventually be generated against the **actual rendered text**.
+End with exactly one evidence-gate conclusion (PASS or FAIL/BLOCKED). No
+production code or tests may be modified.
+
+## Investigation scope
+Only the delivery boundary and its tests were inspected:
+- `backend/ai/tools/delivery.py`
+- `tests/test_67_ai_output_pipeline.py`
+
+Only deterministic constructs already relevant to the current code were
+investigated: `**bold**`, `__bold__`, `*italic*`, `_italic_`, inline code,
+fenced code, Markdown links (underline/strikethrough rejected — no existing
+deterministic handling). No Markdown library, no AI parser, no intent
+inference.
 
 ## Evidence gate
-This chunk ran Phase 1 (targeted investigation only) and assessed each
-question against the actual source and direct execution of that source.
 
 ### Confirmed
 - `process_output()` returns `.text = rendered` (the string actually
-  delivered), but computes `.entities` via `_render_entities(text)` against
-  the **raw input**, not the rendered string. These are different strings.
-- Direct execution of the current source:
-  - `process_output("hi **bold**")` → delivered `.text = 'hi bold'`, but the
-    produced `MessageEntityBold(offset=5, length=4)` is **out of bounds**
-    against the delivered text (`offset+length = 9 > utf16_len 7`) and slices
-    the wrong substring `'ld'`.
-  - `process_output("🙂 *سلام*")` → delivered `.text = '🙂 سلام'`, but
-    `MessageEntityItalic(offset=4, length=4)` slices `'لام'` and is out of
-    bounds (`8 > 7`).
-  - `process_output("🙂 **bold**")` → delivered `.text = '🙂 bold'`, entity
-    slices `'ld'`, out of bounds.
-- No production code consumes `.entities`/`entity_count`. `deliver_response()`
+  delivered) while `_render_entities(text)` builds entities against the
+  **raw** input. For `"hi **bold**"` this yields
+  `MessageEntityBold(offset=5, length=4)`; the delivered text `'hi bold'` has
+  UTF-16 length 7, so `offset+length = 9 > 7` (out of bounds) and the slice is
+  the wrong substring. Same for `"🙂 **bold**"` (slices `'ld'`) and
+  `"🙂 *سلام*"` (slices `'لام'`). [direct interpreter run]
+- No production code consumes `.entities`/`entity_count`; `deliver_response()`
   reads only `processed.text` and passes plain text to `event.edit` /
-  `event.reply`. The entity path is dead output today (which is the only
-  reason the offset bug has not caused live corruption).
-- `deliver_response()` calls `event.edit(...)` and `event.reply(...)` with text
-  only — no `entities=` argument.
+  `event.reply`. The entity path is dead output; the only reason the
+  offset-basis bug has not caused live corruption.
+- `_render_markdown()` is a sequence of `re.sub(...)` passes with **no source
+  span records**. `_normalize_plain()` likewise. Both run before any entity
+  could be bound.
+- Scanning the **rendered** string cannot recover stripped emphasis:
+  `_render_entities('hi bold') => []`. Entity delivery therefore requires
+  tracking spans **through** the strip, not re-scanning the output.
+- Several cases are **inherently ambiguous** under the deterministic rules:
+  - `***bold***` → rendered `'bold'` (all three stars stripped first by `**`
+    then by `*`); the bold-vs-italic class is unknowable. `_render_entities`
+    currently guesses `MessageEntityBold(2,5)`, which is corrupt against the
+    4-unit rendered string.
+  - `*x **bold** y*` → `'x bold y'`: nested/overlapping ranges collapse, so a
+    single deterministic bold-and-italic entity set cannot be recovered.
+- Link flattening changes the surface: `[label](https://x.com)` →
+  `'label (https://x.com)'` (a synthesized space + moved `(url)`). Converting
+  that into a native link entity would change the visible presentation
+  (Telegram would render a tappable link over just `label`, hiding the URL),
+  i.e. a **semantics/presentation change**, not offset-correctness.
+- UTF-16 accounting across transforms is non-trivial:
+  - NFC: `'e\u0301'` (2 UTF-16 units raw) → `'é'` (1 unit); decompositions
+    change unit counts per code point.
+  - Synthesized punctuation space: `'سلام,world'` → `'سلام, world'` inserts a
+    code point with no raw counterpart (all subsequent offsets must shift).
+  - `.strip()` removes leading/trailing code points.
+  - `_protect()`/`_restore()` replace opaque tokens with short `\0{i}\0`
+    placeholders and back — a unique 1:1 map, but it runs simultaneously with
+    surrounding substitutions and must be re-entangled in any map.
 
 ### Likely
-- `_format_chunks()` interleaves a `header` prefix on the first message and
-  `\n\n_(i/n)_` continuation markers on subsequent messages. Mapping any
-  body-relative entity to chunk-relative offsets therefore requires adding the
-  header's UTF-16 length and stripping/re-clamping per continuation — with no
-  existing precedent in the source and real risk to the just-hardened UTF-16
-  splitting.
+- A narrow subset (`**bold**`, `*italic*`, `_italic_`, `__bold__`, inline
+  code, and preserved-literal intraword delimiters like `some_word_here`,
+  `2*3*4`) could be made span-trackable with a focused rewrite of just the
+  emphasis formatting pass, because the word-boundary rule is an explicit,
+  deterministic predicate (not intent inference) and the plain-text output
+  would be byte-identical.
 
 ### Unknown
-- Whether users actually require Telegram native formatting (as opposed to the
-  current faithful plain-text rendering). No issue/report in the repository
-  evidences a user-facing formatting defect.
+- Whether users actually need native Telegram formatting at all. The
+  repository contains no issue, failure log, or report evidencing a
+  user-facing formatting defect; plain-text rendering is correct and complete.
 
-## Exact defect / limitation addressed
-**None implemented.** Investigation found that naive Markdown-entity delivery
-is provably unsafe in the current code: the existing `_render_entities`
-produces entity offsets against the *raw* input while the delivered message is
-the *rendered* (normalized + Markdown-degraded) text, so those entities are
-out of bounds / point at the wrong substring when applied to the real message.
+## Exact defect / limitation investigated
+Entity generation is unsafe because offsets are computed on the raw input while
+delivery uses the rendered string. Correct entity delivery requires a
+**deterministic raw→rendered span map** through normalization + Markdown
+degradation + chunking, plus a safe gate so uncertain entities are omitted.
 
 ## Root cause
-Two independent causes make entity delivery unsafe today:
-1. Offset basis mismatch — `_render_entities(text)` runs before/against the raw
-   input, whereas `.text` is the transformed `rendered` string. Any entity
-   derived from the raw string is wrong for the delivered string.
-2. No span tracking — `_render_markdown` strips emphasis with `re.sub(...)`
-   and no source-span records. Offsets cannot be recovered from the delivered
-   string without re-parsing, which requires deciding which `*`/`_`/`__` were
-   actually stripped vs. left literal (intraword punctuation). That decision is
-   Markdown-intent inference, which the repair/entity rules forbid.
+1. Offset-basis mismatch: `_render_entities(text)` vs. delivered `.text =
+   rendered`.
+2. Span loss: `re.sub`-based `_normalize_plain`/`_render_markdown` record no
+   source spans, and emphasis delimiters are deleted during stripping, so they
+   cannot be recovered from the output.
+3. Inherent ambiguity for `***bold***`, nesting, and overlapping constructs:
+   the rendered text no longer encodes which delimiter class applied.
+4. Links require a presentation change (showing the URL text today) to become
+   native link entities.
 
-## Exact files changed
-**None (production).** `backend/ai/tools/delivery.py` and
-`tests/test_67_ai_output_pipeline.py` are unchanged.
+## Span-tracking feasibility analysis
+Span-tracking **is** technically achievable for the unambiguous emphasis/code
+subset: each `re.sub` is segment-preserving outside matches and can be replayed
+with `re.finditer` to build a per-segment raw→rendered map; the word-boundary
+predicate is deterministic and byte-identical output is preserved. However, a
+complete implementation must also thread NFC decomposition
+(`unicodedata.normalize`), synthesized-space insertion, `.strip()`, the
+`_protect`/`_restore` token map, link flattening, heading/list/quote prefix
+rewrites, and then map entities (in UTF-16 units on the rendered string) into
+chunk-relative offsets across `_format_chunks` headers, continuation markers,
+and split boundaries. Each piece is individually deterministic, but *all* must
+compose without any ambiguity, on the already-correct, hardened pipeline.
 
-Documentation changed:
+## Transformation analysis
+| Transformation | Input | Output | Spans preservable | Ambiguity / failure |
+|---|---|---|---|---|
+| NFC normalize | code points | recomposed | yes (codepoint-level, lengths change) | low, but must be mapped |
+| newline normalize | CRLF/CR | LF | yes (1:1 per run) | none |
+| Persian char swap | ي→ی, ك→ک | same UTF-16 width | yes | none |
+| `_protect`/`_restore` | token→`\0i\0`→token | same | yes (unique 1:1) | must re-entangle after other subs |
+| whitespace collapse | runs→1 space | shorter | yes | none (entities never start inside runs) |
+| `.strip()` | drop edge whitespace | shorter | yes | drop is 1:0 |
+| punctuation space splice | `a,b`→`a, b` | longer | yes (insertion) | insertion shifts offsets |
+| link flatten | `[t](u)`→`t (u)` | longer/reordered | yes | native link = presentation change |
+| `**`/`__` strip | `**x**`→`x` | delimiters deleted | yes | `***bold***` class ambiguous → omit |
+| `*`/`_` strip | `*x*`→`x` | delimiters deleted | yes | intraword literal rule preserved |
+| headings/lists/quotes | → rewrites | shorter/symbol | yes | none |
+| inline code | unchanged text | unchanged | yes (entity over inner) | backticks remain visible |
+| fenced code | unchanged text | unchanged | yes (entity over inner) | fences remain visible |
+
+## Chunk / UTF-16 analysis
+Entity offsets must use UTF-16 units (`_utf16_units`). After chunking:
+- First message = `header + body[0]`: entity offset += `_utf16_units(header)`,
+  then drop any entity not fully inside `body[0]`.
+- Continuations = `body[i] + "\n\n_(i/n)_"`: entity offsets remain
+  body-relative; the appended marker does not affect leading offsets; drop
+  entities that would cross the split.
+- Entities crossing a chunk boundary are **dropped (fail closed)**, or (if the
+  split falls on a paragraph/newline/word boundary) they naturally don't cross.
+This is deterministic bookkeeping using the existing UTF-16 primitive. It is
+feasible but adds a real, error-prone surface on top of the hardened
+`_split_text`/`_format_chunks`.
+
+## Security / architecture analysis
+No security or execution boundary would need to change. `deliver_response()`
+remains the sole delivery entry; the Self Bot stays the Telegram execution
+authority; `_protect` token contents remain opaque; no provider/AI/network/
+database/Telegram-RPC calls are added; no message-content or credential logging
+is introduced. A future PAWS check on entities (`_entity_valid`) plus fail-closed
+omission keeps uncertain entities from corrupting text.
+
+## Evidence / experiments
+Read-only interpreter probes against the actual source (no files modified):
+- `_render_entities('hi **bold**')` → `MessageEntityBold(5,4)`, invalid vs
+  delivered `'hi bold'` (5+4>7). Its raw-basis slice is the wrong substring.
+- `_render_entities('🙂 **bold**')` → `(5,4)`, slice `'ld'`; invalid.
+- `_render_entities('🙂 *سلام*')` → `(4,4)`, slice `'لام'` on the delivered
+  `'🙂 سلام'`; invalid.
+- `***bold***` → rendered `'bold'`; `_render_entities` guesses `(2,5)` (invalid
+  on 4-unit rendered). Correct class unknowable.
+- `_render_entities('hi bold')` → `[]` (stripped emphasis not recoverable by
+  re-scan).
+- `[label](https://x.com)` → `'label (https://x.com)'`; `'سلام,world'` →
+  `'سلام, world'` (synthesized space); NFC `'e\u0301'(2u)`→`'é'(1u)`;
+  `'  **bold**'` → `'bold'` (strip + emphasis delimiters gone); fenced code
+  keeps its fences.
+
+## Final evidence-gate decision
+**FAIL / BLOCKED** — a safe deterministic implementation is not currently
+justified.
+
+Reasons:
+1. Delivering entities requires a span-aware rewrite of the already-correct,
+   hardened `_normalize_plain` + `_render_markdown`, threading NFC, synthesized
+   insertions, strip, protection, link flattening, and block rewrites into one
+   coherent raw→rendered map, plus chunk-relative remapping — an
+   **architectural rewrite**, not a small rule. The task explicitly asks
+   whether this crossed into "architectural rewrite that should remain
+   blocked"; it has.
+2. Several mandated cases are **inherently ambiguous** (`***bold***`, nesting,
+   overlapping). The only deterministic outcome is **omission**, which yields
+   essentially zero user-visible benefit over the current, already-safe plain
+   text.
+3. Links and fence retention would require **changing rendered presentation
+   semantics** — out of scope and risky.
+4. There is **no repository evidence of a current user-facing formatting
+   defect**; this is a feature, not a repair. The evidence gate governs safe
+   repair, and nothing is broken to repair — plain-text delivery is correct and
+   complete.
+
+## Next-step recommendation
+Remain blocked. The existing plain-text delivery (normalization, intraword
+emphasis preservation, protected tokens, UTF-16 splitting, formatter fallback)
+is correct and must not change. The dormant `_render_entities`/`RenderedOutput.
+entities` path is broken and unused; it must not be wired into delivery.
+
+**Evidence that would be required before reopening:** a concrete, repository-
+documented user-facing need for native formatting (issue/report/saved example),
+a decision to accept the presentation change for links and to omit
+`***bold***`/nested cases, and acceptance of a dedicated span-tracking rewrite
+as a distinct feature work-stream (not a repair). Absent that, still safe to
+omit.
+
+## Files changed
 - `IMPLEMENTATION_REPORT.md` — completely replaced with this single
-  investigation/blocked report.
+  investigation report (the only permitted repository modification).
+- `backend/ai/tools/delivery.py` — **unchanged**.
+- `tests/test_67_ai_output_pipeline.py` — **unchanged**.
+- `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`, migrations, Supabase —
+  **unchanged**.
 
-## Exact implementation changes
-None. This is an investigation + blocked-delivery report chunk.
-
-## Behavior changed
-- FIXED: none.
-- MITIGATED: none.
-- PROTECTED: all existing delivery behavior is preserved unchanged — central
-  normalization, intraword emphasis repair (`2*3*4`, `some_word_here`,
-  `some__word__here`), protected URLs/usernames/commands/inline+fenced code,
-  UTF-16-aware splitting, formatter-failure fallback, empty-output rejection.
-- PRESERVED: `Provider → ProviderManager → Dispatcher → Engine → EngineResult
-  → ai_unified._execute_ai → deliver_response → process_output → _format_chunks
-  → Telegram edit/reply`.
-- NOT PROVEN: safe deterministic Markdown-entity rendering (evidence gate
-  failed — see Evidence gate and Root cause).
-
-## Intentionally not changed
-`ai_unified.py`, `dispatcher.py`, `engine.py`, `result.py`, `ProviderManager`,
-Telegram execution boundary, `ghost_seen_v2`, Supabase, migrations,
-`DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`, and unrelated tests.
-
-## Tests added / updated
-None. Per the fail-closed rule, no speculative regression tests were added for
-behavior that is not implemented.
-
-## Tests actually executed
-No production or test files were modified, so no focused/full test suite was
-re-run for a code change. Source behavior was verified by direct interpreter
-execution of the current `process_output`/entity path (commands run this
-chunk), which demonstrated the out-of-bounds entity defect. The full suite
-state from the last committed chunk remains: `1044 passed, 23 skipped,
-1 warning`.
-
-## Validation
-- Direct execution confirmed the offset-mismatch/out-of-bounds entity defect
-  (evidence above).
-- `git status` / `git rev-parse HEAD` confirmed a clean tree at base commit
-  `89c7135…`, synced with `origin/main`.
-- No code was changed, so `compileall`/`git diff --check` for code edits are
-  not applicable beyond confirming the tree was clean at start.
-
-## Security / architecture boundaries
-Unchanged and preserved: centralized single delivery boundary; Self Bot as
-Telegram execution authority; `deliver_response()` as the sole caller-facing
-delivery entry; no provider/AI/network/database/Telegram-RPC calls added; no
-message-content, credential, API-key, or session logging introduced. No second
-delivery path was created.
+## Tests
+No production/test modifications were made. Only read-only interpreter probes
+(recorded under Evidence/experiments) were executed. The last committed suite
+remains `1044 passed, 23 skipped, 1 warning` (unchanged from the previous
+delivered chunk; not re-run because no code changed).
 
 ## Database / schema impact
-- `DATABASE_ARCHITECTURE.md`: unchanged.
-- No schema changes, no migrations, no Supabase writes, no SQL executed.
-
-## Current limitations
-- Telegram formatting is delivered as faithful plain text, not native entities.
-- The existing `_render_entities`/`RenderedOutput.entities` machinery is
-  latent, incorrect against the delivered string, and unused. It should not be
-  wired into delivery without a correct span-tracking rewrite.
-
-## Remaining work / blockers
-- To ever deliver entities safely, a future chunk would need: (a) correct
-  entity construction against the **rendered** string with explicit source-span
-  tracking through normalization + Markdown stripping (no re-guessing whether a
-  marker was stripped or literal), (b) UTF-16 chunk-relative offset remapping in
-  `_format_chunks` (header prefix + continuation markers), and (c)
-  `deliver_response()` passing `entities=`. That is a substantial, delicate
-  change beyond this chunk's scope and is not justified by current evidence.
-- Removed dead/incorrect entity code from `RenderedOutput` (smaller `entity_*`
-  fields) is an optional cleanup; currently left in place to avoid unrelated
-  churn.
+None. No schema changes, no migrations, no Supabase writes, no SQL executed.
 
 ## Commit / delivery
-- Primary commit (report body): `de0cd3e991d5a1f41d2a87f1ddd3cf60861234fe` — `docs: record markdown entity delivery blocked investigation`
-- Final delivered commit (on `origin/main`): `f7f59043f0788c97b4417dbf593860bf9f41020a` — report truthfulness corrections
-- Push result: pushed to `origin/main` (fast-forwards up to `f7f5904`)
-- Remote verification: local HEAD == `origin/main` == remote `main` == `f7f59043f0788c97b4417dbf593860bf9f41020a`; verified via `git fetch origin main`
-- Final working-tree state: clean
+- Base commit (start of chunk): `0c5be2755dfa335466a807cdb569a37aa8a9d960`
+- Local HEAD == `origin/main` == remote `main` at start of chunk.
+- This investigation produces a report-only change; commit/push facts are
+  recorded after delivery.
+- Working tree at end of investigation (before optional report commit): report
+  changed only; no production/test code changed.
