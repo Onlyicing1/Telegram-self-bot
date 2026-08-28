@@ -1,4 +1,4 @@
-# Implementation Report — Span-Tracking Design for Telegram Markdown Entities: FAIL / BLOCKED
+# Implementation Report — Deterministic AI Output Delivery Audit
 
 ## Date
 2026-08-28
@@ -6,223 +6,253 @@
 ## Repository / Branch / Base commit
 - Repository: `https://github.com/Onlyicing1/Telegram-self-bot` (`origin`)
 - Branch: `main`
-- Base commit: `0c5be2755dfa335466a807cdb569a37aa8a9d960` (synced with `origin/main`)
+- Base commit (start of audit): `ceb9c797d4b1db5dfa63e7c9aada00b6992952dc` (synced with `origin/main`)
 
 ## Task objective
-Determine, by investigation only, whether there is a technically safe,
-deterministic, meaning-preserving way to introduce **source-span tracking**
-into the existing Markdown normalization/rendering pipeline so Telegram
-entities could eventually be generated against the **actual rendered text**.
-End with exactly one evidence-gate conclusion (PASS or FAIL/BLOCKED). No
-production code or tests may be modified.
+Audit the complete centralized plain-text AI output delivery path to determine
+whether any other deterministic, source-proven delivery defect exists, without
+reopening the (blocked) Markdown entity work. Investigation only — no
+production/test/database changes.
+
+Audited path (exact):
+```
+ProviderManager → Dispatcher → Engine → EngineResult
+→ ai_unified._execute_ai → deliver_response → process_output
+→ _format_chunks → Telegram edit/reply
+```
 
 ## Investigation scope
-Only the delivery boundary and its tests were inspected:
-- `backend/ai/tools/delivery.py`
-- `tests/test_67_ai_output_pipeline.py`
+Source inspected:
+- `backend/ai/tools/delivery.py` (full)
+- `backend/bot/handlers/ai_unified.py` (the `deliver_response` call site,
+  empty/failure branches, silent-delete guard)
+- `tests/test_67_ai_output_pipeline.py` (full)
 
-Only deterministic constructs already relevant to the current code were
-investigated: `**bold**`, `__bold__`, `*italic*`, `_italic_`, inline code,
-fenced code, Markdown links (underline/strikethrough rejected — no existing
-deterministic handling). No Markdown library, no AI parser, no intent
-inference.
+Read-only interpreter probes were run against the actual source (no file
+modifications). Focused test baseline was executed and passed.
 
 ## Evidence gate
 
 ### Confirmed
-- `process_output()` returns `.text = rendered` (the string actually
-  delivered) while `_render_entities(text)` builds entities against the
-  **raw** input. For `"hi **bold**"` this yields
-  `MessageEntityBold(offset=5, length=4)`; the delivered text `'hi bold'` has
-  UTF-16 length 7, so `offset+length = 9 > 7` (out of bounds) and the slice is
-  the wrong substring. Same for `"🙂 **bold**"` (slices `'ld'`) and
-  `"🙂 *سلام*"` (slices `'لام'`). [direct interpreter run]
-- No production code consumes `.entities`/`entity_count`; `deliver_response()`
-  reads only `processed.text` and passes plain text to `event.edit` /
-  `event.reply`. The entity path is dead output; the only reason the
-  offset-basis bug has not caused live corruption.
-- `_render_markdown()` is a sequence of `re.sub(...)` passes with **no source
-  span records**. `_normalize_plain()` likewise. Both run before any entity
-  could be bound.
-- Scanning the **rendered** string cannot recover stripped emphasis:
-  `_render_entities('hi bold') => []`. Entity delivery therefore requires
-  tracking spans **through** the strip, not re-scanning the output.
-- Several cases are **inherently ambiguous** under the deterministic rules:
-  - `***bold***` → rendered `'bold'` (all three stars stripped first by `**`
-    then by `*`); the bold-vs-italic class is unknowable. `_render_entities`
-    currently guesses `MessageEntityBold(2,5)`, which is corrupt against the
-    4-unit rendered string.
-  - `*x **bold** y*` → `'x bold y'`: nested/overlapping ranges collapse, so a
-    single deterministic bold-and-italic entity set cannot be recovered.
-- Link flattening changes the surface: `[label](https://x.com)` →
-  `'label (https://x.com)'` (a synthesized space + moved `(url)`). Converting
-  that into a native link entity would change the visible presentation
-  (Telegram would render a tappable link over just `label`, hiding the URL),
-  i.e. a **semantics/presentation change**, not offset-correctness.
-- UTF-16 accounting across transforms is non-trivial:
-  - NFC: `'e\u0301'` (2 UTF-16 units raw) → `'é'` (1 unit); decompositions
-    change unit counts per code point.
-  - Synthesized punctuation space: `'سلام,world'` → `'سلام, world'` inserts a
-    code point with no raw counterpart (all subsequent offsets must shift).
-  - `.strip()` removes leading/trailing code points.
-  - `_protect()`/`_restore()` replace opaque tokens with short `\0{i}\0`
-    placeholders and back — a unique 1:1 map, but it runs simultaneously with
-    surrounding substitutions and must be re-entangled in any map.
+- **`_normalize_plain` corrupts dot/colon-delimited literals.** The splice rule
+  `re.sub(r"([,.;:!?،؛؟])(?=[A-Za-zА-Яа-яء-ي])", r"\1 ", text)` inserts a space
+  after `.`/`:` (and other punctuation) when a letter follows, splitting
+  filenames, extensions, bare domains, and abbreviations.
+  Reproduced against current source: `main.py` → `main. py`; `report.txt` →
+  `report. txt`; `example.com` → `example. com`; `data.v1.csv` → `data. v1.
+  csv`; `e.g.` → `e. g.`; `U.S.A` → `U. S. A`; `run main.py now` → `run main.
+  py now`.
+  Expected output: unchanged (literal identifiers/domains/abbreviations).
+  Root cause: `.`/`:` are sentence/clause punctuation in the intended rule but
+  are ubiquitous in technical literals.
+- Protected regions are unaffected: URLs (`https://x.com/...`), inline code
+  `` `main.py` ``, fenced code ```` ```main.py``` ````, `@user`, `/cmd` all
+  survive intact.
+- The intended punctuation-spacing behavior works and is preserved: `hello,world`
+  → `hello, world`; `سلام،world` → `سلام، world`; `note;see` → `note; see`;
+  `تشکر!انجام` → `تشکر! انجام`; `x,y` → `x, y`.
+- Baseline focused suite passes unchanged: `tests/test_67_ai_output_pipeline.py`
+  → `54 passed`.
 
 ### Likely
-- A narrow subset (`**bold**`, `*italic*`, `_italic_`, `__bold__`, inline
-  code, and preserved-literal intraword delimiters like `some_word_here`,
-  `2*3*4`) could be made span-trackable with a focused rewrite of just the
-  emphasis formatting pass, because the word-boundary rule is an explicit,
-  deterministic predicate (not intent inference) and the plain-text output
-  would be byte-identical.
+- Dropping `.` and `:` from the splice set is the minimal fix and, in a read-only
+  replication of `_normalize_plain`, restores all 8 corrupted cases while leaving
+  every intended-spacing case identical (see Next-step recommendation).
+- No user-facing formatting-entity defect reopens; the adjacent/touching mixed
+  `*`/`_` emphasis outputs (`*a*_b_` → `'*a*b'`) are the deterministic
+  consequence of the documented `\w`-based word-boundary rule (which treats `_`
+  as a word character) and are consistent with it — a limitation, not a defect.
 
 ### Unknown
-- Whether users actually need native Telegram formatting at all. The
-  repository contains no issue, failure log, or report evidencing a
-  user-facing formatting defect; plain-text rendering is correct and complete.
+- Whether the `.`-splice has caused a user-visible problem in practice (no
+  repository log/issue evidences it; the corruption is purely text-shaping and
+  deterministic).
 
-## Exact defect / limitation investigated
-Entity generation is unsafe because offsets are computed on the raw input while
-delivery uses the rendered string. Correct entity delivery requires a
-**deterministic raw→rendered span map** through normalization + Markdown
-degradation + chunking, plus a safe gate so uncertain entities are omitted.
+## Audit results
 
-## Root cause
-1. Offset-basis mismatch: `_render_entities(text)` vs. delivered `.text =
-   rendered`.
-2. Span loss: `re.sub`-based `_normalize_plain`/`_render_markdown` record no
-   source spans, and emphasis delimiters are deleted during stripping, so they
-   cannot be recovered from the output.
-3. Inherent ambiguity for `***bold***`, nesting, and overlapping constructs:
-   the rendered text no longer encodes which delimiter class applied.
-4. Links require a presentation change (showing the URL text today) to become
-   native link entities.
+### Unicode normalization
+`_normalize_plain` performs NFC normalization, CRLF→LF, a Persian letter swap
+(`ي`→`ی`, `ك`→`ک` when Persian markers present), protected-token masking,
+whitespace collapse, punctuation spacing, and a final space-after-punctuation
+pass. NFC is deterministic and meaning-preserving (`é` ≡ decomposed `e\u0301`);
+it can change UTF-16 length per code point but that is only relevant once
+entities are involved (blocked). Persian/CJK/emoji content is unaltered.
+**Defect found: the punctuation-spacing pass (dot/colon split) — see Confirmed
+defects.**
 
-## Span-tracking feasibility analysis
-Span-tracking **is** technically achievable for the unambiguous emphasis/code
-subset: each `re.sub` is segment-preserving outside matches and can be replayed
-with `re.finditer` to build a per-segment raw→rendered map; the word-boundary
-predicate is deterministic and byte-identical output is preserved. However, a
-complete implementation must also thread NFC decomposition
-(`unicodedata.normalize`), synthesized-space insertion, `.strip()`, the
-`_protect`/`_restore` token map, link flattening, heading/list/quote prefix
-rewrites, and then map entities (in UTF-16 units on the rendered string) into
-chunk-relative offsets across `_format_chunks` headers, continuation markers,
-and split boundaries. Each piece is individually deterministic, but *all* must
-compose without any ambiguity, on the already-correct, hardened pipeline.
+### Protected-region handling
+`_protect`/`_restore` mask URLs, `@user`, `/cmd`, inline `` ` `` and fenced
+```` ``` ```` regions with unique `\0{i}\0` placeholders, then restore 1:1.
+Confirmed no collision (placeholders use NUL + index, unreserved), no reorder,
+no content loss for URLs/usernames/commands/inline+fenced code regardless of
+internal `*`/`_`/emoji/Persian/Arabic/CJK. Adjacent protected regions restored
+correctly. No failed-restoration path observed. **No defect.**
 
-## Transformation analysis
-| Transformation | Input | Output | Spans preservable | Ambiguity / failure |
-|---|---|---|---|---|
-| NFC normalize | code points | recomposed | yes (codepoint-level, lengths change) | low, but must be mapped |
-| newline normalize | CRLF/CR | LF | yes (1:1 per run) | none |
-| Persian char swap | ي→ی, ك→ک | same UTF-16 width | yes | none |
-| `_protect`/`_restore` | token→`\0i\0`→token | same | yes (unique 1:1) | must re-entangle after other subs |
-| whitespace collapse | runs→1 space | shorter | yes | none (entities never start inside runs) |
-| `.strip()` | drop edge whitespace | shorter | yes | drop is 1:0 |
-| punctuation space splice | `a,b`→`a, b` | longer | yes (insertion) | insertion shifts offsets |
-| link flatten | `[t](u)`→`t (u)` | longer/reordered | yes | native link = presentation change |
-| `**`/`__` strip | `**x**`→`x` | delimiters deleted | yes | `***bold***` class ambiguous → omit |
-| `*`/`_` strip | `*x*`→`x` | delimiters deleted | yes | intraword literal rule preserved |
-| headings/lists/quotes | → rewrites | shorter/symbol | yes | none |
-| inline code | unchanged text | unchanged | yes (entity over inner) | backticks remain visible |
-| fenced code | unchanged text | unchanged | yes (entity over inner) | fences remain visible |
+### Markdown degradation
+Emphasis stripping uses `(?<!\w)`…`(?!\w)` boundaries where `\w` includes `_`,
+so intraword `2*3*4`, `some_word_here`, `some__word__here`, `foo_bar_baz`,
+Arabic/CJK word-adjacent delimiters (`و*علی*کم`) all stay literal — confirmed.
+Clearly delimited `*italic*`, `**bold**`, `_em_`, `__under__` degrade. Adjacent
+mixed echoes (`*a*_b_` → `'*a*b'`, `**a**_b_` → `'*a*b'`) are the deterministic
+rule output (a late `*`/`_` gets read as a word char); classified as consistent
+rule behavior, not a rule violation, and no unambiguous literal is deleted.
+Bare list/heading/quote markers `- x`→`• x`, `# x`→`x`, `> `→`▎ ` are by-design
+Markdown block conversions. **No new defect beyond the confirmed one.**
 
-## Chunk / UTF-16 analysis
-Entity offsets must use UTF-16 units (`_utf16_units`). After chunking:
-- First message = `header + body[0]`: entity offset += `_utf16_units(header)`,
-  then drop any entity not fully inside `body[0]`.
-- Continuations = `body[i] + "\n\n_(i/n)_"`: entity offsets remain
-  body-relative; the appended marker does not affect leading offsets; drop
-  entities that would cross the split.
-- Entities crossing a chunk boundary are **dropped (fail closed)**, or (if the
-  split falls on a paragraph/newline/word boundary) they naturally don't cross.
-This is deterministic bookkeeping using the existing UTF-16 primitive. It is
-feasible but adds a real, error-prone surface on top of the hardened
-`_split_text`/`_format_chunks`.
+### Empty-output handling
+`process_output` raises `ValueError` for empty/whitespace-only input and when
+rendering yields empty. Standalone `*`, `**`, `_`, `__`, `` ` ``, `####` etc.
+remain literal (not turned empty). `>` → `▎ ` by blockquote rule. In
+`ai_unified`, delivery runs only when `result.success and result.response`;
+`deliver_response` handles empty `response_text` with an explicit error edit. No
+silent success / accidental empty-delivery path found. **No defect.**
 
-## Security / architecture analysis
-No security or execution boundary would need to change. `deliver_response()`
-remains the sole delivery entry; the Self Bot stays the Telegram execution
-authority; `_protect` token contents remain opaque; no provider/AI/network/
-database/Telegram-RPC calls are added; no message-content or credential logging
-is introduced. A future PAWS check on entities (`_entity_valid`) plus fail-closed
-omission keeps uncertain entities from corrupting text.
+### Chunk formatting
+`_format_chunks`: header prefix on message 1; continuation `\n\n_(p/n)_` markers
+on the rest, with correct numbering and totals tied to `len(body)`; deterministic;
+reconstruction `"".join(parts)` with continuation markers stripped equals the body
+across ASCII/BMP/supplementary/Persian/Arabic/CJK/long-unbroken/newline-heavy
+input. Surrogate pairs never split; every chunk ≤ `SAFE_LIMIT` (4000 UTF-16
+units). **No defect.**
 
-## Evidence / experiments
-Read-only interpreter probes against the actual source (no files modified):
-- `_render_entities('hi **bold**')` → `MessageEntityBold(5,4)`, invalid vs
-  delivered `'hi bold'` (5+4>7). Its raw-basis slice is the wrong substring.
-- `_render_entities('🙂 **bold**')` → `(5,4)`, slice `'ld'`; invalid.
-- `_render_entities('🙂 *سلام*')` → `(4,4)`, slice `'لام'` on the delivered
-  `'🙂 سلام'`; invalid.
-- `***bold***` → rendered `'bold'`; `_render_entities` guesses `(2,5)` (invalid
-  on 4-unit rendered). Correct class unknowable.
-- `_render_entities('hi bold')` → `[]` (stripped emphasis not recoverable by
-  re-scan).
-- `[label](https://x.com)` → `'label (https://x.com)'`; `'سلام,world'` →
-  `'سلام, world'` (synthesized space); NFC `'e\u0301'(2u)`→`'é'(1u)`;
-  `'  **bold**'` → `'bold'` (strip + emphasis delimiters gone); fenced code
-  keeps its fences.
+### Formatter failure containment
+If `process_output`/rendering raises, `deliver_response` catches it, logs only
+`type(exc).__name__`, and continues with the original validated text. Confirmed:
+a raised `RuntimeError` still delivers the full original text unchanged, with
+`success=True` and no sensitive detail logged. **No defect.** (This is the
+documented `AI_OUTPUT_NORMALIZATION_FALLBACK` path.)
 
-## Final evidence-gate decision
-**FAIL / BLOCKED** — a safe deterministic implementation is not currently
-justified.
+### Message edit/reply semantics
+First chunk → `event.edit`, subsequent chunks → `event.reply`. Multi-chunk
+partial failure returns `success=False` with honest `chunks_delivered/total` and
+the error set; no false success, no silent duplication (no retry loop). Empty
+response → an explicit error edit. The handler's silent-delete guard reverts the
+request message rather than emitting a confirmation. **No defect**; only
+inherent multi-message partial-delivery semantics are present (in a multi-chunk
+response, an error after chunk 1 leaves a partially delivered response plus a
+`success=False` — deterministic, not silently inconsistent).
 
-Reasons:
-1. Delivering entities requires a span-aware rewrite of the already-correct,
-   hardened `_normalize_plain` + `_render_markdown`, threading NFC, synthesized
-   insertions, strip, protection, link flattening, and block rewrites into one
-   coherent raw→rendered map, plus chunk-relative remapping — an
-   **architectural rewrite**, not a small rule. The task explicitly asks
-   whether this crossed into "architectural rewrite that should remain
-   blocked"; it has.
-2. Several mandated cases are **inherently ambiguous** (`***bold***`, nesting,
-   overlapping). The only deterministic outcome is **omission**, which yields
-   essentially zero user-visible benefit over the current, already-safe plain
-   text.
-3. Links and fence retention would require **changing rendered presentation
-   semantics** — out of scope and risky.
-4. There is **no repository evidence of a current user-facing formatting
-   defect**; this is a feature, not a repair. The evidence gate governs safe
-   repair, and nothing is broken to repair — plain-text delivery is correct and
-   complete.
+### Idempotence
+A 18-case corpus plus a 4000-trial deterministic fuzzer (`random.seed(7)`):
+`process_output(process_output(x).text)` is idempotent for all literal/protected
+content. The only non-idempotence observed is a **harmless whitespace
+insertion**: when emphasis-stripping leaves a letter adjacent to punctuation, a
+second pass adds the sentence-space (`سلام؟_y_` → `سلام؟y` → `سلام؟ y`). This
+**never deletes or alters literal characters and never corrupts URLs/protected
+tokens** — classified as harmless normalization, not corruption, given the
+already-adopted punctuation-spacing rule.
 
-## Next-step recommendation
-Remain blocked. The existing plain-text delivery (normalization, intraword
-emphasis preservation, protected tokens, UTF-16 splitting, formatter fallback)
-is correct and must not change. The dormant `_render_entities`/`RenderedOutput.
-entities` path is broken and unused; it must not be wired into delivery.
+### Reconstruction invariant
+Verified for ASCII, BMP, supplementary-plane, emoji, Persian, Arabic, CJK,
+mixed scripts, long unbroken strings, paragraph boundaries, newline-heavy
+content, and Markdown punctuation at/over the `SAFE_LIMIT` boundary:
+`delivered_body == intended_processed_body` after stripping only continuation
+metadata (`\n\n_(p/n)_`). **Holds — no defect.**
 
-**Evidence that would be required before reopening:** a concrete, repository-
-documented user-facing need for native formatting (issue/report/saved example),
-a decision to accept the presentation change for links and to omit
-`***bold***`/nested cases, and acceptance of a dedicated span-tracking rewrite
-as a distinct feature work-stream (not a repair). Absent that, still safe to
-omit.
+### Boundary fuzzing
+Deterministic fuzzing found no silent truncation, no chunk-limit violation, no
+surrogate splitting, and no protected-region corruption. The two observed
+effects were (a) the harmless whitespace-insertion non-idempotence (above) and
+(b) the confirmed `.`/`:` literal split. **No additional defects.**
 
-## Files changed
-- `IMPLEMENTATION_REPORT.md` — completely replaced with this single
-  investigation report (the only permitted repository modification).
-- `backend/ai/tools/delivery.py` — **unchanged**.
-- `tests/test_67_ai_output_pipeline.py` — **unchanged**.
-- `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`, migrations, Supabase —
-  **unchanged**.
+## Confirmed defects
+### Defect 1 — Punctuation-space rule splits dot/colon literals
+- **Exact input:** `main.py` (also `report.txt`, `example.com`, `data.v1.csv`,
+  `e.g.`, `U.S.A`, `run main.py now`).
+- **Actual output:** `main. py`, `report. txt`, `example. com`,
+  `data. v1. csv`, `e. g.`, `U. S. A`, `run main. py now`.
+- **Expected output:** unchanged (`main.py`, `report.txt`, `example.com`, …)
+  — these are literal identifiers/domains/abbreviations, not sentence/clause
+  punctuation.
+- **Root cause:** in `_normalize_plain`,
+  `re.sub(r"([,.;:!?،؛؟])(?=[A-Za-zА-Яа-яء-ي])", r"\1 ", text)`. Including
+  `.` and `:` treats filename/domain/extension boundaries as sentence
+  punctuation.
+- **Reproduction:** direct interpreter run against current source (above).
+- **Architectural location:** `backend/ai/tools/delivery.py`, `_normalize_plain`
+  (single substring substitution; no provider/AI/database/Telegram change).
+- **Deterministic fixability:** Yes — local, deterministic, no intent inference.
+- **Proposed minimal deterministic rule (documented only, NOT implemented in
+  this audit chunk):** narrow the splice class to sentence punctuation only —
+  `re.sub(r"([,;!?،؛؟])(?=[A-Za-zА-Яа-яء-ي])", r"\1 ", text)` (drop `.` and
+  `:`). A read-only replication (`_normalize_plain` with only this change) fixed
+  all 8 corrupted cases above while leaving every intended-spacing case
+  (`hello,world`, `سلام،world`, `note;see`, `تشکر!انجام`, `x,y`) identical and
+  the existing focused tests green.
 
-## Tests
-No production/test modifications were made. Only read-only interpreter probes
-(recorded under Evidence/experiments) were executed. The last committed suite
-remains `1044 passed, 23 skipped, 1 warning` (unchanged from the previous
-delivered chunk; not re-run because no code changed).
+## Not defects (explicitly tested, confirmed intentional/rule-consistent)
+- Intraword emphasis preservation (`2*3*4`, `some_word_here`,
+  `some__word__here`, `foo_bar_baz`, Arabic/CJK word-adjacent delimiters).
+- Word-boundary emphasis degradation (`*italic*`, `**bold**`, `_em_`,
+  `__under__`).
+- Adjacent/touching mixed `*`/`_` output (`*a*_b_` → `*a*b`) — deterministic
+  rule consequence of the `\w`-includes-`_` boundary.
+- Block conversions: `- x` → `• x`, `# x` → `x`, `> ` → `▎ `.
+- `.strip()` trailing/leading whitespace; `<span> ` collapse.
+- Chunk continuation markers, numbering, first-message header, reconstruction.
+- Formatter-failure fallback preserving original text; partial-delivery
+  `success=False` semantics.
+- Harmless whitespace-insertion idempotence (never deletes literals/URLs).
+
+## Unknowns
+- Practical user-visible impact of the `.`/`:` literal split (no repo evidence;
+  defect is deterministic and content-altering, so it stands regardless).
+- Whether native Markdown entities would be desired if ever unblocked.
+
+## Security / architecture impact
+No security or execution boundary changes. `deliver_response` remains the sole
+delivery entry; Self Bot stays the Telegram execution authority; no
+provider/AI/network/database/Telegram-RPC change. The confirmed defect and its
+proposed fix are confined to `_normalize_plain` inside the existing centralized
+boundary. Protected-token content remains opaque (fix only affects the plain
+splice pass, which runs on protected-masked text).
 
 ## Database / schema impact
 None. No schema changes, no migrations, no Supabase writes, no SQL executed.
 
+## Tests / experiments actually executed
+- `python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header`
+  → **54 passed** (read-only baseline; no file edits).
+No other suite was run because no code was modified. Only read-only interpreter
+probes (reproduction + a `_normalize_plain` replication of the proposed fix)
+were executed, all documented above. No test counts are invented.
+
+## Final evidence-gate decision
+**PASS — actionable deterministic delivery defect(s) identified.**
+Exactly one confirmed defect: `_normalize_plain`'s punctuation-space splice
+splits dot/colon literals (filenames, extensions, bare domains, abbreviations).
+It is reproducible, deterministic, meaning-altering, and has a small local fix
+inside the existing architecture without intent inference, protected-region
+change, or UTF-16/chunking change.
+
+## Next-step recommendation
+Implement exactly ONE rule in the next implementation chunk:
+**Prevent the punctuation-space splice from splitting `.`/`:` literals.**
+- Files expected: `backend/ai/tools/delivery.py` (`_normalize_plain`) and
+  `tests/test_67_ai_output_pipeline.py` (regression) + `IMPLEMENTATION_REPORT.md`.
+- Minimal change: splice set `[,.;:!?،؛؟]` → `[,;!?،؛؟]` (drop `.` and `:`).
+- Deterministic, idempotent, meaning-preserving; protected regions and existing
+  tests unaffected.
+- Focused tests: `main.py`/`report.txt`/`example.com`/`e.g.`/`U.S.A`/`data.v1.csv`
+  preserved; `hello,world`/`سلام،world`/`note;see`/`x,y` still spaced; protected
+  URL/`@user`/`/cmd`/inline+fenced code unchanged; idempotence; malformed/
+  ambiguous input unchanged; integration through `deliver_response`.
+- DO NOT touch the entity work, UTF-16 splitter, chunk formatting, or provider
+  code.
+
+## Files changed
+- `IMPLEMENTATION_REPORT.md` — completely replaced with this single audit report
+  (the only repository modification this investigation chunk).
+- Production files: **None**.
+- Test files: **None**.
+- `backend/ai/tools/delivery.py`, `backend/bot/handlers/ai_unified.py`,
+  `tests/test_67_ai_output_pipeline.py`, `DATABASE_ARCHITECTURE.md`,
+  `INVESTIGATION.md`: **unchanged**.
+
 ## Commit / delivery
-- Base commit (start of chunk): `0c5be2755dfa335466a807cdb569a37aa8a9d960`
-- Investigation report commit: `739364649bcc0069e90cc71fabfe62db27c91c9f` — `docs: record span-tracking markdown entity investigation (blocked)`
-- Push result: pushed to `origin/main` (`0c5be27..7393646`)
-- Remote verification: local HEAD == `origin/main` == remote `main` == `739364649bcc0069e90cc71fabfe62db27c91c9f` (verified via `git fetch origin main`)
-- Final working-tree state: clean
-- No production/test code changed; investigation-only report delivery.
+- Base commit (start of audit): `ceb9c797d4b1db5dfa63e7c9aada00b6992952dc`
+- Local HEAD == `origin/main` == remote `main` at start.
+- This investigation produces a report-only change; commit/push facts will be
+  recorded after delivery.
+- Working tree at end of audit (before report commit): `IMPLEMENTATION_REPORT.md`
+  changed only; no production/test/database code changed.
