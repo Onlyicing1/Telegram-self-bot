@@ -392,3 +392,109 @@ in Phase 4 and are reported separately.
 
 This Phase 4 report update is the only repository change. Commit and remote
 verification details are recorded after delivery.
+
+---
+
+# Canonical Database Bootstrap — Full Contract Audit Delivery
+
+## Objective
+
+Produce ONE canonical, self-contained Supabase/PostgreSQL bootstrap script
+that establishes the complete database state required by CURRENT application
+code, derived from a repository-wide database contract audit — not from
+prior reports or documentation prose.
+
+## Base commit
+
+`30bb3a426c2ec419be9d8f43373d85ce27d77099` (`origin/main`, clean tree).
+
+## Repository state verified
+
+- Every `.table(` call site enumerated across `backend/`, `tests/`, `src/`:
+  **60 call sites, zero `.rpc(` calls** (no functions/triggers required).
+- All 16 migrations under `supabase/migrations/` read chronologically.
+- Writer/read payloads traced at source level: `backend/db/client.py`,
+  `backend/services/save_service.py`, `backend/services/settings_service.py`,
+  `backend/services/panel_settings_repository.py`,
+  `backend/services/ghost_seen_v2.py`, `backend/ai/persistence.py`,
+  `backend/ai/config_store.py`,
+  `backend/ai/database/usage_repository.py`,
+  `backend/ai/database/provider_stats_repository.py`, `backend/web/app.py`.
+- Table inventory: **14 tables = 13 code-active** (`saved_items`,
+  `bio_state`, `username_state`, `bot_logs`, `panel_settings`,
+  `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`,
+  `ai_tool_history`, `ai_usage`, `ai_provider_stats`) **+ 1 legacy**
+  (`ghost_chats`, zero code references, owner-gated drop).
+
+## Findings (headline corrections vs prior reports)
+
+- `username_state` **has** a migration (`20260801215007`); the earlier
+  "migration-less" claim was an indexing artifact.
+- `saved_items.file_name`/`short_code` have **no live writer** — the current
+  Deep-Save payload in `save_service.py` omits both (preserved additively).
+- Migration-history conflicts: `20260712234229` vs `20260714111706`
+  (`save_type`/`bot_logs.level` CHECKs removed by the later file; a raw
+  chronological replay leaves `anon_update_bot_logs` alive);
+  `20260823130000` performs a destructive days→seconds column transition
+  that the canonical script does not replay.
+- Legacy columns preserved additively: `saved_items.short_code`/`file_name`,
+  `panel_settings.update_stale_seconds`,
+  `panel_settings.ghost_seen_retention_seconds`,
+  `ai_tool_history.result_data`.
+- Seeds: only `panel_settings('global')` is code-required; the five
+  `bot_settings` legacy defaults are retained `ON CONFLICT DO NOTHING`;
+  `ghost_seen_allowed_chats` is runtime-created and deliberately NOT seeded.
+
+## Changes implemented
+
+- `DATABASE_ARCHITECTURE.md`: new **"Canonical Supabase Bootstrap SQL (Full
+  Database Contract Audit)"** section — application↔database contract
+  matrix, migration-history reconciliation findings, and ONE complete fenced
+  SQL block (510 lines: 14 tables, 28 indexes, RLS enabled with SELECT-only
+  anon policies on every table, `BEGIN`/`COMMIT`), plus explicit boundaries
+  and uncertainty statements.
+- `supabase/canonical_bootstrap.sql`: standalone copy of the canonical block,
+  verified **byte-identical** to the doc's fenced block programmatically.
+- Implementation note: the file-edit tool layer was out of sync with
+  `DATABASE_ARCHITECTURE.md` (seven anchored edit attempts failed against
+  byte-verified content, proven via `od`). The section was spliced
+  programmatically and the result re-verified: exactly one ` ```sql ` fence,
+  byte-identity with the standalone file, and correct
+  table/index/policy/seed counts.
+
+## Database safety
+
+- Live Supabase was **NOT accessible**; no live state is claimed.
+- **No SQL was executed** against any database (no PostgreSQL tooling in the
+  environment; validation was static: contract cross-check + block
+  completeness checks).
+- No destructive operations; no RLS weakening — the script enforces the
+  documented SELECT-only anon boundary and drops only anon WRITE policies
+  that contradict it. No data was modified.
+
+## Tests actually executed (this phase, this environment)
+
+- `python3 -m pytest tests/ -q` → **981 passed, 23 skipped, 1 warning in
+  31.35s** (the 23 skips are the pre-existing legacy `ghost_seen_service`
+  suite; identical to the `30bb3a4` baseline).
+- `python3 -m compileall -q backend tests` → OK.
+- `git diff --check` → clean.
+- SQL execution against a live/test database: **not performed** (no
+  PostgreSQL/Supabase tooling available; no parser installed).
+
+## Previous recorded tests
+
+- `775b010` delivery: full suite 981 passed, 23 skipped (recorded then, not
+  re-run as part of that phase's evidence).
+
+## Remaining blockers (owner-gated, unchanged)
+
+`ghost_chats` drop (requires live-data check), `saved_items.short_code`/
+`file_name` drops, orphan `panel_settings` columns, `ai_preferences`,
+`GHOST_SEEN_DESTINATION_*` configuration, AI-table retention policy, live
+RLS-posture verification, legacy skipped-test disposition.
+
+## Commit / delivery
+
+Delivery commit and remote verification details are recorded immediately
+after push.
