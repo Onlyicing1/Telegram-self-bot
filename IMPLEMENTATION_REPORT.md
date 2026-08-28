@@ -151,8 +151,8 @@ delivery path was created.
   churn.
 
 ## Commit / delivery
-- Commit 1: `de0cd3e991d5a1f41d2a87f1ddd3cf60861234fe` — `docs: record markdown entity delivery blocked investigation`
-- Commit 2 (report-facts finalization): `151089a4ac517e972dfe58cee0318a85d4b77804` — `docs: finalize blocked investigation delivery facts`
-- Push result: pushed to `origin/main` (both commits)
-- Remote verification: local HEAD == `origin/main` == remote `main`
+- Primary commit: `de0cd3e991d5a1f41d2a87f1ddd3cf60861234fe` — `docs: record markdown entity delivery blocked investigation` (report body)
+- Ledger-finalization commit: `2c884e508fe023d6b0932714aaa06fcac6bc6b4b` — `docs: finalize blocked investigation delivery facts`
+- Push result: pushed both commits to `origin/main` (`89c7135..2c884e5`)
+- Remote verification: `origin/main` advanced to `2c884e5…`; local HEAD == `origin/main` == remote `main`
 - Final working-tree state: clean
