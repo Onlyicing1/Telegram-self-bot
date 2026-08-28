@@ -744,4 +744,4 @@ The active durable state is `bot_settings(key text primary key, value text not n
 - Security: service-role writes and existing SELECT-only RLS policies unchanged; no credentials, arbitrary SQL, or Telegram RPC surface introduced.
 
 ### Delivery
-Pending commit and push of this implementation and report.
+Delivered in commit `8679e1881104f03967e9f1b11784cb43864eeb3e` (`fix: confirm ghost seen allow-list persistence`). Push to `origin/main` succeeded. Local HEAD, `origin/main`, and remote `refs/heads/main` match; working tree is clean.
