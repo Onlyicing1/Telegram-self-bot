@@ -614,3 +614,44 @@ the audit proved broken.
   origin/main` + `git ls-remote origin main` all equal `c205caa…`.
 - **Final working-tree state:** `main` in sync with `origin/main`,
   clean; no unrelated files touched.
+
+# Ghost Seen Durable Persistence Verification — 2026-08-28
+
+## Objective
+
+Verified and documented the complete Ghost Seen allow-list lifecycle: enable → database write → restart → database read → in-memory restoration → enforcement.
+
+## Repository state and contract
+
+Audited current HEAD `128f4883b90b304b88c5c6982202dec34e3b1657`. The active contract is `bot_settings(key, value, value_type, updated_at)`, using `key = 'ghost_seen_allowed_chats'` and a JSON array of integer Telegram chat IDs in `value`.
+
+`backend/services/ghost_seen_v2.py` performs the write through `_persist_allowed_to_db()` and the read through `_ensure_allowed_loaded_async()`. `allow_chat()` and `disallow_chat()` mutate the runtime set and persist the complete sorted set. Startup registration schedules the async loader; browser, manage, and toggle paths await it before consuming the allow-list. The loader unions decoded IDs into `_allowed_chats`, and `is_chat_allowed()` enforces the restored set.
+
+## Database verification
+
+The repository migration `supabase/migrations/20260729213959_20260729120000_create_bot_settings_table.sql` and `supabase/canonical_bootstrap.sql` both define the required `bot_settings` schema, primary key, RLS, and SELECT policy. The canonical SQL does not repurpose `ghost_chats`.
+
+The earlier architecture text incorrectly described `bot_settings` as removable. That stale statement was corrected to mark the proposal superseded because current Ghost Seen code depends on the table.
+
+## Changes
+
+- Corrected the contradictory `bot_settings` statement in `DATABASE_ARCHITECTURE.md`.
+- No application code, migrations, or canonical SQL changes were necessary; the prior race-safe implementation and restart regression tests already cover the persistence boundary.
+- No new Ghost Seen table or persistence mechanism was introduced.
+
+## Verification actually executed
+
+- `python3 -m pytest tests/test_65_ghost_seen_v2_restart_persistence.py -q --no-header` — 5 passed.
+- `python3 -m pytest tests/ -q --no-header` — 988 passed, 23 skipped, 1 warning.
+- `python3 -m compileall -q backend tests` — passed.
+- `git diff --check` — passed.
+
+Live Supabase and Telegram runtime access were not used. SQL was not executed against any database. The live presence of `bot_settings` remains to be confirmed separately; the repository schema and code contract agree.
+
+## Safety
+
+No credentials, tokens, session strings, or historical data were added. No destructive SQL was run, no RLS policy was weakened, and no database data was modified.
+
+## Delivery
+
+Pending commit and push of this report plus the architecture correction.

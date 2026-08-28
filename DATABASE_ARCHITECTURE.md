@@ -379,11 +379,10 @@ The following columns were referenced in older documentation or the
 - ~~`panel_auto_close_seconds`~~ — superseded by `auto_close_delay`
 - ~~`log_cleanup_days`~~ — superseded by `log_retention_days`
 - ~~`diagnostics_enabled`~~ — never implemented in `settings_service.py`
-- ~~`bot_settings` table~~ — key-value transition table created by
-  migration `20260729213959` and intended to be migrated into
-  `panel_settings` columns. The migration that would have performed the
-  migration and dropped `bot_settings` does not exist. A future
-  migration must drop `bot_settings` if it exists.
+- ~~`bot_settings` table~~ — this earlier removal proposal is superseded.
+  The current Ghost Seen implementation actively requires `bot_settings`
+  for the `ghost_seen_allowed_chats` durable allow-list; do not drop it
+  until a replacement persistence design and data migration are implemented.
 
 ---
 
