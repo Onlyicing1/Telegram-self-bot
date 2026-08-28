@@ -221,8 +221,8 @@ None. No schema changes, no migrations, no Supabase writes, no SQL executed.
 
 ## Commit / delivery
 - Base commit (start of chunk): `0c5be2755dfa335466a807cdb569a37aa8a9d960`
-- Local HEAD == `origin/main` == remote `main` at start of chunk.
-- This investigation produces a report-only change; commit/push facts are
-  recorded after delivery.
-- Working tree at end of investigation (before optional report commit): report
-  changed only; no production/test code changed.
+- Investigation report commit: `739364649bcc0069e90cc71fabfe62db27c91c9f` — `docs: record span-tracking markdown entity investigation (blocked)`
+- Push result: pushed to `origin/main` (`0c5be27..7393646`)
+- Remote verification: local HEAD == `origin/main` == remote `main` == `739364649bcc0069e90cc71fabfe62db27c91c9f` (verified via `git fetch origin main`)
+- Final working-tree state: clean
+- No production/test code changed; investigation-only report delivery.
