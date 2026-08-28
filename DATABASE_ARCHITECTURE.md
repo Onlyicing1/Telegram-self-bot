@@ -1,5 +1,8 @@
 # Database Architecture — LifeOS Telegram Self-Bot
 
+> **Canonical specification:** This document defines the final PostgreSQL/Supabase contract for the current application. Historical notes below are retained only where needed to explain compatibility; the canonical SQL block and final table contracts are authoritative.
+
+
 > **Canonical database specification.**
 > This document is the single source of truth for every table, column,
 > index, constraint, and RLS policy in the Supabase database. Future
@@ -1778,6 +1781,31 @@ producer yet.
 | Scheduler active flags | CURRENT (runtime) + durable per-engine `is_active` in `bio_state` / `username_state` | `profile/scheduler.py` + engines | Yes |
 
 ---
+
+## Final Canonical Contract
+
+The canonical database consists of the following public-schema tables: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, and the compatibility-preserved legacy table `ghost_chats`. The complete definitions, defaults, constraints, indexes, RLS policies, and seeds are in the single SQL block in the next section.
+
+All tables use RLS. `anon` and `authenticated` have SELECT-only policies with `USING (true)`; they have no INSERT, UPDATE, or DELETE policies. Backend writes use the service-role client. No foreign keys are required: identifier relationships are intentionally application-level.
+
+### Persistent state contract
+
+| State | Storage | Durable behavior |
+|---|---|---|
+| Saved item metadata | `saved_items` | Inserted after Deep Save and read by retrieval, search, delete, and dashboard paths |
+| Bio automation | `bio_state` keyed by `owner_id` | Loaded/updated by the ProfileEngine |
+| Username automation | `username_state` keyed by `owner_id` | Loaded/updated by the ProfileEngine |
+| Global settings | `panel_settings` row `key='global'` | Required singleton is seeded; dashboard font is `dashboard_font text NOT NULL DEFAULT 'default'` with the 23-key CHECK |
+| Ghost Seen enabled chats | `bot_settings` row `key='ghost_seen_allowed_chats'`, `value text` | JSON array of integer Telegram chat IDs; loaded at startup and consumed by `is_chat_allowed()` |
+| AI configuration | `ai_config` keyed by `owner_id` | Provider/configuration and trigger fields persist across startup |
+| AI sessions/messages/memories/tool history | respective AI tables | Persisted where current repositories write/read them |
+| AI usage/provider aggregates | `ai_usage`, `ai_provider_stats` | Per-request telemetry and `(provider_name, owner_id)` aggregate upsert |
+
+Ghost Seen does not persist messages, selections, reply state, pagination, locks, or temporary viewer state. `ghost_chats` is legacy compatibility storage and is not the Ghost Seen allow-list source.
+
+### Required seeds
+
+`panel_settings(key='global')` is required. The canonical SQL inserts it with `ON CONFLICT DO NOTHING`. Five legacy `bot_settings` compatibility rows are also inserted. The Ghost Seen allow-list row is intentionally not seeded: the first toggle creates it, and its initial logical value is an empty list. No historical application data or credentials are fabricated.
 
 ## Canonical Supabase Bootstrap SQL (Full Database Contract Audit)
 

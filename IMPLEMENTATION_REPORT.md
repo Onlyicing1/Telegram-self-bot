@@ -686,3 +686,33 @@ RLS remains enabled with anonymous SELECT-only policy posture; service-role writ
 ## Delivery
 
 Pending commit and push of this audit report.
+
+# Canonical Database Architecture Specification — 2026-08-28
+
+## Objective
+
+Reconciled `DATABASE_ARCHITECTURE.md` into an explicit canonical database construction specification for the current application, while preserving the verified canonical SQL block and avoiding application/schema redesign.
+
+## Changes
+
+- Added a clearly marked final canonical contract section covering all application tables, persistent-state ownership, RLS posture, required seeds, Ghost Seen storage, dashboard font storage, and transient-state boundaries.
+- Preserved the existing complete 510-line SQL block and verified it remains byte-identical to `supabase/canonical_bootstrap.sql`.
+- No migrations, application code, live database, or canonical standalone SQL file were changed.
+
+## Included contract
+
+The specification covers `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, and compatibility-preserved `ghost_chats`. Ghost Seen uses `bot_settings.key='ghost_seen_allowed_chats'` with a JSON array of integer chat IDs. Dashboard font uses `panel_settings.dashboard_font` with the built-in 23-key CHECK. Service-role writes and anonymous/authenticated SELECT-only RLS policies are preserved.
+
+## Validation actually executed
+
+- `python3 -m pytest tests/ -q --no-header` — 988 passed, 23 skipped, 1 warning.
+- `python3 -m pytest tests/test_03_database_consistency.py tests/test_33_ai_telemetry.py tests/test_44_database_stats.py tests/test_65_ghost_seen_v2_restart_persistence.py -q --no-header` — 40 passed.
+- `python3 -m compileall -q backend tests` — passed.
+- `git diff --check` — passed.
+- Canonical fenced SQL vs `supabase/canonical_bootstrap.sql` — byte-identical.
+
+Live Supabase access and SQL execution were not performed. No credentials or historical application data were added, and no destructive SQL or RLS weakening occurred.
+
+## Delivery
+
+Pending commit and push of this architecture specification and report.
