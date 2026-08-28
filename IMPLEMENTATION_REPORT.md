@@ -603,3 +603,14 @@ the audit proved broken.
   contract verifications, simulated at the persistence boundary with
   fakes. Live state (whether migrations `20260823120000` +
   `20260827000001` are already applied) remains an owner-side check.
+
+## Delivery verification
+
+- **Commit:** `c205caa253dcd08c09d00efa19efab97273e815f` — `fix: make
+  ghost seen allow-list restart persistence race-free` (5 files,
+  +419/−22).
+- **Push:** succeeded — `1a4c955..c205caa  main -> main`.
+- **Remote verification:** post-push `git fetch` + `git rev-parse HEAD
+  origin/main` + `git ls-remote origin main` all equal `c205caa…`.
+- **Final working-tree state:** `main` in sync with `origin/main`,
+  clean; no unrelated files touched.
