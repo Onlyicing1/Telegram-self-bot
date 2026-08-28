@@ -152,7 +152,7 @@ delivery path was created.
 
 ## Commit / delivery
 - Primary commit (report body): `de0cd3e991d5a1f41d2a87f1ddd3cf60861234fe` — `docs: record markdown entity delivery blocked investigation`
-- Final commit (current HEAD, this report): `9f3a067f929fea5a739b52b6d35ae61bebeb6a48` — `docs: record final delivered sha in blocked investigation report`
-- Push result: pushed to `origin/main`
-- Remote verification: local HEAD == `origin/main` == remote `main` == `9f3a067f929fea5a739b52b6d35ae61bebeb6a48`; verified via `git fetch origin main`
+- Final delivered commit (on `origin/main`): `f7f59043f0788c97b4417dbf593860bf9f41020a` — report truthfulness corrections
+- Push result: pushed to `origin/main` (fast-forwards up to `f7f5904`)
+- Remote verification: local HEAD == `origin/main` == remote `main` == `f7f59043f0788c97b4417dbf593860bf9f41020a`; verified via `git fetch origin main`
 - Final working-tree state: clean
