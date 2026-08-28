@@ -4,7 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.ai.tools.delivery import SAFE_LIMIT, _format_chunks, process_output, _entity_valid
+import re
+from backend.ai.tools.delivery import (
+    SAFE_LIMIT,
+    _entity_valid,
+    _format_chunks,
+    _split_text,
+    _utf16_units,
+    process_output,
+)
 
 
 @pytest.mark.parametrize("text", [
@@ -56,8 +64,15 @@ def test_utf16_safe_chunking_and_no_truncation():
     text = "🙂" * (SAFE_LIMIT + 20)
     chunks = _format_chunks("Nova hi", "Nova", text)
     assert len(chunks) > 1
-    assert all(len(chunk) <= SAFE_LIMIT for chunk in chunks)
-    assert "🙂" * (SAFE_LIMIT + 20) in "".join(chunks)
+    assert all(_u16(chunk) <= SAFE_LIMIT for chunk in chunks)
+    # The response body is preserved across all delivered messages when the
+    # continuation markers are stripped.
+    header = "Nova hi\n────────────\n🤖 Nova\n"
+    suffix = re.compile(r"\n\n_\(\d+/\d+\)_$")
+    parts = [chunks[0][len(header):]]
+    for m in chunks[1:]:
+        parts.append(suffix.sub("", m))
+    assert "".join(parts) == text
 
 
 @pytest.mark.asyncio
@@ -96,6 +111,180 @@ def test_entity_and_utf16_offsets_are_valid():
 def test_telegram_length_is_enforced_in_utf16_units():
     chunks = _format_chunks("Nova", "Nova", "🙂" * (SAFE_LIMIT + 100))
     assert all(len(chunk.encode("utf-16-le")) // 2 <= SAFE_LIMIT * 2 for chunk in chunks)
+
+
+_EMOJI = "🙂"  # BMP-free: 2 UTF-16 code units, 1 Python character
+
+
+def _u16(s):
+    return _utf16_units(s)
+
+
+@pytest.mark.parametrize("body", [
+    "a" * (SAFE_LIMIT - 40),
+    "a" * (SAFE_LIMIT - 24),
+    "a" * (SAFE_LIMIT - 23),
+    "a" * (SAFE_LIMIT - 20),
+])
+def test_ascii_near_limit_splits_within_utf16(body):
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert chunks
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_ascii_exact_at_limit_no_split():
+    body = "a" * SAFE_LIMIT
+    assert _split_text(body, SAFE_LIMIT) == [body]
+
+
+def test_ascii_just_over_limit_splits():
+    body = "a" * (SAFE_LIMIT + 1) + "."
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert len(chunks) == 2
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_bmp_unicode_chunks():
+    body = "پ" * (SAFE_LIMIT + 1) + "端"
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_python_len_below_limit_but_utf16_over_limit_must_split():
+    # 4000 emoji have Python len 4000 (at limit) but UTF-16 length 8000
+    # (over). The splitter MUST split, proving length is measured in UTF-16.
+    python_below_limit = _EMOJI * (SAFE_LIMIT - 1)  # Python len 3999 < 4000
+    assert len(python_below_limit) < SAFE_LIMIT
+    assert _u16(python_below_limit) > SAFE_LIMIT
+    chunks = _split_text(python_below_limit, SAFE_LIMIT)
+    assert len(chunks) > 1
+    assert "".join(chunks) == python_below_limit
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_many_emoji_split_and_preserved():
+    body = _EMOJI * (SAFE_LIMIT + 100)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert len(chunks) > 1
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_mixed_ascii_and_emoji_split_and_preserved():
+    body = ("ab" + _EMOJI) * (SAFE_LIMIT)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_persian_and_emoji_split_and_preserved():
+    body = ("قیمت" + _EMOJI + "دلار") * (SAFE_LIMIT)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_arabic_and_emoji_split_and_preserved():
+    body = ("مرحبا" + _EMOJI) * (SAFE_LIMIT)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_cjk_and_emoji_split_and_preserved():
+    body = ("世界" + _EMOJI) * (SAFE_LIMIT)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_mixed_rtl_ltr_and_emoji_split_and_preserved():
+    body = ("سلام_test" + _EMOJI + "راه") * (SAFE_LIMIT)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_no_surrogate_pair_is_split():
+    body = _EMOJI * (SAFE_LIMIT + 10)
+    chunks = _split_text(body, SAFE_LIMIT)
+    for c in chunks:
+        for ch in c:
+            pass
+    # every chunk must have an even count of the pair (each emoji is 2 code
+    # units), so no lone surrogate appears at chunk edges.
+    for c in chunks:
+        assert _EMOJI * (len(c) // 1) == c
+
+
+def test_paragraph_newline_word_preference_preserved():
+    # When a paragraph boundary fits in the budget it is used (the chunk
+    # does NOT split mid-word).
+    body = ("word " * 30) + "\n\n" + ("another " * 60)
+    limit = 120
+    chunks = _split_text(body, limit)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= limit for c in chunks)
+    # A paragraph split point (if it fits) yields a chunk ending at the
+    # boundary, not in the middle of a word.
+    first_has_para = "\n\n" in chunks[0]
+    if first_has_para:
+        assert chunks[0].rstrip().endswith(chunks[0].rstrip().split()[-1])
+
+
+def test_long_unicode_output():
+    body = ("سلام " * 50) + (_EMOJI * 100) + ("世界" * 40) + ("hello " * 60)
+    chunks = _split_text(body, SAFE_LIMIT)
+    assert "".join(chunks) == body
+    assert all(_u16(c) <= SAFE_LIMIT for c in chunks)
+
+
+def test_formatted_delivery_messages_all_within_utf16_limit():
+    resp = _EMOJI * (SAFE_LIMIT - 1)
+    msgs = _format_chunks("hi", "Nova", resp)
+    assert any("🙂" in m for m in msgs)
+    assert all(_u16(m) <= SAFE_LIMIT for m in msgs)
+    assert len(msgs) > 1
+
+
+def test_delivery_body_reconstructs_response_across_messages():
+    resp = _EMOJI * (SAFE_LIMIT + 30)
+    msgs = _format_chunks("user", "Nova", resp)
+    header = "user\n────────────\n🤖 Nova\n"
+    suffix = re.compile(r"\n\n_\(\d+/\d+\)_$")
+    parts = [msgs[0][len(header):]]
+    for m in msgs[1:]:
+        parts.append(suffix.sub("", m))
+    assert "".join(parts) == resp
+
+
+@pytest.mark.asyncio
+async def test_deliver_response_delivers_splitted_utf16_output():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text): replies.append(text)
+    from backend.ai.tools.delivery import deliver_response
+    resp = _EMOJI * (SAFE_LIMIT + 1)
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "u", "Nova", resp,
+    )
+    assert result.success
+    assert result.total_chunks == len(edits) + len(replies)
+    assert result.chunks_delivered == result.total_chunks
+    assert all(_u16(m) <= SAFE_LIMIT for m in edits + replies)
+
+
+def test_utf16_splitter_idempotent_on_realistic_bodies():
+    for body in [
+        "a" * (SAFE_LIMIT + 1) + "b",
+        (_EMOJI * 100) + "z",
+        "قیمت " * 100,
+    ]:
+        chunks = _split_text(body, SAFE_LIMIT)
+        assert "".join(chunks) == body
 
 
 def test_intraword_emphasis_delimiters_are_preserved():

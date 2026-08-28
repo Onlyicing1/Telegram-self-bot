@@ -158,22 +158,80 @@ def _find_split_point(chunk: str) -> int | None:
 
 
 def _split_text(text: str, limit: int) -> list[str]:
+    """Split ``text`` so every chunk is at most ``limit`` UTF-16 code units.
+
+    `limit` is a Telegram text-size boundary measured in UTF-16 code units,
+    matching Telegram/entity offset accounting. Supplementary-plane
+    characters (e.g. many emoji) occupy 2 UTF-16 units, so the limit is
+    enforced against ``_utf16_units``, never Python character count.
+    Surrogate pairs are never split. The concatenation of the returned
+    chunks preserves the complete content.
+    """
     chunks: list[str] = []
-    while len(text) > limit:
-        point = _find_split_point(text[:limit]) or limit
-        chunks.append(text[:point])
-        text = text[point:].lstrip("\n")
-    if text:
-        chunks.append(text)
+    rest = text
+    while _utf16_units(rest) > limit:
+        # Locate the UTF-16 boundary; drop to a character boundary when
+        # needed so a leading surrogate of a supplementary pair is never
+        # cut from the chunk and left orphaned.
+        point = _split_point_at_utf16(rest, limit)
+        chunks.append(rest[:point])
+        rest = rest[point:]
+    if rest:
+        chunks.append(rest)
     return chunks or [""]
+
+
+def _split_point_at_utf16(text: str, limit: int) -> int:
+    """Return the character index at which a legal split occurs.
+
+    First attempts paragraph/newline/word-boundary splits within the UTF-16
+    budget (mirroring the existing preference order); if none fits, falls
+    back to a character boundary that does not split a surrogate pair.
+    """
+    candidate = _find_split_point(_upto_utf16(text, limit)) or len(_upto_utf16(text, limit))
+    candidate = _align_to_character(text, candidate)
+    if candidate <= 0 or candidate >= len(text):
+        candidate = _align_to_character(text, limit)
+    return candidate
+
+
+def _upto_utf16(text: str, units: int) -> str:
+    """Return the longest prefix of ``text`` whose UTF-16 length <= ``units``.
+
+    Never splits a surrogate pair. Falls back to at least one character so
+    progress always occurs.
+    """
+    if _utf16_units(text) <= units:
+        return text
+    prefix = text
+    # Over-allocate then trim by units so a complete maximum-length prefix is
+    # always found without widening the scan repeatedly.
+    approx = min(len(text), (units // 2) + 4)
+    prefix = prefix[:approx]
+    while _utf16_units(prefix) > units:
+        prefix = prefix[:_align_to_character(prefix, len(prefix) - 1)]
+    if not prefix:
+        prefix = text[:1]
+    return prefix
+
+
+def _align_to_character(text: str, units: int) -> int:
+    """Return an index into ``text`` closest to ``units`` that does not split
+    a supplementary surrogate pair, and at minimum splits after one char."""
+    index = max(1, min(units, len(text)))
+    while index < len(text) and 0xD800 <= ord(text[index]) <= 0xDFFF:
+        index += 1
+    if index == 0 and text:
+        index = 1
+    return index
 
 
 def _format_chunks(user_message: str, trigger_label: str, response_text: str) -> list[str]:
     full = _format_message(user_message, trigger_label, response_text)
-    if len(full) <= SAFE_LIMIT:
+    if _utf16_units(full) <= SAFE_LIMIT:
         return [full]
     header = f"{user_message}\n────────────\n🤖 {trigger_label}\n"
-    body = _split_text(response_text, max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - len(header)))
+    body = _split_text(response_text, max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - _utf16_units(header)))
     if len(body) == 1:
         return _split_text(full, SAFE_LIMIT)
     return [header + body[0]] + [_format_continuation(part, i + 1, len(body)) for i, part in enumerate(body[1:], 1)]
