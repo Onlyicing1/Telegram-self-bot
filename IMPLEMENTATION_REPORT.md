@@ -745,3 +745,52 @@ The active durable state is `bot_settings(key text primary key, value text not n
 
 ### Delivery
 Delivered in commit `8679e1881104f03967e9f1b11784cb43864eeb3e` (`fix: confirm ghost seen allow-list persistence`). Push to `origin/main` succeeded. Local HEAD, `origin/main`, and remote `refs/heads/main` match; working tree is clean.
+
+# AI Output Normalization & Telegram Delivery Pipeline — 2026-08-28
+
+## Objective
+
+Add centralized, automatic, language-agnostic normalization before AI responses reach Telegram without changing provider or tool architecture.
+
+## Scope and integration
+
+The verified path is `ProviderManager → Dispatcher → EngineResult → ai_unified._execute_ai → backend/ai/tools/delivery.py::deliver_response → Telegram edit/reply`. The delivery module is the single normalization boundary.
+
+## Files changed
+
+- `backend/ai/tools/delivery.py`
+- `tests/test_67_ai_output_pipeline.py`
+- `IMPLEMENTATION_REPORT.md`
+
+## Implementation
+
+The processor applies NFC normalization, conservative whitespace/newline cleanup, punctuation spacing, Unicode script profiling, and RTL/LTR metadata. It protects fenced and inline code, URLs, usernames, and Telegram commands. Persian character normalization is gated by Persian-specific markers; Arabic, Latin, Cyrillic, and CJK text are not subjected to Persian rules. No translation or user configuration is involved.
+
+Supported Markdown is safely degraded to text: links become visible text plus URL, emphasis markers are removed, and headings/lists/quotes are rendered as readable text. Malformed Markdown remains recoverable. Responses are never silently truncated; oversized results are split deterministically. Formatter failures are logged by exception type and fall back to the original response.
+
+The processor performs no AI, network, database, or Telegram calls. Diagnostics contain only scripts, direction, Markdown presence, changed state, and length.
+
+## Telegram and test coverage
+
+The tests cover English, Persian, Arabic, Cyrillic, Chinese, Japanese, Korean, mixed RTL/LTR text, numbers, emoji, URLs, usernames, commands, inline/fenced code, Markdown, malformed markers, whitespace, punctuation, blank lines, CJK preservation, protected tokens, UTF-16 entity calculations, length enforcement, formatter fallback, empty output rejection, and the real centralized delivery function.
+
+The current delivery path sends normalized plain text rather than Telegram parse-mode markup. Entity structures are validated for UTF-16 ranges in the processor tests; no entity list is currently passed to Telethon.
+
+## Verification
+
+- `python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header` — **26 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1016 passed, 23 skipped, 1 warning**.
+- `python3 -m compileall -q backend tests` — passed.
+- `git diff --check` — passed.
+
+## Database and security boundary
+
+`DATABASE_ARCHITECTURE.md` intentionally unchanged. No schema, migration, Supabase write, or persistent state change was introduced. Existing owner authorization, tool execution, Telegram client ownership, and credential/session protections remain unchanged.
+
+## Limitations
+
+Markdown is currently rendered as safe plain text rather than sent as Telegram entities. Chunking uses conservative Python string limits; the tested supplementary-plane emoji path remains within the conservative delivery bound.
+
+## Delivery status
+
+This report section is being committed with the implementation and tests; commit and remote verification are recorded after commit.
