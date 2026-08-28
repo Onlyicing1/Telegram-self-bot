@@ -655,3 +655,34 @@ No credentials, tokens, session strings, or historical data were added. No destr
 ## Delivery
 
 Pending commit and push of this report plus the architecture correction.
+
+# Complete Application-Code ↔ Database-Schema Compatibility Audit — 2026-08-28
+
+## Objective and scope
+
+Audited current HEAD `effdb70748aaafa0e92d7109a4eefa8b28dd1da1` against `DATABASE_ARCHITECTURE.md`, `supabase/canonical_bootstrap.sql`, all tracked migrations, backend persistence code, startup hydration, web readers, and database-focused tests.
+
+## Findings
+
+Active tables verified: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, and `ai_provider_stats`. `ghost_chats` is legacy/owner-gated with no current consumer. No `.rpc()` or raw SQL execution paths were found.
+
+All active reads, inserts, updates, deletes, filters, pagination, JSON serialization, defaults, nullable fields, CHECK values, and the `ai_provider_stats` conflict target `provider_name,owner_id` were cross-checked against the canonical SQL. No active code ↔ canonical SQL payload mismatch was found.
+
+Ghost Seen persists the complete sorted integer-ID set in `bot_settings.value` under `ghost_seen_allowed_chats`; startup hydration restores `_allowed_chats`, and `is_chat_allowed()` consumes it. Dashboard font persists through `panel_settings.dashboard_font` and is restored by `settings_service.load_all()` during supervisor startup. Bio/Username, Save, and AI persistence/telemetry contracts also match the canonical schema.
+
+Historical migration-status prose still contains older pending/proposed descriptions for objects resolved by Phase 3. Those are documentation drift in historical sections, not active schema incompatibilities; the canonical SQL and current contract matrix are authoritative. No production code, migration, or canonical SQL change was required.
+
+## Safety and live-state boundary
+
+RLS remains enabled with anonymous SELECT-only policy posture; service-role writes are preserved. No destructive SQL, live SQL execution, RLS weakening, credentials, historical data changes, arbitrary SQL execution, or arbitrary Telegram execution was introduced. Live Supabase and live Telegram runtime state were not accessed.
+
+## Validation actually executed
+
+- `python3 -m pytest tests/test_65_ghost_seen_v2_restart_persistence.py -q --no-header` — 5 passed.
+- `python3 -m pytest tests/ -q --no-header` — 988 passed, 23 skipped, 1 warning.
+- `python3 -m compileall -q backend tests` — passed.
+- `git diff --check` — passed.
+
+## Delivery
+
+Pending commit and push of this audit report.
