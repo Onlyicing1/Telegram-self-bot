@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ _selections: dict[int, set[int]] = {}
 _reply_states: dict[int, dict] = {}
 _allowed_chats: set[int] = set()
 _allowed_loaded = False
+_allowed_load_task: "asyncio.Task[None] | None" = None
+_persist_lock = threading.Lock()
 _manage_directory: list[Any] | None = None
 _manage_directory_at: float = 0.0
 
@@ -133,18 +136,8 @@ def clear_all_replies() -> None:
 
 # ── Privacy: per-chat opt-in model ──
 
-async def _ensure_allowed_loaded_async() -> None:
-    """Load the persisted allowed-chat set from ``bot_settings``.
-
-    Runs the Supabase read in a worker thread via ``asyncio.to_thread`` so
-    the event loop is never blocked on the render path. Loads at most once
-    per process; in-memory additions made during a load race are preserved
-    by unioning into the existing set.
-    """
-    global _allowed_loaded
-    if _allowed_loaded:
-        return
-    _allowed_loaded = True
+async def _load_allowed_chats_task() -> None:
+    """Single-shot DB read of the persisted allow-list (worker thread)."""
     try:
         import asyncio
         import json
@@ -161,34 +154,62 @@ async def _ensure_allowed_loaded_async() -> None:
                 _allowed_chats.update(int(x) for x in json.loads(data["value"]))
 
         await asyncio.to_thread(_load_sync)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.warning("ghost_seen_v2: failed to load allowed chats from DB: %s", exc)
+
+
+async def _ensure_allowed_loaded_async() -> None:
+    """Load the persisted allowed-chat set from ``bot_settings``.
+
+    Runs the Supabase read in a worker thread via ``asyncio.to_thread`` so
+    the event loop is never blocked on the render path. Loads at most once
+    per process; in-memory additions made during a load race are preserved
+    by unioning into the existing set.
+
+    Concurrent callers await the SAME in-flight load task: a Manage toggle
+    that lands while the initial read is still running waits for it, so it
+    can never persist a partial allow-list over the persisted one.
+    """
+    global _allowed_loaded, _allowed_load_task
+    import asyncio
+
+    if _allowed_load_task is None or _allowed_load_task.done():
+        if _allowed_loaded:
+            return
+        _allowed_loaded = True
+        _allowed_load_task = asyncio.ensure_future(_load_allowed_chats_task())
+    await asyncio.shield(_allowed_load_task)
 
 
 def _persist_allowed_to_db() -> None:
     """Persist the current allowed-chat set to ``bot_settings``.
 
     Runs the Supabase write in a background daemon thread so a slow DB
-    never blocks the event loop or a Manage toggle callback.
+    never blocks the event loop or a Manage toggle callback. Writes are
+    serialized through ``_persist_lock`` and snapshot the set INSIDE the
+    lock, so the last finishing write always carries the latest in-memory
+    state instead of an out-of-order stale snapshot.
     """
     try:
         import json
-        import threading
 
         from backend.db.client import get_db
         db = get_db()
         if db is None:
             return
-        value = json.dumps(sorted(_allowed_chats))
 
         def _write_sync() -> None:
             try:
-                existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
-                data = getattr(existing, "data", None) or []
-                if data:
-                    db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
-                else:
-                    db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
+                with _persist_lock:
+                    value = json.dumps(sorted(_allowed_chats))
+                    existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
+                    data = getattr(existing, "data", None) or []
+                    if data:
+                        db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
+                    else:
+                        db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
             except Exception as exc:
                 logger.warning("ghost_seen_v2: failed to persist allowed chats to DB: %s", exc)
 
@@ -238,9 +259,10 @@ def get_allowed_chats() -> frozenset[int]:
 
 def reset_allowed_chats() -> None:
     """Clear all privacy permissions (used only in tests)."""
-    global _allowed_loaded
+    global _allowed_loaded, _allowed_load_task
     _allowed_chats.clear()
     _allowed_loaded = True
+    _allowed_load_task = None
 
 
 async def send_reply(client: Any, source_chat_id: int, message_id: int, text: str) -> dict[str, Any]:

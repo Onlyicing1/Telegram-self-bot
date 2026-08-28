@@ -505,3 +505,101 @@ RLS-posture verification, legacy skipped-test disposition.
 - **Remote verification:** post-push `git fetch` + `origin/main` comparison
   and working-tree cleanliness check recorded in the follow-up verification
   entry below.
+
+---
+
+# Audit — Restart Persistence of Dashboard Font & Ghost Seen Allow-List
+
+**Date:** 2026-08-28 · **Base commit:** `1a4c955` (`docs: record canonical
+bootstrap delivery verification`) · **Scope:** verify the full WRITE →
+DATABASE → RESTART → READ → RESTORE → CONSUMPTION lifecycle for the
+dashboard/profile font and the Ghost Seen allowed-chat list; fix only what
+the audit proved broken.
+
+## Verdicts
+
+1. **Dashboard/Profile font survives a full restart: YES (code + DB
+   contract verified; live DB application of the migrations remains the
+   owner's pending manual step).**
+   Selection (`misc.py::_font_set_action` / web `PATCH /api/settings`) →
+   validation (`value in FONT_KEYS`, 23 keys — `"default"` included) →
+   `panel_settings_repository.update_field('dashboard_font', key)` →
+   `UPDATE panel_settings SET dashboard_font=…, updated_at=… WHERE key=
+   'global'` → schema `dashboard_font text NOT NULL DEFAULT 'default'`
+   + CHECK on the same 23 keys (`20260823120000`) → restart:
+   `RuntimeSupervisor.start()` calls `settings_service.load_all()`
+   (supervisor.py:177) which hydrates the cache before panels render →
+   consumed by `panel_render.py`, `profile/engine.py`, and
+   `GET /api/settings` → frontend. `load_all()` never writes defaults
+   back, so no restart-time overwrite exists.
+2. **Ghost Seen allowed-chat list survives a full restart: YES after the
+   fixes below; previously PARTIALLY** — the write/load/restore chain
+   existed (`allow_chat`/`disallow_chat` → `bot_settings` key
+   `ghost_seen_allowed_chats` JSON array; preload at `register()`;
+   union-restore enforced by `is_chat_allowed()`), but two races could
+   silently lose persisted chats.
+3. WRITE both states: yes (schema payloads verified against the current
+   migrations/writers).
+4. READ both back after restart: yes (startup hydration for font;
+   preload + awaited in-flight load for the allow-list).
+5. `DATABASE_ARCHITECTURE.md`: accurate at the schema level; updated
+   (§19.4, §25.2) with the verified restart lifecycles and race fixes.
+6. Schema/code mismatches: none for these two features (the known
+   panel-settings column gap is already covered by migration
+   `20260827000001`, pending live application).
+7. RLS/permission problems: none — both writes go through the
+   service-role key; anon/authenticated policies are SELECT-only.
+8. Startup-order/default-value problems: none for the font (cache-first
+   with startup hydration). For the allow-list, two races (fixed, below).
+9. Tests proving restart persistence: previously the font had a
+   service-level reload test but no write→restart→read chain test, and
+   the allow-list had NONE. Added (see Changes).
+10. Changed: `backend/services/ghost_seen_v2.py` (2 race fixes),
+    `tests/test_65_ghost_seen_v2_restart_persistence.py` (new, 5 tests),
+    `tests/test_42_dashboard_font.py` (+2 tests), `DATABASE_ARCHITECTURE.md`
+    (+2 verified-lifecycle sections).
+
+## Fixes implemented (Ghost Seen only — minimal, in-architecture)
+
+- **Race 1 (partial-list overwrite):** `_ensure_allowed_loaded_async()`
+  previously set its loaded-flag before the DB read completed, so a
+  Manage toggle landing during the startup preload could persist the
+  still-empty/partial in-memory set over the persisted allow-list,
+  silently dropping other allowed chats across the restart. Now the
+  loader is a single shared `asyncio.Task` and every concurrent caller
+  awaits it (`tests/test_65…::test_toggle_during_initial_load_persists_full_list`).
+- **Race 2 (stale overwrite):** `_persist_allowed_to_db()` spawned an
+  unsynchronized thread per toggle with the value snapshot taken at call
+  time; out-of-order thread completion could leave an older list in the
+  DB. Writes are now serialized through a `threading.Lock` and the set
+  is snapshotted inside the lock, so the last finishing write always
+  carries the latest in-memory state
+  (`tests/test_65…::test_rapid_toggles_never_persist_stale_list`).
+- `reset_allowed_chats()` (test hook) also clears the shared load task.
+- No API, schema, handler, or product behavior changed; the daemon-thread
+  persist (never blocking the toggle callback) is retained.
+
+## Tests actually executed NOW (this phase)
+
+- `python3 -m pytest tests/test_65_ghost_seen_v2_restart_persistence.py
+  tests/test_42_dashboard_font.py tests/test_48_font_panel.py -q` →
+  **25 passed**.
+- Full suite `python3 -m pytest tests/ -q` → **988 passed, 23 skipped**
+  (baseline 981 + 7 new tests; skips are the pre-existing legacy
+  `ghost_seen_service` tests, untouched).
+- `python3 -m compileall -q backend tests` → OK.
+- `git diff --check` → PASS.
+
+## Previous recorded tests (not re-run as proof)
+
+- Baseline full-suite results from the canonical-bootstrap delivery
+  (`981 passed, 23 skipped` at `ebd513b`/`1a4c955`) — superseded above
+  by the fresh run including the new tests.
+
+## Live database / runtime boundary
+
+- No live Supabase access in this environment; no SQL executed; no live
+  runtime (Telegram) restart exercised. Verdicts are code + schema
+  contract verifications, simulated at the persistence boundary with
+  fakes. Live state (whether migrations `20260823120000` +
+  `20260827000001` are already applied) remains an owner-side check.

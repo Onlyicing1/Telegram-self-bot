@@ -1011,6 +1011,20 @@ per process by `_ensure_allowed_loaded_async()` and persisted on every
 Manage toggle by `_persist_allowed_to_db()`. It is the **only durable
 store for the Ghost Seen per-chat privacy allow-list**.
 
+**Verified restart lifecycle (persistence audit):** toggles run
+`Manage → _toggle_permission_action → await _ensure_allowed_loaded_async()
+→ allow_chat()/disallow_chat() → _persist_allowed_to_db()` (UPDATE, or
+INSERT on first write, of the JSON array at `key =
+'ghost_seen_allowed_chats'`). After a restart the handler `register()`
+fires a background preload, and Browser/Manage open plus every toggle
+await the SAME single in-flight load task; the loaded JSON list is
+unioned into the runtime set and enforced by `is_chat_allowed()`.
+Persistence races are closed: concurrent callers await the in-flight
+load (a toggle can never persist a partial list over the persisted one)
+and persist writes are serialized with an in-lock snapshot (the DB can
+never end on an out-of-order stale value). Regression coverage:
+`tests/test_65_ghost_seen_v2_restart_persistence.py`.
+
 The table still has no `owner_id` (single-tenant assumption) and stores
 a JSON blob where a relational representation is appropriate, but it
 cannot be dropped until the allow-list is migrated to `ghost_chats`
@@ -1705,6 +1719,22 @@ Read/write path: `settings_service.dashboard_font()` /
 `set_dashboard_font()` → `panel_settings_repository` (write-through
 cache). The dashboard maps the key to a fixed CSS stack; the Glass UI
 maps it to the letter transform.
+
+**Verified restart lifecycle (persistence audit):** selection
+(`font_set` panel action or `PATCH /api/settings`) → validator
+(`value in FONT_KEYS`) → `panel_settings_repository.update_field(
+'dashboard_font', key)` (UPDATE … WHERE key = 'global') → on restart
+`RuntimeSupervisor.start()` calls `settings_service.load_all()`
+(`backend/runtime/supervisor.py`), hydrating the cache from
+`panel_settings` before panels render → `dashboard_font()` serves the
+restored key to `panel_render`, `profile/engine`, and
+`GET /api/settings`. `load_all()` never writes defaults back to the DB,
+so a restart cannot overwrite the persisted value. Caveat (pre-existing,
+§19.3): if the DB write fails (e.g. migration not yet applied live),
+`set_setting` degrades to the in-memory cache and still reports success
+— the value sticks for the session only. Regression:
+`tests/test_42_dashboard_font.py` (write-reaches-DB + restart restore +
+startup-hydration guard).
 
 ### 25.3 Gaps / decisions
 

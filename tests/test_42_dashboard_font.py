@@ -54,6 +54,41 @@ def test_reload_read_returns_persisted_font():
     assert svc.get_all()["dashboard_font"] == "fraktur"
 
 
+def test_font_write_reaches_db_and_survives_restart():
+    """Full persistence chain in one test: selection → DB write (captured
+    payload) → fresh-process restart → startup load_all → the selected
+    font is restored and consumed."""
+    _reset_service()
+    row = {"key": "global", "dashboard_font": "default"}
+    written = {}
+
+    def fake_update_field(field, value):
+        written[field] = value
+        row[field] = value
+        return True
+
+    with patch("backend.services.panel_settings_repository.update_field", side_effect=fake_update_field), \
+         patch("backend.services.panel_settings_repository.load", return_value=row):
+        from backend.services import settings_service as svc
+        assert svc.set_dashboard_font("mono") is True
+        assert written["dashboard_font"] == "mono"
+
+        _reset_service()  # simulate a complete restart (fresh runtime state)
+        svc.load_all()    # startup hydration from the DB row
+
+    assert svc.dashboard_font() == "mono"
+
+
+def test_supervisor_hydrates_panel_settings_at_startup():
+    """Source-level guard: the supervisor must load persisted panel
+    settings during startup, before panels render, so the selected font
+    is applied again after every restart."""
+    from pathlib import Path
+
+    source = Path("backend/runtime/supervisor.py").read_text()
+    assert "settings_service.load_all()" in source
+
+
 def test_invalid_font_value_rejected():
     _load_with(None)
     from backend.services import settings_service as svc
