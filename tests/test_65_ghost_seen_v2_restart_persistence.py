@@ -128,7 +128,7 @@ async def test_allow_chat_persists_json_array_to_bot_settings(monkeypatch):
     recorder = _record_threads(monkeypatch)
     _fresh_process()
 
-    service_module.allow_chat(123)
+    assert await service_module.allow_chat_and_persist(123) is True
     _join(recorder)
 
     assert db.inserts, "first enable must INSERT the bot_settings row"
@@ -149,7 +149,7 @@ async def test_allowed_list_restored_from_db_after_restart(monkeypatch):
     assert service_module.is_chat_allowed(222) is True
     assert service_module.is_chat_allowed(999) is False
 
-    service_module.allow_chat(333)
+    assert await service_module.allow_chat_and_persist(333) is True
     _join(recorder)
     assert db.updates and json.loads(db.updates[-1]) == [111, 222, 333]
 
@@ -175,7 +175,7 @@ async def test_toggle_during_initial_load_persists_full_list(monkeypatch):
     await toggle_wait
     assert service_module.get_allowed_chats() == frozenset({111, 222})
 
-    service_module.allow_chat(333)
+    assert await service_module.allow_chat_and_persist(333) is True
     _join(recorder)
     assert db.updates and json.loads(db.updates[-1]) == [111, 222, 333]
 
@@ -190,8 +190,8 @@ async def test_rapid_toggles_never_persist_stale_list(monkeypatch):
     _fresh_process()
 
     await service_module._ensure_allowed_loaded_async()
-    service_module.allow_chat(222)
-    service_module.allow_chat(333)
+    assert await service_module.allow_chat_and_persist(222) is True
+    assert await service_module.allow_chat_and_persist(333) is True
     _join(recorder)
     assert json.loads(db.stored_value) == [111, 222, 333]
 
@@ -204,9 +204,8 @@ async def test_disallow_removes_chat_from_persisted_list(monkeypatch):
     _fresh_process()
 
     await service_module._ensure_allowed_loaded_async()
-    service_module.allow_chat(222)
-    _join(recorder)
-    service_module.disallow_chat(111)
+    assert await service_module.allow_chat_and_persist(222) is True
+    assert await service_module.disallow_chat_and_persist(111) is True
     _join(recorder)
     assert json.loads(db.updates[-1]) == [222]
     assert service_module.is_chat_allowed(111) is False

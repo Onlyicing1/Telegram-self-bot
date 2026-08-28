@@ -1,6 +1,7 @@
 """Ghost Seen v2 private-chat browser, bounded viewer, and selection model."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
@@ -183,14 +184,13 @@ async def _ensure_allowed_loaded_async() -> None:
     await asyncio.shield(_allowed_load_task)
 
 
-def _persist_allowed_to_db() -> None:
-    """Persist the current allowed-chat set to ``bot_settings``.
+async def _persist_allowed_to_db() -> bool:
+    """Persist the current allow-list and report whether the write succeeded.
 
-    Runs the Supabase write in a background daemon thread so a slow DB
-    never blocks the event loop or a Manage toggle callback. Writes are
-    serialized through ``_persist_lock`` and snapshot the set INSIDE the
-    lock, so the last finishing write always carries the latest in-memory
-    state instead of an out-of-order stale snapshot.
+    The synchronous Supabase client runs in a worker thread, while the lock
+    serializes writes and snapshots the latest set inside that lock. Callers
+    await completion so a UI action cannot claim durable success before the
+    database has accepted the new value.
     """
     try:
         import json
@@ -198,24 +198,26 @@ def _persist_allowed_to_db() -> None:
         from backend.db.client import get_db
         db = get_db()
         if db is None:
-            return
+            logger.warning("ghost_seen_v2: cannot persist allowed chats; database unavailable")
+            return False
 
         def _write_sync() -> None:
-            try:
-                with _persist_lock:
-                    value = json.dumps(sorted(_allowed_chats))
-                    existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
-                    data = getattr(existing, "data", None) or []
-                    if data:
-                        db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
-                    else:
-                        db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
-            except Exception as exc:
-                logger.warning("ghost_seen_v2: failed to persist allowed chats to DB: %s", exc)
+            with _persist_lock:
+                value = json.dumps(sorted(_allowed_chats))
+                existing = db.table("bot_settings").select("key").eq("key", "ghost_seen_allowed_chats").execute()
+                data = getattr(existing, "data", None) or []
+                if data:
+                    db.table("bot_settings").update({"value": value}).eq("key", "ghost_seen_allowed_chats").execute()
+                else:
+                    db.table("bot_settings").insert({"key": "ghost_seen_allowed_chats", "value": value, "value_type": "str"}).execute()
 
-        threading.Thread(target=_write_sync, daemon=True).start()
+        await asyncio.to_thread(_write_sync)
+        return True
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.warning("ghost_seen_v2: failed to persist allowed chats to DB: %s", exc)
+        return False
 
 
 def _ensure_allowed_loaded() -> None:
@@ -236,20 +238,44 @@ def is_chat_allowed(source_chat_id: int) -> bool:
     return int(source_chat_id) in _allowed_chats
 
 
-def allow_chat(source_chat_id: int) -> None:
-    """Enable Ghost Seen for the given source private chat."""
+def _set_allowed(source_chat_id: int, allowed: bool) -> None:
     _ensure_allowed_loaded()
-    _allowed_chats.add(int(source_chat_id))
-    _persist_allowed_to_db()
+    if allowed:
+        _allowed_chats.add(int(source_chat_id))
+    else:
+        _allowed_chats.discard(int(source_chat_id))
+
+
+def allow_chat(source_chat_id: int) -> None:
+    """Enable Ghost Seen for the given source private chat in memory.
+
+    Use ``allow_chat_and_persist`` from async UI paths when durable success
+    must be confirmed to the user.
+    """
+    _set_allowed(source_chat_id, True)
 
 
 def disallow_chat(source_chat_id: int) -> None:
-    """Disable Ghost Seen for the given source private chat."""
-    _ensure_allowed_loaded()
-    _allowed_chats.discard(int(source_chat_id))
-    _persist_allowed_to_db()
+    """Disable Ghost Seen for the given source private chat in memory.
+
+    Use ``disallow_chat_and_persist`` from async UI paths when durable
+    success must be confirmed to the user.
+    """
+    _set_allowed(source_chat_id, False)
     clear_selection(int(source_chat_id))
     clear_reply(int(source_chat_id))
+
+
+async def allow_chat_and_persist(source_chat_id: int) -> bool:
+    _set_allowed(source_chat_id, True)
+    return await _persist_allowed_to_db()
+
+
+async def disallow_chat_and_persist(source_chat_id: int) -> bool:
+    _set_allowed(source_chat_id, False)
+    clear_selection(int(source_chat_id))
+    clear_reply(int(source_chat_id))
+    return await _persist_allowed_to_db()
 
 
 def get_allowed_chats() -> frozenset[int]:

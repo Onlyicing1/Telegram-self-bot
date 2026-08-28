@@ -874,9 +874,11 @@ async def _toggle_permission_action(event, extra: str, chat_id: int):
     if source <= 0:
         return "⚙ Permissions", "Invalid chat.", []
     if is_chat_allowed(source):
-        disallow_chat(source)
+        persisted = await service.disallow_chat_and_persist(source)
     else:
-        allow_chat(source)
+        persisted = await service.allow_chat_and_persist(source)
+    if not persisted:
+        return "⚙ Permissions", "Database persistence failed. The change was not confirmed as durable; please try again.", []
     page, query = _decode_state(_session_extra(chat_id, _event_ids(event)[1], _MANAGE_ID))
     chats = await load_manage_directory(inline_engine.get_self_client(), inline_engine.get_owner_id())
     return _render_manage(chats, page, query)

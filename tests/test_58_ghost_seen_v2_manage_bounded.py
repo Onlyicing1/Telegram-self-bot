@@ -180,7 +180,11 @@ def test_18_toggle_preserves_page_and_query():
             reset_allowed()
             service_module.invalidate_manage_directory()
             target = manage_page(_chats(30), page=2).chats[0].chat_id
-            title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
+            async def allow_and_persist(chat_id):
+                allow_chat(chat_id)
+                return True
+            with patch.object(service_module, "allow_chat_and_persist", new=allow_and_persist):
+                title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
             texts = _button_texts(buttons)
             assert any("ON" in t for t in texts)
             assert any("2/4" in t for t in texts)
@@ -193,7 +197,11 @@ def test_19_toggle_off_removes_chat_from_page():
             service_module.invalidate_manage_directory()
             target = _chats(30)[0].chat_id  # User0 → page 1
             allow_chat(target)
-            title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
+            async def disallow_and_persist(chat_id):
+                service_module._allowed_chats.discard(chat_id)
+                return True
+            with patch.object(service_module, "disallow_chat_and_persist", new=disallow_and_persist):
+                title, body, buttons = _run(handler_module._toggle_permission_action(_event(777, 5), str(target), 777))
             texts = _button_texts(buttons)
             assert not any("User0" in t and "ON" in t for t in texts)
             assert any("User0" in t and "OFF" in t for t in texts)

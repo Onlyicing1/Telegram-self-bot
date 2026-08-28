@@ -715,4 +715,33 @@ Live Supabase access and SQL execution were not performed. No credentials or his
 
 ## Delivery
 
-Pending commit and push of this architecture specification and report.
+## 2026-08-28 — Durable Ghost Seen persistence fix
+
+### Objective
+Ensure Ghost Seen allow-list changes are durably written before the UI confirms the toggle, while preserving restart restoration and race safety.
+
+### Root cause
+The previous `allow_chat()`/`disallow_chat()` path launched a daemon persistence thread and returned immediately. Database exceptions were logged only, so the in-memory UI could show chats as allowed even when `bot_settings` was unavailable or the write had not completed. The observed `ghost_chats.allowed=false` rows are not evidence of the active contract: current Ghost Seen code does not read or write `ghost_chats`.
+
+### Contract and lifecycle
+The active durable state is `bot_settings(key text primary key, value text not null, value_type text not null default 'str', updated_at timestamptz)`, with `key='ghost_seen_allowed_chats'` and `value` as a JSON array of integer Telegram chat IDs. Manage toggles call the async `allow_chat_and_persist()` / `disallow_chat_and_persist()` path; the full sorted set is written via update-or-insert. Startup registration schedules `_ensure_allowed_loaded_async()`, which reads the same row, decodes JSON, and restores `_allowed_chats`; `is_chat_allowed()` consumes that set. `ghost_chats` remains legacy and is not a second source of truth.
+
+### Changes
+- `backend/services/ghost_seen_v2.py`: made durable persistence awaitable and boolean-result based; unavailable/failed database writes return `False` and are not reported as successful. Existing serialized write locking and shared startup-load task remain intact.
+- `backend/bot/handlers/ghost_seen_v2.py`: awaits persistence and renders an explicit failure instead of a successful manage state when the write fails.
+- `tests/test_65_ghost_seen_v2_restart_persistence.py`: updated lifecycle tests for the awaited write boundary.
+- `tests/test_66_ghost_seen_v2_persistence_failures.py`: added write-failure and malformed-JSON safety coverage.
+- `tests/test_58_ghost_seen_v2_manage_bounded.py`: adjusted handler tests to model successful persistence while retaining runtime-state assertions.
+- `DATABASE_ARCHITECTURE.md` and `supabase/canonical_bootstrap.sql`: existing `bot_settings` contract verified; no schema change or duplicate Ghost Seen table required.
+
+### Verification
+- Targeted Ghost Seen/manage tests: **28 passed**.
+- Full suite: **990 passed, 23 skipped, 1 warning**.
+- `python3 -m compileall -q backend tests`: passed.
+- `git diff --check`: passed.
+- Canonical SQL synchronization: verified byte-identical between the fenced block and `supabase/canonical_bootstrap.sql`.
+- Live Supabase inspection: not performed; SQL was not executed against any database.
+- Security: service-role writes and existing SELECT-only RLS policies unchanged; no credentials, arbitrary SQL, or Telegram RPC surface introduced.
+
+### Delivery
+Pending commit and push of this implementation and report.
