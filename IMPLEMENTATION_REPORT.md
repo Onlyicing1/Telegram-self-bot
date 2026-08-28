@@ -496,5 +496,12 @@ RLS-posture verification, legacy skipped-test disposition.
 
 ## Commit / delivery
 
-Delivery commit and remote verification details are recorded immediately
-after push.
+- **Commit:** `ebd513b` — `docs: add canonical supabase bootstrap sql and
+  full contract audit` (3 files: `DATABASE_ARCHITECTURE.md` +608,
+  `supabase/canonical_bootstrap.sql` +510 new, `IMPLEMENTATION_REPORT.md`
+  +106; 1224 insertions total).
+- **Push:** succeeded — `30bb3a4..ebd513b  main -> main` on
+  `https://github.com/Onlyicing1/Telegram-self-bot.git`.
+- **Remote verification:** post-push `git fetch` + `origin/main` comparison
+  and working-tree cleanliness check recorded in the follow-up verification
+  entry below.
