@@ -251,8 +251,8 @@ Implement exactly ONE rule in the next implementation chunk:
 
 ## Commit / delivery
 - Base commit (start of audit): `ceb9c797d4b1db5dfa63e7c9aada00b6992952dc`
-- Local HEAD == `origin/main` == remote `main` at start.
-- This investigation produces a report-only change; commit/push facts will be
-  recorded after delivery.
-- Working tree at end of audit (before report commit): `IMPLEMENTATION_REPORT.md`
-  changed only; no production/test/database code changed.
+- Audit report commit: `250829400682d8d2d7650ecc1c5e2a2a741f9ae2` — `docs: record deterministic ai output delivery audit (pass)`
+- Push result: pushed to `origin/main` (`ceb9c79..2508294`)
+- Remote verification: local HEAD == `origin/main` == remote `main` == `250829400682d8d2d7650ecc1c5e2a2a741f9ae2` (verified via `git fetch origin main`)
+- Final working-tree state: clean
+- Investigation-only: no production/test/database code changed.
