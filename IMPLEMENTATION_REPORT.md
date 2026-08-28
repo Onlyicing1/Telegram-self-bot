@@ -151,9 +151,8 @@ delivery path was created.
   churn.
 
 ## Commit / delivery
-- Commit: created this chunk
-- Commit SHA: (recorded after commit)
-- Commit message: (recorded after commit)
-- Push result: (recorded after push)
-- Remote verification: (recorded after remote check)
-- Final working-tree state: (recorded after verification)
+- Commit 1: `de0cd3e991d5a1f41d2a87f1ddd3cf60861234fe` — `docs: record markdown entity delivery blocked investigation`
+- Commit 2 (report-facts finalization): `151089a4ac517e972dfe58cee0318a85d4b77804` — `docs: finalize blocked investigation delivery facts`
+- Push result: pushed to `origin/main` (both commits)
+- Remote verification: local HEAD == `origin/main` == remote `main`
+- Final working-tree state: clean
