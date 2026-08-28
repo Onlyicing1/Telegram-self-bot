@@ -136,6 +136,6 @@ report); this chunk intentionally did not reopen it.
 
 ## Commit / delivery
 - Primary implementation commit: `0e816ec8785b283e22c710cb19593f7b59bf1c28` — `fix: preserve dot and colon literals in ai output` (delivery.py + tests + report)
-- Push result: pushed to `origin/main`
-- Remote verification: local HEAD == `origin/main` == remote `main` == `(final sha)`; verified via `git fetch origin main`
+- Push result: pushed to `origin/main` (`61c7ab2..a8d0210` — implementation commit `0e816ec` + facts commit)
+- Remote verification: local HEAD == `origin/main` == remote `main` == `a8d02102a3628c10b33466da0b3e36a771bdbd52`; verified via `git fetch origin main`
 - Final working-tree state: clean
