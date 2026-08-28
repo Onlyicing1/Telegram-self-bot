@@ -135,7 +135,7 @@ None for this repair. Markdown entity delivery remains blocked (per prior
 report); this chunk intentionally did not reopen it.
 
 ## Commit / delivery
-- Commit (created this chunk): recorded after delivery.
-- Push result: recorded after push.
-- Remote verification: recorded after remote check.
-- Final working-tree state: recorded after verification.
+- Primary implementation commit: `0e816ec8785b283e22c710cb19593f7b59bf1c28` — `fix: preserve dot and colon literals in ai output` (delivery.py + tests + report)
+- Push result: pushed to `origin/main`
+- Remote verification: local HEAD == `origin/main` == remote `main` == `(final sha)`; verified via `git fetch origin main`
+- Final working-tree state: clean
