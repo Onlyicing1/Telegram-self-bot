@@ -269,3 +269,126 @@ manually, persistence resumes working.
 - Final working-tree state: `main` in sync with `origin/main`; the four
   migration files, `DATABASE_ARCHITECTURE.md`, and this report are
   committed; no unrelated files were touched.
+
+---
+
+# Phase 4 — Database Architecture Verification
+
+## Objective
+
+Verify the Phase 3 migration delivery against the current repository, source
+writers, architecture documentation, and available database tooling without
+inventing live Supabase state or performing destructive operations.
+
+## Base commit
+
+`1efb119` — `docs: record schema migration delivery verification`.
+
+## Repository state verified
+
+- Current branch: `main`, tracking `origin/main`.
+- HEAD was clean before the Phase 4 audit.
+- The four Phase 3 migration files exist at the paths reported in Phase 3.
+- `DATABASE_ARCHITECTURE.md` documents those migrations as pending manual
+  application, rather than claiming they are live.
+- No contradiction requiring a repository correction was found.
+
+## Files inspected
+
+- `AGENTS.md`
+- `DATABASE_ARCHITECTURE.md`
+- `INVESTIGATION.md`
+- `IMPLEMENTATION_REPORT.md`
+- `supabase/migrations/20260827000001_add_missing_panel_settings_columns.sql`
+- `supabase/migrations/20260827000002_add_ai_config_trigger_columns.sql`
+- `supabase/migrations/20260827000003_create_ai_usage_table.sql`
+- `supabase/migrations/20260827000004_create_ai_provider_stats_table.sql`
+- `backend/services/settings_service.py`
+- `backend/services/panel_settings_repository.py`
+- `backend/ai/config_store.py`
+- `backend/ai/database/usage_repository.py`
+- `backend/ai/database/provider_stats_repository.py`
+- related AI database manager/usage-recorder and migration sources
+
+## Findings
+
+### Migration-to-source contract matrix
+
+| Migration | Table / columns | Application writer and exact contract | Constraints / indexes / RLS | Potential mismatch | Verdict |
+|---|---|---|---|---|---|
+| `000001` | `panel_settings`; adds `auto_close_delay`, `max_deep_save_mb`, `delete_batch_size`, `log_retention_days`, `panel_timeout_seconds`, `allow_multiple_panels`, `reuse_existing_panel`, `language`, `debug_callbacks`, `owner_only` | `settings_service` typed defaults and validators consume all ten exact names; repository upserts the typed settings and the migration also ensures `key='global'` | Integer/boolean/text types and defaults match source; CHECK ranges match validators; singleton row uses existing `key` primary key; no RLS alteration | None found in the repository contract | PASS |
+| `000002` | `ai_config.trigger_en`, `ai_config.trigger_fa`, nullable text | `config_store._save_config_sync` includes both keys in every upsert and converts empty values to NULL | Nullable text, default NULL; existing table RLS is not changed | Live application status cannot be inferred from the file | PASS — pending live application |
+| `000003` | `ai_usage`: bigserial `id`, owner/session/provider/model, token counts, latency, token source, timestamp | `SupabaseUsageRepository.create` inserts `owner_id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, token_source, created_at`; it does not send `id`; readers/count use the documented columns | Primary key and owner/created indexes; RLS enabled with SELECT-only anon/authenticated policy; service-role writes remain separate | Repository evidence cannot prove the live table exists | PASS — pending live application |
+| `000004` | `ai_provider_stats`: provider/owner composite key plus request counters, token counters, latency, timestamps | `SupabaseProviderStatsRepository.record_request` upserts the complete `ProviderStatsRecord.as_dict()` payload with conflict target `provider_name,owner_id`; nullable `last_request_at` matches source | Composite primary key supplies the upsert uniqueness; RLS enabled with SELECT-only policy; no destructive operation | Repository evidence cannot prove live policy state | PASS — pending live application |
+
+The migration SQL is ordered after the existing 20260826/20260827 migration
+series and is additive/idempotent. The new tables use `IF NOT EXISTS`; column
+adds use `IF NOT EXISTS`; policy recreation is explicit and limited to the new
+AI tables. No migration drops tables, columns, or indexes and none weakens an
+existing RLS policy.
+
+### Architecture-document audit
+
+`DATABASE_ARCHITECTURE.md` accurately records the four migration paths, the
+schema contracts, the RLS intent, and the **pending manual application** status.
+`INVESTIGATION.md` Phase 3 and the architecture document agree that destructive
+cleanup and live-data-dependent decisions remain blocked. No documentation
+edit was necessary during this phase.
+
+### Live database gate
+
+Live Supabase inspection was **not available** through the repository tooling
+in this environment. Direct environment/database inspection was blocked by the
+workspace security boundary, and no safe authenticated Supabase inspection path
+was available. Therefore this phase does not claim whether the migrations have
+been applied, what RLS policies currently exist, or whether any rows/columns
+contain data.
+
+The following remain unverified: live RLS posture; application status of all
+four migrations; `ghost_chats` row count; non-empty `saved_items.short_code`
+and `file_name`; obsolete `panel_settings` values; obsolete `bot_settings`
+seed rows; and whether dropping `ghost_chats` would lose data.
+
+## Changes implemented
+
+Investigation/verification only. No application or schema implementation was
+performed in Phase 4, and `DATABASE_ARCHITECTURE.md` required no correction.
+
+## Database safety
+
+- Live Supabase: unavailable; repository credentials or safe inspection tooling
+  were not exposed.
+- SQL execution: none.
+- Destructive operations: none.
+- RLS changes: none.
+- Data modification: none.
+
+## Tests actually executed
+
+- `python3 -m pytest tests/test_03_database_consistency.py tests/test_33_ai_telemetry.py tests/test_42_dashboard_font.py tests/test_44_database_stats.py tests/test_10_tool_calls.py -q --no-header` — **63 passed**, one existing warning.
+- `python3 -m pytest tests/ -q --no-header` — **981 passed, 23 skipped**, one existing warning.
+- `python3 -m compileall -q backend tests` — passed (exit 0).
+- `git diff --check` — passed (exit 0).
+
+## Previous recorded tests
+
+The Phase 3 delivery report also records 63 targeted passes and 981 passes /
+23 skips. Those are historical records; the results above were executed again
+in Phase 4 and are reported separately.
+
+## Remaining blockers
+
+1. Live Supabase access is required before claiming the four migrations are
+   applied or before changing their live-status documentation.
+2. Live RLS verification remains required.
+3. Live-data checks remain required before any destructive decision involving
+   `ghost_chats`, `saved_items.short_code`, `saved_items.file_name`, obsolete
+   `panel_settings` columns, or obsolete `bot_settings` seed rows.
+4. Product/owner decisions remain required for the previously gated orphan
+   settings, `ai_preferences`, Ghost Seen destination configuration, AI
+   retention, dashboard font surface, and legacy skipped-test disposition.
+
+## Commit / delivery
+
+This Phase 4 report update is the only repository change. Commit and remote
+verification details are recorded after delivery.
