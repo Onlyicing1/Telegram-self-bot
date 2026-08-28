@@ -170,5 +170,13 @@ modified. No live Telegram or live Supabase access was performed.
 
 ## Commit / delivery
 
-- Commit: pending — recorded after the commit is created.
-- Push result: pending — recorded after the push and remote verification.
+- Commit: `6fa491dc861830072f87bcd02f89c1782e059fc1` —
+  `fix: enforce telegram utf-16 text limit in ai output splitting`
+  (3 files changed, +432/−153).
+- Push result: pushed to `origin/main` (`a25c140..6fa491d`), exit 0.
+- Remote verification: after `git fetch origin main`, local HEAD ==
+  `origin/main` == `git ls-remote origin refs/heads/main` ==
+  `6fa491dc861830072f87bcd02f89c1782e059fc1`. Remote
+  `IMPLEMENTATION_REPORT.md` contains exactly one report section.
+- Final working-tree state: `main` in sync with `origin/main`; only the
+  intended implementation, tests, and report were committed.
