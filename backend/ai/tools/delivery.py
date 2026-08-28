@@ -81,7 +81,11 @@ def _normalize_plain(text: str) -> str:
     text = re.sub(r" *\n[ \t]*", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     text = re.sub(r" +([,.;:!?،؛؟])", r"\1", text)
-    text = re.sub(r"([,.;:!?،؛؟])(?=[A-Za-zА-Яа-яء-ي])", r"\1 ", text)
+    # Sentence spacing after punctuation only. `.` and `:` are excluded so
+    # filenames, extensions, bare domains, and abbreviations stay intact
+    # (e.g. main.py, report.txt, example.com, e.g.). ",";"/"!"/"?" and the
+    # Arabic marks are sentence/clause punctuation and keep their space.
+    text = re.sub(r"([,;!?،؛؟])(?=[A-Za-zА-Яа-яء-ي])", r"\1 ", text)
     return _restore(text, tokens)
 
 

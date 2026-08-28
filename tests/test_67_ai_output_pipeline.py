@@ -358,3 +358,95 @@ async def test_integration_delivery_uses_repaired_output():
 def test_empty_output_is_rejected():
     with pytest.raises(ValueError):
         process_output("   ")
+
+
+# ── Dot/colon literal preservation (audit-repair) ────────────────────────────
+# The sentence-spacing rules previously leaked a space into dot/colon-delimited
+# technical literals (main.py -> main. py). `.`/`:` are excluded from the splice
+# class so filenames, extensions, bare domains, and abbreviations stay intact.
+
+
+def test_dot_extension_and_domain_literals_are_preserved():
+    for text in [
+        "main.py",
+        "report.txt",
+        "example.com",
+        "data.v1.csv",
+        "e.g.",
+        "U.S.A",
+        "run main.py now",
+        "see config.json and data.json now",
+    ]:
+        assert process_output(text).text == text
+
+
+def test_colon_in_technical_literals_left_intact():
+    # v2.3.1 uses `.`; UUID/hex/time-like tokens and addresses with `:` must not
+    # gain an inserted space.
+    for text in [
+        "12:30",
+        "ratio 3:2",
+        "v2.3.1",
+        "node:18",
+    ]:
+        assert process_output(text).text == text
+
+
+def test_intended_sentence_spacing_is_preserved():
+    for text, expected in {
+        "hello,world": "hello, world",
+        "سلام،world": "سلام، world",
+        "note;see": "note; see",
+        "تشکر!انجام": "تشکر! انجام",
+        "x,y": "x, y",
+    }.items():
+        assert process_output(text).text == expected
+
+
+def test_dot_repair_preserves_protected_regions():
+    text = "https://example.com/a_b?x=1 @user /cmd `main.py` ```report.txt``` end."
+    result = process_output(text).text
+    assert "https://example.com/a_b?x=1" in result
+    assert "@user" in result
+    assert "/cmd" in result
+    assert "`main.py`" in result
+    assert "```report.txt```" in result
+
+
+def test_dot_repair_is_idempotent():
+    corpus = [
+        "main.py",
+        "report.txt",
+        "example.com",
+        "data.v1.csv",
+        "e.g.",
+        "U.S.A",
+        "run main.py now",
+        "hello,world",
+        "سلام،world",
+        "x,y",
+        "see https://example.com/a_b @user /cmd `a*b`",
+    ]
+    for text in corpus:
+        once = process_output(text).text
+        assert process_output(once).text == once
+
+
+def test_dot_and_emphasis_coexist():
+    # `.py` must stay intact even when emphasis delimiters are present nearby.
+    assert process_output("run *this* then main.py").text == "run this then main.py"
+
+
+@pytest.mark.asyncio
+async def test_delivery_delivers_dot_preserved_text():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text): replies.append(text)
+    from backend.ai.tools.delivery import deliver_response
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "Nova hi", "Nova",
+        "run main.py now and check report.txt",
+    )
+    assert result.success
+    assert edits == ["Nova hi\n────────────\n🤖 Nova\nrun main.py now and check report.txt"]
+    assert replies == []
