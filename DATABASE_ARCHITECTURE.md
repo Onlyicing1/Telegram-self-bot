@@ -35,17 +35,17 @@
 15. [ai_tasks](#15-ai_tasks)
 16. [ai_task_occurrences](#16-ai_task_occurrences)
 17. [Relationships](#17-relationships)
-16. [RLS Policy Model](#16-rls-policy-model)
-17. [Panel Database](#17-panel-database)
-18. [In-Memory Fallback](#18-in-memory-fallback)
-19. [Known Inconsistencies](#19-known-inconsistencies)
-20. [Migration Status](#20-migration-status)
-21. [Migration Generation Rules](#21-migration-generation-rules)
-22. [Ghost Seen / Ghost PV](#22-ghost-seen--ghost-pv)
-23. [Self Bot Persistent State Inventory](#23-self-bot-persistent-state-inventory)
-24. [Hermes Integration Boundary & Corrected Architecture](#24-hermes-integration-boundary--corrected-architecture)
-25. [Font System Persistence](#25-font-system-persistence)
-26. [Current vs Proposed Status Matrix](#26-current-vs-proposed-status-matrix)
+18. [RLS Policy Model](#18-rls-policy-model)
+19. [Panel Database](#19-panel-database)
+20. [In-Memory Fallback](#20-in-memory-fallback)
+21. [Known Inconsistencies](#21-known-inconsistencies)
+22. [Migration Status](#22-migration-status)
+23. [Migration Generation Rules](#23-migration-generation-rules)
+24. [Ghost Seen / Ghost PV](#24-ghost-seen--ghost-pv)
+25. [Self Bot Persistent State Inventory](#25-self-bot-persistent-state-inventory)
+26. [Hermes Integration Boundary & Corrected Architecture](#26-hermes-integration-boundary--corrected-architecture)
+27. [Font System Persistence](#27-font-system-persistence)
+28. [Current vs Proposed Status Matrix](#28-current-vs-proposed-status-matrix)
 
 ---
 
@@ -844,19 +844,18 @@ RLS is enabled. SELECT is granted to `anon` and `authenticated`; no public write
 
 ## 17. Relationships
 
-There are **no enforced foreign keys** between any tables. Each table is
-independent. The following logical relationships exist (not FK
-constraints):
+The task foundation is the one intentional enforced relationship. The
+following logical relationships exist without foreign keys:
 
 - `ai_messages.session_id` → `ai_sessions.session_id` (logical)
 - `ai_tool_history.session_id` → `ai_sessions.session_id` (logical)
 - `ai_usage.session_id` → `ai_sessions.session_id` (logical)
-- `owner_id` (on `saved_items`, `bio_state`, `username_state`,
-  `bot_logs`, `ai_config`, all AI tables) links rows to the bot owner
-  but is not a foreign key.
+- `ai_task_occurrences.owner_id` must match `ai_tasks.owner_id` by repository validation; there is no owner FK.
+- `owner_id` on existing tables links rows to the bot owner but is not a foreign key.
 
-Future migrations MAY add enforced FK constraints for these logical
-relationships, but it is not required for correctness.
+`ai_task_occurrences.task_id` → `ai_tasks.id` is enforced by the task
+migration with `ON DELETE RESTRICT`. Other relationships remain logical;
+future changes require separate review.
 
 ---
 
