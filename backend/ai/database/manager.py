@@ -31,6 +31,7 @@ from backend.ai.database.provider_stats_repository import (
 )
 from backend.ai.database.session_repository import InMemorySessionRepository, SessionRepository
 from backend.ai.database.tool_history_repository import InMemoryToolHistoryRepository, ToolHistoryRepository
+from backend.ai.database.task_repository import InMemoryTaskRepository, TaskRepository
 from backend.ai.database.usage_repository import (
     InMemoryUsageRepository,
     SupabaseUsageRepository,
@@ -56,6 +57,7 @@ class RepositoryManager:
         "_usage",
         "_preferences",
         "_tool_history",
+        "_task",
         "_supabase_available",
     )
 
@@ -70,6 +72,7 @@ class RepositoryManager:
         self._usage = SupabaseUsageRepository() if supabase_available else InMemoryUsageRepository()
         self._preferences = InMemoryPreferencesRepository()
         self._tool_history = InMemoryToolHistoryRepository()
+        self._task = InMemoryTaskRepository()
 
         if supabase_available:
             logger.info("RepositoryManager: Supabase available — in-memory fallbacks used until migrations are applied")
@@ -105,6 +108,10 @@ class RepositoryManager:
         return self._tool_history
 
     @property
+    def task(self) -> TaskRepository:
+        return self._task
+
+    @property
     def supabase_available(self) -> bool:
         return self._supabase_available
 
@@ -113,7 +120,7 @@ class RepositoryManager:
             "supabase_available": self._supabase_available,
             "repositories": [
                 "memory", "session", "message",
-                "provider_stats", "usage", "preferences", "tool_history",
+                "provider_stats", "usage", "preferences", "tool_history", "task",
             ],
         }
 
