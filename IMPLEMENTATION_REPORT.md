@@ -1,48 +1,36 @@
-# Implementation Report — Stage 5 Task Scheduler Runtime and Restart-Safe Occurrence Coordination
+# Implementation Report — Stage 6 Task Execution and Action Dispatch
 
 ## Stage
-- **Stage completed:** Stage 5 — Task Scheduler Runtime and Restart-Safe Occurrence Coordination
-- **Previous stage:** Stage 4 — Supabase Task Repository Integration
-- **Next stage:** Stage 6 — Task Execution and Action Dispatch
+- **Completed stage:** Stage 6 — Task Execution and Action Dispatch
+- **Previous stage:** Stage 5 — Task Scheduler Runtime and Restart-Safe Occurrence Coordination
+- **Next stage:** Stage 7 — Retry Classification, Backoff, and Operational Task Management
 - **Repository:** `https://github.com/Onlyicing1/Telegram-self-bot`
 - **Branch:** `main`
-- **Base commit:** `396b87c351883e62907b754247f4b2c64e5b5ec0`
+- **Base commit:** `227613d6a429121e61cccd8116700cf4fd7728b6`
 
 ## Objective and scope
-Recovered the missing Stage 3 deterministic schedule prerequisite and implemented the durable Stage 5 coordination layer. The scheduler discovers bounded owner-scoped due tasks, calculates occurrences through the isolated schedule domain, creates deterministic/idempotent occurrence records, claims them, advances `next_run_at` with task-version CAS, and marks incomplete claimed/running occurrences as interrupted during startup recovery.
+Implemented the execution boundary that consumes a previously claimed durable occurrence, validates its immutable action snapshot, executes actions in stored order through the existing `ToolExecutor` and `ToolRegistry`, and persists bounded success/failure metadata through the existing task repository.
 
-No task actions are executed in this stage.
+The scheduler remains responsible only for durable coordination. No task parser, notification system, retry worker, dashboard, or new database model was added.
 
 ## Exact files changed
-- `backend/ai/scheduling.py` — recovered deterministic schedule value objects and calculations.
-- `backend/ai/task_scheduler.py` — bounded durable task scheduler coordinator.
-- `backend/ai/database/task_repository.py` — due-task discovery, recovery enumeration, CAS-safe next-run advancement, and scheduler-compatible repository operations.
-- `backend/runtime/supervisor.py` — owns one scheduler instance and starts/stops it through the existing supervisor lifecycle.
-- `tests/test_task_scheduler.py` — focused Stage 5 and recovered schedule-domain tests.
+- `backend/ai/task_execution.py` — new bounded occurrence execution coordinator.
+- `tests/test_task_execution.py` — focused Stage 6 execution tests.
 - `IMPLEMENTATION_REPORT.md` — this current-state report.
 
-The existing Stage 2 migration and database architecture document were not modified.
+No other production subsystem was modified.
 
-## Implementation details
+## Execution architecture
+`TaskExecutionCoordinator` requires an occurrence already in `running` state, verifies authoritative owner identity, validates the immutable action snapshot, resolves every action only through the injected `ToolExecutor` registry, preserves stored ordering, and stops on the first unsuccessful action result. It uses `ToolExecutor.execute_calls()` with an authoritative `ToolContext`, bounded by a 60-second coordinator deadline.
 
-### Schedule prerequisite
-The source-verified tree did not contain the previously reported Stage 3 module, so the minimum isolated prerequisite was recovered in `backend/ai/scheduling.py`. It supports only `once`, `interval`, `daily`, and `weekly`; validates IANA zones; normalizes authoritative results to UTC; applies deterministic nonexistent-time forward shifting and ambiguous-time earlier-UTC selection; anchors intervals to scheduled timestamps; bounds interval advancement; coalesces recurring catch-up to one occurrence; and provides parameterized one-shot grace/expiry state calculation.
+Unknown tools, malformed action structures, non-object arguments, owner mismatches, and non-running occurrences are rejected without execution. The coordinator never interprets persisted JSON as code and never invokes arbitrary method names, RPCs, SQL, shell commands, providers, or Telegram APIs directly.
 
-### Scheduler coordination
-`TaskScheduler` is a single owner-scoped coordinator with:
-- idempotent `start()`/`stop()` behavior;
-- bounded 10-task wake batches and bounded recovery scans;
-- explicit UTC reference times for deterministic `run_once()` calls;
-- deterministic occurrence keys based on task ID and normalized scheduled instant;
-- repository-mediated occurrence creation and claiming;
-- CAS-protected `next_run_at` advancement;
-- startup recovery of claimed/running occurrences to `interrupted`;
-- cancellation propagation and no action execution.
+Successful executions transition `running → succeeded`. Execution failures transition `running → failed` with bounded safe metadata. Cancellation propagates and is not converted into success or failure. The existing repository state machine remains authoritative.
 
-The loop wakes through an explicit stop event with a 60-second interval and does not create per-task timers.
+The honest delivery guarantee remains at-least-once side-effect semantics; durable occurrence identity and claims do not provide exactly-once Telegram execution.
 
-### Runtime lifecycle
-`RuntimeSupervisor` remains the sole lifecycle authority. It constructs one scheduler, starts it after profile recovery and before READY, and stops it during shutdown. The profile Bio/Username scheduler remains separate and unchanged in responsibility.
+## Ownership and security
+The coordinator receives the owner ID from runtime context and compares it with the occurrence owner. Action JSON cannot supply or override ownership. Telegram access remains behind the existing `ToolExecutor` → registered tool → service/TelegramAPI boundaries. No AI provider or scheduler execution bypass was introduced.
 
 ## Database/schema status
 - **Database/schema changes: NONE.**
@@ -51,48 +39,44 @@ The loop wakes through an explicit stop event with a 60-second interval and does
 - No Supabase SQL was executed.
 - Live Supabase schema was not modified or verified.
 
-## Ownership and security
-All scheduler operations use the authoritative supervisor owner ID and the repository owner-scoping boundary. No owner identity is read from task JSON. No direct Supabase access was added to the scheduler. No public policies, tables, triggers, SQL functions, or dashboard APIs were added.
-
-The scheduler does not call Telegram, Telethon, `ToolExecutor`, `ProviderManager`, `Engine`, `Dispatcher`, AI providers, shell commands, arbitrary SQL, or arbitrary RPC. Persisted action JSON is stored in occurrence snapshots but never executed.
-
 ## Tests added
-`tests/test_task_scheduler.py` exercises:
-- valid schedule parsing and timezone-aware UTC results;
-- invalid schedule/timezone rejection;
-- DST nonexistent and ambiguous wall-clock handling;
-- deterministic occurrence keys;
-- due-task discovery and active-task filtering;
-- duplicate wake idempotency;
-- version/snapshot preservation;
-- bounded recurring catch-up;
-- interval anchoring independent of completion time;
-- one-shot grace/expiry calculation;
-- interrupted occurrence recovery;
-- scheduler start/stop idempotency;
-- no execution authority in the scheduler.
+`tests/test_task_execution.py` covers:
+- successful claimed-occurrence execution;
+- deterministic action ordering;
+- claimed/running/succeeded persistence;
+- unregistered action rejection without execution;
+- authoritative owner mismatch rejection without execution.
 
 ## Tests and validation actually executed
-- `python3 -m pytest tests/test_task_scheduler.py tests/test_task_repository.py -q` — **15 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1089 passed, 23 skipped, 1 warning**.
+- `python3 -m pytest tests/test_task_execution.py -q` — **3 passed**.
+- `python3 -m pytest tests/test_task_execution.py tests/test_task_scheduler.py tests/test_task_repository.py -q` — **18 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1092 passed, 23 skipped, 1 warning**.
 - `python3 -m compileall -q backend tests` — passed.
-- `git diff --check` — passed before final delivery.
+- `git diff --check` — passed.
 
-No live Supabase integration test was available or executed.
+No live Telegram execution or live Supabase integration was performed.
 
-## Files intentionally untouched
-- `profile/scheduler.py` and profile engines.
-- `RuntimeSupervisor` recovery authority beyond the minimal scheduler lifecycle ownership.
-- AI Engine, Dispatcher, ProviderManager, ToolExecutor, and providers.
-- TelegramAPI/self-client execution paths.
-- Supabase migrations and `DATABASE_ARCHITECTURE.md`.
-- Dashboard, handlers, notifications, and task parsing.
+## Architecture preserved
+- `RuntimeSupervisor` remains the single runtime lifecycle authority.
+- `TaskScheduler` remains separate from action execution.
+- `profile.scheduler` remains the separate Bio/Username scheduler.
+- Engine, Dispatcher, ProviderManager, and AI providers were untouched.
+- ToolRegistry and ToolExecutor remain the execution authority.
+- TelegramAPI/self-client remains the Telegram boundary.
+- No third durable task table, migration, trigger, arbitrary command path, or dashboard API was introduced.
+
+## Files and systems intentionally untouched
+- `backend/ai/task_scheduler.py` except as an existing consumer boundary.
+- `backend/ai/database/task_repository.py` and migrations.
+- `backend/runtime/supervisor.py`.
+- `backend/profile/scheduler.py` and profile engines.
+- Engine, Dispatcher, ProviderManager, providers, handlers, dashboard, and services unrelated to execution.
 
 ## Limitations and remaining work
-This stage coordinates durable occurrences only. It does not execute actions, send Telegram messages, classify transient execution failures, perform retries, parse natural language, manage tasks through handlers/UI, or provide scheduler-specific live Supabase verification. The next stage is Stage 6 — Task Execution and Action Dispatch; it must consume claimed occurrences through the existing registered-tool/Telegram execution boundaries without moving execution authority into the scheduler.
+Stage 6 executes only already-claimed occurrences and does not create tasks, parse natural language, schedule work, send notifications, or implement provider/Telegram-specific retry classification or backoff. The next stage is Stage 7 — Retry Classification, Backoff, and Operational Task Management, which must preserve this execution/repository boundary and the two-table model.
 
 ## Delivery
-- **Implementation commit:** `354de6f33d486714b54b4fcb0166558614230da1`
-- **Push:** succeeded to `origin/main`.
-- **Remote HEAD:** `354de6f33d486714b54b4fcb0166558614230da1`, matching local HEAD.
-- **Final working tree:** clean on `main`, synchronized with `origin/main`.
+- **Implementation commit:** to be recorded after commit.
+- **Push:** to be recorded after push verification.
+- **Remote HEAD:** to be recorded after push verification.
+- **Final working tree:** to be recorded after final verification.
