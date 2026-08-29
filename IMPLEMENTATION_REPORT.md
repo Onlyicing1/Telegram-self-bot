@@ -1,35 +1,27 @@
-# Implementation Report — Stage 7 Retry Classification, Backoff, and Operational Task Management
+# Implementation Report — Stage 8 Task Management Interfaces and Notifications
 
 ## Stage
-- **Completed stage:** Stage 7 — Retry Classification, Backoff, and Operational Task Management
-- **Previous stage:** Stage 6 — Task Execution and Action Dispatch
-- **Next stage:** Stage 8 — Task Management Interfaces and Notifications
+- **Completed stage:** Stage 8 — Task Management Interfaces and Notifications
+- **Previous stage:** Stage 7 — Retry Classification, Backoff, and Operational Task Management
+- **Next stage:** Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring
 - **Repository:** `https://github.com/Onlyicing1/Telegram-self-bot`
 - **Branch:** `main`
-- **Base commit:** `ea5401a271f41dd4585e4c4caf3a0040092e20a5`
+- **Base commit:** `6a1727e80c87566e73fb7267522a5e9057f23fc9`
 
 ## Objective and scope
-Added a deterministic retry policy and operational failure handoff while preserving the existing scheduler, execution, repository, and Telegram boundaries. Retry state continues to use `ai_task_occurrences`; no new durable model was introduced.
+Added narrow service-level management and notification boundaries on top of the existing durable task architecture. Management is owner-scoped and CAS-protected; notifications accept structured scheduler/execution outcomes and use an injected safe sender. No task creation parser, handler/UI, notification delivery integration, or schema change was added.
 
 ## Exact files changed
-- `backend/ai/retry.py` — deterministic failure classification, retry eligibility, and bounded exponential backoff.
-- `backend/ai/task_execution.py` — retry-management handoff for execution failures.
-- `tests/test_retry.py` — retry policy tests.
+- `backend/ai/task_management.py` — owner-scoped task listing, inspection, and lifecycle operations.
+- `backend/ai/notifications.py` — bounded structured notification boundary with failure isolation.
+- `tests/test_task_management.py` — focused management and notification tests.
 - `IMPLEMENTATION_REPORT.md` — this current-state report.
 
-## Retry classification and backoff
-- Timeout and clearly transient/rate-limit indicators are classified as retryable.
-- Cancellation is non-retryable and never converted into success.
-- Unknown/unclassified failures fail closed as permanent for retry purposes.
-- Attempts 1 and 2 may schedule another attempt; attempt 3 cannot retry.
-- Backoff is deterministic: 30 seconds after attempt 1 and 60 seconds after attempt 2, bounded by a 15-minute ceiling.
-- Retry state is persisted as `retry_pending` with `retry_at` through the existing repository transition API.
-- No retry worker, per-occurrence background task, or unbounded loop was added.
+## Management behavior
+`TaskManagementService` supports owner-scoped listing and task/occurrence inspection, plus pause, resume, complete, fail, expire, and delete lifecycle operations through the existing repository and expected-version CAS contract. Stale versions return no update, terminal history is preserved, and another owner cannot inspect or mutate the task.
 
-The existing `TaskExecutionCoordinator` remains the execution authority. The new `handle_failure()` method only classifies and persists state; it does not execute Telegram actions or invoke providers.
-
-## Operational management
-Existing repository lifecycle operations continue to provide owner-scoped pause/resume and terminal task transitions with CAS/version semantics. Stage 7 does not add UI, handlers, notifications, or a separate management service. Occurrence history remains intact.
+## Notification behavior
+`TaskNotificationService` accepts only structured notifications for `succeeded`, `failed`, `retry_pending`, and `cancelled` outcomes. It verifies the authoritative owner, bounds message size to 1024 characters, applies a 10-second send bound, propagates cancellation, and isolates ordinary sender failures by returning `False`. Notification failure does not mutate task or occurrence state and no arbitrary Telegram method is accepted.
 
 ## Database/schema status
 - **Database/schema changes: NONE.**
@@ -39,30 +31,30 @@ Existing repository lifecycle operations continue to provide owner-scoped pause/
 - Live Supabase schema was not modified or verified.
 
 ## Ownership and security
-Retry decisions receive runtime/repository state, not model-generated identity. Owner filtering and existing RLS/service-role conventions remain unchanged. Persisted action JSON remains data and is never executed by the retry layer. No arbitrary SQL, RPC, shell, provider, or direct Telegram path was introduced.
+Management receives owner identity from its constructed runtime context and applies repository owner filtering. Notifications cannot override owner identity. No persisted JSON is executed as code. No arbitrary SQL, RPC, shell, provider, or direct Telegram execution path was introduced.
 
-## Tests added and executed
-- `python3 -m pytest tests/test_retry.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_task_repository.py -q` — **20 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1094 passed, 23 skipped, 1 warning**.
+## Tests and validation actually executed
+- `python3 -m pytest tests/test_task_management.py tests/test_retry.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_task_repository.py -q` — **22 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1096 passed, 23 skipped, 1 warning**.
 - `python3 -m compileall -q backend tests` — passed.
 - `git diff --check` — passed.
 
-No live Supabase or live Telegram verification was performed.
+No live Supabase, live Telegram, or end-to-end notification transport verification was performed.
 
 ## Architecture preserved
 - RuntimeSupervisor remains the sole lifecycle authority.
-- TaskScheduler remains coordination-only and does not execute actions.
-- TaskExecutionCoordinator remains the execution boundary.
-- ToolRegistry/ToolExecutor remain the registered-tool authority.
-- TelegramAPI/self-client remains behind existing tools/services.
+- TaskScheduler remains coordination-only.
+- TaskExecutionCoordinator, ToolRegistry, and ToolExecutor remain the execution authority.
+- TelegramAPI/self-client remains behind established tools/services.
 - `profile.scheduler` remains separate.
 - The two-table durable model remains unchanged.
+- No notification loop, task parser, task creation UX, or dashboard API was added.
 
 ## Limitations and remaining work
-This stage does not add a retry worker, scheduler retry polling integration, provider-specific error taxonomy, Telegram-specific transient classification, task-management handlers/UI, notifications, or execution guarantees beyond at-least-once external side effects. The next stage is Stage 8 — Task Management Interfaces and Notifications.
+The management service is not yet exposed through Telegram handlers, Glass UI, or dashboard APIs. Notification service instances are not yet wired into scheduler/execution lifecycle events, and no task creation/parser workflow exists. The next stage is Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring.
 
 ## Delivery
-- **Implementation commit:** `2c56138202b90f8c6b59063d0631b125440c1b87`
-- **Push:** succeeded to `origin/main`.
-- **Remote HEAD:** `2c56138202b90f8c6b59063d0631b125440c1b87`, matching local HEAD.
-- **Final working tree:** clean on `main`, synchronized with `origin/main`.
+- **Implementation commit:** to be recorded after commit.
+- **Push:** to be recorded after push verification.
+- **Remote HEAD:** to be recorded after push verification.
+- **Final working tree:** to be recorded after final verification.
