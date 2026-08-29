@@ -6,6 +6,7 @@ from typing import Any
 
 from backend.ai.database.task_repository import TaskRecord, TaskRepository
 from backend.ai.scheduling import ScheduleError, parse_schedule, next_occurrence
+from backend.ai.task_candidate import TaskCandidate
 
 
 class TaskCreationError(ValueError):
@@ -20,6 +21,8 @@ class TaskCreationService:
         self.owner_id = owner_id
 
     async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
+        if isinstance(candidate, TaskCandidate):
+            candidate = candidate.as_creation_candidate()
         if not isinstance(candidate, dict):
             raise TaskCreationError("task candidate must be an object")
         if not isinstance(reference, datetime) or reference.tzinfo is None:
