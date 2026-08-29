@@ -6,172 +6,147 @@
 - Branch: `main`
 - Date: 2026-08-29
 - Starting commit: `e594a497a8f5b552f4a8244dc69aa4b0d89a1988`
-- Phase: investigation and product/architecture decision freeze only
+- Phase: Phase 1 database contract review; investigation/design only
 
 ## 1. PROBLEM
 
-LifeOS has no durable AI Task/Scheduler system. The requested feature must turn owner-approved natural-language requests into durable, restart-safe scheduled plans without bypassing the existing AI, tool, owner, or Telegram boundaries.
+The durable AI Task/Scheduler feature needs restart-safe task definitions and execution occurrence history. This phase freezes the database contract only. It does not create migrations, execute SQL, add repositories, or implement scheduling.
 
-## 2. CURRENT ARCHITECTURE
+## 2. SOURCE-BACKED CURRENT CONVENTIONS
 
-The application is a single Python 3.11 asyncio process. `RuntimeSupervisor` owns the self-client lifecycle, recovery, helper, profile resumption, watchdogs, and shutdown. The AI path is `ai_unified` → `Engine` → `Dispatcher` → `ProviderManager` → `EngineResult`; registered tools are executed only by `ToolExecutor`, and Telegram remains behind the self-client/TelegramAPI authority.
+### Identity and keys
 
-There is no task parser, task creation tool, task repository, generic scheduler, execution-attempt model, or scheduled-task handler. `IMPLEMENTATION_REPORT.md` confirms the unrelated table-delivery work and was not changed.
+- Telegram owner identity is a numeric `BIGINT`; existing tables store it as a plain `owner_id BIGINT NOT NULL`.
+- Existing application tables generally use `bigserial` primary keys. AI sessions use a text `session_id`, and provider statistics use a composite primary key. No existing owner table is referenced by foreign key: current migrations explicitly use plain `owner_id` columns and describe the schema as having no owner foreign keys.
+- The proposed task records therefore use `BIGINT owner_id` and stable `UUID` task/occurrence IDs only if the implementation dependency accepts UUID generation. Because the repository has no existing UUID primary-key convention, the safer repository-compatible choice is `BIGSERIAL` identifiers for both new tables; the immutable occurrence key remains a separate text value with a uniqueness constraint.
 
-## 3. CURRENT SCHEDULER / RUNTIME
+### Timestamps and JSON
 
-`backend/profile/scheduler.py` is a process-memory singleton dedicated to Bio and Username. It keeps an asyncio task, client, updater callbacks, and active-engine flags; waits for minute boundaries; updates profile fields; and has cancellation/restart behavior specific to profile updates. It is not generic and must remain separate.
+Existing migrations use `TIMESTAMPTZ DEFAULT now()`. Application writes use UTC-aware Python timestamps and ISO-8601 strings. Existing structured payload columns use `JSONB DEFAULT '{}'` (AI tool arguments/results, memory metadata, bot-log context). Schedule and action payloads should use JSONB, with deterministic application validation and database size/count checks where feasible.
 
-`RuntimeSupervisor` provides the correct lifecycle authority and supervised task primitives. Existing heartbeat, keepalive, failsafe, diagnostics, and retry/watchdog loops are health/recovery infrastructure, not business scheduling. A future TaskScheduler must be one supervisor-owned process-wide loop, with no per-task forever loops and no second recovery authority.
+### Constraints and indexes
 
-## 4. CURRENT DATABASE / PERSISTENCE
+Existing migrations use inline `CHECK` constraints for finite statuses/roles/types, `UNIQUE` constraints for per-owner state, primary/composite keys, and btree indexes such as `(owner_id)`, `(owner_id, created_at DESC)`. There is no existing PostgreSQL enum type convention. New values should therefore use text columns with explicit CHECK constraints rather than database enum types.
 
-`DATABASE_ARCHITECTURE.md` documents owner-scoped core and AI tables, service-role backend writes, RLS for client-facing reads, and in-memory fallbacks. Existing state covers saves, profile engines, settings, AI configuration, sessions/messages, memories, usage, provider statistics, and tool history. No existing table represents a durable schedule, due time, occurrence key, claim, retry, or task lifecycle.
+### RLS and service role
 
-Conversation/session and tool-history persistence cannot be repurposed as task authority: they do not define schedule semantics or atomic occurrence uniqueness. No SQL was executed and no schema was changed.
+Existing tables enable RLS and generally grant SELECT to `anon, authenticated`; backend writes use the Supabase service-role client, which bypasses RLS. Existing policies are permissive/select-oriented rather than request-user owner policies because the dashboard reads through the backend and the service role is authoritative. New task tables must still enable RLS and default to no public write grants; backend repositories use the service role and always add explicit owner filters. Any dashboard exposure requires a separately reviewed owner-scoped API.
 
-## 5. NATURAL LANGUAGE → TASK FLOW
+### Database functions/triggers
 
-Current owner requests enter through `ai_unified` and the existing Engine/Dispatcher/provider path. The future contract is:
+No current scheduler or business execution is implemented in SQL. No trigger is justified for task scheduling, claiming, retries, or execution. Timestamps may use existing defaults; monotonic versioning and occurrence claiming belong in explicit repository compare-and-set operations so behavior is visible and testable.
 
-```text
-owner message → AI structured proposal → deterministic validator
-→ owner-scoped task persistence → TaskScheduler due claim
-→ deterministic action validation → ToolExecutor → TelegramAPI/self-client
-→ durable execution result → explicit owner notification
-```
+## 3. CURRENT ARCHITECTURE RELEVANT TO THE CONTRACT
 
-AI may construct a structured proposal, but it must not create timers, persist unvalidated executable JSON, call Telegram directly, or bypass ToolExecutor. Schedule parsing/normalization, limits, timezone validation, action allowlisting, destination validation, and ownership checks belong to deterministic application code.
+`RuntimeSupervisor` is the single lifecycle/recovery authority. `profile.scheduler` is a separate in-memory Bio/Username minute-boundary scheduler and is not reusable. The AI path remains `ai_unified` → `Engine` → `Dispatcher` → `ProviderManager` → `EngineResult`; registered actions are executed only through `ToolExecutor`, with Telegram controlled by the self-client/TelegramAPI. Existing persistence/repository layers are thin Supabase wrappers with in-memory fallback and bounded async database calls. No task table, execution table, task repository, or scheduler exists.
 
-## 6. TASK MODEL
+## 4. EXACTLY TWO-TABLE CONTRACT
 
-Keep these concepts distinct:
+The next schema implementation may introduce exactly two tables/concepts. No action or step table is permitted initially.
 
-- **Definition:** owner-owned, versioned desired plan and lifecycle state.
-- **Schedule:** normalized recurrence/one-shot rule and IANA timezone.
-- **Occurrence/execution:** one deterministic scheduled occurrence and its attempt state.
-- **Result:** success, failure, cancellation, retry state, timestamps, and bounded safe metadata.
-- **Runtime state:** transient wakeup/cache/semaphore state only.
+### A. `ai_tasks` — authoritative task definitions
 
-Initial definitions contain a bounded ordered JSON action list. Every action names an existing allowlisted tool and validated arguments. The authoritative owner ID is obtained from the authenticated owner context, never from model-provided identity. Destinations are explicit and validated.
+| Column | Proposed type | Null/default | Contract |
+|---|---|---|---|
+| `id` | `bigserial` | NOT NULL, PK | Stable task identifier using the repository's established ID convention. |
+| `owner_id` | `bigint` | NOT NULL | Authenticated Telegram owner; never model-supplied. |
+| `label` | `text` | NOT NULL | Bounded display name. |
+| `status` | `text` | NOT NULL, default `'active'` | CHECK: `active`, `paused`, `completed`, `failed`, `expired`, `deleted`. Only active tasks are due. |
+| `version` | `integer` | NOT NULL, default `1` | Positive monotonic definition version. |
+| `schedule_type` | `text` | NOT NULL | CHECK: `once`, `interval`, `daily`, `weekly`. |
+| `schedule` | `jsonb` | NOT NULL | Versioned normalized schedule payload; deterministic validator owns semantics. |
+| `timezone` | `text` | NOT NULL | Explicit valid IANA timezone identifier. Machine timezone is never implied. |
+| `next_run_at` | `timestamptz` | NULL for terminal tasks | UTC due instant, indexed with status. |
+| `actions` | `jsonb` | NOT NULL | Versioned bounded ordered safe-tool action list; no conditionals, loops, replanning, or arbitrary commands. |
+| `notification_destination` | `jsonb` | NOT NULL | Explicit owner-scoped validated destination, not inferred at execution. |
+| `created_at` | `timestamptz` | NOT NULL, default `now()` | Creation time. |
+| `updated_at` | `timestamptz` | NOT NULL, default `now()` | Last definition/lifecycle update. |
+| `terminal_at` | `timestamptz` | NULL | Set for completed/failed/expired/deleted tasks. |
 
-## 7. SCHEDULING MODEL
+Required constraints: positive version; nonblank bounded label; valid status and schedule type; non-null schedule/actions/destination; JSON action array with a bounded maximum count and bounded serialized size; schedule-type payload validation in application code; `next_run_at` required for active recurring/once tasks and null for terminal tasks where enforced safely. A database CHECK can enforce basic JSON shape/array length, but full tool/action validation remains application responsibility.
 
-One process-wide `TaskScheduler` is owned and started/stopped/rebuilt by `RuntimeSupervisor`. It loads enabled definitions, wakes for the nearest due task with bounded polling, atomically claims occurrences, and executes outside database transactions.
+Required indexes: `ai_tasks(status, next_run_at)` for due active tasks; `ai_tasks(owner_id, updated_at DESC)` for owner management; optionally `ai_tasks(owner_id, status)` if repository query patterns require it. Do not add speculative indexes.
 
-### Frozen decisions
+### B. `ai_task_occurrences` — durable occurrence/attempt history
 
-1. **Missed runs — FROZEN:** for recurring tasks, coalesce all overdue occurrences into at most one catch-up occurrence on restart/recovery, then advance from the latest scheduled occurrence. One-shot tasks that are overdue but still within the configured grace window run once; expired one-shots become terminal `expired`. No unbounded replay or backlog.
+| Column | Proposed type | Null/default | Contract |
+|---|---|---|---|
+| `id` | `bigserial` | NOT NULL, PK | Stable history row identifier. |
+| `task_id` | `bigint` | NOT NULL | Foreign key to `ai_tasks.id` if the migration dependency/order permits it. |
+| `owner_id` | `bigint` | NOT NULL | Denormalized owner for fast owner filtering and RLS; must match task owner. |
+| `occurrence_key` | `text` | NOT NULL | Immutable deterministic key derived from task and normalized scheduled instant; unique with task ID. |
+| `definition_version` | `integer` | NOT NULL | Version used for this occurrence. |
+| `action_snapshot` | `jsonb` | NOT NULL | Immutable validated action snapshot, bounded and independent of later task edits. |
+| `scheduled_for` | `timestamptz` | NOT NULL | UTC scheduled instant. |
+| `attempt` | `smallint` | NOT NULL, default `1` | Total attempt number, CHECK 1–3. |
+| `status` | `text` | NOT NULL, default `'claimed'` | CHECK: `claimed`, `running`, `succeeded`, `failed`, `retry_pending`, `cancelled`, `expired`, `interrupted`. |
+| `claimed_at` | `timestamptz` | NULL | Durable claim time. |
+| `started_at` | `timestamptz` | NULL | Execution start time. |
+| `finished_at` | `timestamptz` | NULL | Terminal time. |
+| `retry_at` | `timestamptz` | NULL | Next retry UTC instant, only for retry-pending state. |
+| `error_metadata` | `jsonb` | NOT NULL, default `'{}'` | Bounded safe error classification/details; no secrets. |
+| `result_metadata` | `jsonb` | NOT NULL, default `'{}'` | Bounded safe result summary; no sensitive provider output. |
+| `created_at` | `timestamptz` | NOT NULL, default `now()` | History insertion time. |
+| `updated_at` | `timestamptz` | NOT NULL, default `now()` | Last state transition. |
 
-2. **DST — FROZEN:** store an IANA timezone and normalize persisted execution timestamps to UTC. A nonexistent local wall-clock time is shifted forward to the first valid local instant after the gap. An ambiguous local time chooses the earlier UTC occurrence (`fold=0`). The policy is deterministic and never uses the machine timezone implicitly. The chosen normalized instant is persisted as the occurrence identity.
+Required constraints: foreign key `task_id → ai_tasks.id` with deliberate delete behavior; positive owner ID policy consistent with existing schema (no new owner FK invented); owner/task consistency enforced by repository transaction or a database constraint/trigger only if later proven necessary; positive attempt and maximum 3; valid statuses; retry timestamp only for retry-pending; immutable occurrence identity; bounded JSON metadata/action snapshot.
 
-3. **Interval anchoring — FROZEN:** intervals anchor to the scheduled occurrence timeline, not completion time. The next occurrence is calculated from the prior scheduled timestamp and advances by the interval until it is in the future or reaches the bounded catch-up rule. Slow execution therefore does not silently drift the schedule.
+Required indexes: unique `(task_id, occurrence_key)`; `(owner_id, scheduled_for DESC)` for history; `(task_id, scheduled_for DESC)` for task history; `(status, retry_at)` for due retries only if the repository needs that query. Keep the unique index as the duplicate-claim protection.
 
-4. **Retries — FROZEN:** an occurrence has at most three total attempts, including the initial attempt. Retry only deterministic/transient execution failures classified by the execution layer; validation, authorization, unsupported-tool, and malformed-data failures are terminal and not retried. Backoff is bounded and deterministic: 1 minute after attempt 1 and 5 minutes after attempt 2, capped by the next scheduled occurrence. No infinite retry.
+## 5. VERSIONING AND OCCURRENCE MODEL
 
-5. **Destructive/admin actions — FROZEN:** confirmation-required, admin-only, and destructive unattended actions are excluded from initial scheduled scope. Immediate-message owner authorization is not treated as standing authorization. Supporting them later requires an explicit reviewed pre-authorization model and separate tests.
+A task row's `version` starts at 1 and increments only through compare-and-set update. An occurrence stores both the version and immutable action snapshot at claim/creation time. Editing a task changes future unclaimed work only. The scheduler creates or claims one occurrence using a deterministic key based on task ID plus the normalized UTC scheduled instant (including an explicit recurrence identity where needed). The unique `(task_id, occurrence_key)` constraint makes duplicate occurrence creation fail atomically. This is idempotency protection for occurrence records, not exactly-once Telegram execution.
 
-6. **Notifications — FROZEN:** each task stores or references an explicit owner-scoped destination validated at creation. Default destination may be the authenticated owner's configured Saved/notification chat only if an existing setting contract is later approved; otherwise creation requires an explicit destination. Task outcome and notification outcome are separate: a failed notification never changes action success, and a successful notification never masks action failure. No arbitrary destination inference.
+## 6. RLS AND SERVICE-ROLE DESIGN
 
-7. **One-shot failure — FROZEN:** after the bounded retry budget is exhausted, a one-shot enters terminal `failed` with its execution history retained and the definition disabled/completed according to the task lifecycle. It is never silently deleted. Manual retry, if later added, creates a new explicit occurrence rather than silently replaying an old one.
+Both tables must enable RLS. Because the current backend uses a service-role Supabase client and existing policies do not establish authenticated-user identity mapping, the initial migration should grant no public INSERT/UPDATE/DELETE and expose only the minimum read policy required by existing conventions, preferably no direct client access. Repository methods must always filter by the authoritative owner ID even when service role bypasses RLS. If future dashboard reads are added, they require a dedicated backend owner-scoped API and reviewed policies; do not rely on RLS alone.
 
-8. **Versioning/edit behavior — FROZEN:** definitions have a monotonic version. Editing creates the next version through compare-and-set. An already-claimed occurrence snapshots the definition version/action JSON used for that occurrence; later edits affect only unclaimed occurrences. Disable/delete prevents future claims but does not rewrite history or silently cancel an already-running occurrence.
+The task foreign key is the one relationship directly required by the model. Existing schema has no owner identity table, so no owner foreign key can be safely added from current source evidence. `owner_id` consistency must be checked in repository operations and validated on load.
 
-9. **Conditional workflows — FROZEN:** deferred. Initial tasks are fixed, bounded, ordered action lists only. No conditional branches, loops, model re-planning, or arbitrary workflow language.
+## 7. RETENTION
 
-10. **Two durable tables — FROZEN:** sufficient initially: task definitions plus execution occurrences/attempt history. Actions remain bounded versioned JSON in the definition; a step table is deferred until resume-from-step or detailed per-step audit is a demonstrated requirement.
+Task definitions are durable until owner deletion/terminal cleanup according to an explicit future policy. Occurrence history should be retained for a bounded period sufficient for debugging, retry/idempotency audit, and restart reconciliation; a conservative initial recommendation is 90 days, with terminal history cleanup performed by a bounded maintenance operation rather than a database trigger. Retention is a product/operations setting and must be confirmed before migration if deletion semantics matter. No automatic cleanup logic is part of this phase.
 
-## 8. EXECUTION MODEL
+## 8. MIGRATION ORDER AND ROLLBACK
 
-The scheduler claims an occurrence with a unique `(task_id, occurrence_key)`, validates the immutable snapshot and owner, then invokes bounded actions sequentially through ToolRegistry/ToolExecutor. Initial multi-action behavior is stop-on-first-failure. The scheduler never calls providers, arbitrary Telethon RPC, SQL, shell, or natural-language commands.
+1. Review this contract and exact names/types with the repository owner.
+2. Create `ai_tasks` first, including owner/status/schedule/action checks and due indexes.
+3. Create `ai_task_occurrences` second with the task foreign key, unique occurrence index, history indexes, and RLS.
+4. Add repository/fallback code in a later implementation phase.
+5. Add scheduler only after repositories and deterministic schedule validation exist.
 
-Execution state must distinguish claimed/running/succeeded/failed/retry-pending/cancelled/expired. Result and error metadata are bounded and must not contain secrets. Notification is an owner-only, separately observable operation.
+Migrations must be additive and idempotent according to current migration style. Rollback must be an explicitly reviewed reverse migration that drops occurrence table before task table only when no production data must be preserved; never perform destructive rollback automatically. No migration or SQL was created or executed in this phase.
 
-## 9. RESTART / RECOVERY MODEL
+## 9. SECURITY REVIEW
 
-Durable definitions and occurrences are authoritative. On startup/recovery, the scheduler reloads enabled definitions and reconciles `running` attempts left by a crash as interrupted/unknown; they are retried only under the frozen bounded policy or terminally failed. Success is recorded only after ToolExecutor reports completion. A crash after Telegram side effects but before durable success can duplicate effects; the system therefore promises at-least-once behavior, not exactly-once Telegram side effects.
+Owner identity is taken from authenticated self-bot context. Persisted task JSON is untrusted and validated on every load. Only allowlisted safe ToolRegistry actions are eligible; confirmation-required, admin-only, and destructive actions are excluded initially. No scheduler/database operation may call AI, providers, Telegram, arbitrary RPC, SQL, shell, or timers. Explicit destinations are validated and owner-scoped. Error/result metadata are bounded and secret-free. At-least-once execution is the only honest side-effect guarantee.
 
-Offline due work follows the one-catch-up/expiry policy. Multiple due tasks are ordered deterministically by scheduled time then task ID and bounded by a global execution limit. No distributed leader election is required for the current single-process deployment, though atomic claims remain mandatory.
+## 10. REMAINING BLOCKERS
 
-## 10. CONCURRENCY / LOCKING MODEL
+- The repository proves `BIGINT owner_id`, `bigserial`, `TIMESTAMPTZ`, JSONB, text CHECK constraints, btree indexes, and service-role access, but it does not prove a UUID convention or a shared owner table; therefore UUID owner/task foreign keys must not be invented.
+- Exact live Supabase RLS state cannot be established without live access, which was not performed.
+- Retention duration and terminal task deletion semantics need owner approval before migration.
+- Exact JSON byte-size/count limits and schedule-payload shapes require implementation-level validation constants; their table columns are settled but not numeric thresholds in this phase.
+- Whether a task destination should default to a configured owner chat remains unresolved because no existing task notification setting is present.
 
-Reuse supervisor recovery locks/task guards and ToolExecutor's sequential behavior, but add a dedicated scheduler singleton guard, bounded execution semaphore (initially one), and atomic repository claim operations. A task cannot overlap itself in the initial scope. Disable/delete and finalization use owner/version/status compare-and-set. Database locks are not held during Telegram calls.
+## 11. CONFIRMED FINDINGS
 
-## 11. MULTI-ACTION MODEL
+- Exactly two durable concepts are required by the restart, claim, version, retry, and history contract: task definitions and occurrences/attempts.
+- Existing source uses numeric Telegram `BIGINT owner_id`, `bigserial` IDs, UTC `TIMESTAMPTZ`, JSONB payloads, text CHECK constraints, btree indexes, RLS, and service-role backend writes.
+- No existing table can safely represent task definitions or occurrence claims.
+- No SQL, migration, database state, or production code was changed.
 
-A task contains a bounded ordered list of existing safe tool calls. Actions execute sequentially and stop on the first failure. Aggregate occurrence history stores bounded per-action summaries; a separate step table is not initially required. Conditional actions, loops, dynamic branching, and AI replanning are explicitly deferred.
+## 12. PROPOSED / LIKELY FINDINGS
 
-## 12. SECURITY MODEL
+- `ai_tasks` and `ai_task_occurrences` are the smallest compatible names and schema concepts, subject to final migration review.
+- A task foreign key is appropriate; an owner foreign key is not supported by current source because no owner table exists.
+- Two tables remain sufficient while actions are bounded JSON and execution history is aggregate; a step table is deferred.
+- No trigger or database business logic is justified.
 
-Owner-only outgoing handling remains the authorization boundary. Persisted owner IDs, destinations, schedules, action names, arguments, and JSON versions are validated on creation and again on load. ToolRegistry/ToolExecutor permissions, limits, timeouts, and confirmation semantics remain mandatory. Prompt-injected text in labels or arguments cannot alter the validated action name or privilege. Self Bot/TelegramAPI remains the only Telegram execution authority.
+## 13. TEST / VALIDATION PLAN FOR NEXT PHASES
 
-Scheduled dangerous/admin operations are rejected initially. No arbitrary shell, SQL, RPC, provider, or command executor is permitted. Database writes use existing backend service-role conventions; owner-scoped RLS/read rules must be designed in the schema phase.
+Schema tests must verify migration creation, constraints, indexes, RLS posture, owner filtering, task/occurrence FK consistency, unique occurrence claims, bounded JSON/action validation, timestamp serialization, and service-role repository behavior. Repository tests must cover Supabase failure fallback, compare-and-set version updates, duplicate claims, and safe status transitions. Scheduler tests come later and must cover DST, missed runs, retries, restart reconciliation, and at-least-once semantics.
 
-## 13. EXISTING FEATURE INTEGRATION
+## 14. PHASE BOUNDARY
 
-Bio/Username remain on `profile.scheduler`. Save, Deep Save, Delete, Ghost Seen, and other features have no automatic scheduler dependency; only individually reviewed safe tools may be scheduled. Deep Save and destructive tools require separate policy review. ProviderManager, Dispatcher, Engine, and EngineResult remain proposal/immediate-execution infrastructure, not scheduler owners. RuntimeSupervisor owns scheduler lifecycle. Existing settings may supply a timezone default only after explicit precedence is implemented. Health/diagnostics may expose bounded telemetry without becoming authority.
-
-## 14. DATABASE / SCHEMA REQUIREMENTS
-
-The next schema phase requires exactly two new durable concepts:
-
-1. **Task definitions:** owner ID, stable task ID, label, enabled/lifecycle status, monotonic version, normalized schedule payload/type, IANA timezone, next scheduled UTC instant, bounded versioned action JSON, explicit notification destination, created/updated timestamps, and optional terminal timestamp.
-2. **Execution occurrences/attempts:** task ID/owner ID, immutable occurrence key, definition version and action snapshot/reference, scheduled UTC instant, attempt number, status, claim/start/finish timestamps, bounded error/result metadata, and retry timing.
-
-Required constraints include owner/task consistency, valid status/schedule values, bounded JSON/action size, unique `(task_id, occurrence_key)`, and indexes for enabled due definitions plus owner/task history. Exact SQL types, RLS, retention, foreign keys, and fallback behavior require schema review. The database stores state/history only and never executes business logic.
-
-## 15. CONFIRMED FINDINGS
-
-- `RuntimeSupervisor` is the single lifecycle/recovery authority.
-- `profile.scheduler` is a separate in-memory Bio/Username scheduler and is not generic.
-- No generic AI task scheduler, task persistence, occurrence history, or task creation path exists.
-- ToolExecutor is the sole registered-tool execution component and must remain in the scheduled path.
-- Existing persistence conventions provide service-role writes/fallback patterns but no suitable task authority.
-- Restart-safe scheduling requires durable definitions and occurrence/attempt state.
-- The Self Bot remains the final Telegram execution authority.
-
-## 16. LIKELY / PROPOSED FINDINGS
-
-- A singleton supervisor-owned loop with atomic database claims is the smallest compatible design.
-- Two tables with bounded versioned action JSON are sufficient initially.
-- Initial semantics should be bounded, sequential, stop-on-first-failure, at-least-once, and exclude dangerous actions.
-- The task proposal should be a structured ToolExecutor-mediated operation followed by deterministic validation and persistence.
-
-## 17. UNKNOWN / REQUIRES IMPLEMENTATION VERIFICATION
-
-- Exact live Supabase schema/RLS state and available owner foreign-key relationships.
-- Exact existing configured notification destination setting; no current source proves a task-specific default.
-- Whether production will ever run multiple instances.
-- Exact transient/permanent error classification exposed by every existing tool.
-- Whether aggregate action snapshots provide enough audit detail in practice.
-- DST library behavior at all historical timezone transition anomalies requires focused implementation tests.
-
-## 18. FINAL FROZEN INITIAL SCOPE
-
-Implement only owner-scoped one-shot, positive interval, daily, and weekly tasks; explicit IANA timezone; bounded catch-up/expiry; at-most-three-attempt retry; versioned bounded ordered safe-tool JSON actions; explicit destination; sequential stop-on-first-failure execution through ToolExecutor; durable claims and history; supervisor-owned lifecycle; and owner-only outcome notification.
-
-No conditionals, loops, dynamic workflows, dangerous/admin actions, arbitrary commands, unbounded replay/retry, or exactly-once guarantee.
-
-## 19. IMPLEMENTATION PHASE ORDER
-
-1. Review and approve the frozen decisions and exact schema contract.
-2. Add only the two task/occurrence migrations and owner-scoped repositories with in-memory fallback.
-3. Implement schedule value objects and deterministic validation/next-run/DST/missed-run calculations.
-4. Implement atomic occurrence creation/claim/finalization and bounded retry transitions.
-5. Implement the singleton TaskScheduler and RuntimeSupervisor lifecycle/recovery hooks.
-6. Add a structured task proposal/creation tool with deterministic validation and safe-tool allowlist.
-7. Execute versioned action snapshots sequentially through ToolExecutor and persist outcomes.
-8. Add owner-only management handlers/notifications and bounded diagnostics.
-9. Add integration and restart/concurrency tests before enabling production behavior.
-
-## 20. TEST / VALIDATION PLAN
-
-Future tests must cover schedule normalization, timezone/DST boundaries, missed-run coalescing/expiry, interval anchoring, version compare-and-set, duplicate occurrence claims, restart reconciliation, retry cap/backoff, cancellation/disable races, owner isolation, malformed JSON rejection, action limits, dangerous-tool rejection, ordered stop-on-failure execution, ToolExecutor reuse, supervisor lifecycle without duplicate loops, fake Telegram authority, notification independence, Supabase fallback, and bounded retention.
-
-## 21. HARD CONSTRAINTS
-
-No second recovery authority; no per-task forever loops; no direct Telegram RPC from scheduler/AI; no provider/Engine/Dispatcher bypass; no arbitrary shell/SQL/RPC/natural-language execution; no unvalidated persisted JSON; no unbounded backlog/actions/retries/resources; no exactly-once side-effect claim; profile scheduler remains separate; database stores state/history only; owner scope is authoritative.
-
-## 22. PHASE BOUNDARY
-
-This phase was investigation and decision freeze only. No production code, tests, database schema, migrations, SQL, Supabase state, providers, Engine, Dispatcher, ToolExecutor, handlers, scheduler, or Telegram execution behavior was modified.
+This was database contract investigation/design only. Production code changed: **NO**. Tests changed: **NO**. Migrations changed: **NO**. SQL executed: **NO**. Supabase changed: **NO**. Telegram behavior changed: **NO**. Commit made: **NO**. Push made: **NO**.
