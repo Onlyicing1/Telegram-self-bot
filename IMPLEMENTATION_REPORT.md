@@ -185,12 +185,16 @@ work required.
 - No other known delivery defect; no blocker for this chunk.
 
 ## Commit / delivery
-(Recorded after the actual commit/push; see below.)
-
-## Final verification
-- `git status`: clean, on `main`, synced with `origin/main`.
-- `git fetch origin main` → local HEAD == `origin/main` == remote `main`.
-- Remote `backend/ai/tools/delivery.py` contains `_render_tables`; remote test
+- Implementation commit: `e972b5cbaaa113e1366343c204f8b5f378c65682` —
+  `feat: render ai markdown tables as aligned telegram blocks`
+  (contains the production change, the 8 tests, and this report).
+- Base commit: `b305c97a7ba723d38b69773719e26f4085570b8d`.
+- Push result: pushed to `origin/main` (`b305c97..e972b5c`).
+- Remote verification: after `git fetch origin main`, local HEAD ==
+  `origin/main` == remote `main` == `e972b5cbaaa113e1366343c204f8b5f378c65682`;
+  remote `backend/ai/tools/delivery.py` contains `_render_tables`; remote test
   file contains the new table tests; remote `IMPLEMENTATION_REPORT.md` contains
-  exactly this one current report.
-- Working tree: clean.
+  exactly one current report.
+- Final working-tree state: clean (`## main...origin/main`, no changes).
+- Files in the delivery commit: `backend/ai/tools/delivery.py`,
+  `tests/test_67_ai_output_pipeline.py`, `IMPLEMENTATION_REPORT.md` only.
