@@ -544,3 +544,233 @@ async def test_delivery_delivers_dot_preserved_text():
     assert result.success
     assert edits == ["Nova hi\n────────────\n🤖 Nova\nrun main.py now and check report.txt"]
     assert replies == []
+
+
+# ── Large / multiline / wide table regression suite (diagnostic) ─────────────
+# These tests pin the ACTUAL current behavior of the table renderer at scale.
+# They are deliberately written as invariants (no content loss, UTF-16 chunk
+# safety, fail-closed on broken tables) rather than assumed expectations.
+
+_HEADER = "u\n────────────\n🤖 Nova\n"
+_CONT_SUFFIX = re.compile(r"\n\n_\(\d+/\d+\)_$")
+
+
+def _body_parts(msgs):
+    """Strip the first-message header and continuation markers, returning the
+    response-body fragments in order (matches the reconstruction used by the
+    existing UTF-16 delivery tests)."""
+    parts = [msgs[0][len(_HEADER):]]
+    for message in msgs[1:]:
+        parts.append(_CONT_SUFFIX.sub("", message))
+    return parts
+
+
+def _reconstruct(msgs):
+    return "".join(_body_parts(msgs))
+
+
+def _big_table(n=300, cell="x" * 30):
+    return "| Model | Score | Note |\n|---|---|---|\n" + "\n".join(
+        f"| row{i} | value{i} | {cell} |" for i in range(n)
+    )
+
+
+def test_large_table_exceeds_single_message_and_preserves_all_rows():
+    # 300 rows of 30-char cells render to ~15K UTF-16 units, well over one
+    # SAFE_LIMIT message. Nothing may be lost and every chunk must stay within
+    # the limit.
+    text = _big_table(300)
+    rendered = process_output(text).text
+    messages = _format_chunks("u", "Nova", rendered)
+    assert len(messages) > 1
+    assert all(_u16(message) <= SAFE_LIMIT for message in messages)
+    reconstructed = _reconstruct(messages)
+    assert reconstructed == rendered
+    assert all(f"row{i}" in reconstructed for i in range(300))
+
+
+def test_large_table_chunks_split_at_row_boundaries():
+    # Current behavior: when each row fits the per-message body budget, every
+    # body chunk ends on a newline (rows are never split mid-row) and the final
+    # chunk carries the closing fence.
+    rendered = process_output(_big_table(300)).text
+    parts = _body_parts(_format_chunks("u", "Nova", rendered))
+    assert all(part.endswith("\n") for part in parts[:-1])
+    assert parts[-1].endswith("```")
+
+
+def test_multiline_cell_fails_closed_without_content_loss():
+    # A physical line break inside a logical row is not a valid GFM pipe row;
+    # the renderer must fail closed and leave the text byte-for-byte intact.
+    text = (
+        "| ID | Name | Description |\n"
+        "|----|------|-------------|\n"
+        "| 1 | Alice | This is a long sentence that\n"
+        "continues on another physical line |"
+    )
+    assert process_output(text).text == text
+
+
+def test_multiple_multiline_rows_fail_closed():
+    text = (
+        "| ID | Name | Description |\n"
+        "|----|------|-------------|\n"
+        "| 1 | Alice | line one\n"
+        "of two |\n"
+        "| 2 | Bob | line one\n"
+        "of two |"
+    )
+    assert process_output(text).text == text
+
+
+def test_large_table_with_long_cell_preserves_content():
+    text = _big_table(250, cell="word " * 60)
+    rendered = process_output(text).text
+    messages = _format_chunks("u", "Nova", rendered)
+    assert len(messages) > 1
+    assert all(_u16(message) <= SAFE_LIMIT for message in messages)
+    assert _reconstruct(messages) == rendered
+
+
+def test_long_unbroken_cell_split_content_preservingly():
+    # A single cell larger than the per-message budget is split by the UTF-16
+    # splitter (mid-cell, at a character boundary); the content itself is
+    # preserved exactly.
+    text = "| k | v |\n|---|---|\n| 1 | " + "a" * 9000 + " |"
+    rendered = process_output(text).text
+    messages = _format_chunks("u", "Nova", rendered)
+    assert len(messages) > 1
+    assert all(_u16(message) <= SAFE_LIMIT for message in messages)
+    reconstructed = _reconstruct(messages)
+    assert reconstructed == rendered
+    assert "a" * 9000 in reconstructed
+
+
+def test_wide_table_mixed_unicode_widths_deterministic():
+    from backend.ai.tools.delivery import _cell_display_width
+    text = (
+        "| مدل | Model | رقم | 数字 | Emoji |\n"
+        "|---|---|---|---|---|\n"
+        "| کارایی | perf | ۱۲۳ | 中文 | 🙂 |\n"
+        "| ظرفیت | cap | 456 | 測試 | 🚀 |"
+    )
+    rendered = process_output(text).text
+    # deterministic: identical output on a second pass
+    assert process_output(rendered).text == rendered
+    body = rendered.split("\n")[1:-1]
+    assert all(len(line.split("|")) == 5 for line in body)
+    for token in ("کارایی", "perf", "۱۲۳", "中文", "🙂", "ظرفیت", "456", "測試", "🚀"):
+        assert token in rendered
+    # every cell (header + body) pads to the same monospace display width per
+    # column; the separator row uses width+2 dashes and is excluded
+    rows = [body[0]] + body[2:]
+    for column in range(5):
+        width = max(_cell_display_width(row[column]) for row in rows)
+        assert all(_cell_display_width(row[column]) == width for row in rows)
+
+
+def test_large_table_with_short_cells_all_rows_survive():
+    text = "| A | B | C |\n|---|---|---|\n" + "\n".join(
+        f"| A{i} | B{i} | C{i} |" for i in range(150)
+    )
+    rendered = process_output(text).text
+    assert all(f"A{i}" in rendered and f"B{i}" in rendered and f"C{i}" in rendered for i in range(150))
+    messages = _format_chunks("u", "Nova", rendered)
+    assert all(_u16(message) <= SAFE_LIMIT for message in messages)
+    assert _reconstruct(messages) == rendered
+
+
+def test_table_surrounded_by_text_is_not_merged():
+    text = "before text\n| a | b |\n|---|---|\n| 1 | 2 |\nafter text"
+    assert process_output(text).text == (
+        "before text\n```\na | b\n--- | ---\n1 | 2\n```\nafter text"
+    )
+
+
+def test_text_before_and_after_large_table_preserved():
+    text = "intro line\n\n" + _big_table(300) + "\n\noutro line"
+    rendered = process_output(text).text
+    assert rendered.startswith("intro line\n\n```")
+    assert rendered.endswith("```\n\noutro line")
+    reconstructed = _reconstruct(_format_chunks("u", "Nova", rendered))
+    assert reconstructed == rendered
+    assert reconstructed.count("row") == 300
+
+
+def test_two_tables_rendered_independently():
+    text = (
+        "first\n| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+        "second\n| c | d |\n|---|---|\n| 3 | 4 |"
+    )
+    rendered = process_output(text).text
+    assert rendered.count("```") == 4
+    assert "first\n```" in rendered
+    assert "```\n\nsecond\n```" in rendered
+
+
+def test_large_table_idempotence():
+    corpus = [
+        _big_table(120),
+        "| مدل | Model | رقم |\n|---|---|---|\n| کارایی | perf | ۱۲۳ |\n| ظرفیت | cap | 456 |",
+        "| a | b |\n|---|---|\n| `x|y` | `2*3` |",
+        "first\n| a | b |\n|---|---|\n| 1 | 2 |\n\nsecond\n| c | d |\n|---|---|\n| 3 | 4 |",
+    ]
+    for text in corpus:
+        once = process_output(text).text
+        assert process_output(once).text == once
+
+
+def test_large_emoji_table_utf16_safe():
+    text = "| item | icons |\n|---|---|\n" + "\n".join(
+        f"| item-{i:04d} | " + "🙂🚀" * 3 + " |" for i in range(300)
+    )
+    rendered = process_output(text).text
+    messages = _format_chunks("u", "Nova", rendered)
+    assert len(messages) > 1
+    # chunk size is measured in UTF-16 units, never Python character count
+    assert all(_u16(message) <= SAFE_LIMIT for message in messages)
+    reconstructed = _reconstruct(messages)
+    assert reconstructed == rendered
+    assert reconstructed.count("🙂") == 300 * 3
+    assert reconstructed.count("🚀") == 300 * 3
+
+
+@pytest.mark.asyncio
+async def test_delivery_large_table_first_edit_then_replies():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text): replies.append(text)
+    from backend.ai.tools.delivery import deliver_response
+    text = _big_table(300)
+    rendered = process_output(text).text
+    expected = _format_chunks("u", "Nova", rendered)
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "u", "Nova", text,
+    )
+    assert result.success
+    assert result.total_chunks == len(expected) > 1
+    assert result.chunks_delivered == result.total_chunks
+    assert len(edits) == 1 and len(replies) == len(expected) - 1
+    assert edits == expected[:1]
+    assert replies == expected[1:]
+    assert all(_u16(message) <= SAFE_LIMIT for message in edits + replies)
+    assert _reconstruct(edits + replies) == rendered
+
+
+@pytest.mark.asyncio
+async def test_delivery_large_table_partial_failure_is_not_false_success():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text):
+        replies.append(text)
+        if len(replies) == 1:
+            raise RuntimeError("second chunk failed")
+    from backend.ai.tools.delivery import deliver_response
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "u", "Nova", _big_table(300),
+    )
+    # the first chunk was delivered via edit, the failing continuation reply
+    # must surface as an honest failure, never a false success
+    assert not result.success
+    assert result.chunks_delivered == 1
+    assert len(edits) == 1 and len(replies) == 1
