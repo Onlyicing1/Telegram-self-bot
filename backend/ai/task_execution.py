@@ -12,6 +12,7 @@ from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
+from backend.ai.retry import FailureClass, classify_failure, retry_delay, can_retry
 
 logger = logging.getLogger(__name__)
 MAX_EXECUTION_SECONDS = 60.0
@@ -105,6 +106,18 @@ class TaskExecutionCoordinator:
         if updated is None:
             return TaskExecutionResult(False, "unknown", len(calls), successful, "state_persist_failed", metadata)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
+
+    async def handle_failure(self, occurrence: OccurrenceRecord, error: BaseException | str) -> TaskExecutionResult:
+        decision = classify_failure(error)
+        if decision.classification == FailureClass.RETRYABLE and can_retry(occurrence.attempt):
+            retry_at = occurrence.updated_at + retry_delay(occurrence.attempt)
+            updated = await self.repository.transition_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+                "retry_pending", retry_at=retry_at,
+                error_metadata={"error_class": decision.reason, "attempt": occurrence.attempt},
+            )
+            return TaskExecutionResult(False, "retry_pending" if updated else "unknown", 0, 0, decision.reason)
+        return await self._fail(occurrence, decision.reason, 0, 0)
 
     async def _fail(
         self,
