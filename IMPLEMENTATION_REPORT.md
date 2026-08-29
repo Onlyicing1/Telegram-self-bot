@@ -76,7 +76,7 @@ No live Telegram execution or live Supabase integration was performed.
 Stage 6 executes only already-claimed occurrences and does not create tasks, parse natural language, schedule work, send notifications, or implement provider/Telegram-specific retry classification or backoff. The next stage is Stage 7 — Retry Classification, Backoff, and Operational Task Management, which must preserve this execution/repository boundary and the two-table model.
 
 ## Delivery
-- **Implementation commit:** to be recorded after commit.
-- **Push:** to be recorded after push verification.
-- **Remote HEAD:** to be recorded after push verification.
-- **Final working tree:** to be recorded after final verification.
+- **Implementation commit:** `a42a3cf88e1d06c5d410c25f68f435b31ba4c308`
+- **Push:** succeeded to `origin/main`.
+- **Remote HEAD:** `a42a3cf88e1d06c5d410c25f68f435b31ba4c308`, matching local HEAD.
+- **Final working tree:** clean on `main`, synchronized with `origin/main`.
