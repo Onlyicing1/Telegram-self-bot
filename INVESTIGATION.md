@@ -215,3 +215,108 @@ git diff --check
 ```
 
 It should also inspect the final diff and verify that only the intended implementation, focused tests, and implementation report changed. If implementation is delivered, verify the commit, push, remote SHA, and clean working tree separately. This investigation itself performed no test mutation, SQL execution, commit, or push.
+
+---
+
+## 18. LARGE / MULTILINE MARKDOWN TABLE DELIVERY AUDIT
+
+### 18.1 Metadata
+
+- Investigation date: 2026-08-29
+- Repository: Telegram-self-bot / LifeOS
+- Branch: `main`
+- Starting commit: `34c1208807949f8fef932ce498e0540d2f7ddb1b` (`test: add large markdown table delivery regressions`)
+- Status: Investigation only. No production code, tests, schema, SQL, providers, or Telegram execution were modified in this phase.
+
+### 18.2 Objective
+
+Determine exactly how the current table renderer (`_render_tables` in `backend/ai/tools/delivery.py`) behaves when Markdown tables become large, wide, or contain multiline cells/rows, and whether any deterministic, meaning-changing defect requires a production change in a later phase. This phase is diagnostic only: nothing was fixed.
+
+### 18.3 Source files inspected
+
+- `backend/ai/tools/delivery.py` — full current file: `process_output()`, `_normalize_plain()`, `_protect()`/`_restore()`, `_render_markdown()`, `_render_tables()`, `_build_table_block()`, `_split_table_row()`, `_display_width()`, `_format_chunks()`, `_split_text()`, `_split_point_at_utf16()`, `_utf16_units()`, `deliver_response()`.
+- `tests/test_67_ai_output_pipeline.py` — full current file, including the 15 diagnostic table tests added in commit `34c1208`.
+- `backend/bot/handlers/ai_unified.py` — delivery call sites and failure/empty handling (inspection only).
+
+### 18.4 Tests added / run
+
+The 15 diagnostic tests added in the preceding test-only phase (commit `34c1208`, unchanged in this phase):
+
+1. `test_large_table_exceeds_single_message_and_preserves_all_rows`
+2. `test_large_table_chunks_split_at_row_boundaries`
+3. `test_multiline_cell_fails_closed_without_content_loss`
+4. `test_multiple_multiline_rows_fail_closed`
+5. `test_large_table_with_long_cell_preserves_content`
+6. `test_long_unbroken_cell_split_content_preservingly`
+7. `test_wide_table_mixed_unicode_widths_deterministic`
+8. `test_large_table_with_short_cells_all_rows_survive`
+9. `test_table_surrounded_by_text_is_not_merged`
+10. `test_text_before_and_after_large_table_preserved`
+11. `test_two_tables_rendered_independently`
+12. `test_large_table_idempotence`
+13. `test_large_emoji_table_utf16_safe`
+14. `test_delivery_large_table_first_edit_then_replies`
+15. `test_delivery_large_table_partial_failure_is_not_false_success`
+
+Executed read-only in this phase:
+
+```text
+python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header   → 84 passed (69 existing + 15 new)
+python3 -m pytest tests/ -q --no-header                                → 1074 passed, 23 skipped, 1 warning
+python3 -m compileall -q backend tests                                 → OK
+git diff --check                                                       → OK
+```
+
+### 18.5 Test results
+
+- Focused suite: **84 passed, 0 failed**.
+- Full suite: **1074 passed, 23 skipped, 1 warning** (pre-existing skips/warning), **0 failed**.
+
+### 18.6 Passing cases (verified actual behavior)
+
+- **Large table > 1 message**: a 300-row table renders to ~7 messages; every row is preserved, reconstruction is byte-exact, and every chunk is ≤ `SAFE_LIMIT` UTF-16 units.
+- **Row-atomic chunking**: chunks split at table-row boundaries; no rendered row is split across messages.
+- **Multiline cells / rows**: a physically-broken row (cell content continued on the next physical line) is not a valid GFM pipe row, so `_render_tables` fails closed — output is byte-identical to input, no content loss.
+- **Large table + long cell**: content preserved; an oversized unbroken cell is split by `_split_text` content-preservingly.
+- **Wide table**: per-column monospace display widths are deterministic (combining/ZWJ = 0, CJK/emoji = 2, Persian/Arabic/Latin = 1).
+- **150-row short-cell table**: all rows survive processing and chunking.
+- **Boundary safety**: normal text before/after a table is preserved, never merged or duplicated; two adjacent tables render independently.
+- **Idempotence**: `process_output(process_output(x).text).text == process_output(x).text` for the large-table corpus (fenced tables re-protect as code on the second pass).
+- **Delivery semantics**: first chunk via `edit`, continuations via `reply`, count matches `_format_chunks`; a failing continuation reply yields `success=False` with `chunks_delivered=1` — never a false success.
+- **UTF-16 safety**: supplementary-plane emoji cells in a large table produce chunks all ≤ `SAFE_LIMIT` measured in UTF-16 units; no surrogate pair is split.
+
+### 18.7 Failing cases
+
+None. Every newly added diagnostic test passes against the current implementation.
+
+### 18.8 Exact reproducible failures
+
+None. No input produced truncation, content loss, non-deterministic width, or chunk-limit violation.
+
+### 18.9 Root cause for each confirmed failure
+
+N/A — no confirmed failure.
+
+### 18.10 Whether the issue is deterministic
+
+N/A. All observed behavior is deterministic and rule-consistent (row-atomic splitting, fail-closed multiline rows, deterministic display widths).
+
+### 18.11 Whether production code needs modification
+
+**No.** There is no evidence-backed defect in the table path. The current implementation already satisfies every invariant the diagnostic suite pins.
+
+### 18.12 Recommended implementation scope for the next phase
+
+No production implementation is recommended for table chunking. The next phase should keep the diagnostic suite as regression protection and move to another feature/domain rather than inventing a table change. If a future phase ever changes `_render_tables`, `_format_chunks`, or `_split_text`, the 15 tests above define the invariants that must hold: row-atomic chunking, exact content preservation, UTF-16 `SAFE_LIMIT` compliance, fail-closed multiline rows, deterministic widths, idempotence, and honest delivery results.
+
+### 18.13 Security / architecture impact
+
+None. No security or execution boundary changed. `deliver_response()` remains the single delivery boundary; no second delivery path, no arbitrary Telegram RPC, no provider/AI/network/database calls were introduced or inspected for change.
+
+### 18.14 Database / schema impact
+
+None. No SQL, migration, or Supabase operation.
+
+### 18.15 Explicit statement
+
+NO production code was changed during this investigation. The diagnostic tests were added and committed in the preceding test-only phase (`34c1208`) and were not altered in this phase; the only file changed in this phase is `INVESTIGATION.md`. Nothing in this investigation is claimed to be fixed.
