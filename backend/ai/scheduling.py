@@ -21,6 +21,8 @@ class OneShotState(str, Enum):
 def _tz(name: str) -> ZoneInfo:
     if not isinstance(name, str) or not name.strip():
         raise ScheduleError("timezone is required")
+    if name.strip() == "UTC":
+        return timezone.utc  # type: ignore[return-value]
     try:
         return ZoneInfo(name.strip())
     except ZoneInfoNotFoundError as exc:
