@@ -87,7 +87,7 @@ class RuntimeSupervisor:
         "cfg", "api_id", "api_hash", "session_string", "owner_id", "tz_str",
         "bot_token", "helper_enabled", "state", "client", "helper_client",
         "client_generation", "shutdown_event", "_run_task", "_web_task",
-        "_helper_task", "_recovery_attempts", "_recovery_lock",
+        "_helper_task", "_task_scheduler", "_recovery_attempts", "_recovery_lock",
         "_recovery_cooldown_until", "_reconnect_cooldown_until", "_client_alive",
     )
 
@@ -108,6 +108,7 @@ class RuntimeSupervisor:
         self._run_task: asyncio.Task | None = None
         self._web_task: asyncio.Task | None = None
         self._helper_task: asyncio.Task | None = None
+        self._task_scheduler = None
         self._recovery_attempts = 0
         self._recovery_lock = asyncio.Lock()
         self._recovery_cooldown_until = 0.0
@@ -185,6 +186,7 @@ class RuntimeSupervisor:
 
         await self._resume_bio_cron()
         await self._resume_username_cron()
+        await self._start_task_scheduler()
 
         self._transition(RuntimeState.READY)
         set_supervisor_ok(True)
@@ -319,6 +321,19 @@ class RuntimeSupervisor:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+
+    async def _start_task_scheduler(self) -> None:
+        if self._task_scheduler is None:
+            from backend.ai.database.task_repository import get_task_repository
+            from backend.ai.task_scheduler import TaskScheduler
+            self._task_scheduler = TaskScheduler(get_task_repository(), self.owner_id)
+        await self._task_scheduler.start()
+
+    async def _stop_task_scheduler(self) -> None:
+        scheduler = self._task_scheduler
+        self._task_scheduler = None
+        if scheduler is not None:
+            await scheduler.stop()
 
     async def _resume_bio_cron(self) -> None:
         from backend.db import client as db_client
@@ -863,6 +878,7 @@ class RuntimeSupervisor:
         from backend.username import engine as username_engine
         await bio_engine.stop_cron()
         await username_engine.stop_cron()
+        await self._stop_task_scheduler()
 
         from backend.runtime.heartbeat import stop_heartbeat
         from backend.runtime.keepalive import stop_keepalive
