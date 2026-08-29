@@ -32,7 +32,9 @@
 12. [ai_provider_stats](#12-ai_provider_stats)
 13. [ai_usage](#13-ai_usage)
 14. [ai_preferences](#14-ai_preferences)
-15. [Relationships](#15-relationships)
+15. [ai_tasks](#15-ai_tasks)
+16. [ai_task_occurrences](#16-ai_task_occurrences)
+17. [Relationships](#17-relationships)
 16. [RLS Policy Model](#16-rls-policy-model)
 17. [Panel Database](#17-panel-database)
 18. [In-Memory Fallback](#18-in-memory-fallback)
@@ -787,7 +789,60 @@ migration has been applied for this table.
 
 ---
 
-## 15. Relationships
+## 15. ai_tasks
+
+Durable owner-scoped AI task definitions for the future scheduler. This table exists in the repository migration `supabase/migrations/20260829000001_create_ai_tasks.sql`; live Supabase application is a separate manual deployment step and has not been verified.
+
+| Column | Type | Nullable | Default / constraint |
+|---|---|---:|---|
+| `id` | `bigserial` | NO | PRIMARY KEY |
+| `owner_id` | `bigint` | NO | Authenticated Telegram owner; no owner FK |
+| `label` | `text` | NO | Nonblank; max 256 enforced by repository |
+| `status` | `text` | NO | `'active'`; CHECK `active`, `paused`, `completed`, `failed`, `expired`, `deleted` |
+| `version` | `integer` | NO | `1`; CHECK `> 0` |
+| `schedule_type` | `text` | NO | CHECK `once`, `interval`, `daily`, `weekly` |
+| `schedule` | `jsonb` | NO | Max 16,384 bytes by migration |
+| `timezone` | `text` | NO | Explicit IANA identifier validated by application |
+| `next_run_at` | `timestamptz` | YES | UTC due instant |
+| `actions` | `jsonb` | NO | JSON array, 1–5 actions, max 32,768 bytes |
+| `notification_destination` | `jsonb` | NO | Max 4,096 bytes; explicit owner-scoped destination |
+| `created_at` | `timestamptz` | NO | `now()` |
+| `updated_at` | `timestamptz` | NO | `now()` |
+| `terminal_at` | `timestamptz` | YES | Terminal lifecycle timestamp |
+
+Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no action or step table exists.
+
+RLS is enabled. The migration grants SELECT to `anon` and `authenticated` and adds no public write policy. Backend access uses the service-role client and repository methods must still filter by `owner_id`. Retain task definitions until explicit owner deletion/terminal cleanup policy is approved.
+
+## 16. ai_task_occurrences
+
+Durable occurrence/attempt history for `ai_tasks`. Repository migration state exists in the same migration file; live Supabase deployment is manual and unverified.
+
+| Column | Type | Nullable | Default / constraint |
+|---|---|---:|---|
+| `id` | `bigserial` | NO | PRIMARY KEY |
+| `task_id` | `bigint` | NO | REFERENCES `ai_tasks(id)` ON DELETE RESTRICT |
+| `owner_id` | `bigint` | NO | Denormalized owner; no owner FK |
+| `occurrence_key` | `text` | NO | Nonblank; unique with `task_id` |
+| `definition_version` | `integer` | NO | CHECK `> 0` |
+| `action_snapshot` | `jsonb` | NO | JSON array, 1–5 actions, max 32,768 bytes |
+| `scheduled_for` | `timestamptz` | NO | UTC scheduled instant |
+| `attempt` | `smallint` | NO | `1`; CHECK 1–3 |
+| `status` | `text` | NO | `'claimed'`; CHECK `claimed`, `running`, `succeeded`, `failed`, `retry_pending`, `cancelled`, `expired`, `interrupted` |
+| `claimed_at` | `timestamptz` | YES | Claim timestamp |
+| `started_at` | `timestamptz` | YES | Start timestamp |
+| `finished_at` | `timestamptz` | YES | Finish timestamp |
+| `retry_at` | `timestamptz` | YES | Required by migration for `retry_pending` |
+| `error_metadata` | `jsonb` | NO | `'{}'`; object, max 8,192 bytes |
+| `result_metadata` | `jsonb` | NO | `'{}'`; object, max 8,192 bytes |
+| `created_at` | `timestamptz` | NO | `now()` |
+| `updated_at` | `timestamptz` | NO | `now()` |
+
+Indexes are unique `uq_ai_task_occurrences_task_key (task_id, occurrence_key)`, `idx_ai_task_occurrences_owner_scheduled (owner_id, scheduled_for DESC)`, and `idx_ai_task_occurrences_task_scheduled (task_id, scheduled_for DESC)`. No `(status, retry_at)` index is present because the current repository does not issue that query. The unique index prevents duplicate durable occurrences, not duplicate Telegram side effects.
+
+RLS is enabled. SELECT is granted to `anon` and `authenticated`; no public write policy is added. The task FK uses `ON DELETE RESTRICT`, preserving history. Occurrences snapshot `definition_version` and `action_snapshot`; later task edits do not rewrite history. Recommended retention is bounded terminal history (initially 90 days, subject to operations approval).
+
+## 17. Relationships
 
 There are **no enforced foreign keys** between any tables. Each table is
 independent. The following logical relationships exist (not FK
@@ -805,7 +860,7 @@ relationships, but it is not required for correctness.
 
 ---
 
-## 16. RLS Policy Model
+## 18. RLS Policy Model
 
 All tables have RLS enabled. Only SELECT policies are granted to
 `anon` + `authenticated` (read-only dashboard access). All writes
@@ -834,7 +889,7 @@ their creation migrations (`20260827000003` / `20260827000004`).
 
 ---
 
-## 17. Panel Database
+## 19. Panel Database
 
 The Glass Panel system uses a **column-per-setting** model on the
 `panel_settings` table. Each setting is a real typed column — no
@@ -895,7 +950,7 @@ Supabase call that fails logs a warning and falls back silently.
 
 ---
 
-## 18. In-Memory Fallback
+## 20. In-Memory Fallback
 
 The bot is designed to run **with or without Supabase**. When the DB
 is unavailable, all operations use in-memory fallbacks:
@@ -928,7 +983,7 @@ fails logs a warning and falls back silently.
 
 ---
 
-## 19. Known Inconsistencies
+## 21. Known Inconsistencies
 
 This section documents every discrepancy between the repository code,
 the applied migrations, and this specification. Future migrations
