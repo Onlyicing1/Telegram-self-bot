@@ -103,6 +103,110 @@ def _render_markdown(text: str) -> str:
     return _restore(text, tokens)
 
 
+def _display_width(char: str) -> int:
+    """Monospace display width of a single character.
+
+    Combining marks, zero-width joiners/non-joiners, variation selectors and
+    zero-width spaces occupy no visual column; East Asian wide/fullwidth
+    characters and supplementary-plane characters (emoji) occupy two;
+    everything else (Latin, Persian, Arabic, digits) occupies one.
+    """
+    if unicodedata.combining(char) or char in "\u200d\u200c\u200b\ufe0e\ufe0f":
+        return 0
+    if unicodedata.east_asian_width(char) in ("W", "F") or ord(char) > 0xFFFF:
+        return 2
+    return 1
+
+
+def _cell_display_width(cell: str) -> int:
+    return sum(_display_width(char) for char in cell)
+
+
+def _pad_cell(cell: str, width: int) -> str:
+    return cell + " " * max(0, width - _cell_display_width(cell))
+
+
+def _split_table_row(line: str) -> list[str] | None:
+    """Split a table row on ``|``. Returns ``None`` when the line is not a
+    pipe-delimited row (no pipe, or only a single empty cell)."""
+    if "|" not in line:
+        return None
+    cells = line.split("|")
+    if cells and cells[0].strip() == "":
+        cells = cells[1:]
+    if cells and cells[-1].strip() == "":
+        cells = cells[:-1]
+    if not cells:
+        return None
+    return [cell.strip() for cell in cells]
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _split_table_row(line)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-+:?", cell) for cell in cells)
+
+
+def _build_table_block(rows: list[list[str]]) -> str | None:
+    ncols = len(rows[0])
+    widths = [0] * ncols
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], _cell_display_width(cell))
+
+    def fmt(cells: list[str]) -> str:
+        return " | ".join(_pad_cell(cell, widths[index]) for index, cell in enumerate(cells))
+
+    parts = [fmt(rows[0]), " | ".join("-" * (width + 2) for width in widths)]
+    parts.extend(fmt(row) for row in rows[1:])
+    block = "\n".join(parts)
+    if "```" in block:
+        return None
+    return f"```\n{block}\n```"
+
+
+def _render_tables(text: str) -> str:
+    """Render pipe-delimited Markdown tables as aligned monospace blocks.
+
+    Only lines satisfying real table structure are transformed: a header row
+    followed by a dash separator row with the same column count, then body
+    rows with the same column count. Protected regions (URLs, usernames,
+    commands, inline/fenced code) are masked first, so table syntax inside
+    them is never parsed. Ambiguous or ragged input fails closed and is left
+    exactly as-is.
+    """
+    text, tokens = _protect(text)
+    lines = text.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = _split_table_row(lines[index])
+        if header and index + 1 < len(lines):
+            separator = _split_table_row(lines[index + 1])
+            if separator and _is_table_separator(lines[index + 1]) and len(separator) == len(header):
+                rows: list[list[str]] = [header]
+                cursor = index + 2
+                invalid = False
+                while cursor < len(lines):
+                    row = _split_table_row(lines[cursor])
+                    if row is None:
+                        break
+                    if len(row) != len(header):
+                        invalid = True
+                        break
+                    rows.append(row)
+                    cursor += 1
+                block = None if invalid else _build_table_block(rows)
+                if block is not None:
+                    out.append(block)
+                    index = cursor
+                    continue
+        out.append(lines[index])
+        index += 1
+    return _restore("\n".join(out), tokens)
+
+
 def _utf16_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
@@ -131,7 +235,7 @@ def _render_entities(text: str) -> tuple[Any, ...]:
 def process_output(text: str) -> RenderedOutput:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("AI output must be non-empty text")
-    rendered = _render_markdown(_normalize_plain(text))
+    rendered = _render_tables(_render_markdown(_normalize_plain(text)))
     if not rendered.strip():
         raise ValueError("AI output became empty after rendering")
     entities = _render_entities(text)

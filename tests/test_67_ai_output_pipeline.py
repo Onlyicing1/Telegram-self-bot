@@ -437,6 +437,100 @@ def test_dot_and_emphasis_coexist():
     assert process_output("run *this* then main.py").text == "run this then main.py"
 
 
+def test_table_renders_aligned_fenced_block():
+    # English table: header/separator/body all pad to the same column widths.
+    text = "| Model | Model 1 | Model 2 |\n|---|---|---|\n| Speed | 95 | 88 |\n| Capacity | 200K | 128K |"
+    rendered = process_output(text).text
+    expected = (
+        "```\n"
+        "Model    | Model 1 | Model 2\n"
+        "---------- | --------- | ---------\n"
+        "Speed    | 95      | 88     \n"
+        "Capacity | 200K    | 128K   \n"
+        "```"
+    )
+    assert rendered == expected
+
+
+def test_table_persian_renders_aligned():
+    text = "| مدل | مدل ۱ | مدل ۲ |\n|---|---|---|\n| کارایی | 85% | 92% |\n| ظرفیت | 200K | 128K |"
+    rendered = process_output(text).text
+    lines = rendered.split("\n")
+    assert lines[0] == "```" and lines[-1] == "```"
+    body = lines[1:-1]
+    # every row must have the same pipe-separated column structure
+    widths = {len(row.split("|")) for row in body}
+    assert widths == {3}
+    # separator must contain only dashes/spaces/pipes
+    assert all(char in "- |" for char in body[1])
+
+
+def test_table_detection_guards():
+    # plain pipe text without a separator row is never a table
+    assert process_output("A | B").text == "A | B"
+    assert process_output("condition: x | y").text == "condition: x | y"
+    assert process_output("| A | B |").text == "| A | B |"
+    # ragged body rows fail closed and leave the whole block untouched
+    ragged = "| a | b |\n|---|---|\n| c | d | e |"
+    assert process_output(ragged).text == ragged
+    # separator/header column mismatch fails closed
+    mismatch = "| a | b |\n|---|---|---|\n| c | d |"
+    assert process_output(mismatch).text == mismatch
+
+
+def test_table_protected_regions_untouched():
+    assert process_output("`| A | B |`").text == "`| A | B |`"
+    fenced = "```text\n| A | B |\n|---|---|\n| C | D |\n```"
+    assert process_output(fenced).text == fenced
+    assert process_output("see https://example.com/a|b now").text == "see https://example.com/a|b now"
+    assert process_output("ask @user|one and /cmd|two").text == "ask @user|one and /cmd|two"
+
+
+def test_table_display_width_unicode():
+    from backend.ai.tools.delivery import _cell_display_width, _display_width
+    assert _display_width("a") == 1
+    assert _display_width("م") == 1
+    assert _display_width("中") == 2
+    assert _display_width("🙂") == 2
+    assert _cell_display_width("a\u0301") == 1  # combining mark is zero-width
+    assert _cell_display_width("👨\u200d👩") == 4  # ZWJ family: 2+0+2
+
+
+def test_table_idempotent():
+    corpus = [
+        "| a | b |\n|---|---|\n| c | d |",
+        "hi **bold** and `code`",
+        "main.py and 2*3*4",
+        "سلام\n| x | y |\n|---|---|\n| 1 | 2 |",
+    ]
+    for text in corpus:
+        once = process_output(text).text
+        assert process_output(once).text == once
+
+
+def test_table_content_preserved_and_chunked():
+    big = "| c1 | c2 |\n|---|---|\n" + "\n".join(f"| row{i} | " + "x" * 40 + " |" for i in range(200))
+    rendered = process_output(big).text
+    messages = _format_chunks("user", "Nova", rendered)
+    assert all(_utf16_units(message) <= SAFE_LIMIT for message in messages)
+    assert "".join(messages).count("row") == 200
+
+
+@pytest.mark.asyncio
+async def test_delivery_delivers_rendered_table():
+    edits, replies = [], []
+    async def edit(text): edits.append(text)
+    async def reply(text): replies.append(text)
+    from backend.ai.tools.delivery import deliver_response
+    result = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply), "Nova hi", "Nova",
+        "| a | b |\n|---|---|\n| c | d |",
+    )
+    assert result.success
+    assert edits == ["Nova hi\n────────────\n🤖 Nova\n```\na | b\n--- | ---\nc | d\n```"]
+    assert replies == []
+
+
 @pytest.mark.asyncio
 async def test_delivery_delivers_dot_preserved_text():
     edits, replies = [], []

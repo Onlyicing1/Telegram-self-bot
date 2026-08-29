@@ -1,211 +1,196 @@
-# Implementation Report — Deterministic AI Output Delivery Audit (Post Dot/Colon Repair)
+# Implementation Report — Telegram-Friendly Markdown Table Rendering
 
 ## Date
-2026-08-28
+2026-08-29
 
 ## Repository / Branch / Base commit
 - Repository: `https://github.com/Onlyicing1/Telegram-self-bot` (`origin`)
 - Branch: `main`
-- Base commit (start of audit): `a9bd036dffa41856e09a9ad9affe2c42cd6efd07` (synced with `origin/main`)
+- Base commit (start of chunk): `b305c97a7ba723d38b69773719e26f4085570b8d` (synced with `origin/main`, clean tree)
 
 ## Task objective
-A fresh, read-only, source-grounded audit of the complete centralized plain-text
-AI output delivery path **after** the dot/colon literal-preservation repair, to
-determine whether any additional deterministic, meaning-changing, user-visible
-defect exists. Investigation only — no production/test/database changes, and
-Markdown entity delivery (blocked) was not reopened.
+Make Markdown tables produced by the AI render as properly aligned, readable
+tables inside Telegram messages, using only the existing centralized plain-text
+delivery boundary (`backend/ai/tools/delivery.py`). This is **not** general
+Markdown entity delivery (still blocked) — it is a smallest-possible,
+deterministic table renderer that composes with the existing pipeline.
 
-## Exact audited path
-```
-ProviderManager → Dispatcher → Engine → EngineResult
-→ ai_unified._execute_ai → deliver_response → process_output
-→ _format_chunks → Telegram edit/reply
-```
+## Current implementation state
+`deliver_response()` → `process_output()` → `_format_chunks()` → Telegram
+edit/reply remains the single delivery boundary. `process_output()` now runs
+`_render_tables(_render_markdown(_normalize_plain(text)))`. The new
+`_render_tables()` stage detects real Markdown tables and renders them as
+aligned fixed-width monospace blocks wrapped in balanced triple-backtick
+fences. Telethon's default `parse_mode='md'` (verified empirically, no
+`parse_mode` is set anywhere in the backend) parses the balanced fence into a
+`MessageEntityPre`, so Telegram renders the block in a monospace font where the
+padded columns line up. No entity-offset code, no chunk-relative remapping, no
+second delivery path.
 
-## Investigation scope
-Source inspected (from `origin/main`, which equals the clean working tree):
-- `backend/ai/tools/delivery.py` (full, 276 lines incl. the dot/colon fix)
-- `backend/bot/handlers/ai_unified.py` (delivery call sites, silent-delete
-  guard, success/failure/empty branches, timeout/cancel handling)
-- `tests/test_67_ai_output_pipeline.py` (full, 61 tests)
+## Exact defect / limitation addressed
+AI output containing Markdown tables was delivered as raw pipe-delimited text,
+which is visually misaligned inside Telegram messages (columns do not line up,
+especially with Persian/RTL text, English, numbers, and mixed-length cells).
+Inserting spaces into normal Telegram text is insufficient because normal text
+is not a reliable fixed-width surface.
 
-Read-only interpreter probes and a deterministically-seeded fuzzer were run
-against the actual current implementation (no files modified).
+## Root cause
+The delivery pipeline normalized and degraded Markdown but had no table
+recognition: pipe-delimited rows were passed through unchanged, and Telegram's
+default font is proportional, so naive space padding cannot align columns. The
+fix gives the pipeline a deterministic table detector and a width-aware
+renderer, and uses Telegram's native monospace (pre) rendering for alignment.
 
-## Evidence gate
+## Exact implementation changes (`backend/ai/tools/delivery.py`)
+Added (all local to the delivery module, synchronous, deterministic):
 
-### Confirmed
-- The dot/colon fix (splice class `[,;!?،؛؟]`) is present and correct on
-  `origin/main`: `main.py`, `report.txt`, `example.com`, `data.v1.csv`, `e.g.`,
-  `U.S.A`, `run main.py now`, `config.json`, `node:18`, `v2.3.1`, `12:30` all
-  preserved unchanged; intended spacing preserved (`hello,world` →
-  `hello, world`, `سلام،world` → `سلام، world`, `note;see` → `note; see`,
-  `تشکر!انجام` → `تشکر! انجام`, `x,y` → `x, y`).
-- No meaning-changing defect was found in this audit. Every observed behavior is
-  deterministic and rule-consistent or harmless.
-- Focused baseline: `tests/test_67_ai_output_pipeline.py -q --no-header` →
-  **61 passed** (read-only; no files changed).
+1. `_display_width(char)` — monospace display width: combining marks, ZWJ/ZWNJ,
+   zero-width space, and variation selectors (VS15/VS16) = 0; East Asian
+   wide/fullwidth and supplementary-plane characters (emoji) = 2; everything
+   else (Latin, Persian, Arabic, digits) = 1. Width is computed per code point,
+   never a multiplier over `len()`.
+2. `_cell_display_width(cell)` / `_pad_cell(cell, width)` — display-width-aware
+   padding (plain `str.ljust` is wrong for wide characters).
+3. `_split_table_row(line)` — pipe split, leading/trailing outer empty cells
+   dropped, cells stripped. Returns `None` for non-pipe lines.
+4. `_is_table_separator(line)` — every cell must match `:?-+:?` (at least one
+   dash), with at least one cell.
+5. `_build_table_block(rows)` — column widths = max display width per column;
+   header + `-` separator (`-` × (width+2) per column joined with ` | `) +
+   body rows; cells joined with `" | "`. Returns `None` (fail closed) if any
+   cell contains a triple backtick, so fences can never nest.
+6. `_render_tables(text)` — line scan: a header row immediately followed by a
+   separator row with the **same column count** starts a table; contiguous body
+   rows with the same column count are consumed; a ragged row (different column
+   count) fails the whole candidate closed and leaves the original lines
+   untouched. The stage calls `_protect()`/`_restore()` itself, so tables
+   inside inline code, fenced code, URLs, usernames, or commands are masked and
+   never parsed. Output is wrapped in balanced ` ``` ` fences.
+7. Wired into `process_output()`: `rendered = _render_tables(_render_markdown(_normalize_plain(text)))`.
 
-### Likely
-- None (no candidate reached LIKELY — all suspicious outcomes were explained by
-  an existing intended rule or canonical-equivalent normalization).
+Detection grammar (per task): header row + valid separator row + consistent
+column count across body rows. `A | B` alone, `condition: x | y`, and a bare
+`| A | B |` are **not** tables (no separator row) and pass through unchanged.
 
-### Unknown
-- Practical impact of the pre-existing space-before-punctuation rule (see
-  below) on unusual space-before-dot input; classified INTENTIONAL, not a
-  defect, so no implementation target.
-
-## Audit results by subsystem
-### Unicode normalization
-NFC (canonical), newline normalize, Persian letter swap (`ي`→`ی`, `ك`→`ک`).
-NFC recomposes `e\u0301` → `é` (canonically equivalent; harmless). It changes
-UTF-16 length per code point but this only matters for entity offsets, which are
-blocked/dead. ZWJ sequences and multiperson emoji survive. **No defect.**
-
-### Whitespace / punctuation normalization
-Whitespace collapse, newline collapse, `.strip()`, space-before-punct removal
-(line 83), and the post-fix sentence-spacing splice (line 84). Line 83 removes a
-stray space before punctuation by design (`a   ,b` → `a, b`); it also collapses
-unusual `wait . now` → `wait. now`, which is the rule's documented intent.
-**No new defect.** (Line 84 now excludes `.`/`:`, so no filename/domain split.)
-
-### Persian / Arabic normalization
-Persian markers trigger `ي`→`ی`/`ك`→`ک`. Sentence spacing around `،` `؛` `؟` is
-preserved; dot/colon literals in Persian text (`report.txt`) preserved.
-**No defect.**
-
-### Protected regions & restoration
-`_protect`/`_restore` mask URLs, `@user`, `/cmd`, inline `` ` `` and fenced
-```` ``` ```` with unique `\0{i}\0` tokens. Verified integrity and that block
-conversions/emphasis never touch inside code: `` `- item` ``, ` ```# head``` ``
-stay intact; `https://x.com/a#frag - keep`, `@user say - hi`, `/cmd -flag` all
-preserved. **No defect.**
-
-### Markdown degradation (plain-text, not entities)
-Word-boundary emphasis stripping with `\w` boundaries preserves intraword
-`2*3*4`, `some_word_here`, `some__word__here`, `foo_bar_baz`, and
-Arabic/CJK word-adjacent delimiters; clearly-delimited `*italic*`, `**bold**`,
-`_em_`, `__under__` degrade. Adjacent/touching mixed `*`/`_` (e.g. `*a*_b_` →
-`*a*b`) is a deterministic rule consequence of `\w`-includes-`_`, documented as
-INTENTIONAL/rule-consistent (not a defect; no unambiguous literal is deleted).
-
-### List / heading / blockquote conversions
-`- x` → `• x`, `# x` → `x`, `> q` → `▎ q`, `1. x` preserved, only at line
-start; mid-line `>`, `#tag`, `-x`, `5 - 3` untouched; conversions never apply
-inside protected code. **No defect.**
-
-### Empty-output behavior
-Empty/whitespace-only input → `ValueError`; standalone `*`/`_`/`` ` ``/`#`
-stay literal; `deliver_response` on empty `response_text` edits an explicit
-"AI returned no response" error (verified). Silent-delete path and failure
-edits are correct. **No defect.**
-
-### Chunk formatting / UTF-16 / reconstruction
-`_format_chunks` header + continuation `\n\n_(p/n)_` markers, correct numbering
-tied to `len(body)`, deterministic. Reconstruction (`"".join(parts)` minus
-continuation markers == body) held for ASCII/BMP/supplementary/emoji/Persian/
-Arabic/CJK/long-unbroken/newline-heavy input. Every emitted message ≤
-`SAFE_LIMIT` (4000 UTF-16 units), including worst-case continuation markers
-(`3980 + 17-unit marker = 3997 < 4000`); the `len(body)==1` fallback re-splits
-the full message safely. Surrogate pairs never split. **No defect.**
-
-### Edit/reply semantics
-First chunk `event.edit`, rest `event.reply`; partial failure returns
-`success=False` with honest `chunks_delivered/total` and error; no false
-success, no silent duplication. **No defect** (inherent multi-message partial
-delivery documented).
-
-### Formatter-failure fallback
-`process_output` failure → logged as `error_type` only, original validated text
-delivered unchanged (`success=True`). No sensitive detail leaked. **No defect.**
-
-### Idempotence
-24-case corpus on the current post-fix source → 0 violations. The sole
-non-idempotence observed (in the earlier audit and still present) is a harmless
-whitespace insertion when emphasis-stripping exposes a new punct→letter
-adjacency (`سلام؟_y_` → `سلام؟y` → `سلام؟ y`); it never deletes literals or
-corrupts protected/technical tokens → classified **HARMLESS NORMALIZATION**.
-
-### Boundary fuzzing / literal-integrity
-A deterministically-seeded fuzzer (6000 trials, `seed=99`) checking the
-literal-subsequence invariant found **no literal-character deletion beyond NFC
-canonical recomposition** (`e\u0301`→`é`, canonically equivalent). All flagged
-cases reduced to intended NFC/block/emphasis/spacing rules. **No additional
-defect.**
-
-## Confirmed defects
-**None found.** The prior repairs (intraword emphasis, UTF-16 splitting,
-dot/colon literals) are intact and no independent meaning-changing defect was
-reproduced.
-
-## Explicitly tested non-defects (INTENTIONAL / HARMLESS)
-- Space-before-punctuation removal (line 83) — intended normalization; affects
-  only unusual space-before-punct input.
-- NFC recomposition — canonical-equivalent.
-- Block/list/quote conversions at line start and never inside protected code.
-- Intraword emphasis preservation and word-boundary emphasis degradation.
-- Empty-output rejection and explicit error edit.
-- Continuation markers, header prefix, reconstruction invariant, UTF-16-safe
-  chunks (all ≤ SAFE_LIMIT).
-- Harmless whitespace-insert idempotence edge.
-- Emoji/ZWJ/combining-character preservation.
-
-## Unknowns
-- Whether users ever type space-before-dot constructs whose merging would be
-  surprising (low-value; the rule is intentional and pre-existing).
-- Practical user-visible impact of the dead/broken `_render_entities`/
-  `RenderedOutput.entities` path — it is never consumed by delivery (dead code,
-  entity delivery remains blocked per the prior evidence gate; not a delivery
-  defect).
-
-## Security / architecture impact
-None. `deliver_response()` remains the sole delivery boundary; Self Bot is the
-Telegram execution authority; no provider/AI/network/database change; no new
-delivery path; protected-token content remains opaque; no content/credential
-logging introduced.
-
-## Database / schema impact
-None. No schema changes, no migrations, no Supabase writes, no SQL executed.
-
-## Tests / experiments actually executed
-- `python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header` →
-  **61 passed** (read-only baseline; no code changed).
-- Extensive read-only interpreter probes (documented above) across every
-  subsystem and the SAFE_LIMIT boundary.
-- Deterministic fuzzing (6000 trials, seeds) for literal-integrity and
-  idempotence (read-only).
-No other files/code were modified; only `IMPLEMENTATION_REPORT.md` is replaced.
-No test counts are invented.
-
-## Final evidence-gate decision
-**NO ACTIONABLE DEFECT FOUND.**
-The current centralized plain-text delivery pipeline — after the dot/colon
-repair — exhibits no evidence-backed, deterministic, meaning-changing defect.
-All behaviors are either intentional/rule-consistent or harmless normalization.
-The evidence gate therefore fails in the PASS direction; no implementation task
-is produced.
-
-## Next-step recommendation
-Per the audit rules, none is manufactured. Do NOT invent a delivery change.
-The next work should move to another feature/domain (e.g. a new product area or
-a user-reported need), rather than altering the already-correct plain-text
-delivery pipeline. If Markdown entities are ever desired, that remains blocked
-by the earlier evidence gate and would need explicit product-level acceptance.
+## Behavior changed
+- FIXED: real Markdown tables now render as aligned monospace blocks
+  (e.g. the task's Persian model table and the English Model/Speed/Capacity
+  table; verified byte-exact alignment).
+- PROTECTED: table syntax inside inline code, fenced code, URLs, `@user`,
+  `/cmd` is never transformed.
+- PROTECTED: ragged/ambiguous pipe structures fail closed and are left
+  byte-for-byte as-is.
+- PRESERVED: all previous delivery behavior — intraword emphasis (`2*3*4`,
+  `some_word_here`, `some__word__here`), dot/colon literals (`main.py`,
+  `example.com`, `e.g.`), intended punctuation spacing (`hello,world` →
+  `hello, world`, `سلام،world` → `سلام، world`), protected tokens, UTF-16
+  splitting, chunk formatting, reconstruction, formatter-failure fallback,
+  empty-output rejection.
+- PRESERVED: `_render_entities()` dead code and the blocked entity delivery
+  project were not touched.
 
 ## Files changed
-- `IMPLEMENTATION_REPORT.md` — completely replaced with this single current
-  report (the only repository modification).
-- Production files: **None**.
-- Test files: **None**.
-- `DATABASE_ARCHITECTURE.md`, `INVESTIGATION.md`, `backend/ai/tools/delivery.py`,
-  `backend/bot/handlers/ai_unified.py`, `tests/test_67_ai_output_pipeline.py`:
-  **unchanged**.
+- `backend/ai/tools/delivery.py` — +106 lines (table renderer + one-line wiring)
+- `tests/test_67_ai_output_pipeline.py` — +94 lines (8 new regression tests)
+- `IMPLEMENTATION_REPORT.md` — completely replaced with this current report
 
-## Commit / delivery status
-- Base commit (start of audit): `a9bd036dffa41856e09a9ad9affe2c42cd6efd07`
-- Working tree at end of audit: only `IMPLEMENTATION_REPORT.md` modified (the
-  report replacement); no production/test/database code changed.
-- Audit report commit: `a0eff8efa8401901dc8ed8c25e63664ff8c0b7d0` — `docs: record post-repair delivery audit (no actionable defect)`
-- Push result: pushed to `origin/main` (`a9bd036..a0eff8e`)
-- Remote verification: local HEAD == `origin/main` == remote `main` == `a0eff8efa8401901dc8ed8c25e63664ff8c0b7d0` (verified via `git fetch origin main`)
-- Final working-tree state: clean.
+No other files changed. `backend/bot/handlers/ai_unified.py`, providers,
+Dispatcher, Engine, `_format_chunks`, `_split_text`, Supabase, migrations, and
+`DATABASE_ARCHITECTURE.md` are untouched.
+
+## Tests added
+Eight focused tests in `tests/test_67_ai_output_pipeline.py`:
+
+1. `test_table_renders_aligned_fenced_block` — English table byte-exact
+   expected rendered block (header/separator/body padded identically).
+2. `test_table_persian_renders_aligned` — Persian task example; consistent
+   column structure and dash separator inside fences.
+3. `test_table_detection_guards` — `A | B`, `condition: x | y`, bare
+   `| A | B |`, ragged body row, and header/separator column mismatch all
+   unchanged.
+4. `test_table_protected_regions_untouched` — inline code, fenced code, URL
+   with `|`, `@user|…`, `/cmd|…` untouched.
+5. `test_table_display_width_unicode` — widths: ASCII/Persian = 1, CJK/emoji =
+   2, combining mark = 0, ZWJ family sequence = 4.
+6. `test_table_idempotent` — `process_output(process_output(x).text).text ==
+   process_output(x).text` for table and mixed corpora.
+7. `test_table_content_preserved_and_chunked` — 200-row table: every
+   `_format_chunks` message ≤ `SAFE_LIMIT` UTF-16 units, all rows preserved.
+8. `test_delivery_delivers_rendered_table` — `deliver_response()` edits the
+   request message with the fenced aligned table (mock edit/reply; no live
+   Telegram).
+
+## Tests actually executed
+- `python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header` →
+  **69 passed** (61 existing + 8 new) in 0.28s.
+- `python3 -m pytest tests/ -q --no-header` → **1059 passed, 23 skipped,
+  1 warning** in 56.51s (the warning is a pre-existing capture warning, not a
+  failure; 23 skips are pre-existing).
+- `python3 -m compileall -q backend tests` → OK.
+- `git diff --check` → OK.
+
+## Direct regression probes (read-only, against actual source)
+- Task's Persian table → aligned fenced block; English table byte-exact
+  aligned; guards unchanged; protected regions untouched; ragged/mismatched
+  input fail closed; 200-row table → 5 messages all ≤ 4000 UTF-16 units with
+  all 200 rows preserved; idempotent.
+- Previous fixes all verified intact: `main.py`, `report.txt`, `example.com`,
+  `data.v1.csv`, `e.g.`, `U.S.A`, `run main.py now` unchanged; `hello,world` →
+  `hello, world`; `سلام،world` → `سلام، world`; `note;see` → `note; see`;
+  `تشکر!انجام` → `تشکر! انجام`; `x,y` → `x, y`; `2*3*4`, `some_word_here`,
+  `some__word__here` literal; `hi **bold**` → `hi bold`.
+- Telethon probe (read-only): balanced ` ``` ` fence parses to
+  `MessageEntityPre` with markers stripped (the delivery mechanism); an
+  unbalanced fence (oversized table split mid-fence) degrades gracefully with
+  no exception and no content loss.
+
+## Validation results
+- Focused suite: **69 passed**.
+- Full suite: **1059 passed, 23 skipped, 1 warning** (no new failures; +8 over
+  the previous 1051).
+- compileall: clean. `git diff --check`: clean. Final diff inspected: only the
+  two intended files, no unrelated changes; existing delivery/architecture
+  boundaries intact (`deliver_response()` remains the sole delivery path).
+
+## Security / architecture boundaries
+- `deliver_response()` remains the centralized delivery boundary; Self Bot is
+  the Telegram execution authority.
+- No provider/AI/network/database changes; no new delivery path; no arbitrary
+  RPC; no SQL; no schema changes; no credentials/session involvement; no
+  message-content logging added.
+- The table stage is synchronous, local, deterministic, meaning-preserving,
+  and idempotent; it never infers intent and never calls an AI model.
+- Tables inside protected regions are structurally impossible to transform
+  (masked before scanning).
+
+## Database / schema impact
+None. No database code, no Supabase writes, no SQL/migrations, no manual schema
+work required.
+
+## Current limitations
+- A table larger than the per-message UTF-16 budget is split by the existing
+  `_split_text` (unchanged) and may split mid-fence; the unbalanced fence
+  degrades gracefully (verified) and the full content is preserved across the
+  continuation chunks.
+- Fully RTL rows may be visually bidi-reordered inside the monospace block;
+  logical order, padding, and determinism are unaffected.
+- A cell containing a triple backtick fails the whole block closed (left as
+  original text) to guarantee fences never nest.
+- Protected URLs inside cells are masked during width computation, so their
+  column may be slightly narrower than the restored URL (cosmetic only).
+
+## Remaining work / blockers
+- General Markdown entity delivery remains blocked by the earlier evidence
+  gate and is out of scope.
+- No other known delivery defect; no blocker for this chunk.
+
+## Commit / delivery
+(Recorded after the actual commit/push; see below.)
+
+## Final verification
+- `git status`: clean, on `main`, synced with `origin/main`.
+- `git fetch origin main` → local HEAD == `origin/main` == remote `main`.
+- Remote `backend/ai/tools/delivery.py` contains `_render_tables`; remote test
+  file contains the new table tests; remote `IMPLEMENTATION_REPORT.md` contains
+  exactly this one current report.
+- Working tree: clean.
