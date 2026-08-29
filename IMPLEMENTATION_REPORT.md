@@ -1,60 +1,49 @@
-# Implementation Report — Stage 8 Task Management Interfaces and Notifications
+# Implementation Report — Stage 9
 
 ## Stage
-- **Completed stage:** Stage 8 — Task Management Interfaces and Notifications
-- **Previous stage:** Stage 7 — Retry Classification, Backoff, and Operational Task Management
-- **Next stage:** Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring
-- **Repository:** `https://github.com/Onlyicing1/Telegram-self-bot`
-- **Branch:** `main`
-- **Base commit:** `6a1727e80c87566e73fb7267522a5e9057f23fc9`
+- **Completed stage:** Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring
+- **Previous stage:** Stage 8 — Task Management Interfaces and Notifications
+- **Next stage:** Not yet established by the repository roadmap; no Stage 10 work was implemented.
 
 ## Objective and scope
-Added narrow service-level management and notification boundaries on top of the existing durable task architecture. Management is owner-scoped and CAS-protected; notifications accept structured scheduler/execution outcomes and use an injected safe sender. No task creation parser, handler/UI, notification delivery integration, or schema change was added.
+Implemented the minimum deterministic task-creation service and a persisted-outcome notification adapter. No new scheduler loop, execution authority, parser, dashboard, or database schema was introduced.
 
 ## Exact files changed
-- `backend/ai/task_management.py` — owner-scoped task listing, inspection, and lifecycle operations.
-- `backend/ai/notifications.py` — bounded structured notification boundary with failure isolation.
-- `tests/test_task_management.py` — focused management and notification tests.
-- `IMPLEMENTATION_REPORT.md` — this current-state report.
+- `backend/ai/task_creation.py` — owner-scoped deterministic task creation boundary.
+- `backend/ai/task_notifications.py` — notification adapter that verifies persisted occurrence state before delivery.
+- `backend/ai/scheduling.py` — compatibility fix for the standard `UTC` timezone identifier.
+- `tests/test_stage9.py` — focused Stage 9 creation and notification tests.
+- `IMPLEMENTATION_REPORT.md` — current-state report.
 
-## Management behavior
-`TaskManagementService` supports owner-scoped listing and task/occurrence inspection, plus pause, resume, complete, fail, expire, and delete lifecycle operations through the existing repository and expected-version CAS contract. Stale versions return no update, terminal history is preserved, and another owner cannot inspect or mutate the task.
+## Implementation details
+`TaskCreationService` requires an authoritative positive owner ID, rejects unsupported or missing fields, validates schedules through the existing `parse_schedule` domain API, computes the initial UTC-aware `next_run_at` through `next_occurrence`, and persists through `TaskRepository`. Candidate data cannot override ownership.
 
-## Notification behavior
-`TaskNotificationService` accepts only structured notifications for `succeeded`, `failed`, `retry_pending`, and `cancelled` outcomes. It verifies the authoritative owner, bounds message size to 1024 characters, applies a 10-second send bound, propagates cancellation, and isolates ordinary sender failures by returning `False`. Notification failure does not mutate task or occurrence state and no arbitrary Telegram method is accepted.
+`TaskOutcomeNotifier` reads the occurrence through the owner-scoped repository and sends only when the requested outcome is actually persisted. It delegates bounded delivery and failure isolation to `TaskNotificationService`; notification failures do not alter task state. Supported lifecycle outcomes remain the existing succeeded, failed, retry_pending, and cancelled states.
+
+## Boundaries preserved
+- TaskScheduler remains coordination-only.
+- TaskExecutionCoordinator and ToolExecutor remain execution authorities.
+- Notifications do not execute actions or call Telegram directly.
+- Owner identity remains runtime/application context, not persisted action data.
+- Persisted JSON remains data and is not interpreted as code.
+- No arbitrary Telegram RPC, provider, shell, SQL, or RPC execution was added.
+- `RuntimeSupervisor` and `profile.scheduler` were not changed.
 
 ## Database/schema status
-- **Database/schema changes: NONE.**
-- Existing `ai_tasks` and `ai_task_occurrences` schema remains unchanged.
-- No migration was created or modified.
-- No Supabase SQL was executed.
-- Live Supabase schema was not modified or verified.
+**Database/schema changes: NONE.** Existing `ai_tasks` and `ai_task_occurrences` remain unchanged. No migration was created or modified, no Supabase SQL was executed, and live Supabase state was not modified or verified.
 
-## Ownership and security
-Management receives owner identity from its constructed runtime context and applies repository owner filtering. Notifications cannot override owner identity. No persisted JSON is executed as code. No arbitrary SQL, RPC, shell, provider, or direct Telegram execution path was introduced.
-
-## Tests and validation actually executed
-- `python3 -m pytest tests/test_task_management.py tests/test_retry.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_task_repository.py -q` — **22 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1096 passed, 23 skipped, 1 warning**.
+## Tests and validation
+- `python3 -m pytest tests/test_stage9.py tests/test_task_management.py tests/test_retry.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_task_repository.py -q` — **25 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1099 passed, 23 skipped, 1 warning**.
 - `python3 -m compileall -q backend tests` — passed.
 - `git diff --check` — passed.
 
-No live Supabase, live Telegram, or end-to-end notification transport verification was performed.
-
-## Architecture preserved
-- RuntimeSupervisor remains the sole lifecycle authority.
-- TaskScheduler remains coordination-only.
-- TaskExecutionCoordinator, ToolRegistry, and ToolExecutor remain the execution authority.
-- TelegramAPI/self-client remains behind established tools/services.
-- `profile.scheduler` remains separate.
-- The two-table durable model remains unchanged.
-- No notification loop, task parser, task creation UX, or dashboard API was added.
-
 ## Limitations and remaining work
-The management service is not yet exposed through Telegram handlers, Glass UI, or dashboard APIs. Notification service instances are not yet wired into scheduler/execution lifecycle events, and no task creation/parser workflow exists. The next stage is Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring.
+Natural-language task parsing/creation UX and Telegram/Glass UI exposure remain outside this implementation. End-to-end live Supabase, Telegram, and notification transport behavior was not verified. The repository does not establish a Stage 10 roadmap title; future work must define the next stage explicitly before implementation.
 
 ## Delivery
-- **Implementation commit:** `a90789953afd3d64a973b795925448f3b07b53a1`
-- **Push:** succeeded to `origin/main`.
-- **Remote HEAD:** `a90789953afd3d64a973b795925448f3b07b53a1`, matching local HEAD.
-- **Final working tree:** clean on `main`, synchronized with `origin/main`.
+- **Base commit:** `7b8b2f23e1f998ee80d2e91642a9c6e18b4da751`.
+- **Implementation commit:** not yet created.
+- **Push:** not yet performed.
+- **Remote HEAD:** not yet verified after this implementation.
+- **Final working tree:** changes are present and require commit/delivery verification.
