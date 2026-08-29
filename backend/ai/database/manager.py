@@ -31,7 +31,7 @@ from backend.ai.database.provider_stats_repository import (
 )
 from backend.ai.database.session_repository import InMemorySessionRepository, SessionRepository
 from backend.ai.database.tool_history_repository import InMemoryToolHistoryRepository, ToolHistoryRepository
-from backend.ai.database.task_repository import InMemoryTaskRepository, TaskRepository
+from backend.ai.database.task_repository import InMemoryTaskRepository, SupabaseTaskRepository, TaskRepository
 from backend.ai.database.usage_repository import (
     InMemoryUsageRepository,
     SupabaseUsageRepository,
@@ -72,11 +72,15 @@ class RepositoryManager:
         self._usage = SupabaseUsageRepository() if supabase_available else InMemoryUsageRepository()
         self._preferences = InMemoryPreferencesRepository()
         self._tool_history = InMemoryToolHistoryRepository()
-        self._task = InMemoryTaskRepository()
-
         if supabase_available:
-            logger.info("RepositoryManager: Supabase available — in-memory fallbacks used until migrations are applied")
+            from backend.db.client import get_db
+            client = get_db()
+            self._task = SupabaseTaskRepository(client) if client is not None else InMemoryTaskRepository()
+            logger.info("RepositoryManager: Supabase available — task repository uses Supabase with fallback")
         else:
+            self._task = InMemoryTaskRepository()
+
+        if not supabase_available:
             logger.info("RepositoryManager: Supabase not available — using in-memory fallbacks")
 
     @property
