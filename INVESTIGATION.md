@@ -2,321 +2,273 @@
 
 ## INVESTIGATION METADATA
 
-- Repository: Telegram-self-bot / LifeOS
+- Repository: `https://github.com/Onlyicing1/Telegram-self-bot`
 - Branch: `main`
-- Current HEAD: `89b303f661587101a31d4d3025cdc50f89fd2158` (`fix: harden ai telegram output pipeline`)
-- Investigation date: 2026-08-28
-- Scope: AI message repair after provider generation and before Telegram delivery
-- Status: Investigation only. No production code, tests, schema, SQL, providers, or Telegram execution were modified.
+- Investigation date: 2026-08-29
+- Starting commit: `a80ef8fa619dfcd3ad60f0314201cd1e76f71ff9`
+- Phase: investigation only
+- Status: No production code, tests, migrations, SQL, Supabase state, or Telegram execution behavior was modified.
 
 ## 1. PROBLEM
 
-The investigated problem is whether malformed or awkward AI-generated messages still require a separate deterministic Repair stage after the existing centralized output pipeline.
+The requested feature is a durable AI Task / Scheduler system for owner requests such as one-shot times, intervals, daily/weekly schedules, and ordered multi-action tasks. The repository currently has no task-system implementation, no generic scheduler, and no durable task or execution state. This investigation identifies the smallest compatible architecture without implementing it.
 
-The repository contains no source-backed incident, stored diagnostic, or failing regression that demonstrates a specific remaining malformed-output defect. Existing behavior already normalizes and safely degrades common formatting input. Hypothetical defects such as deeper Markdown nesting failures or provider-specific semantic oddities are not treated as confirmed problems.
+## 2. CURRENT ARCHITECTURE
 
-## 2. ROOT CAUSE
+The application is one Python 3.11 asyncio process. The Telegram self-client is constructed by `backend/runtime/supervisor.py::RuntimeSupervisor`, handlers are registered by `backend/bot/router.py::register_all`, and the supervisor owns startup, shutdown, reconnect, rebuild, helper lifecycle, profile resumption, and watchdog recovery.
 
-### CONFIRMED
+The AI path is `ai_unified` outgoing-owner activation → `Engine.execute()` → `Dispatcher.dispatch()` → `ProviderManager.chat()` → immutable `EngineResult` → `_execute_ai()` result handling → existing tools through `ToolExecutor` → response delivery. `Engine` is the public AI entry point; `Dispatcher` owns orchestration; `ProviderManager` owns provider routing/fallback; `ToolExecutor` is the sole component that calls `Tool.execute()`.
 
-- The current production delivery boundary is `backend/ai/tools/delivery.py`, invoked by `backend/bot/handlers/ai_unified.py` after a successful `EngineResult`.
-- The current processor intentionally renders Markdown to plain Telegram-safe text; it does not send Telegram formatting entities.
-- The processor recognizes scripts and direction metadata but does not perform linguistic translation or semantic rewriting.
-- Oversized responses are split deterministically using Python string length. No source evidence shows a currently failing Telegram-length case.
+The existing task-like state is not a task system. Conversation sessions, pending callbacks, panel timers, and profile state are separate concerns. Telegram execution remains behind the injected `TelegramAPI`/self-client and service/tool layers.
 
-### LIKELY
+## 3. CURRENT SCHEDULER / RUNTIME
 
-- Some complex or ambiguous Markdown may lose formatting rather than preserve it, because rendering is conservative degradation rather than a full Markdown AST/entity renderer.
-- Telegram's hard limit is measured in UTF-16 units while `_split_text` uses Python character count, so astral emoji-heavy messages could be split less conservatively than required.
-- `_render_entities` computes entity metadata from the original Markdown but the delivery path sends only rendered plain text, so entity metadata is observational and not used for Telegram delivery.
+### Confirmed existing infrastructure
 
-These are implementation limitations indicated by source inspection, not demonstrated production failures.
+- `backend/profile/scheduler.py` contains one feature-specific singleton scheduler. It stores `_task`, `_client`, `_updaters`, and `_active_engines` in process memory.
+- It waits for the next local minute boundary using `asyncio.sleep`, calls registered Bio/Username updater functions, merges profile fields, and sends one `UpdateProfileRequest`.
+- `start_cron()` refuses duplicate active tasks; `stop_cron()` cancels and awaits with a ten-second timeout; `_supervised_cron()` restarts the loop after unexpected exceptions with backoff.
+- `set_engine_active()` and `stop_if_idle()` coordinate Bio and Username without stopping one while the other remains active.
+- `RuntimeSupervisor.start()` loads settings, builds/registers the client, starts helper services, resumes Bio/Username state, then starts heartbeat, keepalive, failsafe, diagnostics, web server, and the immortal self-client loop.
+- `RuntimeSupervisor.stop()` cancels profile engines and all owned runtime workers. Rebuild/full recovery cancels and recreates runtime tasks and calls `_resume_bio_cron()` / `_resume_username_cron()`.
+- `backend/runtime/task_guard.py` provides supervised task creation; `asyncio.Lock` is already used for supervisor recovery and save-code generation. `operation_watchdog.guarded_await` bounds DB operations.
+- Heartbeat, keepalive, failsafe, and diagnostics are health/recovery loops, not business schedulers. The supervisor's `_cancel_orphan_tasks()` explicitly protects the profile scheduler and runtime worker names.
 
-### UNKNOWN
+### Reusability conclusion
 
-- Whether any real provider output currently causes user-visible semantic corruption after normalization.
-- Whether live Telegram rejects any currently emitted oversized chunk.
-- Whether users require preserved bold/italic/link entities instead of the current safe plain-text rendering.
-- Whether the existing diagnostics contain an unreported repair candidate; message content is intentionally not logged and no live diagnostics were inspected.
+`profile.scheduler` is not reusable as the task scheduler: its callback signature, minute-boundary timing, shared `UpdateProfileRequest`, active-engine semantics, and client-specific behavior are profile-only. A Task System must use one new singleton task-supervisor loop, registered and started by `RuntimeSupervisor`, rather than create per-task timers or a second ad-hoc scheduler. It should use `guarded_create_task`/`immortal_create_task`, have a unique protected task name, and stop/restart through supervisor lifecycle hooks.
 
-## 3. CURRENT AI OUTPUT PIPELINE
+## 4. CURRENT DATABASE / PERSISTENCE
 
-The current path is:
+### Existing persistent state
 
-```text
-Provider implementation
-  → ProviderManager.chat()
-  → Dispatcher.dispatch()
-  → Engine.execute()
-  → EngineResult
-  → ai_unified._execute_ai()
-  → result.response extraction
-  → backend.ai.tools.delivery.deliver_response()
-  → process_output()
-  → _normalize_plain() / _render_markdown() / profile + validation
-  → _format_chunks()
-  → event.edit() or event.reply()
-  → Telegram
-```
+Source and the existing database discovery material identify `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, and `ai_tool_history`. AI usage/provider-stat repository interfaces also exist, while some corresponding tables are not present in the checked migration inventory. `ghost_chats` is migration-only/orphaned from the application perspective. No task or scheduler table is referenced by current code.
 
-`Engine.execute()` delegates to `Dispatcher.dispatch()`. The dispatcher receives provider responses, processes tool rounds and failures, then returns the immutable `EngineResult`. In `ai_unified._execute_ai`, only a successful result with a response reaches `deliver_response`; failed and empty results use separate failure rendering. The delivery module is therefore the single existing boundary for successful general AI text before Telegram output.
+`backend/db/client.py` is the core Supabase singleton with service-role writes, bounded `asyncio.to_thread` calls, and in-memory fallback. `backend/ai/persistence.py` provides similar thin persistence helpers for AI sessions/messages/memories/tool history. `RepositoryManager` centralizes AI repositories; session/message/preferences/tool-history repositories are currently in-memory implementations, while memory/usage/provider-stat repositories can be Supabase-backed depending on availability. Persistence modules store data; they do not execute Telegram or AI actions.
 
-Ghost Seen AI Reply uses its own execution boundary and does not call this general delivery function; it has separate Telegram reply semantics. No claim is made that a future Repair stage automatically covers Ghost Seen unless that path is deliberately integrated in a later implementation.
+The migration files are not modified or executed in this phase. Existing RLS and owner-scoping conventions require any future task storage to include owner scoping and policies consistent with the repository's service-role write/read architecture. Exact policy SQL must be designed and reviewed in the later schema phase, not guessed here.
 
-## 4. CURRENT NORMALIZATION BEHAVIOR
+### Minimum durable state required
 
-`process_output()` rejects non-string/empty output, then applies:
+A restart-safe scheduler cannot use only RAM. The minimum authoritative state is:
 
-- NFC Unicode normalization and newline normalization.
-- Conservative Arabic Yeh/Kaf conversion only when Persian marker characters are present.
-- Protected-region substitution for fenced/inline code, URLs, usernames, and Telegram commands.
-- Collapsing repeated spaces/tabs, trimming line whitespace, limiting blank lines, trimming outer whitespace.
-- Removing spaces before common Latin and Arabic-script punctuation.
-- Adding a space after punctuation only when the following character is Latin/Cyrillic/Arabic-script text.
-- Markdown degradation: links become `label (URL)`, supported emphasis markers are removed, headings are stripped, list markers become bullets, and quote markers become a visual bar. Unsupported or malformed constructs remain as safe text where they cannot be structurally recognized.
-- Script profiling based on Unicode character names, with RTL recognition for Arabic/Hebrew and metadata for Cyrillic, Greek, Japanese, Korean, CJK, and Latin scripts.
-- Output metadata including scripts, direction, mixed-direction state, Markdown detection, changed state, and entity metadata.
-- Deterministic splitting with paragraph/newline/space boundaries and continuation labels; it does not silently truncate.
+1. **Task definition/schedule record — DATABASE_REQUIRED.** It must survive process restart and contain owner scope, immutable or versioned task identity, enabled/deleted status, normalized schedule, timezone, next-run timestamp, action plan, and creation/update timestamps.
+2. **Execution attempt record or equivalent durable claim/result state — DATABASE_REQUIRED for duplicate/missed-run handling.** A task definition alone cannot record whether a due occurrence was claimed, running, succeeded, failed, or retried. The implementation must durably identify each occurrence/attempt and its outcome before the scheduler advances it.
 
-`deliver_response()` logs only structured facts (script names, direction, mixed state, Markdown flag, changed flag, and output length). If processing raises, it logs only the exception type and falls back to the original response before delivery. It performs no provider, database, network, or Telegram operation itself; Telegram calls occur only after processing in the delivery function.
+A separate action table is **DATABASE_NOT_REQUIRED for the initial safe scope** if ordered actions are stored as validated JSON in the task definition and bounded by a schema/version. A separate execution-step table is **DATABASE_USEFUL but not required initially**; it becomes required if per-step audit, resume-from-step, or large workflows are introduced. Do not add it just in case.
 
-## 5. REPAIR GAP
+Proposed task-definition fields (implementation proposal, not existing schema): `id`, `owner_id`, `name/label`, `enabled`, `schedule_type`, normalized schedule payload, `timezone`, `next_run_at`, `last_scheduled_at`, `created_at`, `updated_at`, `deleted_at`/explicit inactive state, and versioned ordered `actions` JSON. Proposed execution fields: `id`, `task_id`, `owner_id`, deterministic occurrence key, `scheduled_for`, `claimed_at`, `started_at`, `finished_at`, `status`, `attempt`, bounded error/result metadata, and timestamps. Constraints must include owner/task foreign-key consistency, valid status/schedule enums, unique `(task_id, occurrence_key)` to prevent duplicate occurrence records, and indexes for enabled due tasks and task-owned execution history. Retention should be bounded and explicit in a later schema decision; task definitions are authoritative, executions are history.
 
-Only the following possible gaps remain after current normalization:
+Those fields are justified only by restart, duplicate prevention, retry, status, and owner-audit requirements. The database must not execute tools, Telegram calls, AI providers, or scheduling logic.
 
-1. **Complex Markdown preservation** — Evidence: `_render_markdown()` uses bounded deterministic transformations and emits plain text, not a Markdown AST or Telegram entities. Classification: LIKELY limitation, not a confirmed defect. Deterministic repair is safe only for unambiguous balanced constructs; arbitrary malformed nesting or intended emphasis is NOT safe to infer. Safety: safe degradation, but not safe to reconstruct uncertain formatting.
-2. **UTF-16-aware length splitting** — Evidence: `_split_text()` compares Python character length; `_utf16_units()` exists for entity metadata but is not used for chunk limits. Classification: LIKELY technical gap. Deterministic repair/splitting is safe if implemented against UTF-16 units with protected boundaries. Safety: safe, provided no truncation and semantic order are preserved.
-3. **Bidi readability edge cases** — Evidence: the current implementation records direction and protects opaque regions but does not inject isolates. Classification: UNKNOWN as a production defect. Directional controls must not be added automatically without a demonstrated case because they can alter copied text and semantics.
-4. **Semantic repair** — No confirmed gap. Filling omitted words, correcting factual content, inferring intended Markdown boundaries, or rewriting unnatural language is NOT SAFE TO REPAIR AUTOMATICALLY and must remain outside a deterministic stage.
+## 5. NATURAL LANGUAGE → TASK FLOW
 
-No confirmed malformed-output root cause was found.
+Natural-language requests currently enter through `backend/bot/handlers/ai_unified.py` and become `AIRequest` values sent to `Engine.execute()`. The AI can reason through provider tool calls, but existing tool calls are executed immediately by `ToolExecutor`; there is no scheduled-task tool or task proposal contract.
 
-## 6. RELEVANT FILES
-
-- `backend/ai/providers/manager/manager.py`
-- `backend/ai/providers/base.py`
-- `backend/ai/engine/dispatcher.py`
-- `backend/ai/engine/engine.py`
-- `backend/ai/engine/result.py`
-- `backend/bot/handlers/ai_unified.py`
-- `backend/ai/tools/delivery.py`
-- `backend/ai/diagnostics.py`
-- `tests/test_67_ai_output_pipeline.py`
-- `IMPLEMENTATION_REPORT.md`
-
-## 7. RELEVANT FUNCTIONS / CLASSES
-
-- `Engine.execute()` / `Engine`
-- `Dispatcher.dispatch()` / `Dispatcher`
-- `ProviderManager.chat()` / `ProviderManager`
-- `EngineResult`
-- `ai_unified._execute_ai()`
-- `deliver_response()`
-- `process_output()`
-- `_profile()`
-- `_normalize_plain()`
-- `_render_markdown()`
-- `_protect()` / `_restore()`
-- `_format_chunks()` / `_split_text()`
-- `_utf16_units()` / `_utf16_offset()` / `_entity_valid()`
-- `ai_unified._format_error()` and failure handling
-
-## 8. CURRENT BEHAVIOR
-
-Successful general AI text is validated for non-empty content at the delivery boundary, normalized, conservatively rendered, split if oversized, and sent by editing the triggering Telegram message with `event.edit()` or falling back to `event.reply()`. Formatting failures do not become fake AI failures: the original validated response is delivered. Provider failures, empty results, and Telegram delivery failures remain separate paths.
-
-The current output renderer does not execute AI text, tools, or Telegram operations. It does not call external services. Protected tokens are restored after normalization. The general path is centralized, while Ghost Seen AI Reply retains its separate specialized execution/delivery flow.
-
-## 9. DESIRED BEHAVIOR
-
-A future Repair stage should address only demonstrated deterministic defects that remain after `process_output()`. It should preserve semantic text, protected regions, provider and tool boundaries, and current delivery behavior. It should never invent content, translate, infer intent, execute operations, or become a second AI pipeline.
-
-For safely repairable syntax defects, the stage should produce a validated output or explicitly degrade to the existing normalized output. For uncertain formatting or semantic issues, it should leave content unchanged. Any repair failure should fall back to the already validated normalized/original response and remain diagnostically distinguishable from provider and Telegram failures.
-
-## 10. ARCHITECTURAL OPTIONS CONSIDERED
-
-- **Provider layer:** rejected. It would duplicate behavior across providers and make Telegram concerns provider-specific.
-- **ProviderManager:** rejected. It owns routing/fallback, not output presentation.
-- **Dispatcher/Engine:** rejected. They own reasoning, tools, conversation, and `EngineResult`; adding Telegram formatting there would blur responsibilities and affect non-Telegram consumers.
-- **Immediately after `EngineResult` in `ai_unified`:** possible, but would duplicate or bypass the existing centralized delivery processor and could diverge between delivery paths.
-- **Inside Telegram-specific delivery code:** appropriate responsibility, but a new parallel boundary is unnecessary.
-
-### Recommended location
-
-Add a small deterministic Repair stage inside `backend/ai/tools/delivery.py`, immediately before or as a named substage of `process_output()`/`deliver_response()`, after response type/non-empty validation and before final chunk formatting. This is the smallest existing successful-AI-to-Telegram boundary, preserves provider/engine contracts, and keeps all delivery formatting centralized.
-
-The stage must not be added to `ProviderManager`, `Dispatcher`, or individual providers.
-
-## 11. RECOMMENDED FIX SURFACE
-
-Only change `backend/ai/tools/delivery.py` for production behavior unless tests prove an integration adjustment is necessary. Add a small internal repair result/profile if needed; do not create a provider, database state, Telegram RPC, or second delivery path. Keep `deliver_response()` as the only caller-facing delivery entry point.
-
-Add focused tests in `tests/test_67_ai_output_pipeline.py` or a narrowly scoped adjacent test file only for source-backed deterministic cases. Do not modify `DATABASE_ARCHITECTURE.md`, migrations, or SQL.
-
-## 12. IMPLEMENTATION PLAN
-
-1. Capture the existing normalized output and protected-region representation.
-2. Define a deterministic repair function with a narrow contract: syntax-only, meaning-preserving, idempotent, and no network/database/AI calls.
-3. Repair only balanced/uniquely recoverable delimiter or whitespace defects demonstrated by tests; preserve or safely drop ambiguous formatting.
-4. Run repair before final Telegram chunk construction, then revalidate non-empty text and Telegram size.
-5. Keep exception containment: record safe structured failure type and use the pre-repair normalized output.
-6. Verify general AI integration through `ai_unified._execute_ai()` and preserve its error/tool/delete branches.
-7. Add regression tests for positive repairs, no-op ambiguous cases, protected tokens, multilingual RTL/LTR/CJK text, idempotence, fallback, and delivery integration.
-
-## 13. TEST PLAN
-
-Add only deterministic tests justified by the selected repair rules:
-
-- already-normalized output is unchanged;
-- supported balanced Markdown remains safely rendered;
-- unmatched emphasis/backticks degrade without content loss;
-- malformed links and unsupported syntax do not corrupt URLs;
-- URLs, usernames, commands, inline code, and fenced code remain byte-preserved;
-- mixed RTL/LTR, numbers, emoji, Cyrillic, and CJK remain semantically unchanged;
-- repeated application is idempotent;
-- repair exceptions fall back to the prior normalized output;
-- oversized emoji-containing output respects Telegram UTF-16 limits without truncation;
-- actual `deliver_response()` integration edits/replies the processed output;
-- no formatter test performs database, network, provider, tool, or Telegram calls.
-
-Do not add tests claiming semantic language correction, translation, or inferred intent repair is safe.
-
-## 14. DATABASE / SCHEMA IMPACT
-
-No database/schema change required.
-
-No SQL was executed, no migration was created, and no Supabase operation was performed.
-
-## 15. HARD CONSTRAINTS
-
-- Investigation-only in this chunk: no production or test implementation was performed.
-- Preserve `ProviderManager`, provider fallback, `Dispatcher`, `EngineResult`, tool allowlists, owner authorization, and Telegram execution authority.
-- Repair must be local, deterministic, lightweight, async-compatible, and cancellation-safe.
-- No extra AI/provider/network/database/API calls.
-- No arbitrary Telegram RPC, SQL, shell, or tool execution.
-- Never log message content, credentials, API keys, session strings, or sensitive Telegram data.
-- Never silently truncate or invent content.
-- Preserve protected opaque regions and existing delivery semantics.
-- Keep `DATABASE_ARCHITECTURE.md` unchanged for this output-only feature.
-
-## 16. REMAINING WORK
-
-The implementation agent must decide whether a concrete deterministic repair defect is sufficiently evidenced. If yes, implement only that narrow stage at the recommended delivery boundary, add the justified regression tests, update `IMPLEMENTATION_REPORT.md`, and run the required validation. If no confirmed defect can be demonstrated, retain the existing normalization pipeline and document that no Repair code is warranted rather than introducing speculative rewriting.
-
-## 17. VALIDATION
-
-The next implementation chunk should run:
+The safe future contract is:
 
 ```text
-python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header
-python3 -m pytest tests/ -q --no-header
-python3 -m compileall -q backend tests
-git diff --check
+owner outgoing message
+  → ai_unified / Engine / Dispatcher / ProviderManager
+  → structured task proposal tool call
+  → deterministic task validator
+  → owner-scoped persistence transaction
+  → singleton TaskScheduler loads due records
+  → deterministic action validator/dispatcher
+  → ToolExecutor and existing allowed tools
+  → TelegramAPI/self-client
+  → durable execution result + owner notification through an approved delivery path
 ```
 
-It should also inspect the final diff and verify that only the intended implementation, focused tests, and implementation report changed. If implementation is delivered, verify the commit, push, remote SHA, and clean working tree separately. This investigation itself performed no test mutation, SQL execution, commit, or push.
+Task parsing belongs in AI reasoning only as structured proposal construction. Schedule normalization, timezone validation, action schema validation, limits, and authorization belong in deterministic application code before persistence. The AI must never instantiate timers or directly execute a proposed action.
 
----
+The existing ToolRegistry/ToolExecutor can represent execution of existing safe tool calls: it already supplies schemas, permission levels, max five calls per turn, sequential execution, timeout handling, history, and confirmation handling. A scheduled executor should invoke the same validated tool contract with an explicit task execution context, not call providers or Telegram directly. Whether ToolExecutor needs a narrowly scoped batch/context API must be proven in implementation; do not bypass it.
 
-## 18. LARGE / MULTILINE MARKDOWN TABLE DELIVERY AUDIT
+## 6. TASK MODEL
 
-### 18.1 Metadata
+Keep the concepts separate:
 
-- Investigation date: 2026-08-29
-- Repository: Telegram-self-bot / LifeOS
-- Branch: `main`
-- Starting commit: `34c1208807949f8fef932ce498e0540d2f7ddb1b` (`test: add large markdown table delivery regressions`)
-- Status: Investigation only. No production code, tests, schema, SQL, providers, or Telegram execution were modified in this phase.
+- **Task definition:** owner-owned desired action plan plus lifecycle status.
+- **Schedule:** normalized one-shot or recurrence rule and timezone.
+- **Task execution:** one concrete scheduled occurrence/attempt.
+- **Execution result:** success/failure/cancelled/retry outcome and safe metadata.
+- **Runtime scheduler state:** in-memory cache/next wakeup/task handles only; never authoritative.
 
-### 18.2 Objective
+Initial task definitions should use a versioned, bounded ordered action list. Each action must name an existing allowlisted tool and contain validated JSON arguments. The initial model should not persist natural-language instructions as executable authority; retain optional display text only as non-authoritative context. One-shot tasks become inactive after a terminal successful occurrence (and define behavior for terminal failure). Recurrence remains on the definition with `next_run_at` advanced deterministically.
 
-Determine exactly how the current table renderer (`_render_tables` in `backend/ai/tools/delivery.py`) behaves when Markdown tables become large, wide, or contain multiline cells/rows, and whether any deterministic, meaning-changing defect requires a production change in a later phase. This phase is diagnostic only: nothing was fixed.
+Owner identity is the authenticated outgoing owner's numeric `owner_id`, copied into every task and execution record. Chat/message destination must be explicit in validated task context; never infer arbitrary destinations at execution time.
 
-### 18.3 Source files inspected
+## 7. SCHEDULING MODEL
 
-- `backend/ai/tools/delivery.py` — full current file: `process_output()`, `_normalize_plain()`, `_protect()`/`_restore()`, `_render_markdown()`, `_render_tables()`, `_build_table_block()`, `_split_table_row()`, `_display_width()`, `_format_chunks()`, `_split_text()`, `_split_point_at_utf16()`, `_utf16_units()`, `deliver_response()`.
-- `tests/test_67_ai_output_pipeline.py` — full current file, including the 15 diagnostic table tests added in commit `34c1208`.
-- `backend/bot/handlers/ai_unified.py` — delivery call sites and failure/empty handling (inspection only).
+The scheduler should be one process-wide singleton loop owned by the RuntimeSupervisor. It should load enabled tasks from durable storage on startup/recovery, select due work using indexed `next_run_at`, and sleep until the nearest due time with a bounded wakeup so newly-created/disabled tasks are noticed.
 
-### 18.4 Tests added / run
+Normalized schedule types should initially cover:
 
-The 15 diagnostic tests added in the preceding test-only phase (commit `34c1208`, unchanged in this phase):
+- one-shot: an absolute timezone-aware local date/time normalized to UTC plus original timezone;
+- interval: a positive bounded duration with a defined anchor and next-run policy;
+- daily: local wall-clock time plus timezone;
+- weekly: validated weekday plus local wall-clock time plus timezone.
 
-1. `test_large_table_exceeds_single_message_and_preserves_all_rows`
-2. `test_large_table_chunks_split_at_row_boundaries`
-3. `test_multiline_cell_fails_closed_without_content_loss`
-4. `test_multiple_multiline_rows_fail_closed`
-5. `test_large_table_with_long_cell_preserves_content`
-6. `test_long_unbroken_cell_split_content_preservingly`
-7. `test_wide_table_mixed_unicode_widths_deterministic`
-8. `test_large_table_with_short_cells_all_rows_survive`
-9. `test_table_surrounded_by_text_is_not_merged`
-10. `test_text_before_and_after_large_table_preserved`
-11. `test_two_tables_rendered_independently`
-12. `test_large_table_idempotence`
-13. `test_large_emoji_table_utf16_safe`
-14. `test_delivery_large_table_first_edit_then_replies`
-15. `test_delivery_large_table_partial_failure_is_not_false_success`
+Timezone must come from the explicit task request/session or configured owner timezone (`cfg["TZ"]`), with one documented precedence rule. Store an IANA timezone identifier, not only an offset. Daylight-saving transitions require a documented policy for nonexistent/ambiguous local times; do not silently guess.
 
-Executed read-only in this phase:
+The implementation must define: whether missed one-shot tasks run immediately or expire; whether recurring missed occurrences coalesce, skip, or replay; maximum catch-up; whether interval recurrence is anchored to scheduled time or completion; and how DST affects next-run. A conservative initial policy is one bounded catch-up occurrence for an enabled task, then advance from the scheduled occurrence, but this is a decision blocker until explicitly accepted.
 
-```text
-python3 -m pytest tests/test_67_ai_output_pipeline.py -q --no-header   → 84 passed (69 existing + 15 new)
-python3 -m pytest tests/ -q --no-header                                → 1074 passed, 23 skipped, 1 warning
-python3 -m compileall -q backend tests                                 → OK
-git diff --check                                                       → OK
-```
+Due-task claiming must be atomic and occurrence-keyed. Compute and persist the next occurrence only after a successful claim/transition, with compare-and-set conditions on task version/status. Do not use `asyncio.sleep` per task or process-local timer handles as the source of truth.
 
-### 18.5 Test results
+## 8. EXECUTION MODEL
 
-- Focused suite: **84 passed, 0 failed**.
-- Full suite: **1074 passed, 23 skipped, 1 warning** (pre-existing skips/warning), **0 failed**.
+The scheduler claims one occurrence, creates/updates a durable execution attempt, validates the task is still enabled and owner-scoped, and executes actions sequentially through the existing ToolRegistry/ToolExecutor. The self-client injected into `ToolContext` remains the only Telegram authority.
 
-### 18.6 Passing cases (verified actual behavior)
+Initial execution policy should be sequential and bounded. A task may be capped by action count, argument size, total runtime, and recurrence frequency. Existing ToolExecutor limits (`MAX_TOOLS_PER_TURN = 5`, default ten-second timeout, confirmation levels) must remain applicable. Scheduled tasks must not gain a bypass for dangerous/admin tools: confirmation-required actions need a defined owner confirmation workflow or are excluded from the initial scheduled scope. Never execute arbitrary shell, SQL, RPC, provider, or natural-language commands.
 
-- **Large table > 1 message**: a 300-row table renders to ~7 messages; every row is preserved, reconstruction is byte-exact, and every chunk is ≤ `SAFE_LIMIT` UTF-16 units.
-- **Row-atomic chunking**: chunks split at table-row boundaries; no rendered row is split across messages.
-- **Multiline cells / rows**: a physically-broken row (cell content continued on the next physical line) is not a valid GFM pipe row, so `_render_tables` fails closed — output is byte-identical to input, no content loss.
-- **Large table + long cell**: content preserved; an oversized unbroken cell is split by `_split_text` content-preservingly.
-- **Wide table**: per-column monospace display widths are deterministic (combining/ZWJ = 0, CJK/emoji = 2, Persian/Arabic/Latin = 1).
-- **150-row short-cell table**: all rows survive processing and chunking.
-- **Boundary safety**: normal text before/after a table is preserved, never merged or duplicated; two adjacent tables render independently.
-- **Idempotence**: `process_output(process_output(x).text).text == process_output(x).text` for the large-table corpus (fenced tables re-protect as code on the second pass).
-- **Delivery semantics**: first chunk via `edit`, continuations via `reply`, count matches `_format_chunks`; a failing continuation reply yields `success=False` with `chunks_delivered=1` — never a false success.
-- **UTF-16 safety**: supplementary-plane emoji cells in a large table produce chunks all ≤ `SAFE_LIMIT` measured in UTF-16 units; no surrogate pair is split.
+Persist attempt status transitions such as `claimed/running/succeeded/failed/cancelled/retry_pending`, safe error classification, attempt number, and timestamps. Do not persist secrets or full sensitive provider output unnecessarily. Notifications are a separate approved owner-only delivery action and must not be mistaken for task success.
 
-### 18.7 Failing cases
+## 9. RESTART / RECOVERY
 
-None. Every newly added diagnostic test passes against the current implementation.
+Current RuntimeSupervisor rebuilds clients and resumes only Bio/Username; no task state is loaded because no task system exists. A future scheduler must be started after the self-client/tool context is ready and stopped before client teardown. Recovery must reload durable tasks rather than retain stale client references.
 
-### 18.8 Exact reproducible failures
+Required guarantees and limits:
 
-None. No input produced truncation, content loss, non-deterministic width, or chunk-limit violation.
+- Restart before execution: durable enabled task and `next_run_at` allow reload and deterministic missed-run policy.
+- Restart while executing: an attempt left `running` must be reconciled on startup as interrupted/unknown, then either retried under a bounded policy or marked failed; it cannot be assumed successful.
+- Crash after Telegram execution before success recording: duplicate execution is possible in a single-instance crash window unless an idempotency mechanism exists. The initial design must state at-least-once semantics or add action-level idempotency keys where supported; exactly-once Telegram side effects cannot be claimed.
+- Crash after recording success before Telegram execution: ordering must never record success before the actual ToolExecutor result; otherwise false success is possible. Use `running` until the action result is known.
+- Offline past due time: apply the explicitly selected bounded catch-up/coalescing policy; never run an unbounded backlog.
+- Multiple due tasks: process deterministically (scheduled time, task ID), with a global concurrency bound and no duplicate scheduler loop.
 
-### 18.9 Root cause for each confirmed failure
+The current architecture is single-instance, so distributed leader election is not required unless deployment changes. Atomic database claiming is still required to protect against overlapping local loops/recovery races and future accidental multi-instance operation.
 
-N/A — no confirmed failure.
+## 10. CONCURRENCY / LOCKING
 
-### 18.10 Whether the issue is deterministic
+Existing primitives are local `asyncio.Lock` for supervisor recovery and save-code generation, task guards for supervised loops, and sequential ToolExecutor calls. They do not provide task occurrence claiming.
 
-N/A. All observed behavior is deterministic and rule-consistent (row-atomic splitting, fail-closed multiline rows, deterministic display widths).
+A future TaskScheduler needs one scheduler singleton guard, one bounded execution semaphore (initially likely one), and per-task or occurrence claim checks. Disable/delete must use an atomic status/version condition so a task already claimed has a defined cancellation behavior. A recurring task must not overlap itself unless an explicit policy permits it; initial safe scope should skip or defer a due occurrence while one execution is running. Database uniqueness on `(task_id, occurrence_key)` plus conditional updates prevents duplicate claims across restart/recovery.
 
-### 18.11 Whether production code needs modification
+Do not hold a database/network lock across Telegram calls. Claim durably, execute outside the DB transaction, then finalize with conditional status update.
 
-**No.** There is no evidence-backed defect in the table path. The current implementation already satisfies every invariant the diagnostic suite pins.
+## 11. MULTI-ACTION TASKS
 
-### 18.12 Recommended implementation scope for the next phase
+Initial safe scope: one task owns a bounded ordered list of existing allowlisted tool actions, each with a versioned action name and validated arguments. Execute sequentially and record aggregate result. A failure policy must be explicit; safest initial behavior is stop on first failure, mark the execution failed, and do not silently continue destructive or dependent steps.
 
-No production implementation is recommended for table chunking. The next phase should keep the diagnostic suite as regression protection and move to another feature/domain rather than inventing a table change. If a future phase ever changes `_render_tables`, `_format_chunks`, or `_split_text`, the 15 tests above define the invariants that must hold: row-atomic chunking, exact content preservation, UTF-16 `SAFE_LIMIT` compliance, fail-closed multiline rows, deterministic widths, idempotence, and honest delivery results.
+Per-step durable persistence is not required for a small bounded list if the aggregate attempt stores safe step summaries. It becomes DATABASE_REQUIRED if restart resume-from-step or detailed audit is promised. Conditional actions (“if Y then Z”), loops, arbitrary workflows, and AI re-planning during execution are future scope and should be rejected or require a separate reviewed workflow model. Existing ToolExecutor's max-five limit is a useful upper bound, but scheduled-task limits should be independently validated.
 
-### 18.13 Security / architecture impact
+## 12. SECURITY
 
-None. No security or execution boundary changed. `deliver_response()` remains the single delivery boundary; no second delivery path, no arbitrary Telegram RPC, no provider/AI/network/database calls were introduced or inspected for change.
+Owner-only Telegram handlers are enforced through `is_owner`; outgoing-only events are the authenticated instruction boundary. Every task and execution must carry and verify `owner_id`. Task creation must not accept an owner ID supplied by the model or arbitrary destination without deterministic validation.
 
-### 18.14 Database / schema impact
+The ToolRegistry allowlist and ToolExecutor permission checks remain mandatory. Persisted task JSON is untrusted data and must be schema-validated on load, not trusted because it was previously created. Prompt injection in a saved description/action argument must not alter the action name or permission; only validated structured fields are executable.
 
-None. No SQL, migration, or Supabase operation.
+The Self Bot remains the final Telegram authority via the injected client/TelegramAPI. No direct Telethon RPC from the AI/task parser, no shell/SQL execution, no provider bypass, and no new arbitrary command executor. Scheduled destructive/admin actions require an explicit reviewed policy and must not silently inherit immediate-message authorization.
 
-### 18.15 Explicit statement
+Database access must follow service-role backend writes and owner-scoped reads/RLS conventions. Do not expose task definitions or execution history through the dashboard until an owner-scoped API contract exists.
 
-NO production code was changed during this investigation. The diagnostic tests were added and committed in the preceding test-only phase (`34c1208`) and were not altered in this phase; the only file changed in this phase is `INVESTIGATION.md`. Nothing in this investigation is claimed to be fixed.
+## 13. EXISTING FEATURE INTEGRATION
+
+- **Bio/Username:** remain on the existing shared profile scheduler. Do not merge TaskScheduler callbacks into `profile.scheduler`; generic tasks and profile updates have different semantics.
+- **Ghost Seen:** no demonstrated dependency; leave separate.
+- **Save/Deep Save/Delete:** can be scheduled only through existing tools after action allowlisting, argument/context validation, and explicit destructive-action policy. Deep Save is long-running and cannot be assumed safe for unattended execution.
+- **AI sessions/messages:** task creation may record the originating conversation reference if needed for audit, but task execution must not depend on volatile session RAM.
+- **ProviderManager/Dispatcher/Engine:** no scheduler lifecycle ownership; they only produce structured proposals or immediate AI execution.
+- **ToolRegistry/ToolExecutor:** reuse for action execution and permission/timeout/history behavior.
+- **RuntimeSupervisor:** owns task scheduler startup, shutdown, rebuild/reload, and health registration. No second recovery authority.
+- **settings service:** may provide owner timezone/defaults only after a precise source-backed setting contract; current `ConfigManager` AI settings are RAM-only and are not a durable task store.
+- **diagnostics/health:** add only bounded scheduler health/last-run telemetry in a later implementation; do not treat telemetry as authority.
+
+## 14. DATABASE / SCHEMA REQUIREMENTS
+
+No existing table expresses a durable scheduled task or occurrence claim. Reusing `ai_sessions`, `ai_messages`, or `ai_tool_history` would conflate conversation/audit data with task authority and cannot represent due schedules or atomic occurrence uniqueness. Therefore a new task-definition table and an execution-attempt/history table are **DATABASE_REQUIRED** for the requested restart-safe feature. This is a proposal requiring a dedicated schema review; no migration is authorized by this document.
+
+Minimum schema review questions: UUID vs bigint IDs; owner foreign-key availability; UTC timestamp type; IANA timezone storage; JSONB validation/version; enum/check constraints; unique occurrence key; due-task and task-history indexes; RLS policies; deletion/retention; service-role access; migration compatibility with existing fallback behavior.
+
+No database changes were made and no SQL was executed.
+
+## 15. CONFIRMED FINDINGS
+
+- **CONFIRMED / EXISTING:** `profile.scheduler` is a singleton, in-memory, minute-boundary scheduler specific to Bio/Username.
+- **CONFIRMED / EXISTING:** RuntimeSupervisor is the single lifecycle/recovery authority and already has startup, shutdown, rebuild, and task supervision hooks.
+- **CONFIRMED / EXISTING:** There is no generic task scheduler, task table, execution table, task creation handler, or scheduled-task tool in current source.
+- **CONFIRMED / EXISTING:** ToolExecutor is the sole tool execution component and enforces registry lookup, permission levels, sequential calls, limits, timeout handling, and history recording.
+- **CONFIRMED / EXISTING:** Current AI config/preferences/session fallback state is partly RAM-only; it is not suitable as durable scheduler authority.
+- **CONFIRMED / DATABASE_REQUIRED:** Restart-safe task definitions and occurrence execution state require durable storage not represented by current tables.
+- **CONFIRMED / ARCHITECTURE:** Self Bot/TelegramAPI must remain the only Telegram execution authority.
+
+## 16. LIKELY FINDINGS
+
+- **LIKELY / PROPOSED:** A singleton TaskScheduler loop with bounded polling/wakeup and atomic durable claims is the smallest compatible runtime design.
+- **LIKELY / PROPOSED:** Two durable concepts (task definition and execution attempt) are sufficient for initial scope; action/step tables can be deferred while action lists remain small, bounded, and versioned JSON.
+- **LIKELY / PROPOSED:** Initial execution should be sequential, stop-on-first-failure, bounded, and at-least-once rather than promise exactly-once Telegram side effects.
+- **LIKELY / PROPOSED:** A scheduled-action tool should create validated task proposals/persisted definitions, while execution should reuse ToolExecutor rather than directly invoke services or Telegram.
+- **LIKELY / BLOCKER:** DST, missed-run, retry, confirmation-required actions, notification destination, and one-shot terminal-failure semantics need product decisions before implementation.
+
+## 17. UNKNOWN / REQUIRES SOURCE VERIFICATION
+
+- Exact live Supabase schema/RLS state cannot be established without querying the database; no SQL or live DB access was performed.
+- Whether the deployment can ever run multiple process instances is not established; current code is designed as one process.
+- Exact owner-timezone setting precedence for future tasks is not currently defined.
+- Exact acceptable missed-run policy, DST policy, retry backoff/max attempts, and idempotency guarantees require explicit product decisions.
+- Whether unattended dangerous/confirmation-required tools should be supported at all is unresolved.
+- Whether scheduled notifications should edit the originating message, reply in its chat, or use another explicitly authorized destination is unresolved.
+- Whether per-step execution persistence is needed beyond initial bounded aggregate history is a product/audit decision.
+
+## 18. RECOMMENDED IMPLEMENTATION ORDER
+
+1. Resolve the decisions/blockers in section 21 and freeze the initial safe scope.
+2. Perform a dedicated schema design/review for owner-scoped task definitions and execution attempts; add migration and matching repository/fallback only in that separate phase.
+3. Implement deterministic schedule value objects/validation and next-run calculations, including timezone/DST and missed-run tests.
+4. Implement task repository operations with atomic due-claim/occurrence uniqueness and bounded retry/finalization semantics.
+5. Implement a singleton TaskScheduler owned by RuntimeSupervisor; load/reconcile on startup and rebuild, and cancel cleanly on shutdown.
+6. Add a narrowly scoped structured task proposal/creation tool through ToolRegistry/ToolExecutor. Validate owner, schedule, actions, limits, and dangerous-action policy before persistence.
+7. Implement sequential scheduled action execution through the existing ToolExecutor/TelegramAPI context, with durable attempts and owner-only notifications.
+8. Add observability and owner-scoped management UI/handlers only after core correctness is tested.
+
+## 19. TEST / VALIDATION PLAN
+
+Future implementation tests must include:
+
+- schedule normalization for one-shot, interval, daily, weekly, invalid dates/times, timezone IDs, DST transitions, and boundary clocks;
+- deterministic next-run and missed-run policy;
+- owner isolation and malformed persisted JSON rejection;
+- atomic duplicate claim and unique occurrence behavior;
+- restart reconciliation for pending/running/succeeded/failed attempts;
+- bounded retry/backoff and cancellation;
+- disable/delete races and non-overlap of recurring tasks;
+- ordered multi-action success, stop-on-failure, action-count/argument limits, and confirmation-required rejection;
+- ToolRegistry/ToolExecutor reuse with no direct Telegram/RPC/provider calls;
+- RuntimeSupervisor start/rebuild/stop/reload and no duplicate scheduler loop;
+- fake TelegramAPI integration proving Self Bot authority and honest durable result transitions;
+- Supabase repository behavior plus in-memory fallback without executing SQL in unit tests;
+- retention/index/RLS behavior in a separate database integration phase.
+
+## 20. HARD CONSTRAINTS
+
+- This document is investigation-only; no scheduler, parser, tool, handler, migration, schema, or production code was implemented.
+- Do not reuse `profile.scheduler` as a generic task scheduler.
+- One TaskScheduler singleton only; no per-task forever loops and no second recovery authority.
+- RuntimeSupervisor owns task scheduler lifecycle and recovery.
+- AI may propose structured tasks but cannot create timers or execute Telegram actions directly.
+- All scheduled actions must pass deterministic validation and existing tool permission boundaries.
+- Self Bot remains Telegram execution authority.
+- Database stores definitions and history only; it never calls AI, tools, Telegram, SQL business logic, or timers.
+- No arbitrary shell, SQL, RPC, provider, or command execution.
+- No unbounded task/action/retry/backlog/resource growth.
+- No exactly-once claim for Telegram side effects without proven idempotency.
+- Preserve existing Bio/Username scheduler and all current features.
+
+## 21. REMAINING DECISIONS / BLOCKERS
+
+Before implementation, explicitly decide:
+
+1. Missed-run policy: skip, immediate one-time catch-up, coalesce, or bounded replay.
+2. DST policy for nonexistent and ambiguous local times.
+3. Interval anchoring: scheduled-time anchor versus completion-time anchor.
+4. Retry policy and maximum attempts for task-level and action-level failures.
+5. Whether scheduled destructive/admin actions are prohibited, confirmation-gated, or supported only with a pre-authorized task approval model.
+6. Notification destination and behavior after execution/failure.
+7. Whether one-shot failed tasks remain enabled for retry or become terminal.
+8. Whether task edits create versions and how already-claimed occurrences use old/new definitions.
+9. Whether multi-action conditionals are deferred completely; recommended initial answer is yes.
+10. Whether two tables are acceptable for initial durable state; recommended answer is task definitions plus execution attempts, with bounded action JSON.
+
+## 22. PHASE BOUNDARY
+
+This phase was investigation only. The only permitted artifact change is this handoff document. No production code, tests, database/schema/migrations, SQL, Supabase state, AI parser, task creation path, scheduler, Telegram behavior, commit delivery code, or provider/engine architecture was changed.
