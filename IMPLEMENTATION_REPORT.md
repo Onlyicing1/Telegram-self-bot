@@ -191,10 +191,12 @@ work required.
 - Base commit: `b305c97a7ba723d38b69773719e26f4085570b8d`.
 - Push result: pushed to `origin/main` (`b305c97..e972b5c`).
 - Remote verification: after `git fetch origin main`, local HEAD ==
-  `origin/main` == remote `main` == `e972b5cbaaa113e1366343c204f8b5f378c65682`;
-  remote `backend/ai/tools/delivery.py` contains `_render_tables`; remote test
-  file contains the new table tests; remote `IMPLEMENTATION_REPORT.md` contains
-  exactly one current report.
+  `origin/main` == remote `main` == `4c23663becf1622f83ddf948b99ef0cff04c8d0e`
+  (the delivery-facts commit `4c23663` sits on top of the implementation
+  commit `e972b5c`; both are on `main`). Remote `backend/ai/tools/delivery.py`
+  contains `_render_tables`; remote test file contains the new table tests;
+  remote `IMPLEMENTATION_REPORT.md` contains exactly one current report.
 - Final working-tree state: clean (`## main...origin/main`, no changes).
-- Files in the delivery commit: `backend/ai/tools/delivery.py`,
-  `tests/test_67_ai_output_pipeline.py`, `IMPLEMENTATION_REPORT.md` only.
+- Files in the implementation commit `e972b5c`:
+  `backend/ai/tools/delivery.py`, `tests/test_67_ai_output_pipeline.py`,
+  `IMPLEMENTATION_REPORT.md` only.
