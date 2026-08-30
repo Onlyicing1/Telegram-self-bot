@@ -36,7 +36,7 @@ def classify_failure(error: BaseException | str) -> RetryDecision:
         text = error.lower()
     if "cancel" in name or "cancel" in text:
         return RetryDecision(FailureClass.CANCELLED, False, "cancelled")
-    if "timeout" in name or "temporar" in text or "rate limit" in text:
+    if "timeout" in name or "timeouterror" in text or "temporar" in text or "rate limit" in text:
         return RetryDecision(FailureClass.RETRYABLE, True, "transient")
     return RetryDecision(FailureClass.UNKNOWN, False, "unclassified")
 

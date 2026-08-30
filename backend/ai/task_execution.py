@@ -86,7 +86,7 @@ class TaskExecutionCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return await self._fail(occurrence, type(exc).__name__, 0, len(calls))
+            return await self.handle_failure(occurrence, exc, action_count=len(calls))
 
         successful = sum(item.success for item in result)
         failed = next((item for item in result if not item.success), None)
@@ -98,7 +98,16 @@ class TaskExecutionCoordinator:
             "terminal_status": "succeeded" if failed is None else "failed",
         })
         if failed is not None:
-            return await self._fail(occurrence, failed.error or "action_failed", successful, len(calls), metadata)
+            failure = failed.error or failed.message or "action_failed"
+            if failure == "timeout" or failed.message.lower().startswith("timeout"):
+                failure = TimeoutError(failed.message or "tool timed out")
+            return await self.handle_failure(
+                occurrence,
+                failure,
+                successful=successful,
+                action_count=len(calls),
+                metadata=metadata,
+            )
         updated = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,
             "succeeded", result_metadata=metadata,
@@ -107,17 +116,41 @@ class TaskExecutionCoordinator:
             return TaskExecutionResult(False, "unknown", len(calls), successful, "state_persist_failed", metadata)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
 
-    async def handle_failure(self, occurrence: OccurrenceRecord, error: BaseException | str) -> TaskExecutionResult:
+    async def handle_failure(
+        self,
+        occurrence: OccurrenceRecord,
+        error: BaseException | str,
+        *,
+        successful: int = 0,
+        action_count: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> TaskExecutionResult:
         decision = classify_failure(error)
         if decision.classification == FailureClass.RETRYABLE and can_retry(occurrence.attempt):
             retry_at = occurrence.updated_at + retry_delay(occurrence.attempt)
             updated = await self.repository.transition_occurrence(
-                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
-                "retry_pending", retry_at=retry_at,
-                error_metadata={"error_class": decision.reason, "attempt": occurrence.attempt},
+                self.owner_id,
+                occurrence.task_id,
+                occurrence.occurrence_key,
+                "retry_pending",
+                retry_at=retry_at,
+                attempt=occurrence.attempt + 1,
+                error_metadata=_bounded_metadata({
+                    "error_class": decision.reason,
+                    "attempt": occurrence.attempt,
+                    "action_count": action_count,
+                    "successful_action_count": successful,
+                }),
             )
-            return TaskExecutionResult(False, "retry_pending" if updated else "unknown", 0, 0, decision.reason)
-        return await self._fail(occurrence, decision.reason, 0, 0)
+            return TaskExecutionResult(
+                False,
+                "retry_pending" if updated else "unknown",
+                action_count,
+                successful,
+                decision.reason,
+                metadata,
+            )
+        return await self._fail(occurrence, decision.reason, successful, action_count, metadata)
 
     async def _fail(
         self,
