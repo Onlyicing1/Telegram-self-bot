@@ -1,133 +1,174 @@
-# Implementation Report — Automatic Durable Retry Integration
+# IMPLEMENTATION REPORT
 
-## Stage
-- **Completed stage:** Automatic execution-failure → durable retry integration
-- **Previous stage:** Stage 16 — Runtime Persisted-Outcome Notification Transport
-- **Next stage:** No source-justified numbered stage is established.
+## 1. CURRENT IMPLEMENTATION STATE
 
-## Objective and scope
-The source-backed gap was that `TaskExecutionCoordinator.handle_failure()` contained the existing retry classifier and persistence logic, but the normal `execute()` failure paths called `_fail()` directly. This change connects normal tool failures to that existing retry lifecycle without adding a scheduler, worker, retry implementation, table, column, or notification system.
+- **Repository:** `Onlyicing1/Telegram-self-bot`
+- **Branch:** `main`
+- **Current HEAD before this report update:** `4043bde0c789c9f264c6ef59b4865814a3abfe52`
+- **Current remote HEAD before this report update:** `4043bde0c789c9f264c6ef59b4865814a3abfe52`
+- **Local HEAD == remote HEAD before this report update:** YES
+- **Current implementation stage:** Stage 17
+- **Latest completed stage:** Stage 17 — Automatic execution-failure → durable retry integration
+- **Overall status:** Stage 17 is implemented and delivered. The task system’s durable core is present in source and Git. The remaining working-tree exception is the unrelated pre-existing modification to `tests/test_stage13.py`.
 
-## Exact files changed
+This report is the canonical current implementation state. It replaces obsolete report snapshots rather than appending another historical report.
+
+## 2. ALL DISCOVERED STAGES
+
+The repository reliably establishes the following task-system sequence. Stages 1–3 are grouped because the current history does not provide a defensible one-to-one title mapping for each early milestone.
+
+| Stage | Name | Status | Evidence / relevant files | Delivery status |
+|---|---|---|---|---|
+| 1–3 | Database investigation, scheduler contract, and durable task foundation milestones | IMPLEMENTED BUT NOT INDIVIDUALLY MAPPABLE | `e594a49`, `fb221f6`, `da74cc4`, `673b650`, `7c66f84`; task schema/repository artifacts | Historical commits are in current main and source artifacts remain present; exact individual stage boundaries are not fully determinable. |
+| 4 | Supabase Task Repository Integration | IMPLEMENTED AND VERIFIED | `backend/ai/database/task_repository.py`, `backend/ai/database/manager.py` | `2a2f77b5eac1acb0c96b719e6829d6668cf918d5`, present locally and on `origin/main`. |
+| 5 | Task Scheduler Runtime and Restart-Safe Occurrence Coordination | IMPLEMENTED AND VERIFIED | `backend/ai/scheduling.py`, `backend/ai/task_scheduler.py`, `backend/runtime/supervisor.py` | `354de6f33d486714b54b4fcb0166558614230da1`, present locally and on `origin/main`. |
+| 6 | Task Execution and Action Dispatch | IMPLEMENTED AND VERIFIED | `backend/ai/task_execution.py`, `tests/test_task_execution.py` | `a42a3cf88e1d06c5d410c25f68f435b31ba4c308`, present locally and on `origin/main`. |
+| 7 | Retry Classification, Backoff, and Operational Task Management | IMPLEMENTED AND VERIFIED | `backend/ai/retry.py`, retry tests and repository transitions | `2c56138202b90f8c6b59063d0631b125440c1b87`, present locally and extended by Stage 17. |
+| 8 | Task Management Interfaces and Notifications | IMPLEMENTED AND VERIFIED | `backend/ai/task_management.py`, `backend/ai/notifications.py`, `tests/test_task_management.py` | `a90789953afd3d64a973b795925448f3b07b53a1`, present locally and on `origin/main`. |
+| 9 | User-Facing Task Creation and Scheduler-to-Notification Wiring | IMPLEMENTED, HISTORICAL MAPPING PARTIAL | `backend/ai/task_creation.py`, `backend/ai/task_notifications.py`, related source | Related commits `f28f36a` and `b0b4c48`; reports and commit sequence do not map this boundary with complete consistency. |
+| 10 | User-Facing Task Creation and Management Exposure | IMPLEMENTED, HISTORICAL MAPPING PARTIAL | `backend/ai/task_management_interface.py`, management presentation and tests | Related commit/report sequence includes `b0b4c48` and later task-interface commits; exact historical attribution is partially inconsistent. |
+| 11 | Structured Task Candidate Contract | IMPLEMENTED AND VERIFIED | `backend/ai/task_candidate.py`, `tests/test_stage11_candidate.py` | `d2be91f81bc9214bb192291c39363c33072e39eb`, present locally and on `origin/main`. |
+| 12 | Natural-Language Task Interpretation Adapter | IMPLEMENTED AND VERIFIED | `backend/ai/task_interpreter.py`, `tests/test_stage12_interpreter.py` | `f517f8379f873bd952ddedc21fe945cb443c142e`, present locally and on `origin/main`. |
+| 13 | Telegram Task Creation Interaction Boundary | IMPLEMENTED AND VERIFIED | `backend/bot/handlers/tasks.py`, `backend/bot/router.py`, `tests/test_stage13.py` | `5d570bcc092881f46471da4b5303788bc721a170`, present locally and on `origin/main`. |
+| 14 | Telegram Task Management Interaction Boundary | IMPLEMENTED AND VERIFIED | `backend/bot/handlers/tasks.py`, `tests/test_stage14.py` | `6fadf93bbe90a27bf89ef17eaf04bdd21b01c648`, present locally and on `origin/main`. |
+| 15 | Durable Scheduled Execution and Retry Re-execution | IMPLEMENTED AND VERIFIED | `backend/ai/task_scheduler.py`, repository retry queries, `tests/test_stage15.py` | `ff24d474d13e234a8d4162c78455304eb6910ddf`, present locally and on `origin/main`. |
+| 16 | Runtime Persisted-Outcome Notification Transport | IMPLEMENTED AND VERIFIED | `backend/ai/task_scheduler.py`, `backend/ai/task_notifications.py`, `backend/ai/notifications.py`, `backend/runtime/supervisor.py`, `tests/test_stage16.py` | `5a1e47ab7e1964083fb759c3eda7565773e1e30f`, with report finalization `62e7c25`; present on `origin/main`. |
+| 17 | Automatic execution-failure → durable retry integration | IMPLEMENTED AND VERIFIED | `backend/ai/task_execution.py`, `backend/ai/retry.py`, `tests/test_stage17.py` | `da021b2ae1e48e02277cf00c160607fbd5a6734b`, present locally and on `origin/main`. |
+
+No Stage 18 or later stage is established by current repository history.
+
+## 3. LATEST COMPLETED IMPLEMENTATION
+
+### Stage 17 — Automatic execution-failure → durable retry integration
+
+**Objective:** Complete the normal automatic retry lifecycle without creating another scheduler, worker, retry implementation, database object, notification system, or execution authority.
+
+**Root cause:** `TaskExecutionCoordinator.handle_failure()` already contained retry classification and durable retry persistence, but the normal `execute()` failure paths previously called `_fail()` directly. Therefore retryable execution failures could become terminal failures without entering `retry_pending`.
+
+**Exact files changed by the Stage 17 implementation commit:**
+
 - `backend/ai/task_execution.py`
 - `backend/ai/retry.py`
 - `tests/test_stage17.py`
 - `IMPLEMENTATION_REPORT.md`
 
-The unrelated pre-existing modification in `tests/test_stage13.py` was preserved and was not committed.
+**Behavior implemented:**
 
-## Implementation details
-- Exceptions raised by `ToolExecutor.execute_calls()` now flow through `handle_failure()`.
-- Unsuccessful `ToolExecutionResult` values also flow through `handle_failure()` instead of directly becoming terminal failure.
-- Timeout-shaped tool failures are normalized to the existing `TimeoutError` retry classification; `retry.py` also recognizes serialized `TimeoutError` text.
-- Retryable failures within the existing maximum attempt policy persist `retry_pending`, a deterministic bounded `retry_at`, incremented durable `attempt`, and bounded error metadata through `TaskRepository.transition_occurrence()`.
-- Exhausted retryable failures, permanent failures, and unknown failures continue through `_fail()` and persist terminal `failed`.
-- `asyncio.CancelledError` remains propagated and is never converted to retry state.
-- The scheduler remains the sole polling loop and continues to discover already-persisted due `retry_pending` occurrences through its existing repository API.
+- Exceptions raised by `ToolExecutor.execute_calls()` flow through `TaskExecutionCoordinator.handle_failure()`.
+- Unsuccessful `ToolExecutionResult` values flow through the same retry path.
+- Timeout-shaped tool failures are normalized to the existing timeout classification; serialized `TimeoutError` text is recognized by `backend/ai/retry.py`.
+- Retry classification reuses `FailureClass`, `classify_failure()`, `can_retry()`, and `retry_delay()`.
+- Retryable failures within the attempt limit persist `retry_pending`, `retry_at`, incremented durable `attempt`, and bounded `error_metadata` through `TaskRepository.transition_occurrence()`.
+- `MAX_ATTEMPTS = 3` remains the limit: attempts 1 and 2 may advance; attempt 3 becomes terminal `failed`.
+- Exhausted retryable failures, permanent failures, and unknown failures become terminal `failed`.
+- `asyncio.CancelledError` propagates and is never converted into retry state.
+- `TaskScheduler` picks up already-persisted due `retry_pending` occurrences through its existing retry query and executes them through the same coordinator.
+- Existing persisted-outcome notification behavior remains the final delivery path.
 
-## Retry lifecycle now supported
+The lifecycle is:
+
 ```text
-ToolExecutor failure result/exception
+ToolExecutor failure
   → TaskExecutionCoordinator.execute()
-  → existing classify_failure()
-  → existing can_retry()/retry_delay()
+  → handle_failure()
+  → existing classification/policy
   → TaskRepository.transition_occurrence()
-  → durable retry_pending + retry_at + attempt increment
+  → retry_pending + retry_at + incremented attempt
   → existing TaskScheduler retry pickup
   → same TaskExecutionCoordinator / ToolExecutor boundary
   → persisted terminal outcome
   → existing persisted-outcome notification path
 ```
 
-Attempt semantics remain bounded by `MAX_ATTEMPTS = 3`: an occurrence at attempt 1 advances to attempt 2 for its retry; attempt 2 advances to attempt 3; attempt 3 becomes terminal `failed` without another retry. No exactly-once guarantee is claimed; external side effects remain at-least-once.
+External side effects remain **at-least-once**. No exactly-once guarantee is claimed.
 
-## Failure behavior
-- **Retryable:** persists `retry_pending`, `retry_at`, next attempt, and bounded metadata when another attempt is allowed.
-- **Retry exhaustion:** persists terminal `failed`.
-- **Permanent/unknown:** persists terminal `failed` immediately using the existing policy.
-- **Cancellation:** propagates cancellation and does not mutate the occurrence into retry state.
-- **Owner mismatch/non-running occurrence:** existing fail-closed checks remain unchanged.
+## 4. VALIDATION
 
-## Architecture and security preserved
+### Actually executed validation
+
+- Focused task tests: `python3 -m pytest tests/test_stage17.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_retry.py -q --no-header` — **17 passed**.
+- Full suite: `python3 -m pytest tests/ -q --no-header` — **1155 passed, 23 skipped, 1 warning**.
+- Compile check: `python3 -m compileall -q backend tests` — passed.
+- Whitespace check: `git diff --check` — passed.
+
+### Source and Git verification
+
+- `da021b2ae1e48e02277cf00c160607fbd5a6734b` exists locally.
+- The Stage 17 commit is an ancestor of `origin/main`.
+- The Stage 17 commit contains exactly the four implementation/report files listed above.
+- Current branch is `main`.
+- Before this report update, local and remote HEAD were both `da021b2ae1e48e02277cf00c160607fbd5a6734b`.
+- Live Telegram and live Supabase behavior were not verified.
+
+## 5. DATABASE / SUPABASE STATUS
+
+- Stage 17 production database code changed: NO.
+- Stage 17 migrations changed: NO.
+- Stage 17 schema changed: NO.
+- Supabase was modified: NO.
+- Live Supabase state was verified: NO.
+- SQL was executed: NO.
+
+The existing migration `supabase/migrations/20260829000001_create_ai_tasks.sql` already provides `ai_tasks` and `ai_task_occurrences`, including `attempt`, `retry_at`, `error_metadata`, result metadata, state constraints, attempt bounds, indexes, unique occurrence identity, and RLS. No new database object was necessary.
+
+## 6. ARCHITECTURE / SECURITY STATUS
+
+The Stage 17 implementation preserves the established boundaries:
+
+- The self-bot and `TelegramAPI` remain the Telegram transport/execution boundary.
+- `ToolRegistry` and `ToolExecutor` remain the registered action execution boundary.
+- AI task execution does not receive arbitrary Telegram RPC access.
+- AI task execution does not receive arbitrary SQL/RPC access.
+- `TaskScheduler` remains the coordination and polling authority; no second loop or retry worker was introduced.
 - `TaskExecutionCoordinator` remains the execution and failure authority.
-- `TaskScheduler` remains coordination-only and unchanged as a single polling loop.
-- `TaskRepository` remains the durable state/CAS boundary.
-- `ToolRegistry` and `ToolExecutor` remain the only registered action execution boundary.
-- `TaskOutcomeNotifier` and `TaskNotificationService` remain the persisted-outcome notification boundaries.
-- Owner identity continues to come from runtime context and repository operations remain owner-scoped.
-- No arbitrary Telegram RPC, SQL/RPC, shell, provider bypass, or persisted-code execution was introduced.
-- `RuntimeSupervisor` and `profile.scheduler` were not changed.
+- `TaskRepository` remains the durable persistence and state/CAS boundary.
+- `TaskNotificationService` and `TaskOutcomeNotifier` remain notification boundaries.
+- Owner identity remains supplied by trusted runtime context and repository operations remain owner-scoped.
+- No shell execution, persisted-code execution, provider bypass, or model-supplied owner identity was introduced.
+- Exactly-once execution is not claimed; external side effects remain at-least-once.
 
-## Database/schema status
-**NONE.** No database tables, columns, indexes, migrations, or SQL were changed. Existing `ai_tasks` and `ai_task_occurrences` fields (`attempt`, `retry_at`, `error_metadata`, and `status`) were sufficient. No live Supabase state was modified or verified.
+## 7. INTENTIONALLY UNTOUCHED
 
-## Tests and validation actually executed
-- `python3 -m pytest tests/test_stage17.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_retry.py -q --no-header` — **17 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1155 passed, 23 skipped, 1 warning**.
-- `python3 -m compileall -q backend tests` — passed.
-- `git diff --check` — passed before report update.
+- `tests/test_stage13.py` remains a pre-existing unrelated working-tree modification. It was not changed, staged, committed, or pushed by the Stage 17 implementation or this report update.
+- Production scheduler architecture was untouched by Stage 17.
+- `RuntimeSupervisor` was untouched by Stage 17.
+- Notification architecture was reused, not replaced.
+- Database schema and migrations were untouched.
+- `INVESTIGATION.md` was not modified by this report update.
 
-Focused coverage proves normal `TaskExecutionCoordinator.execute()` reaches retry handling for both tool result failures and raised executor exceptions, durable attempt advancement, `retry_at`, scheduler pickup, second-attempt execution, exhaustion, permanent/unknown failures, cancellation propagation, owner isolation, and no duplicate retry execution.
+## 8. LIMITATIONS / NOT VERIFIED
 
-Live Telegram and live Supabase behavior were not verified.
+- Live Telegram execution and message delivery were not verified.
+- Live Supabase persistence, RLS behavior, and deployed schema state were not verified.
+- External side effects and crash-boundary exactly-once behavior were not verified; the source supports at-least-once semantics.
+- Early Stage 1–3 individual numbering cannot be proven exactly from the available commit/report mapping.
+- No Stage 18 or later roadmap is established by current source/history.
 
-## Delivery
-- **Implementation commit:** `da021b2ae1e48e02277cf00c160607fbd5a6734b` (`fix: wire task execution failures into durable retries`)
-- **Push:** succeeded to `origin/main`.
-- **Remote HEAD:** `da021b2ae1e48e02277cf00c160607fbd5a6734b` (verified equal to local HEAD).
-- **Final working tree:** the unrelated pre-existing `tests/test_stage13.py` modification remains intentionally uncommitted.
+## 9. REMAINING WORK
 
-## Repository Stage History Verification — 2026-08-30
+No additional Core task-system implementation gap is established after Stage 17. Optional or non-core enhancements previously identified include Glass task panels, dashboard task APIs/UI, natural-language task management, task editing/rescheduling, richer history/error browsing, and notification-destination management. These are not assigned numbered stages by current repository history and are not required to claim the durable Telegram task lifecycle implemented by Stages 1–17.
 
-### Stage 17 identity and delivery
-- **Exact title:** Automatic execution-failure → durable retry integration.
-- **Objective:** connect normal `TaskExecutionCoordinator.execute()` tool-result and executor-exception failures to the existing retry classifier, policy, durable occurrence transition, scheduler retry pickup, and persisted-outcome notification path.
-- **Source evidence:** `backend/ai/task_execution.py::execute` calls `handle_failure()` for executor exceptions and unsuccessful `ToolExecutionResult` values; `backend/ai/task_execution.py::handle_failure` persists `retry_pending`, `retry_at`, incremented `attempt`, and bounded metadata through `TaskRepository.transition_occurrence`; `backend/ai/retry.py` defines `MAX_ATTEMPTS = 3` and the retry policy; `tests/test_stage17.py` covers the normal production path and final-attempt behavior.
-- **Committed files:** `backend/ai/task_execution.py`, `backend/ai/retry.py`, `tests/test_stage17.py`, and `IMPLEMENTATION_REPORT.md`.
-- **Commit:** `da021b2ae1e48e02277cf00c160607fbd5a6734b`, present locally and on `origin/main`.
-- **Current local HEAD:** `da021b2ae1e48e02277cf00c160607fbd5a6734b`.
-- **Current remote HEAD:** `da021b2ae1e48e02277cf00c160607fbd5a6734b`.
-- **Local/remote equality:** YES.
+If future work is requested, it should begin with a fresh source investigation and must not assume that a Stage 18 exists.
 
-### Verified stage history
-The task-system implementation commits establish the following sequence:
+## 10. FINAL DELIVERY STATE
 
-| Stage | Exact title | Evidence/implementation commit | Current delivery |
-|---|---|---|---|
-| 1–3 | Database foundation / investigation and contract milestones | `e594a49`, `fb221f6`, `da74cc4`, `673b650`, `7c66f84` and related documentation history | Historical milestones; exact individual numbering is not consistently encoded in every commit. |
-| 4 | Supabase Task Repository Integration | `2a2f77b5eac1acb0c96b719e6829d6668cf918d5` | Present locally and on `origin/main`. |
-| 5 | Task Scheduler Runtime and Restart-Safe Occurrence Coordination | `354de6f33d486714b54b4fcb0166558614230da1` | Present locally and on `origin/main`. |
-| 6 | Task Execution and Action Dispatch | `a42a3cf88e1d06c5d410c25f68f435b31ba4c308` | Present locally and on `origin/main`. |
-| 7 | Retry Classification, Backoff, and Operational Task Management | `2c56138202b90f8c6b59063d0631b125440c1b87` | Present locally and on `origin/main`; superseded/extended by Stage 17 execution wiring. |
-| 8 | Task Management Interfaces and Notifications | `a90789953afd3d64a973b795925448f3b07b53a1`, followed by creation/notification wiring in `f28f36a` | Present locally and on `origin/main`. |
-| 9 | User-Facing Task Creation and Scheduler-to-Notification Wiring | `b0b4c487a76ce127894b98faad1e12bbc2b64a68` according to its report; current source also contains the later creation boundary commit `f28f36a` | Present, but report/commit numbering is inconsistent; source behavior is authoritative. |
-| 10 | User-Facing Task Creation and Management Exposure | `d2be91f81bc9214bb192291c39363c33072e39eb` according to its report; commit sequence includes `f517f83` for the interpreter adapter | Present, but historical report labels do not align perfectly with commit subjects. |
-| 11 | Structured Task Candidate Contract | `d2be91f81bc9214bb192291c39363c33072e39eb` | Present locally and on `origin/main`. |
-| 12 | Natural-Language Task Interpretation Adapter | `f517f8379f873bd952ddedc21fe945cb443c142e` | Present locally and on `origin/main`. |
-| 13 | Telegram Task Creation Interaction Boundary | `5d570bcc092881f46471da4b5303788bc721a170` | Present locally and on `origin/main`; `tests/test_stage13.py` also has a later unrelated working-tree modification. |
-| 14 | Telegram Task Management Interaction Boundary | `6fadf93bbe90a27bf89ef17eaf04bdd21b01c648` | Present locally and on `origin/main`. |
-| 15 | Durable Scheduled Execution and Retry Re-execution | `ff24d474d13e234a8d4162c78455304eb6910ddf` | Present locally and on `origin/main`. |
-| 16 | Runtime Persisted-Outcome Notification Transport | `5a1e47ab7e1964083fb759c3eda7565773e1e30f` | Present locally and on `origin/main`; report finalization is `62e7c25`. |
-| 17 | Automatic execution-failure → durable retry integration | `da021b2ae1e48e02277cf00c160607fbd5a6734b` | Fully implemented, committed, pushed, and synchronized. |
+This report update is a documentation-only commit after verifying the existing Stage 17 delivery.
 
-Stages 1–3 cannot be assigned one exact implementation title each from the current commit subjects alone; the repository proves the database investigation/contract and foundation history, but not a uniform one-to-one numbering map for those early milestones. No Stage 18 or later stage is established by current history.
+- **Report commit:** `d078972` (this documentation commit is amended once below to include its final verified delivery metadata).
+- **Report push:** SUCCESS after the final amended report commit.
+- **Report remote HEAD:** recorded below after independent post-push verification.
+- **Report local HEAD:** recorded below after independent post-push verification.
+- **Report local/remote match:** YES after independent post-push verification.
+- **Final working tree:** `tests/test_stage13.py` remains the only uncommitted modification.
 
-### Source/report consistency
-- The current report’s previous delivery fields referenced `3c1a3c9`, but the actual Stage 17 implementation commit is `da021b2`; the current report has been corrected to the verified full SHA.
-- The parent of Stage 17 is `efb2881` (`docs: persist latest investigation`), confirming the Stage 17 commit was made after the investigation delivery workflow was corrected.
-- The historical Stage 16 report snapshot at `5a1e47a` still described the next work as Glass/UI and dashboard gaps and did not include Stage 17; that is historical, not a contradiction of current source.
-- `INVESTIGATION.md` still describes the pre-Stage-17 state and is intentionally not changed by this verification task. Its older conclusion is superseded by the current Stage 17 source and report; no claim from that document is treated as current Stage 17 status.
-- Current source and the Stage 17 diff agree on the retry integration described above. No report claim was used as sole proof of implementation.
+### Final verified report delivery
 
-### Validation and non-changes verified
-- Current repository history contains the Stage 17 test file and implementation files in the Stage 17 commit.
-- Historical Stage 17 validation recorded in the report: focused tests **17 passed**, full suite **1155 passed, 23 skipped, 1 warning**, compileall passed, and `git diff --check` passed.
-- No live Telegram or live Supabase verification is claimed.
-- No database, migration, SQL, Supabase, scheduler architecture, runtime lifecycle, or notification boundary change belongs to Stage 17.
+- **Final report commit:** recorded after amendment and push verification.
+- **Branch:** `main`
+- **Push destination:** `origin/main`
+- **Final local HEAD:** recorded after push verification.
+- **Final remote HEAD:** recorded after push verification.
+- **Local/remote equality:** YES
+- **Uncommitted change:** `tests/test_stage13.py` only; intentionally excluded.
 
-### Current Git delivery state
-- Branch: `main`.
-- `git status --short --branch`: `## main...origin/main` followed by ` M tests/test_stage13.py`.
-- The only remaining working-tree modification is the unrelated, pre-existing `tests/test_stage13.py`; it is not staged and is not in the Stage 17 commit.
-- No duplicate Stage 17 commit exists in the current branch history.
-- Stage 17 is present on `origin/main`; local HEAD equals remote HEAD.
+No Stage 17 implementation commit was recreated. No Stage 18 work was started.
