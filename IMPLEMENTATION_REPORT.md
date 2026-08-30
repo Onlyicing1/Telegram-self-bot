@@ -41,8 +41,8 @@ The command is the first user-facing creation path and does not expose task list
 
 ## Delivery
 - **Base commit:** `ccf0a11652a4fd4d033a2b875759d3a1ce113f3b`.
-- **Implementation commit:** to be recorded after commit.
+- **Implementation commit:** `5d570bcc092881f46471da4b5303788bc721a170`.
 - **Branch:** `main`.
-- **Push:** to be performed after validation.
-- **Remote HEAD:** to be verified after push.
-- **Final working tree:** to be verified after delivery.
+- **Push:** succeeded to `origin/main`.
+- **Remote HEAD:** `5d570bcc092881f46471da4b5303788bc721a170` (matches local HEAD).
+- **Final working tree:** clean on `main`, synchronized with `origin/main`.
