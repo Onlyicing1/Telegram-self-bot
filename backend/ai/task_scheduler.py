@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.scheduling import ScheduleError, catch_up_occurrence, parse_schedule
@@ -31,10 +30,12 @@ class TaskScheduler:
         repository: TaskRepository,
         owner_id: int,
         execution_coordinator=None,
+        outcome_notifier=None,
     ) -> None:
         self.repository = repository
         self.owner_id = owner_id
         self.execution_coordinator = execution_coordinator
+        self.outcome_notifier = outcome_notifier
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -69,6 +70,19 @@ class TaskScheduler:
                 recovered += result is not None
         return recovered
 
+    async def _notify_outcome(self, task_id: int, occurrence_key: str, status: str) -> None:
+        notifier = self.outcome_notifier
+        if notifier is None:
+            return
+        if status not in ("succeeded", "failed", "retry_pending", "cancelled"):
+            return
+        try:
+            await notifier.notify_persisted(task_id, occurrence_key, status)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Task notification failed for %s", occurrence_key)
+
     async def _execute_claimed(self, occurrence: OccurrenceRecord) -> bool:
         coordinator = self.execution_coordinator
         if coordinator is None:
@@ -78,7 +92,10 @@ class TaskScheduler:
         )
         if claimed is None or claimed.status != "running":
             return False
-        await coordinator.execute(claimed)
+        result = await coordinator.execute(claimed)
+        await self._notify_outcome(
+            occurrence.task_id, occurrence.occurrence_key, getattr(result, "status", "unknown")
+        )
         return True
 
     async def _run_due_retries(self, reference: datetime) -> int:

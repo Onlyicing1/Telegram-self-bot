@@ -342,8 +342,25 @@ class RuntimeSupervisor:
             coordinator = TaskExecutionCoordinator(
                 get_task_repository(), executor, self.owner_id, context
             )
+
+            # Notification transport: resolve the CURRENT self client at call
+            # time so a rebuilt client (recovery/hard reset) never leaves the
+            # notifier pointing at a stale connection.
+            from backend.ai.notifications import TaskNotificationService
+            from backend.ai.task_notifications import TaskOutcomeNotifier
+
+            async def _notify_sender(owner: int, message: str) -> object:
+                if not self.client or owner != self.owner_id:
+                    raise RuntimeError("notification sender unavailable")
+                return await TelegramAPI(self.client).send_message(owner, message)
+
+            notification_service = TaskNotificationService(_notify_sender, self.owner_id)
+            outcome_notifier = TaskOutcomeNotifier(
+                get_task_repository(), notification_service, self.owner_id
+            )
+
             self._task_scheduler = TaskScheduler(
-                get_task_repository(), self.owner_id, coordinator
+                get_task_repository(), self.owner_id, coordinator, outcome_notifier
             )
         await self._task_scheduler.start()
 
