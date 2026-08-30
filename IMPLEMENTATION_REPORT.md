@@ -1,49 +1,66 @@
-# Implementation Report — Stage 15
+# Implementation Report — Stage 16
 
 ## Stage
-- **Completed stage:** Stage 15 — Durable Scheduled Execution and Retry Re-execution
-- **Previous stage:** Stage 14 — Telegram Task Management Interaction Boundary
-- **Next stage:** Stage 16 — Runtime Persisted-Outcome Notification Transport
+- **Completed stage:** Stage 16 — Runtime Persisted-Outcome Notification Transport
+- **Previous stage:** Stage 15 — Durable Scheduled Execution and Retry Re-execution
+- **Next stage:** Not yet established. Remaining source-justified gaps are Glass/UI task panels and dashboard task APIs; the next agent must derive the next stage from the repository and this report.
 
 ## Objective and scope
-Stage 15 closes the durable runtime bridge from scheduler-coordinated occurrences to the existing execution coordinator and consumes due retry-pending occurrences through the same scheduler loop. It preserves the existing repository state machine, retry policy, ToolExecutor boundary, owner isolation, and RuntimeSupervisor lifecycle authority.
+Wire persisted task outcomes (succeeded / failed / retry_pending / cancelled) into the existing notification boundary at runtime. The scheduler notifies only after `TaskOutcomeNotifier` re-verifies the occurrence's actual persisted status in the repository. No second scheduler, notification loop, or worker was created; notification delivery stays outside the scheduler's execution authority.
 
 ## Exact files changed
-- `backend/ai/task_scheduler.py` — accepts an injected execution coordinator, claims eligible occurrences, hands them to execution, and polls due retry-pending occurrences.
-- `backend/ai/database/task_repository.py` — adds owner-scoped due-retry occurrence discovery for in-memory and Supabase-backed repositories.
-- `backend/runtime/supervisor.py` — constructs the task execution coordinator from the existing TelegramAPI/tool registry and injects it into the single task scheduler.
-- `tests/test_stage15.py` — focused scheduled execution, retry pickup, ownership, duplicate wake, and boundary tests.
-- `IMPLEMENTATION_REPORT.md` — current-state report.
+- `backend/ai/task_scheduler.py` — added `outcome_notifier` constructor parameter and `_notify_outcome()` hook, invoked in `_execute_claimed()` after the coordinator returns. Cancellation re-raised; other notifier failures logged and isolated.
+- `backend/runtime/supervisor.py` — constructs `TaskNotificationService` + `TaskOutcomeNotifier` and injects the notifier into `TaskScheduler`. The Telegram sender resolves `self.client` at call time so a rebuilt client never leaves stale state.
+- `tests/test_stage16.py` — 13 focused tests for the runtime notification wiring.
+- `IMPLEMENTATION_REPORT.md` — this report.
 
-Pre-existing workspace changes in `INVESTIGATION.md` and `tests/test_stage13.py` were preserved and were not included.
+Pre-existing workspace changes in `INVESTIGATION.md` and `tests/test_stage13.py` were preserved and remain uncommitted.
 
 ## Implementation details
-`TaskScheduler` remains the only polling loop. For a newly due task, it creates the deterministic occurrence, claims it through `TaskRepository`, and only then calls `TaskExecutionCoordinator.execute` when a coordinator is configured. The scheduler itself never resolves or executes action JSON. Existing standalone scheduler tests remain compatible when no coordinator is injected.
+- **Persistence-before-notify**: `TaskOutcomeNotifier.notify_persisted()` re-reads the occurrence from `TaskRepository` and only sends when the stored `status` equals the requested outcome kind. If the coordinator's reported status was not actually persisted (e.g. `transition_occurrence` failed), no notification is sent.
+- **Outcome kinds**: `succeeded`, `failed`, `retry_pending`, `cancelled` — enforced by both `TaskNotificationService.send()` (allow-list) and `TaskOutcomeNotifier._message()` formatting.
+- **Bounded delivery**: 10-second `asyncio.wait_for` timeout and 1024-character message truncation, both pre-existing in `TaskNotificationService`.
+- **Failure isolation**: sender exceptions are caught inside `TaskNotificationService` (returns `False`); scheduler-level notifier failures are logged via `logger.exception` and never mutate task/occurrence state. `asyncio.CancelledError` is re-raised at every boundary.
+- **No duplicate notifications**: notifications fire only in `_execute_claimed()` after an actual execution attempt; scheduler polling (`list_due_tasks`, `list_due_retry_occurrences`) never notifies. `once` tasks get `next_run_at=NULL` after `advance_next_run`, so `list_due_tasks` (filters `status=active AND next_run_at<=now`) will not rediscover them. Due `retry_pending` occurrences are reclaimed and re-executed — the retry_pending notification happens once, at the transition, and re-execution notifies the new terminal outcome.
+- **Lazy client resolution**: `_notify_sender` in the supervisor closes over `self` and reads `self.client` at call time; after a reconnect or hard-reset rebuild, notifications use the new client with no stale references.
+- **Ownership**: `owner_id` flows only from `RuntimeSupervisor` → notifier/service/sender. `TaskNotificationService.send()` rejects notifications whose `owner_id` differs from the service's authoritative owner; the sender double-checks `owner == self.owner_id` and that the client exists.
 
-The repository now exposes bounded, owner-scoped `list_due_retry_occurrences`. Due retry-pending occurrences are claimed through the same CAS/state-machine claim operation and passed to the coordinator only after the returned record is `running`. Not-yet-due retries are ignored, and duplicate wakes cannot reclaim already-running/succeeded occurrences.
-
-`RuntimeSupervisor` creates the coordinator using the existing `TelegramAPI`, `ToolContext`, default `ToolRegistry`, and `ToolExecutor`, then injects it into the one scheduler instance. No second loop, worker, timer, or execution authority was added.
+## Notification lifecycle semantics
+1. Scheduler claims an occurrence (`claimed`/`retry_pending` → `running`) via repository CAS claim.
+2. `TaskExecutionCoordinator.execute()` runs registered tools via `ToolExecutor` and persists `succeeded`/`failed`/`retry_pending` through `transition_occurrence`.
+3. Scheduler calls `_notify_outcome(task_id, occurrence_key, result.status)`.
+4. `TaskOutcomeNotifier` re-reads the occurrence; if the persisted status matches, it formats a bounded message and sends via `TaskNotificationService`.
+5. The Telegram sender resolves the current self-client and sends to the owner's chat.
 
 ## Ownership and security
-All due-task and retry queries are owner-scoped. Claims require the authoritative owner ID and repository state. Execution remains inside `TaskExecutionCoordinator` and `ToolExecutor`; persisted action data is never executed by the scheduler. No arbitrary Telegram RPC, SQL, RPC, shell, provider, or code execution path was introduced. Cancellation is re-raised by scheduler loops and scheduler shutdown cancels its supervised task.
+- Owner identity originates exclusively from `RuntimeSupervisor.owner_id` (runtime context); notification payloads and persisted data cannot override it.
+- Notification code cannot execute task actions (it only reads occurrence state), cannot mutate task/occurrence state, and performs no Telegram RPC beyond the established `TelegramAPI.send_message` facade.
+- No arbitrary Telegram RPC, SQL, RPC, shell, provider, or executable-code path was introduced.
 
 ## Database/schema status
-**Database/schema changes: NONE.** The existing `ai_tasks` and `ai_task_occurrences` tables are unchanged. No migration was created or modified, and no Supabase SQL was executed. Live Supabase and Telegram execution were not verified.
+**Database/schema changes: NONE.** The existing `ai_tasks` and `ai_task_occurrences` tables are unchanged. No migration was created or modified, and no Supabase SQL was executed. Live Supabase and Telegram delivery were not verified.
 
 ## Tests and validation actually executed
-- `python3 -m pytest tests/test_stage15.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_retry.py -q` — **16 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1136 passed, 23 skipped, 1 warning**.
+- `python3 -m pytest tests/test_stage16.py -q --no-header` — **13 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1149 passed, 23 skipped, 1 warning**.
 - `python3 -m compileall -q backend tests` — passed.
 - `git diff --check` — passed.
 
+Test coverage includes: persisted succeeded/failed/retry_pending/cancelled each notify exactly once; outcome not persisted → no notification; persisted status differs from reported status → no notification (lying-coordinator case); sender failure leaves occurrence state untouched; cancellation propagates through the scheduler; owner mismatch rejected; duplicate scheduler wake does not duplicate delivery; retry_pending not notified on rediscovery, only on re-execution with its new outcome; notification never mutates occurrence state; source-level guard that the supervisor wires the lazy-client sender.
+
 ## Architecture preserved
-RuntimeSupervisor remains the sole runtime lifecycle authority. TaskScheduler remains durable coordination and handoff only. TaskExecutionCoordinator remains the occurrence execution boundary. ToolRegistry/ToolExecutor remain registered action execution authorities. TaskRepository remains persistence/state authority. Retry classification/backoff remains in `backend/ai/retry.py`; Stage 15 only consumes persisted retry state. Profile scheduling is untouched.
+- RuntimeSupervisor: sole runtime lifecycle authority (also the only place notification dependencies are constructed).
+- TaskScheduler: durable coordination + execution handoff; notification is a post-execution hook, not an execution authority.
+- TaskExecutionCoordinator / ToolRegistry / ToolExecutor: unchanged execution boundaries.
+- TaskRepository: unchanged persistence/state-machine authority.
+- TaskNotificationService / TaskOutcomeNotifier: notification boundaries, now actually wired at runtime.
+- TelegramAPI: the only Telegram transport used (send_message facade).
+- profile.scheduler: untouched and separate.
 
 ## Limitations and remaining work
-Live Supabase, Telegram, provider, and process-level end-to-end execution were not verified. Notification transport and lifecycle notification wiring remain outside this stage, as do Glass task panels and dashboard task APIs. Retry handling still depends on the existing coordinator failure transitions and does not claim exactly-once side effects; at-least-once semantics remain authoritative.
+- Live Telegram delivery, live Supabase persistence, and end-to-end process behavior were not verified (no live environment in this workspace).
+- `notification_destination` is currently owner-only in practice; richer destinations would need schema or config work (out of scope).
+- Remaining source-justified gaps: Glass/UI task panels, dashboard task APIs, and richer task-management UX. These belong to a future stage to be derived by the next agent from the repository state.
 
 ## Delivery
-- **Implementation commit:** pending.
-- **Push:** pending.
-- **Remote HEAD:** pending.
-- **Final working tree:** pre-existing `INVESTIGATION.md` and `tests/test_stage13.py` changes must remain preserved; Stage 15 files will be isolated for delivery.
+- **Implementation commit:** `5a1e47a` (feat: wire persisted task outcome notifications into scheduler runtime).
