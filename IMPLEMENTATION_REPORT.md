@@ -1,56 +1,49 @@
-# Implementation Report — Stage 14
+# Implementation Report — Stage 15
 
 ## Stage
-- **Completed stage:** Stage 14 — Telegram Task Management Interaction Boundary
-- **Previous stage:** Stage 13 — Telegram Task Creation Interaction Boundary
-- **Next stage:** Stage 15 — Durable Scheduled Execution and Retry Re-execution
+- **Completed stage:** Stage 15 — Durable Scheduled Execution and Retry Re-execution
+- **Previous stage:** Stage 14 — Telegram Task Management Interaction Boundary
+- **Next stage:** Stage 16 — Runtime Persisted-Outcome Notification Transport
 
 ## Objective and scope
-Stage 14 exposes the existing owner-scoped task management service through the established outgoing Telegram self-bot command boundary. It does not alter task creation, scheduling, execution, retry policy, notifications, Glass UI, dashboard APIs, or database schema.
+Stage 15 closes the durable runtime bridge from scheduler-coordinated occurrences to the existing execution coordinator and consumes due retry-pending occurrences through the same scheduler loop. It preserves the existing repository state machine, retry policy, ToolExecutor boundary, owner isolation, and RuntimeSupervisor lifecycle authority.
 
 ## Exact files changed
-- `backend/bot/handlers/tasks.py` — extends the existing `.task` handler with deterministic management commands.
-- `tests/test_stage14.py` — focused Stage 14 interaction tests.
-- `IMPLEMENTATION_REPORT.md` — this report.
+- `backend/ai/task_scheduler.py` — accepts an injected execution coordinator, claims eligible occurrences, hands them to execution, and polls due retry-pending occurrences.
+- `backend/ai/database/task_repository.py` — adds owner-scoped due-retry occurrence discovery for in-memory and Supabase-backed repositories.
+- `backend/runtime/supervisor.py` — constructs the task execution coordinator from the existing TelegramAPI/tool registry and injects it into the single task scheduler.
+- `tests/test_stage15.py` — focused scheduled execution, retry pickup, ownership, duplicate wake, and boundary tests.
+- `IMPLEMENTATION_REPORT.md` — current-state report.
 
-`INVESTIGATION.md` and `tests/test_stage13.py` contain pre-existing workspace changes and were intentionally not included in the Stage 14 delivery.
+Pre-existing workspace changes in `INVESTIGATION.md` and `tests/test_stage13.py` were preserved and were not included.
 
 ## Implementation details
-The existing owner-guarded `.task` handler now supports:
+`TaskScheduler` remains the only polling loop. For a newly due task, it creates the deterministic occurrence, claims it through `TaskRepository`, and only then calls `TaskExecutionCoordinator.execute` when a coordinator is configured. The scheduler itself never resolves or executes action JSON. Existing standalone scheduler tests remain compatible when no coordinator is injected.
 
-- `.task list`
-- `.task inspect <task_id>`
-- `.task pause <task_id> <version>`
-- `.task resume <task_id> <version>`
-- `.task complete <task_id> <version>`
-- `.task fail <task_id> <version>`
-- `.task expire <task_id> <version>`
-- `.task delete <task_id> <version>`
+The repository now exposes bounded, owner-scoped `list_due_retry_occurrences`. Due retry-pending occurrences are claimed through the same CAS/state-machine claim operation and passed to the coordinator only after the returned record is `running`. Not-yet-due retries are ignored, and duplicate wakes cannot reclaim already-running/succeeded occurrences.
 
-List and inspection delegate to `list_text` and `inspect_text`. Mutations delegate dynamically to the corresponding `TaskManagementService` method and pass the user-provided task ID/version only after bounded positive-integer validation. A `None` service result is reported as not found, unauthorized, or stale rather than success. Responses edit the originating message once; malformed input and unexpected failures receive bounded error feedback.
+`RuntimeSupervisor` creates the coordinator using the existing `TelegramAPI`, `ToolContext`, default `ToolRegistry`, and `ToolExecutor`, then injects it into the one scheduler instance. No second loop, worker, timer, or execution authority was added.
 
 ## Ownership and security
-Every request passes `is_owner` before management logic. The handler supplies the authoritative owner ID captured at registration to `TaskManagementService`; no owner value is accepted from command arguments. The handler performs no direct repository, SQL, Telegram RPC, tool, provider, shell, or task-action execution. CAS/version protection remains inside `TaskManagementService` and `TaskRepository`.
+All due-task and retry queries are owner-scoped. Claims require the authoritative owner ID and repository state. Execution remains inside `TaskExecutionCoordinator` and `ToolExecutor`; persisted action data is never executed by the scheduler. No arbitrary Telegram RPC, SQL, RPC, shell, provider, or code execution path was introduced. Cancellation is re-raised by scheduler loops and scheduler shutdown cancels its supervised task.
 
 ## Database/schema status
-**Database/schema changes: NONE.** The existing `ai_tasks` and `ai_task_occurrences` model is unchanged. No migration was created or modified, and no Supabase SQL was executed.
+**Database/schema changes: NONE.** The existing `ai_tasks` and `ai_task_occurrences` tables are unchanged. No migration was created or modified, and no Supabase SQL was executed. Live Supabase and Telegram execution were not verified.
 
 ## Tests and validation actually executed
-- `python3 -m pytest tests/test_stage14.py tests/test_stage13.py tests/test_task_management.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_retry.py -q` — **30 passed**.
-- `python3 -m pytest tests/ -q --no-header` — **1131 passed, 23 skipped, 1 warning**.
+- `python3 -m pytest tests/test_stage15.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_retry.py -q` — **16 passed**.
+- `python3 -m pytest tests/ -q --no-header` — **1136 passed, 23 skipped, 1 warning**.
 - `python3 -m compileall -q backend tests` — passed.
 - `git diff --check` — passed.
 
-The full suite includes the pre-existing Stage 13 test repair required for collection; that unrelated workspace edit was not included in this Stage 14 commit.
-
 ## Architecture preserved
-RuntimeSupervisor remains the sole lifecycle authority. TaskScheduler remains coordination-only. TaskExecutionCoordinator and ToolExecutor remain execution boundaries. TaskRepository remains the persistence boundary. TaskManagementService remains the sole lifecycle management boundary. Existing notification, provider, candidate, interpreter, creation, profile-scheduler, and Glass architectures remain unchanged.
+RuntimeSupervisor remains the sole runtime lifecycle authority. TaskScheduler remains durable coordination and handoff only. TaskExecutionCoordinator remains the occurrence execution boundary. ToolRegistry/ToolExecutor remain registered action execution authorities. TaskRepository remains persistence/state authority. Retry classification/backoff remains in `backend/ai/retry.py`; Stage 15 only consumes persisted retry state. Profile scheduling is untouched.
 
 ## Limitations and remaining work
-This stage exposes deterministic Telegram commands only. It does not add task-specific Glass panels/callbacks, natural-language management, dashboard routes, scheduled occurrence execution, retry re-execution, or runtime notification transport. The next source-justified boundary is scheduled execution and retry re-execution.
+Live Supabase, Telegram, provider, and process-level end-to-end execution were not verified. Notification transport and lifecycle notification wiring remain outside this stage, as do Glass task panels and dashboard task APIs. Retry handling still depends on the existing coordinator failure transitions and does not claim exactly-once side effects; at-least-once semantics remain authoritative.
 
 ## Delivery
 - **Implementation commit:** pending.
 - **Push:** pending.
 - **Remote HEAD:** pending.
-- **Final working tree:** pre-existing `INVESTIGATION.md` and `tests/test_stage13.py` changes must remain preserved; Stage 14 files will be isolated for delivery.
+- **Final working tree:** pre-existing `INVESTIGATION.md` and `tests/test_stage13.py` changes must remain preserved; Stage 15 files will be isolated for delivery.

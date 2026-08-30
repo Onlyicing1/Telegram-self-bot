@@ -83,6 +83,7 @@ class TaskRepository:
     async def get_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def list_occurrences(self, owner_id, task_id=None, limit=100): raise NotImplementedError
     async def list_recoverable_occurrences(self, owner_id, limit=100): raise NotImplementedError
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10): raise NotImplementedError
     async def claim_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
 
@@ -120,6 +121,8 @@ class InMemoryTaskRepository(TaskRepository):
         r=self._occurrences.get((task_id,occurrence_key));return _copy(r) if r and r.owner_id==owner_id else None
     async def list_occurrences(self, owner_id, task_id=None, limit=100): return [_copy(r) for r in list(self._occurrences.values()) if r.owner_id==owner_id and (task_id is None or r.task_id==task_id)][:max(0,limit)]
     async def list_recoverable_occurrences(self, owner_id, limit=100): return [_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status in {"claimed","running"}][:max(0,limit)]
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10):
+        ref=_parse_dt(now); return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status=="retry_pending" and r.retry_at is not None and r.retry_at<=ref], key=lambda r:(r.retry_at,r.id))[:max(0,limit)]
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         r=self._occurrences.get((task_id,occurrence_key))
         if not r or r.owner_id!=owner_id or r.status not in {"claimed","retry_pending","interrupted"}:return None
@@ -207,6 +210,10 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running"]).order("updated_at").limit(limit).execute());return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
         except Exception as exc:logger.warning("Supabase recovery query failed; using fallback: %s",exc);return await self._fallback.list_recoverable_occurrences(owner_id,limit)
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10):
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status","retry_pending").lte("retry_at",_serialize(now)).order("retry_at").limit(limit).execute());return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:logger.warning("Supabase retry query failed; using fallback: %s",exc);return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current or current.status not in {"claimed","retry_pending","interrupted"}:return None

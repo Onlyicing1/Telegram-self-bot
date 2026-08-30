@@ -326,7 +326,25 @@ class RuntimeSupervisor:
         if self._task_scheduler is None:
             from backend.ai.database.task_repository import get_task_repository
             from backend.ai.task_scheduler import TaskScheduler
-            self._task_scheduler = TaskScheduler(get_task_repository(), self.owner_id)
+            from backend.ai.task_execution import TaskExecutionCoordinator
+            from backend.ai.tools.context import ToolContext
+            from backend.ai.tools.executor import ToolExecutor
+            from backend.ai.tools.registry import create_default_registry
+            from backend.telegram_api import TelegramAPI
+            context = ToolContext(
+                telegram=TelegramAPI(self.client),
+                owner_id=self.owner_id,
+                tz_str=self.tz_str,
+                client=self.client,
+            )
+            registry = create_default_registry(context)
+            executor = ToolExecutor(registry, context)
+            coordinator = TaskExecutionCoordinator(
+                get_task_repository(), executor, self.owner_id, context
+            )
+            self._task_scheduler = TaskScheduler(
+                get_task_repository(), self.owner_id, coordinator
+            )
         await self._task_scheduler.start()
 
     async def _stop_task_scheduler(self) -> None:
