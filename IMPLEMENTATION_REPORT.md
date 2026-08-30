@@ -154,21 +154,13 @@ If future work is requested, it should begin with a fresh source investigation a
 
 This report update is a documentation-only commit after verifying the existing Stage 17 delivery.
 
-- **Report commit:** `d078972` (this documentation commit is amended once below to include its final verified delivery metadata).
-- **Report push:** SUCCESS after the final amended report commit.
-- **Report remote HEAD:** recorded below after independent post-push verification.
-- **Report local HEAD:** recorded below after independent post-push verification.
-- **Report local/remote match:** YES after independent post-push verification.
+- **Report commit:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
+- **Report push:** SUCCESS to `origin/main`.
+- **Report remote HEAD:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
+- **Report local HEAD:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
+- **Report local/remote match:** YES.
 - **Final working tree:** `tests/test_stage13.py` remains the only uncommitted modification.
 
-### Final verified report delivery
-
-- **Final report commit:** recorded after amendment and push verification.
-- **Branch:** `main`
-- **Push destination:** `origin/main`
-- **Final local HEAD:** recorded after push verification.
-- **Final remote HEAD:** recorded after push verification.
-- **Local/remote equality:** YES
-- **Uncommitted change:** `tests/test_stage13.py` only; intentionally excluded.
+No Stage 17 implementation commit was recreated. No new implementation stage was started.
 
 No Stage 17 implementation commit was recreated. No Stage 18 work was started.
