@@ -1,336 +1,211 @@
 # INVESTIGATION
 
-## INVESTIGATION METADATA
+## Investigation Metadata
 
 | Field | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Inspected HEAD | `62e7c2589a3d328fbf39e8ba522d205c6b84bfde` |
+| Local HEAD at investigation start | `7b8adc83dd315f44ab343ab14ef01f33a7ea2419` |
+| Remote HEAD at investigation start | `7b8adc83dd315f44ab343ab14ef01f33a7ea2419` |
 | Date | 2026-08-30 |
-| Investigation type | Source-only current-state investigation |
-| Current completed stage | Stage 16 — Runtime Persisted-Outcome Notification Transport |
+| Investigation type | Source-only current-state investigation and next-boundary discovery |
 | Implementation performed | NO |
 
-The working tree already contained unrelated changes to `tests/test_stage13.py`; that file was not modified by this investigation. Only this document was rewritten.
+The working tree contained one unrelated pre-existing modification (`tests/test_stage13.py`); it was not modified by this investigation. Only this document was rewritten.
 
-## 1. EXECUTIVE SUMMARY
+## Current Repository State
 
-The current source contains a durable, owner-scoped task model with structured creation, natural-language interpretation, Telegram creation and management commands, deterministic schedules, durable occurrence coordination, scheduled execution through `TaskExecutionCoordinator`, persisted-outcome notification verification, and runtime construction through `RuntimeSupervisor`.
+- Branch `main`, synchronized with `origin/main` at investigation start.
+- Latest implementation commit in history: `da021b2ae1e48e02277cf00c160607fbd5a6734b` (`fix: wire task execution failures into durable retries`), followed by documentation commits `4043bde`, `4ba68d9`, and `7b8adc8`.
+- Working tree at start: only `M tests/test_stage13.py`.
+- `IMPLEMENTATION_REPORT.md` is the canonical current-state report and describes the durable task system through the automatic retry integration.
+- The prior `INVESTIGATION.md` was stale: it concluded that `TaskExecutionCoordinator.handle_failure()` had no production caller and that attempts were never advanced. Current source contradicts that: `backend/ai/task_execution.py::execute` routes executor exceptions and unsuccessful tool results through `handle_failure()`, which persists `retry_pending` with `retry_at` and `attempt=occurrence.attempt + 1`. That work is delivered and synchronized.
 
-The source does **not** prove that every intended retry path is operationally complete: `TaskExecutionCoordinator.handle_failure()` implements retry classification and persistence, but no production caller was found for that method, and the normal `execute()` exception path calls `_fail()` rather than `handle_failure()`. The scheduler can re-execute already-persisted due `retry_pending` occurrences. Therefore retry re-execution is implemented, while automatic conversion of execution failures into retry-pending state is only partial.
+## Executive Summary
 
-Telegram task creation and management are available through `.task`; no task-specific Glass panels or dashboard task APIs were found. These are optional interfaces unless a project requirement outside the inspected source makes them mandatory. The current source does not establish a numbered future stage. The smallest source-justified remaining implementation boundary, if core retry completeness is required, is an execution-to-retry integration stage; its exact future stage number is not established by the repository roadmap.
+The durable Telegram task lifecycle is implemented in source: owner-scoped creation with natural-language interpretation, bounded candidate validation, durable two-table persistence with CAS versioning, once/interval/daily/weekly scheduling, deterministic occurrence creation, claiming, registered-tool execution, automatic retry classification with durable retry progression, scheduler retry pickup, and persisted-outcome notification verification.
 
-## 2. STAGE HISTORY
+One remaining durability gap is proven by current source: **interrupted-occurrence recovery is incomplete**. On scheduler start, `recover()` marks persisted `claimed`/`running` occurrences as `interrupted`, but nothing ever resolves them afterward. `run_once()` only picks up due `retry_pending` rows and due active tasks. `interrupted` occurrences therefore remain stranded permanently after any process restart that interrupts in-flight work. This is a core durability boundary, not optional UX: the repository already defines `interrupted` as a non-terminal status and its state machine permits `interrupted → retry_pending` or `interrupted → failed`, but no production path exercises either transition.
 
-The implementation reports and current source support the following history. Earlier stages are summarized only where current source provides corresponding artifacts; implementation reports remain historical evidence, not the authority for current behavior.
+After the interrupted-recovery boundary, no further core gap is proven. Remaining absent capabilities (Glass task panels, dashboard task APIs, natural-language management, task editing/rescheduling, richer history browsing, notification-destination management) are optional UX with no source-established necessity.
 
-| Stage | Current source-verified result |
-|---|---|
-| Stage 7 — Retry Classification, Backoff, and Operational Task Management | `backend/ai/retry.py` defines failure classes, retry decisions, bounded exponential delay, and `can_retry`; task repository and management boundaries provide operational state transitions. |
-| Stage 8 — Task Management Interfaces and Notifications | `backend/ai/task_management.py`, `task_management_interface.py`, `notifications.py`, and `task_notifications.py` exist as service/presentation boundaries. |
-| Stage 9 — User-Facing Task Creation and Scheduler-to-Notification Wiring | Historical milestone; current handler and runtime wiring provide the relevant creation and notification paths, but current source does not independently establish every historical claim. |
-| Stage 10 — User-Facing Task Creation and Management Exposure | Current `backend/bot/handlers/tasks.py` exposes creation and management commands. |
-| Stage 11 — Structured Task Candidate Contract | `TaskCandidate` validates bounded, owner-agnostic structured data. |
-| Stage 12 — Natural-Language Task Interpretation Adapter | `TaskInterpreter` calls `ProviderManager.chat()` with an explicit schema and parses only validated JSON. |
-| Stage 13 — Telegram Task Creation Interaction Boundary | `tasks.register()` handles `.task <request>` and delegates interpretation and creation. |
-| Stage 14 — Telegram Task Management Interaction Boundary | `tasks._handle_management()` exposes list, inspect, pause, resume, complete, fail, expire, and delete. |
-| Stage 15 — Durable Scheduled Execution and Retry Re-execution | `TaskScheduler._execute_claimed()` delegates running occurrences to `TaskExecutionCoordinator`; `_run_due_retries()` discovers and reclaims due persisted retries. |
-| Stage 16 — Runtime Persisted-Outcome Notification Transport | `TaskScheduler._notify_outcome()` calls `TaskOutcomeNotifier` after execution; `RuntimeSupervisor._start_task_scheduler()` constructs the notification stack with a rebuild-safe sender. |
+## Verified Implementation History
 
-## 3. CURRENT ARCHITECTURE
+| Boundary | Evidence | Current source status |
+|---|---|---|
+| Durable task database foundation | `supabase/migrations/20260829000001_create_ai_tasks.sql`, `backend/ai/database/task_repository.py` | Present; two tables, bounded payloads, CAS version, RLS, unique occurrence identity |
+| Supabase repository integration with fallback | `backend/ai/database/task_repository.py::SupabaseTaskRepository` | Present; owner-filtered, `asyncio.to_thread` bounded, falls back on external failure |
+| Scheduler runtime and restart-safe coordination | `backend/ai/task_scheduler.py`, `backend/runtime/supervisor.py` | Present; single polling loop, recovery on start, bounded per-wake limits |
+| Execution and action dispatch | `backend/ai/task_execution.py::TaskExecutionCoordinator`, `backend/ai/tools/registry.py`, `backend/ai/tools/executor.py` | Present; registered tools only, bounded runtime and metadata |
+| Retry classification and policy | `backend/ai/retry.py` | Present; `MAX_ATTEMPTS = 3`, exponential backoff bounded at 15 minutes |
+| Management interfaces and notifications | `backend/ai/task_management.py`, `backend/ai/notifications.py`, `backend/ai/task_notifications.py` | Present; owner-scoped service and verified notification path |
+| Telegram creation and management commands | `backend/bot/handlers/tasks.py` | Present; owner-gated, edit-in-place, deterministic management verbs |
+| Candidate contract and interpreter | `backend/ai/task_candidate.py`, `backend/ai/task_interpreter.py` | Present; owner-agnostic validation, provider-mediated JSON interpretation |
+| Persisted-outcome notification transport | `TaskScheduler._notify_outcome`, `TaskOutcomeNotifier.notify_persisted` | Present; verifies persisted status before delivery, lazy rebuild-safe sender |
+| Automatic execution-failure → durable retry | `backend/ai/task_execution.py::execute` + `::handle_failure` | Present and verified; retryable failures persist `retry_pending`, `retry_at`, incremented `attempt` |
 
-The verified current path is:
+Historical report numbering (Stages 4–17) is retained in `IMPLEMENTATION_REPORT.md` as delivery history; current source is authoritative for behavior.
+
+## Current Architecture
 
 ```text
 Telegram `.task <request>`
-  → backend.bot.handlers.tasks.task_handler
-  → TaskInterpreter.interpret
-  → TaskCandidate.from_untrusted / parse_candidate_output
-  → TaskCreationService.create
-  → TaskRepository.create_task
-  → ai_tasks
-  → RuntimeSupervisor._start_task_scheduler
-  → TaskScheduler.run / run_once
-  → TaskRepository.list_due_tasks
-  → create_occurrence / claim_occurrence
+  → backend.bot.handlers.tasks.task_handler          (is_owner gate, edit-in-place)
+  → TaskInterpreter.interpret                         (bounded provider call)
+  → TaskCandidate.from_untrusted                      (owner-agnostic validation)
+  → TaskCreationService.create                        (authoritative owner_id)
+  → TaskRepository.create_task                        (ai_tasks, CAS version)
+  → RuntimeSupervisor._start_task_scheduler           (single scheduler construction)
+  → TaskScheduler.run_once                            (retries first, then due tasks)
+  → TaskRepository.create_occurrence / claim_occurrence
   → TaskExecutionCoordinator.execute
-  → ToolExecutor.execute_calls
-  → registered Tool instances from ToolRegistry
-  → TaskRepository.transition_occurrence
-  → TaskOutcomeNotifier.notify_persisted
-  → TaskNotificationService.send
-  → TelegramAPI.send_message
+  → ToolExecutor.execute_calls                        (registered tools only)
+  → TaskRepository.transition_occurrence              (succeeded / failed / retry_pending)
+  → TaskOutcomeNotifier.notify_persisted              (persisted-state verification)
+  → TaskNotificationService.send                      (bounded, owner-checked)
+  → TelegramAPI.send_message                          (rebuild-safe sender)
 ```
 
-Boundaries are separated in source:
+Boundaries verified in source:
 
-- Interpretation: `backend/ai/task_interpreter.py::TaskInterpreter.interpret`.
-- Candidate validation: `backend/ai/task_candidate.py::TaskCandidate.from_untrusted`.
-- Creation: `backend/ai/task_creation.py::TaskCreationService.create`.
-- Persistence and state transitions: `backend/ai/database/task_repository.py`.
-- Scheduling and occurrence coordination: `backend/ai/task_scheduler.py::TaskScheduler`.
-- Action execution: `backend/ai/task_execution.py::TaskExecutionCoordinator.execute`.
-- Registered action dispatch: `backend/ai/tools/registry.py` and `backend/ai/tools/executor.py`.
-- Notification verification: `backend/ai/task_notifications.py::TaskOutcomeNotifier.notify_persisted`.
-- Notification delivery: `backend/ai/notifications.py::TaskNotificationService.send`.
-- Runtime lifecycle: `backend/runtime/supervisor.py::RuntimeSupervisor`.
+- Lifecycle: `backend/runtime/supervisor.py::RuntimeSupervisor` constructs and owns the task scheduler.
+- Scheduling: `backend/ai/task_scheduler.py::TaskScheduler` is the only task polling loop.
+- Execution: `TaskExecutionCoordinator` never schedules; the scheduler never executes actions itself.
+- Persistence: `backend/ai/database/task_repository.py` enforces owner scoping, transition maps, immutability of occurrence identity fields, bounded payloads, and CAS updates.
+- Notification: `backend/ai/notifications.py::TaskNotificationService` rejects owner mismatch and unsupported kinds, truncates to 1024 characters, and bounds delivery at 10 seconds.
+- Transport: `backend/telegram_api/` remains the only Telegram send path used by the task system.
 
-## 4. TASK DATA MODEL
-
-The migration `supabase/migrations/20260829000001_create_ai_tasks.sql` defines exactly the two durable task tables:
-
-- `ai_tasks`: owner, label, lifecycle status, version, schedule type/payload, timezone, next run, bounded actions, notification destination, timestamps, and terminal timestamp.
-- `ai_task_occurrences`: task/owner identity, deterministic occurrence key, definition version, immutable action snapshot, scheduled time, attempt, occurrence status, claim/start/finish timestamps, retry time, bounded error metadata, bounded result metadata, and timestamps.
-
-`TaskRepository` defines the persistence contract. `InMemoryTaskRepository` provides a fallback; `SupabaseTaskRepository` performs owner-filtered operations and falls back on external failures. Both enforce bounded payloads and state validation.
-
-Task transitions use expected versions through `update_task`, `advance_next_run`, and `transition_task`. Occurrence transitions enforce the current-status transition map, immutable occurrence fields, bounded metadata, and `retry_pending` requiring `retry_at`. Occurrence claiming is owner-scoped and only accepts `claimed`, `retry_pending`, or `interrupted` states.
-
-The schema has owner/status indexes, lifecycle checks, JSON size checks, a unique `(task_id, occurrence_key)` constraint, and RLS. The source documents backend service-role access. Live Supabase state was not verified.
-
-## 5. TASK CREATION FLOW
-
-`backend/bot/handlers/tasks.py::task_handler` is registered by `backend/bot/router.py::register_all` for outgoing Telethon messages. It first applies `is_owner(event, owner_id)`, recognizes `.task`, and routes recognized management subcommands separately.
-
-For creation, it:
-
-1. Edits the source message with an interpreting/progress response.
-2. Gets the configured provider through `_provider_manager()` and `get_engine()`.
-3. Calls `TaskInterpreter.interpret()` inside bounded waits.
-4. Receives a `TaskCandidate`, not arbitrary provider output.
-5. Creates the task through `TaskCreationService(get_repository_manager().task, owner_id)`.
-6. Uses `datetime.now(timezone.utc)` as the reference and edits the same message with success or bounded failure feedback.
-
-`TaskCandidate` rejects unsupported fields, invalid schedules, invalid timezones, malformed actions, and oversized data. It does not accept owner identity. `TaskCreationService` supplies the authoritative owner ID and persists through the repository.
-
-Natural-language management is not implemented: the interpreter is used only in the creation branch, and management uses deterministic command syntax.
-
-## 6. TASK MANAGEMENT FLOW
-
-`backend/bot/handlers/tasks.py::_handle_management` delegates to `TaskManagementService` and presentation helpers:
-
-- `.task list` → `list_text(service)` → `TaskManagementService.list_tasks()`.
-- `.task inspect <id>` → `inspect_text(service, task_id)` → `TaskManagementService.inspect()` with a bounded occurrence list.
-- `.task pause|resume|complete|fail|expire|delete <id> <version>` → corresponding service method with the user-provided expected version.
-
-The handler does not access Supabase directly, manipulate JSON, execute actions, or bypass CAS. It edits in place and returns a bounded error if parsing, ownership, version, or persistence fails. Non-owners return silently through `is_owner`.
-
-Task listing, inspection, lifecycle mutation, and deletion are user-accessible through Telegram. Editing task definitions, rescheduling, notification-destination management, natural-language management, and explicit occurrence-management commands are not exposed by the current handler.
-
-## 7. TRIGGER / SCHEDULE SUPPORT
-
-The only schedule types established by source are `once`, `interval`, `daily`, and `weekly`. `SUPPORTED_TYPES` in `backend/ai/scheduling.py`, `SCHEDULE_TYPES` in `backend/ai/database/task_repository.py`, `TaskCandidate` schema validation, and the migration all agree on this set.
-
-| Type | Required fields and semantics | Runtime status |
-|---|---|---|
-| `once` | `schedule.at` is a naive local ISO datetime and `schedule.timezone` is an IANA timezone. It resolves once to UTC. `TaskScheduler` advances the task to `next_run_at=None`. | Implemented in domain, persisted, schedulable, executable, and creatable through the interpreter/candidate path. No event trigger exists. |
-| `interval` | `schedule.seconds` must be positive. It uses elapsed UTC intervals and requires a previous scheduled occurrence for calculation. | Implemented in domain, persisted, schedulable, executable, and creatable through the candidate path. |
-| `daily` | `schedule.hour`, optional minute/second, and IANA `schedule.timezone`. Local time is normalized around nonexistent DST times. | Implemented in domain, persisted, schedulable, executable, and creatable through the candidate path. |
-| `weekly` | `schedule.weekday` 0–6, hour/minute/second, and IANA timezone. | Implemented in domain, persisted, schedulable, executable, and creatable through the candidate path. |
-
-`catch_up_occurrence()` provides bounded recurring catch-up for interval/daily/weekly scheduling. `occurrence_key(task_id, scheduled_for)` is deterministic and UTC-normalized. Retry is an occurrence-state event, not a fifth schedule type.
-
-Cron, event/message, webhook, conditional, manual, and provider-triggered task schedules are **NOT PROVEN BY CURRENT SOURCE** and should not be counted as supported.
-
-## 8. SCHEDULER AND OCCURRENCE EXECUTION
-
-`TaskScheduler` is the single task loop. `start()` recovers interrupted occurrences and creates one `asyncio` task for `run()`. `run()` calls `run_once()` and waits for `WAKE_INTERVAL_SECONDS`.
-
-`run_once()` first calls `_run_due_retries()`, then queries owner-scoped due active tasks. For each due task it parses the schedule, computes the scheduled and following occurrence, creates the occurrence idempotently, claims it through the repository, and calls `_execute_claimed()`.
-
-`_execute_claimed()` refuses to proceed without an execution coordinator, calls `claim_occurrence()`, requires the returned status to be `running`, and only then invokes `coordinator.execute(claimed)`. After execution it invokes `_notify_outcome()` with the reported status. The scheduler itself does not execute persisted action JSON.
-
-For recurring tasks, `advance_next_run()` uses the task version read before execution. This provides CAS protection against stale advancement. A once task is advanced to `None`. Duplicate wake/claim attempts are bounded by repository uniqueness and claim-state checks; the source provides at-least-once coordination, not an exactly-once external side-effect guarantee.
-
-`recover()` marks persisted `claimed` and `running` occurrences as `interrupted` at scheduler startup. The occurrence transition map permits interrupted occurrences to become `retry_pending` or `failed`, and claiming permits interrupted occurrences. Actual interrupted-occurrence execution policy beyond this is not fully established by the source.
-
-## 9. RETRY MODEL
-
-`backend/ai/retry.py` defines:
-
-- `FailureClass.RETRYABLE`, `PERMANENT`, `CANCELLED`, and `UNKNOWN`.
-- Retryable timeout, temporary, and rate-limit-like failures.
-- `MAX_ATTEMPTS = 3`.
-- Exponential delays starting at 30 seconds, bounded at 15 minutes.
-- `can_retry(attempt)` requiring an attempt below the maximum.
-
-`TaskExecutionCoordinator.handle_failure()` calculates `retry_at` from `occurrence.updated_at + retry_delay(occurrence.attempt)` and persists `retry_pending` via `transition_occurrence`. The scheduler then uses `list_due_retry_occurrences()` and `_execute_claimed()` to reclaim due retries.
-
-However, a production caller for `handle_failure()` was not found. In `TaskExecutionCoordinator.execute()`, exceptions from `ToolExecutor.execute_calls()` go directly to `_fail()`, which persists `failed`; the normal path does not classify those exceptions through `handle_failure()`. Also, no source path was found that increments `occurrence.attempt` before a retry. Consequently:
-
-- Retry policy: implemented.
-- Retry persistence API: implemented.
-- Scheduler pickup and retry re-execution: implemented for already-persisted `retry_pending` rows.
-- Automatic execution-failure → retry-pending conversion: PARTIAL / not fully wired.
-- Retry exhaustion behavior: policy exists, but the complete production lifecycle is NOT PROVEN BY CURRENT SOURCE.
-
-This is the strongest source-backed core gap found in the current tree.
-
-## 10. NOTIFICATION MODEL
-
-`TaskOutcomeNotifier.notify_persisted()` first reads the occurrence through the owner-scoped repository and compares its actual persisted status with the requested status. It sends nothing if the occurrence is missing or the persisted state differs.
-
-`TaskNotificationService.send()` rejects owner mismatches and unsupported kinds, truncates messages to 1024 characters, and bounds delivery with a 10-second `asyncio.wait_for`. Sender errors return `False`; cancellation is re-raised. Notification delivery does not mutate task or occurrence state and does not execute actions.
-
-`TaskScheduler._notify_outcome()` supports `succeeded`, `failed`, `retry_pending`, and `cancelled`, re-raises cancellation, and isolates other notifier failures. It is called after `TaskExecutionCoordinator.execute()` returns, not when execution merely starts. `RuntimeSupervisor._start_task_scheduler()` constructs the service and notifier and uses a sender closure that resolves `self.client` at call time before calling `TelegramAPI.send_message(owner, message)`, avoiding a stale client after rebuild.
-
-The source prevents notification merely from polling a retry row: `_run_due_retries()` only executes due rows, and notification occurs after the coordinator reports a persisted outcome. There is no notification table or notification worker. Notification duplication across process crashes is not proven to be impossible; the source provides state verification and scheduler-level polling avoidance, not durable notification delivery deduplication.
-
-## 11. SECURITY AND OWNERSHIP
-
-Verified boundaries:
-
-- `RuntimeSupervisor` supplies the authoritative owner ID and owns lifecycle startup/shutdown.
-- `TaskCandidate` is owner-agnostic and explicitly excludes owner identity from the interpreter schema.
-- `TaskCreationService` stores the constructor-provided owner ID; candidate data cannot override it.
-- `TaskRepository` filters task and occurrence reads/writes by owner and validates owner fields.
-- `TaskManagementService` stores an owner ID and delegates all operations owner-scoped.
-- `TaskScheduler` receives one owner ID and uses it for every repository operation.
-- `TaskExecutionCoordinator` rejects occurrences whose owner differs from its authoritative owner and passes that owner to `ToolExecutor`.
-- `TaskNotificationService` rejects notifications whose owner differs from its configured owner and calls the configured owner in the sender boundary.
-- Telegram task handlers call `is_owner` before processing.
-
-No task-specific Glass callback or dashboard authorization path exists, so their task-specific ownership behavior is NOT PROVEN BY CURRENT SOURCE. The general existing Glass architecture has owner checks in its existing dispatch path, but no task callbacks are registered.
-
-No source-backed violation was found for arbitrary shell execution, arbitrary SQL/RPC, arbitrary Telegram RPC, model-supplied owner identity, or direct persisted-JSON execution. Tool actions remain data and are resolved through the registered `ToolRegistry` and `ToolExecutor`.
-
-The source does not establish exactly-once side effects: a process crash around an external tool call and durable transition could permit at-least-once behavior. This is an operational limitation, not evidence of an architecture bypass.
-
-## 12. USER-FACING FEATURE COMPLETENESS
+## Current Feature / Capability Status
 
 | Capability | Status | Evidence |
 |---|---|---|
-| Task creation | IMPLEMENTED | `tasks.py::task_handler`, `TaskInterpreter`, `TaskCreationService`. |
-| Natural-language interpretation | IMPLEMENTED | `TaskInterpreter.interpret`, bounded provider call, schema and JSON validation. |
-| Structured candidate validation | IMPLEMENTED | `TaskCandidate.from_untrusted`. |
-| Durable persistence | IMPLEMENTED | `TaskRepository.create_task`, `ai_tasks` migration. |
-| Task listing | IMPLEMENTED | `.task list`, `TaskManagementService.list_tasks`, `list_text`. |
-| Task inspection | IMPLEMENTED | `.task inspect <id>`, `inspect_text`, bounded occurrences. |
-| Pause/resume | IMPLEMENTED | `.task pause/resume <id> <version>`, CAS service methods. |
-| Terminal lifecycle operations | IMPLEMENTED | complete/fail/expire/delete methods and handler commands. |
-| Natural-language management | NOT IMPLEMENTED | No interpreter branch delegates management intents. |
-| Task editing/rescheduling | NOT IMPLEMENTED | No Telegram command or service method exposes definition updates through the handler. |
-| Task cancellation | PARTIAL | Occurrence state supports `cancelled`, but no dedicated user-facing occurrence cancellation command was found; task management has terminal statuses but no `cancel` task method. |
-| Notification destination management | NOT IMPLEMENTED | Destination is stored at creation but no update/UI boundary was found. |
-| Task history/occurrence history | PARTIALLY IMPLEMENTED | `inspect` displays bounded occurrence summaries; no separate history browser/export exists. |
-| Retry/error visibility | PARTIALLY IMPLEMENTED | Inspection displays occurrence status/attempt; it does not display bounded error/result metadata. |
-| Glass task UI | NOT IMPLEMENTED | No task panels/actions/inputs were found in `backend/helper` or handler registrations. |
-| Dashboard task APIs | NOT IMPLEMENTED | `backend/web/app.py` exposes health, saves, settings, logs, AI, and diagnostics routes, but no task routes. |
-| Richer management UX | PARTIALLY IMPLEMENTED | Deterministic Telegram command management exists; no Glass/dashboard/editing UX exists. |
-| Automatic retry conversion | PARTIALLY IMPLEMENTED | `handle_failure` exists but no production caller was found from current source. |
-| Retry re-execution | IMPLEMENTED | `TaskScheduler._run_due_retries` plus `_execute_claimed`. |
-| Persisted outcome notification | IMPLEMENTED with operational limitation | `TaskOutcomeNotifier` verifies state before `TaskNotificationService`; duplicate delivery across crash boundaries is not proven impossible. |
+| Telegram task creation (natural language) | IMPLEMENTED | `backend/bot/handlers/tasks.py::task_handler`, `TaskInterpreter`, `TaskCreationService` |
+| Structured candidate validation | IMPLEMENTED | `backend/ai/task_candidate.py::TaskCandidate.from_untrusted` |
+| Durable persistence with CAS | IMPLEMENTED | `TaskRepository.update_task`, occurrence transition CAS |
+| once/interval/daily/weekly schedules | IMPLEMENTED | `backend/ai/scheduling.py`, `SCHEDULE_TYPES`, migration CHECK |
+| Occurrence claiming | IMPLEMENTED | `claim_occurrence` in both repository implementations |
+| Registered-tool execution | IMPLEMENTED | `TaskExecutionCoordinator.execute`, `ToolExecutor` |
+| Automatic retry on failure | IMPLEMENTED | `execute()` → `handle_failure()`; durable attempt/retry_at |
+| Scheduler retry pickup | IMPLEMENTED | `_run_due_retries`, `list_due_retry_occurrences` |
+| Persisted-outcome notification | IMPLEMENTED | `TaskOutcomeNotifier.notify_persisted`, scheduler hook |
+| Startup recovery marking | IMPLEMENTED | `TaskScheduler.recover()` → `interrupted` |
+| **Interrupted-occurrence resolution** | **NOT IMPLEMENTED** | No production path transitions `interrupted` to any further status; `run_once()` never queries `interrupted` rows |
+| Telegram list/inspect/lifecycle/deletion | IMPLEMENTED | `backend/bot/handlers/tasks.py::_handle_management` |
+| Retry/error visibility in inspect | PARTIAL | `inspect_text` shows status/attempt only, not error/result metadata |
+| Glass task panels | NOT IMPLEMENTED | No `register_panel/register_action` calls in `backend/bot/handlers/tasks.py` |
+| Dashboard task APIs/UI | NOT IMPLEMENTED | `backend/web/app.py` has no task routes; `src/` has no task views |
+| Natural-language task management | NOT IMPLEMENTED | Interpreter used only in creation branch |
+| Task editing/rescheduling | NOT IMPLEMENTED (user-facing) | Repository supports `update_task`; no Telegram/handler path exposes it |
+| Notification destination management | NOT IMPLEMENTED | Destination set at creation only |
+| Cron/event/webhook/conditional triggers | NOT PROVEN BY CURRENT SOURCE | Not present in `SUPPORTED_TYPES` or scheduler |
+| Exactly-once side effects | NOT PROVEN BY CURRENT SOURCE | At-least-once semantics documented and implemented |
 
-## 13. DATABASE / SUPABASE STATUS
+## Source Evidence (key excerpts)
 
-Repository source contains one task migration: `supabase/migrations/20260829000001_create_ai_tasks.sql`. It creates `ai_tasks` and `ai_task_occurrences`, indexes task due/status and owner/update access, enables RLS, grants read access, and intentionally leaves backend writes to the service-role path.
+- `backend/ai/task_scheduler.py::recover` transitions every `claimed`/`running` occurrence to `interrupted` at start.
+- `backend/ai/task_scheduler.py::run_once` processes only `list_due_retry_occurrences()` (status `retry_pending`) and `list_due_tasks()` (task status `active`). No query returns `interrupted` occurrences.
+- `backend/ai/database/task_repository.py::_ALLOWED_OCCURRENCE_TRANSITIONS` permits `interrupted → {retry_pending, failed}` and `claim_occurrence` accepts `interrupted`, proving the state machine anticipates reclaiming interrupted work.
+- `tests/test_task_scheduler.py::test_recovery_marks_claimed_and_running_interrupted_without_execution` asserts the marking only; no test asserts later resolution because none exists.
+- `backend/ai/task_execution.py::handle_failure` persists `retry_pending` with `attempt + 1` and bounded metadata; `backend/ai/retry.py` bounds attempts at 3.
 
-The current two-table model stores task definitions and occurrence history/state, including action snapshots, attempt count, retry timestamps, error metadata, and result metadata. The remaining source-backed retry gap can be addressed in application execution wiring using existing columns and transitions; no new table or column is proven necessary.
+## Core vs Optional
 
-No migration, SQL, Supabase deployment, or live database state was changed or verified during this investigation.
+**Core (established by repository architecture):**
 
-## 14. TEST / VALIDATION STATUS
+- Durable scheduled execution including restart recovery. The repository defines `interrupted` as a non-terminal status with explicit recovery transitions; leaving rows stranded contradicts the durable-scheduling objective and the existing state machine. This is the remaining core boundary.
 
-Relevant tests present in the current tree include:
+**Optional UX (absent but not required by source):**
 
-- `tests/test_task_repository.py`
-- `tests/test_task_scheduler.py`
-- `tests/test_task_execution.py`
-- `tests/test_task_management.py`
-- `tests/test_retry.py`
-- `tests/test_stage10.py` through `tests/test_stage16.py`
-- `tests/test_stage11_candidate.py`
-- `tests/test_stage12_interpreter.py`
+- Glass task panels
+- Dashboard task APIs/UI
+- Natural-language task management
+- Task editing/rescheduling commands
+- Richer history/error browsing
+- Notification-destination management
 
-`tests/test_stage16.py` was run read-only during this investigation: **13 passed**. The repository history/report records the broader Stage 16 validation as **1149 passed, 23 skipped, 1 warning**, plus compileall and diff checks; that historical result was not treated as proof of live integrations.
+None of these is mandated by AGENTS.md, README, the migration, or the task contracts. They must not be classified as core merely because they are absent.
 
-Tests cover repository state transitions, scheduling, execution boundaries, retry policy, management delegation, creation/interpreter boundaries, and persisted notification semantics. Stage 16 tests cover persisted success/failure/retry/cancelled notification, missing or mismatched persistence, sender failure/cancellation, owner mismatch, duplicate wake behavior, non-execution by notifications, and lazy runtime client wiring.
+## Remaining Gaps
 
-The tests are unit/in-memory or mocked boundary tests. Live Telegram, live Supabase, provider API behavior, cross-process crash recovery, and exactly-once external side effects were not verified. The absence of a production caller for `handle_failure()` is source evidence even if existing tests exercise the method directly.
+### Gap 1 — Interrupted-occurrence recovery resolution (CORE)
 
-## 15. REMAINING GAPS
+- **Missing behavior:** After `recover()` marks occurrences `interrupted`, no code path ever resolves them. They are never retried, failed, cancelled, or re-claimed, so restart-interrupted work is silently lost while remaining non-terminal in the database.
+- **Why it matters:** Durable scheduling must survive process restarts. The state machine already authorizes `interrupted → retry_pending` (respecting `MAX_ATTEMPTS` and `retry_at`) or `interrupted → failed`, and `claim_occurrence` accepts `interrupted`, showing reclaim was the intended design.
+- **Exact files/components:** `backend/ai/task_scheduler.py` (recovery resolution in `recover()` or a bounded recovery sweep in `run_once()`), `backend/ai/database/task_repository.py` (a bounded query for recoverable/resumable occurrences reusing the existing transition map), reuse of `TaskExecutionCoordinator.handle_failure()` semantics for attempt/retry_at consistency, and `tests/test_task_scheduler.py` / `tests/test_task_repository.py` for coverage.
+- **Dependencies:** None outside the existing scheduler/repository/coordinator boundaries. No schema change: existing `status`, `retry_at`, and `attempt` columns are sufficient.
+- **Security/ownership:** All operations remain owner-scoped via `self.owner_id`; no new authorization surface.
+- **Test requirements:** recovery → retry_pending with correct attempt/retry_at; recovery → terminal failed at attempt limit; no duplicate execution after reclaim; owner isolation; cancellation propagation.
+- **Can be safely combined:** No other task shares this boundary. Keep it standalone.
 
-### Gap 1 — Automatic execution failure to retry-pending integration
+### Gap 2 — Optional Telegram/Glass management UX (OPTIONAL)
 
-- **Current state:** `retry.py` and `TaskExecutionCoordinator.handle_failure()` implement the retry policy and persistence contract.
-- **Missing capability:** The normal `TaskExecutionCoordinator.execute()` exception path calls `_fail()` directly; no production caller for `handle_failure()` was found, and attempt advancement is not shown.
-- **Evidence:** `backend/ai/task_execution.py::execute`, `::handle_failure`, `::_fail`; repository `OccurrenceRecord.attempt` and validation in `backend/ai/database/task_repository.py`.
-- **Why it matters:** A transient action failure can become terminal `failed` instead of entering the established durable retry lifecycle.
-- **Existing boundary to reuse:** `TaskExecutionCoordinator` should remain the owner of classification and occurrence transitions; reuse `retry.py` and repository transitions.
-- **Core status:** Required if “automatic retries” means execution failures are classified and retried; otherwise retry pickup is already available for explicitly persisted retry rows.
-- **Schema impact:** None proven. Existing `attempt`, `retry_at`, status, and metadata fields are sufficient.
-- **Security impact:** Preserve owner and ToolExecutor boundaries; no new execution authority is justified.
+- Glass panels, richer inspect output, editing/rescheduling, destination management share the Telegram presentation boundary and could be grouped if explicitly requested. Not required by source.
 
-### Gap 2 — Optional Glass task interface
+### Gap 3 — Optional dashboard task APIs/UI (OPTIONAL)
 
-- **Current state:** Existing Glass infrastructure exists in `backend/helper`, but no task panel/action/input registrations were found.
-- **Missing capability:** Glass task creation/management panels and callbacks.
-- **Evidence:** `backend/helper/panels.py`, `panel_registry.py`, `inline_engine.py` contain generic panel dispatch; `backend/bot/handlers/tasks.py` registers only an outgoing message handler and no task panel registrations.
-- **Core status:** Optional UX. Telegram commands already provide creation and management, and no inspected architecture explicitly makes Glass task panels mandatory.
-- **Schema/runtime impact:** None established.
+- Separate transport and authorization boundary. Requires an explicit authenticated owner contract before any implementation. Must remain separate from Telegram work.
 
-### Gap 3 — Optional dashboard task API/UI
+## Dependencies / Boundaries
 
-- **Current state:** `backend/web/app.py` has read-only and settings/AI routes, and `src/` contains dashboard components, but no task routes or task UI were found.
-- **Missing capability:** Dashboard read/manage endpoints and corresponding UI.
-- **Evidence:** `backend/web/app.py` has no `/api/tasks` or `/api/occurrences` route; source search found no task dashboard component.
-- **Core status:** Optional UX unless an external product requirement declares dashboard management mandatory.
-- **Security impact:** Any future implementation would need an explicit authenticated owner boundary; the current source does not establish dashboard task authorization.
-- **Schema impact:** None necessarily, but not determined until a concrete API contract exists.
+- The interrupted-recovery boundary must not create a second scheduler, worker, or execution path; it extends the existing single `TaskScheduler` loop and existing repository transitions.
+- Retry semantics must reuse `retry_delay`, `can_retry`, and `MAX_ATTEMPTS` from `backend/ai/retry.py` so attempts remain bounded across restarts.
+- Notification behavior must remain post-execution and persistence-verified; recovery itself should not fabricate outcomes.
+- Optional Telegram UX work shares `backend/bot/handlers/tasks.py` and `backend/ai/task_management*` and may be grouped; it must not touch scheduler/execution.
+- Dashboard work is a separate boundary and authorization surface.
 
-No other future gap is counted. Cron, event triggers, arbitrary action types, analytics, new providers, and notification tables are not established requirements by current source.
+## Recommended Next Implementation Group(s)
 
-## 16. CORE VS OPTIONAL
+**Single implementation group (standalone): "Restart-safe interrupted occurrence recovery"**
 
-### Core completion checklist
+- Objective: at scheduler start (and only there), resolve persisted `interrupted` occurrences deterministically: reclaim-and-continue within the existing retry policy (`interrupted → running` via existing claim semantics when attempts remain, otherwise `interrupted → failed`), using existing repository transitions and owner scoping, with bounded limits and full test coverage.
+- Files: `backend/ai/task_scheduler.py`, optionally a small bounded query addition in `backend/ai/database/task_repository.py` (interface + both implementations), and focused tests.
+- Must NOT include: Glass UI, dashboard APIs, notification changes, schema changes, new workers, or interpreter changes.
 
-The core feature is functionally complete when all of the following are true:
+## Tasks That Can Be Safely Combined
 
-- A validated owner can create a task from Telegram.
-- The task persists through `TaskRepository` into the two-table durable model.
-- Supported once/interval/daily/weekly schedules calculate and persist due times.
-- The single scheduler creates deterministic occurrences and claims them safely.
-- Claimed occurrences execute only through `TaskExecutionCoordinator` → `ToolExecutor` → registered tools.
-- Success, failure, retry-pending, and cancellation states are persisted through repository transitions.
-- Due persisted retries can be reclaimed and re-executed under owner/state checks.
-- Persisted outcomes are verified before bounded Telegram notification delivery.
-- The owner can list, inspect, pause, resume, complete, fail, expire, and delete tasks.
-- Runtime startup recovery and shutdown are governed by `RuntimeSupervisor`.
+- (Only if explicitly requested later) Telegram/Glass task UX extensions with each other — they share the presentation and management boundary.
+- Dashboard task read APIs with dashboard task UI — same transport and frontend boundary, after an authorization contract exists.
 
-The current source satisfies these items except that automatic conversion of execution failures into retry-pending state is not fully proven because `handle_failure()` has no production caller. Thus the hard conclusion is: **core feature is substantially implemented but retry integration remains PARTIAL if automatic retries are required.**
+## Tasks That Must Remain Separate
 
-### Optional UX
+- Interrupted-recovery work vs any UX work (different architectural layers; recovery changes durable semantics and needs isolated validation).
+- Telegram/Glass UX vs dashboard APIs (different transports and authorization models).
+- Natural-language management vs deterministic management changes (NL must delegate to existing service methods, never become a second authority).
+- Any schema-affecting work vs everything else (no schema change is currently justified; if one ever is, it must be its own boundary).
 
-The following are not required by the current core architecture:
+## Database / Supabase Status
 
-- Glass task panels and inline lifecycle callbacks.
-- Dashboard task APIs and task UI.
-- Natural-language management.
-- Task editing/rescheduling commands.
-- Rich history/error browsing beyond bounded inspection.
-- Notification destination editing.
+- Migration inventory: exactly one task migration, `supabase/migrations/20260829000001_create_ai_tasks.sql`, defining `ai_tasks` and `ai_task_occurrences` with CHECK constraints, attempt bounds, payload bounds, retry-state constraint, unique occurrence identity, indexes, and RLS with SELECT-only anon access.
+- The interrupted-recovery boundary requires **no schema change**: existing `status`, `attempt`, and `retry_at` columns plus the existing transition map suffice.
+- Live Supabase state: NOT PROVEN BY CURRENT SOURCE (no live verification performed in this investigation).
 
-## 17. STAGE / ROADMAP CONCLUSION
+## Security / Ownership Status
 
-The repository proves completed implementation stages through Stage 16. It does not define a post-Stage-16 numbered roadmap. Therefore:
+- Owner identity flows only from `RuntimeSupervisor`/handler context; candidate data cannot override it.
+- All repository operations are owner-filtered in both implementations.
+- No arbitrary Telegram RPC, SQL/RPC, shell execution, persisted-code execution, or provider bypass exists in the task system.
+- Tool actions are data resolved exclusively through `ToolRegistry`/`ToolExecutor`.
+- Model-supplied owner identity: not present; interpreter schema excludes owner fields.
 
-- **Completed stages:** Stages 1–16 as the project’s established numbering, with task-system source artifacts and reports specifically verified through Stage 16.
-- **Required remaining stages:** One, **if** automatic retry conversion is part of the intended core contract.
-- **Optional/future stages:** Glass task UI and dashboard task APIs may be implemented as separate optional UX stages; their numbering is not established by source.
-- **Next implementation stage:** No source-justified future stage number/title is currently established. The smallest source-justified boundary would be an execution-to-retry integration stage centered on `TaskExecutionCoordinator.execute()` / `handle_failure()` and existing repository attempt/retry transitions.
-- **Expected final required stage:** Not established by source. If the retry boundary is implemented, the current inspected source contains no additional core gap proven by this investigation.
+## Test / Validation Status
 
-The retry integration is a separate boundary because it changes failure classification and durable attempt progression inside the execution contract; it should not be merged into optional Glass or dashboard work. It must not create another scheduler, retry worker, action executor, database table, or notification transport.
+- Task-system tests present and green in the tree: `tests/test_task_repository.py`, `tests/test_task_scheduler.py`, `tests/test_task_execution.py`, `tests/test_task_management.py`, `tests/test_retry.py`, `tests/test_stage13.py` … `tests/test_stage17.py`.
+- Most recent full-suite run recorded for this tree: **1155 passed, 23 skipped, 1 warning**; focused task tests: **17 passed** (recorded in `IMPLEMENTATION_REPORT.md`).
+- Not verified in this investigation: live Telegram, live Supabase, cross-process crash behavior, external tool side effects.
 
-## 18. FINAL VERDICT
+## What Was NOT Verified
 
-The current repository is **not conclusively complete for automatic durable retry semantics**: scheduled execution, persisted retry pickup, and retry re-execution exist, but the normal execution failure path does not demonstrably call the retry policy. All other core paths — Telegram creation, durable persistence, schedule coordination, registered-tool execution, Telegram management, persisted-outcome verification, and notification transport — are implemented in source with unit-level coverage.
+- Live Telegram delivery and live Supabase persistence/RLS behavior.
+- Real process-crash/restart behavior in a deployed environment.
+- Exactly-once external side effects (not claimed; at-least-once only).
+- Whether any deployed database already applied the task migration.
 
-A user can create and manage tasks through Telegram, and the runtime can execute supported schedules and notify verified persisted outcomes. Glass panels and dashboard task APIs are absent but are optional interfaces under the inspected architecture, not automatically core blockers. The next action should be a source-justified execution-to-retry integration review/implementation only if the product contract requires transient execution failures to retry automatically. No numbered Stage 17 is established by the current repository.
+## Final Verdict
 
-## 19. INVESTIGATION BOUNDARY
+The previously delivered retry integration is complete and synchronized; the stale prior investigation claiming otherwise is superseded by current source. One genuine core gap remains: interrupted occurrences are marked but never resolved, violating restart-safe durability. The next implementation boundary is therefore **"Restart-safe interrupted occurrence recovery"**, implemented standalone within the existing scheduler/repository boundaries, with no schema change. All other absent capabilities are optional UX unless a product requirement outside the current source declares otherwise.
+
+## Investigation Boundary
 
 - Production code changed: NO
 - Tests changed: NO
@@ -339,60 +214,14 @@ A user can create and manage tasks through Telegram, and the runtime can execute
 - SQL executed: NO
 - Supabase changed: NO
 - Telegram behavior changed: NO
-- Commit made for implementation: NO
-- Push performed: NO
-- `INVESTIGATION.md` rewritten: YES
 - Implementation performed: NO
+- `INVESTIGATION.md` rewritten: YES
 
-## EXACT SOURCES INSPECTED
+## Git Delivery / Verification State
 
-- `AGENTS.md`
-- `README.md`
-- `IMPLEMENTATION_REPORT.md`
-- `INVESTIGATION.md` (previous contents)
-- `DATABASE_ARCHITECTURE.md`
-- `backend/ai/task_candidate.py`
-- `backend/ai/task_interpreter.py`
-- `backend/ai/task_creation.py`
-- `backend/ai/task_management.py`
-- `backend/ai/task_management_interface.py`
-- `backend/ai/scheduling.py`
-- `backend/ai/task_scheduler.py`
-- `backend/ai/task_execution.py`
-- `backend/ai/retry.py`
-- `backend/ai/task_notifications.py`
-- `backend/ai/notifications.py`
-- `backend/ai/database/task_repository.py`
-- `backend/ai/database/manager.py`
-- `backend/ai/tools/registry.py`
-- `backend/ai/tools/executor.py`
-- `backend/bot/handlers/tasks.py`
-- `backend/bot/handlers/guard.py`
-- `backend/bot/handlers/misc.py`
-- `backend/bot/router.py`
-- `backend/helper/panels.py`
-- `backend/helper/panel_registry.py`
-- `backend/helper/inline_engine.py`
-- `backend/runtime/supervisor.py`
-- `backend/profile/scheduler.py`
-- `backend/telegram_api/api.py`
-- `backend/telegram_api/messages.py`
-- `backend/web/app.py`
-- `supabase/migrations/20260829000001_create_ai_tasks.sql`
-- `src/` dashboard/frontend source
-- `tests/test_task_repository.py`
-- `tests/test_task_scheduler.py`
-- `tests/test_task_execution.py`
-- `tests/test_task_management.py`
-- `tests/test_retry.py`
-- `tests/test_stage10.py`
-- `tests/test_stage11_candidate.py`
-- `tests/test_stage12_interpreter.py`
-- `tests/test_stage13.py`
-- `tests/test_stage14.py`
-- `tests/test_stage15.py`
-- `tests/test_stage16.py`
-
-## INVESTIGATION INTEGRITY
-
-This document is a source-only current-state report. It does not authorize or perform implementation of the retry gap, Glass UI, dashboard APIs, or any other future work.
+- Commit status: `7dfeb69b43ac3ebabb45ee5047938e31ef493453` — documentation-only commit containing exactly `INVESTIGATION.md`.
+- Push status: SUCCESS — pushed to `origin/main` and verified via `git fetch` + `git rev-parse origin/main`.
+- Local HEAD: `7dfeb69b43ac3ebabb45ee5047938e31ef493453`
+- Remote HEAD: `7dfeb69b43ac3ebabb45ee5047938e31ef493453`
+- Local/remote equality: YES
+- Final working-tree status: `tests/test_stage13.py` remains modified and uncommitted (pre-existing unrelated change, preserved). No other modifications remain.
