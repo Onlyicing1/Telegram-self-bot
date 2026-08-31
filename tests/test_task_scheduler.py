@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,12 +44,98 @@ async def test_snapshot_and_version_are_preserved():
 
 
 @pytest.mark.asyncio
-async def test_recovery_marks_claimed_and_running_interrupted_without_execution():
+async def test_recovery_resolves_claimed_and_running_occurrences():
+    repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
+    claimed = await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "claimed", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": task.next_run_at})
+    running = await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "running", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": task.next_run_at})
+    await repo.claim_occurrence(1, task.id, running.occurrence_key)
+    scheduler = TaskScheduler(repo, 1); assert await scheduler.recover() == 2
+    for key in (claimed.occurrence_key, running.occurrence_key):
+        resolved = await repo.get_occurrence(1, task.id, key)
+        assert resolved.status == "retry_pending"
+        assert resolved.attempt == 2 and resolved.retry_at is not None
+        assert resolved.finished_at is None
+        assert resolved.error_metadata.get("error_class") == "restart_interrupted"
+
+
+@pytest.mark.asyncio
+async def test_preexisting_interrupted_occurrence_is_resolved_once():
+    repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
+    await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "k", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": task.next_run_at, "status": "interrupted"})
+    scheduler = TaskScheduler(repo, 1)
+    assert await scheduler.recover() == 1
+    resolved = await repo.get_occurrence(1, task.id, "k")
+    assert resolved.status == "retry_pending" and resolved.attempt == 2
+    assert await scheduler.recover() == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_resolves_interrupted_at_attempt_limit_to_failed_without_fourth_attempt():
+    repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
+    row = await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "k", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": task.next_run_at, "attempt": 3})
+    await repo.claim_occurrence(1, task.id, row.occurrence_key)
+    scheduler = TaskScheduler(repo, 1); assert await scheduler.recover() == 1
+    resolved = await repo.get_occurrence(1, task.id, "k")
+    assert resolved.status == "failed"
+    assert resolved.attempt == 3
+    assert resolved.finished_at is not None
+    assert resolved.retry_at is None
+    assert resolved.error_metadata.get("error_class") == "restart_interrupted"
+    assert await scheduler.recover() == 0
+
+
+@pytest.mark.asyncio
+async def test_recovered_retry_pending_occurrence_is_picked_up_by_run_once():
     repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data())
     row = await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "k", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": task.next_run_at})
     await repo.claim_occurrence(1, task.id, row.occurrence_key)
-    scheduler = TaskScheduler(repo, 1); assert await scheduler.recover() == 1
-    assert (await repo.get_occurrence(1, task.id, "k")).status == "interrupted"
+    scheduler = TaskScheduler(repo, 1, execution_coordinator=None)
+    await scheduler.recover()
+    later = datetime.now(timezone.utc) + timedelta(seconds=60)
+    assert await scheduler.run_once(later) == 1
+    final = await repo.get_occurrence(1, task.id, "k")
+    assert final.status == "retry_pending"
+    due = await repo.list_due_retry_occurrences(1, later, 10)
+    assert [o.occurrence_key for o in due] == ["k"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_occurrence_is_claimed_and_executed_once():
+    repo = InMemoryTaskRepository(); task = await repo.create_task(1, task_data(next_run_at=None))
+    scheduled_for = datetime.now(timezone.utc)
+    row = await repo.create_occurrence(1, {"task_id": task.id, "occurrence_key": "k", "definition_version": 1, "action_snapshot": task.actions, "scheduled_for": scheduled_for})
+    await repo.claim_occurrence(1, task.id, row.occurrence_key)
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, occurrence):
+            self.calls += 1
+            await repo.transition_occurrence(1, occurrence.task_id, occurrence.occurrence_key, "succeeded")
+            return SimpleNamespace(status="succeeded")
+
+    coordinator = Coordinator()
+    scheduler = TaskScheduler(repo, 1, execution_coordinator=coordinator)
+    await scheduler.recover()
+    recovered = await repo.get_occurrence(1, task.id, "k")
+    assert await scheduler.run_once(recovered.retry_at) == 1
+    assert await scheduler.run_once(recovered.retry_at) == 0
+    assert coordinator.calls == 1
+    assert (await repo.get_occurrence(1, task.id, "k")).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_owner_scoped():
+    repo = InMemoryTaskRepository()
+    owner_task = await repo.create_task(1, task_data())
+    other_task = await repo.create_task(2, task_data())
+    await repo.create_occurrence(1, {"task_id": owner_task.id, "occurrence_key": "owner", "definition_version": 1, "action_snapshot": owner_task.actions, "scheduled_for": owner_task.next_run_at})
+    await repo.create_occurrence(2, {"task_id": other_task.id, "occurrence_key": "other", "definition_version": 1, "action_snapshot": other_task.actions, "scheduled_for": other_task.next_run_at})
+    scheduler = TaskScheduler(repo, 1)
+    assert await scheduler.recover() == 1
+    assert (await repo.get_occurrence(1, owner_task.id, "owner")).status == "retry_pending"
+    assert (await repo.get_occurrence(2, other_task.id, "other")).status == "claimed"
 
 
 @pytest.mark.asyncio

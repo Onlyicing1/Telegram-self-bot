@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
+from backend.ai.retry import can_retry, retry_delay
 from backend.ai.scheduling import ScheduleError, catch_up_occurrence, parse_schedule
 
 logger = logging.getLogger(__name__)
@@ -64,11 +65,33 @@ class TaskScheduler:
         recovered = 0
         for occurrence in await self.repository.list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START):
             if occurrence.status in {"claimed", "running"}:
-                result = await self.repository.transition_occurrence(
+                occurrence = await self.repository.transition_occurrence(
                     self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
                 )
-                recovered += result is not None
+                if occurrence is None:
+                    continue
+            if occurrence.status == "interrupted":
+                resolved = await self._resolve_interrupted(occurrence)
+                recovered += resolved is not None
         return recovered
+
+    async def _resolve_interrupted(self, occurrence: OccurrenceRecord) -> OccurrenceRecord | None:
+        metadata = {"error_class": "restart_interrupted", "attempt": occurrence.attempt}
+        if can_retry(occurrence.attempt):
+            return await self.repository.transition_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+                "retry_pending",
+                retry_at=occurrence.updated_at + retry_delay(occurrence.attempt),
+                attempt=occurrence.attempt + 1,
+                finished_at=None,
+                error_metadata=metadata,
+            )
+        return await self.repository.transition_occurrence(
+            self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+            "failed",
+            retry_at=None,
+            error_metadata=metadata,
+        )
 
     async def _notify_outcome(self, task_id: int, occurrence_key: str, status: str) -> None:
         notifier = self.outcome_notifier

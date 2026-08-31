@@ -14,7 +14,7 @@ OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "r
 SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly"})
 MAX_ACTIONS = 5; MAX_PAYLOAD_BYTES = 32768; MAX_METADATA_BYTES = 8192; MAX_ATTEMPTS = 3; DB_TIMEOUT = 10.0
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "expired", "deleted"})
-_TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired", "interrupted"})
+_TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired"})
 _ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired", "deleted"}, "paused": {"paused", "active", "deleted"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
 _ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
 
@@ -120,7 +120,7 @@ class InMemoryTaskRepository(TaskRepository):
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         r=self._occurrences.get((task_id,occurrence_key));return _copy(r) if r and r.owner_id==owner_id else None
     async def list_occurrences(self, owner_id, task_id=None, limit=100): return [_copy(r) for r in list(self._occurrences.values()) if r.owner_id==owner_id and (task_id is None or r.task_id==task_id)][:max(0,limit)]
-    async def list_recoverable_occurrences(self, owner_id, limit=100): return [_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status in {"claimed","running"}][:max(0,limit)]
+    async def list_recoverable_occurrences(self, owner_id, limit=100): return [_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status in {"claimed","running","interrupted"}][:max(0,limit)]
     async def list_due_retry_occurrences(self, owner_id, now, limit=10):
         ref=_parse_dt(now); return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status=="retry_pending" and r.retry_at is not None and r.retry_at<=ref], key=lambda r:(r.retry_at,r.id))[:max(0,limit)]
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
@@ -208,7 +208,7 @@ class SupabaseTaskRepository(TaskRepository):
         except Exception as exc:logger.warning("Supabase occurrence list failed; using fallback: %s",exc);return await self._fallback.list_occurrences(owner_id,task_id,limit)
     async def list_recoverable_occurrences(self, owner_id, limit=100):
         try:
-            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running"]).order("updated_at").limit(limit).execute());return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running","interrupted"]).order("updated_at").limit(limit).execute());return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
         except Exception as exc:logger.warning("Supabase recovery query failed; using fallback: %s",exc);return await self._fallback.list_recoverable_occurrences(owner_id,limit)
     async def list_due_retry_occurrences(self, owner_id, now, limit=10):
         try:

@@ -77,12 +77,16 @@ class FakeQuery:
     def insert(self, payload): self.payload = payload; self.operation = "insert"; return self
     def update(self, payload): self.payload = payload; self.operation = "update"; return self
     def eq(self, key, value): self.filters.append((key, value)); return self
+    def in_(self, key, values): self.filters.append((key, set(values))); return self
     def order(self, *_args, **_kwargs): return self
+    def limit(self, value): self.limit_value = value; return self
     def maybe_single(self): self.single = True; return self
     def execute(self):
         if self.client.error: raise self.client.error
         rows = self.client.rows[self.table_name]
-        matches = [r for r in rows if all(r.get(k) == v for k, v in self.filters)]
+        matches = [r for r in rows if all(r.get(k) in v if isinstance(v, set) else r.get(k) == v for k, v in self.filters)]
+        if getattr(self, "limit_value", None) is not None:
+            matches = matches[:self.limit_value]
         if getattr(self, "operation", None) == "insert":
             row = dict(self.payload); row.setdefault("id", self.client.next_id[self.table_name]); self.client.next_id[self.table_name] += 1; rows.append(row); matches = [row]
         elif getattr(self, "operation", None) == "update":
@@ -120,6 +124,17 @@ async def test_supabase_occurrence_idempotency_claim_and_transition():
     claimed = await repo.claim_occurrence(10, 7, "k1"); assert claimed.status == "running"
     succeeded = await repo.transition_occurrence(10, 7, "k1", "succeeded"); assert succeeded.status == "succeeded"
     assert await repo.claim_occurrence(10, 7, "k1") is None
+
+
+@pytest.mark.asyncio
+async def test_supabase_recovery_query_includes_interrupted_and_scopes_owner():
+    client = FakeClient(
+        [row_task()],
+        [row_occurrence(status="interrupted"), row_occurrence(occurrence_key="other", status="succeeded"), row_occurrence(occurrence_key="foreign", owner_id=11, status="interrupted")],
+    )
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    rows = await repo.list_recoverable_occurrences(10, limit=10)
+    assert [row.occurrence_key for row in rows] == ["k1"]
 
 
 @pytest.mark.asyncio
