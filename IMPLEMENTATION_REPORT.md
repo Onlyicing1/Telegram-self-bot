@@ -6,210 +6,245 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Prior HEAD before this fix | `223f9e4bbfb580aba00812232d870f634d1124f3` |
-| Implementation commit | `5db7e4dd888f108d11f33b0caf3f84f0f587a944` |
-| Local HEAD | `5db7e4dd888f108d11f33b0caf3f84f0f587a944` |
-| `origin/main` | `5db7e4dd888f108d11f33b0caf3f84f0f587a944` |
-| Local HEAD == remote HEAD | YES |
+| Prior HEAD before this fix | `280357f4a0fa9f018f94456e4b406f7be1b0490a` |
+| Implementation commit | `c11a42e17ee913d51c113a45c3e96690e12b3ca6` |
+| Report commit | this documentation commit |
+| Local HEAD | see "Final Git Delivery Record" below |
+| `origin/main` | see "Final Git Delivery Record" below |
+| Local HEAD == remote HEAD | see "Final Git Delivery Record" below |
 
 ## Current Implementation State
 
-**IMPLEMENTED** - Natural-language scheduling requests now reach durable task
-creation instead of being diverted into unrelated AI/tool activity or the
-tool-round limit.
+**IMPLEMENTED** - Durable scheduled message execution is now end-to-end
+executable. A natural-language scheduling request ("هر 1 دقیقه یک بار برای
+من بنویس سلام") creates a durable task whose message-writing action is
+canonicalized to the registered `send_message` tool; the scheduler executes
+that action through the existing `ToolExecutor` / `TelegramAPI` boundary,
+and the occurrence persists the real outcome (succeeded / retry_pending /
+failed under the existing retry policy).
 
-The delivered fix is:
+## Exact Defect
+
+The previous implementation fixed natural-language task CREATION and
+durable persistence, but the persisted message-writing action had no
+registered execution tool. A scheduled task such as "every 1 minute write
+hello" could be created successfully, then fail at execution time with
+`unregistered_action` when the `TaskScheduler` claimed its occurrence and
+`TaskExecutionCoordinator` checked the action name against the tool
+registry. The tool registry exposed no generic send tool.
+
+## Root Cause
+
+The task-execution chain requires every layer to agree on the same action
+name and payload contract:
 
 ```text
-Telegram "هر 1 دقیقه یک بار برای من بنویس سلام"
-  -> ai_unified -> AIRequest -> Dispatcher
-  -> _try_local_fast_path (scheduling-intent detection, BEFORE provider/tool rounds)
-  -> create_task tool -> TaskInterpreter (bounded, tools=[])      (interpret)
-  -> TaskCandidate validation                                    (validate)
-  -> TaskCreationService.create(authoritative owner_id)          (create)
-  -> TaskRepository.create_task (ai_tasks, CAS version)          (persist)
-  -> TaskScheduler (single scheduler, later executes the actions)
+candidate action (model-produced name/arguments)
+  -> TaskCandidate validation (name non-empty only)
+  -> persisted in ai_tasks.actions
+  -> occurrence action_snapshot
+  -> TaskExecutionCoordinator: registry lookup
+  -> ToolExecutor -> Tool -> service -> TelegramAPI
 ```
 
-The provider tool loop now also exposes a registered `create_task` tool, so
-requests that are not deterministically matched (for example an ambiguous or
-at-a-time scheduled delete) are still reachable through the same boundary.
+Two gaps existed:
 
-## Defect and Root Cause
-
-A natural-language task request such as "هر 1 دقیقه یک بار برای من بنویس سلام"
-produced unrelated AI/tool activity, hit the tool-round limit, and never
-created a durable task. The database contained no created task. Root cause,
-traced through the actual AI execution path:
-
-1. The AI tool registry (`backend/ai/tools/registry.py::create_default_registry`)
-   exposed delete/save/bio/username/… tools but **no task-creation tool**, so
-   the provider path could never create a task.
-2. The deterministic fast path (`backend/ai/actions.py::parse_command_intent`)
-   classified "write/send" phrasing ("بنویس" -> `send`) as an `UNSUPPORTED`
-   action and returned immediately, so a scheduling request was either
-   abandoned ("Unsupported action: send") or, when it reached the provider,
-   consumed tool rounds on unrelated tools before hitting `MAX_TOOL_ROUNDS = 3`.
-3. Even the canonical task-creation boundary could not persist a **new interval
-   task**: `TaskCreationService.create` computed the first run with
-   `next_occurrence()`, which raises `ScheduleError` for `interval` schedules
-   (interval requires a previous occurrence). Therefore an interval task could
-   not be durably created at all.
-
-No Freebuff-specific bug/fix material exists in the repository; the "Freebuff"
-framing in the task is not source-backed. The fix follows the repository's own
-documented architecture (`INVESTIGATION.md`): the canonical boundary is
-`TaskInterpreter -> TaskCreationService -> TaskRepository`, and the AI path
-must reach that boundary rather than a parallel executor.
+1. **No registered message-send tool.** The `ToolRegistry` (built by
+   `create_default_registry`) had no send/message tool, so the coordinator's
+   registry check failed for any message-writing action. The only Telegram
+   side-effect path was the task-outcome notification sender
+   (`TelegramAPI(self.client).send_message(owner, message)`), which was not
+   exposed to task-action execution.
+2. **Action names were not canonicalized at creation.** The interpreter's
+   model emits the action name freely (e.g. `send` with `content`), and
+   `TaskCandidate.from_untrusted` only required a non-blank name. Creation
+   and execution therefore could disagree on the action contract, and a
+   model could even smuggle destination/method fields into the persisted
+   action.
 
 ## Exact Implementation
 
-- `backend/ai/actions.py`
-  - Added `create_task` to `ACTION_NAMES` and `EXECUTABLE_ACTION_NAMES`, and
-    `request` to `ALLOWED_FIELDS`.
-  - Added `schedule_text` to `ActionParseResult`.
-  - Added `create_task` handling to `validate_action` (requires a non-empty,
-    bounded `request`) and `resolve_tool_calls` (maps to the `create_task` tool).
-  - Added a conservative `_is_scheduling_intent()` detection (Persian/English):
-    a strong recurring cadence, or an interval marker ("هر"/"every"/… + time
-    unit), or an explicit plan/reminder verb combined with an action verb. It
-    is deliberately narrow: a historical delete ("…ساعت ۹ دیروز…") is NOT
-    misclassified as a scheduled task.
-  - `parse_command_intent` now routes a scheduling intent to an executable
-    `create_task` action BEFORE the send/delete/save vocabulary can divert it.
-- `backend/ai/task_creation.py`
-  - Fixed first-run scheduling for a brand-new `interval` task: `TaskCreationService`
-    computes the first run as one interval after the reference time via
-    `advance_interval` (the existing `next_occurrence` cannot anchor an
-    interval without a previous occurrence).
-- `backend/ai/task_interpreter.py`
-  - `interpret()` now accepts an optional `timezone` hint (backward
-    compatible) so the candidate carries the owner's IANA timezone.
-- `backend/ai/tools/task.py` (new)
-  - `CreateTaskTool`: a `READ_WRITE` tool that runs every creation through
-    `TaskInterpreter -> TaskCreationService.create(authoritative owner_id) ->
-    TaskRepository.create_task`. It fabricates nothing: an ambiguous request
-    (interpreter returns JSON null) yields a non-destructive failure ToolResult.
-- `backend/ai/tools/registry.py`
-  - Registered `CreateTaskTool` in `create_default_registry`, so it appears in
-    the provider's native tool definitions and prompt tool block.
-- `backend/ai/tools/executor.py`
-  - Added the `create_task` status label.
-- `tests/test_task_nl_creation.py` (new)
-  - Regression tests: interval routing -> `create_task`; scheduled destructive
-    request -> `create_task`; bare send unchanged; historical delete not
-    misclassified; `create_task` persisted interval task under owner; ambiguity
-    creates nothing; owner isolation; destructive scheduled task persisted with
-    bounded owner-scoped action; and the Dispatcher fast path creating the task
-    with only the interpreter's single bounded provider call (no tool-round
-    exhaustion).
+### 1. Registered deterministic message-send tool (new)
 
-## Files Changed
+`backend/ai/tools/message.py` - `SendMessageTool`:
 
-| File | Change |
-|---|---|
-| `backend/ai/actions.py` | `create_task` action + scheduling-intent detection |
-| `backend/ai/task_creation.py` | first-run scheduling for new interval tasks |
-| `backend/ai/task_interpreter.py` | optional timezone hint |
-| `backend/ai/tools/task.py` | new `CreateTaskTool` |
-| `backend/ai/tools/registry.py` | register `CreateTaskTool` |
-| `backend/ai/tools/executor.py` | `create_task` status label |
-| `tests/test_task_nl_creation.py` | new regression tests |
+- Registered as `send_message` in `create_default_registry` and visible to
+  providers only through the existing registry.
+- Accepts ONLY a bounded `text` argument (1..4096 chars). No destination,
+  chat id, recipient, method name, or RPC instruction is accepted.
+- Resolves the destination from TRUSTED runtime context: the owner's own
+  Saved Messages chat (`context.owner_id`), the same destination the
+  existing task-outcome notification sender uses. Never from model output.
+- Performs the actual Telegram operation through the existing
+  `TelegramAPI.send_message` facade (`backend/telegram_api/messages.py`),
+  which owns bounded timeouts, flood-wait handling, and structured errors.
+- A Telegram failure returns `ToolResult(success=False, ...)`; it flows
+  through the existing `TaskExecutionCoordinator.handle_failure` retry
+  boundary. It is never reported as success.
 
-`IMPLEMENTATION_REPORT.md` is changed separately by the documentation delivery
-commit.
+### 2. Canonical action contract at creation
+
+`backend/ai/task_candidate.py` - `TaskCandidate.from_untrusted` now
+normalizes every action through `_canonicalize_action`:
+
+- Message-send aliases (`send`, `send_message`, `write_message`,
+  `send_text`) normalize to the registered `send_message` tool.
+- Text aliases (`text`, `content`, `message`, `body`) normalize to the
+  single `text` argument; the text must be non-blank and <= 4096 chars,
+  otherwise the candidate is rejected (nothing is created).
+- Any injected destination/chat/recipient/method fields are stripped and
+  never persisted.
+- Non-send actions are preserved unchanged; unknown action names still fail
+  safely at execution time via the coordinator's registry check.
+
+### 3. Interpreter guidance
+
+`backend/ai/task_interpreter.py` - the candidate instructions now tell the
+model to use exactly the action name `send_message` with a single `text`
+argument for any message-writing action, and never to include owner
+identity, chat ids, or destinations.
+
+### 4. Registry / executor consistency
+
+- `backend/ai/tools/registry.py`: registered `SendMessageTool`.
+- `backend/ai/tools/executor.py`: added the `send_message` status label.
+- `tests/test_20_advanced_execution.py`: refined the "no arbitrary
+  Telegram/exec tools" invariant. `send_message` is the single deliberate,
+  bounded, fixed-destination exception; the test now asserts the tool
+  exists, exposes only the `text` parameter, and stays READ_ONLY/READ_WRITE.
+  All arbitrary-RPC/exec/shell/file/secret names remain forbidden.
 
 ## Architecture Preserved
 
-**PRESERVED**
-
-- `TaskScheduler` remains the single scheduler and polling authority.
+- Single `TaskScheduler` polling loop; no second scheduler or worker.
 - `TaskExecutionCoordinator` remains the execution/failure authority.
-- `TaskRepository` remains the durable persistence, owner-filtering,
-  state-transition, and CAS authority.
-- `ToolRegistry`/`ToolExecutor` remain the registered action execution
-  boundary (the `create_task` tool delegates to the service layer).
-- `Self Bot` remains the execution authority; the AI only returns candidate
-  actions, never direct Telegram control.
-- No arbitrary Telegram RPC/SQL/shell, no persisted-code execution, no provider
-  bypass, no second scheduler/worker/retry engine was introduced.
-- Destructive scheduled actions remain owner-scoped and execute later through
-  the registered `ToolExecutor`.
+- `TaskRepository` remains the durable persistence/CAS authority.
+- `ToolRegistry` / `ToolExecutor` remain the registered execution boundary;
+  the new tool is executed only through the executor.
+- Existing retry policy (`FailureClass`, `classify_failure`, `can_retry`,
+  `retry_delay`, `MAX_ATTEMPTS=3`) reused; no duplicate retry logic.
+- Existing `TelegramAPI` facade reused; no parallel Telegram transport, no
+  arbitrary Telegram RPC, no shell/SQL/persisted-code execution.
+- Owner identity comes from trusted runtime context only.
+- Destructive actions unchanged; `send_message` sends only to the owner's
+  own Saved Messages chat.
 
-## Security and Ownership
+## Retry / Failure Behavior
 
-- Owner identity comes only from trusted runtime context (`ToolContext.owner_id`
-  populated from `AIRequest.owner_id`), never from model output.
-- `TaskInterpreter` returns JSON null on ambiguity; `CreateTaskTool` creates
-  nothing in that case.
-- `TaskCreationService` requires a valid owner id and validates the candidate;
-  `TaskRepository.create_task` is owner-scoped and CAS-versioned.
-- The new tool is `READ_WRITE`: in this single-owner self-bot the owner's
-  message is the authorization, matching existing deterministic tools.
+- A retryable Telegram failure (`TelegramTimeoutError` etc.) transitions the
+  occurrence to `retry_pending` with `attempt + 1` and the existing backoff.
+- Attempts stay bounded by `MAX_ATTEMPTS = 3`; the third failed attempt
+  transitions the occurrence to terminal `failed`. No fourth attempt is
+  possible.
+- A successful send transitions the occurrence to `succeeded` with bounded
+  result metadata (`terminal_status: "succeeded"`).
 
-## Retry / Scheduler Relationship
+## Security / Ownership
 
-- This fix only creates durable tasks. The existing retry policy
-  (`MAX_ATTEMPTS = 3`, `can_retry`, `retry_delay`), interrupted-occurrence
-  recovery, and scheduler pickup are unchanged and remain as previously
-  delivered (`1e1b121`).
+- Destination is fixed to the owner's own chat; the model can never supply
+  a chat id, recipient, or Telegram method.
+- Candidate validation strips injected destination fields at creation.
+- The tool verifies owner identity from context and refuses to run without
+  it.
+- No arbitrary Telegram RPC, no arbitrary method dispatch, no shell, no SQL,
+  no persisted-code execution, no provider bypass.
 
-## Database and Supabase
+## Database / Supabase
 
-- Database/schema impact: **UNCHANGED**. No migration, SQL, columns, or tables
-  were added or changed.
-- The existing `ai_tasks` table's `schedule`, `actions`,
-  `notification_destination`, `next_run_at`, `status`, `version`,
-  `created_at`/`updated_at`/`terminal_at` fields were sufficient.
-- Supabase production data was not modified. Supabase live connectivity and RLS
-  behavior were not verified in this environment.
+- **No schema change.** No new tables, columns, or migrations.
+- The canonical `send_message` action persists in the existing
+  `ai_tasks.actions` jsonb array (bounded by existing payload constraints).
+- Supabase behavior is unchanged; the existing Supabase-or-fallback
+  repository pattern applies.
 
-## Validation Actually Executed
+## Tests Actually Executed
 
-- `python3 -m compileall -q backend tests` - passed.
-- `git diff --check` and `git diff --cached --check` - passed.
-- Focused new regression tests:
-  `python3 -m pytest tests/test_task_nl_creation.py` - 11 passed.
-- Focused existing + new:
-  `tests/test_task_nl_creation.py tests/test_19_ai_actions.py tests/test_25_fast_path.py` - 54 passed.
-- Broader focused suite (tool wiring, runtime, actions, fast path, delete
-  regression, task execution/management/scheduler, stage 15/16/17):
-  `240 passed`.
-- Full suite: `python3 -m pytest tests/ -q --no-header` - **1172 passed,
-  23 skipped, 1 warning** (baseline was 1161; +11 new tests).
+New file `tests/test_task_send_execution.py` (15 tests):
 
-## Live Verification and Limitations
+1. `test_send_alias_canonicalized_to_registered_tool`
+2. `test_send_message_alias_with_text_preserved`
+3. `test_injected_destination_is_stripped_not_persisted`
+4. `test_empty_send_text_rejects_candidate`
+5. `test_non_send_actions_unchanged`
+6. `test_send_message_is_registered_in_default_registry`
+7. `test_executor_dispatches_send_message_to_owner`
+8. `test_send_message_tool_ignores_argument_destination`
+9. `test_send_message_tool_rejects_missing_text`
+10. `test_send_message_tool_fails_without_owner_context`
+11. `test_create_task_tool_persists_canonical_send_message_action`
+12. `test_scheduler_executes_scheduled_message_and_persists_success`
+13. `test_send_failure_reaches_retry_boundary_then_terminal_failure`
+14. `test_ordinary_conversation_is_not_scheduled`
+15. `test_immediate_send_is_not_a_scheduled_task`
 
-- Live Telegram end-to-end (real scheduling request creating a task and the
-  scheduler executing it against a live account): **NOT VERIFIED**.
-- Live Supabase persistence of a created task: **NOT VERIFIED**.
-- The task-execution side of a recurring "write hello" action requires a
-  registered message-sending tool; the tool registry currently has no generic
-  `send` tool. Task CREATION and durable persistence are delivered here;
-  executing an unregistered action later would fail at execution time. This is
-  a pre-existing task-action-set limitation, not introduced by this change.
-- The scheduling detector is intentionally conservative; complex or ambiguous
-  at-time requests depend on the provider recognizing the newly registered
-  `create_task` tool.
-- This environment lacks `tzdata` for non-UTC IANA zones, so tests use `UTC`;
-  non-UTC timezone behavior is not exercised in this sandbox.
+Results (actually run):
+
+| Suite | Result |
+|---|---|
+| New `test_task_send_execution.py` | **15 passed** |
+| Task/actions focused set (16 files) | **149 passed** |
+| `tests/test_20_advanced_execution.py` | **32 passed** |
+| Full suite `tests/` | **1187 passed, 23 skipped, 1 warning** |
+| `python3 -m compileall -q backend tests` | **passed** |
+| `git diff --check` | **passed** |
+
+## Live Verification Status
+
+**LIVE TELEGRAM VERIFICATION: NOT AVAILABLE** - no live Telegram account /
+credentials are available in this workspace, so no real Telegram send was
+performed. Execution correctness is proven by deterministic mocked
+execution tests (mocked `TelegramAPI.send_message` verifying the exact
+text and the trusted owner destination).
+
+**LIVE SUPABASE VERIFICATION: NOT AVAILABLE** - persistence is verified
+against the in-memory repository; the Supabase path is unchanged and was not
+exercised against a live database.
+
+## Files Changed
+
+| File | Why |
+|---|---|
+| `backend/ai/tools/message.py` (new) | Registered deterministic `send_message` execution tool |
+| `backend/ai/task_candidate.py` | Canonicalize message-send actions; strip injected destinations |
+| `backend/ai/task_interpreter.py` | Instruct the model to emit the canonical `send_message`/`text` action |
+| `backend/ai/tools/registry.py` | Register `SendMessageTool` |
+| `backend/ai/tools/executor.py` | Add `send_message` status label |
+| `tests/test_task_send_execution.py` (new) | 15 focused regression tests for the complete execution path |
+| `tests/test_20_advanced_execution.py` | Refine the arbitrary-tool invariant for the deliberate bounded exception |
 
 ## Intentionally Untouched Files
 
-- `tests/test_stage13.py` is an unrelated pre-existing working-tree
-  modification. It was not edited, staged, committed, or pushed by this work.
-- `INVESTIGATION.md`, migrations/SQL, Telegram handlers, runtime supervisor,
-  scheduler, retry, execution coordinator, dashboard, and unrelated services
-  were untouched.
+- `tests/test_stage13.py` - pre-existing unrelated modification, preserved
+  exactly, unstaged and uncommitted.
+- `backend/ai/task_scheduler.py`, `backend/ai/task_execution.py`,
+  `backend/ai/retry.py`, `backend/ai/database/task_repository.py`,
+  `backend/ai/actions.py` - no change needed; the existing execution/retry/
+  persistence boundaries were reused as-is.
+- No migrations, SQL, Supabase schema, or configuration were changed.
 
-## Git Delivery Record
+## Known Limitations
 
-- Implementation commit: `5db7e4dd888f108d11f33b0caf3f84f0f587a944`
-  (`fix: route natural-language scheduling requests to durable task creation`).
-- This report/documentation commit is delivered separately.
-- Push result: SUCCESS (verified by `git fetch origin main`, `git rev-parse
-  HEAD`, `git rev-parse origin/main`, and `git ls-remote`).
-- Final local HEAD and `origin/main`: both `5db7e4dd888f108d11f33b0caf3f84f0f587a944`.
-- Local HEAD == remote HEAD: YES.
-- Final working tree: only the pre-existing unrelated unstaged modification
-  `M tests/test_stage13.py` remains.
+- Scheduled message execution sends to the owner's own Saved Messages chat
+  (the existing notification destination). Sending to an arbitrary chat is
+  intentionally not supported - it would require a destination model the
+  current architecture does not define.
+- Immediate (non-scheduled) "send/write" requests remain unchanged: the
+  deterministic fast path still returns the recognized-but-unwired `send`
+  result, and the provider path may now use `send_message` (owner's Saved
+  Messages only) if it chooses to call the registered tool.
+- No schema change was needed; the existing schema is sufficient.
+
+## Final Git Delivery Record
+
+- Implementation commit: `c11a42e17ee913d51c113a45c3e96690e12b3ca6`
+- Push status: SUCCESS (verified via `git push`, `git fetch`,
+  `git rev-parse`, and `git ls-remote`)
+- Local HEAD == origin/main: see the verification note below
+- Final working-tree status: only the pre-existing unrelated unstaged
+  modification `M tests/test_stage13.py` (preserved exactly, not staged or
+  committed).
+
+> Verification note: this report is committed after the implementation
+> push; the "Final Git Delivery Record" fields (report commit SHA, final
+> local/remote HEAD equality) are recorded with the actual values after the
+> report push completes.
