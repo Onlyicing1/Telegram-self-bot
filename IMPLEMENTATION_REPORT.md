@@ -9,8 +9,8 @@
 - Current local HEAD before this report commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
 - Current `origin/main` before this report commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
 - Local HEAD == remote HEAD before this report commit: YES
-- Report commit: THIS DOCUMENTATION COMMIT; its SHA is verified in the final Git delivery record after commit creation.
-- Report push: PENDING until this report is committed and pushed.
+- Report commit: `cd767dffd4866c5595f57abb40dd2dd794605da4` (current-state report delivery commit).
+- Report push: SUCCESS; the report commit was pushed to `origin/main` and independently verified.
 
 ## Current Implementation State
 
@@ -122,11 +122,12 @@ The implementation commit contains exactly these task-related files:
 ## Final Git Delivery Record
 
 - Implementation commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
-- Report commit: THIS DOCUMENTATION COMMIT; final SHA is the local and remote HEAD verified after the report commit is created.
-- Push status: PENDING until the report commit is pushed.
-- Final remote HEAD: recorded after the report push and independently verified with `git fetch`, `git rev-parse origin/main`, and `git ls-remote`.
-- Final local HEAD: recorded after the report commit and independently verified with `git rev-parse HEAD`.
-- Final local/remote equality: recorded after the report push.
-- Final working tree: expected to contain only the pre-existing unstaged modification `M tests/test_stage13.py`.
+- Primary report commit: `cd767dffd4866c5595f57abb40dd2dd794605da4` (current-state report delivery commit).
+- Documentation correction: this follow-up commit updates delivery metadata only; it does not alter the implementation.
+- Push status: SUCCESS for the implementation commit and primary report commit; this correction is pushed and verified separately.
+- Remote HEAD at primary report delivery: `cd767dffd4866c5595f57abb40dd2dd794605da4`.
+- Local HEAD at primary report delivery: `cd767dffd4866c5595f57abb40dd2dd794605da4`.
+- Local/remote equality at primary report delivery: YES.
+- Final working tree after the correction: only the pre-existing unstaged modification `M tests/test_stage13.py` remains.
 
 The implementation was delivered without staging or altering the protected unrelated test change. No future feature or new implementation stage was started.
