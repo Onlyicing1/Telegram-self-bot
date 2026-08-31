@@ -1,166 +1,132 @@
-# IMPLEMENTATION REPORT
+# Current Implementation Report
 
-## 1. CURRENT IMPLEMENTATION STATE
+## Repository and Delivery State
 
-- **Repository:** `Onlyicing1/Telegram-self-bot`
-- **Branch:** `main`
-- **Current HEAD before this report update:** `4043bde0c789c9f264c6ef59b4865814a3abfe52`
-- **Current remote HEAD before this report update:** `4043bde0c789c9f264c6ef59b4865814a3abfe52`
-- **Local HEAD == remote HEAD before this report update:** YES
-- **Current implementation stage:** Stage 17
-- **Latest completed stage:** Stage 17 — Automatic execution-failure → durable retry integration
-- **Overall status:** Stage 17 is implemented and delivered. The task system’s durable core is present in source and Git. The remaining working-tree exception is the unrelated pre-existing modification to `tests/test_stage13.py`.
+- Repository: `Onlyicing1/Telegram-self-bot`
+- Branch: `main`
+- Implementation commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
+- Implementation commit title: `fix: recover interrupted task occurrences after restart`
+- Current local HEAD before this report commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
+- Current `origin/main` before this report commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
+- Local HEAD == remote HEAD before this report commit: YES
+- Report commit: THIS DOCUMENTATION COMMIT; its SHA is verified in the final Git delivery record after commit creation.
+- Report push: PENDING until this report is committed and pushed.
 
-This report is the canonical current implementation state. It replaces obsolete report snapshots rather than appending another historical report.
+## Current Implementation State
 
-## 2. ALL DISCOVERED STAGES
+**IMPLEMENTED** - Restart-safe interrupted occurrence recovery is present in the local source and in the pushed implementation commit. The stale report previously described Stage 17 and incorrectly claimed that interrupted recovery was not part of the current implementation state. This report replaces that historical snapshot.
 
-The repository reliably establishes the following task-system sequence. Stages 1–3 are grouped because the current history does not provide a defensible one-to-one title mapping for each early milestone.
-
-| Stage | Name | Status | Evidence / relevant files | Delivery status |
-|---|---|---|---|---|
-| 1–3 | Database investigation, scheduler contract, and durable task foundation milestones | IMPLEMENTED BUT NOT INDIVIDUALLY MAPPABLE | `e594a49`, `fb221f6`, `da74cc4`, `673b650`, `7c66f84`; task schema/repository artifacts | Historical commits are in current main and source artifacts remain present; exact individual stage boundaries are not fully determinable. |
-| 4 | Supabase Task Repository Integration | IMPLEMENTED AND VERIFIED | `backend/ai/database/task_repository.py`, `backend/ai/database/manager.py` | `2a2f77b5eac1acb0c96b719e6829d6668cf918d5`, present locally and on `origin/main`. |
-| 5 | Task Scheduler Runtime and Restart-Safe Occurrence Coordination | IMPLEMENTED AND VERIFIED | `backend/ai/scheduling.py`, `backend/ai/task_scheduler.py`, `backend/runtime/supervisor.py` | `354de6f33d486714b54b4fcb0166558614230da1`, present locally and on `origin/main`. |
-| 6 | Task Execution and Action Dispatch | IMPLEMENTED AND VERIFIED | `backend/ai/task_execution.py`, `tests/test_task_execution.py` | `a42a3cf88e1d06c5d410c25f68f435b31ba4c308`, present locally and on `origin/main`. |
-| 7 | Retry Classification, Backoff, and Operational Task Management | IMPLEMENTED AND VERIFIED | `backend/ai/retry.py`, retry tests and repository transitions | `2c56138202b90f8c6b59063d0631b125440c1b87`, present locally and extended by Stage 17. |
-| 8 | Task Management Interfaces and Notifications | IMPLEMENTED AND VERIFIED | `backend/ai/task_management.py`, `backend/ai/notifications.py`, `tests/test_task_management.py` | `a90789953afd3d64a973b795925448f3b07b53a1`, present locally and on `origin/main`. |
-| 9 | User-Facing Task Creation and Scheduler-to-Notification Wiring | IMPLEMENTED, HISTORICAL MAPPING PARTIAL | `backend/ai/task_creation.py`, `backend/ai/task_notifications.py`, related source | Related commits `f28f36a` and `b0b4c48`; reports and commit sequence do not map this boundary with complete consistency. |
-| 10 | User-Facing Task Creation and Management Exposure | IMPLEMENTED, HISTORICAL MAPPING PARTIAL | `backend/ai/task_management_interface.py`, management presentation and tests | Related commit/report sequence includes `b0b4c48` and later task-interface commits; exact historical attribution is partially inconsistent. |
-| 11 | Structured Task Candidate Contract | IMPLEMENTED AND VERIFIED | `backend/ai/task_candidate.py`, `tests/test_stage11_candidate.py` | `d2be91f81bc9214bb192291c39363c33072e39eb`, present locally and on `origin/main`. |
-| 12 | Natural-Language Task Interpretation Adapter | IMPLEMENTED AND VERIFIED | `backend/ai/task_interpreter.py`, `tests/test_stage12_interpreter.py` | `f517f8379f873bd952ddedc21fe945cb443c142e`, present locally and on `origin/main`. |
-| 13 | Telegram Task Creation Interaction Boundary | IMPLEMENTED AND VERIFIED | `backend/bot/handlers/tasks.py`, `backend/bot/router.py`, `tests/test_stage13.py` | `5d570bcc092881f46471da4b5303788bc721a170`, present locally and on `origin/main`. |
-| 14 | Telegram Task Management Interaction Boundary | IMPLEMENTED AND VERIFIED | `backend/bot/handlers/tasks.py`, `tests/test_stage14.py` | `6fadf93bbe90a27bf89ef17eaf04bdd21b01c648`, present locally and on `origin/main`. |
-| 15 | Durable Scheduled Execution and Retry Re-execution | IMPLEMENTED AND VERIFIED | `backend/ai/task_scheduler.py`, repository retry queries, `tests/test_stage15.py` | `ff24d474d13e234a8d4162c78455304eb6910ddf`, present locally and on `origin/main`. |
-| 16 | Runtime Persisted-Outcome Notification Transport | IMPLEMENTED AND VERIFIED | `backend/ai/task_scheduler.py`, `backend/ai/task_notifications.py`, `backend/ai/notifications.py`, `backend/runtime/supervisor.py`, `tests/test_stage16.py` | `5a1e47ab7e1964083fb759c3eda7565773e1e30f`, with report finalization `62e7c25`; present on `origin/main`. |
-| 17 | Automatic execution-failure → durable retry integration | IMPLEMENTED AND VERIFIED | `backend/ai/task_execution.py`, `backend/ai/retry.py`, `tests/test_stage17.py` | `da021b2ae1e48e02277cf00c160607fbd5a6734b`, present locally and on `origin/main`. |
-
-No Stage 18 or later stage is established by current repository history.
-
-## 3. LATEST COMPLETED IMPLEMENTATION
-
-### Stage 17 — Automatic execution-failure → durable retry integration
-
-**Objective:** Complete the normal automatic retry lifecycle without creating another scheduler, worker, retry implementation, database object, notification system, or execution authority.
-
-**Root cause:** `TaskExecutionCoordinator.handle_failure()` already contained retry classification and durable retry persistence, but the normal `execute()` failure paths previously called `_fail()` directly. Therefore retryable execution failures could become terminal failures without entering `retry_pending`.
-
-**Exact files changed by the Stage 17 implementation commit:**
-
-- `backend/ai/task_execution.py`
-- `backend/ai/retry.py`
-- `tests/test_stage17.py`
-- `IMPLEMENTATION_REPORT.md`
-
-**Behavior implemented:**
-
-- Exceptions raised by `ToolExecutor.execute_calls()` flow through `TaskExecutionCoordinator.handle_failure()`.
-- Unsuccessful `ToolExecutionResult` values flow through the same retry path.
-- Timeout-shaped tool failures are normalized to the existing timeout classification; serialized `TimeoutError` text is recognized by `backend/ai/retry.py`.
-- Retry classification reuses `FailureClass`, `classify_failure()`, `can_retry()`, and `retry_delay()`.
-- Retryable failures within the attempt limit persist `retry_pending`, `retry_at`, incremented durable `attempt`, and bounded `error_metadata` through `TaskRepository.transition_occurrence()`.
-- `MAX_ATTEMPTS = 3` remains the limit: attempts 1 and 2 may advance; attempt 3 becomes terminal `failed`.
-- Exhausted retryable failures, permanent failures, and unknown failures become terminal `failed`.
-- `asyncio.CancelledError` propagates and is never converted into retry state.
-- `TaskScheduler` picks up already-persisted due `retry_pending` occurrences through its existing retry query and executes them through the same coordinator.
-- Existing persisted-outcome notification behavior remains the final delivery path.
-
-The lifecycle is:
+The fixed lifecycle is:
 
 ```text
-ToolExecutor failure
-  → TaskExecutionCoordinator.execute()
-  → handle_failure()
-  → existing classification/policy
-  → TaskRepository.transition_occurrence()
-  → retry_pending + retry_at + incremented attempt
-  → existing TaskScheduler retry pickup
-  → same TaskExecutionCoordinator / ToolExecutor boundary
-  → persisted terminal outcome
-  → existing persisted-outcome notification path
+claimed/running occurrence
+  -> scheduler startup recovery
+  -> interrupted
+  -> retry_pending with bounded retry metadata, or failed at the attempt limit
+  -> existing due-retry scheduler pickup
+  -> existing claim and TaskExecutionCoordinator path
+  -> persisted outcome
 ```
 
-External side effects remain **at-least-once**. No exactly-once guarantee is claimed.
+External side effects remain at-least-once. Exactly-once execution is not claimed.
 
-## 4. VALIDATION
+## Defect and Root Cause
 
-### Actually executed validation
+The prior production path queried persisted `claimed` and `running` occurrences during `TaskScheduler.recover()`, changed them to `interrupted`, and then stopped. No production path subsequently resolved an `interrupted` occurrence. `run_once()` queried due `retry_pending` occurrences and due active tasks only, so a restart-interrupted occurrence could remain permanently stranded.
 
-- Focused task tests: `python3 -m pytest tests/test_stage17.py tests/test_task_execution.py tests/test_task_scheduler.py tests/test_retry.py -q --no-header` — **17 passed**.
-- Full suite: `python3 -m pytest tests/ -q --no-header` — **1155 passed, 23 skipped, 1 warning**.
-- Compile check: `python3 -m compileall -q backend tests` — passed.
-- Whitespace check: `git diff --check` — passed.
+The source also treated `interrupted` as a terminal timestamp state. That meant a recovery transition could retain terminal completion metadata even when the occurrence was being returned to the retry lifecycle.
 
-### Source and Git verification
+## Exact Implementation
 
-- `da021b2ae1e48e02277cf00c160607fbd5a6734b` exists locally.
-- The Stage 17 commit is an ancestor of `origin/main`.
-- The Stage 17 commit contains exactly the four implementation/report files listed above.
-- Current branch is `main`.
-- Before this report update, local and remote HEAD were both `da021b2ae1e48e02277cf00c160607fbd5a6734b`.
-- Live Telegram and live Supabase behavior were not verified.
+- `TaskScheduler.recover()` now resolves both occurrences newly changed from `claimed` or `running` and occurrences already persisted as `interrupted`.
+- Recovery is bounded by the existing `MAX_RECOVERY_PER_START` limit.
+- Claimed or running rows are first changed through the existing owner-scoped repository CAS transition to `interrupted`.
+- Retry-capable occurrences use the existing `can_retry()` and `retry_delay()` policy from `backend/ai/retry.py`. The next `retry_at` is based on the persisted occurrence `updated_at`, and the durable attempt is incremented by one.
+- Recovery metadata records `error_class=restart_interrupted` and the interrupted attempt number.
+- Occurrences at the maximum attempt use the existing `interrupted -> failed` transition. They do not receive a fourth attempt, and the repository supplies terminal `finished_at` metadata.
+- Requeued occurrences explicitly clear `finished_at`; terminal failure explicitly clears `retry_at`.
+- The existing `run_once()` retry pickup, `claim_occurrence()`, `TaskExecutionCoordinator`, `ToolExecutor`, and persisted-outcome notification path are unchanged and remain the execution path.
+- `interrupted` is no longer included in the repository's terminal occurrence timestamp set, while the existing state machine still permits `interrupted -> retry_pending` and `interrupted -> failed`.
+- Both repository implementations now include `interrupted` in the bounded, owner-filtered `list_recoverable_occurrences()` query.
 
-## 5. DATABASE / SUPABASE STATUS
+## Files Changed
 
-- Stage 17 production database code changed: NO.
-- Stage 17 migrations changed: NO.
-- Stage 17 schema changed: NO.
-- Supabase was modified: NO.
-- Live Supabase state was verified: NO.
-- SQL was executed: NO.
+The implementation commit contains exactly these task-related files:
 
-The existing migration `supabase/migrations/20260829000001_create_ai_tasks.sql` already provides `ai_tasks` and `ai_task_occurrences`, including `attempt`, `retry_at`, `error_metadata`, result metadata, state constraints, attempt bounds, indexes, unique occurrence identity, and RLS. No new database object was necessary.
+- `backend/ai/task_scheduler.py`
+- `backend/ai/database/task_repository.py`
+- `tests/test_task_scheduler.py`
+- `tests/test_task_repository.py`
 
-## 6. ARCHITECTURE / SECURITY STATUS
+`IMPLEMENTATION_REPORT.md` is changed separately by the documentation delivery commit. No migration, SQL, UI, Telegram handler, provider, or unrelated feature file was changed.
 
-The Stage 17 implementation preserves the established boundaries:
+## Architecture Preserved
 
-- The self-bot and `TelegramAPI` remain the Telegram transport/execution boundary.
-- `ToolRegistry` and `ToolExecutor` remain the registered action execution boundary.
-- AI task execution does not receive arbitrary Telegram RPC access.
-- AI task execution does not receive arbitrary SQL/RPC access.
-- `TaskScheduler` remains the coordination and polling authority; no second loop or retry worker was introduced.
+**PRESERVED**
+
+- `TaskScheduler` remains the single scheduler and polling authority.
+- No second scheduler loop, worker, retry engine, or recovery service was introduced.
 - `TaskExecutionCoordinator` remains the execution and failure authority.
-- `TaskRepository` remains the durable persistence and state/CAS boundary.
-- `TaskNotificationService` and `TaskOutcomeNotifier` remain notification boundaries.
-- Owner identity remains supplied by trusted runtime context and repository operations remain owner-scoped.
-- No shell execution, persisted-code execution, provider bypass, or model-supplied owner identity was introduced.
-- Exactly-once execution is not claimed; external side effects remain at-least-once.
+- `TaskRepository` remains the durable persistence, owner-filtering, state-transition, and CAS authority.
+- `ToolRegistry` and `ToolExecutor` remain the registered action execution boundary.
+- Telegram execution remains behind the existing Telegram API and tool boundaries.
+- No provider bypass, arbitrary Telegram RPC, arbitrary SQL/RPC, shell execution, or persisted-code execution was introduced.
+- No notification architecture was added or replaced.
 
-## 7. INTENTIONALLY UNTOUCHED
+## Retry, Recovery, and Safety Semantics
 
-- `tests/test_stage13.py` remains a pre-existing unrelated working-tree modification. It was not changed, staged, committed, or pushed by the Stage 17 implementation or this report update.
-- Production scheduler architecture was untouched by Stage 17.
-- `RuntimeSupervisor` was untouched by Stage 17.
-- Notification architecture was reused, not replaced.
-- Database schema and migrations were untouched.
-- `INVESTIGATION.md` was not modified by this report update.
+- Retry policy: existing `FailureClass`, `classify_failure()`, `can_retry()`, and `retry_delay()` semantics are reused. The scheduler does not duplicate retry policy.
+- Attempt limit: `MAX_ATTEMPTS` remains 3. Attempts 1 and 2 may become `retry_pending`; attempt 3 becomes terminal `failed`. No fourth attempt is possible through this recovery path.
+- Duplicate recovery protection: repository transitions are status-CAS guarded. A second recovery pass sees the already requeued or failed state and does not resolve it again.
+- Duplicate execution protection: due retry pickup still claims only eligible occurrences through `claim_occurrence()`, and the existing durable occurrence identity and state CAS prevent a second scheduler claimant from executing the same persisted occurrence through this path.
+- Owner isolation: every recovery query and transition uses the scheduler's trusted `owner_id`; both in-memory and Supabase repository paths filter by owner. An occurrence belonging to another owner is not recovered.
+- Cancellation: scheduler and coordinator cancellation behavior remains propagation-safe. `asyncio.CancelledError` is re-raised rather than converted into retry or failure state. Existing cancellation coverage remains green.
+- Execution guarantee: the state machine provides at-least-once side-effect semantics, not exactly-once semantics.
 
-## 8. LIMITATIONS / NOT VERIFIED
+## Database and Supabase Status
 
-- Live Telegram execution and message delivery were not verified.
-- Live Supabase persistence, RLS behavior, and deployed schema state were not verified.
-- External side effects and crash-boundary exactly-once behavior were not verified; the source supports at-least-once semantics.
-- Early Stage 1–3 individual numbering cannot be proven exactly from the available commit/report mapping.
-- No Stage 18 or later roadmap is established by current source/history.
+- Database/schema impact: **UNCHANGED**
+- Migrations changed: NO
+- SQL changed or executed: NO
+- New tables or columns: NO
+- Existing `status`, `attempt`, `retry_at`, `error_metadata`, and transition constraints were sufficient.
+- Supabase production data was not modified by this task.
+- Supabase live connectivity, deployed schema state, RLS behavior, and live rows were not verified.
+- The Supabase repository query and the in-memory fallback both implement the same bounded recovery status set.
 
-## 9. REMAINING WORK
+## Validation Actually Executed
 
-No additional Core task-system implementation gap is established after Stage 17. Optional or non-core enhancements previously identified include Glass task panels, dashboard task APIs/UI, natural-language task management, task editing/rescheduling, richer history/error browsing, and notification-destination management. These are not assigned numbered stages by current repository history and are not required to claim the durable Telegram task lifecycle implemented by Stages 1–17.
+- Focused recovery/repository tests: `python3 -m pytest tests/test_task_scheduler.py tests/test_task_repository.py -q --no-header` - 21 passed.
+- Broader focused task tests: `python3 -m pytest tests/test_task_scheduler.py tests/test_task_repository.py tests/test_task_execution.py tests/test_stage17.py tests/test_retry.py -q --no-header` - 32 passed.
+- Full suite: `python3 -m pytest tests/ -q --no-header` - 1161 passed, 23 skipped, 1 warning.
+- Compile validation: `python3 -m compileall -q backend tests` - passed.
+- Whitespace validation: `git diff --check` - passed.
+- Source audit: production references to `interrupted`, `retry_pending`, `claim_occurrence`, `transition_occurrence`, `MAX_ATTEMPTS`, `retry_at`, and `recover()` were searched and reviewed for this boundary.
 
-If future work is requested, it should begin with a fresh source investigation and must not assume that a Stage 18 exists.
+## Live Verification and Limitations
 
-## 10. FINAL DELIVERY STATE
+- Live Telegram behavior: **NOT VERIFIED**.
+- Live Supabase behavior: **NOT VERIFIED**.
+- Deployed process-crash and restart behavior: **NOT VERIFIED**; validation is source- and test-based.
+- External Telegram/tool side effects across a crash boundary: **NOT VERIFIED**; exactly-once behavior is not claimed.
+- Recovery is intentionally bounded to the existing per-start limit. No unbounded recovery sweep was introduced.
+- Optional Glass task UI, dashboard task APIs/UI, natural-language task management, editing/rescheduling, and notification-destination management remain outside this implementation boundary and were not changed.
 
-This report update is a documentation-only commit after verifying the existing Stage 17 delivery.
+## Intentionally Untouched Files and Changes
 
-- **Report commit:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
-- **Report push:** SUCCESS to `origin/main`.
-- **Report remote HEAD:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
-- **Report local HEAD:** `ecf65625ebe1bf6fc42e8d39deeceb8de0a546a6`.
-- **Report local/remote match:** YES.
-- **Final working tree:** `tests/test_stage13.py` remains the only uncommitted modification.
+- `tests/test_stage13.py` is an unrelated pre-existing working-tree modification. It was not edited by this task, staged, committed, or pushed.
+- `INVESTIGATION.md` was not changed; it remains the source-backed investigation that identified this boundary.
+- `backend/ai/task_execution.py` and `backend/ai/retry.py` were reused and not changed for this boundary.
+- Runtime supervisor, Telegram handlers, UI, migrations, SQL, Supabase data, and unrelated services were untouched.
 
-No Stage 17 implementation commit was recreated. No new implementation stage was started.
+## Final Git Delivery Record
 
-No Stage 17 implementation commit was recreated. No Stage 18 work was started.
+- Implementation commit: `1e1b1212f6088c4eac6902af09f26f25418b1dbc`
+- Report commit: THIS DOCUMENTATION COMMIT; final SHA is the local and remote HEAD verified after the report commit is created.
+- Push status: PENDING until the report commit is pushed.
+- Final remote HEAD: recorded after the report push and independently verified with `git fetch`, `git rev-parse origin/main`, and `git ls-remote`.
+- Final local HEAD: recorded after the report commit and independently verified with `git rev-parse HEAD`.
+- Final local/remote equality: recorded after the report push.
+- Final working tree: expected to contain only the pre-existing unstaged modification `M tests/test_stage13.py`.
+
+The implementation was delivered without staging or altering the protected unrelated test change. No future feature or new implementation stage was started.
