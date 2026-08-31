@@ -23,6 +23,7 @@ from typing import Any
 
 from backend.ai.persian import coerce_int, normalize_digits
 from backend.ai.semantic_delete import parse_structural_predicate, spec_from_dict
+from backend.ai.tools.message import MAX_SEND_TEXT_CHARS
 
 # ── Action vocabulary ──
 
@@ -54,6 +55,7 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "save_link",
     "delete_messages",
     "create_task",
+    "send",
     "list_saved_items",
     "search_saved_items",
     "list_recent_messages",
@@ -92,7 +94,7 @@ TARGET_SCOPES = frozenset({
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
     "content", "reason", "link", "message_id", "fields", "request",
-    "until_time", "after_time", "boundary_id", "semantic",
+    "until_time", "after_time", "boundary_id", "semantic", "text",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -152,6 +154,7 @@ class ActionParseResult:
     boundary_id: int | None = None
     semantic: dict[str, Any] | None = None
     schedule_text: str = ""
+    text: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -303,6 +306,28 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             action=action,
             target="schedule",
             schedule_text=req.strip(),
+        )
+
+    if action == "send":
+        # Immediate text-write: the model supplies ONLY the text; the
+        # destination is always the owner's own chat (Saved Messages). A
+        # recipient field is a hard rejection — the model can never choose
+        # where the message goes.
+        if "recipient" in raw:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="'recipient' is not supported for send; the destination is always the owner's own chat.",
+            )
+        text = raw.get("text", raw.get("content", ""))
+        if not isinstance(text, str) or not text.strip():
+            return ActionParseResult(kind=KIND_INVALID, error="Missing 'text' field.")
+        if len(text.strip()) > MAX_SEND_TEXT_CHARS:
+            return ActionParseResult(kind=KIND_INVALID, error="Message text is too long.")
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="saved_messages",
+            text=text.strip(),
         )
 
     if action == "save_link":
@@ -472,6 +497,12 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         # deterministic TaskInterpreter -> TaskCreationService boundary.
         return [{"name": "create_task", "arguments": {"request": result.schedule_text}}]
 
+    if action == "send":
+        # Immediate text-write reuses the SAME registered execution tool the
+        # scheduled path uses — one send implementation, one TelegramAPI
+        # transport, one executor.
+        return [{"name": "send_message", "arguments": {"text": result.text}}]
+
     if action == "list_saved_items":
         return [{"name": "list_saves", "arguments": {}}]
 
@@ -564,6 +595,7 @@ def parse_action_text(text: str) -> ActionParseResult:
             boundary_id=result.boundary_id,
             query=result.query,
             semantic=result.semantic,
+            text=result.text,
             tool_calls=tool_calls,
         )
     return result
@@ -587,6 +619,65 @@ _EN_DELETE = frozenset({"delete", "remove", "deleting", "removing", "deleted", "
 _EN_SAVE = frozenset({"save", "saving", "saved", "store", "storing"})
 _EN_SEND = frozenset({"send", "sending", "forward", "forwarding"})
 _EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
+
+# ── Deterministic text-write intent ──
+# "بنویس سلام" / "write hello" is an IMMEDIATE text-write: it reuses the
+# registered ``send_message`` tool (owner's own Saved Messages chat). Only
+# high-confidence imperative writes resolve here; desire markers ("میخوام",
+# "want"), recipients ("برای X", "to X"), references ("اینو", "this"),
+# and future-time words ("فردا", "tomorrow") are never treated as an
+# immediate text-write — those stay on the provider path.
+_WRITE_TOKENS = frozenset({"بنویس", "نویس", "write", "writing"})
+_WRITE_INTENT_BLOCKERS = frozenset({
+    "میخوام", "میخواهم", "خوام", "میخوایم", "میخوای",
+    "want", "wanna", "would",
+})
+_WRITE_RECIPIENT_MARKERS = frozenset({"برای", "به", "to", "for"})
+_WRITE_REFERENCE_MARKERS = frozenset({
+    "این", "اینو", "اینم", "همین", "همینو", "this", "that", "it",
+})
+_WRITE_FUTURE_MARKERS = frozenset({"فردا", "امشب", "tomorrow", "tonight"})
+
+
+def _is_write_token(tok: str) -> bool:
+    """True when *tok* is an imperative write verb (بنویس/بنویسید/write)."""
+    if tok in _WRITE_TOKENS:
+        return True
+    if tok.startswith("بنویسید") or tok.startswith("بنویسین") or tok.startswith("بنویسش"):
+        return True
+    return False
+
+
+def _write_text_present(words: list[str]) -> bool:
+    return any(_is_write_token(w) for w in words)
+
+
+def _extract_write_text(words: list[str]) -> str | None:
+    """Extract bounded text for a deterministic immediate text-write.
+
+    Returns None when the request is not a safe text-write: no imperative
+    write verb, no remaining text, a desire marker ("I want to write..."),
+    a recipient/reference ("write this to Ali"), or a future-time word.
+    """
+    if any(w in _WRITE_INTENT_BLOCKERS for w in words):
+        return None
+    verb_index = -1
+    for i, tok in enumerate(words):
+        if _is_write_token(tok):
+            verb_index = i
+            break
+    if verb_index < 0 or verb_index + 1 >= len(words):
+        return None
+    rest = words[verb_index + 1:]
+    if any(
+        w in _WRITE_RECIPIENT_MARKERS or w in _WRITE_REFERENCE_MARKERS or w in _WRITE_FUTURE_MARKERS
+        for w in rest
+    ):
+        return None
+    text = " ".join(rest).strip()
+    if not text or len(text) > MAX_SEND_TEXT_CHARS:
+        return None
+    return text
 
 _THIS_TOKENS = frozenset({"این", "اینو", "اینم", "همین", "همینو", "this", "that", "it"})
 _LAST_TOKENS = frozenset({"آخر", "آخرین", "آخری", "آخریه", "اخیر", "last", "latest", "recent"})
@@ -1138,8 +1229,24 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
 
     link_url = _extract_telegram_link(text)
 
-    # Send is recognized but deliberately has no executor wired.
-    if send_pos and not do_delete and not do_save:
+    write_pos = _write_text_present(words)
+
+    # Immediate text-write ("بنویس سلام", "write hello") resolves
+    # deterministically to the registered send_message tool — the owner's
+    # own Saved Messages chat. Recipient/reference/forward sends ("اینو برای
+    # علی بفرست", "forward this") stay unsupported: the architecture never
+    # lets the model choose a destination.
+    if (send_pos or write_pos) and not do_delete and not do_save:
+        if write_pos:
+            text = _extract_write_text(words)
+            if text:
+                return ActionParseResult(
+                    kind=KIND_EXECUTABLE,
+                    action="send",
+                    target="saved_messages",
+                    text=text,
+                    tool_calls=[{"name": "send_message", "arguments": {"text": text}}],
+                )
         return ActionParseResult(kind=KIND_UNSUPPORTED, action="send")
 
     if do_delete and do_save:
