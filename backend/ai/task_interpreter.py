@@ -41,8 +41,12 @@ class TaskInterpreter:
             raise TaskInterpretationError("task request is empty or too long")
         instructions = (
             "Return exactly one JSON object matching the supplied task candidate schema. "
-            "Do not include owner identity. Do not execute tools. If any required detail "
-            "is ambiguous or missing, return JSON null."
+            "Do not include owner identity, chat ids, or destinations. Do not execute tools. "
+            "If any required detail is ambiguous or missing, return JSON null. "
+            "For any message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
+            "exactly the action name 'send_message' with a single 'text' argument containing "
+            "the exact message content; the destination is fixed by the runtime and must not "
+            "be included. Use no other action name for message writing."
         )
         if isinstance(timezone, str) and timezone.strip():
             instructions += (

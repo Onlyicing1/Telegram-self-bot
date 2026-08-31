@@ -433,11 +433,21 @@ def test_registry_has_no_arbitrary_telegram_or_exec_tools():
 
     registry = create_default_registry(ToolContext(telegram=None, owner_id=1, tz_str="UTC"))
     names = set(registry.list_names())
+    # No ARBITRARY Telegram method / RPC / shell / file / secret access is ever
+    # exposed. The single deliberate exception is the bounded ``send_message``
+    # tool: it accepts ONLY a ``text`` argument and sends exclusively to the
+    # owner's own Saved Messages chat resolved from trusted runtime context —
+    # no destination, method, or peer is ever supplied by the model.
     for forbidden in (
         "telegram_method", "call_rpc", "exec", "eval", "shell", "run_python",
-        "send_message", "forward_messages", "read_file", "get_secret", "get_env",
+        "forward_messages", "read_file", "get_secret", "get_env",
     ):
         assert forbidden not in names
+    tool = registry.get("send_message")
+    assert tool is not None
+    assert set(tool.parameters) == {"text"}
+    assert tool.parameters["text"]["type"] == "string"
+    assert tool.permission_level.value in ("read_only", "read_write")
 
 
 @pytest.mark.asyncio

@@ -143,6 +143,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     from backend.ai.tools.organize import OrganizeListTool, OrganizeCleanTool
     from backend.ai.tools.websearch import WebSearchTool
     from backend.ai.tools.task import CreateTaskTool
+    from backend.ai.tools.message import SendMessageTool
 
     if context.telegram is None and context.client is not None:
         from backend.telegram_api import TelegramAPI
@@ -187,5 +188,6 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(OrganizeCleanTool(context))
     registry.register(WebSearchTool(context))
     registry.register(CreateTaskTool(context))
+    registry.register(SendMessageTool(context))
 
     return registry

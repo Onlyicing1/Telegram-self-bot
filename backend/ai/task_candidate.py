@@ -10,6 +10,35 @@ from backend.ai.scheduling import ScheduleError, parse_schedule
 MAX_LABEL_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
 
+# ── Canonical task-execution actions ──
+#
+# A candidate's actions are executed later by the registered ToolExecutor, so
+# every persisted action name must resolve to a registered tool. Message
+# writing is the canonical scheduled action: the model may emit any alias
+# below, but each is normalized to the single registered ``send_message``
+# tool carrying ONLY a bounded ``text`` argument. Destination/owner identity
+# are never accepted from the model — the execution tool resolves the
+# owner's own chat from trusted runtime context. Anything else (unknown
+# action names, destination fields) remains the existing execution-time
+# registry check's responsibility and fails safely there.
+MAX_SEND_TEXT_CHARS = 4096
+_SEND_ACTION_ALIASES = frozenset({"send", "send_message", "write_message", "send_text"})
+_SEND_TEXT_ALIASES = frozenset({"text", "content", "message", "body"})
+
+
+def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one untrusted action to the registered execution contract."""
+    name = action["name"].strip()
+    args = dict(action.get("arguments") or {})
+    if name not in _SEND_ACTION_ALIASES:
+        return {"name": name, "arguments": args}
+    text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_SEND_TEXT_CHARS:
+        raise TaskCandidateError("message action requires bounded nonblank text content")
+    # Only the bounded text travels forward — a model can never smuggle a
+    # destination, recipient, chat id, or raw Telegram method into the action.
+    return {"name": "send_message", "arguments": {"text": text.strip()}}
+
 
 class TaskCandidateError(ValueError):
     """Candidate is malformed, incomplete, ambiguous, or unsafe."""
@@ -44,12 +73,14 @@ class TaskCandidate:
             raise TaskCandidateError("schedule and notification destination must be objects")
         if not isinstance(actions, list) or not 1 <= len(actions) <= MAX_ACTIONS:
             raise TaskCandidateError("actions must contain 1 through 5 items")
+        canonical: list[dict[str, Any]] = []
         for action in actions:
             if not isinstance(action, dict) or not isinstance(action.get("name"), str) or not action["name"].strip():
                 raise TaskCandidateError("each action requires a tool name")
             args = action.get("arguments", {})
             if not isinstance(args, dict):
                 raise TaskCandidateError("action arguments must be objects")
+            canonical.append(_canonicalize_action(action))
         if len(str(value).encode()) > MAX_PAYLOAD_BYTES:
             raise TaskCandidateError("candidate exceeds bounded payload size")
         try:
@@ -58,7 +89,7 @@ class TaskCandidate:
             raise TaskCandidateError(str(exc)) from exc
         if value["schedule_type"] != "interval" and schedule.get("timezone") != timezone:
             raise TaskCandidateError("schedule timezone must match task timezone")
-        return cls(label.strip(), value["schedule_type"], dict(schedule), timezone.strip(), [dict(a) for a in actions], dict(destination))
+        return cls(label.strip(), value["schedule_type"], dict(schedule), timezone.strip(), canonical, dict(destination))
 
     def as_creation_candidate(self) -> dict[str, Any]:
         return {

@@ -66,6 +66,7 @@ _STATUS_LABELS: dict[str, str] = {
     "settings_get": "⚙️ Checking settings...",
     "settings_set": "⚙️ Updating settings...",
     "create_task": "🗓 Creating task...",
+    "send_message": "📨 Sending message...",
     "get_bio": "👤 Reading bio...",
     "bio_show": "👤 Checking bio...",
     "bio_template": "👤 Updating bio...",
