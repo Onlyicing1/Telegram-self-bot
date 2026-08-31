@@ -36,15 +36,21 @@ class TaskInterpreter:
     def __init__(self, provider_manager: Any) -> None:
         self._providers = provider_manager
 
-    async def interpret(self, request: str) -> TaskCandidate:
+    async def interpret(self, request: str, timezone: str = "") -> TaskCandidate:
         if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
             raise TaskInterpretationError("task request is empty or too long")
+        instructions = (
+            "Return exactly one JSON object matching the supplied task candidate schema. "
+            "Do not include owner identity. Do not execute tools. If any required detail "
+            "is ambiguous or missing, return JSON null."
+        )
+        if isinstance(timezone, str) and timezone.strip():
+            instructions += (
+                f" Use the IANA timezone '{timezone.strip()}' for both the schedule "
+                "timezone and the task timezone; interval schedules carry no timezone field."
+            )
         messages = [
-            {"role": "system", "content": (
-                "Return exactly one JSON object matching the supplied task candidate schema. "
-                "Do not include owner identity. Do not execute tools. If any required detail "
-                "is ambiguous or missing, return JSON null."
-            )},
+            {"role": "system", "content": instructions},
             {"role": "system", "content": json.dumps(CANDIDATE_SCHEMA, separators=(",", ":"))},
             {"role": "user", "content": request.strip()},
         ]

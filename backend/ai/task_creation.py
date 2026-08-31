@@ -1,11 +1,16 @@
 """Deterministic task creation boundary for authorized callers."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from backend.ai.database.task_repository import TaskRecord, TaskRepository
-from backend.ai.scheduling import ScheduleError, parse_schedule, next_occurrence
+from backend.ai.scheduling import (
+    ScheduleError,
+    advance_interval,
+    next_occurrence,
+    parse_schedule,
+)
 from backend.ai.task_candidate import TaskCandidate
 
 
@@ -38,7 +43,18 @@ class TaskCreationService:
             schedule = parse_schedule(candidate["schedule_type"], candidate["schedule"])
             initial = candidate.get("next_run_at")
             if initial is None:
-                initial = next_occurrence(schedule, reference)
+                if candidate["schedule_type"] == "interval":
+                    # A brand-new recurring interval task has no previous
+                    # occurrence, so `next_occurrence` (which requires one for
+                    # intervals) cannot anchor it. Schedule the first run one
+                    # interval after the reference time; the scheduler advances
+                    # subsequent occurrences through its normal catch-up path.
+                    interval = getattr(schedule, "interval", None)
+                    if not isinstance(interval, timedelta) or interval <= timedelta(0):
+                        raise ScheduleError("interval must be positive")
+                    initial = advance_interval(reference, interval, reference)
+                else:
+                    initial = next_occurrence(schedule, reference)
         except (ScheduleError, TypeError, ValueError) as exc:
             raise TaskCreationError(str(exc)) from exc
         payload = {key: candidate[key] for key in required}

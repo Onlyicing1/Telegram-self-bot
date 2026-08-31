@@ -33,6 +33,7 @@ ACTION_NAMES = frozenset({
     "deep_save",
     "save_link",
     "delete_messages",
+    "create_task",
     "list_saved_items",
     "search_saved_items",
     "list_recent_messages",
@@ -52,6 +53,7 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "deep_save",
     "save_link",
     "delete_messages",
+    "create_task",
     "list_saved_items",
     "search_saved_items",
     "list_recent_messages",
@@ -89,7 +91,7 @@ TARGET_SCOPES = frozenset({
 # smuggle an unknown field through to execution.
 ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
-    "content", "reason", "link", "message_id", "fields",
+    "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic",
 })
 
@@ -149,6 +151,7 @@ class ActionParseResult:
     after_time: str = ""
     boundary_id: int | None = None
     semantic: dict[str, Any] | None = None
+    schedule_text: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -284,6 +287,24 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     # Save-by-link: the link is the target. The URL is preserved verbatim and
     # validated only for the Telegram-link shape — the tool re-validates it
     # authoritatively before any Telegram call.
+
+    # Create a durable scheduled task. The model never controls execution or
+    # owner identity — the request text flows through the deterministic
+    # TaskInterpreter -> TaskCreationService boundary, which validates the
+    # schedule, actions, and persistence under the trusted owner.
+    if action == "create_task":
+        req = raw.get("request")
+        if not isinstance(req, str) or not req.strip():
+            return ActionParseResult(kind=KIND_INVALID, error="Missing 'request' field.")
+        if len(req.strip()) > 2000:
+            return ActionParseResult(kind=KIND_INVALID, error="Task request is too long.")
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="schedule",
+            schedule_text=req.strip(),
+        )
+
     if action == "save_link":
         link = raw.get("link", "")
         if not isinstance(link, str):
@@ -445,6 +466,11 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         # The existing execute_link_save() resolves the link and reuses the
         # SAME Deep Save pipeline. The URL is passed through verbatim.
         return [{"name": "save_by_link", "arguments": {"link": result.link}}]
+
+    if action == "create_task":
+        # Routes into the registered create_task tool, which reuses the
+        # deterministic TaskInterpreter -> TaskCreationService boundary.
+        return [{"name": "create_task", "arguments": {"request": result.schedule_text}}]
 
     if action == "list_saved_items":
         return [{"name": "list_saves", "arguments": {}}]
@@ -980,6 +1006,69 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
     return None
 
 
+# ── Scheduling-intent detection ──
+# A natural-language scheduling request (a recurring interval, a daily/weekly
+# cadence, or a planned reminder/time) must reach the durable task boundary
+# instead of being diverted into the send/delete/save command vocabulary.
+# Detection is deliberately conservative: a strong cadence OR an explicit
+# plan/reminder verb AND an action verb. Ambiguous at-time deletes stay on
+# the provider path (which now also exposes the create_task tool) rather than
+# being guessed as scheduled.
+
+_FA_RECUR_WORDS = frozenset({
+    "روزانه", "هفتگی", "ماهانه", "سالانه", "تکرار", "تکرارش",
+    "مداوم", "همیشه", "دائمی", "مرتب",
+})
+_EN_RECUR_WORDS = frozenset({
+    "daily", "weekly", "monthly", "yearly", "recurring", "repeat",
+    "repeated", "always", "continuously", "regularly",
+})
+_INTERVAL_INTRO = frozenset({"هر", "every", "each", "once"})
+_TIME_UNITS = frozenset({
+    "دقیقه", "دقیقه‌ای", "دقیق", "ساعت", "ثانیه", "روز", "شب",
+    "هفته", "ماه", "سال",
+    "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+    "second", "seconds", "sec", "secs", "day", "days", "week", "weeks",
+    "month", "months", "year", "years",
+})
+_FA_PLAN_WORDS = frozenset({"برنامه", "تنظیم", "یادآوری", "زمان‌بندی", "زنگ"})
+_EN_PLAN_WORDS = frozenset({"plan", "schedule", "remind", "reminder", "alarm", "timer"})
+_FUTURE_REF_WORDS = frozenset({"فردا", "امشب", "امروز", "tomorrow", "tonight", "today"})
+_FA_ACTION_VERBS = frozenset({
+    "بنویس", "بفرست", "بگو", "بزن", "پاک", "حذف", "سیو",
+    "ذخیره", "ارسال", "یادآوری", "خبر", "نویس",
+    "کن", "کنی", "کنید", "کنیم", "کنه", "کند",
+})
+_EN_ACTION_VERBS = frozenset({
+    "write", "say", "send", "post", "delete", "remove", "clean", "clear",
+    "greet", "tell", "notify", "print", "repeat", "remind", "set",
+    "create", "share", "ask", "deliver", "repeat",
+})
+
+
+def _has_action_verb(words: list[str]) -> bool:
+    return any(w in _FA_ACTION_VERBS or w in _EN_ACTION_VERBS for w in words)
+
+
+def _has_time_unit(words: list[str], start: int) -> bool:
+    return any(w in _TIME_UNITS for w in words[max(0, start):min(len(words), start + 5)])
+
+
+def _is_scheduling_intent(words: list[str]) -> bool:
+    """True when the message clearly requests a recurring/planned task."""
+    if not words or not _has_action_verb(words):
+        return False
+    if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
+        return True
+    for i, w in enumerate(words):
+        if w in _INTERVAL_INTRO and _has_time_unit(words, i + 1):
+            return True
+    if any(w in _FA_PLAN_WORDS or w in _EN_PLAN_WORDS for w in words):
+        if _has_time_unit(words, 0) or any(w in _FUTURE_REF_WORDS for w in words):
+            return True
+    return False
+
+
 def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
     """Deterministically parse a Persian/English executable command.
 
@@ -994,6 +1083,20 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
     words = _tokenize(text)
     if not words:
         return ActionParseResult(kind=KIND_CONVERSATIONAL)
+
+    # A clear scheduling request routes to the deterministic task boundary
+    # before the send/delete/save command vocabulary can divert it. The action
+    # runs only through the create_task tool (TaskInterpreter ->
+    # TaskCreationService); the interpreter fabricates nothing when ambiguous.
+    if _is_scheduling_intent(words):
+        request_text = text.strip()
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="create_task",
+            target="schedule",
+            schedule_text=request_text,
+            tool_calls=[{"name": "create_task", "arguments": {"request": request_text}}],
+        )
 
     is_deep = any(w in _DEEP_TOKENS for w in words)
     is_this = any(w in _THIS_TOKENS for w in words)
