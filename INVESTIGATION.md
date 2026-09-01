@@ -2,231 +2,160 @@
 
 ## PROBLEM
 
-The exact request `هر 1 دقیقه یک بار برای من بنویس سلام` does not create a durable Taskloom task in the deployed service. No task row is inserted, while the user observes `Tool round limit reached`. The immediate request `بنویس سلام` can execute, and the Taskloom UI can render.
+The exact outgoing request `هر 1 دقیقه یک بار برای من بنویس سلام` is reported in production as returning `I could not turn that into a safe, unambiguous schedule...` with no durable task row. The current nested repository is `Onlyicing1/Telegram-self-bot`, branch `main`, at `e5c97295ed7c11e5ec15add33b3a9e6403c59288`. The outer workspace contains a pre-existing unrelated `tests/test_stage13.py` modification; it was not inspected for this investigation's implementation and remains outside the nested repository.
 
-## ROOT CAUSE
+## EXACT CURRENT EXECUTION PATH
 
-**CONFIRMED:** The deterministic scheduling parser exists in `backend/ai/actions.py`, but the normal natural-language AI path is not guaranteed to invoke it before provider execution. The incoming message is routed by `backend/bot/handlers/ai_unified.py` into the AI dispatcher/provider flow. In that flow, scheduling is represented as a provider-selected `create_task` action/tool rather than as an unconditional deterministic pre-provider classification. A provider/tool-round exhaustion therefore returns `Tool round limit reached` before `create_task` reaches task creation or persistence.
-
-**LIKELY:** The reported failure is caused by provider routing/tool-round exhaustion consuming the request before the provider emits a valid `create_task` call. This explains the absence of a database row more directly than a Persian interval parsing defect.
-
-**UNKNOWN:** The exact production provider response and number of rounds for this specific Telegram message are not available in the repository. Source inspection cannot prove whether the provider emitted malformed output, selected another tool repeatedly, or exhausted rounds for another provider-specific reason.
-
-## RELEVANT FILES
-
-- `backend/bot/handlers/ai_unified.py`
-- `backend/ai/engine/dispatcher.py`
-- `backend/ai/actions.py`
-- `backend/ai/task_interpreter.py`
-- `backend/ai/task_candidate.py`
-- `backend/ai/tools/task.py`
-- `backend/ai/task_creation.py`
-- `backend/ai/database/task_repository.py`
-- `backend/ai/task_scheduler.py`
-- `backend/ai/task_execution.py`
-- `backend/runtime/supervisor.py`
-- `backend/runtime/task_guard.py`
-- `backend/health.py`
-- relevant tests under `tests/`
-
-## RELEVANT FUNCTIONS / CLASSES
-
-- `ai_unified` outgoing-message handler and its AI request construction
-- `Dispatcher.dispatch()` / provider execution and local action handling
-- `parse_command_intent()` and scheduling-intent helpers in `backend/ai/actions.py`
-- `parse_action_text()` / `validate_action()` / `resolve_tool_calls()`
-- `TaskInterpreter.interpret()`
-- `CreateTaskTool.execute()`
-- `TaskCreationService.create()`
-- `TaskRepository.create_task()` implementations
-- `TaskScheduler.start()`, `recover()`, `run_once()`
-- `TaskExecutionCoordinator.execute()`
-- runtime supervisor scheduler startup
-- task snapshot/diagnostic logic in `backend/runtime/task_guard.py` and health diagnostics
-
-## CURRENT EXECUTION PATH
-
-For `هر 1 دقیقه یک بار برای من بنویس سلام`, the source-supported path is:
+The active source path is:
 
 ```text
 Telegram outgoing NewMessage
-  -> backend/bot/handlers/ai_unified.py
-  -> AI request with original message text and runtime context
-  -> backend/ai/engine/dispatcher.py
-  -> provider/tool loop
-  -> provider must return a structured create_task action, or provider text must be parsed
-  -> backend/ai/actions.py validates create_task and builds {name: create_task, request: ...}
-  -> backend/ai/tools/task.py::CreateTaskTool.execute
-  -> TaskInterpreter.interpret(request)
-  -> TaskCreationService.create(...)
-  -> TaskRepository.create_task(...)
-  -> persisted task/occurrence rows
+  -> backend/bot/handlers/ai_unified.py::register
+     -> ai_unified_handler
+     -> _execute_ai
+     -> AIRequest(user_message=prompt_text, chat_id=event.chat_id, ...)
+  -> backend/ai/engine/engine.py::Engine.execute
+  -> backend/ai/engine/dispatcher.py::Dispatcher.dispatch
+     -> conversation runtime
+     -> existing _try_local_fast_path(request, ...)
+        -> parse_command_intent(request.user_message, has_reply=...)
+     -> if no fast-path result: prompt builder
+     -> ProviderManager.chat(...)
+     -> structured-action parsing / provider tool loop
+     -> ToolExecutor.execute_calls
+        -> create_task tool, if the provider emits one
+     -> backend/ai/tools/task.py::CreateTaskTool.execute
+     -> TaskInterpreter.interpret
+     -> TaskCreationService.create
+     -> TaskRepository.create_task
+     -> durable task/occurrence persistence
   -> RuntimeSupervisor-owned TaskScheduler
-  -> TaskScheduler.recover()/run_once()
-  -> TaskExecutionCoordinator
-  -> registered ToolExecutor action
+     -> recover/run_once
+     -> TaskExecutionCoordinator
 ```
 
-The critical observed branch ends earlier:
+The handler only activates after the configured `Nova`/Persian trigger or a reply-to-AI condition. It strips the trigger before `_execute_ai`; the request text passed to `AIRequest.user_message` is otherwise the original prompt text. `_execute_ai` captures `event.chat_id` as `AIRequest.chat_id`.
+
+## PRE-PROVIDER ROUTING
+
+**CONFIRMED:** The current committed dispatcher calls `_try_local_fast_path()` after the conversation-runtime stage and before prompt building/provider selection. That method calls `parse_command_intent()` on `request.user_message` and can execute returned tool calls through the existing `ToolExecutor` without a provider round.
+
+**CONFIRMED:** In the current source, `parse_command_intent("هر 1 دقیقه یک بار برای من بنویس سلام", has_reply=False)` is expected to produce an executable `create_task` result: `_tokenize()` normalizes digits; `_is_scheduling_intent()` requires an action verb and recognizes `هر` plus the nearby `دقیقه`; `parse_command_intent()` returns `action="create_task"`, `target="schedule"`, `schedule_text` equal to the stripped original request, and a `create_task` tool call whose `request` is that same text.
+
+**CONFIRMED:** Therefore the repository source does contain a pre-provider interception for this exact phrase. The prior investigation's statement that the parser was not guaranteed to run before providers is superseded by the current committed dispatcher code.
+
+**IMPORTANT LIMITATION:** The fast path is conditional on both `request.allow_tools` and `self._tool_executor is not None`. `AIRequest.allow_tools` defaults to true in the inspected request contract, but the live runtime's actual request/engine wiring must be confirmed from deployment logs to prove those conditions held for the reported event.
+
+**CONFIRMED SOURCE-LEVEL FAILURE POSSIBILITY:** If the dispatcher has no attached tool executor, the condition `tools_allowed and self._tool_executor is not None` is false, so the parser is not invoked at all and the request proceeds to the provider. `Engine.__init__` initially creates an executor only when a tool registry is supplied; later runtime attachment is responsible for wiring tools. The exact deployed engine wiring for the failing event is not available in this repository snapshot.
+
+## EXACT FAILURE POINT
+
+The exact schedule-rejection text is generated in `backend/ai/tools/task.py::CreateTaskTool.execute()` inside its exception handler around `TaskInterpreter(provider_manager).interpret(...)`:
 
 ```text
-provider/tool loop
-  -> tool rounds exhausted
-  -> `Tool round limit reached`
-  -> no create_task tool call
-  -> no TaskInterpreter call
-  -> no TaskCreationService call
-  -> no TaskRepository insert
+I could not turn that into a safe, unambiguous schedule, so I did not create any task...
 ```
 
-The repository proves that `create_task` is an executable action and has a service/repository path, but it does not prove that every natural-language request is deterministically classified as `create_task` before provider dispatch.
+The handler catches `TaskInterpretationError`, `asyncio.TimeoutError`, and all other exceptions and returns a failed `ToolResult` with that message. Thus, if the observed text is exactly this message, the source-level implication is that `CreateTaskTool.execute()` was reached and its interpreter call raised or timed out. This contradicts the older hypothesis that the message necessarily means the provider exhausted before `create_task`; the wording itself identifies the CreateTaskTool exception branch.
 
-## ROUTING FINDINGS
+**CONFIRMED:** The provider/tool-round exhaustion text is generated elsewhere, in `backend/ai/engine/dispatcher.py` when pending provider tool calls remain after `MAX_TOOL_ROUNDS`, and is rendered by `ai_unified.py::_describe_empty_result()` / response delivery. It is a different failure message. The reported schedule-rejection wording is not the dispatcher round-limit wording.
 
-**CONFIRMED:** `create_task` is present in the action vocabulary, executable action set, and tool resolution path in `backend/ai/actions.py`. It requires a non-empty `request` field and resolves to the registered `create_task` tool.
+**UNKNOWN:** The supplied production observation combines a schedule-rejection message with a separate observation of `Tool round limit reached`; without the raw request telemetry, it cannot be proven whether these occurred in the same dispatch or in separate attempts.
 
-**CONFIRMED:** The provider is involved in the ordinary AI request path. The dispatcher performs provider/tool rounds and has a maximum-round failure represented by `Tool round limit reached`.
+## TASK INTERPRETER / CREATION PATH
 
-**CONFIRMED:** Immediate write handling has a deterministic local path for `بنویس سلام` / `write hello`, which explains why that comparison case can work without the same scheduling classification.
+There are two possible current paths:
 
-**CONFIRMED:** The scheduling helpers and deterministic command-intent machinery are not equivalent to a universal pre-provider classifier. Their existence does not establish that the unified natural-language handler always invokes them before provider dispatch.
+1. **Local fast path active:** `Dispatcher._try_local_fast_path()` recognizes the request, calls `ToolExecutor.execute_calls()` with `create_task`, and `CreateTaskTool.execute()` is reached. `CreateTaskTool` obtains `provider_manager` from trusted context and calls the bounded provider-backed `TaskInterpreter`. If that interpretation raises, the exact safe-schedule message is returned before `TaskCreationService` and `TaskRepository`.
+2. **Fast path unavailable:** if tools are disabled or no executor is attached, `_try_local_fast_path()` is skipped; the normal provider path runs. A provider-emitted `create_task` call can still reach `CreateTaskTool`, while provider round exhaustion can prevent it from being reached.
 
-**LIKELY:** The provider is currently allowed to decide whether a natural-language request becomes a scheduled task by emitting `create_task`. Therefore the provider can consume or exhaust the request before deterministic scheduling gets a chance to create a task.
+`CreateTaskTool` then converts a valid `TaskCandidate` to a creation candidate, resolves an explicit `chat_name` through the authenticated client's dialogs, or stores the trusted current request chat from `context.extra["chat_id"]`. Only after that does it call `TaskCreationService.create(...)`. The repository insert is therefore downstream of successful interpretation and destination handling.
 
-## TASK INTERPRETER FINDINGS
+For the reported exact schedule-rejection message, **CONFIRMED:** the CreateTaskTool failure branch is the direct source. **LIKELY:** `TaskInterpreter.interpret()` failed to obtain/validate a structured candidate from its provider response, or timed out. **UNKNOWN:** the exact provider response and exception are not present in the repository.
 
-`TaskInterpreter` is a bounded provider-backed interpreter for a task request. Its contract validates a structured schedule/action candidate; it is not itself the first Telegram-message router.
+## REQUEST DECOMPOSITION
 
-The current candidate normalization supports canonical `send_message` action aliases and interval schedule fields. The surrounding source and tests cover Persian and English interval forms, including forms equivalent to `هر 1 دقیقه`, `هر یک دقیقه`, `هر 5 دقیقه`, `every minute`, and `every 5 minutes`.
+At the deterministic action-parser level, the exact request decomposes as:
 
-**CONFIRMED:** The exact Persian phrase is recognized by the deterministic scheduling-intent logic in `actions.py` based on normalized digits, interval introduction, and a time-unit token. The phrase includes `هر`, `1`, `دقیقه`, and `یک بار`; the tokenizer normalizes the numeric digit and preserves the Persian time unit.
+- **Recurrence:** high-confidence recurring interval intent.
+- **Interval:** recurrence marker `هر`; time unit `دقیقه`; numeric token `1`; `یک بار` is retained as wording and does not prevent interval recognition.
+- **Action:** Persian write verb `بنویس`; deterministic parser maps the whole request to `create_task`, not immediate `send`.
+- **Task request:** the stripped original string is passed as `arguments["request"]`.
+- **Destination:** no explicit chat name is present; `CreateTaskTool` uses trusted `context.extra["chat_id"]` when available. The model cannot supply an arbitrary numeric destination through this fallback.
+- **Owner/context:** `AIRequest.owner_id` comes from the owner-gated handler; `AIRequest.chat_id` comes from the Telegram event; `CreateTaskTool` uses the context owner and dispatcher-injected request chat.
 
-**CONFIRMED:** If `TaskInterpreter.interpret()` is reached and the provider returns a valid candidate, the candidate can represent an interval schedule and a message action.
+The deterministic parser does not itself extract the final schedule interval or action payload; that remains the responsibility of `TaskInterpreter`, which is provider-backed and validates the resulting `TaskCandidate`.
 
-**UNKNOWN:** No live provider response for this exact phrase is available, so the exact candidate produced in production cannot be proven. The source also does not prove that the interpreter is reached in the failing run.
+## TEST COVERAGE
 
-## PERSISTENCE FINDINGS
+Current nested repository test inventory does not contain the previously reported `tests/test_taskloom_milestone.py`, `tests/test_taskloom_ui.py`, or `tests/test_send_write_immediate.py`. The available focused test `tests/test_task_nl_creation.py` was run during this investigation and passed 11 tests, but it exercises task interpretation/creation behavior rather than proving the live `Dispatcher.dispatch()` path with a provider that would fail if called.
 
-**CONFIRMED:** Task creation persists through `CreateTaskTool` -> `TaskCreationService.create()` -> owner-scoped `TaskRepository.create_task()` in the task database repository. The repository handles task ownership, initial status/version, and durable task/occurrence persistence according to its existing schema contract.
+The source contains parser coverage in the repository's existing tests/history, but the current checkout provides no focused test file proving all of the following together:
 
-**CONFIRMED:** The failing request does not reach persistence if `Tool round limit reached` is returned first. Therefore the missing database row is a consequence of the earlier routing/provider failure, not evidence that the database insert itself is the primary failure.
+- actual `ai_unified` handler activation,
+- actual `Engine.execute`/`Dispatcher.dispatch`,
+- an attached runtime `ToolExecutor`,
+- exact Persian request,
+- zero provider calls,
+- and successful `CreateTaskTool` persistence.
 
-**UNKNOWN:** Live Supabase availability, RLS behavior, and production insert errors were not inspected or exercised. No SQL was executed.
+**CONFIRMED COVERAGE GAP:** parser-level recognition is not equivalent to end-to-end production-path proof. A passing parser/task test can coexist with a runtime whose tool executor is absent, whose TaskInterpreter provider fails, or whose deployed commit differs from the checkout.
 
-## SCHEDULER FINDINGS
+## REGRESSION / IMPLEMENTATION STATUS
 
-**CONFIRMED:** `RuntimeSupervisor` owns the Taskloom scheduler lifecycle. The scheduler has startup recovery/loading and a polling execution loop; scheduled execution is separate from task creation.
+The previous intended fix was to connect deterministic scheduling recognition to the dispatcher before provider calls. The current committed source now visibly contains that connection: `Dispatcher.dispatch()` calls `_try_local_fast_path()` before prompt/provider execution, and `_try_local_fast_path()` calls `parse_command_intent()`.
 
-**CONFIRMED:** Task creation and scheduled execution use the supervisor-created scheduler architecture rather than a second scheduler path in the inspected source.
+Therefore the fix was **wired and placed before provider execution in the repository code**. It is not accurate to classify the current repository state as simply “never wired.” The remaining confirmed issue is that successful pre-provider classification only selects the existing `create_task` tool; it does not remove the provider-backed `TaskInterpreter` call inside `CreateTaskTool`. A provider failure there can still produce the exact safe-schedule message and no row.
 
-**CONFIRMED:** The scheduler cannot execute a task that was never persisted. In the reported failure, scheduler registration/loading is downstream of the missing insert.
+No duplicate scheduler, executor, or Telegram transport was found in the inspected active path. The current source/report history is internally inconsistent about older destination semantics, but that is not the immediate cause of this schedule-rejection message.
 
-**UNKNOWN:** The production scheduler’s exact runtime state during this request is not proven by source. No live process inspection was performed.
+## ROOT CAUSE
 
-## PROVIDER / TOOL-ROUND FINDINGS
+**CONFIRMED ROOT CAUSE**
 
-**CONFIRMED:** Provider calls occur in the normal AI dispatch path. Structured actions are converted into registered tool calls and executed through the existing tool executor.
+The latest repository code does perform deterministic pre-provider classification, but the exact production failure message is produced after classification by `CreateTaskTool.execute()` when its provider-backed `TaskInterpreter.interpret()` raises or times out. The exception is caught broadly and converted into the safe-schedule rejection, so `TaskCreationService` and `TaskRepository.create_task` are never called and no `ai_tasks` row can be inserted.
 
-**CONFIRMED:** The dispatcher has a bounded tool-round loop and returns `Tool round limit reached` when the maximum is exhausted.
+The exact underlying interpreter exception/provider response is not available, so the specific provider-side reason for interpreter failure remains unknown. The evidence rules out treating the failure as a pure Persian interval-matcher miss in the current repository.
 
-**CONFIRMED:** A round-limit result prevents a later `create_task` tool call in that dispatch, so `TaskInterpreter`, `TaskCreationService`, and `TaskRepository.create_task` are not reached by that request.
+## EVIDENCE
 
-**LIKELY:** Scheduling is unnecessarily dependent on provider tool selection for ordinary natural-language scheduling requests, because the deterministic scheduling vocabulary exists but is not established as an unconditional pre-provider route.
+- `backend/bot/handlers/ai_unified.py::ai_unified_handler` owner-gates outgoing messages, detects the trigger/reply activation, and calls `_execute_ai`.
+- `backend/bot/handlers/ai_unified.py::_execute_ai` constructs `AIRequest` with `user_message=prompt_text`, `owner_id=owner_id`, and `chat_id=event.chat_id`.
+- `backend/ai/engine/engine.py::Engine.execute` delegates to `Dispatcher.dispatch`.
+- `backend/ai/engine/dispatcher.py::Dispatcher.dispatch` invokes `_try_local_fast_path` before prompt building/provider calls when tools are allowed and an executor is attached.
+- `backend/ai/engine/dispatcher.py::_try_local_fast_path` calls `parse_command_intent` and executes the resulting `create_task` call through `ToolExecutor`.
+- `backend/ai/actions.py::_is_scheduling_intent` checks action verbs, recurrence vocabulary, and interval introduction/time-unit proximity; `parse_command_intent` returns `create_task` for the exact phrase at source level.
+- `backend/ai/tools/task.py::CreateTaskTool.execute` calls `TaskInterpreter.interpret` and catches all interpretation exceptions with the exact reported safe-schedule message.
+- `backend/ai/task_interpreter.py::TaskInterpreter.interpret` is provider-backed and returns a validated candidate or raises `TaskInterpretationError`.
+- `backend/ai/task_creation.py::TaskCreationService.create` and `backend/ai/database/task_repository.py::TaskRepository.create_task` are downstream persistence boundaries.
+- `backend/ai/engine/dispatcher.py` separately reports tool-round exhaustion when pending provider tool calls remain after `MAX_TOOL_ROUNDS=3`.
+- `backend/ai/task_scheduler.py` and `backend/runtime/supervisor.py` place scheduling/execution downstream of persistence; they cannot execute a task that was never created.
+- `tests/test_task_nl_creation.py` passed 11 tests, but no current test proved the complete active handler-to-dispatcher zero-provider-round route.
 
-## DIAGNOSTIC FINDINGS
+## MINIMAL NEXT IMPLEMENTATION TARGET
 
-**CONFIRMED:** The reported diagnostics show recent loop progress, recent Telegram updates/events, recent event dispatch, and recent RPC activity. Those signals do not support a proven event-loop stall during the failed request.
-
-**CONFIRMED:** `TASK_STARVATION` is based on long-lived task snapshots being unchanged/stale. Permanent tasks such as Telethon loops, keepalive, profile scheduler, and task scheduler can remain unchanged while legitimately waiting.
-
-**LIKELY:** The warning is a snapshot-age heuristic rather than proof that the scheduler is blocked, deadlocked, or starved. It is therefore not a demonstrated cause of this failure.
-
-**UNKNOWN:** Without production task stacks or a reproduction with runtime tracing, the warning cannot be ruled out as a secondary operational issue, but the supplied recent-heartbeat evidence does not connect it to task creation failure.
-
-## CONFIRMED FACTS
-
-- The exact request is intended to be recurring and should create a durable interval task.
-- Persian digit normalization and interval/time-unit vocabulary exist.
-- `create_task` is a registered executable action/tool path.
-- Task creation has a repository persistence boundary.
-- The provider/tool loop can terminate with `Tool round limit reached`.
-- A round-limit termination occurs before a task insert if no `create_task` call has been emitted.
-- Immediate `بنویس سلام` has a distinct deterministic immediate-write path.
-- No database row means the task creation boundary was not completed for the observed request.
-- The supplied health signals show recent loop/update/event/RPC activity.
-- No source, schema, or runtime evidence proves a scheduler deadlock for this request.
-
-## LIKELY CAUSES
-
-- Provider selection/tool-loop exhaustion occurs before scheduling intent is converted into `create_task`.
-- The deterministic scheduling parser is a safety/fallback mechanism rather than the mandatory first routing boundary for unified natural-language requests.
-- The production provider may be failing to emit the exact structured `create_task` payload required by the dispatcher/interpreter contract.
-
-## UNKNOWN / MISSING EVIDENCE
-
-- The exact deployed commit/configuration/provider model at failure time.
-- The provider’s raw responses and tool-call sequence for the exact Persian phrase.
-- Whether the failing request entered a local fast path, provider path, or provider fallback branch in that specific production event.
-- The exact TaskInterpreter candidate/error, if the interpreter was invoked.
-- Live Supabase insert/RLS outcome.
-- Live scheduler task stacks and persisted-task count during the incident.
-
-## DESIRED BEHAVIOR
-
-The incoming phrase should be classified as a high-confidence recurring request before ordinary provider reasoning can consume it. It should produce a validated interval task with action text `سلام`, persist it under the authenticated owner, and record the trusted task-creation chat/context as its default destination. The scheduler should later load and execute the durable task through the existing registered tool and TelegramAPI boundaries.
-
-## IMPLEMENTATION PLAN
-
-Do not implement in this investigation. The smallest future implementation boundary is:
-
-1. Establish a deterministic, pre-provider scheduling-intent route for high-confidence Persian/English recurring requests.
-2. Pass the original request unchanged into the existing task creation/interpreter/service boundary.
-3. Preserve ordinary conversational/provider routing for non-scheduled requests such as `پری یه سرچ بزن` and ordinary immediate actions.
-4. Add focused routing tests proving the exact phrase and comparison cases, including the no-provider-round guarantee for deterministic scheduling.
-5. Keep persistence, scheduler, ownership, destination, and Telegram execution within the existing approved boundaries.
-
-## ALREADY IMPLEMENTED
-
-- Persian/English tokenization and digit normalization in `backend/ai/actions.py`.
-- Deterministic intent vocabulary for scheduling and immediate writes.
-- Structured `create_task` action validation and resolution.
-- `TaskInterpreter` schedule/action candidate validation.
-- `TaskCreationService` and owner-scoped task repository persistence.
-- Durable scheduler polling/recovery and registered-tool execution.
-- Immediate write routing through the existing send tool.
-- Provider tool-round bounding and explicit round-limit failure.
-- Runtime health/diagnostic snapshots and long-lived task monitoring.
-
-## REMAINING WORK
-
-- Prove and implement the pre-provider deterministic scheduling routing boundary in a separate implementation task.
-- Add/adjust only focused regression tests for exact Persian/English scheduling and provider bypass behavior.
-- Reproduce with the deployed provider and capture sanitized provider/tool-round evidence.
-- Separately assess whether the starvation heuristic needs improvement; it is not established as the Taskloom root cause.
-
-## DATABASE / SCHEMA IMPACT
-
-No schema change appears necessary for the routing defect. The existing task persistence contract is downstream and already has the fields needed for interval scheduling, ownership, versioning, and task context. Do not execute SQL or modify Supabase during this investigation.
+Keep the existing dispatcher fast path and approved ToolExecutor/task boundaries. Add the smallest source-grounded reliability change needed so a high-confidence recurring request reaches a deterministic/validated task-creation input without failing solely inside the provider-backed interpretation step, while preserving the existing provider architecture for ordinary AI requests. Before coding, capture the exact `TaskInterpreter` provider contract/response failure in a focused dispatcher-to-tool regression test. Do not add a scheduler, executor, transport, arbitrary destination mechanism, or database schema change.
 
 ## HARD CONSTRAINTS
 
-- Investigation only; no production implementation was performed.
-- The Self Bot remains the sole Telegram execution authority.
-- Providers may reason and propose structured actions but must not directly control Telegram.
-- Reuse the existing dispatcher, TaskInterpreter, services, repository, scheduler, ToolExecutor, and TelegramAPI boundaries.
-- No second executor, scheduler, retry engine, Telegram transport, arbitrary RPC, arbitrary chat ID, or provider bypass.
-- Owner identity must remain trusted runtime context; natural-language/model output cannot override it.
-- Database/Supabase schema and data are manually controlled; no migrations or SQL changes.
-- Ordinary AI requests must remain ordinary provider requests unless they satisfy the high-confidence scheduling boundary.
+- Investigation only for this document; no production code, tests, configuration, dependencies, SQL, migrations, Supabase data, or `IMPLEMENTATION_REPORT.md` were modified.
+- The Self Bot remains the only Telegram execution authority.
+- Providers may reason and interpret but must not directly control Telegram.
+- Preserve the existing `TaskInterpreter -> TaskCreationService -> TaskRepository` persistence boundary and the RuntimeSupervisor-owned single TaskScheduler.
+- Ordinary AI requests such as `پری یه سرچ بزن` remain provider-driven.
+- No duplicate scheduler, executor, retry engine, Telegram transport, or provider architecture.
+- No arbitrary Telegram RPC, arbitrary chat IDs, shell execution, or unrestricted recipient selection.
+- Owner identity and destination context must remain trusted runtime data.
+- No database/schema/Supabase changes are part of this diagnosis.
 
 ## VALIDATION
 
-- Inspected current nested repository branch/HEAD/status before editing.
-- Read the prior `INVESTIGATION.md` as context and replaced it entirely.
-- Inspected the current Taskloom routing, action parser, interpreter, creation, repository, scheduler, execution, supervisor, and diagnostic paths.
-- Searched current source for scheduling, `create_task`, provider rounds, scheduler lifecycle, and `TASK_STARVATION` references.
-- Compared the supplied production evidence against the source path.
-- No tests were modified or added.
-- No production code, configuration, dependency, migration, SQL, Supabase data, or UI was modified.
+- Verified outer repository and nested repository roots, branch, HEAD, remotes, and status.
+- Nested repository: `main`, HEAD `e5c97295ed7c11e5ec15add33b3a9e6403c59288`, remote `https://github.com/Onlyicing1/Telegram-self-bot.git`.
+- Confirmed current nested source modifications before this document: `backend/ai/actions.py` and `backend/ai/engine/dispatcher.py`; these are pre-existing implementation changes and were not altered by this investigation.
+- Read current `INVESTIGATION.md` and `IMPLEMENTATION_REPORT.md` for context; this file is being completely replaced.
+- Inspected current handler, request construction, dispatcher, action parser, task tool, interpreter, creation, repository, scheduler, supervisor, and relevant runtime paths.
+- Ran `python3 -m pytest tests/test_task_nl_creation.py -q --no-header`: **11 passed**.
+- Ran `python3 -m compileall -q backend tests`: **passed**.
+- Ran `git diff --check`: **passed before this document rewrite**; final diff check is required after the rewrite.
 - No live Telegram or Supabase verification was performed.
-- Final file-scope verification is required after this rewrite: only `INVESTIGATION.md` should be the new change inside the nested repository; the outer pre-existing `tests/test_stage13.py` modification remains untouched.
