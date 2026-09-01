@@ -1264,7 +1264,7 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
 
     # Immediate text-write ("بنویس سلام", "write hello") resolves
     # deterministically to the registered send_message tool — the owner's
-    # own Saved Messages chat. Recipient/reference/forward sends ("اینو برای
+    # current request chat. Recipient/reference/forward sends ("اینو برای
     # علی بفرست", "forward this") stay unsupported: the architecture never
     # lets the model choose a destination.
     if (send_pos or write_pos) and not do_delete and not do_save:

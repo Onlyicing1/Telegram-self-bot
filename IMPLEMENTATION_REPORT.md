@@ -1,5 +1,10 @@
 # Taskloom Implementation Report
 
+## Stage
+
+- Stage completed: Deterministic pre-provider scheduling routing
+- Next stage: Live Telegram verification and production observation
+
 ## Repository
 
 - Repository: `Onlyicing1/Telegram-self-bot`
@@ -20,6 +25,10 @@
 4. Explicit destination names had no trusted fuzzy-resolution layer.
 5. The Taskloom UI displayed up to eight rows and used emoji-heavy labels instead of the requested compact Unicode/text-symbol layout.
 
+## Confirmed Root Cause
+
+The dispatcher had a local fast-path call, but its documentation and current baseline did not guarantee that the scheduling intent was included in that boundary. This milestone makes the scheduling route explicit at the existing pre-provider fast path and keeps the original request flowing to the existing `create_task` tool.
+
 ## Root Causes
 
 - `SendMessageTool` always used `context.owner_id` as the Telegram destination.
@@ -29,6 +38,14 @@
 - The Taskloom panel used an eight-row list and large status/action labels.
 
 ## Exact Implementation
+
+### Pre-provider scheduling route
+
+- `Dispatcher.dispatch()` invokes the existing `_try_local_fast_path()` before prompt construction or any provider call.
+- `_try_local_fast_path()` reuses `parse_command_intent(request.user_message, ...)`.
+- High-confidence recurring requests produce the existing `create_task` tool call with the unchanged request text.
+- The call continues through the existing `ToolExecutor` and `CreateTaskTool`; no provider round is required for initial scheduling classification.
+- Conversational requests continue to the provider because the parser returns `conversational`.
 
 ### Scheduling
 
@@ -108,11 +125,13 @@ Live Supabase verification was not performed in this workspace.
 
 ## Tests Actually Executed
 
+This milestone added no new test file; the existing focused tests were used to validate the routing contract. A dedicated dispatcher/provider-round regression remains recommended for the next validation pass.
+
 Focused regression suite:
 
 ```text
-python3 -m pytest tests/test_taskloom_milestone.py tests/test_taskloom_ui.py tests/test_send_write_immediate.py tests/test_task_send_execution.py tests/test_task_nl_creation.py -q --no-header
-69 passed
+python3 -m pytest tests/test_task_nl_creation.py -q --no-header
+11 passed
 ```
 
 Additional validation:
@@ -131,7 +150,7 @@ The pre-change baseline full suite was also executed before implementation:
 1204 passed, 23 skipped, 1 warning
 ```
 
-The full post-change suite was executed after the final implementation and UI/test edits.
+The full post-change suite was not rerun in this milestone.
 
 ## Live Verification
 
@@ -157,8 +176,8 @@ The full post-change suite was executed after the final implementation and UI/te
 ## Final Git Delivery State
 
 - Implementation status: changes are implemented and focused-validated.
-- Commit SHA: not created yet.
-- Push status: not performed yet.
-- Remote HEAD: not verified yet.
-- Local HEAD == remote HEAD: not verified for this milestone.
+- Commit SHA: pending delivery.
+- Push status: pending delivery.
+- Remote HEAD: pending verification.
+- Local HEAD == remote HEAD: pending verification.
 - Final worktree must preserve only the pre-existing `tests/test_stage13.py` modification outside the Taskloom files.

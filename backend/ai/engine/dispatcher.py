@@ -334,11 +334,15 @@ class Dispatcher:
             return self._fail(exc, "conversation_runtime", start, errors, metadata)
 
         # ── Local deterministic fast path (BEFORE any provider round) ──
-        # High-confidence command intents (status queries, last-N delete /
-        # review, save/delete by reply, save-by-link) resolve WITHOUT a
+        # High-confidence command and scheduling intents (including durable
+        # Taskloom creation) resolve WITHOUT a provider round. This keeps
+        # recurring requests independent of provider tool selection.
+        # Other command intents (status queries, last-N delete / review,
+        # save/delete by reply, save-by-link) resolve WITHOUT a
         # provider round. This keeps deterministic operations working even
         # when every AI provider is down, rate-limited, or misconfigured —
-        # the reason "وضعیت یوزرنیمم رو بگو" must not depend on Groq.
+        # the reason "وضعیت یوزرنیمم رو بگو" must not depend on Groq, and
+        # "هر 1 دقیقه ..." must not depend on provider tool selection.
         # It is NOT a keyword command parser replacing the AI: only the
         # narrow, high-confidence command vocabulary resolves here; every
         # conversational and semantic request continues to the provider.
