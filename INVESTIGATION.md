@@ -1,227 +1,232 @@
 # INVESTIGATION
 
-## Investigation Metadata
+## PROBLEM
 
-| Field | Value |
-|---|---|
-| Repository | `Onlyicing1/Telegram-self-bot` |
-| Branch | `main` |
-| Local HEAD at investigation start | `127d82e7408a37b5b6d417626b67854be27438ec` |
-| Remote HEAD at investigation start | `127d82e7408a37b5b6d417626b67854be27438ec` |
-| Investigation type | Source-only current-state verification and next-boundary discovery |
-| Implementation performed | NO |
+The exact request `هر 1 دقیقه یک بار برای من بنویس سلام` does not create a durable Taskloom task in the deployed service. No task row is inserted, while the user observes `Tool round limit reached`. The immediate request `بنویس سلام` can execute, and the Taskloom UI can render.
 
-The working tree contained one unrelated pre-existing modification (`tests/test_stage13.py`); it was preserved exactly and not modified by this investigation. Only this document was rewritten.
+## ROOT CAUSE
 
-## Current Repository State
+**CONFIRMED:** The deterministic scheduling parser exists in `backend/ai/actions.py`, but the normal natural-language AI path is not guaranteed to invoke it before provider execution. The incoming message is routed by `backend/bot/handlers/ai_unified.py` into the AI dispatcher/provider flow. In that flow, scheduling is represented as a provider-selected `create_task` action/tool rather than as an unconditional deterministic pre-provider classification. A provider/tool-round exhaustion therefore returns `Tool round limit reached` before `create_task` reaches task creation or persistence.
 
-- Branch `main`, synchronized with `origin/main` at `127d82e7408a37b5b6d417626b67854be27438ec` (local HEAD == remote HEAD).
-- Working tree at start: only `M tests/test_stage13.py`.
-- `IMPLEMENTATION_REPORT.md` is the canonical current-state report and describes the delivered interrupted-occurrence recovery.
-- The previous `INVESTIGATION.md` identified `restart-safe interrupted occurrence recovery` as the remaining core gap and the next boundary. That boundary is now implemented and delivered (see below); that prior gap conclusion is therefore **SUPERSEDED** by current source and history.
+**LIKELY:** The reported failure is caused by provider routing/tool-round exhaustion consuming the request before the provider emits a valid `create_task` call. This explains the absence of a database row more directly than a Persian interval parsing defect.
 
-## Verified Implementation History
+**UNKNOWN:** The exact production provider response and number of rounds for this specific Telegram message are not available in the repository. Source inspection cannot prove whether the provider emitted malformed output, selected another tool repeatedly, or exhausted rounds for another provider-specific reason.
 
-| Boundary | Commit | Current source status |
-|---|---|---|
-| Durable task database foundation | covered by staged history | Present; `ai_tasks` + `ai_task_occurrences`, CAS version, RLS, unique occurrence identity |
-| Scheduler runtime and restart-safe coordination | covered by staged history | Present; single polling loop, `recover()` on start, bounded per-wake limits |
-| Execution and action dispatch | covered by staged history | Present; registered tools, bounded runtime and metadata |
-| Retry classification and policy | covered by staged history | Present; `MAX_ATTEMPTS = 3`, bounded exponential backoff |
-| Automatic execution-failure → durable retry | covered by staged history | Present and verified |
-| **Restart-safe interrupted occurrence recovery** | `1e1b1212f6088c4eac6902af09f26f25418b1dbc` | Present in source (`backend/ai/task_scheduler.py`, `backend/ai/database/task_repository.py`) and on `origin/main` |
-| Current-state implementation report | `cd767dffd4866c5595f57abb40dd2dd794605da4` + `127d82e7408a37b5b6d417626b67854be27438ec` | Present on `origin/main` |
+## RELEVANT FILES
 
-## Delivered Boundary: Restart-safe Interrupted Occurrence Recovery — VERIFIED COMPLETE
+- `backend/bot/handlers/ai_unified.py`
+- `backend/ai/engine/dispatcher.py`
+- `backend/ai/actions.py`
+- `backend/ai/task_interpreter.py`
+- `backend/ai/task_candidate.py`
+- `backend/ai/tools/task.py`
+- `backend/ai/task_creation.py`
+- `backend/ai/database/task_repository.py`
+- `backend/ai/task_scheduler.py`
+- `backend/ai/task_execution.py`
+- `backend/runtime/supervisor.py`
+- `backend/runtime/task_guard.py`
+- `backend/health.py`
+- relevant tests under `tests/`
 
-Portions traced against current source:
+## RELEVANT FUNCTIONS / CLASSES
 
-- **Startup recovery.** `TaskScheduler.recover()` (`backend/ai/task_scheduler.py`) queries `list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START)`. It first transitions persisted `claimed`/`running` rows to `interrupted` via the owner-scoped repository CAS transition, then resolves every row present in the `interrupted` state (including rows already persisted as `interrupted` by a prior process).
-- **Interrupted occurrence resolution.** `_resolve_interrupted()` never strands a row. When `can_retry(attempt)` holds it transitions `interrupted → retry_pending` with `retry_at = updated_at + retry_delay(attempt)`, `attempt + 1`, `finished_at=None`, and `error_metadata.error_class="restart_interrupted"`. Otherwise it transitions `interrupted → failed` (terminal) with `retry_at=None`.
-- **Retry policy reuse / attempt limits.** Recovery calls only `can_retry()` and `retry_delay()` from `backend/ai/retry.py` (`MAX_ATTEMPTS = 3`). No retry policy is duplicated in the scheduler. Attempts 1–2 may be requeued; attempt 3 fails terminal. No fourth attempt is possible.
-- **retry_at handling.** Requeued retries roll their next run off the persisted `updated_at`; the existing `list_due_retry_occurrences()` (`retry_pending` where `retry_at <= now`) and `run_once()` pickup are unchanged.
-- **Terminal failure behavior.** `interrupted` is removed from `_TERMINAL_OCCURRENCE_STATUSES` in `backend/ai/database/task_repository.py`, so a recovery requeue never retains terminal `finished_at`; terminal `failed` still records `finished_at`.
-- **Repository implementations.** Both `InMemoryTaskRepository` and `SupabaseTaskRepository` include `interrupted` in the bounded, owner-filtered `list_recoverable_occurrences()` query; the migration `supabase/migrations/20260829000001_create_ai_tasks.sql` requires no change (existing `status`, `attempt`, `retry_at`, `error_metadata` columns suffice).
-- **Owner isolation.** Every recovery query and transition filters by the scheduler's trusted `owner_id` in both repository paths.
-- **CAS / duplicate protection.** Both `transition_occurrence()` implementations are status-CAS guarded (`eq("status", current.status)` in Supabase; equality check in-memory) and immutable-field guarded. A second recovery pass observes the already-requeued/failed state and does not resolve again. `claim_occurrence()` only moves eligible statuses (`claimed`/`retry_pending`) to `running`.
-- **Cancellation.** `asyncio.CancelledError` is re-raised (not converted to retry/failure state) across the scheduler and coordinator boundaries.
-- **Tests.** `tests/test_task_scheduler.py` and `tests/test_task_repository.py` include recovery marking, exhausted-attempt terminal failure, scheduler pickup of recovered retries, pre-existing `interrupted` recovery, owner scoping, and single execution.
-- **Git delivery state.** Verified by `git fetch origin main`, `git rev-parse HEAD`, `git rev-parse origin/main`: both resolve to `127d82e7408a37b5b6d417626b67854be27438ec`. Commit `1e1b121` contains exactly `backend/ai/task_scheduler.py`, `backend/ai/database/task_repository.py`, `tests/test_task_scheduler.py`, `tests/test_task_repository.py`.
+- `ai_unified` outgoing-message handler and its AI request construction
+- `Dispatcher.dispatch()` / provider execution and local action handling
+- `parse_command_intent()` and scheduling-intent helpers in `backend/ai/actions.py`
+- `parse_action_text()` / `validate_action()` / `resolve_tool_calls()`
+- `TaskInterpreter.interpret()`
+- `CreateTaskTool.execute()`
+- `TaskCreationService.create()`
+- `TaskRepository.create_task()` implementations
+- `TaskScheduler.start()`, `recover()`, `run_once()`
+- `TaskExecutionCoordinator.execute()`
+- runtime supervisor scheduler startup
+- task snapshot/diagnostic logic in `backend/runtime/task_guard.py` and health diagnostics
 
-## Current Architecture
+## CURRENT EXECUTION PATH
+
+For `هر 1 دقیقه یک بار برای من بنویس سلام`, the source-supported path is:
 
 ```text
-Telegram `.task <request>`
-  -> backend.bot.handlers.tasks.task_handler          (is_owner gate, edit-in-place)
-  -> TaskInterpreter / TaskCandidate                  (bounded provider call, owner-agnostic validation)
-  -> TaskCreationService.create                        (authoritative owner_id)
-  -> TaskRepository.create_task                        (ai_tasks, CAS version)
-  -> RuntimeSupervisor._start_task_scheduler           (single scheduler construction)
-  -> TaskScheduler.recover / run_once
-  -> TaskRepository occurrence transitions + claim_occurrence
-  -> TaskExecutionCoordinator.execute
-  -> ToolExecutor.execute_calls                        (registered tools only)
-  -> TaskOutcomeNotifier.notify_persisted / TaskNotificationService
-  -> TelegramAPI.send_message                          (rebuild-safe sender)
-
-AI conversation turn
-  -> backend.bot.handlers.ai_unified -> engine
-  -> Dispatcher._build_context -> ConversationManager history + MemoryManager.retrieve_for_prompt
-  -> ConversationManager._add_message -> persistence.add_message (ai_messages)
-  -> ConversationManager.restore_history (ai_sessions/ai_messages after restart)
+Telegram outgoing NewMessage
+  -> backend/bot/handlers/ai_unified.py
+  -> AI request with original message text and runtime context
+  -> backend/ai/engine/dispatcher.py
+  -> provider/tool loop
+  -> provider must return a structured create_task action, or provider text must be parsed
+  -> backend/ai/actions.py validates create_task and builds {name: create_task, request: ...}
+  -> backend/ai/tools/task.py::CreateTaskTool.execute
+  -> TaskInterpreter.interpret(request)
+  -> TaskCreationService.create(...)
+  -> TaskRepository.create_task(...)
+  -> persisted task/occurrence rows
+  -> RuntimeSupervisor-owned TaskScheduler
+  -> TaskScheduler.recover()/run_once()
+  -> TaskExecutionCoordinator
+  -> registered ToolExecutor action
 ```
 
-Boundaries verified in source:
+The critical observed branch ends earlier:
 
-- Lifecycle: `backend/runtime/supervisor.py::RuntimeSupervisor` owns the self-client, run loop, and the single task scheduler.
-- Scheduling: `backend/ai/task_scheduler.py::TaskScheduler` is the only task polling loop.
-- Execution: `TaskExecutionCoordinator` never schedules; the scheduler never executes actions itself.
-- Persistence: `backend/ai/database/task_repository.py` enforces owner scoping, transition maps, immutable occurrence fields, bounded payloads, and CAS updates.
-- Tool action boundary: actions resolve only through `ToolRegistry`/`ToolExecutor`; `TaskExecutionCoordinator` rejects unregistered actions before execution.
-- Notification: `TaskNotificationService` is owner-checked, kind-bounded, and truncates delivery; outcomes are only notified after persistence-verified status.
-- Telegram transport: `backend/telegram_api/` remains the only Telegram send path used by task systems.
+```text
+provider/tool loop
+  -> tool rounds exhausted
+  -> `Tool round limit reached`
+  -> no create_task tool call
+  -> no TaskInterpreter call
+  -> no TaskCreationService call
+  -> no TaskRepository insert
+```
 
-## Capability / Feature Status
+The repository proves that `create_task` is an executable action and has a service/repository path, but it does not prove that every natural-language request is deterministically classified as `create_task` before provider dispatch.
 
-| Capability | Status | Evidence |
-|---|---|---|
-| Telegram task creation (natural language) | IMPLEMENTED | `backend/bot/handlers/tasks.py`, `TaskInterpreter`, `TaskCreationService` |
-| Structured candidate validation | IMPLEMENTED | `TaskCandidate.from_untrusted` |
-| once/interval/daily/weekly schedules | IMPLEMENTED | `backend/ai/scheduling.py`, `SCHEDULE_TYPES`, migration CHECK |
-| Durable persistence with CAS | IMPLEMENTED | `TaskRepository.update_task`, occurrence transition CAS |
-| Occurrence claiming | IMPLEMENTED | `claim_occurrence` (both repository implementations) |
-| Registered-tool execution | IMPLEMENTED | `TaskExecutionCoordinator`, `ToolExecutor` |
-| Automatic retry on failure | IMPLEMENTED | `execute()` → `handle_failure()`; durable attempt/retry_at |
-| Scheduler retry pickup | IMPLEMENTED | `list_due_retry_occurrences()`, `run_once()` |
-| Persisted-outcome notification | IMPLEMENTED | `TaskOutcomeNotifier.notify_persisted` |
-| Startup recovery | IMPLEMENTED | `recover()` → `interrupted` |
-| **Interrupted-occurrence resolution** | **IMPLEMENTED (delivered)** | `recover()` → `_resolve_interrupted()` → retry_pending/failed |
-| AI memory (short/long/permanent) retrieval into context | IMPLEMENTED | `Dispatcher._build_context` calls `MemoryManager.retrieve_for_prompt` (bounded via `to_thread` + timeout); `ai_memories` migrated |
-| AI session/message persistence + restore | IMPLEMENTED | `ConversationManager._add_message` → `persistence.add_message`; `restore_history`; `ai_sessions`/`ai_messages` migrated |
-| AI usage / provider-stats telemetry | IMPLEMENTED | `ai_usage` migration `20260827000003`, `ai_provider_stats` migration `20260827000004`; Repos upsert and fail soft |
-| Task list/inspect/lifecycle/deletion (Telegram) | IMPLEMENTED | `tasks.py::_handle_management` |
-| Richer inspect (error/result metadata) | NOT IMPLEMENTED (optional UX) | `inspect_text` shows status/attempt only |
-| Glass task panels | NOT IMPLEMENTED (optional UX) | no `register_panel/register_action` in `tasks.py` |
-| Dashboard task APIs/UI | NOT IMPLEMENTED (optional UX) | `backend/web/app.py` has no task routes; no task-only frontend view |
-| Task editing / rescheduling (user-facing) | NOT IMPLEMENTED (optional UX) | `TaskRepository.update_task` exists; no handler path exposes it |
-| Notification-destination management | NOT IMPLEMENTED (optional UX) | destination set at creation only |
-| `ai_preferences` durable persistence | NOT IMPLEMENTED (gated; graceful fallback) | in-memory-only repository; no `ai_preferences` migration column/table; dispatcher falls back to defaults |
-| Cron / event / webhook / conditional triggers | NOT PROVEN BY CURRENT SOURCE | not in `SUPPORTED_TYPES` / scheduler |
-| Exactly-once side effects | NOT PROVEN BY CURRENT SOURCE | at-least-once semantics documented and implemented |
+## ROUTING FINDINGS
 
-## Core vs Optional
+**CONFIRMED:** `create_task` is present in the action vocabulary, executable action set, and tool resolution path in `backend/ai/actions.py`. It requires a non-empty `request` field and resolves to the registered `create_task` tool.
 
-**Core (established by repository architecture):**
+**CONFIRMED:** The provider is involved in the ordinary AI request path. The dispatcher performs provider/tool rounds and has a maximum-round failure represented by `Tool round limit reached`.
 
-- Durable scheduled execution including restart recovery. The interrupted-recovery boundary that closed the last proven core durability gap is implemented and delivered. After that boundary, **no further core durability gap is proven by current source.** The durable task scheduler, occurrence state machine, retry policy, recovery, execution, notification, and AI persistence primitives are all present and wired.
+**CONFIRMED:** Immediate write handling has a deterministic local path for `بنویس سلام` / `write hello`, which explains why that comparison case can work without the same scheduling classification.
 
-**Optional UX / product enhancements (absent but NOT justified as implementation gaps):**
+**CONFIRMED:** The scheduling helpers and deterministic command-intent machinery are not equivalent to a universal pre-provider classifier. Their existence does not establish that the unified natural-language handler always invokes them before provider dispatch.
 
-- Glass task panels
-- Dashboard task APIs/UI
-- Natural-language task management
-- Task editing / rescheduling
-- Richer history/error browsing
-- Notification-destination management
+**LIKELY:** The provider is currently allowed to decide whether a natural-language request becomes a scheduled task by emitting `create_task`. Therefore the provider can consume or exhaust the request before deterministic scheduling gets a chance to create a task.
 
-None of these is mandated by AGENTS.md, README, the migrations, or the task/AI contracts. They must not be classified as core merely because they are absent.
+## TASK INTERPRETER FINDINGS
 
-**Distinctly gated, non-architectural:**
+`TaskInterpreter` is a bounded provider-backed interpreter for a task request. Its contract validates a structured schedule/action candidate; it is not itself the first Telegram-message router.
 
-- Durable `ai_preferences` persistence (an in-memory fallback already exists and the missing table degrades gracefully; making it durable is additive and requires an explicit contract decision, not an architectural fix).
+The current candidate normalization supports canonical `send_message` action aliases and interval schedule fields. The surrounding source and tests cover Persian and English interval forms, including forms equivalent to `هر 1 دقیقه`, `هر یک دقیقه`, `هر 5 دقیقه`, `every minute`, and `every 5 minutes`.
 
-## Remaining Gaps
+**CONFIRMED:** The exact Persian phrase is recognized by the deterministic scheduling-intent logic in `actions.py` based on normalized digits, interval introduction, and a time-unit token. The phrase includes `هر`, `1`, `دقیقه`, and `یک بار`; the tokenizer normalizes the numeric digit and preserves the Persian time unit.
 
-### Gap 1 — Optional Telegram/Glass task-management UX (OPTIONAL)
+**CONFIRMED:** If `TaskInterpreter.interpret()` is reached and the provider returns a valid candidate, the candidate can represent an interval schedule and a message action.
 
-- **Missing behavior:** a user-facing path to edit/reschedule tasks, manage notification destinations, and richer list/inspect output, and optional inline-panel equivalents.
-- **Architectural layer:** Telegram presentation + existing task management services.
-- **Exact files:** `backend/bot/handlers/tasks.py`, `backend/ai/task_management*.py`, `backend/ai/task_management_interface.py`, optional `backend/helper` registrations; reuses `TaskRepository.update_task`, `transition_occurrence`, and existing management service methods.
-- **Dependencies:** none outside existing task service/repository boundaries. No schema change currently justified.
-- **Security/ownership:** every action remains owner-gated (`is_owner`) and owner-scoped in the repository.
-- **Test requirements:** per-verb handler tests, owner isolation, transition validation.
-- **Can be combined:** yes — with the other Telegram/Glass task UX items below (same boundary).
+**UNKNOWN:** No live provider response for this exact phrase is available, so the exact candidate produced in production cannot be proven. The source also does not prove that the interpreter is reached in the failing run.
 
-### Gap 2 — Optional dashboard task read APIs/UI (OPTIONAL)
+## PERSISTENCE FINDINGS
 
-- **Missing behavior:** read-only task/occurrence visibility in the FastAPI dashboard.
-- **Architectural layer:** web transport + frontend, separate authorization surface. Requires an explicit authenticated owner contract before implementation.
-- **Can be combined:** among themselves (API + UI), but must remain separate from Telegram work.
+**CONFIRMED:** Task creation persists through `CreateTaskTool` -> `TaskCreationService.create()` -> owner-scoped `TaskRepository.create_task()` in the task database repository. The repository handles task ownership, initial status/version, and durable task/occurrence persistence according to its existing schema contract.
 
-### Gap 3 — Durable `ai_preferences` persistence (GATED, non-core)
+**CONFIRMED:** The failing request does not reach persistence if `Tool round limit reached` is returned first. Therefore the missing database row is a consequence of the earlier routing/provider failure, not evidence that the database insert itself is the primary failure.
 
-- **Missing behavior:** no `ai_preferences` migration/table; the dispatcher reads an in-memory repository (`get_or_create`) and falls back to defaults on any error.
-- **Why it is NOT core:** the subsystem degrades gracefully, no product contract requires durability, and no core behavior is lost across restart (defaults apply).
-- **Can be combined:** separate from task UX; a persistence change should be its own boundary.
+**UNKNOWN:** Live Supabase availability, RLS behavior, and production insert errors were not inspected or exercised. No SQL was executed.
 
-## Tasks That Can Be Safely Combined
+## SCHEDULER FINDINGS
 
-- Telegram/Glass task-management UX items (editing/rescheduling + destination management + richer inspect + optional panels) — one presentation/management boundary, shared service and repository methods.
-- Dashboard task read API + dashboard task UI — one transport/frontend boundary (after an authorization contract exists).
+**CONFIRMED:** `RuntimeSupervisor` owns the Taskloom scheduler lifecycle. The scheduler has startup recovery/loading and a polling execution loop; scheduled execution is separate from task creation.
 
-## Tasks That Must Remain Separate
+**CONFIRMED:** Task creation and scheduled execution use the supervisor-created scheduler architecture rather than a second scheduler path in the inspected source.
 
-- Any task-system change vs a schema/persistence change (no schema change is currently justified; if `ai_preferences` durability is ever pursued it is its own boundary).
-- Telegram/Glass UX vs dashboard APIs (different transports and authorization models).
-- Natural-language task management vs deterministic management commands (NL must delegate to existing service methods, never become a second authority).
-- Any new scheduler, worker, execution authority, or retry engine (explicitly out of scope; current architecture forbids them).
+**CONFIRMED:** The scheduler cannot execute a task that was never persisted. In the reported failure, scheduler registration/loading is downstream of the missing insert.
 
-## Recommended Next Implementation Group
+**UNKNOWN:** The production scheduler’s exact runtime state during this request is not proven by source. No live process inspection was performed.
 
-**Single recommended next group (optional, presentation-boundary): "Task management UX"**
+## PROVIDER / TOOL-ROUND FINDINGS
 
-- Owner-scoped Telegram verb for editing/rescheduling a task (reuse `TaskRepository.update_task` with `expected_version` CAS and `transition_task`), combined with notification-destination updates and richer `inspect`/`list` output (status, attempt, `retry_at`, `error_metadata`, `result_metadata`), exercised through the existing task management interface and handler.
-- Files: `backend/bot/handlers/tasks.py`, `backend/ai/task_management*.py`, `backend/ai/task_management_interface.py`, and focused handler/management tests.
-- Deterministic management verbs only; natural-language management remains a separate future boundary.
-- No new scheduler, no new execution authority, no schema change.
+**CONFIRMED:** Provider calls occur in the normal AI dispatch path. Structured actions are converted into registered tool calls and executed through the existing tool executor.
 
-This group is justified only if the product owner wants user-facing task management now. It is **OPTIONAL**, not a core durability gap. If no such product requirement exists, there is currently no source-mandated next implementation.
+**CONFIRMED:** The dispatcher has a bounded tool-round loop and returns `Tool round limit reached` when the maximum is exhausted.
 
-## Database / Supabase Status
+**CONFIRMED:** A round-limit result prevents a later `create_task` tool call in that dispatch, so `TaskInterpreter`, `TaskCreationService`, and `TaskRepository.create_task` are not reached by that request.
 
-- Migration inventory includes the pre-existing task migration (`20260829000001_create_ai_tasks.sql`) and the AI migrations for `ai_memories` (`20260804145402_create_ai_tables.sql`), `ai_usage` (`20260827000003_create_ai_usage_table.sql`), and `ai_provider_stats` (`20260827000004_create_ai_provider_stats_table.sql`).
-- The delivered interrupted-recovery boundary required **no schema change**: existing `status`, `attempt`, `retry_at`, and transition constraints sufficed.
-- Live Supabase state: NOT PROVEN BY CURRENT SOURCE (no live verification performed in this investigation).
+**LIKELY:** Scheduling is unnecessarily dependent on provider tool selection for ordinary natural-language scheduling requests, because the deterministic scheduling vocabulary exists but is not established as an unconditional pre-provider route.
 
-## Security / Ownership Status
+## DIAGNOSTIC FINDINGS
 
-- Owner identity flows only from runtime/handler context; candidate/interpreter data cannot override it.
-- All repository operations are owner-filtered in both in-memory and Supabase paths.
-- No arbitrary Telegram RPC, arbitrary SQL/RPC, shell execution, persisted-code execution, or provider bypass exists in the task or AI execution paths.
-- Tool actions resolve exclusively through `ToolRegistry`/`ToolExecutor`; deterministic destructive tools execute only after local ownership and (where flagged) confirmation boundaries.
+**CONFIRMED:** The reported diagnostics show recent loop progress, recent Telegram updates/events, recent event dispatch, and recent RPC activity. Those signals do not support a proven event-loop stall during the failed request.
 
-## Test / Validation Status
+**CONFIRMED:** `TASK_STARVATION` is based on long-lived task snapshots being unchanged/stale. Permanent tasks such as Telethon loops, keepalive, profile scheduler, and task scheduler can remain unchanged while legitimately waiting.
 
-- This investigation performed no code change; no new tests were authored.
-- Full task- and repository-focused coverage exists (`tests/test_task_repository.py`, `tests/test_task_scheduler.py`, `tests/test_task_execution.py`, `tests/test_task_management.py`, `tests/test_retry.py`, and `tests/test_stage*.py`), and the recorded delivery validation in `IMPLEMENTATION_REPORT.md` states: focused recovery/repository `21 passed`, broader focused task `32 passed`, full suite `1161 passed, 23 skipped, 1 warning`, `compileall` clean, `git diff --check` clean. That validation was run during the delivered implementation, not in this investigation.
-- Not re-run in this investigation (no source changed).
+**LIKELY:** The warning is a snapshot-age heuristic rather than proof that the scheduler is blocked, deadlocked, or starved. It is therefore not a demonstrated cause of this failure.
 
-## What Was NOT Verified
+**UNKNOWN:** Without production task stacks or a reproduction with runtime tracing, the warning cannot be ruled out as a secondary operational issue, but the supplied recent-heartbeat evidence does not connect it to task creation failure.
 
-- Live Telegram delivery and live Supabase persistence/RLS behavior.
-- Real process-crash/restart behavior in a deployed environment.
-- Exactly-once external side effects (not claimed; at-least-once only).
-- Durable `ai_preferences` (no table/column exists).
+## CONFIRMED FACTS
 
-## Final Verdict
+- The exact request is intended to be recurring and should create a durable interval task.
+- Persian digit normalization and interval/time-unit vocabulary exist.
+- `create_task` is a registered executable action/tool path.
+- Task creation has a repository persistence boundary.
+- The provider/tool loop can terminate with `Tool round limit reached`.
+- A round-limit termination occurs before a task insert if no `create_task` call has been emitted.
+- Immediate `بنویس سلام` has a distinct deterministic immediate-write path.
+- No database row means the task creation boundary was not completed for the observed request.
+- The supplied health signals show recent loop/update/event/RPC activity.
+- No source, schema, or runtime evidence proves a scheduler deadlock for this request.
 
-The restart-safe interrupted-occurrence recovery boundary identified by the prior investigation is **IMPLEMENTED and DELIVERED**, verified in current source, tests, and `origin/main` (`1e1b121` implementation; local and remote both at `127d82e`). The prior gap conclusion is marked **SUPERSEDED**. No further core durability gap is proven by current source. Remaining absent capabilities are optional UX unless a product requirement outside the current source declares otherwise; the smallest justified optional boundary is deterministic **task management UX** (editing/rescheduling + destination management + richer inspect) within the existing management boundary.
+## LIKELY CAUSES
 
-## Investigation Boundary
+- Provider selection/tool-loop exhaustion occurs before scheduling intent is converted into `create_task`.
+- The deterministic scheduling parser is a safety/fallback mechanism rather than the mandatory first routing boundary for unified natural-language requests.
+- The production provider may be failing to emit the exact structured `create_task` payload required by the dispatcher/interpreter contract.
 
-- Production code changed: NO
-- Tests changed: NO
-- Database changed: NO
-- Migration changed: NO
-- SQL executed: NO
-- Supabase changed: NO
-- Telegram behavior changed: NO
-- Implementation performed: NO
-- `INVESTIGATION.md` rewritten: YES
+## UNKNOWN / MISSING EVIDENCE
 
-## Git Delivery / Verification State
+- The exact deployed commit/configuration/provider model at failure time.
+- The provider’s raw responses and tool-call sequence for the exact Persian phrase.
+- Whether the failing request entered a local fast path, provider path, or provider fallback branch in that specific production event.
+- The exact TaskInterpreter candidate/error, if the interpreter was invoked.
+- Live Supabase insert/RLS outcome.
+- Live scheduler task stacks and persisted-task count during the incident.
 
-- Commit status: this documentation-only commit containing exactly `INVESTIGATION.md`.
-- Push status: to be verified immediately after push via `git fetch` + `git rev-parse`.
-- Local HEAD / Remote HEAD / Local==Remote: to be recorded from the verified delivery output.
-- Final working-tree status: `tests/test_stage13.py` remains modified and uncommitted (pre-existing unrelated change, preserved). No other modifications remain.
+## DESIRED BEHAVIOR
+
+The incoming phrase should be classified as a high-confidence recurring request before ordinary provider reasoning can consume it. It should produce a validated interval task with action text `سلام`, persist it under the authenticated owner, and record the trusted task-creation chat/context as its default destination. The scheduler should later load and execute the durable task through the existing registered tool and TelegramAPI boundaries.
+
+## IMPLEMENTATION PLAN
+
+Do not implement in this investigation. The smallest future implementation boundary is:
+
+1. Establish a deterministic, pre-provider scheduling-intent route for high-confidence Persian/English recurring requests.
+2. Pass the original request unchanged into the existing task creation/interpreter/service boundary.
+3. Preserve ordinary conversational/provider routing for non-scheduled requests such as `پری یه سرچ بزن` and ordinary immediate actions.
+4. Add focused routing tests proving the exact phrase and comparison cases, including the no-provider-round guarantee for deterministic scheduling.
+5. Keep persistence, scheduler, ownership, destination, and Telegram execution within the existing approved boundaries.
+
+## ALREADY IMPLEMENTED
+
+- Persian/English tokenization and digit normalization in `backend/ai/actions.py`.
+- Deterministic intent vocabulary for scheduling and immediate writes.
+- Structured `create_task` action validation and resolution.
+- `TaskInterpreter` schedule/action candidate validation.
+- `TaskCreationService` and owner-scoped task repository persistence.
+- Durable scheduler polling/recovery and registered-tool execution.
+- Immediate write routing through the existing send tool.
+- Provider tool-round bounding and explicit round-limit failure.
+- Runtime health/diagnostic snapshots and long-lived task monitoring.
+
+## REMAINING WORK
+
+- Prove and implement the pre-provider deterministic scheduling routing boundary in a separate implementation task.
+- Add/adjust only focused regression tests for exact Persian/English scheduling and provider bypass behavior.
+- Reproduce with the deployed provider and capture sanitized provider/tool-round evidence.
+- Separately assess whether the starvation heuristic needs improvement; it is not established as the Taskloom root cause.
+
+## DATABASE / SCHEMA IMPACT
+
+No schema change appears necessary for the routing defect. The existing task persistence contract is downstream and already has the fields needed for interval scheduling, ownership, versioning, and task context. Do not execute SQL or modify Supabase during this investigation.
+
+## HARD CONSTRAINTS
+
+- Investigation only; no production implementation was performed.
+- The Self Bot remains the sole Telegram execution authority.
+- Providers may reason and propose structured actions but must not directly control Telegram.
+- Reuse the existing dispatcher, TaskInterpreter, services, repository, scheduler, ToolExecutor, and TelegramAPI boundaries.
+- No second executor, scheduler, retry engine, Telegram transport, arbitrary RPC, arbitrary chat ID, or provider bypass.
+- Owner identity must remain trusted runtime context; natural-language/model output cannot override it.
+- Database/Supabase schema and data are manually controlled; no migrations or SQL changes.
+- Ordinary AI requests must remain ordinary provider requests unless they satisfy the high-confidence scheduling boundary.
+
+## VALIDATION
+
+- Inspected current nested repository branch/HEAD/status before editing.
+- Read the prior `INVESTIGATION.md` as context and replaced it entirely.
+- Inspected the current Taskloom routing, action parser, interpreter, creation, repository, scheduler, execution, supervisor, and diagnostic paths.
+- Searched current source for scheduling, `create_task`, provider rounds, scheduler lifecycle, and `TASK_STARVATION` references.
+- Compared the supplied production evidence against the source path.
+- No tests were modified or added.
+- No production code, configuration, dependency, migration, SQL, Supabase data, or UI was modified.
+- No live Telegram or Supabase verification was performed.
+- Final file-scope verification is required after this rewrite: only `INVESTIGATION.md` should be the new change inside the nested repository; the outer pre-existing `tests/test_stage13.py` modification remains untouched.
