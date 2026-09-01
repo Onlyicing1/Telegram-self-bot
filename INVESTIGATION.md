@@ -1,105 +1,259 @@
 # INVESTIGATION
 
-## CURRENT OBSERVATION
+## 1. CURRENT TASKLOOM EXECUTION MODEL
 
-Taskloom can create and execute a recurring task. The displayed task shows `send_message`, `interval`, `Current chat`, `Asia/Tehran`, and a successful occurrence. The remaining reports are: no task row visible in the user's database, Delete does not remove the task from the list, and displayed timestamps appear UTC rather than Tehran local time.
+**Confirmed from source.** Durable task creation is routed through the existing task boundary; execution is downstream:
 
-The repository was inspected without live Supabase access or SQL execution. Database state therefore cannot be independently confirmed here.
+```text
+AI request / task tool
+  -> TaskInterpreter / TaskCandidate
+  -> TaskCreationService.create()
+  -> TaskRepository.create_task()
+  -> TaskScheduler
+  -> occurrence discovery and creation
+  -> claim_occurrence()
+  -> TaskExecutionCoordinator.execute()
+  -> ToolExecutor.execute_calls()
+  -> registered tool
+  -> TelegramAPI / Self Bot client
+```
 
-## 1. TASK CREATION AND DURABLE PERSISTENCE
+`TaskScheduler` is the single scheduler. `TaskExecutionCoordinator` receives a claimed, `running` occurrence and executes its immutable `action_snapshot` through the existing `ToolExecutor`. It does not call the provider or interpret natural language. The current execution coordinator therefore performs action execution only; it has no AI-preparation phase.
 
-The creation boundary is:
+## 2. CURRENT DURABLE TASK MODEL
 
-`backend/bot/handlers/ai_unified.py::_execute_ai()` → `engine.execute(request)` → `backend/ai/engine/dispatcher.py::dispatch()` deterministic action path → `backend/ai/tools/executor.py::ToolExecutor.execute_calls()` → `backend/ai/tools/task.py::CreateTaskTool.execute()` → `backend/ai/task_creation.py::TaskCreationService.create()` → `backend/ai/database/task_repository.py::TaskRepository` implementation.
+**Confirmed from `DATABASE_ARCHITECTURE.md`, `backend/ai/database/task_repository.py`, and the migration contract.**
 
-`CreateTaskTool.execute()` obtains the repository through `get_repository_manager().task`, constructs `TaskCreationService`, and awaits `service.create(candidate, datetime.now(timezone.utc))`. `TaskCreationService.create()` validates the candidate, parses the schedule, computes `next_run_at`, converts that value to UTC, and calls `repository.create_task(owner_id, payload)`.
+`ai_tasks` stores one owner-scoped task definition with:
 
-`SupabaseTaskRepository.create_task()` validates the payload and executes `client.table("ai_tasks").insert(payload).execute()`. It converts the returned row to `TaskRecord`. On non-validation exceptions it logs a warning and invokes its configured in-memory fallback repository. `InMemoryTaskRepository.create_task()` validates and stores a `TaskRecord` in process memory only.
+- `label`
+- lifecycle `status`
+- integer `version`
+- `schedule_type`, JSON `schedule`, IANA `timezone`
+- UTC-aware `next_run_at`
+- bounded JSON `actions` array
+- bounded JSON `notification_destination`
+- timestamps and optional `terminal_at`
 
-The first occurrence is not inserted by task creation. `TaskScheduler.run_once()` later queries due tasks, calls `repository.create_occurrence(...)`, and the Supabase implementation inserts into `ai_task_occurrences`; the in-memory implementation stores it only in memory. The scheduler is created once by `RuntimeSupervisor._start_task_scheduler()` and started after client setup.
+`ai_task_occurrences` stores per-occurrence history with:
 
-**Status:** The source proves a durable insert is attempted when the active repository is `SupabaseTaskRepository` and its client insert succeeds. It also proves that a Supabase exception silently degrades to the in-memory fallback. The reported absence of a database row is **NOT CONFIRMED from this workspace** because live database state and production logs for the insert are unavailable. A successful UI/task execution can be backed entirely by the fallback repository if Supabase access failed, so UI success does not prove durable persistence.
+- `task_id`, owner, unique `occurrence_key`
+- `definition_version`
+- immutable bounded `action_snapshot` array
+- UTC-aware `scheduled_for`
+- attempt/status timestamps
+- `retry_at`
+- bounded `error_metadata` and `result_metadata`
 
-## 2. TASK LIST SOURCE
+The repository validates action arrays as 1–5 actions and bounds JSON payload sizes. Occurrence snapshots preserve the task definition version and action payload; later task edits do not rewrite historical snapshots.
 
-`backend/bot/handlers/taskloom.py::_taskloom_panel()` → `_service(owner_id)` → `TaskManagementService.list_tasks()` → `repository.list_tasks(owner_id)`.
+The current `actions` and `action_snapshot` contracts represent executable registered tool calls, for example `{"name":"send_message","arguments":{"text":"..."}}`. They can safely represent a final validated action. They do not have a typed, explicit field for an AI instruction, preparation status, prepared timestamp, provider result, or readiness lease. An AI instruction could technically be embedded in an action argument or metadata JSON, but no current executor interprets such a value as a preparation request. Persisting it without an explicit consumer would therefore be inert or unsafe.
 
-`TaskManagementService` is a thin owner-scoped wrapper. `SupabaseTaskRepository.list_tasks()` queries `ai_tasks` filtered by `owner_id`, ordered by `updated_at` descending. On any exception it logs and returns `self._fallback.list_tasks(owner_id)`. The in-memory implementation returns records held in its `_tasks` dictionary.
+The two existing tables are sufficient as the storage boundary in principle: the task row can hold a durable instruction/definition and each occurrence can hold that occurrence's prepared/final snapshot and metadata. The current schema does not, however, explicitly model those concepts. A safe implementation would need either an additive, bounded representation within the existing JSON contracts plus corresponding validators/executors, or minimal additive columns/state approved against the existing migration contract. No third table is required by the current architecture, and no schema change is proposed here.
 
-The panel has no separate task-list cache. Each panel render calls the service/repository again. However, the repository object is a process-level singleton returned by `get_task_repository()`, and its fallback is process-local. A task can therefore remain visible after a database failure because list reads fall back to the same in-memory repository that accepted the task.
+## 3. CURRENT AI EXECUTION TIMING
 
-A refresh callback re-enters `_task_detail_panel()` or the list panel and consequently queries the repository again; it does not force a database-only read.
+**Confirmed from source.** The current scheduler uses `next_run_at` as the due instant. `TaskScheduler` polls on `WAKE_INTERVAL_SECONDS = 60.0`, discovers due tasks, creates/claims occurrences, and hands them to `TaskExecutionCoordinator`. The coordinator starts `ToolExecutor.execute_calls()` only after the occurrence has been claimed and marked `running`.
 
-## 3. DELETE FLOW
+There is no `preparation_deadline`, `prepare_at`, readiness flag, provider job, or AI work before `scheduled_for` in `TaskScheduler`, `OccurrenceRecord`, or `TaskExecutionCoordinator`. Current provider work belongs to the interactive Dispatcher/provider path, not to scheduled occurrence execution. Therefore, in the current Taskloom execution model, any AI interpretation/preparation needed for a scheduled action is not performed ahead of the due instant by the scheduler. The durable scheduler path only executes its already-present action snapshot after claim.
 
-The detail panel constructs `action:taskloom_delete:<task_id>:<version>` in `backend/bot/handlers/taskloom.py::_task_detail_panel()`.
+The scheduler has enough information to calculate a preparation start instant in a future design (`scheduled_for` / task `next_run_at`, task timezone, and the polling interval), but it does not currently do so. A preparation phase must be integrated with the existing occurrence identity and lifecycle rather than creating a second scheduler.
 
-The callback chain is:
+## 4. AI-BACKED TASK MODEL
 
-`backend/helper/panels.py::_callback_router()` → `_handle_action()` → registered `taskloom_delete` handler → `taskloom._delete_action()` → `_mutate(event, extra, "delete")` → `TaskManagementService.delete()` → `TaskManagementService.set_status()` → `repository.transition_task(owner_id, task_id, "deleted", expected_version)`.
+**Proposed design, grounded in existing boundaries.** Explicit task language should create a durable task definition containing the user's bounded natural-language instruction as data, plus the resolved trusted destination and schedule. The task definition must not be treated as a preselected Telegram method or arbitrary recipient.
 
-Deletion is a **soft delete/status transition**, not a hard row delete. `InMemoryTaskRepository.transition_task()` validates the transition and sets `status="deleted"`, increments `version`, and retains the record. `SupabaseTaskRepository.transition_task()` calls `update_task()`, which performs an `ai_tasks.update(...)` filtered by `id`, `owner_id`, and `version`, setting status and version; it does not delete the row.
+At execution time, an AI/provider component may transform the instruction into a candidate action. That candidate must be parsed, bounded, ownership-checked, destination-checked, and resolved to an existing registered tool before the Self Bot can perform a side effect. The provider must never receive direct Telegram, Supabase, SQL, shell, or arbitrary RPC authority.
 
-After mutation, `_mutate()` calls `_task_detail_panel()` again and returns the refreshed detail view. The Delete action therefore does not itself render the Taskloom list. Returning from detail to the list invokes `_taskloom_panel()`, whose `list_tasks()` implementations currently return all owner records, including `deleted` records; neither `SupabaseTaskRepository.list_tasks()` nor `InMemoryTaskRepository.list_tasks()` filters terminal/deleted statuses.
+The durable task definition is distinct from the per-occurrence executable action. For a literal request such as “every minute say X”, a deterministic final `send_message` action may be stored today. For a dynamic request such as “change my bio to a different suitable quote”, the durable instruction must remain available for each occurrence; storing one generated quote permanently as the task definition would change the user's semantics.
 
-**Confirmed source-level failure:** even if the delete transition succeeds, the list query intentionally/currently includes records with `status="deleted"`, so the deleted task remains in the visible list. This is independent of whether the database update succeeded.
+## 5. PER-OCCURRENCE PREPARATION
 
-**Additional unresolved possibility:** if the Supabase update fails, `SupabaseTaskRepository.update_task()` falls back to its in-memory repository. This can create a split-brain presentation in which the transition is recorded only in fallback memory. The exact production outcome is not provable without logs/database state.
+**Architectural recommendation, not implemented.** Dynamic recurring AI work must be prepared once per occurrence, not once per task. Otherwise every recurrence would reuse the same result.
 
-## 4. TIMEZONE FLOW
+The smallest compatible timing model is:
 
-Task creation receives the configured timezone through `ToolContext.tz_str`; `CreateTaskTool` passes it to the interpreter or deterministic candidate path. `TaskCreationService.create()` validates the candidate timezone and schedule timezone, computes the next run against the timezone-aware UTC reference, and serializes `next_run_at` as UTC.
+1. Keep the task's `next_run_at` / occurrence `scheduled_for` as the execution deadline.
+2. Derive a preparation start/deadline from that occurrence's scheduled instant and a measured bounded AI latency budget.
+3. Have the existing single `TaskScheduler` discover work early enough to invoke the provider preparation path for that occurrence.
+4. Persist the prepared, validated action against the same occurrence identity.
+5. At `scheduled_for`, claim/run the occurrence and execute the prepared action through `TaskExecutionCoordinator` and `ToolExecutor`.
 
-`TaskRepository._now()` uses UTC. Supabase row parsing in `_parse_dt()` parses ISO timestamps and attaches UTC to naive values. `TaskRecord.next_run_at`, `created_at`, `updated_at`, and occurrence `scheduled_for` are therefore timezone-aware UTC instants after repository conversion. This is correct storage/normalization behavior and does not itself mean the value should be displayed as UTC.
+This is a scheduler extension, not a second scheduler. Preparation should begin no earlier than necessary and must be tied to `task_id`, `occurrence_key`, and `definition_version`. A result prepared 20 seconds before the deadline is usable if it remains valid and the task definition version is unchanged. A result prepared one second before the deadline is also usable, but execution may be late because the existing scheduler wake and Telegram call have their own latency.
 
-The current Taskloom UI obtains timestamps in `backend/bot/handlers/taskloom.py::_fmt_dt(value)`, which is simply:
+If preparation is still running at `scheduled_for`, the system must not execute an unvalidated or absent action. The occurrence should be recorded as late/failed/retryable using the existing failure policy, or remain in a precisely defined non-executing preparation state. The current states do not themselves distinguish this case; see §7.
 
-`return value.strftime("%m-%d %H:%M")`
+## 6. PREPARATION VS TELEGRAM EXECUTION
 
-There is no `ZoneInfo(task.timezone)`, `astimezone(...)`, or other display conversion in `_fmt_dt()`. Consequently, an aware datetime parsed/stored as UTC is formatted using its existing UTC clock fields. The task's `timezone` metadata is displayed separately but is not used by `_fmt_dt()`.
+The required boundary remains:
 
-The affected fields are `task.next_run_at`, `task.updated_at`, `task.created_at` where shown, and `occurrence.scheduled_for`. The source-grounded failure is therefore in the **UI formatter**, not storage: the formatter discards timezone context by formatting the datetime without converting to the task's declared timezone. The smallest future implementation location is `taskloom.py::_fmt_dt()` or a narrowly scoped caller that passes the task timezone; no fixed offset should be introduced.
+```text
+AI/provider reasoning
+  -> bounded candidate/result
+  -> local validation and trusted destination enforcement
+  -> existing ToolExecutor
+  -> registered domain tool
+  -> TelegramAPI backed by the Self Bot client
+```
 
-## 5. RELATIONSHIP BETWEEN BUGS
+Preparation may call the provider, but it must not call Telethon or the Telegram API directly. The prepared value must be converted into the same registered action contract consumed by `TaskExecutionCoordinator`. For a bio task, that means the existing registered bio tool; for a message task, the existing bounded `send_message` tool. Destination and owner identity must come from the persisted trusted task context, never from provider output.
 
-Persistence and list/delete can be related through the repository fallback: a Supabase failure can leave a task and later status changes in process memory, making the UI appear functional while durable state is absent. This relationship is **LIKELY**, not proven for the reported production instance.
+Validation belongs before persistence/use of the prepared executable snapshot and again at the existing execution boundary as defense in depth. The database stores state and snapshots; it does not execute business actions.
 
-The Delete visibility problem is independently **CONFIRMED FROM SOURCE** because list methods include deleted records even after a successful soft-delete transition.
+## 7. OCCURRENCE STATE REQUIREMENTS
 
-Timezone display is independently **CONFIRMED FROM SOURCE** as a formatter conversion defect. It does not depend on database persistence, deletion, the scheduler, or helper connectivity.
+**Confirmed from source.** Existing statuses are `claimed`, `running`, `succeeded`, `failed`, `retry_pending`, `cancelled`, `expired`, and `interrupted`. The repository transition table permits transitions appropriate to those states. `claimed` and `running` currently mean scheduler claim/execution lifecycle, not “AI preparation complete”.
 
-## 6. HELPER BOT DEPENDENCY
+These statuses are not sufficient to unambiguously represent “AI preparation completed, but Telegram execution has not started.” Reusing `claimed` or `running` would conflate provider work with side-effect execution and would make restart recovery ambiguous. `retry_pending` describes a failed attempt awaiting retry, not a successfully prepared action waiting for its deadline.
 
-The Helper Bot is used by the Glass UI inline delivery and callback registration path, as established in the prior investigation. Once the Taskloom detail view is visible and actions such as Pause/Resume execute, the current observations demonstrate that the relevant UI path is reachable in that runtime state.
+Minimum source-grounded requirement: introduce an explicit durable preparation/readiness distinction, either through a narrowly defined additional occurrence status/state or a bounded, validated preparation state in existing occurrence metadata with clear CAS/transition rules. The latter is only safe if every scheduler/recovery/execution query treats it consistently; the current code does not. This is an implementation decision requiring lifecycle review, not an implemented change.
 
-Task persistence, repository transitions, scheduler execution, and timestamp formatting do not import or call the Helper Bot. The source provides no causal dependency from `helper_connected=False` to the three reported backend/list/timezone defects. Helper connectivity may prevent creation or callback delivery of a panel in the normal inline path, but it does not explain a deleted row remaining in a repository list or UTC formatting of an already-rendered task.
+## 8. PREPARED RESULT / ACTION LIFETIME
 
-## 7. RECENT task.py REPAIR
+**Proposed semantics based on occurrence identity and immutable snapshots.**
 
-The repaired `backend/ai/tools/task.py` is involved in task creation entry and can prevent all task-tool execution if it is syntactically invalid. The current successful task creation/execution observation shows no demonstrated remaining syntax-wiring failure in that path. Its code delegates persistence to `TaskCreationService` and does not implement list rendering, delete transitions, or timestamp formatting.
+- Generate a dynamic AI result once per occurrence.
+- Persist only the final validated action plus bounded preparation metadata, not untrusted provider prose as executable data.
+- Consume the prepared result once for that occurrence.
+- Reuse it for retries of the same occurrence, because rerunning AI could produce a different side effect and violate at-most-one intended occurrence semantics.
+- Never reuse it across recurring occurrences; each occurrence gets a new preparation.
+- Reject or regenerate a result that is stale relative to its preparation deadline, task `definition_version`, or explicit validity policy.
+- If the task definition changes while preparation runs, discard the result unless its version matches the occurrence snapshot.
+- A process restart after successful preparation must recover the persisted prepared state and execute it or apply the defined stale/late policy; it must not silently regenerate or lose it.
 
-No remaining impact on the three reported problems is demonstrated from source. The database fallback behavior is in `task_repository.py`, deletion visibility is in `list_tasks()`/Taskloom rendering, and timezone display is in `_fmt_dt()`.
+The existing `definition_version` and unique `(task_id, occurrence_key)` identity are the correct anchors for this behavior, but the current repository has no preparation-specific fields or transitions.
 
-## 8. CONFIRMED ROOT CAUSES
+## 9. FAILURE / LATENCY MODEL
 
-1. **Delete visibility root cause — CONFIRMED FROM SOURCE:** deletion is implemented as a `status="deleted"` transition, while both list implementations return all owner tasks without excluding deleted/terminal records. A successfully deleted task can therefore remain in the list.
-2. **Timezone display root cause — CONFIRMED FROM SOURCE:** `taskloom._fmt_dt()` formats UTC-normalized aware datetimes directly and never converts them to `task.timezone` (`Asia/Tehran`).
-3. **Persistence failure — NOT CONFIRMED as a live incident:** the repository has a confirmed fallback path that can make UI/task execution succeed without a durable Supabase row when Supabase operations fail, but no live evidence proves that this occurred for the reported task.
+**Required behavior; not implemented.**
 
-## 9. REMAINING UNKNOWN
+- Early successful preparation: persist the validated action and mark the occurrence ready; execute at the scheduled deadline.
+- Late successful preparation: execute only if the result is still valid and the occurrence has not been superseded; record lateness in bounded result metadata.
+- Preparation still running at deadline: do not execute an incomplete result; record a bounded failure/late outcome and apply existing bounded retry policy where appropriate.
+- Provider failure or timeout: no Telegram side effect; persist failure metadata and use the existing retry classification/attempt limit rather than an unbounded retry loop.
+- Invalid provider candidate: reject it locally; do not fabricate success or execute it.
+- Valid preparation followed by Telegram failure: preserve the prepared action for retry of the same occurrence; retry the Telegram execution, not AI generation, unless the action is explicitly marked stale/invalid.
+- Pause while preparing: cancellation/commit logic must prevent a paused task from executing a prepared result.
+- Delete while preparing: ownership/status/version checks must prevent any later side effect; task deletion must not bypass occurrence history constraints.
+- Definition edit while preparing: version mismatch must invalidate the in-flight result.
+- Restart after preparation: recovery must see the durable preparation state and resume safely.
 
-- Whether the production `ai_tasks` insert succeeded, failed, or was routed to the in-memory fallback.
-- Whether the production process was configured with a real Supabase client and valid service-role credentials at task creation time.
-- Whether the displayed task came from the same process/repository instance as the database queried by the user.
-- Whether the Delete update succeeded in Supabase or only in fallback memory.
-- The exact production datetime values and timezone offsets behind the displayed screenshots.
-- Whether the deployed artifact exactly matches this repository HEAD.
+The current `TaskExecutionCoordinator` already returns failure rather than claiming success when tool execution or occurrence-state persistence fails, and its retry behavior is bounded by `backend.ai.retry`. Those semantics should be reused rather than replaced.
 
-## 10. MINIMAL NEXT IMPLEMENTATION SCOPE
+## 10. SHORT-INTERVAL WARNING
 
-- Persistence: add production-observable verification around the existing `SupabaseTaskRepository.create_task()` result/fallback boundary, without changing schema; first confirm the actual production repository/client configuration before changing behavior.
-- Delete visibility: retain the existing soft-delete transition but exclude `deleted` (and, if product policy requires, other terminal statuses) from the existing `list_tasks()` read path or its narrowly scoped service boundary.
-- Timezone: convert aware timestamps with `ZoneInfo(task.timezone)` at the existing Taskloom formatting boundary before `strftime`; preserve UTC storage and avoid fixed offsets.
+The source contains timing constraints, but no existing production constant that safely defines “too short for reliable AI preparation”. Relevant values include:
 
-No implementation was performed in this investigation.
+- `TaskScheduler.WAKE_INTERVAL_SECONDS = 60.0`.
+- `TaskExecutionCoordinator.MAX_EXECUTION_SECONDS = 60.0`.
+- Repository external-operation timeout `DB_TIMEOUT = 10.0`.
+- Dispatcher/provider request and handler bounds exist in the interactive AI path, but they are not a measured scheduled-AI preparation budget.
+- Retry backoff and attempt limits are defined in `backend/ai/retry.py`.
 
+These values are not interchangeable: scheduler polling latency, provider timeout/fallback behavior, validation, persistence, Telegram execution, and clock skew all consume the budget. No threshold should be invented from one constant. The minimum information needed is an observed/p99 provider preparation latency budget (including fallback), scheduler wake/jitter budget, persistence/validation budget, Telegram execution budget, and an explicit lateness tolerance.
+
+Once measured, the warning should apply only to AI-backed tasks whose recurrence interval leaves insufficient preparation margin, and should be shown at creation as a warning without converting a failed task into a success. Persisting the warning is not required by the current contract unless product requirements later require it; the creation response is the smallest existing notification surface.
+
+## 11. COMPLEX AI TASK STRESS TEST
+
+The future request:
+
+> “پری هر ۵ دقیقه تکست بیو من رو به یکی از دیالوگ های ۵۰ و زیر ۵۰ کاراکتری یکی از کاراکتر های کودره انیمه ای تغییر بده”
+
+fits the proposed model conceptually:
+
+- recurring interval schedule in the task definition;
+- durable natural-language instruction with length/content constraints;
+- one provider preparation per occurrence;
+- provider returns a bounded bio candidate, not a Telegram call;
+- local validation enforces the character limit and registered bio-tool schema;
+- `TaskExecutionCoordinator` invokes the existing registered bio tool through `ToolExecutor`;
+- the Self Bot remains the only Telegram authority;
+- no third durable table is inherently required.
+
+The exact missing capability is not scheduling or Telegram transport. It is the absence of a durable preparation/readiness contract and an occurrence-aware provider-preparation executor in the current Taskloom model. The existing `action_snapshot` can carry the final validated bio action, but it cannot by itself express the durable instruction plus an in-progress/ready preparation lifecycle to the current scheduler.
+
+## 12. DATABASE PERSISTENCE OBSERVABILITY
+
+The current repository catches broad external failures and falls back to memory. To diagnose missing durable `ai_tasks` inserts safely, trace points belong at these existing boundaries:
+
+1. `TaskCreationService.create()` — creation start, owner-safe task identifier/label hash or length, schedule type, action count, and selected repository class.
+2. `SupabaseTaskRepository.create_task()` — validated payload structural summary only, before `_run()`.
+3. Immediately around `self._client.table("ai_tasks").insert(payload).execute()` — attempted/succeeded markers and returned row ID only.
+4. The Supabase `except Exception` branch — exception class and sanitized message, with no credentials or task contents.
+5. Fallback activation — explicit fallback marker and fallback repository class.
+6. Final return to the tool/service boundary — persistence outcome (`supabase` vs `fallback`), task ID, and whether the durable row was confirmed.
+7. `create_occurrence()` — equivalent markers for `ai_task_occurrences`, including task ID, occurrence key hash, and returned occurrence ID.
+
+The existing `logger.warning("Supabase task create failed; using fallback")` proves fallback behavior exists but does not expose enough structured state to distinguish selected repository, insert attempt, returned row, and final persistence outcome. No live database inspection or SQL was performed here, so production row existence remains unverified.
+
+## 13. EXISTING CONFIRMED BUGS
+
+These are carried forward without re-investigation or implementation:
+
+- **Delete:** deletion is a soft transition to `status="deleted"`, while `list_tasks()` includes deleted records, so deleted tasks remain visible.
+- **Timezone:** storage uses UTC-aware timestamps and `taskloom._fmt_dt()` formats directly without converting to the task's IANA timezone, so Asia/Tehran can display UTC-style values.
+
+Neither bug is part of the AI-preparation design.
+
+## 14. CONFIRMED FINDINGS
+
+### Confirmed from source
+
+- There is one `TaskScheduler` and one `TaskExecutionCoordinator`.
+- Scheduled execution begins after occurrence claim and uses the immutable `action_snapshot`.
+- The coordinator does not currently perform provider work.
+- `scheduled_for` and `next_run_at` are UTC-aware instants; no preparation deadline/readiness field exists.
+- `actions`/`action_snapshot` are bounded arrays of executable tool-call-shaped JSON.
+- `definition_version` and unique occurrence identity support per-occurrence version safety.
+- Existing occurrence statuses do not explicitly represent prepared-but-not-executed work.
+- Existing retry logic is bounded and belongs to the current execution lifecycle.
+- The repository uses owner-scoped validation and Supabase-to-memory fallback.
+
+### Confirmed from existing documentation/tests
+
+- The two-table Taskloom persistence model and action/occurrence bounds are documented in `DATABASE_ARCHITECTURE.md` and enforced by repository validation code.
+- Existing tests cover current task creation, occurrence execution, retries, and recovery boundaries, but no existing test establishes a provider-backed per-occurrence preparation lifecycle or a pre-deadline readiness state.
+
+### Observed from user/runtime
+
+- The user requires durable AI instructions, dynamic per-occurrence results, lower execution latency, and a warning for schedules too short for reliable preparation.
+- The user reports an existing successful Taskloom execution and separately reports persistence/list/timezone concerns; those live database facts were not independently queried in this investigation.
+
+### Not confirmed
+
+- Actual live Supabase schema/application state and whether any particular production task row exists.
+- Provider p99 latency or a safe warning threshold.
+- Whether the current deployment has code or migrations different from this repository revision.
+- The exact preferred occurrence-state encoding for prepared-but-not-executed work.
+
+### Proposed design
+
+- Persist the natural-language task instruction at task-definition level.
+- Prepare dynamic AI results once per occurrence before `scheduled_for`.
+- Persist the final validated action and preparation metadata against that occurrence.
+- Reuse a prepared result for retries of the same occurrence only.
+- Enforce version, owner, destination, schema, and freshness checks before Self Bot execution.
+- Extend the existing scheduler/lifecycle minimally; do not add a scheduler, executor, Telegram path, or third table.
+
+## 15. MINIMAL NEXT IMPLEMENTATION SCOPE
+
+1. **Define the existing-model representation:** choose a bounded, versioned representation for a durable AI instruction and per-occurrence preparation metadata without changing unrelated tables or adding a parallel store.
+2. **Add the smallest occurrence lifecycle boundary:** represent preparation-in-progress/ready distinctly from Telegram execution, with owner/version/CAS and restart-safe recovery semantics.
+3. **Reuse the existing scheduler:** schedule preparation early enough using measured latency budgets, then let the existing `TaskExecutionCoordinator` execute only the persisted validated action at/after the deadline.
+4. **Reuse existing tools and validation:** provider output must resolve to registered tool calls; no provider direct Telegram access; failure must remain an honest failure.
+5. **Measure before warning:** instrument or derive bounded p99 preparation, scheduler, persistence, and Telegram budgets, then implement a creation-time warning only for AI-backed intervals below the measured safe margin.
+6. **Add focused tests:** per-occurrence regeneration, zero Telegram execution before readiness, prepared-result reuse on same-occurrence retry, version invalidation, pause/delete cancellation safety, restart recovery, and warning behavior.
+
+The already-confirmed Delete and timezone fixes should remain separate implementation stages.
+
+## 16. REMAINING UNKNOWN
+
+- Live Supabase availability/schema and the actual cause of any reported missing `ai_tasks` row.
+- Provider latency distribution and fallback timing in production.
+- Whether the product permits a new explicit occurrence status or requires metadata-only representation.
+- Exact stale-result/lateness tolerance and whether late execution is acceptable or must be marked failed.
+- Whether prepared-result metadata may safely fit current JSON byte limits for all supported AI actions.
+- How an in-flight provider preparation should be cancelled and reconciled against pause/delete/version edits using the runtime's supervised task model.
+
+No code, tests, configuration, schema, SQL, Supabase data, scheduler, UI, or Telegram behavior was modified in this investigation.
