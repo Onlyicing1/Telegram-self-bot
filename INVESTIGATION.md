@@ -1,170 +1,184 @@
 # INVESTIGATION
 
-## CURRENT PRODUCTION EVIDENCE
+## 1. PRODUCTION EVIDENCE
 
-The supplied logs prove:
+The supplied ordering proves that the request was classified as executable
+`create_task`, entered `ToolExecutor`, and reached provider routing. Cohere was
+selected and an attempt was logged. Roughly two seconds later the tool result
+was `success=False`; the Telegram response itself then succeeded. The excerpt
+does not include the provider response body, its metadata, the interpreter
+exception, or the tool result message/error. The later `[Errno 11]` warnings
+occur after the Telegram response and concern message/provider-statistics
+persistence.
 
-1. The Dispatcher classified the request as executable `create_task`.
-2. The existing `ToolExecutor` was attached and selected `create_task`.
-3. The request entered the provider-backed task path. Provider routing selected Cohere and attempted `command-a-plus-05-2026`.
-4. Approximately 3.2 seconds later, the executor recorded `create_task success=False`.
-5. Telegram delivery of the failure response succeeded.
+## 2. ACTUAL SOURCE CALL CHAIN
 
-The logs do **not** include the provider response body, response metadata, exception class/message, candidate validation error, or repository persistence markers. Therefore they cannot identify the exact inner failure by themselves.
+The current path is:
 
-## EXACT EXECUTION TRACE
+`Dispatcher._try_local_fast_path()` → `parse_command_intent()` resolves the
+request to an executable `create_task` call carrying the original stripped
+request under `arguments["request"]` →
+`ToolExecutor.execute_calls()` → `_execute_single()` →
+`CreateTaskTool.execute()`.
 
-The current source path is:
+`CreateTaskTool.execute()` validates the request and owner, then calls
+`TaskInterpreter(provider_manager).interpret(request, timezone=tz_str)` unless
+`context.extra["deterministic_task_candidate"]` exists. The current dispatcher
+can construct that deterministic candidate in
+`Dispatcher._build_tool_context()` for the narrow interval/write shape; when it
+does, the provider is bypassed for the tool itself. The supplied provider logs
+therefore indicate that this particular runtime path did not use that
+candidate, or that the provider logs belong to an earlier provider stage; the
+excerpt alone cannot reconcile that distinction.
 
-```text
-Dispatcher.dispatch(request)
-  -> _try_local_fast_path()
-  -> parse_command_intent()
-  -> create_task tool call
-  -> ToolExecutor.execute_calls()
-  -> ToolExecutor._execute_single()
-  -> CreateTaskTool.execute()
-  -> TaskInterpreter.interpret()
-  -> ProviderManager.chat(..., tools=[])
-  -> provider routing / selected Cohere provider
-  -> ProviderResponse
-  -> JSON decoding
-  -> parse_candidate_output()
-  -> TaskCandidate.from_untrusted()
-  -> destination resolution, if requested
-  -> TaskCreationService.create()
-  -> TaskRepository.create_task()
-  -> SupabaseTaskRepository.create_task(), or fallback
-```
+The provider path is:
 
-The Dispatcher’s local classification does not itself create the task. In the current production path, `_build_tool_context()` only attaches a deterministic candidate for the narrow interval/write form it can build. The supplied logs show a provider routing attempt, so the `CreateTaskTool` path proceeded without an attached deterministic candidate for this request.
+`TaskInterpreter.interpret()` → `ProviderManager.chat(messages, tools=[])` →
+selected provider → `ProviderResponse` → `json.loads(response.text)` →
+`parse_candidate_output()` → `TaskCandidate.from_untrusted()` →
+`TaskCandidate.as_creation_candidate()` → destination resolution →
+`TaskCreationService.create()` → `TaskRepository.create_task()` → either
+`SupabaseTaskRepository.create_task()` and its insert, or an in-memory
+repository/fallback.
 
-`ToolExecutor._execute_single()` invokes the tool inside its bounded timeout and converts a returned unsuccessful `ToolResult` into the logged `tool_result success=False`. It also converts an uncaught tool exception into a failed `ToolExecutionResult`, but the supplied log does not show which of those two cases occurred.
+`ToolExecutor` returns a failed `ToolExecutionResult` whenever the tool returns
+a failed `ToolResult`; it does not expose the tool's internal exception unless
+its own outer execution wrapper catches an exception.
 
-## EXACT FAILURE
+## 3. FIRST FAILURE POINT
 
-The first source location that intentionally converts a provider/interpreter failure into the user-facing safe-schedule failure is `backend/ai/tools/task.py::CreateTaskTool.execute()`:
+The earliest failure point proven by the source and compatible with the
+provider timing is `TaskInterpreter.interpret()`, after the provider returns.
+Its provider call is bounded and its response is accepted only when all of the
+following succeed: `response.success` is true, `response.text` is nonblank,
+JSON decoding succeeds, and `parse_candidate_output()` accepts the exact
+candidate contract.
 
-```python
-try:
-    candidate = await asyncio.wait_for(
-        TaskInterpreter(provider_manager).interpret(request, timezone=tz_str),
-        timeout=INTERPRET_TIMEOUT_SECONDS,
-    )
-except asyncio.CancelledError:
-    raise
-except (TaskInterpretationError, asyncio.TimeoutError, Exception):
-    return ToolResult(
-        success=False,
-        message="I could not turn that into a safe, unambiguous schedule...",
-    )
-```
+However, the production excerpt does not contain the distinguishing response
+or exception log. Therefore the precise first failing sub-operation cannot be
+identified from the supplied production evidence.
 
-The broad exception clause means the user-facing result does not preserve the original exception. `TaskInterpreter.interpret()` can raise `TaskInterpretationError` for any of these concrete conditions:
+## 4. FAILURE MECHANISM
 
-- provider call raises an exception;
-- provider returns `success=False`;
-- provider returns empty/non-string text;
-- provider text is not valid JSON;
-- JSON does not satisfy `TaskCandidate.from_untrusted()`.
+`CreateTaskTool.execute()` has two broad exception-conversion boundaries:
 
-The current source and supplied production logs do **not** recover which of these occurred. No `TaskCreationService` or repository-specific error can be concluded from the shown logs, because the interpreter failure conversion occurs before those calls.
+1. The interpreter block catches `asyncio.TimeoutError` and
+   `TaskInterpretationError` (the tuple also redundantly includes `Exception`).
+   It returns the generic message beginning:
+   `I could not turn that into a safe, unambiguous schedule...`.
+2. The creation block catches `TaskCreationError` (again redundantly with
+   `Exception`) and returns:
+   `The task could not be persisted; nothing was created.`
 
-There is a second failure conversion in `CreateTaskTool.execute()` around creation:
+`TaskInterpreter` converts provider exceptions into `TaskInterpretationError`
+(`task interpretation provider failed`), provider `success=False` into
+`TaskInterpretationError`, blank output into `TaskInterpretationError`, and
+`JSONDecodeError` or `TaskCandidateError` into `TaskInterpretationError`.
+`TaskCandidate.from_untrusted()` rejects non-object/prose output, missing or
+extra fields, invalid labels/timezones/schedules/actions, oversized payloads,
+invalid schedule data, and unsafe message-action content.
 
-```python
-try:
-    service = TaskCreationService(get_repository_manager().task, owner_id)
-    task = await service.create(candidate, datetime.now(timezone.utc))
-except asyncio.CancelledError:
-    raise
-except (TaskCreationError, Exception):
-    return ToolResult(success=False, message="The task could not be persisted; nothing was created.")
-```
+`Production exception not observable from current logs.` The exact data lost is
+the provider response text/metadata and the chained underlying exception or
+candidate validation message. The smallest diagnostic needed is a
+request-correlated, sanitized log at the `CreateTaskTool` interpreter `except`
+that records `request_id`, failure category (`provider_failure`, `timeout`,
+`empty_output`, `json_invalid`, or `candidate_invalid`), exception class, and
+bounded sanitized message—never provider response secrets or user payload.
 
-That branch is distinguishable by its different message, but the supplied `AI_EXEC_TRACE stage=tool_result success=False` line does not include the `ToolResult.message`. Thus the log excerpt cannot prove whether the interpreter branch or creation branch produced the failure. It also cannot prove whether a later destination-resolution return (`Could not resolve chat destination`) was used.
+## 5. PROVIDER CONTRACT
 
-## PROVIDER CONTRACT
+`TaskInterpreter` sends three messages: a system instruction requiring exactly
+one JSON object, a system message containing `CANDIDATE_SCHEMA`, and the
+original stripped user request. It calls `ProviderManager.chat(..., tools=[])`.
+The expected text is a JSON object with exactly these fields:
 
-`TaskInterpreter.interpret(request, timezone)` enforces:
+- `label` (bounded string)
+- `schedule_type` (`once`, `interval`, `daily`, or `weekly`)
+- `schedule` (object)
+- `timezone` (bounded IANA-like string accepted by downstream schedule checks)
+- `actions` (one to five action objects)
+- `notification_destination` (object)
 
-- request must be a nonblank string of at most `MAX_REQUEST_CHARS = 2000` characters;
-- one provider request is made through `ProviderManager.chat(messages, tools=[])`;
-- the provider receives two system messages and one user message:
-  - instructions requiring exactly one JSON task candidate;
-  - the JSON-serialized `CANDIDATE_SCHEMA`;
-  - the stripped original request;
-- provider tools are explicitly disabled for this interpretation call (`tools=[]`);
-- when a timezone is supplied, the prompt asks for that IANA timezone and says interval schedules carry no timezone field;
-- the response must be `ProviderResponse.success == True`;
-- `response.text` must be nonblank JSON;
-- JSON must be an object with exactly these fields:
+For message writing, the prompt requires action `send_message` with only a
+bounded `text` argument and no destination. The parser canonicalizes permitted
+send aliases to `send_message`; other names remain subject to the registered
+tool boundary. Interval schedules use seconds and do not require a schedule
+timezone; non-interval schedules must match the task timezone. JSON `null`,
+ordinary prose, empty text, malformed JSON, missing fields, extra fields, or
+invalid schedule/action data are rejected before candidate creation.
 
-```text
-label
-schedule_type
-schedule
-timezone
-actions
-notification_destination
-```
+ProviderManager itself catches provider exceptions and returns a failed
+`ProviderResponse`; it also may exhaust fallback routing and return
+`success=False`. Thus a provider attempt log does not prove that a usable
+candidate reached `TaskCandidate` construction. Conversely, no source evidence
+shows that a candidate reached persistence for this failed result.
 
-`TaskCandidate.from_untrusted()` then requires:
+## 6. PERSISTENCE STATUS
 
-- nonblank bounded label, maximum 256 characters;
-- nonblank bounded timezone, maximum 128 characters;
-- object schedule and destination;
-- one to five actions;
-- each action has a tool name and object arguments;
-- message aliases are canonicalized to the registered `send_message` action with bounded `text` only;
-- unknown action names are retained as candidate data and are later subject to the existing execution/registry boundary;
-- schedule parsing succeeds for `once`, `interval`, `daily`, or `weekly`;
-- non-interval schedule timezone equals task timezone;
-- optional `chat_name` is a bounded nonblank string; numeric model-provided chat IDs are not accepted as a candidate destination field by the candidate contract.
+The failing result is not sufficient to prove persistence. If interpreter
+validation failed, destination resolution failed, or the provider manager
+returned failure, `TaskCreationService.create()` is never reached. If creation
+is reached, the service validates/parses the schedule and logs
+`TASK_CREATE_PERSIST_ATTEMPT` before calling the repository.
 
-For the exact Persian request, the current schema can represent the intended static operation if the provider returns a valid candidate, for example an interval schedule plus a canonical `send_message` action and empty destination. The source does not prove that Cohere returned such a candidate.
+A Supabase insert is attempted only when the repository manager was initialized
+with both `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` and the task repository
+is `SupabaseTaskRepository`. Its `create_task()` logs an attempt and calls
+`table("ai_tasks").insert(payload).execute()`. Supabase exceptions fall back to
+`InMemoryTaskRepository.create_task()`; validation `ValueError`/`TypeError` is
+re-raised instead. With no Supabase configuration, the manager selects the
+in-memory repository directly. The supplied logs do not show any of these
+persistence markers, so TaskCreationService, repository creation, Supabase
+insert, and fallback are **not proven reached**. No database state can be
+inferred from the excerpt.
 
-## PERSISTENCE STATUS
+## 7. [Errno 11] SEPARATE ISSUE
 
-Based on the supplied evidence and current source:
+The later `[Errno 11] Resource temporarily unavailable` warnings are emitted
+by the unrelated asynchronous AI message/statistics persistence paths after
+the Telegram response. The supplied ordering does not establish causality,
+and the inspected create-task path does not use those operations as its
+interpreter or task-repository result. They must be investigated separately;
+they cannot be identified as the cause of `create_task success=False` from this
+evidence.
 
-- `TaskInterpreter.interpret()` is definitely reached: provider routing and a provider attempt occur inside that call.
-- Whether `TaskInterpreter` completed successfully is unknown.
-- `TaskCandidate` validation may or may not have been reached; the logs omit the response and validation result.
-- `TaskCreationService.create()` is reached only after successful interpretation and destination handling. The supplied logs do not prove it was reached.
-- `TaskRepository.create_task()` is reached only after successful `TaskCreationService` validation. The supplied logs do not prove it was reached.
-- `SupabaseTaskRepository.create_task()` is not proven to have been attempted. Its `TASK_PERSIST_CREATE_ATTEMPT` log is absent from the supplied excerpt, but absence from an excerpt is not proof that it did not occur.
-- The in-memory fallback is not proven to have been involved. It would only be used after a Supabase repository exception, and the repository fallback log is absent from the excerpt.
-- No database row visibility conclusion can be made from this log excerpt alone.
-
-If the safe-schedule interpreter message was returned, the failure occurred before persistence. If the persistence message was returned, the failure occurred in task creation, schedule validation, destination handling, repository construction, Supabase insert, or fallback creation. The excerpt does not include the distinguishing message.
-
-## ROOT CAUSE STATUS
+## 8. ROOT CAUSE STATUS
 
 **UNKNOWN — INSUFFICIENT PRODUCTION EVIDENCE**
 
-The provider attempt and later failed tool result narrow the path, but the current broad exception handling removes the exact exception from the visible result, and the supplied trace omits the returned `ToolResult.message` plus the interpreter/provider/persistence logs needed to distinguish the remaining branches. A provider failure, malformed/incomplete provider JSON, candidate validation failure, destination resolution failure, schedule parsing failure, repository failure, and fallback activation therefore cannot be ranked as confirmed from this evidence.
+The source identifies the exact conversion boundaries and all principal
+provider/interpreter validation branches, but the production excerpt omits the
+provider response and the sanitized exception/category needed to select one
+branch. It also contains no task-persistence marker proving that creation was
+attempted.
 
-The strongest source-derived conclusion is that the failure is most likely converted in one of the two broad exception boundaries in `CreateTaskTool.execute()`, with the first boundary (`TaskInterpreter.interpret`) occurring before any persistence. It is **not** source-proven that persistence was attempted.
+## 9. MINIMAL NEXT IMPLEMENTATION TARGET
 
-## MINIMAL NEXT IMPLEMENTATION TARGET
+Add only request-correlated, sanitized failure-category logging at the two
+`CreateTaskTool` exception boundaries, preserving exception chaining and
+without logging raw request text, provider output, credentials, or Telegram
+payloads. The log must distinguish interpreter/provider failures from creation,
+destination, and persistence failures and include the exception class and
+bounded sanitized message. No behavior or architecture change is required to
+make the next production run diagnostic.
 
-Add sanitized, request-correlated observability at the existing boundaries without changing behavior:
+## 10. OUT OF SCOPE
 
-1. Log entry/exit around `TaskInterpreter.interpret()` with request ID, input length, provider name, response success, finish reason, text length, tool-call count, and a categorized failure (`provider_exception`, `provider_failure`, `empty_response`, `invalid_json`, `candidate_validation`). Never log prompt text, provider credentials, or message contents.
-2. Preserve the existing exception class as structured log metadata before converting it to the safe user-facing `ToolResult`.
-3. Include a sanitized failure category in the `create_task` `ToolResult.data` or trace event so `AI_EXEC_TRACE stage=tool_result` identifies interpreter versus creation failure without exposing secrets.
-4. Retain the existing task-service/repository persistence attempt, success, and fallback markers and correlate them with the same request ID.
+This investigation does not implement:
 
-This is the smallest diagnostic change needed to make the next production occurrence distinguishable. No scheduler, AI precomputation, Taskloom redesign, Delete fix, timezone fix, schema change, or Telegram behavior change is required for this investigation.
+- AI-backed per-occurrence preparation
+- Phase 1 durable AI instruction representation
+- scheduler changes
+- new occurrence states
+- Delete fix
+- timezone fix
+- database schema changes
+- provider redesign
+- new retry engines
+- new executors
+- new Telegram transports
 
-## REQUIRED CONSTRAINTS
-
-- No production code changed.
-- No tests changed.
-- No dependencies or configuration changed.
-- No database/schema/SQL/Supabase mutation performed.
-- No Telegram mutation or live verification performed.
-- No architecture redesign performed.
-- `tests/test_stage13.py` was preserved.
-- Only this `INVESTIGATION.md` file is intended to be changed.
+No production code, tests, dependencies, configuration, SQL/schema, Supabase,
+or Telegram behavior was changed. The unrelated `tests/test_stage13.py`
+modification was preserved.
