@@ -115,7 +115,7 @@ class CreateTaskTool(Tool):
             except asyncio.CancelledError:
                 raise
             except (TaskInterpretationError, asyncio.TimeoutError, Exception):  # noqa: BLE001
-            return ToolResult(
+                return ToolResult(
                 success=False,
                 message=(
                     "I could not turn that into a safe, unambiguous schedule, so I "
