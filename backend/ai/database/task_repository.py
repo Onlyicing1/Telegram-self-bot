@@ -6,17 +6,24 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
+
+from backend.ai.task_contract import validate_ai_instruction, validate_prepared_action
 
 logger = logging.getLogger(__name__)
 TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
 OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted"})
 SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly"})
-MAX_ACTIONS = 5; MAX_PAYLOAD_BYTES = 32768; MAX_METADATA_BYTES = 8192; MAX_ATTEMPTS = 3; DB_TIMEOUT = 10.0
+MAX_ACTIONS = 5
+MAX_PAYLOAD_BYTES = 32768
+MAX_METADATA_BYTES = 8192
+MAX_ATTEMPTS = 3
+DB_TIMEOUT = 10.0
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "expired", "deleted"})
 _TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired"})
 _ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired", "deleted"}, "paused": {"paused", "active", "deleted"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
 _ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
+
 
 def _now(): return datetime.now(timezone.utc)
 def _copy(value): return copy.deepcopy(value)
@@ -33,6 +40,7 @@ def _validate_task_input(data):
     if not isinstance(data.get("timezone"), str) or not data["timezone"].strip() or len(data["timezone"]) > 128: raise ValueError("timezone must be a bounded nonblank string")
     if not isinstance(data.get("schedule"), dict): raise ValueError("schedule must be an object")
     if not isinstance(data.get("notification_destination"), dict): raise ValueError("notification destination must be an object")
+    if data.get("ai_instruction") is not None: validate_ai_instruction(data["ai_instruction"])
     _validate_json_payload(data.get("actions"), array=True)
     if _json_bytes(data["schedule"]) > 16384 or _json_bytes(data["notification_destination"]) > 4096: raise ValueError("task JSON payload exceeds its bounded size")
 def _validate_occurrence_input(data):
@@ -41,6 +49,19 @@ def _validate_occurrence_input(data):
     if not isinstance(data.get("definition_version"), int) or data["definition_version"] < 1: raise ValueError("definition_version must be positive")
     if data.get("status", "claimed") not in OCCURRENCE_STATUSES: raise ValueError("invalid occurrence status")
     if not isinstance(data.get("attempt", 1), int) or not 1 <= data.get("attempt", 1) <= MAX_ATTEMPTS: raise ValueError("attempt must be between 1 and 3")
+    if data.get("preparation_metadata") is not None:
+        _validate_json_payload(data["preparation_metadata"], metadata=True)
+        preparation = data["preparation_metadata"]
+        if preparation and set(preparation) != {"kind", "definition_version", "prepared_at", "action"}:
+            raise ValueError("invalid preparation metadata fields")
+        if preparation:
+            if preparation.get("kind") != "prepared_action":
+                raise ValueError("invalid preparation metadata kind")
+            if not isinstance(preparation.get("definition_version"), int) or preparation["definition_version"] < 1:
+                raise ValueError("invalid preparation definition version")
+            if not isinstance(preparation.get("prepared_at"), str) or not preparation["prepared_at"].strip():
+                raise ValueError("invalid preparation timestamp")
+            validate_prepared_action(preparation.get("action"))
     _validate_json_payload(data.get("action_snapshot"), array=True); _validate_json_payload(data.get("error_metadata", {}), metadata=True); _validate_json_payload(data.get("result_metadata", {}), metadata=True)
     if data.get("status") == "retry_pending" and data.get("retry_at") is None: raise ValueError("retry_pending requires retry_at")
 def _parse_dt(value):
@@ -54,21 +75,23 @@ def _serialize(value): return value.isoformat() if isinstance(value, datetime) e
 
 @dataclass
 class TaskRecord:
-    id: int; owner_id: int; label: str; schedule_type: str; schedule: dict[str, Any]; timezone: str; actions: list[dict[str, Any]]; notification_destination: dict[str, Any]; status: str = "active"; version: int = 1; next_run_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); terminal_at: datetime | None = None
+    id: int; owner_id: int; label: str; schedule_type: str; schedule: dict[str, Any]; timezone: str; actions: list[dict[str, Any]]; notification_destination: dict[str, Any]; status: str = "active"; version: int = 1; next_run_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); terminal_at: datetime | None = None; ai_instruction: str | None = None
     def as_dict(self): return _copy(self.__dict__)
 @dataclass
 class OccurrenceRecord:
-    id: int; task_id: int; owner_id: int; occurrence_key: str; definition_version: int; action_snapshot: list[dict[str, Any]]; scheduled_for: datetime; attempt: int = 1; status: str = "claimed"; claimed_at: datetime | None = None; started_at: datetime | None = None; finished_at: datetime | None = None; retry_at: datetime | None = None; error_metadata: dict[str, Any] = field(default_factory=dict); result_metadata: dict[str, Any] = field(default_factory=dict); created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now)
+    id: int; task_id: int; owner_id: int; occurrence_key: str; definition_version: int; action_snapshot: list[dict[str, Any]]; scheduled_for: datetime; attempt: int = 1; status: str = "claimed"; claimed_at: datetime | None = None; started_at: datetime | None = None; finished_at: datetime | None = None; retry_at: datetime | None = None; error_metadata: dict[str, Any] = field(default_factory=dict); result_metadata: dict[str, Any] = field(default_factory=dict); created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); preparation_metadata: dict[str, Any] = field(default_factory=dict)
     def as_dict(self): return _copy(self.__dict__)
+
 def _task_from_row(row):
     value = {**row, "id": int(row["id"]), "owner_id": int(row["owner_id"]), "version": int(row.get("version", 1))}
+    value.setdefault("ai_instruction", None)
     for key in ("created_at", "updated_at", "next_run_at", "terminal_at"): value[key] = _parse_dt(value.get(key))
     value["schedule"] = dict(value.get("schedule") or {}); value["actions"] = list(value.get("actions") or []); value["notification_destination"] = dict(value.get("notification_destination") or {}); _validate_task_input(value)
     return TaskRecord(**{key: value[key] for key in TaskRecord.__dataclass_fields__})
 def _occurrence_from_row(row):
     value = {**row, "id": int(row["id"]), "task_id": int(row["task_id"]), "owner_id": int(row["owner_id"]), "definition_version": int(row["definition_version"]), "attempt": int(row.get("attempt", 1)), "status": row.get("status", "claimed")}
     for key in ("scheduled_for", "claimed_at", "started_at", "finished_at", "retry_at", "created_at", "updated_at"): value[key] = _parse_dt(value.get(key))
-    value["action_snapshot"] = list(value.get("action_snapshot") or []); value["error_metadata"] = dict(value.get("error_metadata") or {}); value["result_metadata"] = dict(value.get("result_metadata") or {}); _validate_occurrence_input(value)
+    value["action_snapshot"] = list(value.get("action_snapshot") or []); value["error_metadata"] = dict(value.get("error_metadata") or {}); value["result_metadata"] = dict(value.get("result_metadata") or {}); value["preparation_metadata"] = dict(value.get("preparation_metadata") or {}); _validate_occurrence_input(value)
     return OccurrenceRecord(**{key: value[key] for key in OccurrenceRecord.__dataclass_fields__})
 
 class TaskRepository:
@@ -90,7 +113,7 @@ class TaskRepository:
 class InMemoryTaskRepository(TaskRepository):
     def __init__(self): self._tasks={}; self._occurrences={}; self._next_task_id=1; self._next_occurrence_id=1
     async def create_task(self, owner_id, data):
-        payload={**data,"owner_id":owner_id}; _validate_task_input(payload); r=TaskRecord(self._next_task_id,owner_id,payload["label"].strip(),payload["schedule_type"],_copy(payload["schedule"]),payload["timezone"].strip(),_copy(payload["actions"]),_copy(payload["notification_destination"]),payload.get("status","active"),1,payload.get("next_run_at")); self._tasks[r.id]=r; self._next_task_id+=1; return _copy(r)
+        payload={**data,"owner_id":owner_id}; _validate_task_input(payload); r=TaskRecord(self._next_task_id,owner_id,payload["label"].strip(),payload["schedule_type"],_copy(payload["schedule"]),payload["timezone"].strip(),_copy(payload["actions"]),_copy(payload["notification_destination"]),payload.get("status","active"),1,payload.get("next_run_at"),ai_instruction=payload.get("ai_instruction")); self._tasks[r.id]=r; self._next_task_id+=1; return _copy(r)
     async def get_task(self, owner_id, task_id):
         r=self._tasks.get(task_id); return _copy(r) if r and r.owner_id==owner_id else None
     async def list_tasks(self, owner_id): return [_copy(r) for r in self._tasks.values() if r.owner_id==owner_id]
@@ -101,7 +124,7 @@ class InMemoryTaskRepository(TaskRepository):
         if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
         if updates.get("status") and updates["status"] not in _ALLOWED_TASK_TRANSITIONS[r.status]:raise ValueError("invalid task status transition")
         merged=r.as_dict();merged.update(updates);merged["owner_id"]=owner_id;_validate_task_input(merged)
-        for k in ("label","schedule_type","schedule","timezone","actions","notification_destination","status","next_run_at"):setattr(r,k,_copy(merged.get(k,getattr(r,k))))
+        for k in ("label","schedule_type","schedule","timezone","actions","notification_destination","status","next_run_at","ai_instruction"):setattr(r,k,_copy(merged.get(k,getattr(r,k))))
         r.version+=1;r.updated_at=_now()
         if r.status in _TERMINAL_TASK_STATUSES and r.terminal_at is None:r.terminal_at=r.updated_at
         return _copy(r)
@@ -116,7 +139,7 @@ class InMemoryTaskRepository(TaskRepository):
         if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
         _validate_occurrence_input(payload);key=(payload["task_id"],payload["occurrence_key"])
         if key in self._occurrences:return _copy(self._occurrences[key])
-        r=OccurrenceRecord(self._next_occurrence_id,payload["task_id"],owner_id,payload["occurrence_key"].strip(),payload["definition_version"],_copy(payload["action_snapshot"]),payload["scheduled_for"],payload.get("attempt",1),payload.get("status","claimed"),payload.get("claimed_at"),payload.get("started_at"),payload.get("finished_at"),payload.get("retry_at"),_copy(payload.get("error_metadata",{})),_copy(payload.get("result_metadata",{})));self._occurrences[key]=r;self._next_occurrence_id+=1;return _copy(r)
+        r=OccurrenceRecord(self._next_occurrence_id,payload["task_id"],owner_id,payload["occurrence_key"].strip(),payload["definition_version"],_copy(payload["action_snapshot"]),payload["scheduled_for"],payload.get("attempt",1),payload.get("status","claimed"),payload.get("claimed_at"),payload.get("started_at"),payload.get("finished_at"),payload.get("retry_at"),_copy(payload.get("error_metadata",{})),_copy(payload.get("result_metadata",{})),preparation_metadata=_copy(payload.get("preparation_metadata",{})));self._occurrences[key]=r;self._next_occurrence_id+=1;return _copy(r)
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         r=self._occurrences.get((task_id,occurrence_key));return _copy(r) if r and r.owner_id==owner_id else None
     async def list_occurrences(self, owner_id, task_id=None, limit=100): return [_copy(r) for r in list(self._occurrences.values()) if r.owner_id==owner_id and (task_id is None or r.task_id==task_id)][:max(0,limit)]
@@ -150,12 +173,17 @@ class SupabaseTaskRepository(TaskRepository):
         payload={**data,"owner_id":owner_id};_validate_occurrence_input(payload);return {k:_serialize(v) for k,v in payload.items() if k not in {"id","created_at","updated_at"}}
     async def create_task(self, owner_id, data):
         payload=self._task_payload(owner_id,data)
+        logger.info("TASK_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s", type(self).__name__, owner_id)
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").insert(payload).execute());row=getattr(result,"data",None)
             if not row:raise RuntimeError("Supabase task insert returned no row")
-            return _task_from_row(row[0] if isinstance(row,list) else row)
+            record = _task_from_row(row[0] if isinstance(row,list) else row)
+            logger.info("TASK_PERSIST_CREATE_SUCCESS repository=%s task_id=%s", type(self).__name__, record.id)
+            return record
         except (ValueError,TypeError):raise
-        except Exception as exc:logger.warning("Supabase task create failed; using fallback: %s",exc);return await self._fallback.create_task(owner_id,data)
+        except Exception as exc:
+            logger.warning("TASK_PERSIST_FALLBACK repository=%s operation=create_task exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
+            return await self._fallback.create_task(owner_id,data)
     async def get_task(self, owner_id, task_id):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
@@ -191,11 +219,16 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             existing=await self.get_occurrence(owner_id,payload["task_id"],payload["occurrence_key"])
             if existing:return existing
+            logger.info("TASK_OCCURRENCE_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s task_id=%s", type(self).__name__, owner_id, payload["task_id"])
             result=await self._run(lambda:self._client.table("ai_task_occurrences").insert(payload).execute());row=getattr(result,"data",None)
             if not row:raise RuntimeError("Supabase occurrence insert returned no row")
-            return _occurrence_from_row(row[0] if isinstance(row,list) else row)
+            record = _occurrence_from_row(row[0] if isinstance(row,list) else row)
+            logger.info("TASK_OCCURRENCE_PERSIST_CREATE_SUCCESS repository=%s occurrence_id=%s", type(self).__name__, record.id)
+            return record
         except (ValueError,TypeError):raise
-        except Exception as exc:logger.warning("Supabase occurrence create failed; using fallback: %s",exc);return await self._fallback.create_occurrence(owner_id,data)
+        except Exception as exc:
+            logger.warning("TASK_OCCURRENCE_PERSIST_FALLBACK repository=%s operation=create_occurrence exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
+            return await self._fallback.create_occurrence(owner_id,data)
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None

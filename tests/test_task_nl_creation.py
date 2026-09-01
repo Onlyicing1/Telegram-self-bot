@@ -310,7 +310,7 @@ async def test_dispatcher_routes_schedule_local_fast_path_and_creates_task():
     # the scheduling request resolved deterministically, not via the tool loop
     assert result.success is True
     assert result.metadata["finish_state"] == "local_fast_path"
-    # the interpreter's single bounded call is the ONLY provider call: the
-    # request did NOT burn provider tool rounds before creating the task.
-    assert provider.calls == 1
+    # The high-confidence interval/write request is resolved locally, so task
+    # creation does not burn a provider round.
+    assert provider.calls == 0
     assert len(await manager.task.list_tasks(777)) == 1

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS ai_tasks (
     actions                    jsonb        NOT NULL
                                CHECK (jsonb_typeof(actions) = 'array'),
     notification_destination   jsonb        NOT NULL,
+    ai_instruction              text,
     created_at                 timestamptz  NOT NULL DEFAULT now(),
     updated_at                 timestamptz  NOT NULL DEFAULT now(),
     terminal_at                timestamptz,
@@ -29,7 +30,8 @@ CREATE TABLE IF NOT EXISTS ai_tasks (
     CONSTRAINT ai_tasks_actions_count CHECK (jsonb_array_length(actions) BETWEEN 1 AND 5),
     CONSTRAINT ai_tasks_payload_size CHECK (octet_length(actions::text) <= 32768),
     CONSTRAINT ai_tasks_schedule_size CHECK (octet_length(schedule::text) <= 16384),
-    CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096)
+    CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096),
+    CONSTRAINT ai_tasks_ai_instruction_size CHECK (ai_instruction IS NULL OR (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384))
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_tasks_status_next_run
@@ -64,8 +66,9 @@ CREATE TABLE IF NOT EXISTS ai_task_occurrences (
     retry_at              timestamptz,
     error_metadata        jsonb        NOT NULL DEFAULT '{}'
                           CHECK (jsonb_typeof(error_metadata) = 'object'),
-    result_metadata       jsonb        NOT NULL DEFAULT '{}'
-                          CHECK (jsonb_typeof(result_metadata) = 'object'),
+    result_metadata       jsonb        NOT NULL DEFAULT '{}',
+    preparation_metadata  jsonb        NOT NULL DEFAULT '{}'
+                          CHECK (jsonb_typeof(preparation_metadata) = 'object'),
     created_at            timestamptz  NOT NULL DEFAULT now(),
     updated_at            timestamptz  NOT NULL DEFAULT now(),
     CONSTRAINT ai_task_occurrences_key_not_blank CHECK (length(btrim(occurrence_key)) > 0),
@@ -73,6 +76,7 @@ CREATE TABLE IF NOT EXISTS ai_task_occurrences (
     CONSTRAINT ai_task_occurrences_payload_size CHECK (octet_length(action_snapshot::text) <= 32768),
     CONSTRAINT ai_task_occurrences_error_size CHECK (octet_length(error_metadata::text) <= 8192),
     CONSTRAINT ai_task_occurrences_result_size CHECK (octet_length(result_metadata::text) <= 8192),
+    CONSTRAINT ai_task_occurrences_preparation_size CHECK (octet_length(preparation_metadata::text) <= 8192),
     CONSTRAINT ai_task_occurrences_retry_state CHECK (
         (status = 'retry_pending' AND retry_at IS NOT NULL)
         OR (status <> 'retry_pending')

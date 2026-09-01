@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.ai.providers.base.contract import ProviderResponse
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
+from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS
 
 INTERPRET_TIMEOUT_SECONDS = 30.0
 MAX_REQUEST_CHARS = 2000

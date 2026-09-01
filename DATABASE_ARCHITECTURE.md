@@ -809,6 +809,7 @@ Durable owner-scoped AI task definitions for the future scheduler. This table ex
 | `created_at` | `timestamptz` | NO | `now()` |
 | `updated_at` | `timestamptz` | NO | `now()` |
 | `terminal_at` | `timestamptz` | YES | Terminal lifecycle timestamp |
+| `ai_instruction` | `text` | YES | Explicit bounded natural-language instruction for future per-occurrence AI preparation; never an executable action; max 4,096 UTF-8 characters in application contract |
 
 Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no action or step table exists.
 
@@ -837,6 +838,7 @@ Durable occurrence/attempt history for `ai_tasks`. Repository migration state ex
 | `result_metadata` | `jsonb` | NO | `'{}'`; object, max 8,192 bytes |
 | `created_at` | `timestamptz` | NO | `now()` |
 | `updated_at` | `timestamptz` | NO | `now()` |
+| `preparation_metadata` | `jsonb` | NO | `'{}'`; empty or explicit `prepared_action` envelope containing only bounded validated action data, matching `definition_version` and `prepared_at`; max 8,192 bytes |
 
 Indexes are unique `uq_ai_task_occurrences_task_key (task_id, occurrence_key)`, `idx_ai_task_occurrences_owner_scheduled (owner_id, scheduled_for DESC)`, and `idx_ai_task_occurrences_task_scheduled (task_id, scheduled_for DESC)`. No `(status, retry_at)` index is present because the current repository does not issue that query. The unique index prevents duplicate durable occurrences, not duplicate Telegram side effects.
 
