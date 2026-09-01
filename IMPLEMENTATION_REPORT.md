@@ -223,3 +223,66 @@ occurs in this change.
 - Final working-tree status: only the pre-existing unrelated unstaged
   modification `M tests/test_stage13.py` (preserved exactly, not staged or
   committed).
+
+---
+
+# Taskloom — Telegram-native Task Management UI (Latest Implementation)
+
+## Scope
+
+A compact, polished, Telegram-native visual management surface for durable AI
+tasks, named **Taskloom**, inside the AI section of the Self Bot. It is an
+ADDITIONAL management layer over the existing durable task system; the
+textual/natural-language task management path is unchanged.
+
+## Design
+
+- **Level 1 — Task list panel** (`panel:taskloom`): live counts
+  (active/paused/closed) plus one glass button per task (up to 8 rows);
+  overflow is noted in the panel text.
+- **Level 2 — Task detail panel** (`panel:taskloom_task:{id}:{version}`):
+  status icon, schedule type, timezone, next-run/updated timestamps, bounded
+  action snapshot (3), last 5 occurrences with status and attempt count, and
+  status-conditional action buttons.
+- **Mutations**: Pause / Resume / Complete / Delete — every button callback
+  carries `(task_id, version)` and routes through `TaskManagementService`'s
+  CAS-guarded `transition_task`, which delegates to the existing
+  `TaskRepository`. No direct DB access, no second scheduler/executor, and
+  owner scoping throughout (`RepositoryManager.task` + inline-engine owner
+  id). Stale versions fail closed, and every mutation re-renders the
+  refreshed detail panel at the new version.
+
+## Architecture Compliance
+
+- Reuses `TaskManagementService` / `TaskRepository` — no direct DB access.
+- No second scheduler, executor, retry system, or persistence layer.
+- No direct Telegram RPC from the UI; standard glass-button callback flow
+  through the existing helper inline machinery.
+- Owner-only: every callback is validated against the inline-engine owner id.
+
+## Files Changed
+
+| File | Why |
+|---|---|
+| `backend/bot/handlers/taskloom.py` (new) | Taskloom panel system (list, detail, CAS-guarded mutations) |
+| `backend/bot/router.py` | Register the `taskloom` handler module |
+| `backend/bot/handlers/ai.py` | Add the `🧵 Taskloom` button to the AI mother panel |
+| `tests/test_taskloom_ui.py` (new) | 16 focused tests (registration, rendering, buttons, CAS transitions, stale-version and cross-owner fail-closed) |
+| `IMPLEMENTATION_REPORT.md` | This section |
+
+## Tests Actually Executed
+
+- `tests/test_taskloom_ui.py`: **16 passed** — registration, list/detail
+  rendering, button-text vs callback-data decoding, CAS buttons carrying
+  `(id, version)`, pause/resume/complete/delete transitions with version
+  bump, stale-version and cross-owner fail-closed behavior.
+- Full suite: **1219 passed, 23 skipped** (pre-existing skips) — no
+  regressions.
+- `python3 -m compileall -q backend`: passes.
+
+## Intentionally Untouched Files
+
+- `tests/test_stage13.py` — pre-existing unrelated modification, preserved
+  exactly, unstaged and uncommitted.
+- No scheduler, execution engine, retry engine, Telegram transport, AI
+  provider, database schema, or configuration changes.

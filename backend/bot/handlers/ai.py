@@ -249,6 +249,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
 
     builder = InlinePanelBuilder()
     builder.add_row("💬 Start Chat", "action:ai_start_chat")
+    builder.add_row("🧵 Taskloom", "panel:taskloom")
     builder.add_buttons(("📈 Usage", "panel:ai_usage"), ("🩺 Health", "panel:ai_health"))
     builder.add_buttons(("🔍 Details", "panel:ai_details"), ("🤖 Model", "panel:ai_model"))
     builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("⚙️ Settings", "panel:ai_settings"))

@@ -14,7 +14,7 @@ import traceback
 from telethon import events
 
 from backend.bot.handlers import misc, save, retrieve, delete, bio, discover, database, username, ai, ghost_seen_v2
-from backend.bot.handlers import ai_unified, tasks
+from backend.bot.handlers import ai_unified, tasks, taskloom
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("ghost_seen_v2", lambda: ghost_seen_v2.register(client, owner_id, tz_str)),
         ("ai_unified", lambda: ai_unified.register(client, owner_id, tz_str)),
         ("tasks", lambda: tasks.register(client, owner_id, tz_str)),
+        ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
     ]
 
     for name, fn in handlers:
