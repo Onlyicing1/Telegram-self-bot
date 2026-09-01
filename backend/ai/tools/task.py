@@ -20,6 +20,7 @@ from typing import Any
 
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
+from backend.ai.task_candidate import TaskCandidate
 
 MAX_REQUEST_CHARS = 2000
 INTERPRET_TIMEOUT_SECONDS = 30.0
@@ -116,6 +117,66 @@ class CreateTaskTool(Tool):
                     "X minutes'), a time, or a daily/weekly cadence with a clear action."
                 ),
             )
+
+        # Resolve destination: the model may express a chat_name (never a
+        # numeric chat_id). Resolve it against the authenticated Self Bot's
+        # chats. If no chat_name is given, the destination is the current
+        # request chat (for immediate/scheduled sends from this chat).
+        if isinstance(candidate, TaskCandidate):
+            destination = dict(candidate.notification_destination)
+            chat_name = destination.pop("chat_name", None)
+        else:
+            destination = dict(candidate.get("notification_destination", {}))
+            chat_name = destination.pop("chat_name", None)
+        if chat_name:
+            from backend.ai.chat_resolution import format_clarification_options, resolve_chat_name
+            client = getattr(context, "client", None)
+            if client is not None:
+                try:
+                    dialogs = await client.get_dialogs()
+                except Exception:
+                    dialogs = []
+            else:
+                dialogs = []
+            chats = []
+            for dialog in dialogs:
+                if isinstance(dialog, dict):
+                    chat_id = dialog.get("id")
+                    title = dialog.get("title") or dialog.get("name") or ""
+                    username = dialog.get("username") or ""
+                else:
+                    entity = getattr(dialog, "entity", dialog)
+                    chat_id = getattr(entity, "id", None) or getattr(dialog, "id", None)
+                    title = (
+                        getattr(dialog, "title", None)
+                        or getattr(entity, "title", None)
+                        or getattr(entity, "first_name", None)
+                        or getattr(entity, "name", None)
+                        or ""
+                    )
+                    username = getattr(entity, "username", None) or ""
+                chats.append({"id": chat_id, "title": title, "username": username})
+            resolved = resolve_chat_name(chat_name, chats, owner_id=owner_id)
+            if not resolved["resolved"]:
+                options = format_clarification_options(resolved)
+                return ToolResult(
+                    success=False,
+                    message=f"Could not resolve chat destination:\n{options}",
+                )
+            destination["chat_id"] = resolved["chat_id"]
+            destination["chat_title"] = resolved["chat_title"]
+        else:
+            # No explicit chat name — use the current request chat as the
+            # destination for scheduled sends. This comes from trusted runtime
+            # context (the AIRequest.chat_id), never from the model.
+            extra = getattr(context, "extra", None) or {}
+            request_chat_id = extra.get("chat_id")
+            if isinstance(request_chat_id, int) and request_chat_id != 0:
+                destination["chat_id"] = request_chat_id
+
+        if isinstance(candidate, TaskCandidate):
+            candidate = candidate.as_creation_candidate()
+        candidate["notification_destination"] = destination
 
         try:
             from backend.ai.database.manager import get_repository_manager

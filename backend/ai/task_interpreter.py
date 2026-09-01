@@ -41,12 +41,28 @@ class TaskInterpreter:
             raise TaskInterpretationError("task request is empty or too long")
         instructions = (
             "Return exactly one JSON object matching the supplied task candidate schema. "
-            "Do not include owner identity, chat ids, or destinations. Do not execute tools. "
+            "Do not include owner identity, chat ids, or raw Telegram destinations. Do not execute tools. "
             "If any required detail is ambiguous or missing, return JSON null. "
             "For any message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
             "exactly the action name 'send_message' with a single 'text' argument containing "
             "the exact message content; the destination is fixed by the runtime and must not "
-            "be included. Use no other action name for message writing."
+            "be included. Use no other action name for message writing. "
+            "\n\n"
+            "PERSIAN INTERVAL RECOGNITION: Recognize common Persian interval phrases as scheduling requests. "
+            "Examples: 'هر 1 دقیقه یک بار بنویس سلام' (every 1 minute write hello), "
+            "'هر 5 دقیقه بنویس hello' (every 5 minutes write hello), "
+            "'هر یک دقیقه برای من بنویس سلام' (every 1 minute for me write hello), "
+            "'هر ده دقیقه یک پیام بفرست' (every 10 minutes send a message), "
+            "'هر ساعت یادآوری کن' (every hour remind). "
+            "The words 'هر' (every), 'bar' (بار = time/occasion), 'دقیقه' (minute), "
+            "'ساعت' (hour), 'روز' (day), 'هفته' (week), 'ماه' (month) together with "
+            "an action verb clearly indicate a recurring task. "
+            "\n\n"
+            "EXPLICIT DESTINATION (optional): If the user specifies a chat name for the destination "
+            "(e.g. 'در OskarBeam بنویس سلام', 'in OskarBeam write hello'), include it in the "
+            "notification_destination as {'chat_name': 'OskarBeam'}. Use the exact chat name as spoken. "
+            "If no chat is specified, the destination is the current chat — set "
+            "notification_destination to {} (empty). Never include numeric chat_ids."
         )
         if isinstance(timezone, str) and timezone.strip():
             instructions += (

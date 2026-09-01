@@ -229,8 +229,8 @@ async def test_dispatcher_fast_path_sends_write_hello_to_owner():
     assert result.metadata["ai_action"]["action"] == "send"
     # the deterministic write path never burns a provider round
     assert provider.calls == 0
-    # the SAME registered tool sends to the TRUSTED owner destination
-    telegram.send_message.assert_awaited_once_with(777, "hello")
+    # the SAME registered tool sends to the trusted request chat
+    telegram.send_message.assert_awaited_once_with(-1001, "hello")
 
 
 @pytest.mark.asyncio
@@ -250,7 +250,7 @@ async def test_dispatcher_fast_path_persian_write_sends_to_owner():
     assert result.success is True
     assert result.metadata["finish_state"] == "local_fast_path"
     assert provider.calls == 0
-    telegram.send_message.assert_awaited_once_with(777, "سلام")
+    telegram.send_message.assert_awaited_once_with(-1001, "سلام")
 
 
 @pytest.mark.asyncio

@@ -310,13 +310,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
     if action == "send":
         # Immediate text-write: the model supplies ONLY the text; the
-        # destination is always the owner's own chat (Saved Messages). A
-        # recipient field is a hard rejection — the model can never choose
+        # destination is resolved from trusted runtime context (the current
+        # request chat, or the task's creation chat for scheduled sends).
+        # A recipient field is a hard rejection — the model can never choose
         # where the message goes.
         if "recipient" in raw:
             return ActionParseResult(
                 kind=KIND_INVALID,
-                error="'recipient' is not supported for send; the destination is always the owner's own chat.",
+                error="'recipient' is not supported for send; the destination comes from trusted runtime context.",
             )
         text = raw.get("text", raw.get("content", ""))
         if not isinstance(text, str) or not text.strip():
@@ -326,7 +327,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action=action,
-            target="saved_messages",
+            target="current_chat",
             text=text.strip(),
         )
 
@@ -498,9 +499,11 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         return [{"name": "create_task", "arguments": {"request": result.schedule_text}}]
 
     if action == "send":
-        # Immediate text-write reuses the SAME registered execution tool the
-        # scheduled path uses — one send implementation, one TelegramAPI
-        # transport, one executor.
+        # Immediate and scheduled text-write both reuse the SAME registered
+        # execution tool — one send implementation, one TelegramAPI transport,
+        # one executor. The destination is resolved from trusted runtime
+        # context (current chat for immediate sends, task creation chat for
+        # scheduled sends), never from the model.
         return [{"name": "send_message", "arguments": {"text": result.text}}]
 
     if action == "list_saved_items":
@@ -1146,13 +1149,41 @@ def _has_time_unit(words: list[str], start: int) -> bool:
 
 
 def _is_scheduling_intent(words: list[str]) -> bool:
-    """True when the message clearly requests a recurring/planned task."""
+    """True when the message clearly requests a recurring/planned task.
+
+    Detects natural-language interval expressions in Persian and English,
+    recurring cadence words, and explicit plan/reminder wording. Detection
+    is deliberately tolerant of common phrasing but remains conservative:
+    ambiguous requests do NOT match here and stay on the provider path.
+
+    Interval patterns recognised (tokens after normalisation):
+      - "هر 1 دقیقه ...", "هر 5 دقیقه ...", "every minute ...",
+        "every 5 minutes ...", "each hour ..."
+      - "هر یک دقیقه ...", "هر ده دقیقه ...", "every hour ..."
+      - "once a minute", "once every hour"
+    """
     if not words or not _has_action_verb(words):
         return False
     if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
         return True
     for i, w in enumerate(words):
         if w in _INTERVAL_INTRO and _has_time_unit(words, i + 1):
+            return True
+    # "once a minute" / "once every hour" style: "once" followed (within a
+    # few tokens) by an interval intro + time unit.
+    for i, w in enumerate(words):
+        if w == "once" and i + 1 < len(words):
+            nxt = words[i + 1]
+            if nxt in _INTERVAL_INTRO or nxt in _TIME_UNITS:
+                return True
+            # "once a minute": the token after "once" is "a" then time unit
+            if nxt == "a" and i + 2 < len(words) and words[i + 2] in _TIME_UNITS:
+                return True
+    # Persian "bar" (بار) after a number+time-unit pair strengthens the
+    # interval reading: "هر 1 دقیقه یک بار" — already caught above, but
+    # "۱ دقیقه روزی ۱ بار" (once a day) also resolves here.
+    if any(w == "bar" or w == "بار" for w in words):
+        if any(w in _INTERVAL_INTRO for w in words) and any(w in _TIME_UNITS for w in words):
             return True
     if any(w in _FA_PLAN_WORDS or w in _EN_PLAN_WORDS for w in words):
         if _has_time_unit(words, 0) or any(w in _FUTURE_REF_WORDS for w in words):
@@ -1243,7 +1274,7 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
                 return ActionParseResult(
                     kind=KIND_EXECUTABLE,
                     action="send",
-                    target="saved_messages",
+                    target="current_chat",
                     text=text,
                     tool_calls=[{"name": "send_message", "arguments": {"text": text}}],
                 )

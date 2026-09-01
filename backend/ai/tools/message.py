@@ -84,9 +84,16 @@ class SendMessageTool(Tool):
         if len(text) > MAX_SEND_TEXT_CHARS:
             return ToolResult(success=False, message="Message text is too long; nothing was sent.")
         # Destination comes from trusted runtime context, never arguments.
-        owner_id = getattr(context, "owner_id", 0)
-        if not isinstance(owner_id, int) or owner_id <= 0:
-            return ToolResult(success=False, message="Owner identity is unavailable; nothing was sent.")
+        # For immediate sends the chat_id is the current request chat; for
+        # scheduled tasks it is the chat where the task was created (stored
+        # in notification_destination). Falls back to the owner's own chat
+        # (Saved Messages) only when no trusted chat_id is available.
+        extra = getattr(context, "extra", None) or {}
+        chat_id = extra.get("chat_id")
+        if not isinstance(chat_id, int) or chat_id == 0:
+            chat_id = getattr(context, "owner_id", 0)
+        if not isinstance(chat_id, int) or chat_id == 0:
+            return ToolResult(success=False, message="Trusted destination is unavailable; nothing was sent.")
         telegram = getattr(context, "telegram", None)
         if telegram is None:
             client = getattr(context, "client", None)
@@ -95,7 +102,7 @@ class SendMessageTool(Tool):
             from backend.telegram_api import TelegramAPI
             telegram = TelegramAPI(client)
         try:
-            await telegram.send_message(owner_id, text)
+            await telegram.send_message(chat_id, text)
         except Exception as exc:  # noqa: BLE001 — surfaced to the retry boundary
             return ToolResult(
                 success=False,
@@ -104,6 +111,6 @@ class SendMessageTool(Tool):
             )
         return ToolResult(
             success=True,
-            message="📨 Sent to your Saved Messages.",
-            data={"text": text, "chat_id": int(owner_id)},
+            message=f"📨 Sent to chat {chat_id}.",
+            data={"text": text, "chat_id": int(chat_id)},
         )

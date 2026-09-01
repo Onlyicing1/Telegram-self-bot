@@ -129,8 +129,8 @@ def test_list_panel_shows_tasks_with_counts(registered, repo):
     _make_task(repo, OWNER, "cleanup", status="paused")
     _make_task(repo, OWNER, "old one", status="completed")
     title, body, buttons = _run(registered._taskloom_panel(_FakeEvent(), ""))
-    assert "🟢 1 active" in body
-    assert "⏸ 1 paused" in body
+    assert "● 1 active" in body
+    assert "∥ 1 paused" in body
     # task labels live in button text, one row per task
     texts = " ".join(_button_texts(buttons))
     assert "write hello" in texts
@@ -147,12 +147,34 @@ def test_list_panel_is_owner_scoped(registered, repo):
     assert "theirs" not in texts
 
 
+def test_list_panel_paginates_after_four_tasks(registered, repo):
+    for index in range(6):
+        _make_task(repo, OWNER, f"task {index}")
+    title, body, buttons = _run(registered._taskloom_panel(_FakeEvent(), "0"))
+    texts = _button_texts(buttons)
+    task_buttons = [text for text in texts if text.startswith("Task ")]
+    assert len(task_buttons) == 4
+    flat = _callback_data(buttons)
+    assert "panel:taskloom:1" in flat
+    assert "❯" in texts
+
+
+def test_taskloom_uses_text_unicode_symbols(registered, repo):
+    task = _make_task(repo, OWNER)
+    _title, body, buttons = _run(registered._task_detail_panel(_FakeEvent(), str(task.id)))
+    text = body + " ".join(_button_texts(buttons))
+    assert "⟳" in text
+    assert "∥" in text
+    assert "⌫" in text
+    assert "\\ufe0f" not in text
+
+
 # ── detail panel ──
 
 def test_detail_panel_shows_metadata_and_occurrences(registered, repo):
     task = _make_task(repo, OWNER)
     title, body, buttons = _run(registered._task_detail_panel(_FakeEvent(), str(task.id)))
-    assert f"#{task.id}" in body
+    assert f"Task {task.id}" in body
     assert "send_message" in body
     assert "interval" in body
     assert "UTC" in body
@@ -186,7 +208,7 @@ def test_pause_action_transitions_and_rerenders(registered, repo):
     title, body, buttons = _run(
         registered._pause_action(_FakeEvent(), f"{task.id}:{task.version}", 1)
     )
-    assert "✅ paused" in body
+    assert "✓ paused" in body
     stored = _run(repo.get_task(OWNER, task.id))
     assert stored.status == "paused"
     # refreshed detail offers Resume at the NEW version
@@ -199,7 +221,7 @@ def test_resume_action_transitions(registered, repo):
     title, body, buttons = _run(
         registered._resume_action(_FakeEvent(), f"{task.id}:{task.version}", 1)
     )
-    assert "✅ resumed" in body
+    assert "✓ resumed" in body
     assert _run(repo.get_task(OWNER, task.id)).status == "active"
 
 
@@ -220,7 +242,7 @@ def test_stale_version_fails_closed(registered, repo):
     title, body, buttons = _run(
         registered._pause_action(_FakeEvent(), f"{task.id}:{task.version + 5}", 1)
     )
-    assert "❌" in body
+    assert "×" in body
     assert _run(repo.get_task(OWNER, task.id)).status == "active"  # unchanged
 
 
@@ -229,14 +251,14 @@ def test_mutation_on_foreign_task_fails_closed(registered, repo):
     title, body, buttons = _run(
         registered._pause_action(_FakeEvent(), f"{task.id}:{task.version}", 1)
     )
-    assert "❌" in body
+    assert "×" in body
     assert _run(repo.get_task(OTHER, task.id)).status == "active"
 
 
 def test_malformed_action_extra_fails_closed(registered, repo):
     task = _make_task(repo, OWNER)
     title, body, buttons = _run(registered._pause_action(_FakeEvent(), "garbage", 1))
-    assert "❌" in body
+    assert "×" in body
     assert _run(repo.get_task(OWNER, task.id)).status == "active"
 
 

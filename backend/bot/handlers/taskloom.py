@@ -29,22 +29,22 @@ from backend.helper import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_LIST_ROWS = 8
+_MAX_LIST_ROWS = 4
 _MAX_INSPECT_OCC = 8
 
 _STATUS_ICON = {
-    "active": "🟢",
-    "paused": "⏸",
-    "completed": "✅",
-    "failed": "❌",
-    "expired": "⌛",
-    "deleted": "🗑",
+    "active": "●",
+    "paused": "∥",
+    "completed": "✓",
+    "failed": "×",
+    "expired": "×",
+    "deleted": "×",
 }
 _SCHEDULE_ICON = {
-    "once": "1️⃣",
-    "interval": "🔁",
-    "daily": "📅",
-    "weekly": "🗓",
+    "once": "·",
+    "interval": "⟳",
+    "daily": "◷",
+    "weekly": "◷",
 }
 
 
@@ -61,32 +61,37 @@ def _fmt_dt(value) -> str:
 
 
 def _task_row(task) -> tuple[str, str]:
-    icon = _STATUS_ICON.get(task.status, "❓")
-    sched = _SCHEDULE_ICON.get(task.schedule_type, "•")
     label = task.label[:38] + ("…" if len(task.label) > 38 else "")
-    return f"{icon} #{task.id} {label}", f"panel:taskloom_task:{task.id}"
+    return f"Task {task.id}: {label}", f"panel:taskloom_task:{task.id}"
 
 
 def _nav(builder: InlinePanelBuilder) -> None:
     builder.add_buttons(
-        ("⬅ Back", "panel:_nav:back"),
-        ("🏠 Home", "panel:_nav:home"),
+        ("← Back", "panel:_nav:back"),
+        ("⌂ Home", "panel:_nav:home"),
     )
 
 
 async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
-    """LEVEL 1 — task list with live counts."""
+    """LEVEL 1 — compact paginated task list."""
     from backend.helper.inline_engine import _owner_id
     service = _service(_owner_id)
     tasks = await service.list_tasks()
+    try:
+        page = max(0, int(extra or 0))
+    except (TypeError, ValueError):
+        page = 0
+    page_count = max(1, (len(tasks) + _MAX_LIST_ROWS - 1) // _MAX_LIST_ROWS)
+    page = min(page, page_count - 1)
+    visible = tasks[page * _MAX_LIST_ROWS:(page + 1) * _MAX_LIST_ROWS]
 
     active = sum(1 for t in tasks if t.status == "active")
     paused = sum(1 for t in tasks if t.status == "paused")
     done = sum(1 for t in tasks if t.status in ("completed", "failed", "expired", "deleted"))
 
     lines = [
-        "**🧵 Taskloom**",
-        f"🟢 {active} active · ⏸ {paused} paused · 🗄 {done} closed",
+        "▦ **Taskloom**",
+        f"● {active} active · ∥ {paused} paused · × {done} closed",
         "",
     ]
     builder = InlinePanelBuilder()
@@ -95,14 +100,20 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
         lines.append("_No tasks yet._")
         lines.append("_Say e.g. **every minute write hello**_")
     else:
-        lines.append("**Tasks**")
-        for task in tasks[:_MAX_LIST_ROWS]:
+        for task in visible:
             text, cb = _task_row(task)
             builder.add_row(text, cb)
-        remaining = len(tasks) - _MAX_LIST_ROWS
-        if remaining > 0:
-            lines.append("")
-            lines.append(f"_…and {remaining} more (use .task list)_")
+        if page_count > 1:
+            builder.add_row(
+                "❮" if page > 0 else "·",
+                f"panel:taskloom:{page - 1}" if page > 0 else "panel:taskloom",
+            )
+            builder.add_row(
+                f"{page + 1} / {page_count}",
+                f"panel:taskloom:{page + 1}" if page + 1 < page_count else f"panel:taskloom:{page}",
+            )
+            if page + 1 < page_count:
+                builder.add_row("❯", f"panel:taskloom:{page + 1}")
 
     _nav(builder)
     return "Taskloom", "\n".join(lines), builder.build()
@@ -122,19 +133,25 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     try:
         task_id = int(extra)
     except (TypeError, ValueError):
-        return "Taskloom", "❌ Invalid task id.", []
+        return "Taskloom", "× Invalid task id.", []
 
     service = _service(_owner_id)
     view = await service.inspect(task_id, occurrence_limit=_MAX_INSPECT_OCC)
     if view is None:
-        return "Taskloom", "❌ Task not found.", []
+        return "Taskloom", "× Task not found.", []
 
     task, occurrences = view.task, view.occurrences
-    icon = _STATUS_ICON.get(task.status, "❓")
+    icon = _STATUS_ICON.get(task.status, "×")
+    destination = task.notification_destination or {}
+    destination_label = destination.get("chat_title") or (
+        "Current chat" if destination.get("chat_id") else "Unavailable"
+    )
     lines = [
-        f"{icon} **#{task.id} {task.label[:60]}**",
+        f"{icon} **Task {task.id}**",
+        f"`{task.label[:60]}`",
         "",
-        f"**Schedule:** {_SCHEDULE_ICON.get(task.schedule_type, '•')} {task.schedule_type} · v{task.version}",
+        f"**Schedule:** {_SCHEDULE_ICON.get(task.schedule_type, '·')} {task.schedule_type} · v{task.version}",
+        f"**Destination:** ◉ {destination_label}",
         f"**Timezone:** {task.timezone}",
         f"**Next run:** {_fmt_dt(task.next_run_at)}",
         f"**Updated:** {_fmt_dt(task.updated_at)}",
@@ -150,21 +167,21 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
     if occurrences:
         lines += ["", "**Recent occurrences:**"]
         for occ in occurrences[:5]:
-            oicon = _STATUS_ICON.get(occ.status, "❓")
+            oicon = _STATUS_ICON.get(occ.status, "×")
             lines.append(
                 f"  {oicon} {_fmt_dt(occ.scheduled_for)} · {occ.status} · try {occ.attempt}"
             )
 
     builder = InlinePanelBuilder()
     if task.status == "active":
-        builder.add_row("⏸ Pause", f"action:taskloom_pause:{task.id}:{task.version}")
+        builder.add_row("∥ Pause", f"action:taskloom_pause:{task.id}:{task.version}")
     elif task.status == "paused":
-        builder.add_row("▶️ Resume", f"action:taskloom_resume:{task.id}:{task.version}")
+        builder.add_row("● Resume", f"action:taskloom_resume:{task.id}:{task.version}")
     if task.status not in ("completed", "deleted", "expired"):
-        builder.add_row("✅ Complete", f"action:taskloom_complete:{task.id}:{task.version}")
+        builder.add_row("✓ Complete", f"action:taskloom_complete:{task.id}:{task.version}")
     if task.status not in ("deleted",):
-        builder.add_row("🗑 Delete", f"action:taskloom_delete:{task.id}:{task.version}")
-    builder.add_row("🔄 Refresh", f"panel:taskloom_task:{task.id}")
+        builder.add_row("⌫ Delete", f"action:taskloom_delete:{task.id}:{task.version}")
+    builder.add_row("⟳ Refresh", f"panel:taskloom_task:{task.id}")
     _nav(builder)
     return f"Task #{task.id}", "\n".join(lines), builder.build()
 
@@ -195,17 +212,17 @@ async def _mutate(event, extra: str, verb: str) -> tuple[str, str, list] | None:
     from backend.helper.inline_engine import _owner_id
     parsed = _parse_action_extra(extra)
     if parsed is None:
-        return "Taskloom", "❌ Invalid action arguments.", []
+        return "Taskloom", "× Invalid action arguments.", []
     task_id, version = parsed
     service = _service(_owner_id)
     try:
         task = await getattr(service, verb)(task_id, version)
     except Exception:
         logger.exception("Taskloom %s failed for task %s", verb, task_id)
-        return f"Task #{task_id}", "❌ Operation failed; no change was confirmed.", []
+        return f"Task #{task_id}", "× Operation failed; no change was confirmed.", []
     if task is None:
-        return f"Task #{task_id}", "❌ Task not found, ownership check failed, or version is stale.", []
-    notice = f"✅ {verb}d task #{task.id} · v{task.version}\n\n"
+        return f"Task #{task_id}", "× Task not found, ownership check failed, or version is stale.", []
+    notice = f"✓ {verb}d task #{task.id} · v{task.version}\n\n"
     result = await _task_detail_panel(event, str(task_id))
     if result is None:
         return f"Task #{task_id}", notice.rstrip(), []
@@ -231,7 +248,7 @@ async def _delete_action(event, extra: str, chat_id: int):
 
 def register(client, owner_id: int, tz_str: str) -> None:
     try:
-        register_panel("taskloom", _taskloom_panel, parent="ai", title="🧵 Taskloom")
+        register_panel("taskloom", _taskloom_panel, parent="ai", title="▦ Taskloom")
         register_inline_builder("taskloom", _taskloom_inline_builder)
         register_panel("taskloom_task", _task_detail_panel, parent="taskloom", title="Task")
         register_inline_builder("taskloom_task", _task_detail_inline_builder)

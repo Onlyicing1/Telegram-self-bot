@@ -89,6 +89,11 @@ class TaskCandidate:
             raise TaskCandidateError(str(exc)) from exc
         if value["schedule_type"] != "interval" and schedule.get("timezone") != timezone:
             raise TaskCandidateError("schedule timezone must match task timezone")
+        # Validate optional chat_name in notification_destination.
+        if "chat_name" in destination:
+            cn = destination["chat_name"]
+            if not isinstance(cn, str) or not cn.strip() or len(cn) > 256:
+                raise TaskCandidateError("chat_name must be a nonblank bounded string")
         return cls(label.strip(), value["schedule_type"], dict(schedule), timezone.strip(), canonical, dict(destination))
 
     def as_creation_candidate(self) -> dict[str, Any]:

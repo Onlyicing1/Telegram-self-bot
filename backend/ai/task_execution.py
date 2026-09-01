@@ -57,6 +57,27 @@ class TaskExecutionCoordinator:
         if occurrence.status != "running":
             return TaskExecutionResult(False, occurrence.status, 0, 0, "occurrence_not_running")
 
+        # Resolve the trusted destination for this task's actions.
+        # For send_message tools, the chat_id comes from the task's
+        # notification_destination (set at creation time from trusted
+        # runtime context), never from the model.
+        execution_context = self.context
+        task = await self.repository.get_task(self.owner_id, occurrence.task_id)
+        if task is not None:
+            dest = task.notification_destination or {}
+            chat_id = dest.get("chat_id")
+            if isinstance(chat_id, int) and chat_id != 0:
+                extra = dict(self.context.extra) if self.context.extra else {}
+                extra["chat_id"] = chat_id
+                from backend.ai.tools.context import ToolContext
+                execution_context = ToolContext(
+                    telegram=self.context.telegram,
+                    owner_id=self.context.owner_id,
+                    tz_str=self.context.tz_str,
+                    client=self.context.client,
+                    extra=extra,
+                )
+
         actions = occurrence.action_snapshot
         if not isinstance(actions, list) or not actions or len(actions) > 5:
             return await self._fail(occurrence, "invalid_action_snapshot", 0, 0)
@@ -79,7 +100,7 @@ class TaskExecutionCoordinator:
                     calls,
                     owner_id=self.owner_id,
                     session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                    context_override=self.context,
+                    context_override=execution_context,
                 ),
                 timeout=MAX_EXECUTION_SECONDS,
             )
