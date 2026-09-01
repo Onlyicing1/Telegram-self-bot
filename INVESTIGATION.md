@@ -1,104 +1,105 @@
 # INVESTIGATION
 
-## PROBLEM
+## CURRENT OBSERVATION
 
-Taskloom buttons are reportedly absent in the deployed Telegram self-bot while Render reports helper-bot authentication failure (`A wait of 1212 seconds is required`, caused by `ImportBotAuthorizationRequest`). Runtime telemetry then shows `helper_enabled=True`, `helper_connected=False`, `READY_BUT_DISCONNECTED`, and recovery activity.
+Taskloom can create and execute a recurring task. The displayed task shows `send_message`, `interval`, `Current chat`, `Asia/Tehran`, and a successful occurrence. The remaining reports are: no task row visible in the user's database, Delete does not remove the task from the list, and displayed timestamps appear UTC rather than Tehran local time.
 
-## CURRENT RUNTIME OBSERVATIONS
+The repository was inspected without live Supabase access or SQL execution. Database state therefore cannot be independently confirmed here.
 
-- Helper startup calls `build_helper()` and can fail during `client.start(bot_token=...)`; the exception is wrapped as `RuntimeError("Helper bot login failed: ...")`.
-- On failure, `RuntimeSupervisor._start_helper()` sets helper connectivity false and logs `Helper bot start failed`.
-- The heartbeat invariant treats a disconnected helper as unhealthy when `helper_enabled=True`, producing `READY_BUT_DISCONNECTED` and triggering recovery.
-- These facts establish helper failure and recovery pressure, but do not by themselves establish that button construction failed.
+## 1. TASK CREATION AND DURABLE PERSISTENCE
 
-## TASKLOOM UI SOURCE PATH
+The creation boundary is:
 
-The registered self-client handler path is:
+`backend/bot/handlers/ai_unified.py::_execute_ai()` → `engine.execute(request)` → `backend/ai/engine/dispatcher.py::dispatch()` deterministic action path → `backend/ai/tools/executor.py::ToolExecutor.execute_calls()` → `backend/ai/tools/task.py::CreateTaskTool.execute()` → `backend/ai/task_creation.py::TaskCreationService.create()` → `backend/ai/database/task_repository.py::TaskRepository` implementation.
 
-`backend/bot/router.py::register_all()` → `backend/bot/handlers/ai.py::register()` (AI panel registration) → AI panel builder `_ai_main_panel_handler()` creates the Taskloom button with callback data `panel:taskloom` → `backend/bot/handlers/taskloom.py::register()` registers `panel:taskloom` and its inline builder.
+`CreateTaskTool.execute()` obtains the repository through `get_repository_manager().task`, constructs `TaskCreationService`, and awaits `service.create(candidate, datetime.now(timezone.utc))`. `TaskCreationService.create()` validates the candidate, parses the schedule, computes `next_run_at`, converts that value to UTC, and calls `repository.create_task(owner_id, payload)`.
 
-The Taskloom panel path is:
+`SupabaseTaskRepository.create_task()` validates the payload and executes `client.table("ai_tasks").insert(payload).execute()`. It converts the returned row to `TaskRecord`. On non-validation exceptions it logs a warning and invokes its configured in-memory fallback repository. `InMemoryTaskRepository.create_task()` validates and stores a `TaskRecord` in process memory only.
 
-`taskloom._taskloom_panel()` → `InlinePanelBuilder.add_row()` / `add_buttons()` → `Button.inline(...)` → `taskloom._taskloom_inline_builder()` → `render(...)` → `panel_render.render()` → `types.ReplyInlineMarkup(rows=...)`.
+The first occurrence is not inserted by task creation. `TaskScheduler.run_once()` later queries due tasks, calls `repository.create_occurrence(...)`, and the Supabase implementation inserts into `ai_task_occurrences`; the in-memory implementation stores it only in memory. The scheduler is created once by `RuntimeSupervisor._start_task_scheduler()` and started after client setup.
 
-For a root/menu entry, `misc._menu_panel_handler()` / `_menu_inline_builder()` constructs the menu and the AI panel is reached through callback data `panel:ai`. The AI panel then exposes `🧵 Taskloom` with `panel:taskloom`.
+**Status:** The source proves a durable insert is attempted when the active repository is `SupabaseTaskRepository` and its client insert succeeds. It also proves that a Supabase exception silently degrades to the in-memory fallback. The reported absence of a database row is **NOT CONFIRMED from this workspace** because live database state and production logs for the insert are unavailable. A successful UI/task execution can be backed entirely by the fallback repository if Supabase access failed, so UI success does not prove durable persistence.
 
-## BUTTON CONSTRUCTION
+## 2. TASK LIST SOURCE
 
-Taskloom-specific buttons are constructed in `backend/bot/handlers/taskloom.py`:
+`backend/bot/handlers/taskloom.py::_taskloom_panel()` → `_service(owner_id)` → `TaskManagementService.list_tasks()` → `repository.list_tasks(owner_id)`.
 
-- `_taskloom_panel()` builds task rows, pagination, and navigation.
-- `_task_detail_panel()` builds pause/resume/complete/delete/refresh buttons.
-- `InlinePanelBuilder.add_row()` and `add_buttons()` in `backend/helper/panels.py` convert each tuple into Telethon `Button.inline` objects.
-- `backend/helper/panel_render.py::render()` converts the rows into `types.KeyboardButtonRow` and `types.ReplyInlineMarkup` inside a `types.InputBotInlineResult`.
+`TaskManagementService` is a thin owner-scoped wrapper. `SupabaseTaskRepository.list_tasks()` queries `ai_tasks` filtered by `owner_id`, ordered by `updated_at` descending. On any exception it logs and returns `self._fallback.list_tasks(owner_id)`. The in-memory implementation returns records held in its `_tasks` dictionary.
 
-The button definitions and callback data are present in source. No feature gate inside `taskloom.register()` disables these registrations; its only local failure path logs registration failure if an exception occurs.
+The panel has no separate task-list cache. Each panel render calls the service/repository again. However, the repository object is a process-level singleton returned by `get_task_repository()`, and its fallback is process-local. A task can therefore remain visible after a database failure because list reads fall back to the same in-memory repository that accepted the task.
 
-## TELEGRAM CLIENT
+A refresh callback re-enters `_task_detail_panel()` or the list panel and consequently queries the repository again; it does not force a database-only read.
 
-Initial panel delivery is performed by the **self-bot client**, but through Telegram Inline Mode:
+## 3. DELETE FLOW
 
-`misc.menu_cmd()` receives the outgoing `Menu` event and calls `send_inline_panel(client, event.chat_id, "menu")`; `send_inline_panel()` uses the self client as its `self_client` argument; `PanelLifecycleManager.create_panel()` calls `inline_engine.trigger(self_client, ...)`; `inline_engine.trigger()` calls `self_client.inline_query(_helper_username, query, entity=chat_id)` and then `results[0].click(chat_id)`.
+The detail panel constructs `action:taskloom_delete:<task_id>:<version>` in `backend/bot/handlers/taskloom.py::_task_detail_panel()`.
 
-Thus the message containing the buttons is inserted into the target chat by the self account's `inline_query(...).click(...)` operation. The helper bot supplies the inline-query answer, not the initiating Telegram client.
+The callback chain is:
 
-Subsequent panel edits are also performed by the self client when the callback event is an inline message resolved to the configured self client/session: `panels._safe_edit()` calls `event.edit(...)`, while lifecycle reuse calls `self._self_client.edit_message(...)`. Cleanup uses `self._self_client.edit_message()` and `delete_messages()`.
+`backend/helper/panels.py::_callback_router()` → `_handle_action()` → registered `taskloom_delete` handler → `taskloom._delete_action()` → `_mutate(event, extra, "delete")` → `TaskManagementService.delete()` → `TaskManagementService.set_status()` → `repository.transition_task(owner_id, task_id, "deleted", expected_version)`.
 
-## HELPER BOT DEPENDENCY
+Deletion is a **soft delete/status transition**, not a hard row delete. `InMemoryTaskRepository.transition_task()` validates the transition and sets `status="deleted"`, increments `version`, and retains the record. `SupabaseTaskRepository.transition_task()` calls `update_task()`, which performs an `ai_tasks.update(...)` filtered by `id`, `owner_id`, and `version`, setting status and version; it does not delete the row.
 
-- **Button construction:** No helper connection is required. `taskloom._taskloom_panel()`, `InlinePanelBuilder`, `Button.inline`, `render`, and `ReplyInlineMarkup` are local object construction and do not call the helper client.
-- **Initial message send/edit:** The inline delivery path does require a connected helper bot username. `inline_engine.trigger()` returns false when `_helper_username` is empty and logs that inline mode cannot start; `send_inline_panel()` likewise returns false before calling the lifecycle. Therefore the normal inline Taskloom message cannot be created while the helper is unavailable. `misc.menu_cmd()` has a no-helper fallback to edit-in-place, but that fallback is selected only when `get_client()` is `None`, not merely when a helper object exists but its username is unavailable.
-- **Callback registration:** The callback router is registered on the helper client in `RuntimeSupervisor._start_helper()` via `register_callback_handlers(helper, owner_id)`. Inline-query routing is also registered there via `register_inline_handler(helper, owner_id)`. If helper startup fails before these calls, neither helper-side handler is registered.
-- **Callback execution:** Helper connectivity is required for the helper bot to receive inline queries and callback queries. The callback router itself uses the helper client event registration, while actual callback edits delegate through the callback event/self-client lifecycle path described above.
+After mutation, `_mutate()` calls `_task_detail_panel()` again and returns the refreshed detail view. The Delete action therefore does not itself render the Taskloom list. Returning from detail to the list invokes `_taskloom_panel()`, whose `list_tasks()` implementations currently return all owner records, including `deleted` records; neither `SupabaseTaskRepository.list_tasks()` nor `InMemoryTaskRepository.list_tasks()` filters terminal/deleted statuses.
 
-## EXACT FAILURE POINT
+**Confirmed source-level failure:** even if the delete transition succeeds, the list query intentionally/currently includes records with `status="deleted"`, so the deleted task remains in the visible list. This is independent of whether the database update succeeded.
 
-The concrete source-level failure for normal Glass UI creation is:
+**Additional unresolved possibility:** if the Supabase update fails, `SupabaseTaskRepository.update_task()` falls back to its in-memory repository. This can create a split-brain presentation in which the transition is recorded only in fallback memory. The exact production outcome is not provable without logs/database state.
 
-`backend/helper/inline_engine.py::trigger()` checks `if not _helper_username:` and returns `(False, chat_id, 0, "")`. `_helper_username` is populated only after successful `build_helper()` and `get_me()` in `RuntimeSupervisor._start_helper()`. The observed `ImportBotAuthorizationRequest` failure prevents that setup, so the subsequent `send_inline_panel()` / `PanelLifecycleManager.create_panel()` path receives failure and no inline panel message with buttons is created.
+## 4. TIMEZONE FLOW
 
-A separate source-level observation is that `misc.menu_cmd()` chooses plain-text fallback only when `get_client()` returns `None`; `helper_client` is not assigned on failed startup, but `backend.helper.client._client` is also left unset after `build_helper()` disconnects its local client. Whether that exact fallback executes in the deployed process depends on the current module state and event timing; it is not proven from logs alone.
+Task creation receives the configured timezone through `ToolContext.tz_str`; `CreateTaskTool` passes it to the interpreter or deterministic candidate path. `TaskCreationService.create()` validates the candidate timezone and schedule timezone, computes the next run against the timezone-aware UTC reference, and serializes `next_run_at` as UTC.
 
-## CAUSALITY
+`TaskRepository._now()` uses UTC. Supabase row parsing in `_parse_dt()` parses ISO timestamps and attaches UTC to naive values. `TaskRecord.next_run_at`, `created_at`, `updated_at`, and occurrence `scheduled_for` are therefore timezone-aware UTC instants after repository conversion. This is correct storage/normalization behavior and does not itself mean the value should be displayed as UTC.
 
-**Does `helper_connected=False` explain why Taskloom buttons are missing?**
+The current Taskloom UI obtains timestamps in `backend/bot/handlers/taskloom.py::_fmt_dt(value)`, which is simply:
 
-**CONFIRMED for the normal inline-button path:** yes, when helper startup failure leaves `_helper_username` empty, `inline_engine.trigger()` refuses the inline query before panel results are requested or clicked. This prevents initial inline Taskloom buttons from being delivered even though local button construction is valid.
+`return value.strftime("%m-%d %H:%M")`
 
-**Not confirmed as the only possible UI symptom:** the source contains a no-helper edit-in-place fallback in `misc.menu_cmd()`, and the logs supplied do not show the exact `Menu` event, `send_inline_panel` result, or fallback edit exception. Therefore the causal chain from helper failure to the user's precise observed screen is source-proven for inline mode but not fully proven for every possible fallback path.
+There is no `ZoneInfo(task.timezone)`, `astimezone(...)`, or other display conversion in `_fmt_dt()`. Consequently, an aware datetime parsed/stored as UTC is formatted using its existing UTC clock fields. The task's `timezone` metadata is displayed separately but is not used by `_fmt_dt()`.
 
-## RUNTIME WIRING
+The affected fields are `task.next_run_at`, `task.updated_at`, `task.created_at` where shown, and `occurrence.scheduled_for`. The source-grounded failure is therefore in the **UI formatter**, not storage: the formatter discards timezone context by formatting the datetime without converting to the task's declared timezone. The smallest future implementation location is `taskloom.py::_fmt_dt()` or a narrowly scoped caller that passes the task timezone; no fixed offset should be introduced.
 
-`backend/bot/router.py::register_all()` includes `("taskloom", lambda: taskloom.register(...))`, after the AI handler. `taskloom.register()` installs the `taskloom` and `taskloom_task` panels/builders and four task actions in the global helper registries. This registration occurs during `RuntimeSupervisor._build_and_register()` before helper startup, so helper authentication failure occurs after the Taskloom definitions have been registered on the self-client startup path.
+## 5. RELATIONSHIP BETWEEN BUGS
 
-However, the inline query builder and callback router are attached to the helper only in `_start_helper()`. A failed helper startup prevents those helper-side registrations. No source evidence shows a Taskloom-specific registration exception in the supplied logs; the known helper exception occurs at helper login.
+Persistence and list/delete can be related through the repository fallback: a Supabase failure can leave a task and later status changes in process memory, making the UI appear functional while durable state is absent. This relationship is **LIKELY**, not proven for the reported production instance.
 
-## RECENT task.py REPAIR IMPACT
+The Delete visibility problem is independently **CONFIRMED FROM SOURCE** because list methods include deleted records even after a successful soft-delete transition.
 
-The recent `backend/ai/tools/task.py` syntax repair is not on the Taskloom UI registration or panel-rendering path. `RuntimeSupervisor._build_and_register()` calls `register_all()` and then `_wire_ai_tools()`. A task-tool import/wiring failure can affect AI tool execution, but the Taskloom panel definitions are registered by `taskloom.register()` independently. No source evidence demonstrates that the repaired `task.py` syntax caused missing Taskloom buttons.
+Timezone display is independently **CONFIRMED FROM SOURCE** as a formatter conversion defect. It does not depend on database persistence, deletion, the scheduler, or helper connectivity.
 
-## CONFIRMED ROOT CAUSE
+## 6. HELPER BOT DEPENDENCY
 
-**CONFIRMED ROOT CAUSE:** The normal inline Taskloom button delivery path requires a helper username and a functioning helper inline-query handler. The observed helper authentication failure prevents helper initialization, leaves the inline engine without `_helper_username`, and causes `inline_engine.trigger()` / `send_inline_panel()` to fail before the generated markup can be clicked into the chat.
+The Helper Bot is used by the Glass UI inline delivery and callback registration path, as established in the prior investigation. Once the Taskloom detail view is visible and actions such as Pause/Resume execute, the current observations demonstrate that the relevant UI path is reachable in that runtime state.
 
-The local button objects themselves are not the failure: source construction is present and does not require a networked helper client.
+Task persistence, repository transitions, scheduler execution, and timestamp formatting do not import or call the Helper Bot. The source provides no causal dependency from `helper_connected=False` to the three reported backend/list/timezone defects. Helper connectivity may prevent creation or callback delivery of a panel in the normal inline path, but it does not explain a deleted row remaining in a repository list or UTC formatting of an already-rendered task.
 
-## REMAINING UNKNOWN
+## 7. RECENT task.py REPAIR
 
-- Whether the deployed user opened `Menu` while `_helper_username` was empty, and whether `misc.menu_cmd()` selected or successfully completed its edit-in-place fallback.
-- Whether any Telegram API exception occurred during the fallback `event.edit()`; no such event log was supplied.
-- Whether the deployed artifact exactly matches the inspected repository commit; no deployment revision identifier was provided.
-- Whether callbacks were attempted after a panel was created; no callback trace was provided.
+The repaired `backend/ai/tools/task.py` is involved in task creation entry and can prevent all task-tool execution if it is syntactically invalid. The current successful task creation/execution observation shows no demonstrated remaining syntax-wiring failure in that path. Its code delegates persistence to `TaskCreationService` and does not implement list rendering, delete transitions, or timestamp formatting.
 
-## RECOMMENDED NEXT IMPLEMENTATION SCOPE
+No remaining impact on the three reported problems is demonstrated from source. The database fallback behavior is in `task_repository.py`, deletion visibility is in `list_tasks()`/Taskloom rendering, and timezone display is in `_fmt_dt()`.
 
-If implementation is authorized, the smallest justified scope is to make the existing startup/fallback behavior observably and reliably handle the already-supported helper-unavailable state without changing button definitions, callback security, scheduler behavior, or Telegram boundaries. First add focused tests around `Menu` with helper unavailable and around `inline_engine.trigger()` with no helper username; then make only the minimal existing-path correction required by those tests. Do not add another UI engine or Telegram client.
+## 8. CONFIRMED ROOT CAUSES
 
-## HARD CONSTRAINTS
+1. **Delete visibility root cause — CONFIRMED FROM SOURCE:** deletion is implemented as a `status="deleted"` transition, while both list implementations return all owner tasks without excluding deleted/terminal records. A successfully deleted task can therefore remain in the list.
+2. **Timezone display root cause — CONFIRMED FROM SOURCE:** `taskloom._fmt_dt()` formats UTC-normalized aware datetimes directly and never converts them to `task.timezone` (`Asia/Tehran`).
+3. **Persistence failure — NOT CONFIRMED as a live incident:** the repository has a confirmed fallback path that can make UI/task execution succeed without a durable Supabase row when Supabase operations fail, but no live evidence proves that this occurred for the reported task.
 
-- Investigation findings are source-derived; no production code, tests, configuration, dependencies, database, Supabase, schema, or SQL were changed by this investigation.
-- The Self Bot remains the Telegram execution authority for initiating inline queries and editing/deleting panel messages.
-- The helper bot remains the existing optional inline-query/callback provider; no second Telegram path was introduced.
-- Existing owner validation in `misc.menu_cmd()`, helper inline routing, and callback routing remains authoritative.
-- No scheduler, executor, retry engine, arbitrary Telegram RPC, arbitrary chat ID, or provider direct Telegram control was introduced.
-- `IMPLEMENTATION_REPORT.md` and `tests/test_stage13.py` were not modified.
+## 9. REMAINING UNKNOWN
+
+- Whether the production `ai_tasks` insert succeeded, failed, or was routed to the in-memory fallback.
+- Whether the production process was configured with a real Supabase client and valid service-role credentials at task creation time.
+- Whether the displayed task came from the same process/repository instance as the database queried by the user.
+- Whether the Delete update succeeded in Supabase or only in fallback memory.
+- The exact production datetime values and timezone offsets behind the displayed screenshots.
+- Whether the deployed artifact exactly matches this repository HEAD.
+
+## 10. MINIMAL NEXT IMPLEMENTATION SCOPE
+
+- Persistence: add production-observable verification around the existing `SupabaseTaskRepository.create_task()` result/fallback boundary, without changing schema; first confirm the actual production repository/client configuration before changing behavior.
+- Delete visibility: retain the existing soft-delete transition but exclude `deleted` (and, if product policy requires, other terminal statuses) from the existing `list_tasks()` read path or its narrowly scoped service boundary.
+- Timezone: convert aware timestamps with `ZoneInfo(task.timezone)` at the existing Taskloom formatting boundary before `strftime`; preserve UTC storage and avoid fixed offsets.
+
+No implementation was performed in this investigation.
+
