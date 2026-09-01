@@ -90,25 +90,31 @@ class CreateTaskTool(Tool):
             return ToolResult(success=False, message="Task request is too long.")
 
         owner_id = getattr(context, "owner_id", 0)
+        if not isinstance(owner_id, int) or owner_id <= 0:
+            return ToolResult(success=False, message="Owner identity is unavailable; task was not created.")
         tz_str = getattr(context, "tz_str", "UTC") or "UTC"
         provider_manager = (context.extra or {}).get("provider_manager")
-        if provider_manager is None:
-            try:
-                from backend.ai.engine.engine import get_engine
-                provider_manager = get_engine().provider_manager
-            except Exception:
-                provider_manager = None
-        if provider_manager is None:
-            return ToolResult(success=False, message="AI provider manager is unavailable; task was not created.")
+        deterministic_candidate = (context.extra or {}).get("deterministic_task_candidate")
+        if deterministic_candidate is not None:
+            candidate = deterministic_candidate
+        else:
+            if provider_manager is None:
+                try:
+                    from backend.ai.engine.engine import get_engine
+                    provider_manager = get_engine().provider_manager
+                except Exception:
+                    provider_manager = None
+            if provider_manager is None:
+                return ToolResult(success=False, message="AI provider manager is unavailable; task was not created.")
 
-        try:
-            candidate = await asyncio.wait_for(
-                TaskInterpreter(provider_manager).interpret(request, timezone=tz_str),
-                timeout=INTERPRET_TIMEOUT_SECONDS,
-            )
+            try:
+                candidate = await asyncio.wait_for(
+                    TaskInterpreter(provider_manager).interpret(request, timezone=tz_str),
+                    timeout=INTERPRET_TIMEOUT_SECONDS,
+                )
         except asyncio.CancelledError:
             raise
-        except (TaskInterpretationError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+            except (TaskInterpretationError, asyncio.TimeoutError, Exception):  # noqa: BLE001
             return ToolResult(
                 success=False,
                 message=(

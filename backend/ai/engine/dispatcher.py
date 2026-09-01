@@ -952,6 +952,17 @@ class Dispatcher:
         # Looking up the process-global engine from inside a tool can route a
         # request through a stale/unconfigured provider mesh.
         extra["provider_manager"] = self._provider_manager
+        if request.user_message:
+            deterministic = parse_command_intent(
+                request.user_message,
+                has_reply=bool(request.reply_context and request.reply_context.exists),
+            )
+            if deterministic.action == "create_task" and deterministic.kind == "executable":
+                candidate = self._build_deterministic_task_candidate(
+                    request, deterministic.schedule_text,
+                )
+                if candidate is not None:
+                    extra["deterministic_task_candidate"] = candidate
         if request.reply_context and request.reply_context.exists:
             extra["reply_msg"] = {
                 "message_id": request.reply_context.message_id,
@@ -970,6 +981,54 @@ class Dispatcher:
             client=base.client,
             extra=extra,
         )
+
+    @staticmethod
+    def _build_deterministic_task_candidate(request: AIRequest, schedule_text: str) -> dict[str, Any] | None:
+        """Build a narrow interval/write candidate from a high-confidence request."""
+        from backend.ai.actions import _parse_number, _tokenize, _TIME_UNITS
+
+        words = _tokenize(schedule_text)
+        interval_index = next(
+            (i for i, word in enumerate(words) if word in {"هر", "every", "each"}),
+            None,
+        )
+        if interval_index is None:
+            return None
+        unit_index = next(
+            (
+                i for i in range(interval_index + 1, min(len(words), interval_index + 6))
+                if words[i] in _TIME_UNITS
+            ),
+            None,
+        )
+        if unit_index is None:
+            return None
+        number = _parse_number(words, unit_index - 1) or 1
+        unit_seconds = {
+            "ثانیه": 1, "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+            "دقیقه": 60, "دقیقه‌ای": 60, "دقیق": 60,
+            "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+            "ساعت": 3600, "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+        }.get(words[unit_index], 0)
+        if unit_seconds <= 0:
+            return None
+        marker = next(
+            (i for i, word in enumerate(words) if word in {"بنویس", "نویس", "write", "writing"}),
+            None,
+        )
+        if marker is None or marker + 1 >= len(words):
+            return None
+        text = " ".join(words[marker + 1:]).strip()
+        if not text:
+            return None
+        return {
+            "label": text[:256],
+            "schedule_type": "interval",
+            "schedule": {"seconds": number * unit_seconds},
+            "timezone": request.timezone or "UTC",
+            "actions": [{"name": "send_message", "arguments": {"text": text}}],
+            "notification_destination": {},
+        }
 
     async def _try_local_fast_path(
         self,
