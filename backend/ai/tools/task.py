@@ -112,8 +112,8 @@ class CreateTaskTool(Tool):
                     TaskInterpreter(provider_manager).interpret(request, timezone=tz_str),
                     timeout=INTERPRET_TIMEOUT_SECONDS,
                 )
-        except asyncio.CancelledError:
-            raise
+            except asyncio.CancelledError:
+                raise
             except (TaskInterpretationError, asyncio.TimeoutError, Exception):  # noqa: BLE001
             return ToolResult(
                 success=False,
