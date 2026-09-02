@@ -15,6 +15,8 @@ executed later by the single TaskScheduler through the registered ToolExecutor
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,10 +24,32 @@ from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
 
+logger = logging.getLogger(__name__)
+
 MAX_REQUEST_CHARS = 2000
 INTERPRET_TIMEOUT_SECONDS = 30.0
 # Interpreter (30s) plus creation + persistence margin, still bounded.
 EXECUTION_TIMEOUT_SECONDS = 45.0
+
+
+def _classify_interpretation_failure(exc: Exception) -> str:
+    """Map an interpretation failure to a bounded, sanitized category."""
+    from backend.ai.task_candidate import TaskCandidateError
+    from backend.ai.task_interpreter import TaskInterpretationError
+
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(exc, TaskInterpretationError):
+        cause = exc.__cause__
+        cause_name = type(cause).__name__ if cause is not None else ""
+        if cause_name == "JSONDecodeError":
+            return "candidate_invalid_json"
+        if cause_name == "TaskCandidateError":
+            return "candidate_invalid"
+        return "interpretation_error"
+    if isinstance(exc, TaskCandidateError):
+        return "candidate_invalid"
+    return "unexpected_exception"
 
 
 class CreateTaskTool(Tool):
@@ -33,6 +57,11 @@ class CreateTaskTool(Tool):
 
     def __init__(self, context: ToolContext) -> None:
         self._context = context
+
+    @staticmethod
+    def _label_hash(label: str) -> str:
+        """Non-reversible label fingerprint for logs — never raw task content."""
+        return hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
 
     @property
     def name(self) -> str:
@@ -80,7 +109,7 @@ class CreateTaskTool(Tool):
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.ai.task_interpreter import TaskInterpretationError, TaskInterpreter
-        from backend.ai.task_creation import TaskCreationError, TaskCreationService
+        from backend.ai.task_creation import TaskCreationService
 
         request = arguments.get("request")
         if not isinstance(request, str) or not request.strip():
@@ -114,15 +143,32 @@ class CreateTaskTool(Tool):
                 )
             except asyncio.CancelledError:
                 raise
-            except (TaskInterpretationError, asyncio.TimeoutError, Exception):  # noqa: BLE001
-                return ToolResult(
-                success=False,
-                message=(
+            except asyncio.TimeoutError as exc:
+                logger.warning(
+                    "AI_EXEC_TRACE request_id=%s stage=create_task_interpret_failed "
+                    "category=timeout owner_scope=%s",
+                    (context.extra or {}).get("request_id", "-"), owner_id,
+                )
+                return ToolResult(success=False, message=(
                     "I could not turn that into a safe, unambiguous schedule, so I "
                     "did not create any task. Restate it as an interval (e.g. 'every "
                     "X minutes'), a time, or a daily/weekly cadence with a clear action."
-                ),
-            )
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "AI_EXEC_TRACE request_id=%s stage=create_task_interpret_failed "
+                    "category=%s exception=%s detail=%s owner_scope=%s",
+                    (context.extra or {}).get("request_id", "-"),
+                    _classify_interpretation_failure(exc),
+                    type(exc).__name__,
+                    str(exc)[:200],
+                    owner_id,
+                )
+                return ToolResult(success=False, message=(
+                    "I could not turn that into a safe, unambiguous schedule, so I "
+                    "did not create any task. Restate it as an interval (e.g. 'every "
+                    "X minutes'), a time, or a daily/weekly cadence with a clear action."
+                ))
 
         # Resolve destination: the model may express a chat_name (never a
         # numeric chat_id). Resolve it against the authenticated Self Bot's
@@ -184,14 +230,32 @@ class CreateTaskTool(Tool):
             candidate = candidate.as_creation_candidate()
         candidate["notification_destination"] = destination
 
+        repository = None
         try:
             from backend.ai.database.manager import get_repository_manager
             service = TaskCreationService(get_repository_manager().task, owner_id)
+            repository = type(service.repository).__name__
             task = await service.create(candidate, datetime.now(timezone.utc))
         except asyncio.CancelledError:
             raise
-        except (TaskCreationError, Exception):  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=create_task_persist_failed "
+                "exception=%s detail=%s repository=%s owner_scope=%s",
+                (context.extra or {}).get("request_id", "-"),
+                type(exc).__name__, str(exc)[:200],
+                repository, owner_id,
+            )
             return ToolResult(success=False, message="The task could not be persisted; nothing was created.")
+
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=create_task_persisted task_id=%s "
+            "repository=%s schedule_type=%s action_count=%s label_len=%s "
+            "label_hash=%s owner_scope=%s",
+            (context.extra or {}).get("request_id", "-"), task.id,
+            repository, task.schedule_type, len(candidate.get("actions") or []),
+            len(task.label), self._label_hash(task.label), owner_id,
+        )
 
         return ToolResult(
             success=True,

@@ -18,12 +18,18 @@ Root cause fixed here, traced across the real path:
     brand-new interval task, which ``next_occurrence()`` could not (it
     requires a previous occurrence), so an interval task could not previously
     be persisted at all.
+  - Production follow-up (create_task success=False with a healthy provider):
+    ``backend/ai/task_interpreter.py`` now tolerates the ubiquitous markdown
+    code-fence wrapper around an otherwise compliant JSON candidate, and the
+    tool boundary logs a sanitized failure category + repository/outcome
+    record so the next production failure is unambiguous.
 
 These tests assert the routing and the persistence boundary with a REAL
 in-memory task repository and a scripted provider (no network).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -244,6 +250,147 @@ async def test_create_task_tool_persists_scheduled_destructive_delete():
     # later execution goes through the registered ToolExecutor under owner scope
     assert tasks[0].actions == [{"name": "delete", "arguments": {"mode": "all"}}]
     assert tasks[0].owner_id == 777
+
+
+# ── Markdown-fence tolerance (production follow-up) ──
+
+
+_FENCED_INTERVAL_CANDIDATE = f"```json\n{_INTERVAL_CANDIDATE}\n```"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_succeeds_with_markdown_fenced_json():
+    """A compliant candidate wrapped in ``` fences must create the task.
+
+    This is the production-proven failure: the provider attempt succeeds,
+    the JSON is valid, but the fenced wrapper made json.loads fail, so
+    create_task returned success=False with no durable row.
+    """
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _FENCED_INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with patch.object(dbm, "get_repository_manager", return_value=manager):
+        tool = CreateTaskTool(_tool_context(pm))
+        result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    assert result.success is True
+    tasks = await manager.task.list_tasks(777)
+    assert len(tasks) == 1
+    assert tasks[0].actions == [{"name": "send_message", "arguments": {"text": "سلام"}}]
+
+
+@pytest.mark.asyncio
+async def test_fenced_invalid_json_still_rejected():
+    """Fence stripping must not weaken candidate validation."""
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", "```json\n{not json at all}\n```")
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    tool = CreateTaskTool(_tool_context(pm))
+    result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+    assert result.success is False
+
+
+# ── Failure-visibility diagnostics at the create_task boundary ──
+
+
+@pytest.mark.asyncio
+async def test_ambiguity_failure_logs_sanitized_category(caplog):
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", "null")
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with caplog.at_level(logging.WARNING, logger="backend.ai.tools.task"):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            tool = CreateTaskTool(_tool_context(pm))
+            result = await tool.execute(
+                _tool_context(pm), {"request": "هر روز هههه"}
+            )
+
+    assert result.success is False
+    assert (await manager.task.list_tasks(777)) == []
+    records = [r for r in caplog.records if "create_task_interpret_failed" in r.getMessage()]
+    assert records, "the interpretation failure must be logged"
+    assert "category=candidate_invalid" in records[0].getMessage()
+
+
+class _ExplodingTaskRepository:
+    """Stands in for a repository whose Supabase insert crashes."""
+
+    async def create_task(self, owner_id, data):
+        raise RuntimeError("boom: simulated supabase outage")
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_is_classified_and_honest(caplog):
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    manager._task = _ExplodingTaskRepository()
+    with caplog.at_level(logging.WARNING, logger="backend.ai.tools.task"):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            tool = CreateTaskTool(_tool_context(pm))
+            result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    # Honest failure: never a fake success when persistence crashed.
+    assert result.success is False
+    records = [r for r in caplog.records if "create_task_persist_failed" in r.getMessage()]
+    assert records, "the persistence failure must be logged"
+    text = records[0].getMessage()
+    assert "exception=RuntimeError" in text
+    assert "_ExplodingTaskRepository" in text
+
+
+@pytest.mark.asyncio
+async def test_success_logs_persistence_outcome_without_raw_content(caplog):
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with caplog.at_level(logging.INFO, logger="backend.ai.tools.task"):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            tool = CreateTaskTool(_tool_context(pm))
+            result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    assert result.success is True
+    records = [r for r in caplog.records if "create_task_persisted" in r.getMessage()]
+    assert records, "the persistence outcome must be logged"
+    text = records[0].getMessage()
+    assert "InMemoryTaskRepository" in text
+    assert "schedule_type=interval" in text
+    assert "label_hash=" in text
+    # raw task content must never appear in the outcome record
+    assert "سلام" not in text
 
 
 # ── Dispatcher fast-path integration (no provider tool round) ──

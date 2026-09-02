@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from typing import Any
 
 from backend.ai.providers.base.contract import ProviderResponse
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
 from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS
 
+logger = logging.getLogger(__name__)
+
 INTERPRET_TIMEOUT_SECONDS = 30.0
 MAX_REQUEST_CHARS = 2000
+
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 CANDIDATE_SCHEMA = {
     "type": "object",
@@ -29,6 +35,23 @@ CANDIDATE_SCHEMA = {
 
 class TaskInterpretationError(ValueError):
     """Natural-language interpretation did not yield a safe candidate."""
+
+
+def _load_candidate_json(raw: str) -> Any:
+    """Parse the model's JSON, tolerating the common markdown-fence wrapper.
+
+    Providers frequently wrap a compliant JSON object in ``` fences (with or
+    without the ``json`` tag). The candidate itself is still validated by
+    ``parse_candidate_output`` — this only fixes the extraction step.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    match = _JSON_BLOCK_RE.search(raw)
+    if not match:
+        raise
+    return json.loads(match.group(1))
 
 
 class TaskInterpreter:
@@ -89,7 +112,14 @@ class TaskInterpreter:
         if not isinstance(raw, str) or not raw.strip():
             raise TaskInterpretationError("task interpretation returned no structured output")
         try:
-            value = json.loads(raw)
+            value = _load_candidate_json(raw)
             return parse_candidate_output(value)
         except (json.JSONDecodeError, TaskCandidateError) as exc:
+            logger.info(
+                "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
+                str(exc)[:200],
+            )
+            raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TASK_INTERPRET_REJECTED reason=candidate_parse_error detail=%r", exc)
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc

@@ -1157,8 +1157,9 @@ class Dispatcher:
         all_tool_results = [er.as_dict() for er in exec_results]
         for er in exec_results:
             logger.info(
-                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",
+                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s message=%s",
                 rid or "-", er.tool_name, er.success,
+                (er.message or er.error or "no message").replace("\n", " ")[:160],
             )
             self._conversation.add_tool_result(
                 owner_id=request.owner_id,
