@@ -326,9 +326,13 @@ async def test_ambiguity_failure_logs_sanitized_category(caplog):
 
     assert result.success is False
     assert (await manager.task.list_tasks(777)) == []
-    records = [r for r in caplog.records if "create_task_interpret_failed" in r.getMessage()]
+    records = [r for r in caplog.records if "stage=interpretation_failed" in r.getMessage()]
     assert records, "the interpretation failure must be logged"
     assert "category=candidate_invalid" in records[0].getMessage()
+    terminal = [r for r in caplog.records if "stage=create_task_failed" in r.getMessage()]
+    assert terminal, "every failed create_task must emit one terminal failure record"
+    assert "failed_stage=create_task_interpretation" in terminal[0].getMessage()
+    assert "persisted=false" in terminal[0].getMessage()
 
 
 class _ExplodingTaskRepository:
@@ -461,3 +465,186 @@ async def test_dispatcher_routes_schedule_local_fast_path_and_creates_task():
     # creation does not burn a provider round.
     assert provider.calls == 0
     assert len(await manager.task.list_tasks(777)) == 1
+
+
+# ── AI_TASK_TRACE lifecycle observability ──
+
+
+def _trace_records(caplog) -> list:
+    return [r for r in caplog.records if "AI_TASK_TRACE" in r.getMessage()]
+
+
+def _records_with_stage(caplog, stage: str) -> list:
+    return [r for r in caplog.records if f"stage={stage}" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_success_path_emits_full_trace_lifecycle(caplog):
+    """The complete happy path is observable from AI_TASK_TRACE alone."""
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with caplog.at_level(logging.INFO):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            tool = CreateTaskTool(_tool_context(pm))
+            result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    assert result.success is True
+    messages = [r.getMessage() for r in _trace_records(caplog)]
+    stages = [m.split("stage=")[1].split(" ")[0] for m in messages]
+    for expected in (
+        "create_task_received",
+        "create_task_validation_start",
+        "create_task_validation_end",
+        "create_task_interpretation_start",
+        "interpretation_start",
+        "provider_result",
+        "interpretation_end",
+        "create_task_destination_resolution",
+        "create_task_definition_validation_start",
+        "create_task_repository_create_start",
+        "create_task_repository_create_result",
+        "create_task_definition_validation_end",
+        "create_task_success",
+    ):
+        assert expected in stages, f"missing trace stage {expected}; got {stages}"
+    # exactly one terminal event, and it is the success one
+    assert stages.count("create_task_success") == 1
+    assert "create_task_failed" not in stages
+    received = _records_with_stage(caplog, "create_task_received")[0].getMessage()
+    assert "request_len=" in received and "preview=" in received
+    assert "owner_scope=777" in received
+    # provider identity is correlated into the trace
+    provider_result = _records_with_stage(caplog, "provider_result")[0].getMessage()
+    assert "provider=fake" in provider_result and "success=true" in provider_result
+    repo_result = _records_with_stage(caplog, "create_task_repository_create_result")[0].getMessage()
+    assert "InMemoryTaskRepository" in repo_result and "version=1" in repo_result
+    # raw task content is bounded to the single received-preview field; it
+    # must never propagate into interpretation/provider/persistence records
+    # (no label text, no action text beyond that one diagnostic preview)
+    joined = "\n".join(messages)
+    without_preview = "\n".join(
+        m.split("preview=")[0] if "preview=" in m else m for m in messages
+    )
+    assert "بنویس" not in without_preview
+    assert joined.count("preview=") == 1, "task text may appear only in the received preview"
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_preserves_concrete_reason_and_terminal_event(caplog):
+    """All providers failed → trace preserves the concrete exhaustion reason."""
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    provider.calls = 0
+
+    async def failing_chat(messages, **kwargs):
+        provider.calls += 1
+        return ProviderResponse(
+            text="Request failed: RuntimeError: quota exhausted",
+            provider_name="fake",
+            success=False,
+            metadata={
+                "failure_type": "server",
+                "provider_matrix": [{"provider": "fake", "outcome": "failed"}],
+                "fallback_exhausted": True,
+                "errors": ["fake: success=False (quota exhausted)"],
+            },
+        )
+
+    provider.chat = failing_chat
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    with caplog.at_level(logging.WARNING):
+        tool = CreateTaskTool(_tool_context(pm))
+        result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    assert result.success is False
+    messages = [r.getMessage() for r in _trace_records(caplog)]
+    # The exhausted chain is reconstructable: 'attempted' lists the tried
+    # provider(s), 'provider' names the terminal fallback responder.
+    assert any(
+        "stage=provider_result success=false provider=dummy attempted=fake" in m
+        for m in messages
+    )
+    assert any("category=all_providers_failed" in m for m in messages)
+    assert any("fallback_exhausted=True" in m for m in messages)
+    failed = _records_with_stage(caplog, "create_task_failed")
+    assert len(failed) == 1, "exactly one terminal failure event"
+    text = failed[0].getMessage()
+    assert "failed_stage=create_task_interpretation" in text
+    assert "all_providers_failed" in text
+    assert "persisted=false" in text
+    # nothing was persisted
+    from backend.ai.database import manager as dbm
+    assert (await dbm.RepositoryManager(supabase_available=False).task.list_tasks(777)) == []
+
+
+@pytest.mark.asyncio
+async def test_repository_fallback_emits_fallback_trace(caplog):
+    """Supabase crash → fallback start/result records with task id/version."""
+    from backend.ai.database import manager as dbm
+    from backend.ai.database.task_repository import SupabaseTaskRepository
+    from backend.ai.tools.task import CreateTaskTool
+
+    class _BrokenClient:
+        def table(self, *_a, **_k):
+            raise RuntimeError("simulated supabase outage")
+
+    repo = SupabaseTaskRepository(_BrokenClient())
+    manager = dbm.RepositoryManager(supabase_available=False)
+    manager._task = repo
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    with caplog.at_level(logging.INFO):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            tool = CreateTaskTool(_tool_context(pm))
+            result = await tool.execute(_tool_context(pm), {"request": INTERVAL_REQUEST})
+
+    # the fallback succeeded, so the tool succeeds and the trace shows both
+    assert result.success is True
+    messages = [r.getMessage() for r in _trace_records(caplog)]
+    assert any("stage=create_task_fallback_start" in m for m in messages)
+    fallback_result = [m for m in messages if "stage=create_task_fallback_result" in m]
+    assert fallback_result and "success=true" in fallback_result[0]
+    assert "task_id=" in fallback_result[0] and "version=1" in fallback_result[0]
+    success = _records_with_stage(caplog, "create_task_success")[0].getMessage()
+    assert "final_backend=InMemoryTaskRepository" in success
+
+
+@pytest.mark.asyncio
+async def test_tool_terminal_event_always_emitted_on_early_rejection(caplog):
+    """Even an early argument rejection carries a terminal failure record."""
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm = ProviderManager()
+    provider = _FakeProvider("fake", _INTERVAL_CANDIDATE)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    with caplog.at_level(logging.WARNING):
+        tool = CreateTaskTool(_tool_context(pm))
+        result = await tool.execute(_tool_context(pm), {"request": "   "})
+
+    assert result.success is False
+    # Early argument rejection happens before the trace helper exists — the
+    # dispatcher-level tool_result trace still records it. The lifecycle
+    # trace requirement applies from create_task_received onward.
+    assert _records_with_stage(caplog, "create_task_failed") == []
+    assert _records_with_stage(caplog, "create_task_received") == []

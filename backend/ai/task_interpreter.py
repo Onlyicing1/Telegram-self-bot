@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from backend.ai.providers.base.contract import ProviderResponse
@@ -60,9 +61,14 @@ class TaskInterpreter:
     def __init__(self, provider_manager: Any) -> None:
         self._providers = provider_manager
 
-    async def interpret(self, request: str, timezone: str = "") -> TaskCandidate:
+    async def interpret(self, request: str, timezone: str = "", request_id: str = "") -> TaskCandidate:
+        started = time.perf_counter()
         if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
             raise TaskInterpretationError("task request is empty or too long")
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=interpretation_start mode=provider request_len=%s",
+            request_id or "-", len(request),
+        )
         instructions = (
             "Return exactly one JSON object matching the supplied task candidate schema. "
             "Do not include owner identity, chat ids, or raw Telegram destinations. Do not execute tools. "
@@ -104,16 +110,54 @@ class TaskInterpreter:
             )
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError as exc:
+            raise TaskInterpretationError("task interpretation provider timed out") from exc
         except Exception as exc:
             raise TaskInterpretationError("task interpretation provider failed") from exc
         if not response.success:
-            raise TaskInterpretationError("task interpretation provider returned a failure")
+            # The concrete provider failure (rate limit, model-not-found,
+            # exhausted fallback chain, …) must survive into the raised
+            # error — a generic message here is what previously hid the
+            # root cause from the create_task trace.
+            meta = response.metadata or {}
+            category = (
+                "all_providers_failed" if meta.get("fallback_exhausted")
+                else str(meta.get("failure_type") or meta.get("error_type") or "unknown")
+            )
+            detail = " ".join(str(response.text or "").split())[:200]
+            matrix = meta.get("provider_matrix") or []
+            failed_providers = ",".join(
+                str(entry.get("provider")) for entry in matrix
+                if isinstance(entry, dict) and entry.get("provider")
+            )
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=provider_result success=false "
+                "provider=%s attempted=%s category=%s providers_tried=%s "
+                "fallback_exhausted=%s detail=%s",
+                request_id or "-",
+                response.provider_name or "unknown",
+                failed_providers or response.provider_name or "unknown",
+                category, len(matrix), bool(meta.get("fallback_exhausted")),
+                detail,
+            )
+            raise TaskInterpretationError(
+                f"task interpretation provider failed: provider={response.provider_name} "
+                f"category={category} detail={detail}"
+            )
+        meta = response.metadata or {}
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=provider_result success=true "
+            "provider=%s model=%s fallback=%s latency_ms=%s",
+            request_id or "-", response.provider_name or "unknown",
+            meta.get("model") or "-", bool(meta.get("fallback")),
+            int((time.perf_counter() - started) * 1000),
+        )
         raw = response.text
         if not isinstance(raw, str) or not raw.strip():
             raise TaskInterpretationError("task interpretation returned no structured output")
         try:
             value = _load_candidate_json(raw)
-            return parse_candidate_output(value)
+            candidate = parse_candidate_output(value)
         except (json.JSONDecodeError, TaskCandidateError) as exc:
             logger.info(
                 "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
@@ -123,3 +167,10 @@ class TaskInterpreter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("TASK_INTERPRET_REJECTED reason=candidate_parse_error detail=%r", exc)
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=interpretation_end success=true "
+            "schedule_type=%s action_count=%s provider=%s latency_ms=%s",
+            request_id or "-", candidate.schedule_type, len(candidate.actions),
+            response.provider_name or "unknown", int((time.perf_counter() - started) * 1000),
+        )
+        return candidate

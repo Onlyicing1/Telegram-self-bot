@@ -183,7 +183,19 @@ class SupabaseTaskRepository(TaskRepository):
         except (ValueError,TypeError):raise
         except Exception as exc:
             logger.warning("TASK_PERSIST_FALLBACK repository=%s operation=create_task exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
-            return await self._fallback.create_task(owner_id,data)
+            logger.warning("AI_TASK_TRACE stage=create_task_fallback_start backend=InMemoryTaskRepository reason=%s detail=%s", type(exc).__name__, str(exc)[:160])
+            try:
+                record = await self._fallback.create_task(owner_id,data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fallback_exc:
+                logger.warning("AI_TASK_TRACE stage=create_task_fallback_result success=false exception=%s detail=%s", type(fallback_exc).__name__, str(fallback_exc)[:160])
+                raise
+            logger.info("AI_TASK_TRACE stage=create_task_fallback_result success=true task_id=%s version=%s backend=InMemoryTaskRepository", record.id, record.version)
+            # Observability annotation (not a schema field): lets the caller's
+            # terminal trace report the true final backend and fallback usage.
+            record.fallback_backend = type(self._fallback).__name__
+            return record
     async def get_task(self, owner_id, task_id):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
