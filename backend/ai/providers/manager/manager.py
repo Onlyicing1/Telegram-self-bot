@@ -56,6 +56,7 @@ from backend.ai.providers.manager.health import (
 )
 from backend.ai.providers.manager.metrics import ProviderMetricsRegistry
 from backend.ai.providers.registry.registry import ProviderRegistry
+from backend.ai.task_trace import bound_text, task_trace
 from backend.runtime.operation_watchdog import guarded_await
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,10 @@ class ProviderManager:
         for idx, (score, name, provider) in enumerate(eligible):
             model = self._effective_model(provider) or "-"
             logger.info("ROUTER_SELECTED provider=%s model=%s score=%.3f", name, model, score)
+            task_trace(
+                "provider_selection", provider=name, model=model, score=round(score, 3),
+                attempt=idx + 1, selection_reason="active_first_then_score",
+            )
             response = await self._attempt_with_retry(provider, messages, kwargs)
             if response.success:
                 # A semantically-empty or all-malformed "success" is not a
@@ -169,6 +174,11 @@ class ProviderManager:
                     logger.info(
                         "AI_PROVIDER_FAILURE provider=%s model=%s category=%s failover=1",
                         name, model, category,
+                    )
+                    task_trace(
+                        "provider_fallback", failed_provider=name, failure_category=category.lower(),
+                        next_provider=eligible[idx + 1][1] if idx + 1 < len(eligible) else "-",
+                        reason="empty_response", attempt=idx + 1,
                     )
                     continue
                 matrix.append({"provider": name, "outcome": "success", "score": round(score, 3)})
@@ -192,6 +202,11 @@ class ProviderManager:
             total_retries += int((response.metadata or {}).get("ai_retry_count", 0) or 0)
             matrix.append({"provider": name, "outcome": "failed", "reason": (response.text or "")[:200]})
             failures.append(f"{name}: success=False ({response.text[:200]})")
+            task_trace(
+                "provider_fallback", failed_provider=name, failure_category=self._failure_type(response),
+                next_provider=(eligible[idx + 1][1] if idx + 1 < len(eligible) else "emergency_fallback"),
+                reason=bound_text(response.text, 160), attempt=idx + 1,
+            )
 
         return await self._fallback(
             messages, failures=failures, matrix=matrix, retries=total_retries, **kwargs
@@ -592,6 +607,12 @@ class ProviderManager:
         """
         name = self._safe_provider_name(provider)
         start = time.perf_counter()
+        task_trace(
+            "provider_request_start", provider=name, model=self._effective_model(provider) or "-",
+            request_size=sum(len(str(m.get("content", ""))) for m in messages),
+            request_preview=bound_text(messages[-1].get("content", "") if messages else "", 160),
+            timeout_s=_PROVIDER_RPC_TIMEOUT,
+        )
         try:
             response = await guarded_await(
                 provider.chat(messages, **kwargs),
@@ -600,11 +621,27 @@ class ProviderManager:
             )
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error="" if response.success else (response.text or "")[:200])
+            raw = (response.text or "").strip().lower()
+            task_trace(
+                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                success="true" if response.success else "false", elapsed_ms=int(latency * 1000),
+                output_category=("json" if raw.startswith("{") else "null" if raw in {"null", "json null"} else "prose" if raw else "empty"),
+                response_length=len(response.text or ""),
+                response_preview=bound_text(response.text or "", 160),
+                failure_category="" if response.success else self._failure_type(response),
+                error_detail="" if response.success else bound_text(response.text, 200),
+            )
             return response
         except asyncio.TimeoutError as exc:
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error=f"timeout: {exc}")
             logger.warning("ProviderManager: '%s' timed out during chat", name)
+            task_trace(
+                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                success="false", elapsed_ms=int(latency * 1000), output_category="empty",
+                response_length=0, response_preview="", failure_category="timeout",
+                error_detail=bound_text(str(exc), 200),
+            )
             return ProviderResponse(
                 text=f"Request timed out: {exc}",
                 provider_name=name,
@@ -615,6 +652,12 @@ class ProviderManager:
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error=f"{type(exc).__name__}: {exc}")
             logger.warning("ProviderManager: '%s' crashed during chat: %s", name, exc)
+            task_trace(
+                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                success="false", elapsed_ms=int(latency * 1000), output_category="empty",
+                response_length=0, response_preview="", failure_category="network",
+                error_detail=bound_text(f"{type(exc).__name__}: {exc}", 200),
+            )
             return ProviderResponse(
                 text=f"Request failed: {type(exc).__name__}: {exc}",
                 provider_name=name,
@@ -845,6 +888,10 @@ class ProviderManager:
         fallback = self._registry.get_fallback()
         errors = list(failures or [])
         detail = "; ".join(errors) if errors else "no additional provider error information"
+        task_trace(
+            "provider_fallback_exhausted", providers_tried=len(errors),
+            final_category="all_providers_failed", final_error=bound_text(detail, 240),
+        )
         try:
             await guarded_await(
                 fallback.chat(messages, **kwargs),

@@ -1,6 +1,10 @@
 """Deterministic task creation boundary for authorized callers."""
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,9 +17,15 @@ from backend.ai.scheduling import (
 )
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.task_contract import AIInstruction, validate_ai_instruction
-import logging
+from backend.ai.task_trace import bound_text, task_trace
 
 logger = logging.getLogger(__name__)
+
+
+def _creation_trace(stage: str, **fields: Any) -> None:
+    # Correlated AI_TASK_TRACE record when a create_task request is bound;
+    # silent for direct service callers (tests, .task command without a trace).
+    task_trace(stage, **fields)
 
 
 class TaskCreationError(ValueError):
@@ -30,20 +40,36 @@ class TaskCreationService:
         self.owner_id = owner_id
 
     async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
+        started = time.perf_counter()
+
+        def _invalid(reason: str) -> TaskCreationError:
+            _creation_trace(
+                "rejected", reason=reason,
+                elapsed_s=round(time.perf_counter() - started, 2),
+            )
+            return TaskCreationError(reason)
+
+        _creation_trace(
+            "task_validation_start", repo_type=type(self.repository).__name__,
+            candidate_fields=len(candidate) if isinstance(candidate, dict) else 0,
+        )
         if isinstance(candidate, TaskCandidate):
             candidate = candidate.as_creation_candidate()
         if not isinstance(candidate, dict):
-            raise TaskCreationError("task candidate must be an object")
+            raise _invalid("task candidate must be an object")
         if not isinstance(reference, datetime) or reference.tzinfo is None:
             raise TaskCreationError("reference datetime must be timezone-aware")
         required = {"label", "schedule_type", "schedule", "timezone", "actions", "notification_destination"}
         allowed = required | {"next_run_at", "ai_instruction"}
         if set(candidate) - allowed:
-            raise TaskCreationError("unsupported task fields")
+            raise _invalid(f"unsupported task fields: {sorted(set(candidate) - allowed)}")
         if required - set(candidate):
-            raise TaskCreationError("missing required task fields")
+            raise _invalid(f"missing required task fields: {sorted(required - set(candidate))}")
         if candidate.get("timezone") != candidate["schedule"].get("timezone") and candidate["schedule_type"] != "interval":
-            raise TaskCreationError("task and schedule timezones must match")
+            raise _invalid(
+                "task and schedule timezones must match "
+                f"(task={candidate.get('timezone')} schedule={candidate['schedule'].get('timezone')})"
+            )
         try:
             schedule = parse_schedule(candidate["schedule_type"], candidate["schedule"])
             initial = candidate.get("next_run_at")
@@ -61,6 +87,7 @@ class TaskCreationService:
                 else:
                     initial = next_occurrence(schedule, reference)
         except (ScheduleError, TypeError, ValueError) as exc:
+            _creation_trace("schedule_invalid", schedule_type=str(candidate.get("schedule_type")), error=str(exc)[:120])
             raise TaskCreationError(str(exc)) from exc
         payload = {key: candidate[key] for key in required}
         if candidate.get("ai_instruction") is not None:
@@ -75,4 +102,32 @@ class TaskCreationService:
             type(self.repository).__name__, self.owner_id, bool(payload.get("ai_instruction")),
         )
         payload["next_run_at"] = initial.astimezone(timezone.utc) if isinstance(initial, datetime) and initial.tzinfo else initial
-        return await self.repository.create_task(self.owner_id, payload)
+        _creation_trace(
+            "task_validation_result", success="true", schema_version="1",
+            schedule_type=str(candidate["schedule_type"]),
+            actions=len(candidate["actions"]),
+            payload_bytes=len(json.dumps(payload, ensure_ascii=False, default=str)),
+            next_run_at=(payload["next_run_at"].isoformat() if isinstance(payload["next_run_at"], datetime) else "none"),
+        )
+        _creation_trace(
+            "repository_call", repo_type=type(self.repository).__name__,
+            schedule_type=str(candidate["schedule_type"]),
+            payload=bound_text(json.dumps(payload, ensure_ascii=False, default=str), 400),
+        )
+        try:
+            task = await self.repository.create_task(self.owner_id, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _creation_trace(
+                "repository_error", repo_type=type(self.repository).__name__,
+                error_type=type(exc).__name__, error=str(exc)[:200],
+            )
+            raise
+        _creation_trace(
+            "persisted", repo_type=type(self.repository).__name__,
+            task_id=int(task.id), version=int(task.version),
+            next_run_at=(task.next_run_at.isoformat() if task.next_run_at else "none"),
+            elapsed_s=round(time.perf_counter() - started, 2),
+        )
+        return task
