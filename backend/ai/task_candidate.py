@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,33 +13,146 @@ MAX_LABEL_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
 
 # Unit-keyed interval aliases -> seconds. `parse_schedule` requires the
-# canonical {"seconds": N} form; models commonly emit a human-natural unit
-# form (e.g. {"minutes": 3} for "هر سه دقیقه"). A single unambiguous unit
-# key with a finite positive value is converted deterministically below;
-# anything ambiguous or invalid stays rejected.
+# canonical {"seconds": N} form; models emit human-natural unit forms (e.g.
+# {"minutes": 3}, {"interval": 3, "unit": "minutes"}). Every accepted shape
+# below is a single unambiguous, bounded, deterministic representation of
+# "every N <unit>"; anything ambiguous or unknown falls through to
+# parse_schedule, which rejects it with the schedule structure attached.
 _INTERVAL_UNIT_SECONDS = {
     "minute": 60, "minutes": 60, "min": 60, "mins": 60,
     "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
     "day": 86400, "days": 86400,
     "week": 604800, "weeks": 604800,
 }
+# Unit STRING values accepted in (value, unit) pair shapes, incl. the Persian
+# unit words a Persian-request model may echo back.
+_UNIT_WORD_SECONDS = {
+    **_INTERVAL_UNIT_SECONDS,
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+    "دقیقه": 60, "ساعت": 3600, "روز": 86400, "هفته": 604800,
+}
+_VALUE_KEYS = frozenset({"interval", "value", "every", "amount", "count", "number", "n", "repeat"})
+_UNIT_VALUE_KEYS = frozenset({"unit", "units", "time_unit", "unit_name", "granularity"})
+_COMPOUND_KEY_RE = re.compile(
+    r"^(?:interval|every|each|repeat)_(minutes?|mins?|hours?|hrs?|days?|weeks?|seconds?|secs?)$"
+)
+# Persian/Arabic-Indic digits a model may emit inside numeric strings.
+_DIGIT_TRANSLATION = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
-def _canonicalize_interval_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
-    if "seconds" in schedule:
-        return schedule
+def _as_number(value: Any) -> float | None:
+    """Finite float from int/float or a plain numeric string (Persian digits
+    included); None for bools, non-numeric strings, and everything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().translate(_DIGIT_TRANSLATION))
+        except ValueError:
+            return None
+    return None
+
+
+def _schedule_structure(schedule: Any) -> str:
+    """Bounded, safe structural fingerprint for rejection diagnostics.
+
+    Keys (sorted, truncated), value types, and at most one numeric preview —
+    never message content, destinations, or the raw provider response.
+    """
+    if not isinstance(schedule, dict):
+        return f"type={type(schedule).__name__}"
+    keys = sorted(str(k)[:24] for k in schedule)[:6]
+    types = ",".join(type(schedule[k]).__name__ for k in sorted(schedule, key=str)[:6])
+    seconds = schedule.get("seconds")
+    seconds_desc = type(seconds).__name__
+    number = _as_number(seconds)
+    if number is not None and math.isfinite(number):
+        seconds_desc += f"={number:g}"
+    return (
+        f"keys={','.join(keys) or '-'}|types={types or '-'}"
+        f"|has_seconds={str('seconds' in schedule).lower()}|seconds={seconds_desc}"
+        f"|unit_key={str(any(k in _INTERVAL_UNIT_SECONDS for k in schedule)).lower()}"
+        f"|nested={str(any(isinstance(v, dict) for v in schedule.values())).lower()}"
+    )
+
+
+def _convert_value_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"interval": 3, "unit": "minutes"} -> {"seconds": 180}.
+
+    Accepts exactly one numeric value key and one string unit key from the
+    bounded vocabularies; a stray timezone key is dropped (interval schedules
+    carry no timezone). Any other extra key, unknown unit word, or invalid
+    number leaves the shape unmatched (the schedule is then rejected
+    downstream with its structure attached).
+    """
+    value_keys = [k for k in schedule if k in _VALUE_KEYS and _as_number(schedule[k]) is not None]
+    unit_keys = [k for k in schedule if k in _UNIT_VALUE_KEYS and isinstance(schedule[k], str)]
+    if len(value_keys) != 1 or len(unit_keys) != 1:
+        return None
+    unit = schedule[unit_keys[0]].strip().lower()
+    if unit not in _UNIT_WORD_SECONDS:
+        return None
+    extras = set(schedule) - {value_keys[0], unit_keys[0]}
+    if extras - {"timezone"}:
+        return None
+    number = _as_number(schedule[value_keys[0]])
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return {"seconds": number * _UNIT_WORD_SECONDS[unit]}
+
+
+def _convert_compound_key_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"interval_minutes": 3} -> {"seconds": 180}."""
+    for key in schedule:
+        match = _COMPOUND_KEY_RE.match(str(key).strip().lower())
+        if not match:
+            continue
+        if set(schedule) - {key} - {"timezone"}:
+            return None
+        number = _as_number(schedule[key])
+        if number is None or not math.isfinite(number) or number <= 0:
+            return None
+        unit = match.group(1)
+        return {"seconds": number * _INTERVAL_UNIT_SECONDS[unit]}
+    return None
+
+
+def _convert_flat_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"minutes": 3} -> {"seconds": 180}; exactly one unit key allowed."""
     units = [key for key in schedule if key in _INTERVAL_UNIT_SECONDS]
-    if not units:
+    if len(units) != 1:
+        return None
+    extras = set(schedule) - set(units)
+    if extras - {"timezone"}:
+        return None
+    number = _as_number(schedule[units[0]])
+    if number is None or not math.isfinite(number) or number <= 0:
+        return None
+    return {"seconds": number * _INTERVAL_UNIT_SECONDS[units[0]]}
+
+
+def _canonicalize_interval_schedule(schedule: Any) -> Any:
+    """Return the canonical {"seconds": N>0} form for a recognized shape;
+    otherwise return the schedule unchanged so parse_schedule rejects it and
+    the rejection carries the schedule structure."""
+    if not isinstance(schedule, dict):
         return schedule
-    if len(units) > 1:
-        raise TaskCandidateError("interval schedule is ambiguous: multiple time units")
-    value = schedule[units[0]]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TaskCandidateError("interval schedule unit value must be a number")
-    value = float(value)
-    if not math.isfinite(value) or value <= 0:
-        raise TaskCandidateError("interval schedule must be positive")
-    return {"seconds": value * _INTERVAL_UNIT_SECONDS[units[0]]}
+    if "seconds" in schedule:
+        number = _as_number(schedule["seconds"])
+        if number is not None and math.isfinite(number) and number > 0:
+            return {"seconds": number}
+        return schedule
+    for converter in (
+        _convert_value_unit_schedule,
+        _convert_compound_key_schedule,
+        _convert_flat_unit_schedule,
+    ):
+        converted = converter(schedule)
+        if converted is not None:
+            return converted
+    return schedule
 
 # ── Canonical task-execution actions ──
 #
@@ -135,7 +249,12 @@ class TaskCandidate:
         try:
             parsed = parse_schedule(value["schedule_type"], schedule)
         except (ScheduleError, TypeError, ValueError) as exc:
-            raise TaskCandidateError(str(exc)) from exc
+            # The schedule structure rides on the rejection so one production
+            # occurrence identifies the exact provider shape (keys/types
+            # only — never message content or the raw response).
+            raise TaskCandidateError(
+                f"{exc} [{_schedule_structure(schedule)}]"
+            ) from exc
         if value["schedule_type"] != "interval" and schedule.get("timezone") != timezone:
             raise TaskCandidateError("schedule timezone must match task timezone")
         # Validate optional chat_name in notification_destination.

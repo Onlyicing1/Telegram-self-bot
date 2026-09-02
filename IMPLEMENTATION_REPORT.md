@@ -14,6 +14,74 @@
 
 ## Current Implementation State
 
+**IMPLEMENTED (create_task schedule-shape observability + bounded
+normalization)** — THIRD pass on the same request ("یه تسک بساز هر سه دقیقه
+بگو پری کوچولو هستم"). The prior schedule-contract fix (below) assumed the
+provider emitted `{"minutes": 3}`; the latest production evidence does NOT
+establish that — the trace never exposed the schedule keys. This pass adds
+the missing observation and normalizes the semantic class the trace can
+now identify.
+
+### Source-level deduction (authoritative, from current main `8274b4a`)
+
+`malformed schedule payload` is raised ONLY by `parse_schedule`
+(`backend/ai/scheduling.py:94`). The previous canonicalizer's own guards
+raise DIFFERENT messages ("interval schedule is ambiguous: multiple time
+units", "interval schedule unit value must be a number", "interval schedule
+must be positive"). Therefore the production schedule **provably passed
+through the `{'minutes': 3}`-style canonicalizer unchanged**: it has no
+`seconds` (or an unconvertible one) AND no key in the minute/hour/day/week
+table. The previously assumed `{"minutes": 3}` would now SUCCEED — the real
+shape is something else (e.g. `{"interval": 3, "unit": "minutes"}`),
+previously invisible because the rejection never logged schedule keys.
+
+### What this pass changes
+
+1. **Safe structural diagnostics** (`backend/ai/task_candidate.py`): when a
+   schedule is rejected, the rejection now carries a bounded structural
+   fingerprint — `keys=<sorted>`, `types=<per-key>`, `has_seconds`,
+   `seconds=<type and one numeric preview>`, `unit_key`, `nested`. Verified
+   live: `reason=malformed schedule payload [keys=fortnights|types=int|
+   has_seconds=false|seconds=NoneType|unit_key=false|nested=false]`. The
+   next production occurrence identifies the exact provider shape in ONE
+   line (keys/types only — never message content, destinations, or the raw
+   response). The interpreter's rejection trace now carries the full
+   detail (260-char bound).
+2. **Deterministic normalization of the `(value, unit)` semantic class**:
+   `{"interval": 3, "unit": "minutes"}` → `{"seconds": 180}` — the first
+   example shape in the evidence brief. Accepted ONLY as: exactly one
+   numeric value key (`interval/value/every/amount/count/number/n/repeat`;
+   plain numeric strings and Persian digits ۰-۹ accepted, bools rejected)
+   plus one string unit key (`unit/units/time_unit/unit_name/granularity`)
+   whose value is a bounded unit word (incl. Persian دقیقه/ساعت/روز/هفته,
+   case-insensitive); a stray `timezone` key is dropped (interval schedules
+   carry none). Compound keys (`interval_minutes`, `every_hours`) and
+   string-numeric `seconds` normalize the same way. Ambiguous (multiple
+   value keys, unknown unit word, extra keys), zero, negative, non-numeric,
+   NaN/inf, and nested shapes remain REJECTED — `parse_schedule` stays
+   authoritative and its rejection now carries the schedule structure.
+3. **No regression to the action contract** — the canonical
+   `send_message{text}` action path is untouched and covered by tests.
+
+### Honest evidence status (required)
+
+- **Deterministic replay: SUCCESS** — the exact production request through
+  the REAL `TaskInterpreter` + `CreateTaskTool` + repository with a provider
+  emitting `{"interval": 3, "unit": "minutes"}` persists:
+  `success=True`, `schedule {'seconds': 180.0}`, action
+  `{'name': 'send_message', 'arguments': {'text': 'پری کوچولو هستم'}}`,
+  owner-scoped, `status=active`, computed `next_run_at`.
+- **The exact provider-emitted schedule keys from the live Render failure
+  remain UNOBSERVED** (the deployed build predates the structure-carrying
+  rejection). If the live shape is one of the newly normalized classes,
+  this fix resolves it; if not, the FIRST new occurrence logs the exact
+  keys/types, and only then is further normalization justified. No
+  further claim is made.
+- **Render production verification: NOT PERFORMED** (no deployment was
+  triggered from this workspace).
+
+### Delivered earlier: create_task schedule-contract fix (commit `8274b4a`)
+
 **IMPLEMENTED (create_task schedule-contract fix)** — the SECOND production
 failure on the same request ("یه تسک بساز هر سه دقیقه بگو پری کوچولو هستم"):
 
@@ -388,7 +456,27 @@ logs without reading the database.
 
 ## Tests Actually Executed
 
-### This fix (schedule contract) — 19 new tests in `tests/test_task_candidate_contract.py`
+### This fix (schedule-shape observability + bounded normalization) — 30 new tests
+
+- Pair-shape canonicalization matrix (11 cases incl. `{'interval': '۳',
+  'unit': 'minutes'}`, `{'interval': 3, 'unit': 'دقیقه'}`, stray-timezone
+  tolerance) and rejection matrix (11 cases: unknown unit word, missing
+  value/unit, extra keys, zero/negative/bool/list/non-numeric, multiple
+  value keys).
+- Compound-key (`interval_minutes`, `every_hours`) and string-numeric
+  `seconds` cases.
+- Structure-carrying rejection assertions (keys/types/has_seconds/unit_key/
+  nested) for unrecognized shapes — the production diagnostic.
+- `test_once_daily_weekly_validation_remains_intact` — daily/weekly bounds,
+  schedule-timezone matching, and interval-with-stray-tz behavior.
+- Production-shaped replay through the REAL interpreter + `CreateTaskTool`
+  + repository with `{'interval': 3, 'unit': 'minutes'}`: persists
+  `{'seconds': 180}` with the exact Persian action text.
+- Live-verified diagnostic line: `candidate_rejected reason=malformed
+  schedule payload [keys=fortnights|types=int|has_seconds=false|
+  seconds=NoneType|unit_key=false|nested=false]`.
+
+### Earlier: schedule contract (`8274b4a`) — 19 tests in `tests/test_task_candidate_contract.py`
 
 - `test_provider_schema_documents_the_schedule_shapes` — the shipped schema
   documents `seconds` and `weekday 0=Monday`.
@@ -485,10 +573,10 @@ Results (actually run):
 
 | Suite | Result |
 |---|---|
-| `tests/test_task_candidate_contract.py` (30 tests: 19 new schedule-contract + 11 earlier) | **30 passed** |
-| Task suites (stage11/12, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom, management) | **139 passed** |
+| `tests/test_task_candidate_contract.py` (60 tests: 30 new + 19 + 11 earlier) | **60 passed** |
+| Task suites (stage11/12, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom, management, candidate contract) | **169 passed** |
 | Task suites (stage11 candidate, stage12 interpreter, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom milestone/ui, management) | **109 passed** |
-| Full suite `python3 -m pytest tests/ -q` | **1284 passed, 23 skipped, 1 warning** |
+| Full suite `python3 -m pytest tests/ -q` | **1314 passed, 23 skipped, 1 warning** |
 | `python3 -m py_compile` on all three modified backend files | **passed** |
 | `git diff --check` | **passed** |
 
@@ -508,9 +596,12 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 | File | Why |
 |---|---|
-| `backend/ai/task_interpreter.py` | THIS FIX: per-type schedule shapes documented in the `schedule` property + SCHEDULE CONTRACT prompt instruction ("هر سه دقیقه" → `{'seconds': 180}`) |
-| `backend/ai/task_candidate.py` | THIS FIX: deterministic unit-key interval canonicalization (`{'minutes': 3}` → `{'seconds': 180}`) before `parse_schedule`; ambiguous/invalid unit values still rejected |
-| `tests/test_task_candidate_contract.py` | THIS FIX: 19 new tests (canonicalization matrix, rejection matrix, schema contract, unknown-tool chain) |
+| `backend/ai/task_candidate.py` | THIS FIX: structure-carrying schedule rejections (`_schedule_structure`) + deterministic `(value, unit)`, compound-key, string-numeric, and flat-unit interval normalization with strict ambiguity/validity guards |
+| `backend/ai/task_interpreter.py` | THIS FIX: `candidate_rejected` detail bound raised to 260 chars so the schedule structure reaches Render |
+| `tests/test_task_candidate_contract.py` | THIS FIX: 30 new tests — pair/compound/string-numeric canonicalization matrix, Persian digits/units, ambiguity/validity rejection matrix, structure-carrying rejection assertions, production-shaped replay (real interpreter+tool+repository) |
+| `backend/ai/task_interpreter.py` | (earlier, `8274b4a`) per-type schedule shapes documented in the `schedule` property + SCHEDULE CONTRACT prompt instruction |
+| `backend/ai/task_candidate.py` | (earlier, `8274b4a`) deterministic unit-key interval canonicalization (`{'minutes': 3}` → `{'seconds': 180}`) before `parse_schedule` |
+| `tests/test_task_candidate_contract.py` | (earlier, `8274b4a`) 19 tests (canonicalization matrix, rejection matrix, schema contract, unknown-tool chain) |
 | `backend/ai/task_interpreter.py` | (earlier, `50a16da`) CANDIDATE_SCHEMA action-object contract `{name, arguments}`; ACTION OBJECT CONTRACT prompt; structural traces; honest JSONDecodeError |
 | `backend/ai/task_candidate.py` | (earlier, `50a16da`) `from_untrusted` normalizes the field-name aliases models actually emit (`tool`→`name`, `parameters`/`args`→`arguments`, singular `action`→`actions`) BEFORE the strict checks; all safety validation unchanged after normalization |
 | `backend/ai/tools/task.py` | (earlier, `50a16da`) `create_task_normalized` trace (schedule type, action names, destination scope) and `create_task_persist_failure` diagnostic on repository failure |

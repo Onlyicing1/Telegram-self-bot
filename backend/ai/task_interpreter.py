@@ -239,7 +239,7 @@ class TaskInterpreter:
                     "AI_TASK_TRACE request_id=%s stage=candidate_rejected reason=%s "
                     "candidate_type=object action_count=%s "
                     "action_field_names=%s schedule_type=%s",
-                    request_id or "-", str(exc)[:120],
+                    request_id or "-", str(exc)[:260],
                     len(actions) if isinstance(actions, list) else "-",
                     (",".join(sorted(actions[0])) if isinstance(actions, list) and actions
                      and isinstance(actions[0], dict) else "-"),

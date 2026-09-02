@@ -35,11 +35,14 @@ from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.scheduling import parse_schedule
-from datetime import timedelta
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
 from backend.ai.task_interpreter import CANDIDATE_SCHEMA, TaskInterpreter, TaskInterpretationError
 
 REF = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+
+# The exact production request and its intended semantics.
+PRODUCTION_REQUEST = "یه تسک بساز هر سه دقیقه بگو پری کوچولو هستم"
+PRODUCTION_ACTION_TEXT = "پری کوچولو هستم"
 
 
 # ── Candidate-layer contract ──
@@ -168,6 +171,100 @@ def test_unit_keyed_interval_schedules_are_canonicalized(schedule, expected_seco
 def test_invalid_unit_keyed_interval_schedules_are_still_rejected(schedule):
     with pytest.raises(TaskCandidateError):
         parse_candidate_output(_candidate_with_schedule(schedule))
+
+
+# ── (value, unit) pair shapes: {"interval": 3, "unit": "minutes"} ──
+
+
+@pytest.mark.parametrize("schedule,expected_seconds", [
+    ({"interval": 3, "unit": "minutes"}, 180.0),
+    ({"every": 5, "unit": "minutes"}, 300.0),
+    ({"interval": 1, "unit": "minute"}, 60.0),
+    ({"interval": 2, "unit": "hours"}, 7200.0),
+    ({"interval": "10", "unit": "minutes"}, 600.0),
+    ({"interval": "۳", "unit": "minutes"}, 180.0),
+    ({"interval": 3, "unit": "دقیقه"}, 180.0),
+    ({"interval": 3, "unit": "Minutes"}, 180.0),
+    ({"interval": 1, "unit": "seconds"}, 1.0),
+    ({"interval": 3, "unit": "minutes", "timezone": "UTC"}, 180.0),
+    ({"minutes": 3, "timezone": "UTC"}, 180.0),
+    ({"interval_minutes": 3}, 180.0),
+    ({"every_hours": 2}, 7200.0),
+    ({"seconds": "180"}, 180.0),
+])
+def test_semantically_equivalent_interval_shapes_are_canonicalized(schedule, expected_seconds):
+    candidate = parse_candidate_output(_candidate_with_schedule(schedule))
+    assert candidate.schedule == {"seconds": expected_seconds}
+
+
+@pytest.mark.parametrize("schedule", [
+    {"interval": 3, "unit": "fortnights"},
+    {"interval": 3, "unit": 5},
+    {"interval": 3},
+    {"unit": "minutes"},
+    {"interval": 3, "unit": "minutes", "label": "x"},
+    {"interval": 0, "unit": "minutes"},
+    {"interval": -3, "unit": "minutes"},
+    {"interval": "سه", "unit": "minutes"},
+    {"interval": True, "unit": "minutes"},
+    {"interval": [3], "unit": "minutes"},
+    {"interval": 3, "interval2": 5, "unit": "minutes"},
+])
+def test_ambiguous_or_invalid_pair_schedules_are_still_rejected(schedule):
+    with pytest.raises(TaskCandidateError):
+        parse_candidate_output(_candidate_with_schedule(schedule))
+
+
+def test_unrecognized_schedule_shape_rejection_carries_structure():
+    """The production diagnostic: an unrecognized interval shape is rejected
+    by parse_schedule with the schedule structure embedded, so one Render
+    occurrence identifies the exact provider shape (keys/types only)."""
+    with pytest.raises(TaskCandidateError) as excinfo:
+        parse_candidate_output(_candidate_with_schedule({"fortnights": 2}))
+    message = str(excinfo.value)
+    assert "malformed schedule payload" in message
+    assert "keys=fortnights" in message
+    assert "has_seconds=false" in message
+    assert "unit_key=false" in message
+    assert "nested=false" in message
+
+
+def test_rejection_structure_reports_types_and_seconds():
+    with pytest.raises(TaskCandidateError) as excinfo:
+        parse_candidate_output(_candidate_with_schedule(
+            {"seconds": "abc", "when": {"x": 1}}
+        ))
+    message = str(excinfo.value)
+    assert "keys=seconds,when" in message
+    assert "types=str,dict" in message
+    assert "has_seconds=true" in message
+    assert "nested=true" in message
+
+
+def test_once_daily_weekly_validation_remains_intact():
+    base = {
+        "label": "check", "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": "hi"}}],
+        "notification_destination": {},
+    }
+    daily = parse_candidate_output(base | {
+        "schedule_type": "daily", "schedule": {"hour": 9, "timezone": "UTC"},
+    })
+    assert daily.schedule == {"hour": 9, "timezone": "UTC"}
+    with pytest.raises(TaskCandidateError):
+        parse_candidate_output(base | {"schedule_type": "daily", "schedule": {"hour": 25, "timezone": "UTC"}})
+    with pytest.raises(TaskCandidateError):
+        parse_candidate_output(base | {
+            "schedule_type": "weekly",
+            "schedule": {"weekday": 9, "hour": 9, "timezone": "UTC"},
+        })
+    # Interval schedules carry no timezone (original contract): a stray tz
+    # key is dropped by canonicalization, not silently turned into a
+    # timezone-dependent schedule.
+    interval_with_tz = parse_candidate_output(base | {
+        "schedule_type": "interval", "schedule": {"seconds": 180, "timezone": "UTC"},
+    })
+    assert interval_with_tz.schedule == {"seconds": 180.0}
 
 
 # ── Interpreter end-to-end (scripted provider, real parser) ──
@@ -392,3 +489,68 @@ async def test_registered_non_send_tool_survives_but_unknown_tool_fails_executio
     occurrence = await repo.get_occurrence(5, task.id, f"{task.id}:once")
     assert occurrence.status == "failed"
     assert occurrence.error_metadata.get("error_class") == "unregistered_action"
+
+
+# ── Production-shaped replay: REAL interpreter → tool → repository ──
+
+
+@pytest.mark.asyncio
+async def test_production_request_persists_from_value_unit_provider_shape():
+    """The exact production request through the REAL TaskInterpreter with a
+    provider emitting the (value, unit) shape {"interval": 3,
+    "unit": "minutes"} — deterministic replay of the observed failure class,
+    no network."""
+    from backend.ai.tools.task import CreateTaskTool
+
+    candidate_json = json.dumps({
+        "label": "پری کوچولو",
+        "schedule_type": "interval",
+        "schedule": {"interval": 3, "unit": "minutes"},
+        "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": PRODUCTION_ACTION_TEXT}}],
+        "notification_destination": {},
+    }, ensure_ascii=False)
+
+    pm = ProviderManager()
+    provider = _ScriptedProvider("fake", candidate_json)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    manager = dbm.RepositoryManager(supabase_available=False)
+    repo = manager.task
+    with patch.object(dbm, "get_repository_manager", return_value=manager):
+        tool = CreateTaskTool(_tool_context(pm))
+        result = await tool.execute(_tool_context(pm), {"request": PRODUCTION_REQUEST})
+
+    assert result.success is True, result.message
+    task = await repo.get_task(777, result.data["task_id"])
+    assert task.owner_id == 777
+    assert task.schedule_type == "interval"
+    assert task.schedule == {"seconds": 180}
+    assert task.actions == [{"name": "send_message", "arguments": {"text": PRODUCTION_ACTION_TEXT}}]
+    assert task.status == "active"
+    assert task.next_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_interpretation_rejection_records_schedule_structure():
+    """An unrecognized schedule shape surfaces its structure in the
+    rejection so the next production occurrence identifies the exact shape."""
+    candidate_json = json.dumps({
+        "label": "x", "schedule_type": "interval",
+        "schedule": {"fortnights": 2}, "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": "hi"}}],
+        "notification_destination": {},
+    })
+    pm = ProviderManager()
+    provider = _ScriptedProvider("fake", candidate_json)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+
+    with pytest.raises(TaskInterpretationError) as excinfo:
+        await TaskInterpreter(pm).interpret(PRODUCTION_REQUEST, timezone="UTC")
+    message = str(excinfo.value.__cause__)
+    assert "malformed schedule payload" in message
+    assert "keys=fortnights" in message
