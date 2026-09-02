@@ -9,7 +9,9 @@ Focused tests for the runtime fix pass:
      never returns fake success.
   4. Malformed tool arguments become structured failures — never executed
      with fake {}.
-  5. MAX_TOOL_ROUNDS exhaustion is detected and never silently dropped.
+  5. MAX_TOOL_ROUNDS exhaustion: pending-but-unexecuted calls are executed
+     once at the limit; calls already executed are never re-run; the limit
+     still bounds the loop.
   6. Token accounting accumulates initial + every continuation exactly once.
   7. Gemini continuation (functionCall -> functionResponse) works through
      the dispatcher.
@@ -361,13 +363,18 @@ async def test_openai_compat_marks_malformed_arguments():
     assert "malformed" in result.tool_calls[0]["arguments_error"]
 
 
-# ── 6. MAX_TOOL_ROUNDS exhaustion ──
+# ── 6. MAX_TOOL_ROUNDS exhaustion: salvage-at-limit, never discard, never re-run ──
 
 
 @pytest.mark.asyncio
-async def test_max_tool_rounds_exhaustion_is_detected():
-    tool_call = {"id": "c1", "name": "probe", "arguments": {}}
+async def test_pending_calls_are_executed_at_round_limit_not_discarded():
+    """A fresh continuation response's tool calls that were never dispatched
+    (the round limit stopped the loop) must be executed once through the
+    same ToolExecutor — exactly the production create_task-pending bug."""
+    tool_call = {"id": "c1", "name": "probe", "arguments": {"k": "v"}}
     provider = ScriptedProvider([
+        # Rounds 1..3 each execute, then ask for another round; after the
+        # 3rd continuation the loop exits with 1 pending call.
         ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(100, 5)),
         ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(110, 5)),
         ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(120, 5)),
@@ -387,12 +394,78 @@ async def test_max_tool_rounds_exhaustion_is_detected():
         AIRequest(session_id="w2", user_message="loop tools", owner_id=777, chat_id=-1, message_id=1)
     )
 
-    assert result.metadata.get("tool_rounds_exhausted") is True
-    assert len(result.metadata.get("pending_tool_calls", [])) == 1
-    assert any("tool_round_limit_reached" in w for w in result.warnings)
-    assert result.metadata.get("finish_state") == "tool_rounds_exhausted"
-    # The safety limit still bounds the loop.
+    # The safety limit still bounds provider rounds at 3.
+    assert result.metadata.get("tool_rounds") == 3
+    # The 4th (pending) call was NOT discarded — it executed exactly once.
+    assert len(tool.executions) == 4
+    assert result.metadata.get("pending_calls_executed_at_limit") is True
+    assert "pending_tool_execution_at_limit" in result.metadata.get("stages", [])
+    assert any("executed without an additional round" in w for w in result.warnings)
+    # Tool result is real, not dropped.
+    assert result.metadata.get("tool_results")[-1]["success"] is True
+    # No tool_rounds_exhausted flag: nothing was skipped.
+    assert result.metadata.get("tool_rounds_exhausted") is not True
+
+
+@pytest.mark.asyncio
+async def test_final_round_calls_are_never_reexecuted_at_limit():
+    """When the loop ends on a continuation response after the final round's
+    calls already executed, those calls must not run again."""
+    tool_call = {"id": "c1", "name": "probe", "arguments": {}}
+    provider = ScriptedProvider([
+        # Round 3 executes, its continuation returns TEXT (no calls) — the
+        # loop exits normally, nothing pending.
+        ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(100, 5)),
+        ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(110, 5)),
+        ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(120, 5)),
+        ProviderResponse(text="all done", provider_name="scripted", success=True, usage=_usage(130, 5)),
+    ])
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("scripted")
+
+    real_ctx = ToolContext(telegram=FakeTelegram(), owner_id=777, tz_str="UTC", client="client-ref")
+    tool = ProbeTool(real_ctx)
+    engine = _make_engine(pm, real_ctx, tool)
+
+    from backend.ai.session.request import AIRequest
+
+    result = await engine.execute(
+        AIRequest(session_id="w2b", user_message="loop tools", owner_id=777, chat_id=-1, message_id=1)
+    )
+
+    assert result.metadata.get("tool_rounds") == 3
+    # Exactly 3 executions — the continuation's text is returned, nothing re-runs.
     assert len(tool.executions) == 3
+    assert result.metadata.get("finish_state") == "text"
+    assert result.response == "all done"
+
+
+@pytest.mark.asyncio
+async def test_round_limit_still_bounds_excessive_sequences():
+    """The limit must still prevent uncontrolled multi-round execution."""
+    tool_call = {"id": "c1", "name": "probe", "arguments": {}}
+
+    def always_more_calls(messages):  # noqa: ANN001, ANN202
+        return ProviderResponse(text="", provider_name="scripted", success=True, tool_calls=[tool_call], usage=_usage(50, 5))
+
+    provider = ScriptedProvider([always_more_calls] * 10)
+    pm = ProviderManager()
+    pm.register_provider(provider)
+    pm.switch_provider("scripted")
+
+    real_ctx = ToolContext(telegram=FakeTelegram(), owner_id=777, tz_str="UTC", client="client-ref")
+    tool = ProbeTool(real_ctx)
+    engine = _make_engine(pm, real_ctx, tool)
+
+    from backend.ai.session.request import AIRequest
+
+    result = await engine.execute(
+        AIRequest(session_id="w2c", user_message="loop tools", owner_id=777, chat_id=-1, message_id=1)
+    )
+    # 3 in-loop rounds + 1 salvage = 4 total, never unbounded.
+    assert len(tool.executions) <= 4
+    assert result.metadata.get("tool_rounds") == 3
 
 
 # ── 7. Token accounting across continuation rounds ──

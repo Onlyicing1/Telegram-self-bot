@@ -618,6 +618,11 @@ class Dispatcher:
 
         tool_rounds_executed = 0
         rounds_exhausted = False
+        # Distinguishes "the current round's calls were executed" from "a
+        # continuation just produced fresh calls that have not run yet" so
+        # the exhaustion handler never re-executes and never discards.
+        last_round_executed = False
+        round_execution_failed = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
             if not response.success or not response.tool_calls:
@@ -686,6 +691,7 @@ class Dispatcher:
                 metadata["tool_rounds"] = round_num + 1
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
                 tool_rounds_executed = round_num + 1
+                last_round_executed = True
 
                 # The structured-action path reports the real tool result
                 # directly — it never needs a continuation provider round.
@@ -693,6 +699,7 @@ class Dispatcher:
                     response = replace(response, tool_calls=[], text="")
                     break
             except Exception as exc:  # noqa: BLE001
+                round_execution_failed = True
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
                 break
 
@@ -746,20 +753,118 @@ class Dispatcher:
 
             response = cont_response
             messages = continuation_messages
+            last_round_executed = False
 
         # ── Tool-round exhaustion: pending tool calls are NEVER silently dropped ──
+        # The round limit bounds PROVIDER continuation rounds, not the current
+        # round's executable calls. When the loop terminates on a fresh
+        # continuation response whose tool calls were never dispatched, those
+        # calls are executed ONCE here through the same ToolExecutor — no
+        # additional provider round is issued, so the loop still cannot grow
+        # without bound. Calls that already executed in the final round are
+        # never re-executed, and calls are never re-run after a failed round.
         if response.tool_calls:
-            rounds_exhausted = True
-            metadata["tool_rounds_exhausted"] = True
-            metadata["tool_rounds_executed"] = tool_rounds_executed
-            metadata["pending_tool_calls"] = [
-                {"name": tc.get("name", ""), "id": tc.get("id", "")}
-                for tc in response.tool_calls
-            ]
-            warnings.append(
-                f"tool_round_limit_reached: {len(response.tool_calls)} pending tool call(s) "
-                f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+            pending_names = [tc.get("name", "") for tc in response.tool_calls]
+            logger.info(
+                "AI_TOOL_ROUND_LIMIT id=%s limit=%d rounds_executed=%d pending=%d "
+                "tools=%s last_round_executed=%s",
+                rid or "-", MAX_TOOL_ROUNDS, tool_rounds_executed,
+                len(response.tool_calls), pending_names, last_round_executed,
             )
+            salvage_calls = list(response.tool_calls)
+            if last_round_executed:
+                # The final round's calls already ran; the loop ended on the
+                # continuation outcome. Never re-execute them.
+                response = replace(response, tool_calls=[])
+                warnings.append(
+                    "tool_round_limit_reached: final round tool call(s) already "
+                    f"executed; no additional round started (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                )
+            elif round_execution_failed or self._tool_executor is None:
+                # The calls just failed mid-execution, or no executor exists to
+                # run them: either way they must NOT be salvaged (re-running a
+                # failed/destructive call is never safe). They stay recorded
+                # as pending for diagnostics only.
+                rounds_exhausted = True
+                metadata["tool_rounds_exhausted"] = True
+                metadata["tool_rounds_executed"] = tool_rounds_executed
+                metadata["pending_tool_calls"] = [
+                    {"name": tc.get("name", ""), "id": tc.get("id", "")}
+                    for tc in salvage_calls
+                ]
+                warnings.append(
+                    f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                    f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                )
+            else:
+                try:
+                    _stage("TOOL_EXECUTION")
+                    logger.info(
+                        "AI_TOOL_PENDING_EXEC_START id=%s tools=%s rounds_executed=%d limit=%d",
+                        rid or "-", pending_names, tool_rounds_executed, MAX_TOOL_ROUNDS,
+                    )
+                    per_request_ctx = self._build_tool_context(request)
+                    salvage_results = await self._tool_executor.execute_calls(
+                        salvage_calls,
+                        owner_id=request.owner_id,
+                        session_id=request.session_id,
+                        status_callback=status_callback,
+                        context_override=per_request_ctx,
+                    )
+                    for er in salvage_results:
+                        all_tool_results.append(er.as_dict())
+                        marker = "✅" if er.success else "❌"
+                        detail = er.message or er.error or "no message"
+                        self._conversation.add_tool_result(
+                            owner_id=request.owner_id,
+                            tool_name=er.tool_name,
+                            result=f"{marker} {detail}",
+                        )
+                        logger.info(
+                            "AI_TOOL_PENDING_RESULT id=%s tool=%s success=%s",
+                            rid or "-", er.tool_name, er.success,
+                        )
+                    metadata["tool_results"] = all_tool_results
+                    metadata["stages"].append("pending_tool_execution_at_limit")
+                    metadata["pending_calls_executed_at_limit"] = True
+                    # Keep the continuation's own text if the model produced
+                    # one; the real-result fallback below fills the summary
+                    # only when the response has no text at all.
+                    response = replace(response, tool_calls=[])
+                    warnings.append(
+                        f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                        f"executed without an additional round (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                    )
+                    logger.info(
+                        "AI_TOOL_PENDING_EXEC_END id=%s executed=%d rounds_executed=%d limit=%d",
+                        rid or "-", len(salvage_results), tool_rounds_executed, MAX_TOOL_ROUNDS,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    rounds_exhausted = True
+                    metadata["tool_rounds_exhausted"] = True
+                    metadata["tool_rounds_executed"] = tool_rounds_executed
+                    metadata["pending_tool_calls"] = [
+                        {"name": tc.get("name", ""), "id": tc.get("id", "")}
+                        for tc in salvage_calls
+                    ]
+                    warnings.append(f"pending_tool_execution_at_limit: {exc}")
+                    warnings.append(
+                        f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                        f"after {tool_rounds_executed} round(s) (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                    )
+                    logger.warning(
+                        "AI_TOOL_PENDING_EXEC_FAILED id=%s error=%s", rid or "-", exc
+                    )
+
+        logger.info(
+            "AI_TOOL_LOOP_END id=%s rounds_executed=%d limit=%d disposition=%s",
+            rid or "-", tool_rounds_executed, MAX_TOOL_ROUNDS,
+            (
+                "executed_at_limit"
+                if metadata.get("pending_calls_executed_at_limit")
+                else ("skipped_round_limit" if rounds_exhausted else "completed")
+            ),
+        )
 
         if accumulated_finish_reasons:
             metadata["continuation_finish_reasons"] = accumulated_finish_reasons

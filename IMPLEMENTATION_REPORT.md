@@ -14,11 +14,45 @@
 
 ## Current Implementation State
 
-**IMPLEMENTED** - The COMPLETE `create_task` lifecycle is now traceable from
-Telegram input to the final persistence/exit result through ONE
-request-correlated trace family, `[CREATE_TASK_TRACE]`, with every line
-logging the same `request_id` (injected by the Dispatcher tool context) plus
-owner/chat/message ids where available.
+**IMPLEMENTED (tool-round-limit fix)** — "⚠️ Tool round limit reached — N
+pending tool call(s) were not executed" can no longer silently discard valid
+tool calls. `MAX_TOOL_ROUNDS` (3, `backend/ai/engine/dispatcher.py`) still
+bounds PROVIDER continuation rounds, but when the loop terminates on a fresh
+continuation response whose tool calls were never dispatched, those calls are
+now executed ONCE through the same `ToolExecutor` — no additional provider
+round is issued, so the loop still cannot grow without bound.
+
+Exact control flow after the fix (all in `Dispatcher.execute`):
+
+| Situation | Disposition |
+|---|---|
+| Loop ends with pending calls, never executed (`last_round_executed=False`) | Executed once at the limit (`pending_tool_execution_at_limit`), result text preserved, warning `executed without an additional round` |
+| Loop ends after the final round's calls already executed | Never re-executed; warning `final round tool call(s) already executed` |
+| Round execution raised (`round_execution_failed=True`) | NOT salvaged (re-running a failed/destructive call is never safe); `tool_rounds_exhausted` metadata preserved |
+| No ToolExecutor attached | NOT salvageable; `tool_rounds_exhausted` metadata preserved |
+
+Structured Render logging now covers the full disposition: `AI_TOOL_PARSE`,
+`AI_TOOL_ARGS` (argument keys only, values never logged),
+`AI_TOOL_EXECUTION_START/END`, `AI_EXECUTION_RESULT`/`AI_EXECUTION_ERROR`,
+`AI_TOOL_ROUND_LIMIT` (limit, rounds executed, pending count, tool names,
+`last_round_executed`), `AI_TOOL_PENDING_EXEC_START/END`,
+`AI_TOOL_PENDING_RESULT`, `AI_TOOL_PENDING_EXEC_FAILED`, and
+`AI_TOOL_LOOP_END` with disposition `completed` / `executed_at_limit` /
+`skipped_round_limit`. No secrets, prompts, or argument values are logged.
+
+The create_task fast path (`_try_local_fast_path`) bypasses the tool-round
+loop entirely, so the production "1 pending tool call" symptom came from the
+provider tool loop — e.g. a model that requested tool calls on every
+continuation. That request now still gets its final pending call executed
+instead of losing it.
+
+### Delivered earlier: create_task lifecycle tracing
+
+The COMPLETE `create_task` lifecycle is traceable from Telegram input to the
+final persistence/exit result through ONE request-correlated trace family,
+`[CREATE_TASK_TRACE]`, with every line logging the same `request_id`
+(injected by the Dispatcher tool context) plus owner/chat/message ids where
+available.
 
 A shared correlation helper (`backend/ai/task_trace.py`) binds the request id
 for the tool's task scope; nested layers (interpreter, ProviderManager,
@@ -214,7 +248,25 @@ logs without reading the database.
 
 ## Tests Actually Executed
 
-New file `tests/test_task_creation_diagnostics.py` (9 tests):
+### This fix (tool-round limit) — new/updated in `tests/test_11_runtime_wiring.py`
+
+- `test_pending_calls_are_executed_at_round_limit_not_discarded` — 4th
+  pending call after 3 rounds executes exactly once
+  (`pending_calls_executed_at_limit`, stage `pending_tool_execution_at_limit`,
+  warning `executed without an additional round`, real tool result kept,
+  no `tool_rounds_exhausted`).
+- `test_final_round_calls_are_never_reexecuted_at_limit` — after the 3rd
+  round executes, a text continuation ends the loop: exactly 3 executions,
+  `finish_state=text`, model text returned.
+- `test_round_limit_still_bounds_excessive_sequences` — a provider that
+  always demands another round is still capped: 3 in-loop rounds + 1 salvage
+  = 4 executions, never unbounded.
+- The prior exhaustion test was replaced by the three above (it asserted the
+  old discard-on-exhaustion semantics). All other 18 wiring tests unchanged
+  and passing (malformed arguments still never execute; ordinary tool
+  rounds unchanged).
+
+### Earlier: create_task tracing — `tests/test_task_creation_diagnostics.py` (9 tests)
 
 - Success path emits the full stage sequence
   (`received → interpret_start → interpret_result → persist_start →
@@ -242,8 +294,9 @@ Results (actually run):
 
 | Suite | Result |
 |---|---|
-| New `test_task_creation_diagnostics.py` + focused task suite (9 files: nl_creation, repository, scheduler, execution, management, send_execution, send_write_immediate, retry) | **80 passed** |
-| Full suite `python3 -m pytest tests/ -q --no-header` | **1213 passed, 23 skipped, 1 warning** |
+| `tests/test_11_runtime_wiring.py` (incl. 3 new round-limit tests) | **21 passed** |
+| Tool + task suites (test_10_tool_calls, test_11_runtime_wiring, nl_creation, repository, scheduler, execution, management, creation_diagnostics) | **94 passed** |
+| Full suite `python3 -m pytest tests/ -q --no-header` | **1254 passed, 23 skipped, 1 warning** |
 | `python3 -m compileall -q backend tests` | **passed** |
 | `git diff --check` | **passed** |
 
@@ -263,23 +316,24 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 | File | Why |
 |---|---|
-| `backend/ai/tools/task.py` | Staged `TASK_CREATE_TRACE` logging for every create_task stage and failure branch |
-| `backend/ai/task_interpreter.py` | `TASK_INTERPRET_TRACE` provider-result and rejection-category logging |
-| `backend/ai/task_creation.py` | `TASK_PERSIST_TRACE` validation/repository logging incl. `repo_type` visibility |
-| `tests/test_task_creation_diagnostics.py` (new) | 9 focused diagnostics regression tests |
+| `backend/ai/engine/dispatcher.py` | THIS FIX: execute pending-but-unexecuted tool calls once at the round limit; never re-execute executed calls; never salvage failed/executor-less rounds; full disposition logging (`AI_TOOL_ROUND_LIMIT`, `AI_TOOL_PENDING_EXEC_*`, `AI_TOOL_LOOP_END`) |
+| `tests/test_11_runtime_wiring.py` | 3 new round-limit tests; old discard-semantics exhaustion test replaced |
+| `backend/ai/tools/task.py` | (earlier) Staged `TASK_CREATE_TRACE` logging for every create_task stage and failure branch |
+| `backend/ai/task_interpreter.py` | (earlier) `TASK_INTERPRET_TRACE` provider-result and rejection-category logging |
+| `backend/ai/task_creation.py` | (earlier) `TASK_PERSIST_TRACE` validation/repository logging incl. `repo_type` visibility |
+| `tests/test_task_creation_diagnostics.py` | (earlier) 9 focused diagnostics regression tests |
 
 ## Intentionally Untouched Files
 
-- `tests/test_stage13.py` - pre-existing unrelated modification, preserved
-  exactly, unstaged and uncommitted.
-- `backend/ai/engine/dispatcher.py` - no change needed; it already injects
-  `request_id` into the tool context and already emits the surrounding
-  `AI_EXEC_TRACE` stages.
 - `backend/ai/database/task_repository.py` - no change needed; existing
   fallback warnings retained, `repo_type` surfaces the class from the
   service layer.
 - No migrations, SQL, Supabase schema, configuration, or provider code were
-  changed.
+  changed by this fix. `task_scheduler.py`, `RuntimeSupervisor`, Telethon
+  connection loops, and provider routing were all left untouched.
+- `backend/ai/engine/dispatcher.py` was NOT touched by the earlier tracing
+  work (it already injected `request_id`); it IS the file changed by this
+  tool-round-limit fix (see Files Changed).
 
 ## Known Remaining Limitations
 
