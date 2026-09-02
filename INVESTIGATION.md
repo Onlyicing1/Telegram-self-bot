@@ -583,18 +583,22 @@ Layers exercised:
 | 30 | web_search | ✅ | ✅ | ✅ | ✅ | read_only | ✅ (capability interface) | **YDC key / provider manager** | ✅ | ✅ | ✅ | 1 file | PARTIALLY_HEALTHY (key-dependent) |
 | 31 | create_task | ✅ | ✅ | ✅ | ✅ | read_write | ✅ (deterministic candidate → REAL repository) | provider for NL mode | ✅ | ✅ | ✅ (fast-path) | 5 files | HEALTHY |
 | 32 | send_message | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | TelegramAPI (REAL facade) | ✅ | ✅ | ✅ (task actions) | 13 files | HEALTHY |
+| 33 | task_list | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | TaskManagementService (REAL, fallback DB) | ✅ | ✅ | ✅ | added this phase | HEALTHY |
+| 34 | task_inspect | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | TaskManagementService (REAL) | ✅ | ✅ | ✅ | added this phase | HEALTHY |
+| 35 | task_transition | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | TaskManagementService CAS (REAL) | ✅ | ✅ | ✅ | added this phase | HEALTHY |
+| 36 | retrieve_save | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | retrieve_service (REAL; trusted destination) | ✅ | ✅ | ✅ | added this phase | HEALTHY |
 
 ## P1.4 Aggregate Counts
 
 | Classification | Count | Tools |
 |---|---|---|
-| HEALTHY | 31 | all except web_search |
+| HEALTHY | 35 | all except web_search |
 | PARTIALLY_HEALTHY | 1 | web_search (execution path fully correct; requires `YDC_API_KEY`/provider manager — honest failure when absent) |
 | BROKEN | 0 | — |
 | MISWIRED | 0 | — |
 | BLOCKED_BY_CONFIGURATION | 0 | (web_search classified PARTIALLY_HEALTHY: its failure mode is honest and its success path is verified through the capability interface) |
 | NOT_TESTABLE_WITHOUT_LIVE_SERVICE | 0 | (live Telegram/Supabase/provider behavior remains out of scope; see Limitations) |
-| **Total** | **32** | |
+| **Total** | **36** | |
 
 ## P1.5 Findings
 
@@ -651,3 +655,111 @@ async-iterator semantics, and the reply-message fetch fake.
 | Tests added | 60 (test_tool_health_audit.py) |
 | Full suite | 1424 passed, 23 skipped |
 | Commit / push / remote verification | see final report for this phase |
+
+---
+
+# CAPABILITY EXPOSURE IMPLEMENTATION — CURRENT STATE
+
+> This section reflects the implementation phase that followed Phase 1: the
+> remaining existing Self-Bot capabilities identified as
+> IMPLEMENTED_NOT_REGISTERED were progressively connected to the AI through
+> the existing ToolRegistry → Dispatcher → ToolExecutor architecture, and
+> each connection was proven with health tests through the real execution
+> path. The registry now holds **36 tools**.
+
+## C1. Objective
+
+Close the gap between "Self-Bot capability exists" and "AI can safely and
+demonstrably use that capability" — one capability at a time, with no new
+architecture, no provider changes, and no boundary weakening.
+
+## C2. Newly connected in this implementation
+
+### Capability 1 — Task lifecycle management (3 tools)
+
+| Field | Value |
+|---|---|
+| Tools | `task_list`, `task_inspect`, `task_transition` |
+| Capability | See, inspect, and lifecycle-manage the tasks the AI creates (closes the create-only asymmetry) |
+| Authoritative implementation | `TaskManagementService` + `task_management_interface.list_text/inspect_text` + `TaskRepository` — the SAME service the `.task` command and Taskloom panel use; no second management system |
+| New file | `backend/ai/tools/task_management_tools.py` |
+| Registry | Registered in `create_default_registry()`; no duplicates |
+| Dispatcher reachability | Verified: all three appear in `Dispatcher._build_tool_definitions()` native provider schemas |
+| ToolExecutor execution | Verified through `execute_calls()` with the real in-memory repository |
+| Permission model | `task_list`/`task_inspect` = READ_ONLY; `task_transition` = READ_WRITE with CAS `expected_version` required (stale version → honest failure, nothing changes) |
+| Owner scoping | Service-level `owner_id` filtering verified: another owner's task is invisible and untransitionable |
+| Status vocabulary | `task_transition` accepts only `paused`/`active`/`completed` — the lifecycle mutations with a UI precedent; `delete`/`fail`/`expire` remain UI/command-only (explicit-version panel semantics; not chat-AI surface) |
+| External dependency | Supabase-or-in-memory fallback (no live dependency in tests) |
+| Health tests | `tests/test_capability_exposure_tools.py::test_task_*` (12 tests) — registered/reachable, executor path, owner scoping, CAS stale-version rejection, argument validation, failure paths |
+| Result | **CONNECTED** — implemented + registered + dispatcher-reachable + executable + permission-correct + health-tested |
+
+### Capability 2 — Saved-item retrieval / forwarding (1 tool)
+
+| Field | Value |
+|---|---|
+| Tool | `retrieve_save` |
+| Capability | Re-send a saved item (by save code) into the current chat with its metadata caption — the panel's Retrieve action, now AI-reachable |
+| Authoritative implementation | `retrieve_service.do_retrieve` (the only legitimate `forward_messages` user) — reused verbatim; no new forwarding logic |
+| New file | `backend/ai/tools/retrieve_save.py` |
+| Registry | Registered; no duplicates |
+| Dispatcher reachability | Verified in native provider schemas |
+| ToolExecutor execution | Verified through `execute_calls()` with the service boundary faked |
+| Permission model | READ_WRITE |
+| Destination constraint | **Trusted-context rule**: destination is ALWAYS the chat the AI request came from (`context.extra["chat_id"]`) — never a model-supplied argument; asserted by test (model-supplied `destination`/`chat_id` arguments are ignored) |
+| Ownership | Save-code scoping is enforced by the existing service/DB contract (`owner_id`), unchanged |
+| Health tests | `test_retrieve_save_*` (4 tests) — registered/reachable, executor path with service-call assertion (owner/code/destination args), trusted-destination enforcement, honest failure paths (no chat, service failure string, missing code) |
+| Result | **CONNECTED** — all six conditions satisfied |
+
+## C3. Previously connected
+
+The 32 tools documented in the capability audit and Phase 1 health audit
+above (save, save_by_link, delete ×5, list_recent_messages, bio ×7,
+username ×6, search, list_saves, database_stats, account_show, settings_get,
+settings_set, organize_list, organize_clean, web_search, create_task,
+send_message). All remain intact; the Phase 1 audit suite was updated to the
+36-tool baseline and still passes.
+
+## C4. Remaining implemented but NOT AI-connected (intentional)
+
+| Capability | Why it stays disconnected | Status |
+|---|---|---|
+| Memory write path (`MemoryManager.store_long/store_permanent`) | AI_MASTER_DESIGN §5 contract: "The AI can propose a new persistent memory… The owner confirms. Only confirmed entries are persisted. The AI never writes to persistent memory autonomously." No proposal/confirmation mechanism exists in code. Creating a memory tool now would violate the documented product contract. | IMPLEMENTED_NOT_REGISTERED / NOT_AI_EXPOSED |
+| Ghost Seen v2 | Panel-driven by design; its AI usage is a reasoning service with `allow_tools=False`. No AI-tool contract exists in source for the chat AI to operate Ghost Seen. | IMPLEMENTED_NOT_REGISTERED / NOT_AI_EXPOSED |
+| Provider/model switching, trigger configuration | Runtime authority belongs to panels/dashboard; the audit found no AI-tool precedent and the security model reserves provider routing internals from the AI. | IMPLEMENTED_NOT_REGISTERED / NOT_AI_EXPOSED |
+| Model tester / discovery | Diagnostic/panel surface; not a conversational capability. | IMPLEMENTED_NOT_REGISTERED / NOT_AI_EXPOSED |
+| Dashboard REST APIs | Human UI surface; not an AI capability. | IMPLEMENTED_NOT_REGISTERED / NOT_AI_EXPOSED |
+| Task `delete`/`fail`/`expire` transitions | The authoritative service supports them, but the panel contract requires explicit version confirmation; destructive/critical lifecycle states stay out of the chat-AI vocabulary for now. `task_transition` covers pause/resume/complete. | PARTIALLY_EXPOSED (deliberate scope line) |
+
+## C5. Still not implemented (unchanged from the audit)
+
+Hermes, Workers, Service Mesh, Orchestrator, external reasoning endpoints,
+future tools (calendar/tags/folders/summarize/translate/automations),
+general web browsing/URL fetching, voice input, `tool_request` on AIRequest.
+
+## C6. Security findings after implementation
+
+Re-verified boundary checks (all pass):
+
+- New tools delegate entirely to existing services — zero new Telegram RPC,
+  SQL, shell, filesystem, or HTTP surface.
+- No new destination authority: `retrieve_save` destination is trusted
+  context only (tested).
+- No new mutation authority: `task_transition` is CAS-version-checked,
+  owner-scoped, and enum-limited (tested).
+- Registry has no duplicate names (tested: 36 unique).
+- Permission gates unchanged: only READ_ONLY/READ_WRITE added; no
+  ADMIN_ONLY/DANGEROUS semantics weakened; delete verification untouched.
+- Providers remain reasoning services only; tool execution still flows
+  exclusively through ToolExecutor.
+
+## C7. Database / Supabase impact
+
+No database/schema changes were required. All new tools operate on the
+existing `ai_tasks`/`ai_task_occurrences` tables and `saved_items` through
+the existing repositories/services.
+
+## C8. Live verification status
+
+No live Telegram, Supabase, or provider verification was performed. All
+claims are execution-path-verified through the real registry/executor chain
+with external boundaries faked.

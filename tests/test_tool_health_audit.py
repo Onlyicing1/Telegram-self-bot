@@ -132,18 +132,22 @@ EXPECTED_TOOLS = {
     "organize_clean": PermissionLevel.DANGEROUS,
     "web_search": PermissionLevel.READ_ONLY,
     "create_task": PermissionLevel.READ_WRITE,
+    "task_list": PermissionLevel.READ_ONLY,
+    "task_inspect": PermissionLevel.READ_ONLY,
+    "task_transition": PermissionLevel.READ_WRITE,
+    "retrieve_save": PermissionLevel.READ_WRITE,
     "send_message": PermissionLevel.READ_WRITE,
 }
 
 
-def test_registry_contains_exactly_the_32_expected_tools():
+def test_registry_contains_exactly_the_expected_tools():
     registry, _ctx, _ex = make_registry(FakeTelegramAPI())
     names = set(registry.list_names())
     assert names == set(EXPECTED_TOOLS), (
         f"registry mismatch: missing={set(EXPECTED_TOOLS) - names} "
         f"extra={names - set(EXPECTED_TOOLS)}"
     )
-    assert len(registry.list()) == 32
+    assert len(registry.list()) == 36
 
 
 @pytest.mark.asyncio

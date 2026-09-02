@@ -6,13 +6,161 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Prior HEAD before this fix | `f38357a900830420243ddab954d8ad003ca39d77` |
+| Prior HEAD before this phase | `3fbe194815ef9b4ad848276375b86b0ffc0cbc1e` (Phase 1 health audit) |
 | Implementation/report commit | see "Final Git Delivery Record" below |
 | Local HEAD | see "Final Git Delivery Record" below |
 | `origin/main` | see "Final Git Delivery Record" below |
 | Local HEAD == remote HEAD | see "Final Git Delivery Record" below |
 
 ## Current Implementation State
+
+**IMPLEMENTED (capability exposure phase — task lifecycle + saved-item
+retrieval connected to the AI)** — following the canonical capability audit
+and the Phase 1 health audit (32 tools, all healthy), this phase connects the
+audit's top IMPLEMENTED_NOT_REGISTERED capabilities to the AI through the
+EXISTING ToolRegistry → Dispatcher → ToolExecutor architecture. The registry
+grows from 32 to **36 tools**. No provider, scheduler, database, or runtime
+changes.
+
+### Objective
+
+Close the gap between "Self-Bot capability exists" and "AI can safely and
+demonstrably use that capability" — one capability at a time, with health
+tests proving each connection through the real execution path.
+
+### Exact files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/tools/task_management_tools.py` | NEW — `TaskListTool` (`task_list`), `TaskInspectTool` (`task_inspect`), `TaskTransitionTool` (`task_transition`): thin adapters over the authoritative `TaskManagementService` + `task_management_interface` renderers + `TaskRepository` |
+| `backend/ai/tools/retrieve_save.py` | NEW — `RetrieveSaveTool` (`retrieve_save`): thin adapter over `retrieve_service.do_retrieve` with a trusted-destination rule |
+| `backend/ai/tools/registry.py` | Register the four new tools in `create_default_registry()` (imports + 4 `registry.register` calls — nothing else) |
+| `tests/test_capability_exposure_tools.py` | NEW — 17 health tests proving the real chain for each new tool |
+| `tests/test_tool_health_audit.py` | Baseline updated 32 → 36 with the new tools' permission levels |
+| `INVESTIGATION.md` | Capability-exposure section: newly connected matrix, remaining disconnected capabilities with reasons, re-run security findings |
+
+### Existing services reused (zero business logic duplicated)
+
+- `TaskManagementService.list_tasks / inspect / set_status` (+
+  `task_management_interface.list_text/inspect_text` renderers and the
+  owner-scoped, CAS-versioned `TaskRepository`) — the SAME boundary used by
+  the `.task` command and Taskloom panel.
+- `retrieve_service.do_retrieve` — the panel's Retrieve action and the only
+  legitimate `forward_messages` user, called verbatim.
+
+### New AI tools
+
+| Tool | Permission | Semantics |
+|---|---|---|
+| `task_list` | READ_ONLY | List the owner's tasks (id, label, status, version, next run) |
+| `task_inspect` | READ_ONLY | One task's detail: schedule, timezone, recent occurrences |
+| `task_transition` | READ_WRITE | Pause/resume/complete a task; requires current `expected_version` (CAS); enum-limited to `paused`/`active`/`completed` |
+| `retrieve_save` | READ_WRITE | Re-send a saved item into the CURRENT chat (trusted context destination — never model-chosen) |
+
+### Registry / dispatcher / executor integration
+
+- Registry: 36 unique names (no-duplicate assertion in tests).
+- Dispatcher: all four tools appear in `Dispatcher._build_tool_definitions()`
+  native provider schemas (asserted).
+- Executor: every tool executes through `ToolExecutor.execute_calls()` with
+  permission gating, argument validation, and timeouts — the sole execution
+  authority, unchanged.
+
+### Permission / security behavior
+
+- No new capability grants arbitrary Telegram RPC, SQL, shell, filesystem,
+  or HTTP access — the tools delegate to existing services only.
+- `retrieve_save` destination is ALWAYS `context.extra["chat_id"]` (trusted
+  request context); model-supplied `destination`/`chat_id` arguments are
+  ignored (asserted by test).
+- `task_transition` is owner-scoped (foreign owner's task fails) and
+  stale-version-safe (CAS failure leaves the task unchanged; asserted).
+- Status vocabulary deliberately excludes `delete`/`fail`/`expire` — those
+  stay UI/command-only per the panel's explicit-confirmation contract.
+- No permission levels weakened; delete verification, `settings_set` gate,
+  and all existing semantics untouched.
+
+### Exact tests added (17, in `tests/test_capability_exposure_tools.py`)
+
+- `test_task_list_registered_and_reachable`, `test_task_list_executor_path_lists_persisted_tasks`,
+  `test_task_list_is_owner_scoped`
+- `test_task_inspect_registered_and_reachable`, `test_task_inspect_executor_path_returns_detail`,
+  `test_task_inspect_failure_path_missing_and_invalid`
+- `test_task_transition_registered_and_reachable`, `test_task_transition_executor_path_pause_resume_complete`,
+  `test_task_transition_cas_stale_version_fails_honestly`, `test_task_transition_is_owner_scoped`,
+  `test_task_transition_validates_arguments`
+- `test_retrieve_save_registered_and_reachable`, `test_retrieve_save_executor_path_forwards_through_service`,
+  `test_retrieve_save_destination_is_trusted_context_not_arguments`, `test_retrieve_save_failure_paths_are_honest`
+- `test_new_tools_are_provider_schema_visible`, `test_no_duplicate_registrations`
+
+### Tests executed / results
+
+- Focused new-tool suite: **17 passed**.
+- Phase 1 audit suite (`test_tool_health_audit.py`): **60 passed** at the
+  36-tool baseline.
+- Full suite: **1441 passed, 23 skipped**.
+- `python3 -m py_compile` on all changed/new Python files: clean.
+- `git diff --check`: clean.
+
+### AI-path health-test results
+
+All four tools satisfy the CONNECTED contract — IMPLEMENTED + REGISTERED +
+DISPATCHER-REACHABLE + TOOL-EXECUTABLE + PERMISSION-CORRECT + HEALTH-TESTED:
+
+- `task_list`: executor path returns real persisted tasks from the real
+  `InMemoryTaskRepository`; owner-scoped (other owner's task absent).
+- `task_inspect`: detail path (schedule/occurrences) plus honest failure for
+  missing/invalid ids.
+- `task_transition`: full pause→resume→complete round-trip on a real task;
+  stale CAS version fails honestly and leaves the task unchanged; foreign
+  owner rejected; argument validation enforced.
+- `retrieve_save`: service called with exactly (client, owner, code,
+  trusted_chat); destination enforcement against model-supplied arguments;
+  honest failure paths (no trusted chat, service failure string, missing
+  code).
+
+### Not executed / not verified
+
+Live Telegram, live Supabase, and live provider calls were NOT performed —
+all verification is through the real registry/executor chain with external
+boundaries faked, consistent with every prior phase.
+
+### Database / Supabase impact
+
+No database/schema changes were required. Existing `ai_tasks`,
+`ai_task_occurrences`, and `saved_items` tables are used through the existing
+repositories/services.
+
+### Remaining unconnected capabilities (intentional, with reasons)
+
+- **Memory write path** — the documented product contract (AI_MASTER_DESIGN
+  §5) requires an owner-confirmed proposal flow that does not exist in code;
+  an autonomous memory-write tool would violate it.
+- **Ghost Seen v2** — panel-driven; its AI usage is reasoning-only with
+  `allow_tools=False`; no AI-tool contract exists in source.
+- **Provider/model/trigger switching, model tester/discovery, dashboard
+  APIs** — runtime authority reserved to panels/dashboard by the security
+  model.
+- **Task `delete`/`fail`/`expire` transitions** — supported by the service
+  but excluded from the chat-AI vocabulary by the panel's explicit-confirmation
+  contract.
+
+### Intentional non-changes
+
+No provider, dispatcher-loop, scheduler, Taskloom, Ghost Seen, dashboard,
+UI, schema, migration, or runtime-supervisor changes. No Hermes/Workers/
+Service Mesh/Orchestrator work. No future tools added.
+
+### Limitations
+
+- Live-service verification remains outstanding (as in all prior phases).
+- `task_transition` mutations from the chat AI are READ_WRITE by design (the
+  owner's message is the authorization); the CAS version requirement keeps
+  them deterministic and stale-safe.
+
+## Prior Implementation State (delivered earlier)
+
+### create_task schedule-shape observability + bounded normalization (commit `df23029`)
 
 **IMPLEMENTED (create_task schedule-shape observability + bounded
 normalization)** — THIRD pass on the same request ("یه تسک بساز هر سه دقیقه
