@@ -1,241 +1,488 @@
-# INVESTIGATION
+# INVESTIGATION — AI Tool / Capability Access Audit
 
-Scope: exact source path that turns the `create_task` execution into
-`AI_EXEC_TRACE stage=tool_result tool=create_task success=False` for request
-`dd62aecd3d7f`. Investigation only — no code, tests, config, schema, Supabase,
-or Telegram changes were made. `tests/test_stage13.py` untouched.
+> **Canonical current investigation.** This file completely replaces all prior
+> investigation content. It describes the CURRENT repository state as verified
+> by THIS audit. Prior investigations (create_task tracing, etc.) are
+> superseded; their outcomes were delivered and are reflected in the code
+> audited here.
 
-## 1. PRODUCTION EVIDENCE
+---
 
-Confirmed ordering from the supplied logs:
+## 1. Investigation Objective
 
-1. `create_task` is available (AI_TOOL_AVAILABILITY).
-2. `AI_EXEC_TRACE stage=intent_resolved intent=create_task kind=executable` —
-   deterministic classifier matched (dispatcher.py:1064).
-3. `stage=tool_selected tools=['create_task']` (dispatcher.py:1136).
-4. `stage=tool_execute tools=['create_task']` (dispatcher.py:1140).
-5. `ROUTER_SCORE` for cohere/gemini/openai/openrouter/groq/sambanova,
-   `PROVIDER_SKIPPED provider=you reason=capability=web_search`,
-   `ROUTER_SELECTED provider=cohere model=command-a-plus-05-2025 score=0.677`,
-   `AI_PROVIDER_ATTEMPT provider=cohere ... attempt=1` (manager.py:144/153/641).
-6. ~5.8 s after tool execution began:
-   `stage=tool_result tool=create_task success=False` (dispatcher.py:1160).
-7. `stage=telegram_response success=True` (dispatcher.py:1205).
+Determine exactly what the AI can access and execute inside the Telegram
+Self-Bot / LifeOS system today, and separate — without merging them:
 
-Only ONE `AI_PROVIDER_ATTEMPT attempt=1` appears; no `attempt=2`, no further
-provider attempts, no `AI_PROVIDER_FAILOVER`. The failure surfaced ~5.8 s in —
-far below `create_task`'s 45 s executor cap (task.py:29) and the interpreter's
-30 s cap (task.py:28, interpreter.py:27), so no executor/interpreter timeout
-fired.
+1. Tools/capabilities available to the AI inside the Self Bot.
+2. Tools actually registered and reachable through the AI execution path.
+3. Tools implemented in code but NOT registered/reachable.
+4. Capabilities available through external services/providers.
+5. External capabilities referenced by architecture but NOT connected.
+6. Partially implemented / stubbed / fallback-only / disabled / broken items.
+7. Capabilities the AI can reason about but cannot execute.
+8. Capabilities the Self Bot executes deterministically without AI.
+9. Capabilities requiring the Self Bot as final execution authority.
+10. Capabilities that must NEVER be exposed directly to the AI.
 
-Because `intent_resolved` → `tool_selected` → `tool_execute` → `tool_result`
-→ `telegram_response` is emitted back-to-back by
-`Dispatcher._try_local_fast_path` (dispatcher.py:1064–1205), the execution ran
-on the deterministic fast path, not the provider tool loop.
+This is an audit. No production code, tests, migrations, schema, or
+configuration were modified.
 
-## 2. FAILED TOOLRESULT ORIGIN
+---
 
-`backend/ai/tools/task.py`, class `CreateTaskTool`, method
-`async def execute(self, context, arguments)`. It contains exactly seven
-`ToolResult(success=False, ...)` returns:
+## 2. Repository State Investigated
 
-| # | Line | Message | Reached from |
-|---|------|---------|--------------|
-| 1 | task.py:87 | `Missing task request argument.` | `arguments["request"]` not a non-empty string |
-| 2 | task.py:90 | `Task request is too long.` | request > 2000 chars |
-| 3 | task.py:94 | `Owner identity is unavailable; task was not created.` | `context.owner_id` invalid |
-| 4 | task.py:108 | `AI provider manager is unavailable; task was not created.` | no `provider_manager` after fallback lookup |
-| 5 | task.py:117–124 | `I could not turn that into a safe, unambiguous schedule, so I did not create any task. Restate it as an interval (e.g. 'every X minutes'), a time, or a daily/weekly cadence with a clear action.` | single `except (TaskInterpretationError, asyncio.TimeoutError, Exception)` around `TaskInterpreter.interpret()` |
-| 6 | task.py:170 | `Could not resolve chat destination:\n{options}` | candidate carried `chat_name` that `resolve_chat_name` failed to resolve |
-| 7 | task.py:194 | `The task could not be persisted; nothing was created.` | `except (TaskCreationError, Exception)` around `TaskCreationService.create()` |
+| Field | Value |
+|---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` (origin) |
+| Branch | `main` |
+| HEAD audited | `e9f29e4690aaeda2c0b0f70c3adf242dad30d4b2` |
+| HEAD subject | "fix: resolve fused show-forms to get_bio and deliver the tool result verbatim" |
+| Investigation date | 2026-09-02 |
+| Working tree | Clean except pre-existing untracked nested `telegram-self-bot/` clone (preserved, untouched) |
 
-The `ToolExecutionResult` wrapping that becomes the logged `tool_result`
-event is built in `backend/ai/tools/executor.py::_execute_single` (success
-path returns at executor.py:261–267; the `except Exception` fallback at
-executor.py:290–299). The dispatcher fast path then emits
-`stage=tool_result tool=%s success=%s` (dispatcher.py:1158–1161).
+Method: read every tool implementation, the registry, executor, context,
+base contract, dispatcher, provider factory/registry/manager, telegram_api
+facade, services, DB client, web app, handlers, router, and config; executed
+the real `create_default_registry()` in-process to enumerate registered tools
+and their metadata (not copied from docs); counted test coverage per tool
+name via the test suite; grepped for arbitrary-access surfaces (`subprocess`,
+`eval`, `exec`, raw env reads in tools), Hermes/worker/mesh references, and
+outbound HTTP clients. Evidence classes: [SOURCE] = file verified this
+session; [TEST] = test-suite evidence; [RUNTIME] = executed in-process.
 
-## 3. EXACT FAILURE BRANCHES
+---
 
-Conditions for each branch, with current-source reachability for this request:
+## 3. AI Execution Pipeline (verified path)
 
-1. **task.py:87** — unreachable here: the deterministic parser already
-   validated `request` (actions.py:494–496 rejects empty/missing before
-   emitting the tool call).
-2. **task.py:90** — unreachable here: the parser enforces the same 2000-char
-   bound (actions.py:497–498) as `MAX_REQUEST_CHARS`.
-3. **task.py:94** — requires a ToolContext without a valid owner id. The fast
-   path builds context from the authenticated AIRequest
-   (dispatcher.py:940–976); possible only on a wiring bug, no evidence.
-4. **task.py:108** — requires `provider_manager` to be absent from
-   `context.extra` AND `get_engine()` to fail. Excluded: a provider attempt
-   is proven by the logs (manager.py:641 runs inside
-   `ProviderManager.chat`, reached only via that manager).
-5. **task.py:117–124** — fires whenever `TaskInterpreter.interpret()` raises
-   any exception or the 30 s `wait_for` expires. Every interpreter failure
-   (§5) funnels here. Occurs strictly AFTER the provider attempt. Consistent
-   with the observed logs and timing.
-6. **task.py:170** — requires the candidate to contain
-   `notification_destination.chat_name`; only reachable after a successful
-   interpretation. Not excluded by logs but produces a distinguishable
-   message; also implies interpreter success (§7 gap).
-7. **task.py:194** — fires on any exception from `TaskCreationService.create`
-   (task_creation.py:24–78: field checks, `parse_schedule`, and the
-   repository call). `create()` logs
-   `TASK_CREATE_PERSIST_ATTEMPT repository=%s owner_id=%s has_ai_instruction=%s`
-   (task_creation.py:71–74) BEFORE touching the repository; the Phase 1
-   Supabase repository additionally logs its own attempt/success/fallback
-   events. None of those lines appear in production logs.
+```
+Owner outgoing message (outgoing=True, is_owner gate)
+→ backend/bot/handlers/ai_unified.py::_execute_ai
+→ AIRequest (frozen: session_id, user_message, owner_id, chat_id, message_id,
+  reply_context, language, timezone, request_id, allow_tools)
+→ Engine.execute()  (engine.py:130 — "the ONLY public execution method")
+→ Dispatcher.dispatch (engine/dispatcher.py)
+   1. Conversation Runtime (history restore + user message)
+   2. LOCAL DETERMINISTIC FAST PATH (before any provider round)
+      parse_command_intent → high-confidence intents executed through
+      ToolExecutor with ZERO provider involvement
+   3. Prompt Builder (+ registry tool schemas injected as text)
+   4. ProviderManager.chat() — capability/health-scored routing + fallback
+   5. Bounded empty-response retry (1x, format nudge)
+   6. Structured-action fallback: model prose/JSON → parse_action_text() →
+      resolve_tool_calls() → SAME ToolExecutor (deterministic parser is
+      authoritative; model JSON only fills the gap)
+   7. Tool loop: MAX_TOOL_ROUNDS=3 → ToolExecutor.execute_calls
+      (MAX_TOOLS_PER_TURN=5; per-tool timeout 10s/30s/45s)
+      - structured-action rounds end verbatim (no continuation round)
+      - get_bio-only rounds end verbatim (_VERBATIM_READ_TOOLS)
+   8. Tool-round exhaustion handler — pending calls salvaged ONCE through
+      the same executor; never silently dropped, never re-executed
+   9. Conversation update, telemetry, usage persistence
+→ EngineResult → Telegram delivery (edit-in-place; chunked; deletes silent)
+```
 
-## 4. ACTUAL ACTIVE PATH
+Provider tool-call path: provider returns OpenAI-format `tool_calls` →
+Dispatcher → ToolExecutor (the SOLE caller of `tool.execute()`) → tool →
+service → TelegramAPI facade / DB / provider mesh → ToolResult →
+continuation round or verbatim return.
 
-CONFIRMED (source + logs):
+Ghost Seen v2 also calls `Engine.execute` internally but with
+`allow_tools=False` — it uses the provider as a reasoning service only
+[SOURCE: handlers/ghost_seen_v2.py:432 area].
 
-- The active path is the deterministic fast path: `_try_local_fast_path`
-  resolved `create_task`, built tool context via `_build_tool_context`
-  (dispatcher.py:961–965 attempted `_build_deterministic_task_candidate`),
-  and executed through `ToolExecutor.execute_calls` (dispatcher.py:1144).
-- A provider call occurred inside `create_task` — i.e. inside
-  `TaskInterpreter.interpret()` (task.py:111 → interpreter.py:63–66) — so the
-  deterministic candidate was NOT injected; the interpreter ran a live
-  provider round.
-- The failed `ToolResult` returned through `_execute_single` (executor.py) to
-  `execute_calls`, was logged at dispatcher.py:1160, summarized by
-  `_summarize_tool_results`, and delivered via `_build_fast_path_result`
-  (dispatcher.py:1180–1205) — which is why the Telegram response still
-  succeeded.
+---
 
-UNKNOWN (not observable from current logs): which single sub-branch inside
-branch 5 produced the failure, and (if branch 6 applied) that it was reached
-at all. Enumerated interpreter failure points, all raising
-`TaskInterpretationError` and all collapsing into the one wrapper at
-task.py:117:
+## 4. Inside-Self-Bot Capability Matrix (32 registered tools)
 
-- interpreter.py:42 — request empty/too long (impossible here; parser-validated)
-- interpreter.py:85 — `ProviderManager.chat` raised (manager never raises; it
-  returns `success=False` responses — manager.py:101 docstring and §5 — so
-  this is effectively dead for provider errors)
-- interpreter.py:87 — `response.success is False` (provider failure →
-  `chat()` returns the emergency-fallback response with
-  `success=False`, manager.py:830–868)
-- interpreter.py:90 — empty/non-string `response.text`
-- interpreter.py:95 — `json.loads` failed OR `parse_candidate_output` raised
-  `TaskCandidateError` (task_candidate.py:47–107: field-set mismatch
-  `"candidate fields are incomplete or unsupported"`, invalid label/timezone,
-  action canonicalization, `MAX_PAYLOAD_BYTES`, schedule mismatch). Note:
-  the interpreter's own instruction tells the model to answer ambiguous
-  requests with JSON `null`; `json.loads("null")` yields `None`, and
-  `from_untrusted(None)` raises `TaskCandidateError("candidate must be an
-  object")` — a self-instruction-driven rejection path.
+Registry ground truth [RUNTIME]: `create_default_registry()` constructed
+in-process at HEAD e9f29e4 → **TOTAL=32**, matching
+`backend/ai/tools/registry.py` (32 `registry.register(...)` calls).
 
-Timing (~5.8 s, single attempt=1, no attempt=2 / failover / skipped lines for
-the other scored providers) is consistent with: Cohere's one attempt returned
-quickly with either `success=False` (branch interpreter.py:87) or a
-non-empty but unusable text (interpreter.py:90/95 — non-empty text suppresses
-`_has_no_usable_output` failover, manager.py:727–740, so no second provider
-is tried). It is NOT consistent with a timeout (branch would need ≥30 s) or
-with branch 7.
+Legend — Impl: implementation status; Reg: registered; Reach: reachable
+through Dispatcher; Exec: executable by AI; Det: deterministically executable
+by Self Bot without AI; Ext: external dependency required; Status: final
+audit status.
 
-## 5. TASKINTERPRETER / PROVIDER CONTRACT
+| Tool | Category | Location | Impl | Reg | Reach | Exec | Det | Ext | Permission | Status | Evidence |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| save | save | ai/tools/save.py | complete | ✅ | ✅ | ✅ | ✅ (panel/reply) | Telegram+DB | read_write, long_running | CONNECTED | [SOURCE][TEST 11 files] |
+| save_by_link | save | ai/tools/save.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram+DB | read_write, long_running | CONNECTED | [SOURCE] |
+| delete | delete | ai/tools/delete.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | dangerous, 30s cap | CONNECTED | [SOURCE][TEST 15 files] |
+| delete_by_id | delete | ai/tools/delete.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | dangerous | CONNECTED | [SOURCE] |
+| delete_replied | delete | ai/tools/delete.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | dangerous | CONNECTED | [SOURCE] |
+| delete_message_by_id | delete | ai/tools/delete.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | dangerous | CONNECTED | [SOURCE] |
+| delete_messages_by_ids | delete | ai/tools/semantic.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | dangerous | CONNECTED | [SOURCE] |
+| list_recent_messages | read | ai/tools/semantic.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | read_only | CONNECTED | [SOURCE][TEST 5 files] |
+| bio_set_template | profile | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | DB (bio_state) | read_write | CONNECTED | [SOURCE][service tests] |
+| bio_set_text | profile | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| bio_set_mood | profile | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| bio_on | profile | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram+DB | read_write | CONNECTED | [SOURCE] |
+| bio_off | profile | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| bio_show | read | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_only | CONNECTED | [SOURCE] |
+| get_bio | read | ai/tools/bio.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram (GetFullUser) | read_only | CONNECTED (verbatim-delivered) | [SOURCE][TEST 4 files] |
+| username_set_template | profile | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| username_set_text | profile | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| username_set_mood | profile | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| username_on | profile | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram+DB | read_write | CONNECTED | [SOURCE] |
+| username_off | profile | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_write | CONNECTED | [SOURCE] |
+| username_show | read | ai/tools/username.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_only | CONNECTED | [SOURCE] |
+| search | retrieve | ai/tools/retrieve.py | complete | ✅ | ✅ | ✅ | ✅ | DB (saved_items, owner-scoped) | read_only | CONNECTED | [SOURCE] |
+| list_saves | retrieve | ai/tools/retrieve.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_only | CONNECTED | [SOURCE] |
+| database_stats | db | ai/tools/database.py | complete | ✅ | ✅ | ✅ | ✅ | DB (+writes 1 bot_logs row) | read_only | CONNECTED | [SOURCE][TEST 1 file] |
+| account_show | read | ai/tools/account.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram (get_me) | read_only | CONNECTED | [SOURCE][TEST 8 files] |
+| settings_get | settings | ai/tools/settings.py | complete | ✅ | ✅ | ✅ | ✅ | DB (panel_settings) | read_only | CONNECTED | [SOURCE][service tests] |
+| settings_set | settings | ai/tools/settings.py | complete | ✅ | ✅ | ⚠️ confirmation-gated | ✅ | DB | **admin_only** | CONNECTED (gated) | [SOURCE] |
+| organize_list | organize | ai/tools/organize.py | complete | ✅ | ✅ | ✅ | ✅ | DB | read_only | CONNECTED | [SOURCE][service tests] |
+| organize_clean | organize | ai/tools/organize.py | complete | ✅ | ✅ | ✅ | ✅ | DB (deletes bot_logs) | dangerous | CONNECTED | [SOURCE] |
+| web_search | external | ai/tools/websearch.py | complete | ✅ | ✅ | ⚠️ if YDC key set | ✅ | **You.com API** | read_only | PARTIALLY_CONNECTED | [SOURCE] |
+| create_task | automation | ai/tools/task.py | complete | ✅ | ✅ | ✅ | ✅ | DB+provider (interpretation) | read_write, 45s | CONNECTED | [SOURCE][TEST 5 files] |
+| send_message | message | ai/tools/message.py | complete | ✅ | ✅ | ✅ | ✅ | Telegram | read_write, 30s | CONNECTED | [SOURCE][TEST 13 files] |
 
-- Call site: `CreateTaskTool.execute` →
-  `TaskInterpreter(provider_manager).interpret(request, timezone=tz_str)`
-  wrapped in `asyncio.wait_for(..., 30)` (task.py:111–113).
-- Input: the ORIGINAL user request string, passed verbatim by the
-  deterministic parser: `parse_command_intent` classifies the message and
-  `tool_calls=[{"name": "create_task", "arguments": {"request":
-  result.schedule_text}}]` (actions.py:496–500); `schedule_text` is the
-  stripped request (actions.py:298–306). No transformation or translation.
-- Prompt: system message with the safety/schema instructions (incl. Persian
-  interval recognition and "return JSON null if ambiguous"), a second system
-  message containing `CANDIDATE_SCHEMA` JSON (interpreter.py:25–36, 47–60),
-  and the user request as the user message (interpreter.py:61–65).
-- Provider call: `self._providers.chat(messages, tools=[])` — i.e.
-  `ProviderManager.chat` routes to Cohere `command-a-plus-05-2025`; `chat()`
-  NEVER raises; failures become `success=False` responses
-  (manager.py:101–198; `_call_once` converts timeouts/exceptions into
-  `success=False` responses, manager.py:596–620; exhausted candidates end in
-  `_fallback` with `success=False` and `errors` metadata, manager.py:830–868).
-  No interpreter-internal provider fallback exists beyond the manager's own
-  chain — only Cohere was attempted per the logs.
-- Expected output: exactly one JSON object matching `CANDIDATE_SCHEMA`;
-  parsed via `json.loads` then `parse_candidate_output` →
-  `TaskCandidate.from_untrusted` (interpreter.py:68–72,
-  task_candidate.py:47–107), which normalizes send aliases to the single
-  bounded `send_message{text}` action and rejects everything else.
-- Failure conversion: ANY of the above failures → `TaskInterpretationError`
-  → caught at task.py:117 → branch-5 ToolResult. The exception message and
-  cause are discarded there (the except clause binds nothing).
+Distinct-tool confirmation: `delete`, `delete_by_id`, `delete_replied`,
+`delete_message_by_id`, `delete_messages_by_ids` are five separate tools.
+`bio_show` (engine state) and `get_bio` (authoritative Telegram about) are
+separate and separately routed [SOURCE: actions.py maps `bio_status`/`get_bio`
+intents → `get_bio`; engine queries → `bio_show`].
 
-## 6. PERSISTENCE STATUS
+Key wiring facts:
+- Registration is done ONCE at supervisor startup
+  [SOURCE: runtime/supervisor.py:248–260 `create_default_registry` +
+  `engine.attach_tools`] and AGAIN for the TaskScheduler's executor
+  [SOURCE: supervisor.py:325–365], so scheduled `send_message` actions run
+  through the SAME ToolExecutor — one execution authority.
+- Reachability: every registered tool is exposed both as a native tool
+  definition (dispatcher `_build_tool_definitions`) and as prompt text
+  (`_render_tool_schemas`). Provider tool calls are looked up by exact name;
+  unknown names return `not_found` [SOURCE: executor.py `_execute_single`].
+- Execution gating: READ_ONLY/READ_WRITE/DANGEROUS execute directly (owner
+  message = authorization in this single-owner bot, documented in
+  executor.py); ADMIN_ONLY/CONFIRMATION_REQUIRED return
+  `needs_confirmation` and never execute — this catches `settings_set`.
+- DANGEROUS delete tools re-verify every target as outgoing (owner-sent)
+  through `delete_service.delete_verified_self_messages` before deletion
+  [SOURCE: delete.py, semantic.py].
 
-**Persistence is not reached in this failure path.**
+---
 
-Source proof: branches 1–5 and (if reached) 6 all return before
-task.py:186–190, where `TaskCreationService` is constructed. Branch 5 — the
-confirmed active branch — returns at the interpreter wrapper. Corroborating
-log proof: `TaskCreationService.create` logs `TASK_CREATE_PERSIST_ATTEMPT`
-(task_creation.py:71–74) before any repository work, and the Phase 1
-Supabase task repository logs its own persistence events; none appear in the
-supplied production logs. Therefore `TaskRepository.create_task`, the Supabase
-insert, and the in-memory fallback were NOT involved, and no database failure
-can be inferred from the missing row.
+## 5. Implemented In Code But NOT Registered / NOT AI-Reachable
 
-## 7. MISSING PRODUCTION EVIDENCE
+| Capability | Location | Implemented | Registered as AI tool | Reachable by AI | Actual users | Status |
+|---|---|---|---|---|---|---|
+| Task management (list/inspect/pause/resume/complete/delete) | ai/task_management.py, ai/task_management_interface.py, bot/handlers/tasks.py, bot/handlers/taskloom.py | complete | ❌ | ❌ | `.task` text command + Taskloom Glass UI panel | IMPLEMENTED_NOT_REGISTERED |
+| Saved-item retrieval / forward to chat | services/retrieve_service.py (`do_retrieve` → `forward_messages`) | complete | ❌ | ❌ | retrieve Glass UI panel | IMPLEMENTED_NOT_REGISTERED |
+| Ghost Seen v2 (PV browser/viewer/auto-reply, privacy) | services/ghost_seen_v2.py + handlers/ghost_seen_v2.py | complete | ❌ | ❌ (engine used with `allow_tools=False`) | inline panels | IMPLEMENTED_NOT_REGISTERED |
+| Provider/model switching | bot/handlers/ai.py panels; web/app.py `/api/ai/provider`, `/api/ai/model` | complete | ❌ | ❌ | panels + dashboard | IMPLEMENTED_NOT_REGISTERED |
+| Trigger-word configuration | handlers/ai.py; web/app.py `/api/ai/triggers` | complete | ❌ | ❌ | panels + dashboard | IMPLEMENTED_NOT_REGISTERED |
+| Model availability tester / model discovery | ai/model_tester.py, ai/model_discovery.py | complete | ❌ | ❌ | panel + `/api/ai/test-models` | IMPLEMENTED_NOT_REGISTERED |
+| Memory write path (`store_long` / `store_permanent`) | ai/memory/manager.py, ai/database/memory_repository.py (`ai_memories`) | complete + tested | ❌ | ❌ read-only via prompt | **NO production caller — tests only** | HALF-BUILT (see §12) |
+| TelegramAPI.forward_messages | telegram_api/api.py, messages.py | complete | n/a | ❌ | retrieve_service only | IMPLEMENTED_NOT_REGISTERED (AI-orphaned) |
+| Web dashboard read/write API | web/app.py (GET /api/*, PATCH /api/settings, POST /api/ai/*) | complete | n/a | ❌ | React dashboard | IMPLEMENTED_NOT_REGISTERED (not AI) |
 
-The logs do not expose:
+---
 
-- the returned `ToolResult.message` — the fast-path result log at
-  dispatcher.py:1158–1161 prints only `tool` and `success`, unlike the
-  provider tool loop, which logs `AI_EXECUTION_ERROR ... error=%s`
-  (dispatcher.py:683–687);
-- the exception class / `TaskInterpretationError` cause swallowed at
-  task.py:117 (and, if branch 7 were ever active, the cause swallowed at
-  task.py:193);
-- the provider response outcome: `response.success`, `response.text`,
-  `metadata.provider_matrix` / `errors` from manager.py:157–198 / 830–868 —
-  needed to separate "provider returned failure" from "provider returned
-  unusable JSON (incl. the instructed `null`)".
+## 6. Outside Self Bot — External Capability Matrix
 
-Single sanitized log statement that would expose the missing information on
-the next run: inside the `except` at `backend/ai/tools/task.py:117`, one line
-logging the failure category and exception class only — e.g.
-`AI_EXEC_TRACE request_id=%s stage=create_task_interpret_failed category=%s`
-with category ∈ {provider_failure, provider_empty_output, candidate_invalid,
-timeout} derived from the `TaskInterpretationError.__cause__` / exception
-type — plus logging `er.message` (static tool message, no request text) in
-the fast-path `stage=tool_result` line at dispatcher.py:1160. No request
-text, message contents, tokens, or provider credentials would be emitted.
+### 6.1 AI providers (reasoning services)
 
-## 8. MINIMAL NEXT IMPLEMENTATION
+Factory registry [SOURCE: ai/providers/factory.py `_PROVIDER_CLASSES`]:
+`dummy`, `gemini`, `openai`, `openrouter`, `cerebras`, `mistral`, `groq`,
+`zai`, `sambanova`, `nvidia`, `cohere`, `siliconflow`, `fireworks`, `you`.
+Defaults additionally declare `claude`, `glm`, `custom` model names
+[SOURCE: providers/base/defaults.py] — no dedicated adapter class for these
+three; reachable only through config, no `_PROVIDER_CLASSES` entry.
 
-Smallest observability change (do NOT implement in this investigation):
+| Provider | Adapter | Endpoint | Auth (env) | Chat | Tools (function calling) | Fallback | AI-invokable | Status |
+|---|---|---|---|---|---|---|---|---|
+| gemini | native httpx | generativelanguage.googleapis.com/v1beta | AI_GEMINI_API_KEY / GEMINI_API_KEY | ✅ | ✅ (translates to functionDeclarations) | ✅ | ✅ (as reasoning engine) | EXTERNAL_CONNECTED (if key) |
+| openai | openai_compat | {base_url}/chat/completions | AI_OPENAI_API_KEY / OPENAI_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
+| openrouter | openai_compat | configurable base_url | AI_OPENROUTER_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
+| cerebras, mistral, groq, zai, sambanova, nvidia, cohere, siliconflow, fireworks | openai_compat | per-provider base_url | AI_<NAME>_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
+| dummy | local, no network | — | none | ✅ (honest failure) | ❌ | always registered | ✅ (reports "not configured") | FALLBACK_ONLY |
+| you (You.com Search) | native httpx | POST ydc-index.io/v1/search | YDC_API_KEY | ❌ (`NOT_IMPLEMENTED`, capability_kind=web_search) | ❌ | skipped for chat (`PROVIDER_SKIPPED reason=capability=web_search`) | ✅ via web_search tool only | EXTERNAL_CONNECTED (retrieval-only, if key) |
 
-1. In `backend/ai/tools/task.py::execute`, replace the bare
-   `except (TaskInterpretationError, asyncio.TimeoutError, Exception):` at
-   task.py:117 with a form that binds the exception and emits the single
-   sanitized category log described in §7 before returning the same
-   ToolResult message. Optionally do the same for the persistence `except`
-   at task.py:193.
-2. In `backend/ai/engine/dispatcher.py:1158–1161`, include the static tool
-   message (`er.message`) in the fast-path `stage=tool_result` log line.
+Facts that hold for every provider:
+- Providers ONLY receive messages + OpenAI-format tool schemas and MAY return
+  tool-call proposals. The Self Bot executes all tool calls
+  [SOURCE: dispatcher → ToolExecutor]. No provider can reach Telegram,
+  Supabase, the filesystem, or the owner.
+- Routing: active provider first, then all healthy providers scored by
+  capability × health × reliability; per-provider failure categories;
+  fallback-exhausted surfaced honestly; dummy never fakes success
+  [SOURCE: manager.py:102–215].
+- Configured-vs-available per provider CANNOT be established from this
+  workspace (env secrets intentionally unreadable). The runtime discovery
+  layer (`ai/discovery.py`) classifies available/detected/invalid/
+  not_configured and is exposed at `/api/ai/providers`. Marked per-key
+  status UNKNOWN by design.
 
-With those two lines, the next production occurrence distinguishes
-provider-failure vs unusable-output vs candidate-validation vs timeout
-immediately, from source-verified evidence rather than inference. No
-behavioral change is required for observability.
+### 6.2 Other external services
 
-## 9. OUT OF SCOPE
+| Service | Used for | Connected? | AI-invokable? | Status |
+|---|---|---|---|---|
+| Telegram MTProto (self account) | everything user-visible | ✅ | ✅ only through tools | EXTERNAL_CONNECTED |
+| Helper Bot (BOT_TOKEN) | Glass UI inline panels | optional; disabled-helper is a valid state | ❌ (UI only) | EXTERNAL_CONNECTED (optional) |
+| Supabase (SUPABASE_URL + service key) | 14 tables; full in-memory fallback | optional; fallback-safe | ✅ only through tools | EXTERNAL_CONNECTED (optional) |
+| You.com Search | web_search tool | key-dependent | ✅ via web_search | PARTIALLY_CONNECTED |
+| Hermes / workers / service mesh / orchestrator | — | **zero code references** [SOURCE: grep; DATABASE_ARCHITECTURE.md:1596 explicitly states Hermes is not in tree] | ❌ | EXTERNAL_NOT_CONNECTED / DOCUMENTED_ONLY |
+| GitHub | project workflow only (git remote); no runtime integration | n/a | ❌ | NOT AN AI CAPABILITY |
 
-This investigation does NOT implement:
+### 6.3 Outbound network map (AI-relevant)
 
-- AI-backed per-occurrence preparation
-- Phase 1 durable AI instruction representation
-- scheduler changes
-- occurrence state changes
-- Delete fix
-- timezone fix
-- provider redesign
-- database changes
-- Telegram changes
-- retry-engine changes
+| Destination | Initiator | AI chooses URL? | AI chooses method/headers/body? |
+|---|---|---|---|
+| 13 provider chat endpoints | provider adapters | No (config) | No — messages + tool schemas only |
+| ydc-index.io/v1/search | WebSearchTool → service → manager | Query only; URL fixed | No |
+| Telegram MTProto | TelegramAPI / services / scheduler | No (chat_id from trusted context) | No |
+| Supabase REST | db/client.py, AI repositories, config_store | No | No |
+
+**The AI has NO arbitrary HTTP capability.** Every outbound request from the
+AI path has a hard-coded destination and schema. httpx exists only in
+providers/discovery/ghost_seen and db client — never in ai/tools/
+[SOURCE: httpx call-site audit].
+
+---
+
+## 7. CURRENTLY CONNECTED
+
+Everything the AI can actually access/use today (all verified):
+
+1. `get_bio` — authoritative current Telegram bio (GetFullUserRequest →
+   `full_user.about`), delivered verbatim (no model rewrite round).
+2. `account_show` — identity fields only (first/last/full name, username);
+   phone and account ID are stripped by design.
+3. `list_recent_messages` — bounded (≤100) window of REAL chat messages,
+   all participants, chronological.
+4. `save` / `save_by_link` — Deep Save (download → re-upload as NEW Saved
+   Messages message), metadata persisted to `saved_items`.
+5. Five distinct delete tools — outgoing-only, re-verified, bounded
+   (≤500 / ≤100 IDs), 30s/10s caps, silent delivery on success.
+6. `search` / `list_saves` — owner-scoped saved-items queries.
+7. `database_stats` — saved-items aggregates + AI row counts.
+8. `settings_get` / `settings_set` — panel settings; set is
+   confirmation-gated (ADMIN_ONLY).
+9. `organize_list` / `organize_clean` — overview + bot_logs purge (>retention).
+10. Bio engine control: `bio_set_template/text/mood`, `bio_on`, `bio_off`,
+    `bio_show`.
+11. Username engine control: `username_set_template/text/mood`,
+    `username_on`, `username_off`, `username_show`.
+12. `web_search` — You.com Search (normalized results only), when
+    `YDC_API_KEY` is configured.
+13. `create_task` — durable natural-language scheduling (interval / once /
+    daily / weekly) persisted to `ai_tasks`; execution later via the single
+    TaskScheduler through the same ToolExecutor.
+14. `send_message` — text to the owner's own chat / task-creation chat;
+    destination always from trusted runtime context.
+15. Provider-independent execution of high-confidence command intents via
+    the deterministic fast path (works with all providers down).
+16. Reasoning engine: any configured chat provider with automatic fallback;
+    `dummy` guarantees an honest failure when nothing is configured.
+
+---
+
+## 8. IMPLEMENTED BUT NOT CONNECTED (to AI)
+
+1. **Task management** — list/inspect/pause/resume/complete/delete tasks
+   (`TaskManagementService` + `.task` command + Taskloom panel). The AI can
+   CREATE tasks but cannot see or manage them afterward.
+2. **Saved-item retrieval/forward** — `retrieve_service.do_retrieve` exists
+   (the only legitimate `forward_messages` user); no AI tool.
+3. **Ghost Seen v2** — complete PV browser/viewer/auto-reply automation with
+   its own privacy model; panel-only. (It consumes the AI engine internally
+   as a reasoning service with tools disabled.)
+4. **Provider/model switching + trigger config** — panels and dashboard API
+   only; no AI tool can change the active provider (correct: that is runtime
+   authority).
+5. **Model tester / discovery** — panel/dashboard only.
+6. **Memory write path** — `MemoryManager.store_long/store_permanent` and the
+   `ai_memories` repository are fully implemented and tested, but NO
+   production code ever calls the store methods (tests only). The prompt's
+   memory block therefore reads empty in production. HALF-BUILT.
+7. **TelegramAPI.forward_messages** — implemented in the facade; AI-orphaned
+   (retrieve-only).
+
+---
+
+## 9. NOT IMPLEMENTED / NOT CONNECTED
+
+Documented or architecturally expected but absent from code:
+
+1. **Hermes** — documented as an integration boundary
+   (DATABASE_ARCHITECTURE.md §24) which itself states the Hermes Runtime
+   document is not in the tree. Zero source references. DOCUMENTED ONLY.
+2. **Workers / service mesh / orchestrator** — no code. AI_MASTER_DESIGN's
+   "background workers" are in-process asyncio workers only.
+3. **Future tools from AI_MASTER_DESIGN §6.9** — `calendar_create`,
+   `calendar_list`, `tag_save`, `folder_move`, `notify`, `summarize`,
+   `translate`, `automation_create/list/toggle`: NOT IMPLEMENTED.
+   Of that list only `web_search` and `task_create` (as `create_task`) exist.
+   `task_list`/`task_cancel` exist as capability but as panel/command
+   features, not AI tools.
+4. **General web browsing** — no URL fetcher, no HTML reader, no file
+   downloader reachable by AI. `web_search` ≠ browsing.
+5. **Event-driven automations** — design-only.
+6. **`tool_request` field on AIRequest** — declared "future", always empty.
+7. **Voice/audio input** — explicitly non-goal today.
+
+---
+
+## 10. Deterministic (Non-AI) Self Bot Capabilities
+
+The Self Bot executes these WITHOUT any AI involvement:
+
+1. `Menu` command → Glass UI mother panel (helper bot inline or text
+   fallback).
+2. All Glass UI panels: Save (Deep Save reply/link), Retrieve, Delete,
+   List, Find, Database, AI config, Taskloom, Profile (Bio/Username),
+   Settings/General, Context, Health.
+3. Profile engines: shared minute-boundary scheduler updates `about` /
+   `first_name` from templates when enabled (boot flags or bio_on/username_on).
+4. TaskScheduler: minute wake → `list_due_tasks` → occurrence claim →
+   bounded action execution via TaskExecutionCoordinator → notifications.
+5. RuntimeSupervisor: connection lifecycle, heartbeat (30s), keepalive,
+   failsafe, reconnect/rebuild with cooldown and recovery lock.
+6. Deterministic fast path: status queries, last-N delete/review,
+   save/delete-by-reply, save-by-link, deterministic task creation — all
+   executed with zero provider rounds.
+7. Web dashboard API and React SPA.
+8. Helper-bot inline rendering, input listeners, panel state.
+
+---
+
+## 11. Requires Self Bot as Final Execution Authority
+
+Everything user-visible. Concretely:
+
+- All 32 registered tools (ToolExecutor is the sole `tool.execute()` caller).
+- All Telegram RPC (only TelegramAPI facade/services/scheduler touch Telethon).
+- All Supabase access (only db/client.py and AI repositories).
+- All provider HTTP (only provider adapters).
+- Task actions (TaskScheduler → ToolExecutor → send_message).
+- Provider tool-call proposals are executed ONLY after local validation
+  (`parse_action_text` / `TaskCandidate.from_untrusted` / permission gates).
+
+---
+
+## 12. AI Can Reason About But Cannot Execute
+
+1. Managing existing tasks (the model may discuss a task it just created but
+   has no tool to list/pause/cancel it).
+2. Retrieving/re-sending saved items to chats.
+3. Ghost Seen operations (the AI engine is used BY Ghost Seen; the chat AI
+   cannot operate Ghost Seen).
+4. Switching providers/models or editing triggers.
+5. Writing to its own memory (read path exists; write path has no caller).
+6. Browsing arbitrary URLs / fetching files.
+7. Message editing (`TelegramAPI.edit_message` has no AI tool), message
+   search in chats (`search_messages`), media download (`download_media` —
+   internal to save), dialogs listing (only inside create_task chat-name
+   resolution), forwarding.
+8. Anything outside the 32-tool allowlist — unknown tool names return
+   `not_found`, never execution.
+
+---
+
+## 13. Security / Execution-Authority Findings
+
+Architectural rule under audit: AI reasons and proposes; the Self Bot is the
+execution authority. Verification results:
+
+| Check | Result | Status |
+|---|---|---|
+| Arbitrary Telegram RPC from AI | No path exists; tools → facade/services only | SAFE |
+| Arbitrary SQL from AI | No SQL surface in tools; table names hard-coded in repos | SAFE |
+| Arbitrary shell/process/filesystem from AI | No `subprocess`/`eval`/`exec`/env reads in ai/tools [SOURCE: grep exit=1] | SAFE |
+| Arbitrary external API from AI | None; destinations hard-coded | SAFE |
+| Unrestricted tool dispatch | Registry fixed at startup; exact-name lookup; `MAX_TOOLS_PER_TURN=5`; `MAX_TOOL_ROUNDS=3` | SAFE |
+| Unrestricted Telegram access | Delete tools re-verify outgoing ownership; send destination from trusted context only; account fields allowlisted | SAFE |
+| ADMIN_ONLY / CONFIRMATION_REQUIRED | Honored (`settings_set` never auto-executes) | SAFE |
+| Credential exposure to AI | None; ToolContext carries facade/owner/tz only | SAFE |
+| Provider trust boundary | Provider output never executed directly; parsed/validated first | SAFE |
+| Cross-owner DB access | Single-owner; owner-scoped queries | CONTROLLED |
+| DANGEROUS tools auto-execute | Documented single-owner design: owner message = authorization; destructive tools enforce deterministic args + bounded deadlines | CONTROLLED |
+| `database_stats` is READ_ONLY but writes one `bot_logs` diagnostics row | Side effect in a read-classified tool (log write, not data mutation) | POTENTIAL GAP (cosmetic) |
+| `get_dialogs` inside create_task chat-name resolution | Reads the dialog list into the tool layer for name matching; only id/title/username used; bounded clarification output | CONTROLLED |
+| Non-verbatim read tools still pass through a continuation provider round | Model may paraphrase tool results (e.g. list_saves) — bounded by the real-result fallback, but not verbatim like `get_bio` | CONTROLLED |
+| Provider capability boundary | Providers are external reasoning services; they cannot reach Telegram/Supabase/filesystem | SAFE |
+
+**No violation of the execution-authority boundary was found.** The two
+"POTENTIAL GAP (cosmetic)" entries are semantic classification notes, not
+exploitable paths.
+
+---
+
+## 14. Gaps / Blockers
+
+1. **Task lifecycle asymmetry** — AI can create tasks but not list, inspect,
+   pause, resume, or delete them. `TaskManagementService` exists and would
+   need only thin, permission-mapped tools.
+2. **Memory loop incomplete** — nothing ever writes memories, so the prompt's
+   memory section is dead weight in production; either wire writes (with
+   bounded scope) or remove the read.
+3. **web_search key dependency** — capability silently absent without
+   `YDC_API_KEY`; discovery shows it, but the AI experiences a hard tool
+   failure with no alternative retrieval path.
+4. **No saved-item retrieval tool** — retrieve exists panel-side only.
+5. **Under-tested tools** — `bio_set_*`, `username_set_*`, `bio_on/off`,
+   `username_on/off`, `settings_get/set`, `organize_*` have no direct
+   tool-level tests (service-level tests exist).
+6. **Documentation drift** — AI_MASTER_DESIGN still describes `.menu` and
+   lists future tools as if near-term; AGENTS.md is the accurate current
+   description.
+7. **Provider key visibility** — per-provider availability is unknowable
+   from the repository; operators must consult `/api/ai/providers` or Render
+   logs.
+
+---
+
+## 15. Recommended Next Steps (evidence-based; NOT implemented here)
+
+1. Add thin `task_list` / `task_pause` / `task_resume` / `task_cancel` AI
+   tools wrapping `TaskManagementService` (the service is already the
+   authority used by `.task`); keep delete-style confirmation semantics.
+2. Decide the memory loop: wire `store_long/store_permanent` behind a
+   bounded, explicit mechanism (tool or automatic summarizer), or remove the
+   always-empty memory block from the prompt.
+3. Consider a `retrieve_save` tool wrapping `do_retrieve` with destination
+   limited to the owner's chat (same trusted-destination rule as
+   `send_message`).
+4. Add direct tool-level tests for the 12 under-tested tools.
+5. Reconcile AI_MASTER_DESIGN §6.9 and the `.menu` references with current
+   reality (`Menu`, 32 tools, Taskloom).
+6. Cosmetic: reclassify `database_stats`' bot_logs write or move diagnostics
+   logging out of the read path.
+7. Optional: extend `_VERBATIM_READ_TOOLS` to other deterministic read tools
+   (e.g. `list_saves`, `settings_get`) if verbatim delivery is desired —
+   note this changes response style, so it is a product decision.
+
+---
+
+## 16. Limitations / Not Actually Verified
+
+1. **Per-provider key configuration** — cannot be verified from this
+   workspace by design (env secrets unreadable). Status per provider is
+   code-verified; configuration status is UNKNOWN-by-environment, not
+   UNKNOWN-by-absence-of-evidence: the runtime classification mechanism
+   (`discovery.py`, `/api/ai/providers`) exists and is the authority.
+2. **Live Telegram / live Supabase / live provider calls** — none were
+   performed (audit-only). All connectivity claims are source-verified plus
+   test-suite-verified, not live-verified.
+3. **Deployed-environment behavior** — Render logs were not available for
+   this audit; production health claims are out of scope.
+4. **Untracked nested clone** `telegram-self-bot/` — pre-existing, not part
+   of this audit, untouched.
+
+---
+
+## 17. Final Git Delivery Record
+
+| Field | Value |
+|---|---|
+| Files changed for this investigation | INVESTIGATION.md only |
+| Commit | see push verification below |
+| Push | see push verification below |
+| Local HEAD | see push verification below |
+| Remote HEAD | see push verification below |
+| Verification method | `git ls-remote origin main` after push; remote HEAD must equal local HEAD |
+
+(Values are filled by the delivery step of this investigation; a commit SHA
+alone is not proof of delivery.)
