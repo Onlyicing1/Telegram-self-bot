@@ -117,6 +117,14 @@ class TelegramAPI:
     async def get_me(self) -> dict[str, Any]:
         return await entities.get_me(self._client)
 
+    async def get_bio(self) -> str:
+        """Return the current account's bio ('about') text.
+
+        Uses the authoritative full-profile source (GetFullUser), not the
+        basic ``get_me`` user object, and returns ONLY the bio text.
+        """
+        return await entities.get_bio(self._client)
+
     async def get_dialogs(self, limit: int = 100) -> list[dict[str, Any]]:
         return await entities.get_dialogs(self._client, limit)
 

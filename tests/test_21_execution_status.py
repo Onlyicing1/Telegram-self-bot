@@ -456,12 +456,8 @@ async def test_get_bio_reads_real_telegram_bio():
     from backend.ai.tools.context import ToolContext
 
     class FakeTelegram:
-        async def get_me(self):
-            return {
-                "first_name": "Ali", "username": "alirezaei",
-                "phone": "989120000000", "id": 999,
-                "about": "🕒 LifeOS | 💭 همیشه بهروز",
-            }
+        async def get_bio(self):
+            return "🕒 LifeOS | 💭 همیشه بهروز"
 
     ctx = ToolContext(telegram=FakeTelegram(), owner_id=1, tz_str="UTC")
     result = await BioGetTool(ctx).execute(ctx, {})
@@ -471,8 +467,6 @@ async def test_get_bio_reads_real_telegram_bio():
     # Data minimization: ONLY the bio is returned — never phone/id/username.
     assert result.data == {"bio": "🕒 LifeOS | 💭 همیشه بهروز"}
     assert "phone" not in result.message.lower()
-    assert "989120000000" not in result.message
-    assert "999" not in result.message
 
 
 @pytest.mark.asyncio
@@ -481,8 +475,8 @@ async def test_get_bio_empty_and_missing_telegram():
     from backend.ai.tools.context import ToolContext
 
     class EmptyTelegram:
-        async def get_me(self):
-            return {"about": None, "id": 1}
+        async def get_bio(self):
+            return ""
 
     ctx = ToolContext(telegram=EmptyTelegram(), owner_id=1, tz_str="UTC")
     result = await BioGetTool(ctx).execute(ctx, {})
@@ -492,3 +486,21 @@ async def test_get_bio_empty_and_missing_telegram():
     no_tg = ToolContext(telegram=None, owner_id=1, tz_str="UTC")
     result = await BioGetTool(no_tg).execute(no_tg, {})
     assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_get_bio_failure_is_not_reported_as_empty_bio():
+    from backend.ai.tools.bio import BioGetTool
+    from backend.ai.tools.context import ToolContext
+
+    class FailingTelegram:
+        async def get_bio(self):
+            raise RuntimeError("RPC down")
+
+    ctx = ToolContext(telegram=FailingTelegram(), owner_id=1, tz_str="UTC")
+    result = await BioGetTool(ctx).execute(ctx, {})
+
+    # A failed Telegram retrieval must NEVER be hidden as "Bio: —".
+    assert result.success is False
+    assert "RPC down" in result.message
+    assert result.data is None or result.data == {} or not (result.data or {}).get("bio")

@@ -9,6 +9,8 @@ import asyncio
 import logging
 from typing import Any
 
+from telethon import functions
+
 from backend.runtime.operation_watchdog import guarded_await
 from backend.telegram_api._helpers import serialize_chat, serialize_user
 from backend.telegram_api.exceptions import (
@@ -90,6 +92,36 @@ async def get_me(client: Any) -> dict[str, Any]:
         if isinstance(exc, TelegramAPIError):
             raise
         raise TelegramAPIError(f"get_me failed: {exc}") from exc
+
+
+async def get_bio(client: Any) -> str:
+    """Retrieve the current account's bio via the full-profile request.
+
+    Telethon's basic ``get_me()`` User object is not the authoritative
+    source for the 'about' field; ``GetFullUserRequest`` is. This extracts
+    ONLY ``full_user.about`` — no other profile data crosses this layer.
+    """
+    try:
+        me = await guarded_await(
+            client.get_me(),
+            name="telegram:get_bio:me",
+            timeout=_RPC_TIMEOUT,
+        )
+        if me is None:
+            raise TelegramAPIError("get_bio: self account is not available")
+        full = await guarded_await(
+            client(functions.users.GetFullUserRequest(me)),
+            name="telegram:get_bio:full",
+            timeout=_RPC_TIMEOUT,
+        )
+        about = getattr(getattr(full, "full_user", None), "about", None)
+        return about or ""
+    except asyncio.TimeoutError:
+        raise TelegramTimeoutError(f"get_bio timed out after {_RPC_TIMEOUT}s")
+    except TelegramAPIError:
+        raise
+    except Exception as exc:
+        raise TelegramAPIError(f"get_bio failed: {exc}") from exc
 
 
 async def get_dialogs(client: Any, limit: int = 100) -> list[dict[str, Any]]:

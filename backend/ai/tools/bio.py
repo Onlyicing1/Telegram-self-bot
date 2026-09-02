@@ -236,8 +236,9 @@ class BioGetTool(Tool):
     """Read the CURRENT Telegram bio (the account's actual 'about' text).
 
     This is the real bio retrieval operation: it reads the authenticated
-    self account through ``TelegramAPI.get_me()`` and returns ONLY the bio
-    text — never engine config, phone, account ID, or other metadata.
+    self account through ``TelegramAPI.get_bio()`` — the authoritative
+    ``GetFullUserRequest`` full-profile source — and returns ONLY the bio
+    text: never engine config, phone, account ID, or other metadata.
     """
 
     def __init__(self, context: ToolContext) -> None:
@@ -276,16 +277,14 @@ class BioGetTool(Tool):
             return ToolResult(success=False, message="Telegram is not available.")
 
         try:
-            me = await context.telegram.get_me()
+            bio = await context.telegram.get_bio()
         except Exception as exc:
+            # A failed retrieval is NEVER reported as an empty bio.
             return ToolResult(success=False, message=f"Could not read the bio: {exc}")
-
-        if not me:
-            return ToolResult(success=False, message="Bio is unavailable.")
 
         # Data minimization: only the bio itself is returned — never phone,
         # account ID, session, or other account metadata.
-        bio = (me.get("about") or "").strip()
+        bio = (bio or "").strip()
         if not bio:
             return ToolResult(success=True, message="📝 Bio: —", data={"bio": ""})
         return ToolResult(success=True, message=f"📝 Bio: {bio}", data={"bio": bio})
