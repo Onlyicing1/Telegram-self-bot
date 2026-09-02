@@ -761,6 +761,28 @@ _BIO_STEMS = ("بیو", "بایو")
 _BIO_QUERY_WORDS = frozenset({
     "الان", "الانم", "حالا", "فعلی", "فعلیم", "فعلیه", "my", "من", "now",
 })
+# Fused pronoun show-forms: Persian attaches the object pronoun directly to
+# the verb ("نشونم بده" = نشون + م, "show me"), producing single tokens that
+# never equal the plain "نشون" in _STATUS_WORDS. Stem-matching with the
+# trailing clitic stripped keeps "بیو رو نشونم بده" deterministic instead of
+# sending it to the provider (where the result was hallucinated/stylized).
+_BIO_SHOW_VERB_STEMS = ("نشون", "نمایش")
+_PRONOUN_CLITICS = ("مون", "تون", "شون", "مان", "تان", "شان", "م", "ت", "ش")
+
+
+def _is_show_verb_token(tok: str) -> bool:
+    """True for a show verb, bare or with a trailing pronoun clitic.
+
+    Matches نشون / نمایش (+ optional م/ت/ش/مون/تون/شون/مان/تان/شان) so
+    "نشونم", "نمایشش", and plain "نشون" all count as show verbs. Only
+    meaningful when a bio word is also present (checked by the caller).
+    """
+    for stem in _BIO_SHOW_VERB_STEMS:
+        if tok == stem or tok.startswith(stem):
+            remainder = tok[len(stem):]
+            if not remainder or remainder in _PRONOUN_CLITICS:
+                return True
+    return False
 
 
 def _has_bio_mention(words: list[str]) -> bool:
@@ -1073,11 +1095,15 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
         )
 
     # Bio retrieval: "وضعیت بایو چیه", "بیوم الان چیه؟", "بیوی فعلیم",
-    # "what is my bio?", "current bio", "my bio". This reads the ACTUAL
-    # Telegram bio via get_bio — never a hallucinated or engine-state value.
-    # It runs BEFORE the account branch so "بیو اکانتم رو بگو" resolves to
-    # bio retrieval, not account identity.
-    if _has_bio_mention(words) and ((wordset & _STATUS_WORDS) or (wordset & _BIO_QUERY_WORDS)):
+    # "بیو رو نشونم بده", "what is my bio?", "current bio", "my bio". This
+    # reads the ACTUAL Telegram bio via get_bio — never a hallucinated or
+    # engine-state value. It runs BEFORE the account branch so
+    # "بیو اکانتم رو بگو" resolves to bio retrieval, not account identity.
+    if _has_bio_mention(words) and (
+        (wordset & _STATUS_WORDS)
+        or (wordset & _BIO_QUERY_WORDS)
+        or any(_is_show_verb_token(w) for w in words)
+    ):
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action="get_bio",

@@ -42,13 +42,18 @@ from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
 from backend.ai.runtime.manager import ConversationManager
 from backend.ai.session.request import AIRequest
-from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.executor import ToolExecutor, ToolExecutionResult
 from backend.ai.tools.registry import ToolRegistry, create_default_registry
 from backend.ai.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 3
+
+# Deterministic READ tools whose successful results are authoritative and
+# must be delivered to the user EXACTLY as the tool produced them — never
+# re-interpreted, stylized, or replaced by a continuation provider round.
+_VERBATIM_READ_TOOLS = frozenset({"get_bio"})
 
 
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
@@ -697,6 +702,24 @@ class Dispatcher:
                 # directly — it never needs a continuation provider round.
                 if structured_action:
                     response = replace(response, tool_calls=[], text="")
+                    break
+
+                # Verbatim read-authority: a native tool-call round that
+                # executed ONLY deterministic read tools must return the
+                # real tool results exactly — a continuation round lets the
+                # model paraphrase, stylize, or hallucinate the value
+                # (production: a real bio was regenerated as unrelated text).
+                # Same contract as the structured-action path above.
+                if self._read_results_authoritative(response.tool_calls, exec_results):
+                    logger.info(
+                        "AI_EXEC_TRACE id=%s stage=verbatim_tool_result tools=%s",
+                        rid or "-", [er.tool_name for er in exec_results],
+                    )
+                    response = replace(
+                        response,
+                        tool_calls=[],
+                        text=self._summarize_tool_results(all_tool_results),
+                    )
                     break
             except Exception as exc:  # noqa: BLE001
                 round_execution_failed = True
@@ -1439,6 +1462,33 @@ class Dispatcher:
         if not queries or any(not query for query in queries):
             return False
         return bool(prior_results.intersection(queries))
+
+    @staticmethod
+    def _read_results_authoritative(
+        tool_calls: list[dict[str, Any]],
+        exec_results: list["ToolExecutionResult"],
+    ) -> bool:
+        """True when the round executed only successful deterministic READ
+        tools whose results must reach the user verbatim.
+
+        The tool result is authoritative data, not a suggestion: for these
+        tools the dispatcher skips the continuation provider round entirely
+        so the model can never paraphrase, stylize, or replace the value.
+        Any failure, any additional tool in the round, or any unknown tool
+        keeps the normal continuation behavior.
+        """
+        if not tool_calls or not exec_results:
+            return False
+        if len(tool_calls) != len(exec_results):
+            return False
+        for call, er in zip(tool_calls, exec_results):
+            if call.get("name") != er.tool_name:
+                return False
+            if er.tool_name not in _VERBATIM_READ_TOOLS:
+                return False
+            if not er.success:
+                return False
+        return True
 
     @staticmethod
     def _summarize_tool_results(results: list[dict[str, Any]]) -> str:
