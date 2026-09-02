@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -57,6 +58,17 @@ async def test_authorized_request_interprets_then_persists_and_edits_in_place():
     assert create.await_count == 1
     assert "✅ Created" in event.edits[-1]
     assert len(event.edits) == 2
+
+
+@pytest.mark.asyncio
+async def test_management_commands_are_available():
+    source = Path("backend/bot/handlers/tasks.py").read_text()
+    assert "_MANAGEMENT_COMMANDS" in source
+    assert "TaskManagementService" in source
+    assert "list_text" in source
+    assert "inspect_text" in source
+    assert "expected_version" not in source
+    assert "getattr(service, command)" in source
 
 
 @pytest.mark.asyncio
