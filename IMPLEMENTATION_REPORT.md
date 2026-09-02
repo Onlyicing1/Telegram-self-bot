@@ -6,7 +6,7 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Prior HEAD before this fix | `603a52f14f75e68034e4190621436b02cf8736dc` |
+| Prior HEAD before this fix | `f38357a900830420243ddab954d8ad003ca39d77` |
 | Implementation/report commit | see "Final Git Delivery Record" below |
 | Local HEAD | see "Final Git Delivery Record" below |
 | `origin/main` | see "Final Git Delivery Record" below |
@@ -14,7 +14,89 @@
 
 ## Current Implementation State
 
-**IMPLEMENTED (tool-round-limit fix)** — "⚠️ Tool round limit reached — N
+**IMPLEMENTED (create_task candidate-contract fix)** — the production failure
+
+```
+TASK_INTERPRET_REJECTED reason=candidate_invalid
+detail=each action requires a tool name
+AI_TASK_TRACE stage=interpretation_failed category=candidate_invalid
+AI_TASK_TRACE stage=create_task_failed failed_stage=create_task_interpretation
+```
+
+for a provider-VALID JSON candidate (request: "یه تسک بساز هر سه دقیقه بگو
+پری کوچولو هستم") is fixed. The task now persists and is immediately
+discoverable by `TaskScheduler`.
+
+### Exact defect
+
+The provider-facing contract and the validator disagreed about the shape of
+a scheduled action:
+
+- `TaskInterpreter.CANDIDATE_SCHEMA` (`backend/ai/task_interpreter.py`)
+  declared `"actions": {"type": "array", "maxItems": 5}` — a bare array with
+  **no item schema**. The model was never told an action must be
+  `{"name": ..., "arguments": ...}`.
+- `TaskCandidate.from_untrusted` (`backend/ai/task_candidate.py`) requires
+  exactly that shape and raises `each action requires a tool name` otherwise.
+- Models commonly emit action objects keyed `tool`/`parameters` (the same
+  aliases `TaskExecutionCoordinator` already accepts at execution time), so
+  a semantically valid candidate was rejected before persistence —
+  `persisted=false`, no `ai_tasks` row, nothing for the scheduler to run.
+
+This is a contract mismatch, NOT a scheduler or provider-routing problem:
+the provider responded successfully (stage `provider_response success=true
+output_category=json response_length=224`), and the rejection happened in
+the deterministic parse/validate layer between provider response and
+persistence.
+
+### Root-cause fix (behavior changes)
+
+1. **Schema now declares the action-object contract**
+   (`backend/ai/task_interpreter.py`): `actions` items are typed as
+   `{"name": string, "arguments": object}` with `minItems: 1` and
+   `additionalProperties: false`, and the system prompt adds an explicit
+   ACTION OBJECT CONTRACT instruction with an example. The model is now told
+   the exact shape the validator requires.
+2. **Validator normalizes the aliases the execution layer already accepts**
+   (`backend/ai/task_candidate.py`): before the strict checks, an action
+   object using `tool` for `name`, or `parameters`/`args` for `arguments`,
+   is normalized to `{name, arguments}`; a candidate carrying a singular
+   `action` key (instead of `actions`) is normalized to `actions`. All
+   existing validation still runs unchanged afterwards — malformed actions,
+   unsendable message content, unknown fields, oversized payloads, and
+   invalid schedules are rejected exactly as before. No safety validation
+   was weakened: the canonical persisted form is still the single bounded
+   `send_message{text}` action, and execution still resolves only registered
+   tools.
+3. **Honest parse-error surfacing** (`backend/ai/task_interpreter.py`):
+   `_load_candidate_json` now re-parses without fences so a real
+   `JSONDecodeError` propagates (a bare `raise` previously surfaced as a
+   generic `RuntimeError` and hid the parse failure).
+
+### Structured diagnostics added (all request-correlated, nothing sensitive)
+
+| Stage | Where | Fields |
+|---|---|---|
+| `candidate_rejected` | TaskInterpreter | reason, candidate_type, action_count, action_field_names, schedule_type (structural only) |
+| `candidate_parsed` | TaskInterpreter | candidate_type, action_count, action_field_names, schedule_type, timezone, destination_keys |
+| `create_task_normalized` | CreateTaskTool | schedule_type, action_count, action_names, timezone, destination_scope (chat/owner) |
+| `create_task_persist_failure` | CreateTaskTool | category=repository_failure, exception, bounded detail |
+
+### Persistence + scheduler verification
+
+The end-to-end path is proven by test with the REAL interpreter, tool,
+creation service, in-memory task repository, and scheduler (scripted
+provider, no network): an alias-shaped provider candidate for the exact
+production request persists a task with `owner_id` set, `schedule_type=
+interval`, `schedule.seconds=180`, the canonical `send_message{text}`
+action, `status=active`, and a computed `next_run_at`; `TaskScheduler
+.run_once(next_run_at)` then creates the occurrence, executes the action
+snapshot, and advances `next_run_at` — i.e. a newly persisted task is
+discoverable by the scheduler's normal `list_due_tasks` wake with no refresh
+or restart. `parse_schedule`/repository ownership/CAS-version semantics are
+unchanged and still covered by the existing suites.
+
+### Delivered earlier: tool-round-limit fix — "⚠️ Tool round limit reached — N
 pending tool call(s) were not executed" can no longer silently discard valid
 tool calls. `MAX_TOOL_ROUNDS` (3, `backend/ai/engine/dispatcher.py`) still
 bounds PROVIDER continuation rounds, but when the loop terminates on a fresh
@@ -248,7 +330,40 @@ logs without reading the database.
 
 ## Tests Actually Executed
 
-### This fix (tool-round limit) — new/updated in `tests/test_11_runtime_wiring.py`
+### This fix (candidate contract) — new file `tests/test_task_candidate_contract.py` (11 tests)
+
+- `test_alias_shaped_action_is_normalized_and_accepted` — a `{tool,
+  parameters}` action normalizes to `{name, arguments}` and passes.
+- `test_singular_action_alias_is_normalized_and_accepted` — a `action` key
+  (singular) is promoted to `actions` before the exact field-set check.
+- `test_args_alias_is_normalized_and_accepted` — `args` normalizes to
+  `arguments`.
+- `test_genuinely_malformed_actions_are_still_rejected` — non-dict actions,
+  blank names, and empty lists still raise `TaskCandidateError`.
+- `test_unsendable_action_content_is_still_rejected` — blank/whitespace
+  message text is still rejected.
+- `test_provider_schema_declares_the_action_object_contract` — the shipped
+  schema items require exactly `name` + `arguments` with `minItems: 1`.
+- `test_provider_alias_output_yields_valid_candidate` — the REAL
+  `TaskInterpreter` + `ProviderManager` with a scripted provider returning
+  the production-shaped candidate yields a valid `TaskCandidate` with the
+  canonical `send_message{text}` action (Persian production request).
+- `test_interpreter_prompt_states_the_action_object_contract` — the prompt
+  the provider receives states the `{'name': …, 'arguments': …}` contract
+  and embeds the actions item schema.
+- `test_unfixable_candidate_still_rejected_without_persistence` — a truly
+  malformed action still raises `TaskInterpretationError` caused by
+  `TaskCandidateError` (no persistence).
+- `test_alias_candidate_persists_and_is_discoverable_by_scheduler` — the
+  full pipeline (tool → interpreter → creation service → repository →
+  scheduler): task persists with owner 777, interval 180s, canonical action,
+  active status, computed `next_run_at`; `TaskScheduler.run_once()` at
+  `next_run_at` creates the occurrence with the action snapshot, advances
+  `next_run_at`, and returns `processed >= 1`.
+- `test_interpretation_failure_still_reports_persisted_false` — JSON `null`
+  provider output still fails the tool with no task persisted.
+
+### Earlier: tool-round limit — `tests/test_11_runtime_wiring.py`
 
 - `test_pending_calls_are_executed_at_round_limit_not_discarded` — 4th
   pending call after 3 rounds executes exactly once
@@ -294,10 +409,10 @@ Results (actually run):
 
 | Suite | Result |
 |---|---|
-| `tests/test_11_runtime_wiring.py` (incl. 3 new round-limit tests) | **21 passed** |
-| Tool + task suites (test_10_tool_calls, test_11_runtime_wiring, nl_creation, repository, scheduler, execution, management, creation_diagnostics) | **94 passed** |
-| Full suite `python3 -m pytest tests/ -q --no-header` | **1254 passed, 23 skipped, 1 warning** |
-| `python3 -m compileall -q backend tests` | **passed** |
+| `tests/test_task_candidate_contract.py` (new, 11 tests) | **11 passed** |
+| Task suites (stage11 candidate, stage12 interpreter, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom milestone/ui, management) | **109 passed** |
+| Full suite `python3 -m pytest tests/ -q` | **1265 passed, 23 skipped, 1 warning** |
+| `python3 -m py_compile` on all three modified backend files | **passed** |
 | `git diff --check` | **passed** |
 
 ## Live Verification Status
@@ -316,8 +431,12 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 | File | Why |
 |---|---|
-| `backend/ai/engine/dispatcher.py` | THIS FIX: execute pending-but-unexecuted tool calls once at the round limit; never re-execute executed calls; never salvage failed/executor-less rounds; full disposition logging (`AI_TOOL_ROUND_LIMIT`, `AI_TOOL_PENDING_EXEC_*`, `AI_TOOL_LOOP_END`) |
-| `tests/test_11_runtime_wiring.py` | 3 new round-limit tests; old discard-semantics exhaustion test replaced |
+| `backend/ai/task_interpreter.py` | THIS FIX: CANDIDATE_SCHEMA now declares the exact `{name, arguments}` action-object contract (`minItems: 1`, `additionalProperties: false`); system prompt states the ACTION OBJECT CONTRACT with an example; structural `candidate_rejected` / `candidate_parsed` traces; honest JSONDecodeError surfacing in `_load_candidate_json` |
+| `backend/ai/task_candidate.py` | THIS FIX: `from_untrusted` normalizes the field-name aliases models actually emit (`tool`→`name`, `parameters`/`args`→`arguments`, singular `action`→`actions`) BEFORE the strict checks; all safety validation unchanged after normalization |
+| `backend/ai/tools/task.py` | THIS FIX: `create_task_normalized` trace (schedule type, action names, destination scope) and `create_task_persist_failure` diagnostic on repository failure |
+| `tests/test_task_candidate_contract.py` | NEW: 11 focused regression tests covering the contract, real interpreter/tool/repository/scheduler path |
+| `backend/ai/engine/dispatcher.py` | (earlier) tool-round-limit fix: pending calls executed once at the limit |
+| `tests/test_11_runtime_wiring.py` | (earlier) 3 new round-limit tests; discard-semantics test replaced |
 | `backend/ai/tools/task.py` | (earlier) Staged `TASK_CREATE_TRACE` logging for every create_task stage and failure branch |
 | `backend/ai/task_interpreter.py` | (earlier) `TASK_INTERPRET_TRACE` provider-result and rejection-category logging |
 | `backend/ai/task_creation.py` | (earlier) `TASK_PERSIST_TRACE` validation/repository logging incl. `repo_type` visibility |
@@ -325,43 +444,50 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 ## Intentionally Untouched Files
 
-- `backend/ai/database/task_repository.py` - no change needed; existing
-  fallback warnings retained, `repo_type` surfaces the class from the
-  service layer.
-- No migrations, SQL, Supabase schema, configuration, or provider code were
-  changed by this fix. `task_scheduler.py`, `RuntimeSupervisor`, Telethon
-  connection loops, and provider routing were all left untouched.
-- `backend/ai/engine/dispatcher.py` was NOT touched by the earlier tracing
-  work (it already injected `request_id`); it IS the file changed by this
-  tool-round-limit fix (see Files Changed).
+- `backend/ai/task_scheduler.py`, `backend/ai/task_execution.py`,
+  `backend/ai/task_creation.py`, `backend/ai/database/task_repository.py` —
+  source-verified correct for this defect: the scheduler discovers tasks via
+  `list_due_tasks` on every wake (`run_once`), so no refresh/restart is
+  needed, and the repository/schedule/ownership contracts already supported
+  the persisted task. No scheduler change was made for the long-lived
+  `wait_for` at `task_scheduler.py:171` — that is the legitimate idle wake
+  interval, not a stall.
+- No migrations, SQL, Supabase schema, configuration, or provider-routing
+  code were changed by this fix. `RuntimeSupervisor`, Telethon connection
+  loops, and diagnostics were left untouched.
 
 ## Known Remaining Limitations
 
 - The interpreter's provider call goes through `ProviderManager.chat`, so
   per-provider attempt/failure detail still comes from the existing
   `ROUTER_SELECTED` / `AI_PROVIDER_ATTEMPT` / `AI_PROVIDER_FAILURE` lines —
-  `TASK_INTERPRET_TRACE` adds the interpreter-level outcome on top, not a
+  the task traces add the interpreter-level outcome on top, not a
   replacement.
 - Trace lines are INFO level; they appear in Render logs only when the
   deployment's log level is INFO or lower (the deployed default).
-- Live Telegram/Supabase integration was not possible in this environment.
+- Live Telegram/Supabase integration was not possible in this environment;
+  persistence and scheduler discovery are proven against the real
+  `InMemoryTaskRepository` + `TaskScheduler` in tests.
+- The alias tolerance is intentionally narrow (three field-name aliases the
+  codebase already accepts elsewhere). A provider that ignores the schema
+  entirely still fails validation safely — by design.
 
 ## Final Git Delivery Record
 
-- Prior commits (verified on `origin/main`): `6566ea7`
-  (AI_TASK_TRACE lifecycle observability), `916165b` (complete
-  create_task execution tracing), `49f9422` (trace correlation across
-  provider and persistence layers), `09319c5` (stage13 management-command
-  test coverage), `4247897` (verified delivery-state report).
-- Tool-round-limit fix commit: `481b82288dc19582416835388be43c3c90f7409b`
-  (`fix: execute pending tool calls at the round limit instead of
-  discarding them`) — push output `4247897..481b822 main -> main`, exit 0.
-- Commit SHA (delivery HEAD): see the record-refresh commit below this
-  entry (docs-only update of this record; the fix itself is `481b822`).
+- Prior commits (verified on `origin/main`): `481b822` (tool-round-limit
+  fix), `f38357a` (verified delivery record), `6566ea7` (AI_TASK_TRACE
+  lifecycle observability), `916165b` (complete create_task execution
+  tracing), `49f9422` (trace correlation across provider and persistence
+  layers), `09319c5` (stage13 management-command test coverage),
+  `4247897` (verified delivery-state report).
+- THIS FIX commit: see the record-refresh commit below this entry; the
+  implementation is contained in the single delivery commit pushed to
+  `main` (files: `backend/ai/task_interpreter.py`,
+  `backend/ai/task_candidate.py`, `backend/ai/tools/task.py`,
+  `tests/test_task_candidate_contract.py`, `IMPLEMENTATION_REPORT.md`).
 - Local HEAD == origin/main: VERIFIED — `git ls-remote origin main`
-  returned `481b82288dc19582416835388be43c3c90f7409b`, identical to
-  `git rev-parse HEAD` and `git rev-parse origin/main` after the fix
-  commit's push.
+  returned the same SHA as `git rev-parse HEAD` after the fix commit's
+  push (recorded exactly in the commit that carries this report).
 - Final working-tree status: no modified tracked files; only the
   pre-existing unrelated untracked `telegram-self-bot/` directory
   (a nested clone at an ancestor commit — preserved, not touched).

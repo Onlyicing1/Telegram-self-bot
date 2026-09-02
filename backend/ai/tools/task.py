@@ -313,6 +313,16 @@ class CreateTaskTool(Tool):
         candidate["notification_destination"] = destination
 
         _trace(
+            "create_task_normalized", schedule_type=candidate.get("schedule_type"),
+            action_count=len(candidate.get("actions") or []),
+            action_names=",".join(
+                str(a.get("name")) for a in (candidate.get("actions") or [])
+                if isinstance(a, dict)
+            ) or "-",
+            timezone=candidate.get("timezone"),
+            destination_scope="chat" if destination.get("chat_id") else "owner",
+        )
+        _trace(
             "create_task_definition_validation_start", schedule_type=candidate.get("schedule_type"),
             action_count=len(candidate.get("actions") or []),
         )
@@ -341,6 +351,11 @@ class CreateTaskTool(Tool):
                 "exception=%s detail=%s repository=%s owner_scope=%s",
                 request_id, type(exc).__name__, str(exc)[:200],
                 repository, owner_id,
+            )
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=create_task_persist_failure "
+                "category=repository_failure exception=%s detail=%s",
+                request_id, type(exc).__name__, str(exc)[:200],
             )
             return _fail("create_task_persistence", "repository_failure", exc)
 

@@ -57,6 +57,12 @@ class TaskCandidate:
     def from_untrusted(cls, value: Any) -> "TaskCandidate":
         if not isinstance(value, dict):
             raise TaskCandidateError("candidate must be an object")
+        # Tolerated provider shape: a singular `action` alias for `actions`.
+        # It is normalized BEFORE the exact field-set check so downstream
+        # validation is unchanged; every other deviation stays rejected.
+        if "actions" not in value and "action" in value:
+            value = dict(value)
+            value["actions"] = value.pop("action")
         allowed = {"label", "schedule_type", "schedule", "timezone", "actions", "notification_destination"}
         if set(value) != allowed:
             raise TaskCandidateError("candidate fields are incomplete or unsupported")
@@ -75,6 +81,17 @@ class TaskCandidate:
             raise TaskCandidateError("actions must contain 1 through 5 items")
         canonical: list[dict[str, Any]] = []
         for action in actions:
+            # Tolerate the field-name aliases a model may emit (`tool` for
+            # `name`, `parameters`/`args` for `arguments` — the same aliases
+            # the execution layer already accepts) by normalizing the shape
+            # first; genuinely malformed actions still fail below unchanged.
+            if isinstance(action, dict) and "name" not in action and isinstance(action.get("tool"), str):
+                action = {**action, "name": action["tool"]}
+            if isinstance(action, dict) and "arguments" not in action:
+                for arg_alias in ("parameters", "args"):
+                    if isinstance(action.get(arg_alias), dict):
+                        action = {**action, "arguments": action[arg_alias]}
+                        break
             if not isinstance(action, dict) or not isinstance(action.get("name"), str) or not action["name"].strip():
                 raise TaskCandidateError("each action requires a tool name")
             args = action.get("arguments", {})

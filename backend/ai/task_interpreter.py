@@ -28,7 +28,20 @@ CANDIDATE_SCHEMA = {
         "schedule_type": {"type": "string", "enum": ["once", "interval", "daily", "weekly"]},
         "schedule": {"type": "object"},
         "timezone": {"type": "string"},
-        "actions": {"type": "array", "maxItems": 5},
+        "actions": {
+            "type": "array",
+            "maxItems": 5,
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "arguments"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                },
+            },
+        },
         "notification_destination": {"type": "object"},
     },
 }
@@ -51,7 +64,10 @@ def _load_candidate_json(raw: str) -> Any:
         pass
     match = _JSON_BLOCK_RE.search(raw)
     if not match:
-        raise
+        # Re-parse without fences so the raised error is the real
+        # JSONDecodeError (a bare `raise` here would surface as a generic
+        # RuntimeError and hide the parse failure from diagnostics).
+        return json.loads(raw)
     return json.loads(match.group(1))
 
 
@@ -73,10 +89,15 @@ class TaskInterpreter:
             "Return exactly one JSON object matching the supplied task candidate schema. "
             "Do not include owner identity, chat ids, or raw Telegram destinations. Do not execute tools. "
             "If any required detail is ambiguous or missing, return JSON null. "
-            "For any message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
-            "exactly the action name 'send_message' with a single 'text' argument containing "
-            "the exact message content; the destination is fixed by the runtime and must not "
-            "be included. Use no other action name for message writing. "
+            "ACTION OBJECT CONTRACT: every element of 'actions' MUST be an object of the "
+            "exact form {'name': <action name>, 'arguments': <object>} — a 'name' string "
+            "plus an 'arguments' object, no other keys inside the action object. Example: "
+            "{'name': 'send_message', 'arguments': {'text': 'hello'}}. For any "
+            "message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
+            "exactly the action name 'send_message' with arguments carrying a single "
+            "bounded 'text' key containing the exact message content; the destination "
+            "is fixed by the runtime and must not be included. Use no other action name "
+            "for message writing. Keep exactly one action object in 'actions'. "
             "\n\n"
             "PERSIAN INTERVAL RECOGNITION: Recognize common Persian interval phrases as scheduling requests. "
             "Examples: 'هر 1 دقیقه یک بار بنویس سلام' (every 1 minute write hello), "
@@ -155,10 +176,23 @@ class TaskInterpreter:
         raw = response.text
         if not isinstance(raw, str) or not raw.strip():
             raise TaskInterpretationError("task interpretation returned no structured output")
+        value: Any = None
         try:
             value = _load_candidate_json(raw)
             candidate = parse_candidate_output(value)
         except (json.JSONDecodeError, TaskCandidateError) as exc:
+            if isinstance(value, dict):
+                actions = value.get("actions")
+                logger.info(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected reason=%s "
+                    "candidate_type=object action_count=%s "
+                    "action_field_names=%s schedule_type=%s",
+                    request_id or "-", str(exc)[:120],
+                    len(actions) if isinstance(actions, list) else "-",
+                    (",".join(sorted(actions[0])) if isinstance(actions, list) and actions
+                     and isinstance(actions[0], dict) else "-"),
+                    value.get("schedule_type", "-"),
+                )
             logger.info(
                 "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
                 str(exc)[:200],
@@ -167,6 +201,15 @@ class TaskInterpreter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("TASK_INTERPRET_REJECTED reason=candidate_parse_error detail=%r", exc)
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=candidate_parsed candidate_type=%s "
+            "action_count=%s action_field_names=%s schedule_type=%s timezone=%s "
+            "destination_keys=%s",
+            request_id or "-", "object", len(candidate.actions),
+            ",".join(sorted(candidate.actions[0])) if candidate.actions else "-",
+            candidate.schedule_type, candidate.timezone,
+            ",".join(sorted(candidate.notification_destination)) or "-",
+        )
         logger.info(
             "AI_TASK_TRACE request_id=%s stage=interpretation_end success=true "
             "schedule_type=%s action_count=%s provider=%s latency_ms=%s",
