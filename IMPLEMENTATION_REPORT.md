@@ -14,6 +14,64 @@
 
 ## Current Implementation State
 
+**IMPLEMENTED (create_task schedule-contract fix)** — the SECOND production
+failure on the same request ("یه تسک بساز هر سه دقیقه بگو پری کوچولو هستم"):
+
+```
+AI_TASK_TRACE stage=candidate_rejected reason=malformed schedule payload
+candidate_type=object action_count=1 action_field_names=arguments,name
+schedule_type=interval
+TASK_INTERPRET_REJECTED reason=candidate_invalid detail=malformed schedule payload
+AI_TASK_TRACE stage=create_task_failed failed_stage=create_task_interpretation
+persisted=false
+```
+
+The previous fix (below) resolved the action-object contract — the new trace
+proved `action_field_names=arguments,name`, i.e. the action shape now PASSES.
+The rejection moved one level deeper: the schedule payload.
+
+### Exact defect (this fix)
+
+`CANDIDATE_SCHEMA` declared `"schedule": {"type": "object"}` with NO shape,
+while `parse_schedule` (`backend/ai/scheduling.py:94`) accepts exactly
+`{"seconds": <positive number>}` for `interval` (and `at`/`timezone` for
+`once`, `hour`/`minute`/`second`/`timezone` for `daily`/`weekly`). The model
+(openrouter `dots-studio/dots-3-note-preview:free`) emitted the human-natural
+unit form for "هر سه دقیقه" — e.g. `{"minutes": 3}` — which `parse_schedule`
+rejected with exactly `malformed schedule payload` (KeyError on `seconds` →
+`ScheduleError` → `TaskCandidateError`). Same contract-gap class as the
+action fix, one level deeper: the model was never told the schedule shape.
+
+### Root-cause fix (this fix)
+
+1. **Schema now declares the schedule shapes**
+   (`backend/ai/task_interpreter.py`): per-type schedule objects
+   (`interval: seconds>0`, `once: at+timezone`, `daily/weekly:
+   hour/minute/second/timezone`, `weekly: weekday 0=Monday`) are documented
+   in the `schedule` property description AND the system prompt adds an
+   explicit SCHEDULE CONTRACT instruction ("convert unit names to seconds
+   yourself") with the exact "هر سه دقیقه" → `{'seconds': 180}` example.
+2. **Deterministic unit-key canonicalization**
+   (`backend/ai/task_candidate.py`): for `interval` candidates, a schedule
+   carrying ONE unambiguous unit key (`minute(s)/min(s)`, `hour(s)/hr(s)`,
+   `day(s)`, `week(s)`) with a finite positive number is converted to
+   `{"seconds": N}` before `parse_schedule`. Ambiguous (multiple unit keys),
+   non-numeric, non-finite, zero, or negative values remain REJECTED —
+   this is normalization of a single unambiguous alias, not loosened
+   validation. Every existing check (field set, label/timezone bounds,
+   action shape, payload size, schedule validity, destination rules) is
+   unchanged.
+
+Deterministic replay (real tool + repository, scripted provider, no
+network): the production-shaped candidate `{"minutes": 3}` now persists —
+success=true, `interval {'seconds': 180}`, owner-scoped, `status=active`,
+computed `next_run_at`. 19 new tests cover unit-key canonicalization
+(positive + rejection matrix), the schema contract, and the unknown-tool
+safety chain (candidate layer accepts well-formed non-send actions; the
+execution layer still fails them with `unregistered_action`).
+
+### Delivered earlier: create_task candidate-contract fix (commit `50a16da`)
+
 **IMPLEMENTED (create_task candidate-contract fix)** — the production failure
 
 ```
@@ -330,7 +388,25 @@ logs without reading the database.
 
 ## Tests Actually Executed
 
-### This fix (candidate contract) — new file `tests/test_task_candidate_contract.py` (11 tests)
+### This fix (schedule contract) — 19 new tests in `tests/test_task_candidate_contract.py`
+
+- `test_provider_schema_documents_the_schedule_shapes` — the shipped schema
+  documents `seconds` and `weekday 0=Monday`.
+- `test_unit_keyed_interval_schedules_are_canonicalized` (10 parametrized
+  cases) — `{minutes/hour/hrs/days/weeks}` → exact seconds via the REAL
+  `parse_candidate_output` + `parse_schedule` (incl. fractional `1.5`
+  minutes → 90s).
+- `test_invalid_unit_keyed_interval_schedules_are_still_rejected` (6 cases)
+  — multiple unit keys, non-numeric, boolean, zero, negative, list values.
+- `test_unknown_tool_candidate_is_rejected_by_candidate_validation` and
+  `test_registered_non_send_tool_survives_but_unknown_tool_fails_execution`
+  — the unknown-tool safety chain end-to-end (`unregistered_action`).
+
+Deterministic replay of the production-shaped `{"minutes": 3}` candidate
+through the real `CreateTaskTool` + `InMemoryTaskRepository`: persisted
+`interval {'seconds': 180}`, success=true, computed `next_run_at`.
+
+### Earlier: candidate contract — `tests/test_task_candidate_contract.py` (11 tests)
 
 - `test_alias_shaped_action_is_normalized_and_accepted` — a `{tool,
   parameters}` action normalizes to `{name, arguments}` and passes.
@@ -409,9 +485,10 @@ Results (actually run):
 
 | Suite | Result |
 |---|---|
-| `tests/test_task_candidate_contract.py` (new, 11 tests) | **11 passed** |
+| `tests/test_task_candidate_contract.py` (30 tests: 19 new schedule-contract + 11 earlier) | **30 passed** |
+| Task suites (stage11/12, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom, management) | **139 passed** |
 | Task suites (stage11 candidate, stage12 interpreter, nl_creation, repository, scheduler, execution, send_execution, creation_diagnostics, taskloom milestone/ui, management) | **109 passed** |
-| Full suite `python3 -m pytest tests/ -q` | **1265 passed, 23 skipped, 1 warning** |
+| Full suite `python3 -m pytest tests/ -q` | **1284 passed, 23 skipped, 1 warning** |
 | `python3 -m py_compile` on all three modified backend files | **passed** |
 | `git diff --check` | **passed** |
 
@@ -431,10 +508,13 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 | File | Why |
 |---|---|
-| `backend/ai/task_interpreter.py` | THIS FIX: CANDIDATE_SCHEMA now declares the exact `{name, arguments}` action-object contract (`minItems: 1`, `additionalProperties: false`); system prompt states the ACTION OBJECT CONTRACT with an example; structural `candidate_rejected` / `candidate_parsed` traces; honest JSONDecodeError surfacing in `_load_candidate_json` |
-| `backend/ai/task_candidate.py` | THIS FIX: `from_untrusted` normalizes the field-name aliases models actually emit (`tool`→`name`, `parameters`/`args`→`arguments`, singular `action`→`actions`) BEFORE the strict checks; all safety validation unchanged after normalization |
-| `backend/ai/tools/task.py` | THIS FIX: `create_task_normalized` trace (schedule type, action names, destination scope) and `create_task_persist_failure` diagnostic on repository failure |
-| `tests/test_task_candidate_contract.py` | NEW: 11 focused regression tests covering the contract, real interpreter/tool/repository/scheduler path |
+| `backend/ai/task_interpreter.py` | THIS FIX: per-type schedule shapes documented in the `schedule` property + SCHEDULE CONTRACT prompt instruction ("هر سه دقیقه" → `{'seconds': 180}`) |
+| `backend/ai/task_candidate.py` | THIS FIX: deterministic unit-key interval canonicalization (`{'minutes': 3}` → `{'seconds': 180}`) before `parse_schedule`; ambiguous/invalid unit values still rejected |
+| `tests/test_task_candidate_contract.py` | THIS FIX: 19 new tests (canonicalization matrix, rejection matrix, schema contract, unknown-tool chain) |
+| `backend/ai/task_interpreter.py` | (earlier, `50a16da`) CANDIDATE_SCHEMA action-object contract `{name, arguments}`; ACTION OBJECT CONTRACT prompt; structural traces; honest JSONDecodeError |
+| `backend/ai/task_candidate.py` | (earlier, `50a16da`) `from_untrusted` normalizes the field-name aliases models actually emit (`tool`→`name`, `parameters`/`args`→`arguments`, singular `action`→`actions`) BEFORE the strict checks; all safety validation unchanged after normalization |
+| `backend/ai/tools/task.py` | (earlier, `50a16da`) `create_task_normalized` trace (schedule type, action names, destination scope) and `create_task_persist_failure` diagnostic on repository failure |
+| `tests/test_task_candidate_contract.py` | (earlier, `50a16da`) 11 focused regression tests covering the contract, real interpreter/tool/repository/scheduler path |
 | `backend/ai/engine/dispatcher.py` | (earlier) tool-round-limit fix: pending calls executed once at the limit |
 | `tests/test_11_runtime_wiring.py` | (earlier) 3 new round-limit tests; discard-semantics test replaced |
 | `backend/ai/tools/task.py` | (earlier) Staged `TASK_CREATE_TRACE` logging for every create_task stage and failure branch |
@@ -474,17 +554,17 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 ## Final Git Delivery Record
 
-- Prior commits (verified on `origin/main`): `481b822` (tool-round-limit
+- Prior commits (verified on `origin/main`): `50a16da` (create_task
+  candidate-contract fix — action shape), `481b822` (tool-round-limit
   fix), `f38357a` (verified delivery record), `6566ea7` (AI_TASK_TRACE
   lifecycle observability), `916165b` (complete create_task execution
   tracing), `49f9422` (trace correlation across provider and persistence
   layers), `09319c5` (stage13 management-command test coverage),
   `4247897` (verified delivery-state report).
-- THIS FIX commit: see the record-refresh commit below this entry; the
-  implementation is contained in the single delivery commit pushed to
-  `main` (files: `backend/ai/task_interpreter.py`,
-  `backend/ai/task_candidate.py`, `backend/ai/tools/task.py`,
-  `tests/test_task_candidate_contract.py`, `IMPLEMENTATION_REPORT.md`).
+- THIS FIX commit (schedule contract): the single delivery commit pushed
+  to `main` (files: `backend/ai/task_interpreter.py`,
+  `backend/ai/task_candidate.py`, `tests/test_task_candidate_contract.py`,
+  `IMPLEMENTATION_REPORT.md`).
 - Local HEAD == origin/main: VERIFIED — `git ls-remote origin main`
   returned the same SHA as `git rev-parse HEAD` after the fix commit's
   push (recorded exactly in the commit that carries this report).

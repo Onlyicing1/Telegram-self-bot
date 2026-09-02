@@ -19,6 +19,42 @@ MAX_REQUEST_CHARS = 2000
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+_SCHEDULE_INTERVAL = {
+    "type": "object", "additionalProperties": False,
+    "required": ["seconds"],
+    "properties": {"seconds": {"type": "number", "exclusiveMinimum": 0}},
+}
+_SCHEDULE_ONCE = {
+    "type": "object", "additionalProperties": False,
+    "required": ["at", "timezone"],
+    "properties": {
+        "at": {"type": "string", "description": "naive local datetime, ISO 8601, e.g. 2026-09-03T09:00:00"},
+        "timezone": {"type": "string"},
+    },
+}
+_SCHEDULE_DAILY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["hour", "timezone"],
+    "properties": {
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        "second": {"type": "integer", "minimum": 0, "maximum": 59},
+        "timezone": {"type": "string"},
+    },
+}
+_SCHEDULE_WEEKLY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["weekday", "hour", "timezone"],
+    "properties": {
+        "weekday": {"type": "integer", "minimum": 0, "maximum": 6,
+                     "description": "0=Monday .. 6=Sunday"},
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        "second": {"type": "integer", "minimum": 0, "maximum": 59},
+        "timezone": {"type": "string"},
+    },
+}
+
 CANDIDATE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -26,7 +62,15 @@ CANDIDATE_SCHEMA = {
     "properties": {
         "label": {"type": "string"},
         "schedule_type": {"type": "string", "enum": ["once", "interval", "daily", "weekly"]},
-        "schedule": {"type": "object"},
+        "schedule": {
+            "type": "object",
+            "description": (
+                "interval: {'seconds': <positive number>}; "
+                "once: {'at': '<naive local ISO datetime>', 'timezone': '...'}; "
+                "daily: {'hour': 0-23, 'minute': 0-59, 'timezone': '...'}; "
+                "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, 'timezone': '...'}"
+            ),
+        },
         "timezone": {"type": "string"},
         "actions": {
             "type": "array",
@@ -98,6 +142,14 @@ class TaskInterpreter:
             "bounded 'text' key containing the exact message content; the destination "
             "is fixed by the runtime and must not be included. Use no other action name "
             "for message writing. Keep exactly one action object in 'actions'. "
+            "SCHEDULE CONTRACT: 'schedule' must match the schedule_type exactly — "
+            "interval: {'seconds': <positive number>} (every X minutes = X*60 seconds, "
+            "e.g. 'هر سه دقیقه' or 'every 3 minutes' = {'seconds': 180}); "
+            "once: {'at': '<naive local ISO datetime>', 'timezone': '<IANA tz>'}; "
+            "daily: {'hour': 0-23, 'minute': 0-59, 'timezone': '<IANA tz>'}; "
+            "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, "
+            "'timezone': '<IANA tz>'}. Do not put unit names like 'minutes' inside "
+            "the schedule object — convert them to seconds yourself. "
             "\n\n"
             "PERSIAN INTERVAL RECOGNITION: Recognize common Persian interval phrases as scheduling requests. "
             "Examples: 'هر 1 دقیقه یک بار بنویس سلام' (every 1 minute write hello), "

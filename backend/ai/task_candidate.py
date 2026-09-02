@@ -1,6 +1,7 @@
 """Untrusted structured task candidates; no persistence or execution authority."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,35 @@ from backend.ai.scheduling import ScheduleError, parse_schedule
 
 MAX_LABEL_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
+
+# Unit-keyed interval aliases -> seconds. `parse_schedule` requires the
+# canonical {"seconds": N} form; models commonly emit a human-natural unit
+# form (e.g. {"minutes": 3} for "هر سه دقیقه"). A single unambiguous unit
+# key with a finite positive value is converted deterministically below;
+# anything ambiguous or invalid stays rejected.
+_INTERVAL_UNIT_SECONDS = {
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+    "day": 86400, "days": 86400,
+    "week": 604800, "weeks": 604800,
+}
+
+
+def _canonicalize_interval_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
+    if "seconds" in schedule:
+        return schedule
+    units = [key for key in schedule if key in _INTERVAL_UNIT_SECONDS]
+    if not units:
+        return schedule
+    if len(units) > 1:
+        raise TaskCandidateError("interval schedule is ambiguous: multiple time units")
+    value = schedule[units[0]]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TaskCandidateError("interval schedule unit value must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise TaskCandidateError("interval schedule must be positive")
+    return {"seconds": value * _INTERVAL_UNIT_SECONDS[units[0]]}
 
 # ── Canonical task-execution actions ──
 #
@@ -100,6 +130,8 @@ class TaskCandidate:
             canonical.append(_canonicalize_action(action))
         if len(str(value).encode()) > MAX_PAYLOAD_BYTES:
             raise TaskCandidateError("candidate exceeds bounded payload size")
+        if value["schedule_type"] == "interval":
+            schedule = _canonicalize_interval_schedule(schedule)
         try:
             parsed = parse_schedule(value["schedule_type"], schedule)
         except (ScheduleError, TypeError, ValueError) as exc:

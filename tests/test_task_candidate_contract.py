@@ -35,6 +35,7 @@ from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.scheduling import parse_schedule
+from datetime import timedelta
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
 from backend.ai.task_interpreter import CANDIDATE_SCHEMA, TaskInterpreter, TaskInterpretationError
 
@@ -118,6 +119,55 @@ def test_provider_schema_declares_the_action_object_contract():
     item_schema = items["items"]
     assert item_schema["required"] == ["name", "arguments"]
     assert set(item_schema["properties"]) == {"name", "arguments"}
+
+
+def test_provider_schema_documents_the_schedule_shapes():
+    schedule_schema = CANDIDATE_SCHEMA["properties"]["schedule"]
+    description = schedule_schema["description"]
+    assert "'seconds'" in description
+    assert "0=Monday" in description
+
+
+def _candidate_with_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "label": "say hello",
+        "schedule_type": "interval",
+        "schedule": schedule,
+        "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": "hi"}}],
+        "notification_destination": {},
+    }
+
+
+@pytest.mark.parametrize("schedule,expected_seconds", [
+    ({"seconds": 180}, 180.0),
+    ({"minutes": 3}, 180.0),
+    ({"minute": 3}, 180.0),
+    ({"mins": 3}, 180.0),
+    ({"hours": 1}, 3600.0),
+    ({"hour": 2}, 7200.0),
+    ({"hrs": 0.5}, 1800.0),
+    ({"days": 1}, 86400.0),
+    ({"weeks": 2}, 1209600.0),
+    ({"minutes": 1.5}, 90.0),
+])
+def test_unit_keyed_interval_schedules_are_canonicalized(schedule, expected_seconds):
+    candidate = parse_candidate_output(_candidate_with_schedule(schedule))
+    parsed = parse_schedule(candidate.schedule_type, candidate.schedule)
+    assert parsed.interval == timedelta(seconds=expected_seconds)
+
+
+@pytest.mark.parametrize("schedule", [
+    {"minutes": 3, "hours": 1},
+    {"minutes": "سه"},
+    {"minutes": True},
+    {"minutes": 0},
+    {"hours": -1},
+    {"minutes": [3]},
+])
+def test_invalid_unit_keyed_interval_schedules_are_still_rejected(schedule):
+    with pytest.raises(TaskCandidateError):
+        parse_candidate_output(_candidate_with_schedule(schedule))
 
 
 # ── Interpreter end-to-end (scripted provider, real parser) ──
@@ -291,3 +341,54 @@ async def test_interpretation_failure_still_reports_persisted_false():
     assert result.success is False
     repo = manager.task
     assert await repo.list_tasks(777) == []
+
+
+# ── Unknown/arbitrary tools stay rejected end-to-end ──
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_candidate_is_rejected_by_candidate_validation():
+    # Non-send action names pass the candidate boundary (the candidate layer
+    # does not own the registry) only if well-formed; a name-less action
+    # never does.
+    with pytest.raises(TaskCandidateError):
+        parse_candidate_output(_candidate_with_schedule({"seconds": 180}) | {
+            "actions": [{"name": "", "arguments": {}}],
+        })
+
+
+@pytest.mark.asyncio
+async def test_registered_non_send_tool_survives_but_unknown_tool_fails_execution():
+    """The safety chain: candidate validation accepts well-formed non-send
+    actions, but a tool that is NOT in the ToolRegistry fails at execution
+    with ``unregistered_action`` and the occurrence is marked failed."""
+    from backend.ai.task_execution import TaskExecutionCoordinator
+    from backend.ai.tools.context import ToolContext
+    from backend.ai.tools.executor import ToolExecutor
+    from backend.ai.tools.registry import ToolRegistry
+
+    value = _candidate_with_schedule({"seconds": 180})
+    value["actions"] = [{"name": "mystery_tool", "arguments": {"x": 1}}]
+    candidate = parse_candidate_output(value)
+    assert candidate.actions == [{"name": "mystery_tool", "arguments": {"x": 1}}]
+
+    repo = InMemoryTaskRepository()
+    task = await repo.create_task(5, candidate.as_creation_candidate() | {
+        "next_run_at": REF + timedelta(seconds=1),
+    })
+    await repo.create_occurrence(5, {
+        "task_id": task.id,
+        "occurrence_key": f"{task.id}:once",
+        "definition_version": task.version,
+        "action_snapshot": task.actions,
+        "scheduled_for": task.next_run_at,
+    })
+    await repo.claim_occurrence(5, task.id, f"{task.id}:once")
+    ctx = ToolContext(None, 5, "UTC")
+    result = await TaskExecutionCoordinator(
+        repo, ToolExecutor(ToolRegistry(), ctx), 5, ctx
+    ).execute(await repo.get_occurrence(5, task.id, f"{task.id}:once"))
+    assert not result.success
+    occurrence = await repo.get_occurrence(5, task.id, f"{task.id}:once")
+    assert occurrence.status == "failed"
+    assert occurrence.error_metadata.get("error_class") == "unregistered_action"
