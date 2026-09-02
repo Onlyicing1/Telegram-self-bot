@@ -348,17 +348,20 @@ repository (`repo_type=InMemoryTaskRepository`).
 
 ## Final Git Delivery Record
 
-- Implementation commits (verified on `origin/main`): `6566ea7`
+- Prior commits (verified on `origin/main`): `6566ea7`
   (AI_TASK_TRACE lifecycle observability), `916165b` (complete
   create_task execution tracing), `49f9422` (trace correlation across
   provider and persistence layers), `09319c5` (stage13 management-command
-  test coverage).
-- Commit SHA (delivery HEAD): `09319c58ebc0b5d2c62ca83f82d8eb5c0161d6e8`.
-- Push status: VERIFIED — `git push origin main` returned "Everything
-  up-to-date" (exit 0) with local HEAD `09319c5`.
+  test coverage), `4247897` (verified delivery-state report).
+- Tool-round-limit fix commit: `481b82288dc19582416835388be43c3c90f7409b`
+  (`fix: execute pending tool calls at the round limit instead of
+  discarding them`) — push output `4247897..481b822 main -> main`, exit 0.
+- Commit SHA (delivery HEAD): see the record-refresh commit below this
+  entry (docs-only update of this record; the fix itself is `481b822`).
 - Local HEAD == origin/main: VERIFIED — `git ls-remote origin main`
-  returned `09319c58ebc0b5d2c62ca83f82d8eb5c0161d6e8`, identical to
-  `git rev-parse HEAD`.
+  returned `481b82288dc19582416835388be43c3c90f7409b`, identical to
+  `git rev-parse HEAD` and `git rev-parse origin/main` after the fix
+  commit's push.
 - Final working-tree status: no modified tracked files; only the
   pre-existing unrelated untracked `telegram-self-bot/` directory
   (a nested clone at an ancestor commit — preserved, not touched).
