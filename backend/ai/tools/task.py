@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.ai.task_trace import bind_request, unbind
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
@@ -115,6 +116,26 @@ class CreateTaskTool(Tool):
         return EXECUTION_TIMEOUT_SECONDS
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.task_interpreter import TaskInterpreter
+        from backend.ai.task_creation import TaskCreationService
+
+        extra0 = getattr(context, "extra", None) or {}
+        # Bind the request correlation so the interpreter, provider manager,
+        # creation service, and repository layers emit correlated
+        # AI_TASK_TRACE records for this request (silent outside create_task).
+        bind_token = bind_request(
+            str(extra0.get("request_id") or "-"),
+            _owns_exit=False,
+            owner_id=getattr(context, "owner_id", 0),
+            chat_id=extra0.get("chat_id", "-"),
+            request_message_id=extra0.get("request_message_id", "-"),
+        )
+        try:
+            return await self._execute(context, arguments)
+        finally:
+            unbind(bind_token)
+
+    async def _execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.ai.task_interpreter import TaskInterpreter
         from backend.ai.task_creation import TaskCreationService
 

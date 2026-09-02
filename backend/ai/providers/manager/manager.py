@@ -610,7 +610,6 @@ class ProviderManager:
         task_trace(
             "provider_request_start", provider=name, model=self._effective_model(provider) or "-",
             request_size=sum(len(str(m.get("content", ""))) for m in messages),
-            request_preview=bound_text(messages[-1].get("content", "") if messages else "", 160),
             timeout_s=_PROVIDER_RPC_TIMEOUT,
         )
         try:
@@ -627,9 +626,8 @@ class ProviderManager:
                 success="true" if response.success else "false", elapsed_ms=int(latency * 1000),
                 output_category=("json" if raw.startswith("{") else "null" if raw in {"null", "json null"} else "prose" if raw else "empty"),
                 response_length=len(response.text or ""),
-                response_preview=bound_text(response.text or "", 160),
                 failure_category="" if response.success else self._failure_type(response),
-                error_detail="" if response.success else bound_text(response.text, 200),
+                error_detail="" if response.success else bound_text(response.text, 160),
             )
             return response
         except asyncio.TimeoutError as exc:

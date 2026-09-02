@@ -112,7 +112,7 @@ class TaskCreationService:
         _creation_trace(
             "repository_call", repo_type=type(self.repository).__name__,
             schedule_type=str(candidate["schedule_type"]),
-            payload=bound_text(json.dumps(payload, ensure_ascii=False, default=str), 400),
+            payload_bytes=len(json.dumps(payload, ensure_ascii=False, default=str)),
         )
         try:
             task = await self.repository.create_task(self.owner_id, payload)
