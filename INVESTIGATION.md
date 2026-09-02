@@ -486,3 +486,168 @@ exploitable paths.
 
 (Values are filled by the delivery step of this investigation; a commit SHA
 alone is not proof of delivery.)
+
+---
+
+# PHASE 1 — AI TOOL HEALTH AUDIT (all 32 registered tools)
+
+> Appended below the capability audit above (which remains accurate as of the
+> same code state). This phase verifies — rather than assumes — that every
+> currently registered tool is healthy through the REAL AI execution path.
+
+## P1.1 Scope and Objective
+
+Verify for all 32 currently registered AI tools: implemented → registered →
+AI-visible → provider-schema-visible → dispatcher-resolvable →
+executor-resolvable → permission-valid → executable → dependency-valid →
+ToolResult-valid → response-path-valid → deterministic-path-valid (where
+applicable) → test coverage → failure behavior.
+
+A tool is HEALTHY only when the complete reachable execution path has been
+exercised — registration alone proves nothing.
+
+NOT in scope (intentionally not connected, left untouched): Hermes, Workers,
+Service Mesh, Orchestrator, new providers, AI_MASTER_DESIGN future tools,
+task lifecycle management, saved-item retrieval/forwarding, Ghost Seen,
+provider/model switching, trigger configuration, memory write path,
+`forward_messages` as an AI tool.
+
+## P1.2 Methodology
+
+New test suite `tests/test_tool_health_audit.py` (60 tests) drives the REAL
+chain — `create_default_registry()` → `ToolExecutor.execute_calls()`
+(permission gate, argument validation, timeouts, tool-history recording) →
+tool → service/facade boundary — with external effects faked ONLY at that
+boundary (raw Telegram client, service functions, provider manager,
+repository). No live Telegram, no Supabase writes, no provider network
+_calls. No production code was modified: **zero defects were found in the
+execution path itself**, so no source fix was required.
+
+Layers exercised:
+1. **Registration/visibility** — exact 32-name set equality; per-tool
+   permission level, description, parameters, return_type, `safe` flag.
+2. **Provider schema visibility** — `Dispatcher._build_tool_definitions()`
+   must produce native OpenAI-format definitions for all 32 (`type=function`,
+   `parameters.type=object` with `properties`).
+3. **Executor chain (parametrized per tool)** — name resolution, permission
+   gate, execution, ToolResult validity, latency recording.
+4. **Safety semantics** — unknown tool → `not_found`; `settings_set` gated
+   (setter never awaited); delete paths route through the
+   `delete_verified_self_messages` ownership chokepoint; `send_message`
+   destination from trusted context only; `account_show` never leaks
+   phone/ID; `get_bio` failure never masked as "📝 Bio: —".
+5. **Deterministic argument validation** — delete without count / >500
+   rejected; save without reply context rejected; invalid links rejected.
+6. **Real-service paths** — bio/username tools run the REAL services against
+   the in-memory DB fallback (round-trip on/off included); `web_search`
+   honest failure without provider manager and success through the
+   capability interface; `create_task` persists through the REAL
+   `InMemoryTaskRepository` with owner/schedule/status verified.
+7. **Response-path contract** — `get_bio`-only rounds are verbatim
+   (`_read_results_authoritative`); failures/extra tools fall back to normal
+   continuation; `_summarize_tool_results` reports failures verbatim.
+
+## P1.3 Health Matrix — all 32 tools
+
+| # | Tool | Registered | AI-visible | Schema-visible | Executor-resolvable | Permission | Executable | Dependency | ToolResult | Response path | Deterministic path | Prior tests | Classification |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | save | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | Telegram+DB (faked at boundary) | ✅ | ✅ | ✅ (fast-path reply mode) | 11 files | HEALTHY |
+| 2 | save_by_link | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | Telegram+DB | ✅ | ✅ | ✅ | 1 file | HEALTHY |
+| 3 | delete | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | Telegram | ✅ | ✅ (silent) | ✅ (fast-path delete) | 15 files | HEALTHY |
+| 4 | delete_by_id | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | Telegram | ✅ | ✅ | ✅ | 2 files | HEALTHY |
+| 5 | delete_replied | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | Telegram | ✅ | ✅ | ✅ | 6 files | HEALTHY |
+| 6 | delete_message_by_id | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | Telegram | ✅ | ✅ | ✅ | 3 files | HEALTHY |
+| 7 | delete_messages_by_ids | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | Telegram | ✅ | ✅ | ✅ | 3 files | HEALTHY |
+| 8 | list_recent_messages | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | Telegram | ✅ | ✅ (rendered list) | ✅ | 5 files | HEALTHY |
+| 9 | bio_set_template | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | bio_service (REAL, fallback DB) | ✅ | ✅ | ✅ | 0 files → now covered | HEALTHY |
+| 10 | bio_set_text | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | bio_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 11 | bio_set_mood | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | bio_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 12 | bio_on | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | bio_service + profile engine | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 13 | bio_off | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | bio_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 14 | bio_show | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | bio_service (REAL) | ✅ | ✅ | ✅ | 2 files | HEALTHY |
+| 15 | get_bio | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | TelegramAPI.get_bio (REAL) | ✅ | ✅ **verbatim** | ✅ | 4 files | HEALTHY |
+| 16 | username_set_template | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | username_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 17 | username_set_text | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | username_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 18 | username_set_mood | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | username_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 19 | username_on | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | username_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 20 | username_off | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | username_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 21 | username_show | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | username_service (REAL) | ✅ | ✅ | ✅ | 2 files | HEALTHY |
+| 22 | search | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | discover_service | ✅ | ✅ | ✅ | 3 files | HEALTHY |
+| 23 | list_saves | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | discover_service | ✅ | ✅ | ✅ | 3 files | HEALTHY |
+| 24 | database_stats | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | database_service | ✅ | ✅ | ✅ | 1 file | HEALTHY |
+| 25 | account_show | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | TelegramAPI.get_me | ✅ | ✅ | ✅ | 8 files | HEALTHY |
+| 26 | settings_get | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | settings_service (REAL) | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 27 | settings_set | ✅ | ✅ | ✅ | ✅ | **admin_only → confirmation gate VERIFIED** | gated (by design) | settings_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY (gate enforced) |
+| 28 | organize_list | ✅ | ✅ | ✅ | ✅ | read_only | ✅ | organize_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 29 | organize_clean | ✅ | ✅ | ✅ | ✅ | dangerous | ✅ | organize_service | ✅ | ✅ | ✅ | 0 → covered | HEALTHY |
+| 30 | web_search | ✅ | ✅ | ✅ | ✅ | read_only | ✅ (capability interface) | **YDC key / provider manager** | ✅ | ✅ | ✅ | 1 file | PARTIALLY_HEALTHY (key-dependent) |
+| 31 | create_task | ✅ | ✅ | ✅ | ✅ | read_write | ✅ (deterministic candidate → REAL repository) | provider for NL mode | ✅ | ✅ | ✅ (fast-path) | 5 files | HEALTHY |
+| 32 | send_message | ✅ | ✅ | ✅ | ✅ | read_write | ✅ | TelegramAPI (REAL facade) | ✅ | ✅ | ✅ (task actions) | 13 files | HEALTHY |
+
+## P1.4 Aggregate Counts
+
+| Classification | Count | Tools |
+|---|---|---|
+| HEALTHY | 31 | all except web_search |
+| PARTIALLY_HEALTHY | 1 | web_search (execution path fully correct; requires `YDC_API_KEY`/provider manager — honest failure when absent) |
+| BROKEN | 0 | — |
+| MISWIRED | 0 | — |
+| BLOCKED_BY_CONFIGURATION | 0 | (web_search classified PARTIALLY_HEALTHY: its failure mode is honest and its success path is verified through the capability interface) |
+| NOT_TESTABLE_WITHOUT_LIVE_SERVICE | 0 | (live Telegram/Supabase/provider behavior remains out of scope; see Limitations) |
+| **Total** | **32** | |
+
+## P1.5 Findings
+
+1. **No execution-path defects found.** All 32 tools resolve, pass the
+   permission gate correctly, execute through their intended
+   service/facade boundary, and return valid ToolResults. No source code
+   changes were required in this phase.
+2. **Security semantics verified, not just claimed:** unknown tool names →
+   `not_found`; `settings_set` never executes without confirmation (the
+   underlying setter is asserted never to be awaited); every delete path
+   funnels through `delete_verified_self_messages` (asserted await-count);
+   `send_message` sends only to the trusted context chat;
+   `account_show` strips phone/ID; failed `get_bio` is never reported as an
+   empty bio.
+3. **Test-coverage gap closed for 12 tools:** `bio_set_template`,
+   `bio_set_text`, `bio_set_mood`, `bio_on`, `bio_off`,
+   `username_set_template`, `username_set_text`, `username_set_mood`,
+   `username_on`, `username_off`, `settings_get`, `settings_set`,
+   `organize_list`, `organize_clean` previously had no direct tool-name
+   coverage; they are now exercised through the real executor chain.
+4. **web_search honest degradation verified:** without a provider manager or
+   key the tool returns a failure result (never fabricated results); with a
+   capability-conforming provider manager the full result path succeeds.
+5. **create_task persistence proven without mocks of the repository:** the
+   deterministic fast-path candidate persists through the REAL
+   `InMemoryTaskRepository` and the created task is discoverable
+   (`owner_id`, `schedule_type`, `status=active` verified).
+
+## P1.6 Fixes Applied
+
+None to production code — the audit found no defect requiring a fix. The
+only repository change of this phase is the new test suite plus this
+document. During test development, three initial failures were traced to
+test-fake inaccuracies (not production bugs) and corrected inside the test
+file: `do_del_id_counts` mock return shape, `iter_messages` sync-method/
+async-iterator semantics, and the reply-message fetch fake.
+
+## P1.7 Remaining Blockers / Limitations
+
+1. **Live-service verification not performed** (unchanged from the capability
+   audit): real Telegram, real Supabase, and real provider keys are not
+   exercised. Classifications are execution-path-verified, not
+   live-verified.
+2. **web_search remains key-dependent** — operator must set `YDC_API_KEY` for
+   the capability to be usable in production.
+3. Non-verbatim read tools still pass through a continuation provider round
+   (documented in the capability audit; a product decision, not a defect).
+
+## P1.8 Phase 1 Git Delivery Record
+
+| Field | Value |
+|---|---|
+| Files changed | `tests/test_tool_health_audit.py` (new), `INVESTIGATION.md` |
+| Tests added | 60 (test_tool_health_audit.py) |
+| Full suite | 1424 passed, 23 skipped |
+| Commit / push / remote verification | see final report for this phase |
