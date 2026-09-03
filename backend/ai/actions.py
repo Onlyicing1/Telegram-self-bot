@@ -1381,6 +1381,72 @@ def _is_scheduling_intent(words: list[str]) -> bool:
     return False
 
 
+# Task vocabulary — deterministic task-show resolution. "تسک"/"کار"/task
+# stem-matched so possessives ("تسک‌هام", "کارها", "تسکهایم") count; the
+# list/show verbs reuse the same fused-clitic matching as the bio branch
+# ("نشونم بده").
+_TASK_STEMS = ("تسک", "کار")
+_EN_TASK_WORDS = frozenset({"task", "tasks", "todo", "todos"})
+_TASK_LIST_VERBS = frozenset({"لیست", "لیستش", "بده", "ببین", "نشون", "نمایش", "list", "show"})
+
+
+def _has_task_mention(words: list[str]) -> bool:
+    """True when any token is a task word (Persian stem or English)."""
+    return any(
+        w in _EN_TASK_WORDS
+        or w.startswith("تسک")
+        or w.startswith("کار")
+        for w in words
+    )
+
+
+def _extract_task_id(words: list[str]) -> int | None:
+    """Return the explicit task number in a show request, else None."""
+    from backend.ai.actions import _parse_number
+
+    for i, w in enumerate(words):
+        if w in ("تسک", "کار", "task") and i + 1 < len(words):
+            number = _parse_number(words, i + 1)
+            if number is not None:
+                return number
+    return None
+
+
+def _parse_task_show_intent(words: list[str]) -> ActionParseResult | None:
+    """Deterministically recognize read-only task-show intents.
+
+    Returns an executable tool call (task_list / task_inspect) or None.
+    Runs AFTER _parse_status_intent so saved-items/database/bio/account
+    requests that merely contain the word "کار" never route here. An
+    explicit task id in the request selects task_inspect; a bare
+    list/show request selects task_list (no arguments — the read-only
+    tool takes none).
+    """
+    if not _has_task_mention(words):
+        return None
+
+    has_list_verb = any(w in _TASK_LIST_VERBS or _is_show_verb_token(w) for w in words)
+    has_status_word = bool(set(words) & (_STATUS_WORDS | _SAVE_LIST_WORDS))
+    if not (has_list_verb or has_status_word):
+        return None
+
+    task_id = _extract_task_id(words)
+    if task_id is not None:
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="task_inspect",
+            target="schedule",
+            task_id=task_id,
+            tool_calls=[{"name": "task_inspect", "arguments": {"task_id": task_id}}],
+        )
+    return ActionParseResult(
+        kind=KIND_EXECUTABLE,
+        action="task_list",
+        target="schedule",
+        tool_calls=[{"name": "task_list", "arguments": {}}],
+    )
+
+
 def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
     """Deterministically parse a Persian/English executable command.
 
@@ -1684,5 +1750,14 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
     status = _parse_status_intent(words, has_at="@" in text)
     if status is not None:
         return status
+
+    # Task-show requests resolve to the registered task_list / task_inspect
+    # tools BEFORE falling through as conversational. Without this branch a
+    # deterministic READ request depended on provider tool selection
+    # (production: narration -> retry -> fallback -> error,
+    # ai_last_provider_s ~ 60s = the handler ceiling).
+    task_show = _parse_task_show_intent(words)
+    if task_show is not None:
+        return task_show
 
     return ActionParseResult(kind=KIND_CONVERSATIONAL)
