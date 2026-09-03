@@ -9,6 +9,7 @@
 | Starting HEAD | `4069797399ed8a1ab49502792b7ba69c38ae9868` (`fix: accept new AI tool actions on the deterministic fallback route`) |
 | Implementation commit (final HEAD at delivery) | `7aee8d1d7c2d9743d389029dfa4fb877641b2afa` |
 | Report commit | the single commit immediately following `7aee8d1` on `main`, containing ONLY this report rewrite; its SHA is the final HEAD |
+| Report recovery | the dropped create_task/AI_TASK_TRACE report rewrite (`48ee64d`, orphaned by a failed rebase, never pushed) was recovered from git evidence and reconciled into this current-state report as the subsection at the end of §4; the remote report text is otherwise preserved verbatim |
 | Implementation date | 2026-09-03 |
 | Task/chunk | Forensic root-cause analysis and minimal fix for real AI tool connectivity — `task_list` reproduction case |
 | Work type | investigation + implementation |
@@ -124,12 +125,91 @@ reproduction test failed on the exact production sentence (§3).
   ("هر 1 دقیقه یک بار بنویس سلام" → `create_task`); "لیست سیوها رو بده" →
   `list_saved_items`; "وضعیت بایو چیه" → `get_bio`.
 
+The `create_task`/`AI_TASK_TRACE` implementation changes recovered into §4
+(`2ab0db8`, `6566ea7`) are already part of origin/main history and are
+documented there rather than re-listed in this table.
+
 ### `IMPLEMENTATION_REPORT.md`
 
 Replaced entirely with this single current-state report (the previous file
 was an append-log of six earlier phases; per the reporting mandate it is
 superseded — the earlier phases remain documented in their delivery commits
 and in INVESTIGATION.md).
+
+### Recovered current-state documentation — `create_task` interpretation fix + `AI_TASK_TRACE` observability (commits `2ab0db8`, `6566ea7`, in origin/main history)
+
+The documentation of the already-delivered `create_task` observability work,
+which was lost when its report rewrite was dropped during a failed rebase
+(`48ee64d`, not in remote history), is restored here because the remote
+current-state report did not cover it. The descriptions below were verified
+against the code at the current HEAD (incl. the later `create_task` commits
+`50a16da`, `8274b4a`, `df23029`, `49f9422`) before inclusion.
+
+**Proven root cause of the original no-diagnostic `create_task` failures:**
+`backend/ai/task_interpreter.py` → `TaskInterpreter.interpret()`. Providers
+frequently wrap the compliant JSON candidate in markdown fences (` ``` `/` ```json `);
+the original code called `json.loads(raw)` directly, the `JSONDecodeError`
+collapsed into `TaskInterpretationError`, and the tool boundary's anonymous
+`except (…, Exception)` returned a generic message while logging nothing —
+production showed `tool=create_task success=False` with zero diagnostics.
+Failure layer: AI interpretation parsing (not registry/executor/dispatcher/
+repository). Evidence: the source investigation at commit `c40af4a` proved
+the interpretation wrapper (branch 5 of seven `ToolResult(success=False)`
+branches in `CreateTaskTool.execute`) was the active one by timing (~5.8 s),
+single provider attempt, and absence of persistence log lines.
+
+**Exact changes (all verified present at current HEAD):**
+
+- `backend/ai/task_interpreter.py` — `_load_candidate_json(raw)`: retries
+  extraction against a markdown-fenced block (`_JSON_BLOCK_RE`) when direct
+  `json.loads` fails; candidate validation remains with
+  `parse_candidate_output`. `interpret(..., request_id=...)` threads the
+  correlation id into `AI_TASK_TRACE stage=interpretation_start`, and no
+  longer collapses concrete provider failures into a generic message:
+  `response.success is False` now logs `stage=provider_result success=false`
+  (provider, attempted-provider list, providers-tried count, category
+  `all_providers_failed` or the concrete `failure_type`/`error_type`,
+  200-char sanitized detail) and raises a structured error that survives
+  into the tool trace; provider success logs provider/model/fallback/latency;
+  candidate rejections log `TASK_INTERPRET_REJECTED` with detail; timeout is
+  converted with cause preserved; `stage=interpretation_end` reports
+  schedule type, action count, provider, latency.
+- `backend/ai/tools/task.py` — `_classify_interpretation_failure` maps
+  failures to bounded sanitized categories (`timeout`,
+  `candidate_invalid_json`, `candidate_invalid`, structured
+  `provider=… category=… detail=…` propagation, `unexpected_exception`);
+  `_label_hash` gives a SHA-256 12-hex log-safe label fingerprint; `_trace`/
+  `_fail` emit one `AI_TASK_TRACE` record per stage and one terminal
+  `create_task_failed` record (`failed_stage`, category, exception class,
+  sanitized detail, `elapsed_ms`, `persisted=false`) while keeping every
+  user-facing message unchanged. Stage coverage: `create_task_received`,
+  `create_task_validation_start/end` (deterministic vs `nl_interpretation`),
+  `create_task_provider_resolution`, `create_task_interpretation_start`,
+  `interpretation_failed`, `create_task_destination_resolution`
+  (chat-name/current-chat), `create_task_definition_validation_start/end`,
+  `create_task_repository_create_start/result`, and terminal
+  `create_task_success` (task id, version, `fallback_used`, final backend,
+  elapsed ms).
+- `backend/ai/engine/dispatcher.py` (`2ab0db8`) — the fast-path
+  `stage=tool_result` log now includes the static tool message (first 160
+  chars) instead of only `tool` and `success`.
+- `backend/ai/database/task_repository.py` (`6566ea7`) — the Supabase
+  create fallback no longer silently returns the in-memory result: it logs
+  `create_task_fallback_start`/`create_task_fallback_result` (reason, task
+  id, version) and annotates the record with `fallback_backend`
+  (observability attribute, not a schema column).
+- `tests/test_task_nl_creation.py` — updated ambiguity-failure expectations
+  for the new trace stages plus an `AI_TASK_TRACE` lifecycle test class
+  (success-path stage sequence, terminal-failure records, fallback-backend
+  annotation, request-id correlation, structured provider-failure
+  propagation); 20 test functions.
+
+**Validation recorded for that phase** (executed at HEAD `6566ea7`, before
+the later remote `create_task` commits): focused suites
+`test_task_nl_creation.py`, `test_task_contract.py`, `test_task_repository.py`
+→ 34 passed; `compileall -q backend tests` passed; `git diff --check`
+passed. Live Telegram verification of the trace chain remained NOT PROVEN
+then and is still outstanding.
 
 ## 5. FILES CHANGED
 
