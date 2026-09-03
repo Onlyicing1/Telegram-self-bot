@@ -17,7 +17,13 @@ from typing import Any
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 
-_MUTABLE_STATUSES = ("paused", "active", "completed")
+# Statuses the owner can filter the task list by (deleted tasks are
+# terminal and excluded from the normal list — they stay inspectable by id).
+_LIST_STATUSES = ("active", "paused", "completed")
+# Statuses task_transition may move a task to. ``deleted`` is the existing
+# terminal lifecycle state: active/paused tasks may be deleted, and a deleted
+# task can never return to an active lifecycle.
+_TRANSITION_STATUSES = ("active", "paused", "completed", "deleted")
 
 
 class TaskListTool(Tool):
@@ -34,8 +40,9 @@ class TaskListTool(Tool):
     def description(self) -> str:
         return (
             "List the owner's scheduled tasks (id, label, status, version, "
-            "next run). Optionally filter by status (active / paused / "
-            "completed). Use the returned id and version for task_transition."
+            "next run). Deleted tasks are excluded. Optionally filter by "
+            "status (active / paused / completed). Use the returned id and "
+            "version for task_transition."
         )
 
     @property
@@ -43,7 +50,7 @@ class TaskListTool(Tool):
         return {
             "status": {
                 "type": "string",
-                "enum": list(_MUTABLE_STATUSES),
+                "enum": list(_LIST_STATUSES),
                 "default": None,
                 "description": "Optional status filter (paused, active, completed).",
             },
@@ -67,7 +74,7 @@ class TaskListTool(Tool):
         from backend.ai.task_management_interface import list_text
 
         status = str(arguments.get("status") or "").strip().lower()
-        if status and status not in _MUTABLE_STATUSES:
+        if status and status not in _LIST_STATUSES:
             return ToolResult(
                 success=False,
                 message=(
@@ -157,9 +164,11 @@ class TaskTransitionTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Change a scheduled task's status: pause, resume (set active), or "
-            "complete. Requires the task's CURRENT version (from task_list or "
-            "task_inspect) — a stale version fails and nothing changes."
+            "Change a scheduled task's status: pause, resume (set active), "
+            "complete, or delete (terminal). Requires the task's CURRENT "
+            "version (from task_list or task_inspect) — a stale version fails "
+            "and nothing changes. A deleted task leaves the normal task list "
+            "but keeps its occurrence history and stays inspectable by id."
         )
 
     @property
@@ -172,8 +181,8 @@ class TaskTransitionTool(Tool):
             },
             "action": {
                 "type": "string",
-                "enum": list(_MUTABLE_STATUSES),
-                "description": "Target status: paused, active (resume), or completed.",
+                "enum": list(_TRANSITION_STATUSES),
+                "description": "Target status: paused, active (resume), completed, or deleted.",
             },
             "expected_version": {
                 "type": "integer",
@@ -214,10 +223,13 @@ class TaskTransitionTool(Tool):
                     "task_inspect). Nothing was changed."
                 ),
             )
-        if status not in _MUTABLE_STATUSES:
+        if status not in _TRANSITION_STATUSES:
             return ToolResult(
                 success=False,
-                message=f"Unsupported status '{status}'. Allowed: paused, active, completed.",
+                message=(
+                    f"Unsupported status '{status}'. "
+                    "Allowed: paused, active, completed, deleted."
+                ),
             )
 
         try:
@@ -233,11 +245,18 @@ class TaskTransitionTool(Tool):
                     f"version {version} is stale. Nothing was changed."
                 ),
             )
-        _STATUS_VERB = {"paused": "paused", "active": "resumed", "completed": "completed"}
+        _STATUS_VERB = {
+            "paused": "paused",
+            "active": "resumed",
+            "completed": "completed",
+            "deleted": "deleted",
+        }
+        prefix = "🗑" if str(task.status) == "deleted" else "✅"
         return ToolResult(
             success=True,
             message=(
-                f"✅ Task #{task.id} {_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
+                f"{prefix} Task #{task.id} "
+                f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
                 f"· version {task.version}."
             ),
             data={

@@ -184,7 +184,11 @@ async def test_task_transition_registered_and_reachable():
     tool = registry.get("task_transition")
     assert tool is not None
     assert tool.permission_level.value == "read_write"
-    assert sorted(tool.parameters["action"]["enum"]) == ["active", "completed", "paused"]
+    assert sorted(tool.parameters["action"]["enum"]) == ["active", "completed", "deleted", "paused"]
+    # The list tool's filter enum deliberately stays narrower: a terminal
+    # deleted task can never be listed through a status filter.
+    list_tool = registry.get("task_list")
+    assert sorted(list_tool.parameters["status"]["enum"]) == ["active", "completed", "paused"]
 
 
 @pytest.mark.asyncio
@@ -253,12 +257,91 @@ async def test_task_transition_is_owner_scoped():
 async def test_task_transition_validates_arguments():
     registry, ctx, executor = make_chain()
     for bad in (
-        {"task_id": 1, "action": "deleted", "expected_version": 1},   # status outside enum
         {"task_id": 1, "action": "paused"},                            # missing version
+        {"task_id": 1, "action": "completed", "expected_version": 0}, # non-positive version
         {"action": "paused", "expected_version": 1},                   # missing id
+        {"task_id": 1, "action": "resumed", "expected_version": 1},   # status outside enum
     ):
         result = await run_tool(executor, ctx, "task_transition", bad)
         assert result.success is False, bad
+
+
+# ── delete (terminal lifecycle state) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_transition_delete_executor_path():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+    occurrence = await repo.create_occurrence(
+        OWNER,
+        {
+            "task_id": created.id,
+            "occurrence_key": "2026-09-01T00:00:00+00:00",
+            "definition_version": created.version,
+            "action_snapshot": created.actions,
+            "scheduled_for": "2026-09-01T00:00:00+00:00",
+        },
+    )
+
+    deleted = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "deleted", "expected_version": created.version},
+    )
+    assert deleted.success is True
+    assert deleted.data["status"] == "deleted"
+    assert deleted.data["version"] == created.version + 1
+
+    stored = await repo.get_task(OWNER, created.id)
+    assert stored is not None and stored.status == "deleted"
+    assert stored.version == created.version + 1
+    assert stored.terminal_at is not None
+
+    # Deleted task leaves the normal task list but stays inspectable by id,
+    # and its occurrence history is untouched.
+    listing = await run_tool(executor, ctx, "task_list", {})
+    assert listing.success is True
+    assert f"#{created.id}" not in listing.message
+    inspection = await run_tool(executor, ctx, "task_inspect", {"task_id": created.id})
+    assert inspection.success is True and "Deleted" in inspection.message
+    kept = await repo.get_occurrence(OWNER, created.id, occurrence.occurrence_key)
+    assert kept is not None and kept.status == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_deleted_task_is_terminal_and_cannot_be_reactivated():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+    deleted = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "deleted", "expected_version": created.version},
+    )
+    assert deleted.success is True
+    terminal_at = (await repo.get_task(OWNER, created.id)).terminal_at
+
+    # A terminal deleted task can never return to an active lifecycle, even
+    # with the correct version.
+    reactivate = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "active", "expected_version": deleted.data["version"]},
+    )
+    assert reactivate.success is False
+
+    # The repository's existing self-transition (deleted -> deleted) is
+    # idempotent and safe; terminal_at is never cleared.
+    again = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "deleted", "expected_version": deleted.data["version"]},
+    )
+    assert again.success is True and again.data["status"] == "deleted"
+    stored = await repo.get_task(OWNER, created.id)
+    assert stored.terminal_at == terminal_at
 
 
 # ── retrieve_save ────────────────────────────────────────────────────────────

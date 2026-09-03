@@ -120,6 +120,7 @@ def test_task_inspect_rejects_unexpected_fields():
     ("paused", "paused"),
     ("active", "active"),
     ("completed", "completed"),
+    ("deleted", "deleted"),
 ])
 def test_task_transition_resolves_full_cas_arguments(status, verb):
     result = parse_action_text(
@@ -147,12 +148,22 @@ def test_task_transition_normalizes_status_case():
 
 
 def test_task_transition_rejects_nonlifecycle_status():
+    # "delete" is not a lifecycle status; the registered terminal state is
+    # "deleted" (the existing ai_tasks lifecycle value).
     result = parse_action_text(
         '{"action":"task_transition","task_id":7,'
         '"action_status":"delete","expected_version":1}'
     )
     assert result.kind == "invalid"
     assert "action_status" in result.error
+
+
+def test_task_list_status_filter_rejects_terminal_deleted():
+    # The list filter vocabulary stays narrower than the transition
+    # vocabulary: deleted tasks are excluded from the normal list and can
+    # never be listed through a status filter (matches the registered tool).
+    result = parse_action_text('{"action":"task_list","status":"deleted"}')
+    assert result.kind == "invalid"
 
 
 def test_task_transition_requires_expected_version():

@@ -317,7 +317,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                 status_value = raw.get("status")
                 if (
                     not isinstance(status_value, str)
-                    or status_value.strip().lower() not in _TASK_STATUS_VOCABULARY
+                    or status_value.strip().lower() not in _TASK_LIST_STATUS_VOCABULARY
                 ):
                     return ActionParseResult(
                         kind=KIND_INVALID,
@@ -540,7 +540,12 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
 _TASK_INSPECT_FIELDS = frozenset({"action", "task_id"})
 _TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version"})
-_TASK_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
+# task_list's optional status filter: terminal deleted tasks never match a
+# list filter (the normal list excludes them, see TaskManagementService).
+_TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
+# task_transition targets, mirroring the registered tool's action enum:
+# ``deleted`` is the existing terminal lifecycle state.
+_TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed", "deleted"})
 _SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
 
 
@@ -577,12 +582,12 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
         )
 
     status = raw.get("action_status")
-    if not isinstance(status, str) or status.strip().lower() not in _TASK_STATUS_VOCABULARY:
+    if not isinstance(status, str) or status.strip().lower() not in _TASK_TRANSITION_STATUS_VOCABULARY:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=(
                 "Invalid 'action_status' for task_transition "
-                "(allowed: paused, active, completed)."
+                "(allowed: paused, active, completed, deleted)."
             ),
         )
     version = coerce_int(raw.get("expected_version"))

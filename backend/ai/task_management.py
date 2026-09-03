@@ -24,10 +24,18 @@ class TaskManagementService:
         Filtering happens here (owner-scoped) so repository interfaces stay
         unchanged; task volumes are small. Status values are the record's
         canonical strings (active / paused / completed / ...).
+
+        The normal (unfiltered) list excludes ``deleted`` tasks: ``deleted``
+        is the terminal lifecycle state, so a deleted task leaves the list
+        while its row and occurrence history stay durable and it remains
+        inspectable by id. An explicit ``status`` filter matches the record's
+        exact status and is never widened.
         """
         tasks = await self.repository.list_tasks(self.owner_id)
         if status is None:
-            return tasks
+            return [
+                t for t in tasks if str(getattr(t, "status", "") or "") != "deleted"
+            ]
         return [t for t in tasks if str(getattr(t, "status", "") or "") == status]
 
     async def inspect(self, task_id: int, occurrence_limit: int = 100) -> TaskView | None:
