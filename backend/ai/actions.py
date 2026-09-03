@@ -105,7 +105,7 @@ ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
-    "task_id", "action_status", "expected_version", "save_code",
+    "task_id", "action_status", "expected_version", "save_code", "status",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -170,6 +170,7 @@ class ActionParseResult:
     action_status: str = ""
     expected_version: int | None = None
     save_code: str = ""
+    status: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -285,6 +286,15 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                     ),
                 )
 
+    # ``status`` is only meaningful for the task_list action (an optional
+    # status filter on the read). The lifecycle actions express their target
+    # status via ``action_status`` — never via ``status``.
+    if "status" in raw and action != "task_list":
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'status' is only valid for the task_list action.",
+        )
+
     if action in ("task_inspect", "task_transition"):
         return _validate_task_lifecycle_action(action, raw)
 
@@ -296,6 +306,28 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     # ``list_recent_messages`` accepts an optional limit, and
     # ``account_status`` accepts an optional ``fields`` allowlist.
     if action in _STATUS_ACTIONS:
+        # task_list accepts an OPTIONAL status filter so natural-language
+        # retrieval semantics ("show completed tasks") can be expressed as a
+        # validated argument instead of per-phrase vocabulary. Filtering is
+        # owner-scoped inside TaskManagementService; this layer only
+        # validates the enum.
+        if action == "task_list":
+            status = ""
+            if "status" in raw:
+                status_value = raw.get("status")
+                if (
+                    not isinstance(status_value, str)
+                    or status_value.strip().lower() not in _TASK_STATUS_VOCABULARY
+                ):
+                    return ActionParseResult(
+                        kind=KIND_INVALID,
+                        error=(
+                            "Invalid 'status' for task_list "
+                            "(allowed: paused, active, completed)."
+                        ),
+                    )
+                status = status_value.strip().lower()
+            return ActionParseResult(kind=KIND_EXECUTABLE, action=action, status=status)
         if action == "search_saved_items":
             query = raw.get("query")
             if not isinstance(query, str) or not query.strip():
@@ -674,7 +706,8 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         return [{"name": "account_show", "arguments": args}]
 
     if action == "task_list":
-        return [{"name": "task_list", "arguments": {}}]
+        args: dict[str, Any] = {"status": result.status} if result.status else {}
+        return [{"name": "task_list", "arguments": args}]
 
     if action == "task_inspect":
         return [{"name": "task_inspect", "arguments": {"task_id": result.task_id}}]
@@ -763,6 +796,7 @@ def parse_action_text(text: str) -> ActionParseResult:
             action_status=result.action_status,
             expected_version=result.expected_version,
             save_code=result.save_code,
+            status=result.status,
             tool_calls=tool_calls,
         )
     return result
@@ -1381,70 +1415,21 @@ def _is_scheduling_intent(words: list[str]) -> bool:
     return False
 
 
-# Task vocabulary — deterministic task-show resolution. "تسک"/"کار"/task
-# stem-matched so possessives ("تسک‌هام", "کارها", "تسکهایم") count; the
-# list/show verbs reuse the same fused-clitic matching as the bio branch
-# ("نشونم بده").
-_TASK_STEMS = ("تسک", "کار")
-_EN_TASK_WORDS = frozenset({"task", "tasks", "todo", "todos"})
-_TASK_LIST_VERBS = frozenset({"لیست", "لیستش", "بده", "ببین", "نشون", "نمایش", "list", "show"})
+# ── Task-management routing ──
+#
+# Task-management requests (list / inspect / pause / resume / complete) are
+# intentionally NOT hardcoded here. There is deliberately no Persian/English
+# task vocabulary in this deterministic parser: selecting the registered
+# task tools (task_list / task_inspect / task_transition) is the AI's
+# semantic job, driven by the provider-visible tool schemas and the prompt's
+# JSON-action contract. The Self Bot stays the execution authority:
+# whichever route the AI output takes (native tool call, or a JSON action
+# object validated by validate_action / resolve_tool_calls) ends in the SAME
+# registered tool -> ToolExecutor -> TaskManagementService chain. Requests
+# the deterministic command vocabulary cannot resolve (including every
+# task-management sentence) fall through as conversational and reach the
+# provider, where tool selection happens.
 
-
-def _has_task_mention(words: list[str]) -> bool:
-    """True when any token is a task word (Persian stem or English)."""
-    return any(
-        w in _EN_TASK_WORDS
-        or w.startswith("تسک")
-        or w.startswith("کار")
-        for w in words
-    )
-
-
-def _extract_task_id(words: list[str]) -> int | None:
-    """Return the explicit task number in a show request, else None."""
-    from backend.ai.actions import _parse_number
-
-    for i, w in enumerate(words):
-        if w in ("تسک", "کار", "task") and i + 1 < len(words):
-            number = _parse_number(words, i + 1)
-            if number is not None:
-                return number
-    return None
-
-
-def _parse_task_show_intent(words: list[str]) -> ActionParseResult | None:
-    """Deterministically recognize read-only task-show intents.
-
-    Returns an executable tool call (task_list / task_inspect) or None.
-    Runs AFTER _parse_status_intent so saved-items/database/bio/account
-    requests that merely contain the word "کار" never route here. An
-    explicit task id in the request selects task_inspect; a bare
-    list/show request selects task_list (no arguments — the read-only
-    tool takes none).
-    """
-    if not _has_task_mention(words):
-        return None
-
-    has_list_verb = any(w in _TASK_LIST_VERBS or _is_show_verb_token(w) for w in words)
-    has_status_word = bool(set(words) & (_STATUS_WORDS | _SAVE_LIST_WORDS))
-    if not (has_list_verb or has_status_word):
-        return None
-
-    task_id = _extract_task_id(words)
-    if task_id is not None:
-        return ActionParseResult(
-            kind=KIND_EXECUTABLE,
-            action="task_inspect",
-            target="schedule",
-            task_id=task_id,
-            tool_calls=[{"name": "task_inspect", "arguments": {"task_id": task_id}}],
-        )
-    return ActionParseResult(
-        kind=KIND_EXECUTABLE,
-        action="task_list",
-        target="schedule",
-        tool_calls=[{"name": "task_list", "arguments": {}}],
-    )
 
 
 def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
@@ -1751,13 +1736,10 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
     if status is not None:
         return status
 
-    # Task-show requests resolve to the registered task_list / task_inspect
-    # tools BEFORE falling through as conversational. Without this branch a
-    # deterministic READ request depended on provider tool selection
-    # (production: narration -> retry -> fallback -> error,
-    # ai_last_provider_s ~ 60s = the handler ceiling).
-    task_show = _parse_task_show_intent(words)
-    if task_show is not None:
-        return task_show
-
+    # Task-management requests deliberately fall through as conversational:
+    # selecting a task tool is the AI's semantic job (see the
+    # "Task-management routing" note above), never per-phrase vocabulary in
+    # this parser. The provider path then emits either a native task tool
+    # call or a JSON action object that validate_action/resolve_tool_calls
+    # accept.
     return ActionParseResult(kind=KIND_CONVERSATIONAL)

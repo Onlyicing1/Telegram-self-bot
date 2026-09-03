@@ -6,135 +6,209 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `4069797399ed8a1ab49502792b7ba69c38ae9868` (`fix: accept new AI tool actions on the deterministic fallback route`) |
-| Implementation commit (final HEAD at delivery) | `7aee8d1d7c2d9743d389029dfa4fb877641b2afa` |
-| Report commit | the single commit immediately following `7aee8d1` on `main`, containing ONLY this report rewrite; its SHA is the final HEAD |
-| Report recovery | the dropped create_task/AI_TASK_TRACE report rewrite (`48ee64d`, orphaned by a failed rebase, never pushed) was recovered from git evidence and reconciled into this current-state report as the subsection at the end of §4; the remote report text is otherwise preserved verbatim |
+| Starting HEAD | `3a70cec9190a177de06a127725ec788ab3be0bcd` |
+| Final HEAD | The delivery commit containing this implementation and current-state report |
+| Report reconciliation | The recovered `create_task`/`AI_TASK_TRACE` documentation from the newer remote report was retained in §4 while stale prior task-show delivery metadata was replaced with this implementation's current state |
 | Implementation date | 2026-09-03 |
-| Task/chunk | Forensic root-cause analysis and minimal fix for real AI tool connectivity — `task_list` reproduction case |
+| Task/chunk | Replace regex-based task natural-language routing with AI-driven registered-tool selection and extend task retrieval semantics |
 | Work type | investigation + implementation |
-| Final implementation status | **COMPLETE WITH LIMITATIONS** — root cause proven and fixed with deterministic validation; live Telegram verification outstanding (see §10, §14) |
+| Final implementation status | **COMPLETE WITH LIMITATIONS** — source, unit, provider-schema, dispatcher/executor contract, and compile checks pass; live Telegram verification remains unproven |
+
+This is the single current-state report for the implementation. It records
+only behavior and validation established from the current source, working-tree
+diff, and commands actually run.
+
+---
 
 ## 2. OBJECTIVE
 
-The task required diagnosing why AI tools that are registered and
-deterministically healthy still fail through the real Telegram AI execution
-path, using the reproduction request **"لیست تسک رو ببین"** (`task_list`
-capability), and fixing the proven production failure minimally.
+The task was to replace the current deterministic task-show routing with
+proper AI-driven tool selection. The previous task-specific branch in
+`backend/ai/actions.py::parse_command_intent` recognized a finite Persian and
+English vocabulary and executed `task_list` or `task_inspect` before any
+provider round. That solved the narrow production request **"لیست تسک رو ببین"**
+but made arbitrary task phrasing depend on continued parser vocabulary rather
+than semantic tool selection.
 
-- **Primary production symptom** (USER-SUPPLIED PRODUCTION EVIDENCE from
-  Render runtime logs and Telegram screenshots in earlier conversation
-  context): the request entered the AI, showed an "Inspecting the task
-  list" narration phase, then performed a retry/fallback sequence and
-  returned an error instead of executing the registered `task_list` tool.
-  `ai_last_provider_s ~ 60s` — the handler ceiling.
-- **Primary affected path**: `Dispatcher._try_local_fast_path` →
-  `backend/ai/actions.py::parse_command_intent` → `ToolExecutor` →
-  `task_list` / `task_inspect` (`TaskManagementService`).
-- The four capability-exposure tools (`task_list`, `task_inspect`,
-  `task_transition`, `retrieve_save`) were registered, schema-visible, and
-  executor-executable before this task. Registration was therefore NOT the
-  failure; this task proves where the real path diverged and fixes it.
+The intended path is:
+
+```text
+Telegram request
+  → AI provider receives registered tool schemas
+  → native tool call or validated JSON action
+  → ToolRegistry / ToolExecutor
+  → existing TaskManagementService
+  → real task result
+```
+
+The implementation also extends retrieval semantics so a model can express
+requests such as “show completed tasks” through an optional validated
+`task_list.status` argument rather than another phrase-specific rule.
+
+The Self Bot remains the execution authority. Providers propose tool calls;
+they do not receive direct Telegram, SQL, shell, or arbitrary HTTP execution
+access.
+
+---
 
 ## 3. ROOT CAUSE
 
-**Root cause (proven):** `parse_command_intent` — the deterministic intent
-parser that runs BEFORE any provider round — had **no task vocabulary**.
-"لیست تسک رو ببین" fell through the entire command vocabulary and returned
-`kind=conversational`, so a deterministic READ request was routed to the
-provider tool loop. With the configured free-tier model returning prose
-instead of a structured tool call, the bounded retry → structured-action
-fallback → error chain ran to the handler ceiling.
+### Architectural root cause
 
-- **Exact component/module:** `backend/ai/actions.py` →
-  `parse_command_intent()` (and the fast path that consumes it,
-  `backend/ai/engine/dispatcher.py::_try_local_fast_path`, lines 342–355
-  and 1187).
-- **Failure mechanism:** no parser branch recognized task-show requests →
-  `ActionParseResult(kind=KIND_CONVERSATIONAL)` → dispatcher skips the
-  local fast path → provider rounds spent on a request that never needed
-  one → prose response → retry/fallback → error at the 60s handler ceiling.
-- **Failure layer classification:** deterministic intent resolution
-  (pre-registry). The ToolRegistry, Dispatcher tool-schema generation,
-  ToolExecutor, permission gates, and the underlying
-  `TaskManagementService` were source-verified healthy.
-- **Evidence proving the root cause:**
-  1. Deterministic reproduction: `parse_command_intent("لیست تسک رو ببین")`
-     returned `conversational` — exactly matching the production outcome
-     (assertion captured in `tests/test_task_show_intent.py` before the
-     `_has_task_mention` correction below).
-  2. Source trace: `dispatcher.py` executes `parse_command_intent` before
-     any provider round and executes its `tool_calls` through the SAME
-     `ToolExecutor` as the provider loop — so a deterministic resolution
-     removes the entire provider dependency.
-  3. Registry proof: `create_default_registry(ToolContext)` → 36 tools;
-     `task_list` and `task_inspect` resolve by name (no `not_found` risk).
-- **Secondary defect found during validation:** the first cut of the new
-  `_has_task_mention` helper required `len(w) > len(stem)`, which EXCLUDED
-  the bare token "تسک" — the reproduction test for the exact production
-  sentence failed. Corrected to plain prefix matching (`w.startswith("تسک")`
-  / `w.startswith("کار")`). This is recorded because it demonstrates the
-  reproduction test is a true production repro, not an expectation rewrite.
+The concrete architectural cause was the deterministic task-show branch in
+`backend/ai/actions.py`:
+
+- `_TASK_STEMS`, `_EN_TASK_WORDS`, and `_TASK_LIST_VERBS` encoded a finite
+  language vocabulary.
+- `_has_task_mention`, `_extract_task_id`, and
+  `_parse_task_show_intent` converted matching text directly to
+  `task_list`/`task_inspect` calls.
+- `parse_command_intent` ran from the dispatcher fast path before the provider
+  was asked to interpret the request.
+
+That mechanism bypassed AI semantic selection for task-management requests and
+could not generalize to new wording such as status-filtered reads or lifecycle
+operations without adding more local vocabulary.
+
+### Earlier production symptom
+
+The supplied production evidence was that **"لیست تسک رو ببین"** produced
+narration, provider retry/fallback behavior, and an error instead of a task
+operation. The current implementation does not claim live resolution of that
+request without a functioning provider: the required architecture deliberately
+routes task phrasing back through AI selection. The current source proves the
+local action/schema/executor contracts, but it does not prove a live provider's
+semantic output.
+
+### Failure-layer classification
+
+- Prior architectural failure: **deterministic intent-routing layer**.
+- Provider behavior in the supplied live incident: **not independently
+  reproduced in this workspace**.
+- Current live production outcome: **NOT PROVEN** until Telegram/provider
+  verification is performed.
+
+---
 
 ## 4. EXACT IMPLEMENTATION CHANGES
 
-### `backend/ai/actions.py` — deterministic task-show resolution
+### `backend/ai/actions.py`
 
-- **Module/function:** new private helpers `_has_task_mention`,
-  `_extract_task_id`, `_parse_task_show_intent`; new module vocabularies
-  `_TASK_STEMS` (`تسک`, `کار`), `_EN_TASK_WORDS` (`task`, `tasks`, `todo`,
-  `todos`), `_TASK_LIST_VERBS` (`لیست`, `لیستش`, `بده`, `ببین`, `نشون`,
-  `نمایش`, `list`, `show`).
-- **Previous behavior:** any task-show request returned
-  `KIND_CONVERSATIONAL` from `parse_command_intent`; the request proceeded
-  to provider rounds.
-- **New behavior:** a task-show request returns `KIND_EXECUTABLE` with
-  concrete `tool_calls`: `{"name": "task_list", "arguments": {}}` for a
-  bare list/show request, or `{"name": "task_inspect", "arguments":
-  {"task_id": N}}` when an explicit task number is present (Persian digits
-  normalized by the existing `_tokenize`/`_parse_number` machinery).
-- **Dispatch position:** the new branch runs at the END of
-  `parse_command_intent`, AFTER the scheduling intent (so recurring
-  requests stay on `create_task`), AFTER save/delete/send intents, AFTER
-  the recent-messages branch, and AFTER `_parse_status_intent` (so
-  saved-items/database/bio/account requests that merely contain the word
-  "کار" never route here). `_has_task_mention` uses plain prefix matching
-  so ZWNJ-clitic forms ("تسک‌هام", "تسک‌های") and the bare token "تسک"
-  both match; `has_list_verb` reuses the existing `_is_show_verb_token`
-  plus `_STATUS_WORDS`/`_SAVE_LIST_WORDS` membership as secondary triggers.
-- **Reason:** deterministic READ intents must not depend on provider tool
-  selection (the established reliability guarantee of the local fast path).
-- **Architectural implications:** none — no new tool, no new executor, no
-  registry/permission change. The fast path executes the resolved calls
-  through the existing `ToolExecutor` with unchanged permission semantics;
-  `task_list`/`task_inspect` are READ_ONLY.
+- Removed the deterministic task vocabulary and task-show helpers:
+  `_TASK_STEMS`, `_EN_TASK_WORDS`, `_TASK_LIST_VERBS`,
+  `_has_task_mention`, `_extract_task_id`, and
+  `_parse_task_show_intent`.
+- Task-management phrases now fall through `parse_command_intent` as
+  `conversational`, allowing the provider path to select a registered tool.
+- Added `status` to the validated action-field allowlist and to
+  `ActionParseResult`.
+- Added an action guard so `status` is accepted only by `task_list`.
+- Added case-insensitive validation for the closed lifecycle vocabulary:
+  `active`, `paused`, and `completed`.
+- `resolve_tool_calls` now maps a valid task-list status to the concrete
+  `task_list` executor call; invalid or misplaced fields remain rejected.
+- `parse_action_text` preserves the normalized status value in its result.
 
-### Correction within this change
+### `backend/ai/task_management.py`
 
-`_has_task_mention` was corrected during validation from a
-`len(w) > len(stem)` guard to plain `startswith` matching after the
-reproduction test failed on the exact production sentence (§3).
+- Extended `TaskManagementService.list_tasks` to accept an optional status.
+- Filtering occurs after the existing owner-scoped repository query and uses
+  the task record's canonical status. Repository interfaces and persistence
+  ownership rules were not changed.
 
-### `tests/test_task_show_intent.py` — NEW regression suite (15 tests)
+### `backend/ai/task_management_interface.py`
 
-- Persian show/list forms including ZWNJ clitics ("تسک‌هام", "تسک‌های") →
-  `task_list`; English "show my tasks" / "list my tasks" → `task_list`.
-- Explicit task id (Persian "تسک ۳" and English "task 12") →
-  `task_inspect` with the parsed id.
-- Negative guards: bare "تسک" stays conversational; scheduling intent wins
-  ("هر 1 دقیقه یک بار بنویس سلام" → `create_task`); "لیست سیوها رو بده" →
-  `list_saved_items`; "وضعیت بایو چیه" → `get_bio`.
+- Extended `list_text` with a keyword-only optional status filter.
+- Filtered results render a status-aware title while preserving the existing
+  `No tasks found.` empty-result text and list formatting.
 
-The `create_task`/`AI_TASK_TRACE` implementation changes recovered into §4
-(`2ab0db8`, `6566ea7`) are already part of origin/main history and are
-documented there rather than re-listed in this table.
+### `backend/ai/tools/task_management_tools.py`
 
-### `IMPLEMENTATION_REPORT.md`
+- Updated `TaskListTool.description` to advertise status-filtered reads.
+- Exposed `status` as an optional string enum in the tool schema.
+- Validated the tool argument at execution time and delegated the filtered
+  operation to the existing `TaskManagementService`/`list_text` boundary.
+- No new persistence or execution authority was introduced.
 
-Replaced entirely with this single current-state report (the previous file
-was an append-log of six earlier phases; per the reporting mandate it is
-superseded — the earlier phases remain documented in their delivery commits
-and in INVESTIGATION.md).
+### `backend/ai/tools/executor.py`
+
+- Added task lifecycle tool labels for in-flight status updates:
+  `task_list`, `task_inspect`, and `task_transition`.
+- Native calls still execute only through the existing `ToolExecutor`.
+
+### `backend/ai/prompt/template.py`
+
+- Added semantic task-tool guidance covering list, inspect, pause/resume, and
+  complete operations.
+- Documented that task IDs and optimistic-concurrency versions must come from
+  actual task-tool results rather than being invented.
+- Added the status-filter JSON fallback example for completed tasks.
+
+### Focused tests
+
+- `tests/test_task_show_intent.py` now verifies that former task-vocabulary
+  sentences reach the AI path, while valid task JSON actions still resolve to
+  registered calls and invalid actions/fields remain rejected.
+- `tests/test_new_tool_action_path.py` covers valid, normalized, invalid, and
+  misplaced `task_list.status` JSON values.
+- `tests/test_capability_exposure_tools.py` covers real registry/executor
+  reachability, owner-scoped filtered results, invalid status handling, and
+  provider-facing schema generation. It also asserts that optional
+  `task_list.status` is present in `properties` but absent from `required`.
+
+No provider implementation, database schema, migration, Telegram RPC surface,
+or UI was changed.
+
+### Recovered current-state documentation — `create_task` interpretation fix + `AI_TASK_TRACE` observability
+
+The remote current-state report also documents the already-delivered
+`create_task` observability work recovered from git history. That documentation
+is retained here so this report does not discard the newer remote report-only
+commit while describing the current implementation.
+
+**Proven root cause of the original no-diagnostic `create_task` failures:**
+`backend/ai/task_interpreter.py` → `TaskInterpreter.interpret()`. Providers
+frequently wrap the compliant JSON candidate in markdown fences (` ``` `/` ```json `);
+the original code called `json.loads(raw)` directly, the `JSONDecodeError`
+collapsed into `TaskInterpretationError`, and the tool boundary's anonymous
+`except (…, Exception)` returned a generic message while logging nothing —
+production showed `tool=create_task success=False` with zero diagnostics.
+Failure layer: AI interpretation parsing (not registry/executor/dispatcher/
+repository). Evidence: the source investigation at commit `c40af4a` proved
+
+the interpretation wrapper (branch 5 of seven `ToolResult(success=False)`
+branches in `CreateTaskTool.execute`) was the active one by timing (~5.8 s),
+single provider attempt, and absence of persistence log lines.
+
+**Exact changes recorded in the remote report:**
+
+- `backend/ai/task_interpreter.py` — `_load_candidate_json(raw)` retries
+  extraction against a markdown-fenced block (`_JSON_BLOCK_RE`) when direct
+  `json.loads` fails; candidate validation remains with
+  `parse_candidate_output`. `interpret(..., request_id=...)` threads the
+  correlation id into `AI_TASK_TRACE stage=interpretation_start`, logs
+  structured provider failures and successes, logs candidate rejections, and
+  preserves causes through timeout and interpretation-end reporting.
+- `backend/ai/tools/task.py` — failure classification, log-safe label hashing,
+  and `_trace`/`_fail` lifecycle records add `AI_TASK_TRACE` stages including
+  receipt, validation, provider resolution, interpretation, destination
+  resolution, definition validation, repository creation, success, and
+  terminal failure while keeping user-facing messages unchanged.
+- `backend/ai/engine/dispatcher.py` — the fast-path `stage=tool_result` log
+  includes the static tool message instead of only tool and success.
+- `backend/ai/database/task_repository.py` — Supabase create fallback logs
+  `create_task_fallback_start`/`create_task_fallback_result` and annotates the
+  in-memory record with `fallback_backend`.
+- `tests/test_task_nl_creation.py` — ambiguity-failure expectations and
+  `AI_TASK_TRACE` lifecycle coverage were updated, including success,
+  terminal-failure, fallback-backend, request-id, and provider-failure cases.
+
+The recovered report recorded 34 focused tests passing, `compileall -q
+backend tests` passing, and `git diff --check` passing for that earlier phase;
+those results are historical evidence, not new validation claimed by this
+implementation task. Live Telegram verification remains unproven.
+
+---
 
 ### Recovered current-state documentation — `create_task` interpretation fix + `AI_TASK_TRACE` observability (commits `2ab0db8`, `6566ea7`, in origin/main history)
 
@@ -215,239 +289,122 @@ then and is still outstanding.
 
 | File | Category | Purpose |
 |---|---|---|
-| `backend/ai/actions.py` | runtime code | Deterministic task-show intent resolution → `task_list` / `task_inspect` tool calls (§4) |
-| `tests/test_task_show_intent.py` | test | NEW — 15 regression tests: production sentence repro, clitic/English forms, task-id → inspect, negative guards |
-| `IMPLEMENTATION_REPORT.md` | documentation | This report (single current-state document replacing the append-log) |
+| `backend/ai/actions.py` | runtime | Remove deterministic task-show routing and validate/resolve `task_list.status` |
+| `backend/ai/prompt/template.py` | prompt | Teach semantic task-tool selection and status-filter fallback output |
+| `backend/ai/task_management.py` | service | Add owner-scoped status filtering |
+| `backend/ai/task_management_interface.py` | presentation | Render filtered task lists |
+| `backend/ai/tools/executor.py` | runtime | Add task-tool execution labels |
+| `backend/ai/tools/task_management_tools.py` | tool | Expose and validate optional task-list status |
+| `tests/test_capability_exposure_tools.py` | test | Verify executor behavior and provider schema optionality |
+| `tests/test_new_tool_action_path.py` | test | Verify JSON action status semantics |
+| `tests/test_task_show_intent.py` | test | Verify AI routing replaces deterministic task vocabulary |
+| `IMPLEMENTATION_REPORT.md` | documentation | Record this current implementation state |
 
-Per `git diff`/`git status` at delivery: exactly these three files; no
-other tracked file changed.
+The working tree also contains an unrelated untracked `telegram-self-bot/`
+directory. It was not inspected for implementation changes, modified, staged,
+or included in this task.
 
-**Files inspected but intentionally unchanged:**
-`backend/ai/engine/dispatcher.py` (fast path + ToolExecutor wiring verified
-correct — no change needed), `backend/ai/tools/registry.py` (36 tools,
-`task_list`/`task_inspect` already registered),
-`backend/ai/tools/task_management_tools.py` (executor-healthy),
-`backend/ai/providers/manager/manager.py` (fallback chain — ruled out as
-root cause, §8), `backend/bot/handlers/ai_unified.py`, `INVESTIGATION.md`
-(current capability audit remains accurate; the fast path it documents is
-the path this fix extends), `backend/ai/prompt/template.py`,
-`backend/ai/task_management.py`, `backend/ai/task_creation.py`.
+---
 
-## 6. AI TOOL CONNECTIVITY IMPACT
+## 6. BEHAVIOR AND ARCHITECTURE IMPACT
 
-**Tool: `task_list`**
-- Permission: READ_ONLY — UNCHANGED
-- Implementation: complete (`backend/ai/tools/task_management_tools.py`) — UNCHANGED
-- Registry: registered (36-tool registry verified in-process) — UNCHANGED
-- Provider exposure: native schema + prompt schemas — UNCHANGED
-- Provider request / call generation: UNCHANGED (providers still receive the schema and may still propose the call)
-- Dispatcher: NOW deterministically resolvable via the local fast path (previously only via provider selection) — **CHANGED (fix)**
-- ToolExecutor: sole execution authority — UNCHANGED
-- Underlying service: `TaskManagementService.list_tasks` — UNCHANGED
-- Result propagation: fast-path summary path — UNCHANGED
-- Real Telegram verification: NOT VERIFIED (§10)
-- Final status: **PROVEN CONNECTED through the deterministic route (unit + in-process integration); live Telegram NOT VERIFIED**
+### Task routing
 
-**Tool: `task_inspect`** — identical profile to `task_list`, resolved with
-`{"task_id": N}` from an explicit id; final status: **PROVEN CONNECTED
-through the deterministic route; live Telegram NOT VERIFIED**.
+Before:
 
-**Tools: `task_transition`, `retrieve_save`** — UNCHANGED by this task
-(their deterministic JSON-action acceptance was delivered in commit
-`4069797` and is covered by `tests/test_new_tool_action_path.py`, which
-passes unchanged). Status: **UNCHANGED**.
+```text
+recognized task phrase → local vocabulary parser → task tool
+```
 
-The connectivity failure for `task_list` was NOT in the registry, provider
-exposure, call generation, or executor — it was in intent resolution one
-stage before the registry (§3).
+After:
 
-## 7. BEHAVIOR CHANGED
+```text
+natural-language task request → provider-visible registered schemas
+→ native task call or JSON action → local validation
+→ ToolExecutor → TaskManagementService
+```
 
-### Added
-- Deterministic recognition of read-only task-show intents in
-  `parse_command_intent`, producing executable `task_list`/`task_inspect`
-  tool calls with zero provider involvement.
+`parse_command_intent("لیست تسک رو ببین", has_reply=False)` now returns
+`conversational` rather than selecting `task_list` locally. This is deliberate:
+task phrasing is no longer hardcoded into the deterministic parser.
 
-### Changed
-- Task-show requests no longer enter the provider tool loop; they resolve
-  on the local fast path (no narration/retry/fallback chain, no 60s
-  ceiling exposure for this request class).
-- `_has_task_mention` stem matching (corrected during validation, §3).
+### Retrieval semantics
 
-### Preserved
-- All existing intents and their ordering (scheduling, save/delete/send,
-  recent-messages, status queries) — asserted by the negative-guard tests
-  and by the unchanged 1491-test suite.
-- ToolRegistry membership, permission levels, ToolExecutor authority,
-  provider fallback semantics, user-visible tool result formats.
+`task_list` remains `READ_ONLY` and owner-scoped. It now accepts one optional
+status filter from the closed set `active`, `paused`, or `completed`. An
+unfiltered call retains the previous list behavior.
 
-### Not Proven
-- Live Telegram behavior of the new branch on Render (§10).
+### Security boundaries
 
-## 8. FALLBACK / RETRY BEHAVIOR
+- The provider can select only capabilities exposed by `ToolRegistry`.
+- JSON actions are checked by `validate_action` and resolved through the same
+  executor path as native calls.
+- `task_transition` still requires the current `expected_version` and remains
+  owner-scoped with CAS semantics.
+- The model cannot choose a Telegram destination or bypass the service layer.
+- No database schema or migration was added.
 
-- **Fallback occurred in production** (USER-SUPPLIED evidence): after the
-  conversational fall-through, the provider route ended in retry/fallback.
-- **What caused fallback:** the provider returning prose with no structured
-  tool call for a request whose deterministic resolution was missed one
-  stage earlier — i.e. **fallback merely exposed another defect**; it was
-  the symptom carrier, not the cause.
-- **Fallback root cause: RULED OUT.** Source-verified: ProviderManager
-  fallback operates after a conversational fall-through has already
-  happened; the same request resolves without any provider round once the
-  parser branch exists. No ProviderManager code was changed.
-- **Tool definitions survived retry/fallback:** yes by construction —
-  schemas are regenerated from the registry for every request
-  (`_build_tool_definitions` / `_render_tool_schemas`), and the nudge text
-  carries the full vocabulary (delivered in `4069797`); not modified here.
-- **Request/context survived fallback:** yes — the parser re-reads the
-  original `request.user_message` on every recovery pass (verified at
-  `dispatcher.py:1187` and `:1396`).
-- **Provider response normalization:** not implicated; no change.
+---
 
-## 9. VALIDATION
+## 7. VALIDATION
 
-Only actually-executed validation is listed.
-
-| Validation | Exact command | Exact result |
+| Validation | Command | Result |
 |---|---|---|
-| Reproduction (BEFORE the `_has_task_mention` correction) | `python3 -m pytest tests/test_task_show_intent.py -x -q` | **1 failed** — `AssertionError: 'لیست تسک رو ببین' -> conversational` (true production repro) |
-| Focused suite (after fix) | `python3 -m pytest tests/test_task_show_intent.py -q` | **15 passed** |
-| Affected suites | `python3 -m pytest tests/test_19_ai_actions.py tests/test_25_fast_path.py tests/test_new_tool_action_path.py tests/test_task_show_intent.py tests/test_capability_exposure_tools.py tests/test_tool_health_audit.py -q` | **170 passed** |
-| Full suite | `python3 -m pytest tests/ -q` | **1491 passed, 23 skipped, 1 warning** |
-| Compile check | `python3 -m py_compile backend/ai/actions.py tests/test_task_show_intent.py` | **passed** (PY_COMPILE_OK) |
-| Whitespace check | `git diff --check` | **passed** (no output) |
-| In-process end-to-end chain | `create_default_registry(ToolContext(...))` + `parse_command_intent(...)` scripted run | 36 registered tools; `'لیست تسک رو ببین'` → `executable / task_list / [{'name': 'task_list', 'arguments': {}}]`; `'تسک ۳ رو نشون بده'` → `task_inspect {'task_id': 3}`; `'show my tasks'` → `task_list`; both names resolve in the real registry |
+| Full test suite | `python3 -m pytest tests/ -q` | **1510 passed, 23 skipped, 1 warning** |
+| Focused routing/schema suites | `python3 -m pytest tests/test_task_show_intent.py tests/test_new_tool_action_path.py tests/test_capability_exposure_tools.py tests/test_19_ai_actions.py tests/test_25_fast_path.py -q` | **129 passed** |
+| Native dispatcher/executor coverage | `python3 -m pytest tests/test_10_tool_calls.py tests/test_19_ai_actions.py tests/test_capability_exposure_tools.py -q` | **76 passed** |
+| Compile check | `python3 -m py_compile backend/ai/actions.py backend/ai/task_management.py backend/ai/task_management_interface.py backend/ai/tools/task_management_tools.py backend/ai/tools/executor.py backend/ai/prompt/template.py tests/test_task_show_intent.py tests/test_new_tool_action_path.py tests/test_capability_exposure_tools.py` | **passed** |
+| Diff whitespace check | `git diff --check` | **passed** |
 
-Classification: **UNIT TESTED** (focused suite) + **INTEGRATION TESTED**
-(in-process real parser → real registry; real fast-path consumption of
-`parse_command_intent` is source-verified and covered by
-`tests/test_25_fast_path.py`, which passes unchanged). **LIVE TELEGRAM
-VERIFIED: NO.** No mock-only "healthy" claim is made beyond this scope.
+The tests verify both concrete JSON-action resolution and the existing native
+provider-call path's use of `ToolExecutor`. They do not substitute for a live
+provider or Telegram run.
 
-## 10. REAL TELEGRAM VERIFICATION STATUS
+---
 
-**Live Telegram verification: NOT VERIFIED** — no deployed Self-Bot or live
-Telegram access was available in this workspace; no live test was performed
-by this agent.
+## 8. LIVE TELEGRAM VERIFICATION
 
-- **What the user had already observed** (USER-SUPPLIED PRODUCTION
-  EVIDENCE): "لیست تسک رو ببین" → narration → retry/fallback → error; no
-  real `task_list` execution; `ai_last_provider_s ~ 60s` on Render.
-- **What the existing evidence established:** the failure is real and
-  reproducible deterministically; the tools themselves were never the
-  problem (§6).
-- **What a future production verification must prove:** on live Telegram,
-  `Nova لیست تسک رو ببین` (or the owner's trigger) produces
-  `AI_EXEC_TRACE stage=intent_resolved intent=task_list kind=executable`
-  followed by `stage=tool_execute tools=['task_list']` and
-  `stage=tool_result tool=task_list success=True` — with the actual task
-  list delivered — and latency far below the handler ceiling. Until that is
-  observed, live behavior remains **NOT PROVEN**.
+**Not performed.** No deployed Self Bot, live Telegram session, or production
+provider credentials were used by this agent.
 
-## 11. DATABASE / SUPABASE IMPACT
+Live verification must confirm that a request such as `Nova لیست تسک رو ببین`
+causes the configured provider to select the registered `task_list` capability,
+that the call reaches `ToolExecutor`, and that the returned owner-scoped task
+list is delivered. A request for completed tasks must additionally produce the
+validated argument `{"status":"completed"}`.
 
-- Database changed: **NO**
-- Schema changed: **NO**
-- Migrations created: **NO**
-- Supabase configuration changed: **NO**
-- Live Supabase verification: **NO** (no database interaction in this change)
+Because that test was not run here, this report does not claim that the live
+provider will always select a tool or that the production incident is fully
+resolved under provider failure conditions.
 
-Database/Supabase impact: **NONE.**
+---
 
-## 12. SECURITY / ARCHITECTURE BOUNDARIES
+## 9. DATABASE / SUPABASE IMPACT
 
-All boundaries preserved:
+- Database schema changed: **NO**.
+- Migrations changed: **NO**.
+- Repository interfaces changed: **NO**.
+- Live Supabase verification: **NO**.
+- The status filter operates on the existing owner-scoped task records after
+  retrieval and introduces no new table or persistence path.
 
-- **Self Bot remains execution authority** — the deterministic branch only
-  selects an EXISTING registered tool; Telegram side effects still flow
-  through `TaskManagementService` → existing repositories.
-- **ToolRegistry remains the capability allowlist** — no tool added,
-  removed, or re-permissioned (36 tools before and after, verified
-  in-process).
-- **ToolExecutor remains the sole execution authority** — the fast path
-  executes through the same `ToolExecutor.execute_calls` as the provider
-  loop (source-verified, `dispatcher.py:1273`).
-- **No arbitrary Telegram RPC / SQL / shell / HTTP** — the change is a
-  pure intent-recognition vocabulary addition inside `actions.py`; zero new
-  I/O surface.
-- **Permission/ownership checks intact** — `task_list`/`task_inspect` are
-  READ_ONLY and owner-scoped exactly as before; the fast path cannot
-  bypass permission gating because it uses the same executor.
-- **Destructive-operation verification intact** — untouched; the new
-  branch handles only read-only requests.
+---
 
-## 13. INTENTIONALLY NOT CHANGED
+## 10. DELIVERY STATE
 
-- **Hermes / Workers / Service Mesh / Orchestrator** — zero code references
-  in the tree; explicitly out of scope.
-- **Provider architecture, ProviderManager, new providers** — fallback was
-  ruled out as root cause (§8); routing unchanged.
-- **UI/panels, Taskloom visuals** — outside scope.
-- **Unrelated task functionality** — `task_transition`, `retrieve_save`,
-  `create_task` untouched.
-- **RuntimeSupervisor, Telegram execution authority, scheduler** — proven
-  unrelated to the defect.
-- **Database/schema** — no interaction.
-- **`INVESTIGATION.md`** — its current capability audit remains accurate;
-  this fix extends the deterministic fast path it already documents, and
-  the full detail lives in this report.
+- The implementation changes in this report are delivered on `main`; the
+  exact commit and remote SHA are verified in the final delivery record.
+- No force-push was used, and the newer remote report commit was preserved.
+- The unrelated untracked `telegram-self-bot/` directory was preserved.
 
-## 14. LIMITATIONS / UNCERTAINTIES
+---
 
-- **No live Telegram access / credentials** — the production fix is proven
-  deterministically, not on the deployed bot.
-- **No live provider credentials** — the prose-returning free-tier model
-  behavior (openrouter) could not be reproduced locally; it is irrelevant
-  to the fixed path (zero provider rounds) but relevant to any request
-  that still falls through conversationally.
-- **Production log lines were not re-inspected in this session** — the
-  symptom is taken from the user-supplied evidence in prior conversation
-  context (the current task's evidence section was empty); the
-  deterministic reproduction is this session's primary evidence.
-- **`_TASK_LIST_VERBS` is a bounded vocabulary** — Persian phrasings
-  outside the listed verbs/stems remain conversational by design; the
-  negative guards deliberately keep the branch narrow.
-- **Full-suite runtime environment** — Python 3.10 in this workspace vs
-  3.11 target; 23 skips are pre-existing environment skips, unchanged.
+## 11. LIMITATIONS
 
-## 15. REMAINING WORK / BLOCKERS
-
-- `task_list` / `task_inspect` require live Telegram verification on Render
-  (§10) — the only outstanding proof for "fixed in production".
-- Optional follow-up (not started): extend deterministic resolution to
-  task-transition phrasings ("تسک ۳ رو متوقف کن" → `task_transition`),
-  which currently remain on the provider/JSON-action route.
-
-## 16. GIT DELIVERY
-
-| Field | Value |
-|---|---|
-| Starting HEAD | `4069797399ed8a1ab49502792b7ba69c38ae9868` |
-| Implementation commit | `7aee8d1d7c2d9743d389029dfa4fb877641b2afa` — `fix: resolve Persian task-show requests to task_list deterministically` (files: `backend/ai/actions.py`, `tests/test_task_show_intent.py`) |
-| Push result | **SUCCESS** — `4069797..7aee8d1  main -> main` (no force push) |
-| Remote verification | `git ls-remote origin main` returned `7aee8d1d7c2d9743d389029dfa4fb877641b2afa` — identical to local HEAD after the implementation push |
-| Report commit | the single commit immediately following `7aee8d1` on `main`, containing ONLY this report rewrite; pushed in the same delivery task, same verification method |
-| Branch | `main` |
-| Local HEAD == origin/main | YES (verified via `git ls-remote` after push; the report commit's SHA is the final HEAD, checkable with `git log -2 --oneline`) |
-| Final working-tree state | clean of tracked modifications at delivery; the pre-existing untracked `telegram-self-bot/` nested clone (an ancestor-commit clone, preserved untouched through every prior phase) remains the only untracked entry |
-
-## 17. FINAL REPOSITORY STATE
-
-- **Implementation status:** COMPLETE WITH LIMITATIONS (live Telegram
-  verification outstanding)
-- **Root cause status:** PROVEN — missing deterministic task-show
-  vocabulary in `parse_command_intent`; fixed minimally in
-  `backend/ai/actions.py`
-- **Affected tools:** `task_list`, `task_inspect` (deterministic route
-  added); `task_transition`, `retrieve_save` unchanged
-- **Remaining blockers:** live Telegram verification of the fixed path
-- **Database impact:** NONE
-- **Live Telegram verification:** NOT VERIFIED (user's prior failure
-  evidence stands as the last live observation)
-- **Final commit:** `7aee8d1d7c2d9743d389029dfa4fb877641b2afa`
-  (implementation) + the report commit carrying this file
-- **Remote HEAD:** identical to local HEAD (verified via `git ls-remote
-  origin main` after push)
-- **Working tree:** no tracked modifications; pre-existing untracked
-  `telegram-self-bot/` clone preserved
+1. AI-driven routing intentionally restores provider dependence for task
+   requests; it does not guarantee execution when every provider is down or a
+   model ignores the supplied schemas.
+2. The status filter is a single closed-enum read filter. Pagination,
+   multi-status filtering, and new lifecycle states were not added.
+3. Live Telegram/provider verification was not available in this workspace.
+4. The implementation was uncommitted at the start of delivery; final commit and remote verification are recorded in the delivery response.

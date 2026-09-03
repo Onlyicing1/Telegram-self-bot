@@ -59,6 +59,30 @@ def test_task_list_rejects_stray_fields():
     assert "task_id" in result.error
 
 
+def test_task_list_status_filter_resolves_to_tool_argument():
+    result = parse_action_text('{"action":"task_list","status":"completed"}')
+    assert result.kind == "executable"
+    assert result.tool_calls == [
+        {"name": "task_list", "arguments": {"status": "completed"}}
+    ]
+
+
+@pytest.mark.parametrize("payload", [
+    '{"action":"task_list","status":"failed"}',
+    '{"action":"task_list","status":""}',
+    '{"action":"task_list","status":42}',
+])
+def test_task_list_rejects_invalid_status_filters(payload):
+    result = parse_action_text(payload)
+    assert result.kind == "invalid"
+
+
+def test_task_list_status_field_rejected_for_other_actions():
+    result = parse_action_text('{"action":"retrieve_save","save_code":"S1","status":"active"}')
+    assert result.kind == "invalid"
+    assert "status" in result.error
+
+
 # ── task_inspect ─────────────────────────────────────────────────────────────
 
 

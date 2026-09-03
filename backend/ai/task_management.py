@@ -18,8 +18,17 @@ class TaskManagementService:
         self.repository = repository
         self.owner_id = owner_id
 
-    async def list_tasks(self) -> list[TaskRecord]:
-        return await self.repository.list_tasks(self.owner_id)
+    async def list_tasks(self, status: str | None = None) -> list[TaskRecord]:
+        """List the owner's tasks, optionally filtered by status.
+
+        Filtering happens here (owner-scoped) so repository interfaces stay
+        unchanged; task volumes are small. Status values are the record's
+        canonical strings (active / paused / completed / ...).
+        """
+        tasks = await self.repository.list_tasks(self.owner_id)
+        if status is None:
+            return tasks
+        return [t for t in tasks if str(getattr(t, "status", "") or "") == status]
 
     async def inspect(self, task_id: int, occurrence_limit: int = 100) -> TaskView | None:
         task = await self.repository.get_task(self.owner_id, task_id)

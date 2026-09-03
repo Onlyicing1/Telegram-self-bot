@@ -34,12 +34,20 @@ class TaskListTool(Tool):
     def description(self) -> str:
         return (
             "List the owner's scheduled tasks (id, label, status, version, "
-            "next run). Use the returned id and version for task_transition."
+            "next run). Optionally filter by status (active / paused / "
+            "completed). Use the returned id and version for task_transition."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {}
+        return {
+            "status": {
+                "type": "string",
+                "enum": list(_MUTABLE_STATUSES),
+                "default": None,
+                "description": "Optional status filter (paused, active, completed).",
+            },
+        }
 
     @property
     def permission_level(self) -> PermissionLevel:
@@ -58,9 +66,18 @@ class TaskListTool(Tool):
         from backend.ai.task_management import TaskManagementService
         from backend.ai.task_management_interface import list_text
 
+        status = str(arguments.get("status") or "").strip().lower()
+        if status and status not in _MUTABLE_STATUSES:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Unsupported status filter '{status}'. "
+                    "Allowed: paused, active, completed."
+                ),
+            )
         try:
             service = TaskManagementService(get_repository_manager().task, context.owner_id)
-            result = await list_text(service)
+            result = await list_text(service, status=status or None)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task list failed: {exc}")
         return ToolResult(

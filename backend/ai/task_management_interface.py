@@ -14,11 +14,18 @@ def _task_line(task) -> str:
     return f"{icon} #{task.id} {task.label[:80]} · {task.status} · v{task.version} · next {next_run}"
 
 
-async def list_text(service: TaskManagementService) -> str:
-    tasks = await service.list_tasks()
+async def list_text(service: TaskManagementService, *, status: str | None = None) -> str:
+    """Render the owner's task list, optionally filtered by *status*.
+
+    The status label (paused / active / completed) comes from the AI tool's
+    validated argument — never free text. The empty text keeps the exact
+    "No tasks found." phrasing so existing consumers can detect emptiness.
+    """
+    tasks = await service.list_tasks(status=status)
+    title = f"Tasks · {status}" if status else "Tasks"
     if not tasks:
-        return "Tasks\n\nNo tasks found."
-    lines = ["Tasks", ""] + [_task_line(task) for task in tasks[:MAX_LINES]]
+        return f"{title}\n\nNo tasks found."
+    lines = [title, ""] + [_task_line(task) for task in tasks[:MAX_LINES]]
     if len(tasks) > MAX_LINES:
         lines.append(f"…and {len(tasks) - MAX_LINES} more")
     return "\n".join(lines)

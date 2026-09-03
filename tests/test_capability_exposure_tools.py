@@ -89,6 +89,55 @@ async def test_task_list_is_owner_scoped():
     assert f"#{created.id}" not in result.message
 
 
+@pytest.mark.asyncio
+async def test_task_list_advertises_status_filter_parameter():
+    registry, _ctx, _executor = make_chain()
+    tool = registry.get("task_list")
+    params = tool.parameters
+    assert set(params) == {"status"}
+    assert sorted(params["status"]["enum"]) == ["active", "completed", "paused"]
+
+
+@pytest.mark.asyncio
+async def test_task_list_status_filter_returns_only_matching_status():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+
+    def task_data(label):
+        data = _task_data()
+        data["label"] = label
+        return data
+
+    active_task = await repo.create_task(OWNER, task_data("status-filter-active-beta"))
+    paused_task = await repo.create_task(OWNER, task_data("status-filter-paused-alpha"))
+    assert paused_task.status == "active"
+    paused = await repo.transition_task(
+        OWNER, paused_task.id, "paused", expected_version=paused_task.version
+    )
+    assert paused is not None and paused.status == "paused"
+    assert active_task.status == "active"
+
+    paused_view = await run_tool(executor, ctx, "task_list", {"status": "paused"})
+    assert paused_view.success is True
+    assert "status-filter-paused-alpha" in paused_view.message
+    assert "status-filter-active-beta" not in paused_view.message
+
+    full_view = await run_tool(executor, ctx, "task_list", {})
+    assert full_view.success is True
+    assert "status-filter-paused-alpha" in full_view.message
+    assert "status-filter-active-beta" in full_view.message
+
+
+@pytest.mark.asyncio
+async def test_task_list_rejects_invalid_status_filter_argument():
+    registry, ctx, executor = make_chain()
+    result = await run_tool(executor, ctx, "task_list", {"status": "deleted"})
+    assert result.success is False
+    assert "status" in result.message.lower()
+
+
 # ── task_inspect ─────────────────────────────────────────────────────────────
 
 
@@ -326,9 +375,15 @@ async def test_new_tools_are_provider_schema_visible():
 
     dispatcher = object.__new__(Dispatcher)
     dispatcher.set_tool_registry(registry)
-    names = {d["function"]["name"] for d in Dispatcher._build_tool_definitions(dispatcher)}
+    definitions = Dispatcher._build_tool_definitions(dispatcher)
+    names = {d["function"]["name"] for d in definitions}
     for expected in ("task_list", "task_inspect", "task_transition", "retrieve_save"):
         assert expected in names
+
+    task_list = next(d["function"] for d in definitions if d["function"]["name"] == "task_list")
+    task_parameters = task_list["parameters"]
+    assert "status" in task_parameters["properties"]
+    assert "required" not in task_parameters
 
 
 def test_no_duplicate_registrations():
