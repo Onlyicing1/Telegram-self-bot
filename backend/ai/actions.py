@@ -43,6 +43,10 @@ ACTION_NAMES = frozenset({
     "get_bio",
     "username_status",
     "account_status",
+    "task_list",
+    "task_inspect",
+    "task_transition",
+    "retrieve_save",
     "send",
     "clean_chat",
     "remember",
@@ -64,11 +68,16 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "get_bio",
     "username_status",
     "account_status",
+    "task_list",
+    "task_inspect",
+    "task_transition",
+    "retrieve_save",
 })
 
 # Read-only status/query actions: no target — the mapped tool reads the
-# owner's own saved-items DB, profile-engine state, or REAL Telegram chat
-# history. ``list_recent_messages`` additionally accepts an optional limit.
+# owner's own saved-items DB, task list, profile-engine state, or REAL
+# Telegram chat history. ``list_recent_messages`` additionally accepts an
+# optional limit.
 _STATUS_ACTIONS = frozenset({
     "list_saved_items",
     "search_saved_items",
@@ -78,6 +87,7 @@ _STATUS_ACTIONS = frozenset({
     "get_bio",
     "username_status",
     "account_status",
+    "task_list",
 })
 
 TARGET_SCOPES = frozenset({
@@ -95,6 +105,7 @@ ALLOWED_FIELDS = frozenset({
     "action", "target", "count", "mode", "caption", "recipient", "query",
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
+    "task_id", "action_status", "expected_version", "save_code",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -155,6 +166,10 @@ class ActionParseResult:
     semantic: dict[str, Any] | None = None
     schedule_text: str = ""
     text: str = ""
+    task_id: int | None = None
+    action_status: str = ""
+    expected_version: int | None = None
+    save_code: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -246,6 +261,35 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             kind=KIND_INVALID,
             error="'fields' is only valid for the account_status action.",
         )
+
+    # ``save_code`` is only meaningful for retrieve_save. It is validated as
+    # a bounded string here; the canonical `S####` shape is enforced by the
+    # tool (the code travels verbatim, upper-cased at the service boundary).
+    if "save_code" in raw and action != "retrieve_save":
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'save_code' is only valid for the retrieve_save action.",
+        )
+
+    # ``task_id``/``expected_version``/``action`` status fields are only
+    # meaningful for the task lifecycle actions.
+    _TASK_ONLY_FIELDS = ("task_id", "expected_version")
+    if action not in ("task_inspect", "task_transition"):
+        for field_name in _TASK_ONLY_FIELDS:
+            if field_name in raw:
+                return ActionParseResult(
+                    kind=KIND_INVALID,
+                    error=(
+                        f"'{field_name}' is only valid for the "
+                        "task_inspect/task_transition actions."
+                    ),
+                )
+
+    if action in ("task_inspect", "task_transition"):
+        return _validate_task_lifecycle_action(action, raw)
+
+    if action == "retrieve_save":
+        return _validate_retrieve_save_action(raw)
 
     # Read-only status/query actions map directly to an existing tool. They
     # take no target; ``search_saved_items`` requires a query,
@@ -460,12 +504,109 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     )
 
 
+# ── Task lifecycle + saved-item retrieval actions ──
+
+_TASK_INSPECT_FIELDS = frozenset({"action", "task_id"})
+_TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version"})
+_TASK_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
+_SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
+
+
+def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
+    """Validate one task_lifecycle action object.
+
+    The status field is read from ``action_status`` so it can never collide
+    with the action name itself. The model supplies only the task id, the
+    target status, and the CAS version it learned from task_list/task_inspect
+    — ownership, persistence, and transition legality stay in the existing
+    TaskManagementService/TaskRepository boundary.
+    """
+    allowed = _TASK_INSPECT_FIELDS if action == "task_inspect" else _TASK_TRANSITION_FIELDS
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
+        )
+
+    task_id = coerce_int(raw.get("task_id"))
+    if task_id is None or task_id <= 0:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Missing or invalid 'task_id' for {action}.",
+        )
+
+    if action == "task_inspect":
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="schedule",
+            task_id=task_id,
+        )
+
+    status = raw.get("action_status")
+    if not isinstance(status, str) or status.strip().lower() not in _TASK_STATUS_VOCABULARY:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                "Invalid 'action_status' for task_transition "
+                "(allowed: paused, active, completed)."
+            ),
+        )
+    version = coerce_int(raw.get("expected_version"))
+    if version is None or version <= 0:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="Missing or invalid 'expected_version' for task_transition.",
+        )
+    return ActionParseResult(
+        kind=KIND_EXECUTABLE,
+        action=action,
+        target="schedule",
+        task_id=task_id,
+        action_status=status.strip().lower(),
+        expected_version=version,
+    )
+
+
+def _validate_retrieve_save_action(raw: dict[str, Any]) -> ActionParseResult:
+    """Validate one retrieve_save action object (exact-field-set rule)."""
+    unknown = sorted(set(raw) - {"action", "save_code"})
+    if unknown:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Unknown field(s) for retrieve_save: {', '.join(unknown)}",
+        )
+    save_code = raw.get("save_code")
+    if not isinstance(save_code, str):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="Missing or invalid 'save_code' for retrieve_save.",
+        )
+    normalized = save_code.strip().upper()
+    if not normalized or not _SAVE_CODE_RE.match(normalized):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="Invalid 'save_code' (expected the item's save code, e.g. S0001).",
+        )
+    return ActionParseResult(
+        kind=KIND_EXECUTABLE,
+        action="retrieve_save",
+        target="current_chat",
+        save_code=normalized,
+    )
+
+
 # ── Target resolution ──
 
 
 def _default_target(action: str) -> str:
     if action in ("save", "deep_save"):
         return "replied_message"
+    if action == "retrieve_save":
+        return "current_chat"
+    if action in ("task_list", "task_inspect", "task_transition"):
+        return "schedule"
     return "recent_messages"
 
 
@@ -531,6 +672,25 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action == "account_status":
         args: dict[str, Any] = {"fields": list(result.fields)} if result.fields else {}
         return [{"name": "account_show", "arguments": args}]
+
+    if action == "task_list":
+        return [{"name": "task_list", "arguments": {}}]
+
+    if action == "task_inspect":
+        return [{"name": "task_inspect", "arguments": {"task_id": result.task_id}}]
+
+    if action == "task_transition":
+        return [{
+            "name": "task_transition",
+            "arguments": {
+                "task_id": result.task_id,
+                "action": result.action_status,
+                "expected_version": result.expected_version,
+            },
+        }]
+
+    if action == "retrieve_save":
+        return [{"name": "retrieve_save", "arguments": {"save_code": result.save_code}}]
 
     if action == "delete_messages":
         if target == "message_id":
@@ -599,6 +759,10 @@ def parse_action_text(text: str) -> ActionParseResult:
             query=result.query,
             semantic=result.semantic,
             text=result.text,
+            task_id=result.task_id,
+            action_status=result.action_status,
+            expected_version=result.expected_version,
+            save_code=result.save_code,
             tool_calls=tool_calls,
         )
     return result

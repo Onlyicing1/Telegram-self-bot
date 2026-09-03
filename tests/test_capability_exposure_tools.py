@@ -244,9 +244,11 @@ async def test_retrieve_save_executor_path_forwards_through_service():
         result = await run_tool(executor, ctx, "retrieve_save", {"save_code": "s0001"})
     svc.assert_awaited_once()
     args = svc.await_args.args
-    assert args[1] == OWNER and args[2] == "s0001" and args[3] == CHAT
+    # The tool boundary canonicalizes the model's echo to the stored
+    # upper-case code form before the service sees it (service re-normalizes).
+    assert args[1] == OWNER and args[2] == "S0001" and args[3] == CHAT
     assert result.success is True and "Retrieved" in result.message
-    assert result.data == {"save_code": "s0001", "chat_id": CHAT}
+    assert result.data == {"save_code": "S0001", "chat_id": CHAT}
 
 
 @pytest.mark.asyncio

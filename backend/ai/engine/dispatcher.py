@@ -65,10 +65,11 @@ _TRUNCATED_FINISH_TOKENS = ("MAX_TOKENS", "LENGTH", "TRUNCATED")
 # parser + validator before execution, so the nudge never weakens safety.
 _ENFORCE_ACTION_NUDGE = (
     "If the user's request requires an action (save, delete, list/search saved "
-    "items, database status, bio/username status, or reviewing recent Telegram "
-    "messages), respond with ONLY a native tool call or a single JSON action "
-    "object — no prose, no questions, no permission explanations. If the request "
-    "is purely conversational, answer normally."
+    "items, retrieve a saved item, database status, bio/username status, task "
+    "list/inspect/transition, or reviewing recent Telegram messages), respond "
+    "with ONLY a native tool call or a single JSON action object — no prose, "
+    "no questions, no permission explanations. If the request is purely "
+    "conversational, answer normally."
 )
 
 

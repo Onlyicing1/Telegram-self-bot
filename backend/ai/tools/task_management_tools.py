@@ -216,9 +216,13 @@ class TaskTransitionTool(Tool):
                     f"version {version} is stale. Nothing was changed."
                 ),
             )
+        _STATUS_VERB = {"paused": "paused", "active": "resumed", "completed": "completed"}
         return ToolResult(
             success=True,
-            message=f"✅ Task #{task.id} is now {task.status} · version {task.version}.",
+            message=(
+                f"✅ Task #{task.id} {_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
+                f"· version {task.version}."
+            ),
             data={
                 "task_id": int(task.id),
                 "status": str(task.status),

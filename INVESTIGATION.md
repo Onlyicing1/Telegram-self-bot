@@ -763,3 +763,105 @@ the existing repositories/services.
 No live Telegram, Supabase, or provider verification was performed. All
 claims are execution-path-verified through the real registry/executor chain
 with external boundaries faked.
+
+---
+
+# ROOT-CAUSE INVESTIGATION — Live Telegram fallback for the 4 newly connected tools
+
+## R1. Live evidence vs deterministic evidence
+
+The owner's live Telegram tests showed the AI falling back / taking no real
+action for `task_list`, `task_inspect`, `task_transition`, and `retrieve_save`,
+while deterministic tests claimed all four healthy. Both observations were
+correct: the tools were registered, dispatcher-visible, and executor-executable,
+but **the deterministic layers that decide what the AI can actually invoke
+never learned about them**.
+
+## R2. The real execution path has two invocation routes
+
+Traced end-to-end: Telegram → `ai_unified` → `AIRequest` → Dispatcher →
+provider (schema generation → request → response) → tool-call parsing →
+registry lookup → `ToolExecutor` → service → Telegram/Supabase side effect.
+
+The provider response reaches execution through TWO routes:
+
+1. **Native tool calls** — provider emits a function call; parsed into tool
+   name/arguments and dispatched. This route works for the new tools.
+2. **Deterministic fallback** — text/JSON is parsed by
+   `backend/ai/actions.py` (`resolve_tool_calls` → `parse_action_text` →
+   `validate_action`) into structured actions. The JSON action vocabulary
+   here is a fixed allowlist and did NOT contain the four new actions.
+
+When the live provider (weak/free tier, or one that returns JSON/text instead
+of native calls) produced `{"action": "task_list"}` or a `retrieve_save`
+JSON object, `validate_action` rejected it as an **unknown action**, the
+dispatcher fell back to a text-only answer, and no side effect occurred.
+Native-capable providers never exercised the tools live because the owner's
+configured provider fell into the deterministic route for these requests.
+
+## R3. Exact divergences found (new tools vs known-working tools)
+
+1. **`ACTION_NAMES`/`EXECUTABLE_ACTION_NAMES`** (`backend/ai/actions.py`):
+   `task_list`, `task_inspect`, `task_transition`, `retrieve_save` absent →
+   JSON outputs rejected as "Unknown action". This is the primary live
+   fallback cause.
+2. **Prompt template §8 JSON fallback schema**
+   (`backend/ai/prompt/template.py`): listed only the old action vocabulary,
+   so providers relying on the prompt contract never emit the new actions.
+3. **`_ENFORCE_ACTION_NUDGE`** (`backend/ai/engine/dispatcher.py`): the
+   correction nudge re-listed the stale vocabulary, actively steering the
+   model away from the new actions on retry rounds.
+4. **`retrieve_save` code echo**: live, the model echoed the save code in
+   lower case (`s0012`); the service looks codes up verbatim after its own
+   `upper().strip()` normalization happens AFTER the tool passed the raw
+   echo — with the tool boundary passing the raw value through, `query_save`
+   missed rows for lower-cased echoes and the tool reported not-found.
+5. **User-facing enum rendering**: `task_list`/`task_transition` rendered
+   raw status enums (`active`) in result text — cosmetic, fixed alongside.
+
+## R4. Fixes applied (production path, not test-only)
+
+- `backend/ai/actions.py` — added the four actions to the action
+  allowlists; added `task_id`/`action_status`/`expected_version`/`save_code`
+  to `ALLOWED_FIELDS` and to `ActionParseResult`; added
+  `_validate_task_lifecycle_action` / `_validate_retrieve_save_action`
+  validators (strict per-action field allowlists, int-coerced ids, status
+  vocabulary `{paused, active, completed}`); wired both into
+  `validate_action` BEFORE the status-action fall-through so the original
+  fall-through for `create_task`/`send`/`save`/… is preserved; mapped the
+  four actions into `resolve_tool_calls`.
+- `backend/ai/prompt/template.py` — §8 JSON fallback schema now lists the
+  four new actions with their exact fields; rule 8 nudge extended.
+- `backend/ai/engine/dispatcher.py` — `_ENFORCE_ACTION_NUDGE` lists the
+  full current vocabulary including the new actions.
+- `backend/ai/tools/retrieve_save.py` — save code normalized
+  (`.strip().upper()`, alphanumeric-checked) at the tool boundary before the
+  service call.
+- `backend/ai/tools/task_management_tools.py` +
+  `backend/ai/task_management_interface.py` — human-readable status labels
+  in result text.
+
+## R5. Verification
+
+- New regression suite `tests/test_new_tool_action_path.py` (35 tests):
+  parser accepts/rejects each new action with exact fields, unknown-field
+  rejection, status vocabulary enforcement, save-code validation, tool
+  mapping through `resolve_tool_calls`, prompt/dispatcher vocabulary
+  presence, and regression guards that the pre-existing actions
+  (`create_task`, `send`, `save`, status actions) still validate — locking
+  the fall-through behavior.
+- `tests/test_capability_exposure_tools.py` — updated
+  `test_retrieve_save_executor_path_forwards_through_service` to expect the
+  canonical upper-case code (matches the service contract; the service
+  normalizes again defensively).
+- Full suite: **1476 passed, 23 skipped**. `py_compile` clean on all touched
+  files.
+
+## R6. Honest limitations
+
+- Real-provider live retest still belongs to the owner (the deterministic
+  route now accepts and maps the new actions; native tool calls were already
+  reaching the tools). This fix removes the identified divergence, but the
+  final live confirmation is a Telegram-side test.
+- The repository inspector shows a stray untracked nested `telegram-self-bot/`
+  clone (stale, preserved untouched).

@@ -5,10 +5,13 @@ from backend.ai.task_management import TaskManagementService, TaskView
 
 MAX_LINES = 20
 
+_STATUS_ICONS = {"active": "▶️", "paused": "⏸", "completed": "✅", "failed": "❌", "expired": "⌛", "deleted": "🗑"}
+
 
 def _task_line(task) -> str:
     next_run = task.next_run_at.isoformat() if task.next_run_at else "none"
-    return f"#{task.id} {task.label[:80]} · {task.status} · v{task.version} · next {next_run}"
+    icon = _STATUS_ICONS.get(str(task.status), "•")
+    return f"{icon} #{task.id} {task.label[:80]} · {task.status} · v{task.version} · next {next_run}"
 
 
 async def list_text(service: TaskManagementService) -> str:

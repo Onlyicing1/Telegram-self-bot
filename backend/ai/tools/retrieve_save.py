@@ -55,9 +55,16 @@ class RetrieveSaveTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
 
-        save_code = str(arguments.get("save_code") or "").strip()
-        if not save_code:
-            return ToolResult(success=False, message="A save code is required (e.g. S0001).")
+        # Model/provider output is normalized at the tool boundary: the
+        # service looks codes up verbatim and DB codes are stored upper-case,
+        # so a lower-cased echo ("s0012") must be canonicalized here. Codes
+        # are `S` + alphanumerics (see db.client._SHORT_CODE_ALPHABET).
+        save_code = str(arguments.get("save_code") or "").strip().upper()
+        if not save_code or not all(ch.isalnum() for ch in save_code):
+            return ToolResult(
+                success=False,
+                message="A valid save code is required (e.g. S0001).",
+            )
 
         chat_id = context.extra.get("chat_id") if context.extra else None
         if not isinstance(chat_id, int) or chat_id == 0:

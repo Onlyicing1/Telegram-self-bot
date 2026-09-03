@@ -810,3 +810,56 @@ repository (`repo_type=InMemoryTaskRepository`).
 - Final working-tree status: no modified tracked files; only the
   pre-existing unrelated untracked `telegram-self-bot/` directory
   (a nested clone at an ancestor commit — preserved, not touched).
+
+---
+
+# FIX — Live Telegram fallback for the 4 newly connected tools
+
+## Problem
+
+Live Telegram tests (owner-supplied screenshots + Render logs) showed the AI
+falling back / taking no real action for `task_list`, `task_inspect`,
+`task_transition`, and `retrieve_save`, although deterministic tests claimed
+all four healthy. Root cause analysis (see INVESTIGATION.md §R1–R3): the tools
+were registered and executor-healthy, but the deterministic JSON-action
+pipeline (`backend/ai/actions.py`), the prompt template's JSON fallback
+schema, and the dispatcher's action nudge never learned the new action names —
+so live providers on the deterministic route had their tool intents rejected
+as unknown actions, and `retrieve_save` additionally missed rows when the
+model echoed the save code in lower case.
+
+## Changes (production path)
+
+| File | Change |
+|---|---|
+| `backend/ai/actions.py` | Added `task_list` / `task_inspect` / `task_transition` / `retrieve_save` to `ACTION_NAMES` + `EXECUTABLE_ACTION_NAMES`; added the four new fields to `ALLOWED_FIELDS` and `ActionParseResult`; added strict validators (`_validate_task_lifecycle_action`, `_validate_retrieve_save_action`) wired before the status-action fall-through; mapped the actions in `resolve_tool_calls`. |
+| `backend/ai/prompt/template.py` | §8 JSON fallback schema + rule 8 nudge now include the four actions with their exact fields. |
+| `backend/ai/engine/dispatcher.py` | `_ENFORCE_ACTION_NUDGE` lists the full current vocabulary. |
+| `backend/ai/tools/retrieve_save.py` | Save code canonicalized (`.strip().upper()` + alphanumeric check) at the tool boundary. |
+| `backend/ai/tools/task_management_tools.py`, `backend/ai/task_management_interface.py` | Human-readable status labels in tool result text. |
+| `tests/test_new_tool_action_path.py` (new) | 35 regression tests: acceptance/rejection per action, unknown-field and status-vocabulary enforcement, tool mapping via `resolve_tool_calls`, prompt/dispatcher vocabulary presence, and fall-through guards proving the pre-existing actions still validate. |
+| `tests/test_capability_exposure_tools.py` | `retrieve_save` executor-path test now expects the canonical upper-case code (service re-normalizes defensively). |
+
+## Verification actually executed
+
+- `tests/test_new_tool_action_path.py`: **35 passed**.
+- `tests/test_capability_exposure_tools.py` + `tests/test_19_ai_actions.py` +
+  new suite: **90 passed**.
+- Full suite: **1476 passed, 23 skipped** (`python3 -m pytest tests/ -q`).
+- `py_compile` clean on all touched source files.
+
+## Security / boundary review
+
+No new Telegram RPC, SQL, shell, filesystem, or HTTP surface. The new action
+validators only gate which JSON objects the deterministic parser accepts;
+execution still flows exclusively through the existing ToolRegistry →
+ToolExecutor boundary with unchanged permission levels and ownership checks.
+`task_transition` remains CAS-version-checked and enum-limited;
+`retrieve_save`'s destination remains trusted context (never model-supplied).
+
+## Honest verification status
+
+The live-provider retest on Telegram remains with the owner: the fix removes
+the identified deterministic-route divergence and the regression suite locks
+it, but the final confirmation is a live Telegram request (e.g. `Nova show my
+tasks`, `Nova retrieve S0001`).
