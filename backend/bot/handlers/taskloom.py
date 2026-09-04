@@ -57,7 +57,12 @@ def _service(owner_id: int):
 def _fmt_dt(value) -> str:
     if value is None:
         return "—"
-    return value.strftime("%m-%d %H:%M")
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    if getattr(value, "tzinfo", None) is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ZoneInfo("Asia/Tehran")).strftime("%m-%d %H:%M")
 
 
 def _task_row(task) -> tuple[str, str]:
@@ -85,9 +90,13 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
     page = min(page, page_count - 1)
     visible = tasks[page * _MAX_LIST_ROWS:(page + 1) * _MAX_LIST_ROWS]
 
-    active = sum(1 for t in tasks if t.status == "active")
-    paused = sum(1 for t in tasks if t.status == "paused")
-    done = sum(1 for t in tasks if t.status in ("completed", "failed", "expired", "deleted"))
+    # Authoritative per-status counts from the service: the normal task
+    # collection excludes terminal deleted tasks, so deleted tasks can never
+    # inflate the active/paused/closed totals.
+    counts = await service.counts()
+    active = counts.get("active", 0)
+    paused = counts.get("paused", 0)
+    done = counts.get("completed", 0) + counts.get("failed", 0) + counts.get("expired", 0)
 
     lines = [
         "▦ **Taskloom**",

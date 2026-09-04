@@ -1,9 +1,18 @@
 """Presentation helpers for the user-facing task management boundary."""
 from __future__ import annotations
 
+from datetime import timezone
+from zoneinfo import ZoneInfo
+
 from backend.ai.task_management import TaskManagementService, TaskView
 
 MAX_LINES = 20
+
+# All user-facing task times are displayed in Iran/Tehran local time. The
+# IANA zone (never a fixed numeric offset) keeps DST transitions correct;
+# persisted instants stay timestamptz/UTC internally.
+DISPLAY_TIMEZONE = "Asia/Tehran"
+_FALLBACK_NOTE = "⚠️ Memory fallback — Supabase unavailable (state is not durable)."
 
 _STATUS_LABELS = {
     "active": ("▶️", "Active"),
@@ -40,11 +49,20 @@ def _format_datetime(value: object, *, empty: str) -> str:
     if value is None:
         return empty
     try:
-        formatted = value.strftime("%Y-%m-%d %H:%M")
-        timezone_name = value.tzname()
+        if getattr(value, "tzinfo", None) is None:
+            value = value.replace(tzinfo=timezone.utc)
+        local = value.astimezone(ZoneInfo(DISPLAY_TIMEZONE))
+        formatted = local.strftime("%Y-%m-%d %H:%M")
+        timezone_name = local.tzname()
     except (AttributeError, TypeError, ValueError):
         return str(value)
     return f"{formatted} {timezone_name}" if timezone_name else formatted
+
+
+def _fallback_active(service: TaskManagementService) -> bool:
+    """True when the repository degraded to its in-memory fallback."""
+    repository = getattr(service, "repository", None)
+    return bool(getattr(repository, "fallback_active", False))
 
 
 def _task_block(task: object, *, include_version: bool) -> str:
@@ -71,12 +89,18 @@ async def list_text(service: TaskManagementService, *, status: str | None = None
     tasks = await service.list_tasks(status=status)
     header = _list_header(status)
     if not tasks:
-        return "\n".join(header + ["", "No tasks found."])
+        lines = header + ["", "No tasks found."]
+        if _fallback_active(service):
+            lines.append(_FALLBACK_NOTE)
+        return "\n".join(lines)
 
     blocks = [_task_block(task, include_version=False) for task in tasks[:MAX_LINES]]
     if len(tasks) > MAX_LINES:
         blocks.append(f"…and {len(tasks) - MAX_LINES} more")
-    return "\n".join(header + ["", "\n\n".join(blocks)])
+    rendered = "\n".join(header + ["", "\n\n".join(blocks)])
+    if _fallback_active(service):
+        rendered += "\n\n" + _FALLBACK_NOTE
+    return rendered
 
 
 async def inspect_text(service: TaskManagementService, task_id: int) -> str:
@@ -91,6 +115,8 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
         f"Schedule: {task.schedule_type}",
         f"Timezone: {task.timezone}",
     ]
+    if _fallback_active(service):
+        lines.append(_FALLBACK_NOTE)
     if view.occurrences:
         occurrence_blocks = []
         for item in view.occurrences[:10]:

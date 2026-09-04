@@ -90,7 +90,7 @@ async def test_task_list_uses_vertical_mobile_blocks_for_mixed_content():
     assert "Status: ▶️ Active" in text
     assert "Status: ⏸ Paused" in text
     assert "Status: ✅ Completed" in text
-    assert "Next: 2026-01-02 09:30 UTC" in text
+    assert "Next: 2026-01-02 13:00 +0330" in text
     assert "Next: Not scheduled" in text
     assert "یادآوری جلسه تیم / Sprint review" in text
     assert "\n\nTask #5\n" in text
@@ -124,7 +124,7 @@ async def test_task_list_filter_is_visible_without_reintroducing_table_layout():
         "Task #2\n"
         "Title: Paused task\n"
         "Status: ⏸ Paused\n"
-        "Next: 2026-01-02 09:30 UTC"
+        "Next: 2026-01-02 13:00 +0330"
     )
     assert "Task #1" not in text
     assert "|" not in text
@@ -158,12 +158,12 @@ async def test_task_detail_moves_technical_fields_below_the_primary_block():
         "Task #6\n"
         "Title: بررسی گزارش / Review report\n"
         "Status: ⏸ Paused\n"
-        "Next: 2026-01-02 09:30 UTC\n"
+        "Next: 2026-01-02 13:00 +0330\n"
         "Version: v28"
     )
     assert "\n\nSchedule: weekly\nTimezone: Asia/Tehran" in text
     assert "\n\nRecent occurrences:\n" in text
-    assert "• 2026-W01\n  Status: ✅ Succeeded\n  Scheduled: 2026-01-02 09:30 UTC\n  Attempt: 2" in text
+    assert "• 2026-W01\n  Status: ✅ Succeeded\n  Scheduled: 2026-01-02 13:00 +0330\n  Attempt: 2" in text
     assert "|" not in text
 
 

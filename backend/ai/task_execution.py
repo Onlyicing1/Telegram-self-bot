@@ -17,6 +17,8 @@ from backend.ai.retry import FailureClass, classify_failure, retry_delay, can_re
 logger = logging.getLogger(__name__)
 MAX_EXECUTION_SECONDS = 60.0
 MAX_METADATA_BYTES = 8192
+MAX_RESULT_DELIVERY_CHARS = 4000
+RESULT_DELIVERY_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -45,11 +47,34 @@ class TaskExecutionCoordinator:
         executor: ToolExecutor,
         owner_id: int,
         context: ToolContext,
+        client_provider=None,
     ) -> None:
         self.repository = repository
         self.executor = executor
         self.owner_id = owner_id
         self.context = context
+        self.client_provider = client_provider
+
+    def _fresh_context(self) -> ToolContext:
+        """Return a context bound to the CURRENT self client when a provider
+        is available (the supervisor's recovery path rebuilds the client; a
+        stale captured client must never execute a scheduled action)."""
+        if self.client_provider is None:
+            return self.context
+        try:
+            client = self.client_provider()
+        except Exception:
+            client = None
+        if client is None or client is self.context.client:
+            return self.context
+        from backend.telegram_api import TelegramAPI
+        return ToolContext(
+            telegram=TelegramAPI(client),
+            owner_id=self.context.owner_id,
+            tz_str=self.context.tz_str,
+            client=client,
+            extra=self.context.extra,
+        )
 
     async def execute(self, occurrence: OccurrenceRecord) -> TaskExecutionResult:
         if occurrence.owner_id != self.owner_id:
@@ -61,20 +86,19 @@ class TaskExecutionCoordinator:
         # For send_message tools, the chat_id comes from the task's
         # notification_destination (set at creation time from trusted
         # runtime context), never from the model.
-        execution_context = self.context
+        execution_context = self._fresh_context()
         task = await self.repository.get_task(self.owner_id, occurrence.task_id)
         if task is not None:
             dest = task.notification_destination or {}
             chat_id = dest.get("chat_id")
             if isinstance(chat_id, int) and chat_id != 0:
-                extra = dict(self.context.extra) if self.context.extra else {}
+                extra = dict(execution_context.extra) if execution_context.extra else {}
                 extra["chat_id"] = chat_id
-                from backend.ai.tools.context import ToolContext
                 execution_context = ToolContext(
-                    telegram=self.context.telegram,
-                    owner_id=self.context.owner_id,
-                    tz_str=self.context.tz_str,
-                    client=self.context.client,
+                    telegram=execution_context.telegram,
+                    owner_id=execution_context.owner_id,
+                    tz_str=execution_context.tz_str,
+                    client=execution_context.client,
                     extra=extra,
                 )
 
@@ -135,7 +159,64 @@ class TaskExecutionCoordinator:
         )
         if updated is None:
             return TaskExecutionResult(False, "unknown", len(calls), successful, "state_persist_failed", metadata)
+        await self._deliver_result(task, result, execution_context, occurrence.occurrence_key)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
+
+    async def _deliver_result(
+        self,
+        task: Any,
+        results: list[Any],
+        execution_context: ToolContext,
+        occurrence_key: str,
+    ) -> None:
+        """Deliver the execution result to the task's destination chat when
+        the task definition explicitly asked for it (``deliver_result``).
+
+        Best-effort and isolated: a delivery failure is logged and never
+        changes the occurrence outcome (the actions already succeeded), and
+        the destination always comes from the trusted task definition —
+        never from the model.
+        """
+        if task is None:
+            return
+        destination = task.notification_destination or {}
+        if destination.get("deliver_result") is not True:
+            return
+        chat_id = destination.get("chat_id")
+        if not isinstance(chat_id, int) or chat_id == 0:
+            chat_id = self.owner_id
+        parts = [str(getattr(item, "message", "") or "").strip() for item in results]
+        text = "\n\n".join(part for part in parts if part)
+        if not text:
+            return
+        if len(text) > MAX_RESULT_DELIVERY_CHARS:
+            text = text[: MAX_RESULT_DELIVERY_CHARS - 3] + "..."
+        telegram = getattr(execution_context, "telegram", None)
+        client = getattr(execution_context, "client", None)
+        if telegram is None and client is not None:
+            from backend.telegram_api import TelegramAPI
+            telegram = TelegramAPI(client)
+        if telegram is None:
+            logger.warning(
+                "TASK_RESULT_DELIVERY_UNAVAILABLE task_id=%s occurrence_key=%s",
+                task.id, occurrence_key,
+            )
+            return
+        try:
+            await asyncio.wait_for(
+                telegram.send_message(chat_id, text), timeout=RESULT_DELIVERY_TIMEOUT_SECONDS
+            )
+            logger.info(
+                "TASK_RESULT_DELIVERED task_id=%s occurrence_key=%s chat_id=%s",
+                task.id, occurrence_key, chat_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "TASK_RESULT_DELIVERY_FAILED task_id=%s occurrence_key=%s exception=%s",
+                task.id, occurrence_key, type(exc).__name__,
+            )
 
     async def handle_failure(
         self,

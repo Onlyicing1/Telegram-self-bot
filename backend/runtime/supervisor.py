@@ -340,7 +340,12 @@ class RuntimeSupervisor:
             registry = create_default_registry(context)
             executor = ToolExecutor(registry, context)
             coordinator = TaskExecutionCoordinator(
-                get_task_repository(), executor, self.owner_id, context
+                get_task_repository(), executor, self.owner_id, context,
+                # Scheduled actions must always run against the CURRENT self
+                # client: recovery/hard-reset rebuilds the client, so a
+                # coordinator that captured one client at startup would fail
+                # every scheduled Telegram action after a rebuild.
+                client_provider=lambda: self.client,
             )
 
             # Notification transport: resolve the CURRENT self client at call

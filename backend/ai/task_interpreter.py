@@ -165,7 +165,15 @@ class TaskInterpreter:
             "(e.g. 'در OskarBeam بنویس سلام', 'in OskarBeam write hello'), include it in the "
             "notification_destination as {'chat_name': 'OskarBeam'}. Use the exact chat name as spoken. "
             "If no chat is specified, the destination is the current chat — set "
-            "notification_destination to {} (empty). Never include numeric chat_ids."
+            "notification_destination to {} (empty). Never include numeric chat_ids. "
+            "\n\n"
+            "DESTINATION FLAGS (both optional, both default false): inside notification_destination "
+            "set 'deliver_result': true ONLY when the user asks to see the task's result when it runs "
+            "(e.g. 'show me the latest tasks', 'به من نشون بده', 'نمایش بده') and the action is a "
+            "read/report action (task_list, list_saves, search, ...) — never for message-writing "
+            "actions. Set 'notify_on_outcome': true ONLY when the user explicitly asks to be notified "
+            "when the task runs or fails ('notify me', 'خبرم کن', 'به من اطلاع بده'). Otherwise omit "
+            "both flags: scheduled execution must stay silent by default."
         )
         if isinstance(timezone, str) and timezone.strip():
             instructions += (

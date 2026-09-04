@@ -262,6 +262,11 @@ class TaskCandidate:
             cn = destination["chat_name"]
             if not isinstance(cn, str) or not cn.strip() or len(cn) > 256:
                 raise TaskCandidateError("chat_name must be a nonblank bounded string")
+        # Delivery/notification flags are explicit task-definition opt-ins;
+        # they must be booleans so the scheduler can never misread them.
+        for flag_key in ("deliver_result", "notify_on_outcome"):
+            if flag_key in destination and not isinstance(destination[flag_key], bool):
+                raise TaskCandidateError(f"{flag_key} must be a boolean")
         return cls(label.strip(), value["schedule_type"], dict(schedule), timezone.strip(), canonical, dict(destination))
 
     def as_creation_candidate(self) -> dict[str, Any]:

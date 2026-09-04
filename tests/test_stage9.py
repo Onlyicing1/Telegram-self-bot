@@ -18,7 +18,8 @@ def candidate():
         "schedule": {"hour": 13, "minute": 0, "timezone": "UTC"},
         "timezone": "UTC",
         "actions": [{"name": "account_show", "arguments": {}}],
-        "notification_destination": {"kind": "owner"},
+        # Outcome notifications require the explicit per-task opt-in (Problem 6).
+        "notification_destination": {"kind": "owner", "notify_on_outcome": True},
     }
 
 

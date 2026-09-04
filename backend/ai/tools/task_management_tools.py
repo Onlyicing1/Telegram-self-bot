@@ -84,13 +84,17 @@ class TaskListTool(Tool):
             )
         try:
             service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            tasks = await service.list_tasks(status=status or None)
             result = await list_text(service, status=status or None)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task list failed: {exc}")
         return ToolResult(
             success=True,
             message=result,
-            data={"count": 0 if "No tasks found" in result else -1},
+            data={
+                "task_count": len(tasks),
+                "fallback_active": bool(getattr(service.repository, "fallback_active", False)),
+            },
         )
 
 

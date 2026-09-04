@@ -138,6 +138,19 @@ def test_list_panel_shows_tasks_with_counts(registered, repo):
     assert sum(1 for d in data if "panel:taskloom_task:" in d) == 3
 
 
+def test_list_panel_summary_excludes_deleted_tasks(registered, repo):
+    _make_task(repo, OWNER, "write hello")
+    doomed = _make_task(repo, OWNER, "doomed")
+    _run(TaskManagementService(repo, OWNER).delete(doomed.id, doomed.version))
+    title, body, buttons = _run(registered._taskloom_panel(_FakeEvent(), ""))
+    # deleted tasks are terminal: they never inflate active/paused/closed
+    assert "● 1 active" in body
+    assert "∥ 0 paused" in body
+    assert "× 0 closed" in body
+    texts = " ".join(_button_texts(buttons))
+    assert "doomed" not in texts
+
+
 def test_list_panel_is_owner_scoped(registered, repo):
     _make_task(repo, OWNER, "mine")
     _make_task(repo, OTHER, "theirs")

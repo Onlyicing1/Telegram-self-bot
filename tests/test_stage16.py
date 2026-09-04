@@ -15,14 +15,19 @@ from backend.ai.task_scheduler import TaskScheduler
 NOW = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
 
-def task_data(next_run=NOW):
+def task_data(next_run=NOW, notify=True):
+    destination = {"kind": "owner"}
+    if notify:
+        # Problem-6 contract: outcome notifications require an explicit
+        # per-task opt-in; without it execution is silent by default.
+        destination = {**destination, "notify_on_outcome": True}
     return {
         "label": "notify",
         "schedule_type": "once",
         "schedule": {"at": "2030-01-01T12:00:00", "timezone": "UTC"},
         "timezone": "UTC",
         "actions": [{"name": "safe", "arguments": {}}],
-        "notification_destination": {"kind": "owner"},
+        "notification_destination": destination,
         "next_run_at": next_run,
     }
 
@@ -131,6 +136,17 @@ async def test_persisted_cancelled_notifies():
     await scheduler._execute_claimed(occurrence)
     assert len(sent) == 1
     assert "cancelled" in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_success_is_silent_without_notify_opt_in():
+    """Problem-6 default: no flag -> no Saved Messages outcome message."""
+    repo = InMemoryTaskRepository()
+    await repo.create_task(7, task_data(notify=False))
+    sent = []
+    scheduler, _ = make_scheduler(repo, "succeeded", sent)
+    assert await scheduler.run_once(NOW) == 1
+    assert sent == []
 
 
 @pytest.mark.asyncio
