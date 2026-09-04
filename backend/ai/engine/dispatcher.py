@@ -31,6 +31,13 @@ from dataclasses import replace
 from typing import Any
 
 from backend.ai.actions import parse_action_text, parse_command_intent
+from backend.ai.confirmation import (
+    CONFIRMATION_ALREADY_PENDING_TEXT,
+    PendingConfirmationStore,
+    _expired_text,
+    confirmation_request_text,
+    is_explicit_confirmation,
+)
 from backend.ai.engine.hooks import NOOP_HOOKS, EngineHooks, safe_call
 from backend.ai.engine.metrics import EngineMetrics
 from backend.ai.engine.result import EngineResult
@@ -107,6 +114,7 @@ class Dispatcher:
         "_tool_registry",
         "_tool_executor",
         "_memory_manager",
+        "_confirmation_store",
     )
 
     def __init__(
@@ -133,6 +141,11 @@ class Dispatcher:
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
         self._memory_manager = memory_manager
+        # Bounded in-memory pending-owner-approval state (see
+        # backend/ai/confirmation.py). Lives on the Dispatcher because the
+        # Dispatcher is the orchestration boundary that creates and consumes
+        # confirmations; per-instance ownership also isolates tests.
+        self._confirmation_store = PendingConfirmationStore()
 
     @property
     def metrics(self) -> EngineMetrics:
@@ -338,6 +351,22 @@ class Dispatcher:
             metadata["stages"].append("conversation_runtime")
         except Exception as exc:  # noqa: BLE001
             return self._fail(exc, "conversation_runtime", start, errors, metadata)
+
+        # ── Pending owner confirmation (deterministic, BEFORE any provider ──
+        # ── round) ──
+        # An explicit confirmation reply to an earlier owner-only tool
+        # request is consumed here. The ORIGINAL stored call (frozen tool
+        # name + arguments) is re-issued through the SAME ToolExecutor. The
+        # model never re-parses the confirmation message, so a pending
+        # action can never be re-targeted or re-argued by prose. When no
+        # pending action exists, normal (provider) flow continues untouched
+        # — conversational yes/no exchanges are never hijacked.
+        if tools_allowed and self._tool_executor is not None:
+            confirmation = await self._try_consume_confirmation(
+                request, rid, status_callback, start, metadata,
+            )
+            if confirmation is not None:
+                return confirmation
 
         # ── Local deterministic fast path (BEFORE any provider round) ──
         # High-confidence command and scheduling intents (including durable
@@ -684,6 +713,11 @@ class Dispatcher:
                     if er.tool_name == "web_search" and isinstance(er.data, dict):
                         result_dict["query"] = er.data.get("query", "")
                     all_tool_results.append(result_dict)
+                    if er.needs_confirmation:
+                        # Not an execution: the confirmation gate below turns
+                        # it into a pending owner approval instead of a
+                        # history failure.
+                        continue
                     # Record EVERY tool outcome (success or failure) so tool
                     # failures never silently disappear from history.
                     marker = "✅" if er.success else "❌"
@@ -698,6 +732,18 @@ class Dispatcher:
                 metadata["stages"].append(f"tool_execution_round_{round_num + 1}")
                 tool_rounds_executed = round_num + 1
                 last_round_executed = True
+
+                # Permission-gated outcomes: create the bounded pending
+                # owner approval and stop the round (no continuation round
+                # sees the blocked result and no follow-up can re-request it
+                # on its own).
+                confirmation_text = self._gate_confirmation_results(
+                    request, response.tool_calls, exec_results,
+                )
+                if confirmation_text is not None:
+                    metadata["confirmation_pending"] = True
+                    response = replace(response, tool_calls=[], text=confirmation_text)
+                    break
 
                 # The structured-action path reports the real tool result
                 # directly — it never needs a continuation provider round.
@@ -837,6 +883,8 @@ class Dispatcher:
                     )
                     for er in salvage_results:
                         all_tool_results.append(er.as_dict())
+                        if er.needs_confirmation:
+                            continue
                         marker = "✅" if er.success else "❌"
                         detail = er.message or er.error or "no message"
                         self._conversation.add_tool_result(
@@ -851,14 +899,25 @@ class Dispatcher:
                     metadata["tool_results"] = all_tool_results
                     metadata["stages"].append("pending_tool_execution_at_limit")
                     metadata["pending_calls_executed_at_limit"] = True
-                    # Keep the continuation's own text if the model produced
-                    # one; the real-result fallback below fills the summary
-                    # only when the response has no text at all.
-                    response = replace(response, tool_calls=[])
-                    warnings.append(
-                        f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
-                        f"executed without an additional round (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                    # Permission-gated salvage: turn the blocked call into a
+                    # pending owner approval instead of claiming it ran.
+                    salvage_confirmation = self._gate_confirmation_results(
+                        request, salvage_calls, salvage_results,
                     )
+                    if salvage_confirmation is not None:
+                        metadata["confirmation_pending"] = True
+                        response = replace(
+                            response, tool_calls=[], text=salvage_confirmation,
+                        )
+                    else:
+                        # Keep the continuation's own text if the model
+                        # produced one; the real-result fallback below fills
+                        # the summary only when the response has no text.
+                        response = replace(response, tool_calls=[])
+                        warnings.append(
+                            f"tool_round_limit_reached: {len(salvage_calls)} pending tool call(s) "
+                            f"executed without an additional round (MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS})"
+                        )
                     logger.info(
                         "AI_TOOL_PENDING_EXEC_END id=%s executed=%d rounds_executed=%d limit=%d",
                         rid or "-", len(salvage_results), tool_rounds_executed, MAX_TOOL_ROUNDS,
@@ -1159,6 +1218,147 @@ class Dispatcher:
             "notification_destination": {},
         }
 
+    def _gate_confirmation_results(
+        self,
+        request: AIRequest,
+        tool_calls: list[dict[str, Any]],
+        exec_results: list["ToolExecutionResult"],
+    ) -> str | None:
+        """Turn needs_confirmation results into a bounded pending approval.
+
+        Called after every tool-execution batch. Returns the deterministic
+        confirmation-request text when at least one result was blocked by
+        the permission gate, else None. Only the FIRST blocked call is
+        stored — the store holds exactly one bounded pending confirmation
+        per (owner, chat), and an existing pending action is never silently
+        overwritten; additional blocked calls must be re-requested after
+        the first is approved or expires.
+        """
+        blocked = [
+            (call, er)
+            for call, er in zip(tool_calls, exec_results, strict=False)
+            if er.needs_confirmation
+        ]
+        if not blocked:
+            return None
+        call, first = blocked[0]
+        tool_name = str(call.get("name") or first.tool_name or "")
+        raw_arguments = call.get("arguments")
+        arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+        pending = self._confirmation_store.create(
+            request.owner_id,
+            request.chat_id,
+            request.session_id,
+            tool_name,
+            dict(arguments),
+        )
+        extra_blocked = len(blocked) - 1
+        if pending is None:
+            text = CONFIRMATION_ALREADY_PENDING_TEXT
+        else:
+            text = confirmation_request_text(tool_name, arguments)
+            if extra_blocked:
+                text = (
+                    f"{text}\n\n⚠️ {extra_blocked} additional owner-only "
+                    "action(s) were requested at the same time and were NOT "
+                    "scheduled — approve the action above first, then ask again."
+                )
+        logger.info(
+            "AI_CONFIRMATION_PENDING id=%s owner=%d chat=%s tool=%s stored=%s extra=%d",
+            getattr(request, "request_id", "") or "-",
+            request.owner_id, request.chat_id, tool_name,
+            pending is not None, extra_blocked,
+        )
+        return text
+
+    async def _try_consume_confirmation(
+        self,
+        request: AIRequest,
+        rid: str,
+        status_callback: Callable[[str], Awaitable[None]] | None,
+        start: float,
+        metadata: dict[str, Any],
+    ) -> EngineResult | None:
+        """Consume an explicit owner confirmation and re-issue the stored call.
+
+        Runs BEFORE any provider round and ONLY for an exact explicit
+        confirmation reply. The reply never re-interprets anything: it may
+        only consume a server-created pending action whose tool name and
+        arguments are frozen at creation time. Returns a deterministic
+        EngineResult when the message consumed (or found expired) a pending
+        confirmation; returns None otherwise so normal flow continues — a
+        conversational "yes" with nothing pending stays conversational.
+        """
+        message = (request.user_message or "").strip()
+        if not is_explicit_confirmation(message):
+            return None
+
+        entry, expired = self._confirmation_store.take(request.owner_id, request.chat_id)
+        if entry is None:
+            if expired:
+                logger.info(
+                    "AI_CONFIRMATION_EXPIRED id=%s owner=%d chat=%s",
+                    rid or "-", request.owner_id, request.chat_id,
+                )
+                text = _expired_text()
+                return self._build_fast_path_result(
+                    request, rid, start, metadata, success=True, text=text,
+                    action="confirmation", kind="expired", target="",
+                )
+            return None
+
+        logger.info(
+            "AI_CONFIRMATION_CONSUMED id=%s owner=%d chat=%s tool=%s confirm=%s",
+            rid or "-", request.owner_id, request.chat_id,
+            entry.tool_name, entry.confirmation_id,
+        )
+        # Rebuild the call EXCLUSIVELY from the frozen pending record. The
+        # confirmation message contributed nothing but intent.
+        call = {"name": entry.tool_name, "arguments": dict(entry.arguments)}
+        per_request_ctx = self._build_tool_context(request)
+        try:
+            er = await self._tool_executor.execute_confirmed(
+                call,
+                owner_id=request.owner_id,
+                session_id=request.session_id,
+                status_callback=status_callback,
+                context_override=per_request_ctx,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AI_CONFIRMATION_EXEC_FAILED id=%s tool=%s error=%s",
+                rid or "-", entry.tool_name, exc,
+            )
+            text = f"❌ The confirmed action could not be executed: {exc}"
+            return self._build_fast_path_result(
+                request, rid, start, metadata, success=True, text=text,
+                action=entry.tool_name, kind="confirmed_error", target="",
+            )
+
+        result_dict = er.as_dict()
+        metadata["tool_results"] = [result_dict]
+        metadata["confirmation_consumed"] = True
+        marker = "✅" if er.success else "❌"
+        detail = er.message or er.error or "no message"
+        self._conversation.add_tool_result(
+            owner_id=request.owner_id,
+            tool_name=er.tool_name,
+            result=f"{marker} {detail}",
+        )
+        self._conversation.add_assistant_message(
+            owner_id=request.owner_id, content=detail,
+        )
+        logger.info(
+            "AI_CONFIRMATION_RESULT id=%s tool=%s success=%s",
+            rid or "-", er.tool_name, er.success,
+        )
+        return self._build_fast_path_result(
+            request, rid, start, metadata, success=True, text=detail,
+            action=er.tool_name, kind="confirmed", target="",
+        )
+
     async def _try_local_fast_path(
         self,
         request: AIRequest,
@@ -1290,6 +1490,8 @@ class Dispatcher:
                 rid or "-", er.tool_name, er.success,
                 (er.message or er.error or "no message").replace("\n", " ")[:160],
             )
+            if er.needs_confirmation:
+                continue
             self._conversation.add_tool_result(
                 owner_id=request.owner_id,
                 tool_name=er.tool_name,
@@ -1298,7 +1500,17 @@ class Dispatcher:
         metadata["tool_results"] = all_tool_results
         metadata["stages"].append("local_fast_path_tool_execution")
 
-        summary = self._summarize_tool_results(all_tool_results) or "Action completed."
+        # A deterministic command resolving to a permission-gated tool (no
+        # registered command does today) would surface the same pending
+        # owner approval instead of pretending the action ran.
+        confirmation_text = self._gate_confirmation_results(
+            request, result.tool_calls, exec_results,
+        )
+        if confirmation_text is not None:
+            metadata["confirmation_pending"] = True
+            summary = confirmation_text
+        else:
+            summary = self._summarize_tool_results(all_tool_results) or "Action completed."
         self._conversation.add_assistant_message(owner_id=request.owner_id, content=summary)
 
         return self._build_fast_path_result(

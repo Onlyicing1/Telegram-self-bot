@@ -20,7 +20,14 @@ Safety:
     arguments in their own ``execute()``.
   - ADMIN_ONLY and CONFIRMATION_REQUIRED tools return a "confirmation
     required" result instead of executing. The caller (Engine) must
-    surface this to the owner for confirmation.
+    surface this to the owner for confirmation. Once the owner EXPLICITLY
+    confirms a server-created pending action, the caller re-issues the
+    ORIGINAL stored tool call through ``execute_confirmed()`` — the only
+    path that honors that explicit owner approval while keeping every
+    other executor guarantee (registry lookup, argument handling,
+    timeouts, history, error containment) identical. The ``confirmed``
+    flag is never provider-visible: it is passed out-of-band by the
+    Dispatcher after it consumes a valid pending confirmation.
   - Unknown tools return an error result.
   - Every execution is wrapped in try/except — the executor never raises.
 """
@@ -170,12 +177,45 @@ class ToolExecutor:
 
         return results
 
+    async def execute_confirmed(
+        self,
+        call: dict[str, Any],
+        owner_id: int = 0,
+        session_id: str = "",
+        status_callback: Callable[[str], Awaitable[None]] | None = None,
+        context_override: ToolContext | None = None,
+    ) -> ToolExecutionResult:
+        """Execute ONE tool call whose confirmation boundary is satisfied.
+
+        Called by the Dispatcher confirmation round-trip: after the owner
+        explicitly confirms a pending ADMIN_ONLY / CONFIRMATION_REQUIRED
+        action, the ORIGINAL stored call (frozen tool name + arguments) is
+        re-issued through this method. Only the Dispatcher calls it, and
+        only with a call rebuilt from a consumed ``PendingConfirmation`` —
+        never with a model-invented call. The executor remains the sole
+        component that calls ``tool.execute()``; registry lookup, argument
+        handling, timeouts, history, and error containment are unchanged.
+        """
+        ctx = context_override or self._context
+        tool_name = call.get("name", "") or call.get("tool", "")
+        if status_callback and tool_name:
+            label = _STATUS_LABELS.get(tool_name, f"⏳ Running {tool_name}...")
+            try:
+                await status_callback(label)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ToolExecutor: status callback failed for '%s': %s", tool_name, exc)
+        return await self._execute_single(
+            call, owner_id, session_id, ctx, confirmed=True
+        )
+
     async def _execute_single(
         self,
         call: dict[str, Any],
         owner_id: int,
         session_id: str,
         context: ToolContext | None = None,
+        *,
+        confirmed: bool = False,
     ) -> ToolExecutionResult:
         """Execute a single tool call. Never raises."""
         ctx = context or self._context
@@ -218,7 +258,10 @@ class ToolExecutor:
                 error="not_found",
             )
 
-        if not self._is_auto_executable(tool):
+        # ``confirmed`` is set ONLY by execute_confirmed(), which the
+        # Dispatcher uses to re-issue an already-owner-approved pending
+        # action. Every other validation below still applies.
+        if not confirmed and not self._is_auto_executable(tool):
             return ToolExecutionResult(
                 tool_name=tool_name,
                 success=False,
