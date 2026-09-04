@@ -6,12 +6,12 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `9406ff391427a1e3643b7a27d7ba418f8e887013` |
-| Implementation commit | `67471b5` (`fix: harden task lifecycle, scheduler execution, and notifications`) |
+| Starting HEAD | `98150d98798efe7a6e9fb26555bac6c7f277ed27` |
+| Implementation commit | `de4cde8` (`feat: add event-triggered task automation`) |
 | Implementation date | 2026-09-04 |
-| Task/chunk | Complete and harden AI task management / scheduler (six production problems) |
+| Task/chunk | Upgrade the AI Task system into a general-purpose automation system (event triggers + deterministic matching + Telegram message event execution) |
 | Work type | implementation |
-| Final implementation status | **COMPLETE** — full test suite, compile check, and diff hygiene pass; live Telegram/Supabase verification **NOT performed** (no credentials/runtime in this workspace) |
+| Final implementation status | **COMPLETE** — full test suite, compile check, and diff hygiene pass; live Telegram/Supabase verification **NOT performed** (no credentials/runtime in this workspace); schema migration **NOT applied** (SQL provided, user applies in Supabase) |
 
 This is the single current-state report. It records only behavior and
 validation established from the current source, the working-tree diff, and
@@ -21,421 +21,440 @@ commands actually run.
 
 ## 2. OBJECTIVE
 
-The task system already had durable owner-scoped tasks (`ai_tasks`),
-occurrence history (`ai_task_occurrences`), CAS versioning, a single
-`TaskScheduler`, and a `TaskExecutionCoordinator` that replays stored action
-snapshots through the registered `ToolExecutor`. Six production problems
-remained: deleted tasks still counted, delete persistence appeared not to
-reach Supabase, Telegram said "no tasks" while the database had tasks, tasks
-could be created but could not reliably automate registered tools, task
-times were displayed in UTC and `next_run_at` misrepresented lifecycle
-state, and every scheduled execution flooded Saved Messages with status
-messages.
+The task system was a time-only scheduler: `ai_tasks` with
+`schedule_type` constrained to `once`/`interval`/`daily`/`weekly`, a single
+`TaskScheduler` that polls `next_run_at`, and a `TaskExecutionCoordinator`
+that replays stored action snapshots through the registered `ToolExecutor`.
+The limitations to solve:
 
-The goal: fix each problem at its correct architectural layer, preserve the
-existing boundaries (AI semantic tool selection → ToolRegistry → ToolExecutor
-→ service → repository → Telegram), add no second scheduler/executor/
-repository authority, make no schema change, and keep deterministic,
-owner-scoped, restart-safe behavior.
+1. Natural-language scheduling ("Tomorrow at 5 PM do X", "فردا ساعت ۵ …")
+   needed a precise Tehran-local schedule boundary.
+2. The system behaved like a timer; it could not represent **event-driven**
+   automation ("when John sends me a message, reply using X").
+3. Incoming Telegram messages had no task-evaluation path — no event
+   triggers, no deterministic matcher.
+4. Scheduled/triggered tasks must execute only **registered tools** through
+   the existing `ToolExecutor`; stored actions re-validated at execution.
+5. Task detection must stay **AI-semantic** (no regex/keyword routing) while
+   ordinary conversation never auto-creates a task.
+6. Security boundaries (ToolRegistry → ToolExecutor → Self Bot execution
+   authority; owner scoping; CAS) must remain intact.
+7. A latent recovery bug: full recovery cancelled the `lifeos-task-scheduler`
+   task permanently (not in the orphan-cancellation protected set).
 
----
-
-## 3. ROOT CAUSES (from current source, before this task)
-
-1. **Deleted tasks counted** — `TaskManagementService.list_tasks(status=None)`
-   already excluded terminal `deleted` tasks (previous task), but counting
-   was not centralized: Taskloom computed `active/paused/done` locally, and
-   the `task_list` tool returned a placeholder count. There was no
-   authoritative per-status count boundary that provably excluded deleted
-   tasks.
-2. **Delete persistence appeared not to reach Supabase** — the
-   `SupabaseTaskRepository.transition_task → update_task` CAS path was
-   correct, but every Supabase failure silently fell back to a *separate*
-   in-memory repository: the process held TWO task-repository singletons
-   (`get_repository_manager().task` for tools/handlers/Taskloom vs
-   `get_task_repository()` for the scheduler), each with its own fallback.
-   A Supabase outage made the UI appear successful (memory) while the
-   Supabase row never changed, with no visible marker.
-3. **"No tasks" while the database has tasks** — `list_tasks` on a failing
-   Supabase degraded to the in-memory fallback, which is empty in a fresh
-   process, and the empty result was presented as authoritative "No tasks
-   found." with no indication that the durable source was unavailable.
-   The two-singleton split also let tools and scheduler diverge.
-4. **AI could create a task but could not reliably automate tools** — the
-   scheduler and coordinator existed, but (a) the scheduler and the tool
-   layer used different repository instances (divergent fallbacks), (b) a
-   read/report action such as `task_list` executed and persisted its
-   occurrence but its result never reached the user, and (c) after a
-   supervisor rebuild/recovery the coordinator kept a stale Telethon client
-   captured at startup, so scheduled Telegram actions failed after every
-   recovery.
-5. **Missing/wrong next execution time + UTC display** — `next_run_at` is
-   stored as timestamptz (UTC) and the presentation layers
-   (`task_management_interface._format_datetime`, Taskloom `_fmt_dt`)
-   formatted the raw UTC instant; pause/complete/delete left `next_run_at`
-   untouched, so terminal/paused tasks still advertised a future run, and
-   resume did not restore a run time. No per-task timezone display existed.
-6. **Saved Messages flooded with execution status** — `TaskOutcomeNotifier`
-   was wired unconditionally in `RuntimeSupervisor` and sent
-   "Task occurrence … succeeded/failed/…" messages to the owner's Saved
-   Messages for every persisted outcome. There was no opt-in: the task
-   definition never expressed whether the user wanted a notification.
-
-Supporting environment finding: `ZoneInfo("Asia/Tehran")` raised
-`ZoneInfoNotFoundError` on this workspace's Python (no system tz database,
-no `tzdata` package) — the project never declared `tzdata`, so correct
-IANA timezone handling was not reproducible everywhere.
+The goal: add the smallest production-safe **event-trigger** model on top of
+the existing two-table architecture, route message events through the
+existing Telethon update path into deterministic trigger matching and the
+existing execution authority, and keep the single scheduler/executor/
+repository/supervisor model.
 
 ---
 
-## 4. EXACT IMPLEMENTATION CHANGES
+## 3. ARCHITECTURE DECISIONS (source-verified)
 
-### `backend/ai/database/task_repository.py`
-- **Single repository authority**: `get_task_repository()` now returns
-  `get_repository_manager().task` — the scheduler, tools, handlers, and
-  Taskloom share ONE `SupabaseTaskRepository` (and one in-memory fallback).
-  A Supabase outage can no longer split state between two fallback copies.
-- **Fallback visibility**: `SupabaseTaskRepository.fallback_active` — set
-  when any Supabase operation degrades to the in-memory fallback, cleared on
-  the next successful Supabase operation; fallback-returned records from
-  mutation paths carry `fallback_backend` (create already did; update paths
-  now annotate too).
-- **Consistency**: the terminal `terminal_at` timestamp is set only on first
-  entry to a terminal state and never overwritten by an idempotent
-  `deleted → deleted` self-transition (matches `InMemoryTaskRepository`).
+Inspection of the current source established the following facts that shaped
+the implementation:
 
-### `backend/ai/task_management.py` (service — one authoritative rule)
-- New `TaskManagementService.counts()`: per-status counts from the owner's
-  full repository rows; every normal summary derives from it and the
-  terminal `deleted` population is reported separately, never in normal
-  totals. The normal list already excludes deleted tasks.
-- `set_status` now manages `next_run_at` lifecycle semantics:
-  - pause / completed / failed / expired / deleted → `next_run_at = None`
-    (a paused or terminal task must not advertise another run);
-  - resume (paused → active with no `next_run_at`) → recompute from the
-    stored schedule (`interval`: one interval from now; once/daily/weekly:
-    `next_occurrence`); if the schedule cannot be parsed, the task resumes
-    but stays unscheduled (fail closed, logged) rather than lying about a
-    run time.
-- `set_status` keeps CAS (`expected_version` mandatory) and repository
-  transition legality checks — no behavior change for invalid transitions
-  (reactivation of a deleted task still raises `ValueError`).
-
-### `backend/ai/task_management_interface.py`
-- `DISPLAY_TIMEZONE = "Asia/Tehran"`: every user-facing task timestamp
-  (`Next:`, occurrence `Scheduled:`) is converted with
-  `ZoneInfo("Asia/Tehran")` — a real IANA zone, never a fixed `+3:30`
-  offset, so DST rules stay correct. Naive datetimes are treated as UTC
-  first. Persisted instants remain timestamptz/UTC.
-- `list_text` / `inspect_text` append `⚠️ Memory fallback — Supabase
-  unavailable (state is not durable).` whenever the repository reports
-  `fallback_active` — a fallback read is never presented as durable truth.
-
-### `backend/bot/handlers/taskloom.py`
-- `_fmt_dt` renders Taskloom times in Asia/Tehran.
-- The list-panel summary uses `service.counts()`; the `closed` total is
-  `completed + failed + expired` — deleted tasks never inflate it.
-
-### `backend/ai/task_execution.py`
-- `TaskExecutionCoordinator` accepts a `client_provider`; each execution
-  refreshes its `ToolContext` to the CURRENT self client (recovery/rebuild
-  safe — scheduled Telegram actions no longer die on a stale captured
-  client).
-- **Result delivery**: after a successful occurrence, when the task
-  definition explicitly set `notification_destination.deliver_result: true`
-  (and a destination chat exists, falling back to the owner's own chat),
-  the combined action-result text (bounded to 4000 chars) is sent to that
-  chat through the trusted TelegramAPI facade. Delivery is best-effort and
-  isolated: a failure is logged and never changes the occurrence outcome.
-
-### `backend/ai/task_notifications.py`
-- `TaskOutcomeNotifier.notify_persisted` now requires BOTH the persisted
-  outcome match AND the task definition's explicit
-  `notification_destination.notify_on_outcome: true`. Deleted tasks never
-  notify. Without the flag the outcome stays in the durable occurrence and
-  structured logs only (`TASK_OUTCOME_SILENT` debug line) — no Telegram
-  message. This is the Saved Messages spam fix.
-
-### `backend/ai/task_candidate.py` + `backend/ai/task_interpreter.py`
-- `notification_destination` accepts two validated boolean flags —
-  `deliver_result` (send the execution result) and `notify_on_outcome`
-  (send status notifications); non-boolean values reject the candidate.
-- Interpreter guidance documents when to set each flag (explicit "show me /
-  نشون بده / notify me / خبرم کن" phrasing) and that both default to false —
-  scheduled execution stays silent by default.
-
-### `backend/ai/tools/task_management_tools.py`
-- `task_list` now returns the real authoritative `task_count` (deleted
-  excluded, via the service) and `fallback_active` in tool data, so the AI
-  can see honest counts and fallback state.
-
-### `backend/runtime/supervisor.py`
-- `_start_task_scheduler` passes `client_provider=lambda: self.client` to
-  the coordinator. No second scheduler; the supervisor remains the sole
-  lifecycle authority.
-
-### `backend/requirements.txt`
-- Added `tzdata==2026.3` — platform-independent IANA timezone data for
-  `zoneinfo` (required for correct Asia/Tehran handling on hosts without a
-  system tz database).
-
-### Tests
-- `tests/test_task_hardening.py` (new, 20 tests) — full coverage of the six
-  problems through the real chain (see §12).
-- `tests/test_stage10.py` — presentation assertions updated to the
-  Asia/Tehran display (`2026-01-02 13:00 +0330`).
-- `tests/test_stage16.py`, `tests/test_stage9.py` — notification tests
-  updated to the explicit `notify_on_outcome` opt-in contract; added
-  `test_success_is_silent_without_notify_opt_in`.
-- `tests/test_taskloom_ui.py` — added
-  `test_list_panel_summary_excludes_deleted_tasks`.
+- **No trigger concept existed.** `ai_tasks.schedule` JSONB held only time
+  schedules; the `schedule_type` CHECK constraint allowed only the four time
+  types. No event representation was possible.
+- **No incoming-message task path existed.** The only plain
+  `events.NewMessage()` handler in the bot was a health-timestamp hook; the
+  router registered only outgoing/command handlers and the AI unified
+  handler.
+- **Identity-resolution infrastructure existed for chats only.**
+  `backend/ai/chat_resolution.py` had `resolve_chat_name` (fuzzy scoring,
+  multi-match clarification, fail-closed) but no sender resolution and no
+  first/last-name awareness in the dialog snapshot.
+- **Latent recovery bug.** `RuntimeSupervisor._cancel_orphan_tasks` had a
+  protected-name set that omitted `lifeos-task-scheduler`, so a full
+  recovery cancelled the time scheduler permanently.
+- **Shared execution machinery exists and is correct.** One repository
+  singleton (`get_task_repository()`), one `TaskScheduler`, one
+  `TaskExecutionCoordinator`, one outcome notifier; occurrence creation is
+  keyed on `(task_id, occurrence_key)` and returns the existing occurrence
+  when the key already exists (both in-memory and Supabase repositories) —
+  which makes deterministic event dedup safe.
+- **Notifications are already opt-in.** `notify_on_outcome` /
+  `deliver_result` default false after the prior hardening task; Saved
+  Messages is not an execution log sink.
 
 ---
 
-## 5. FILES CHANGED
+## 4. IMPLEMENTATION CHANGES
 
-| File | Category | Purpose |
-|---|---|---|
-| `backend/ai/database/task_repository.py` | repository | Single singleton authority; fallback visibility; terminal_at consistency |
-| `backend/ai/task_management.py` | service | `counts()`; next_run lifecycle (pause/terminal/resume) |
-| `backend/ai/task_management_interface.py` | presentation | Asia/Tehran display; honest fallback note |
-| `backend/ai/task_execution.py` | execution | client refresh per execution; opt-in result delivery |
-| `backend/ai/task_notifications.py` | notifications | Outcome notifications require `notify_on_outcome` opt-in |
-| `backend/ai/task_candidate.py` | contract | Boolean destination-flag validation |
-| `backend/ai/task_interpreter.py` | runtime | Flag guidance for explicit result/notification requests |
-| `backend/ai/tools/task_management_tools.py` | tool | Real `task_count` + `fallback_active` in task_list data |
-| `backend/bot/handlers/taskloom.py` | UI | Tehran display; authoritative counts (deleted excluded) |
-| `backend/runtime/supervisor.py` | runtime | Client provider for the scheduler coordinator |
-| `backend/requirements.txt` | dependency | `tzdata` (IANA data for zoneinfo) |
-| `tests/test_task_hardening.py` | test | New regression suite (six problems) |
-| `tests/test_stage10.py` | test | Tehran display assertions |
-| `tests/test_stage16.py` | test | Opt-in notification contract + silent-by-default test |
-| `tests/test_stage9.py` | test | Opt-in notification contract |
-| `tests/test_taskloom_ui.py` | test | Deleted tasks excluded from panel summary |
-| `IMPLEMENTATION_REPORT.md` | documentation | This report |
+### 4.1 Trigger model — `backend/ai/task_trigger.py` (new)
 
-Unrelated pre-existing working-tree changes (NaraRouter provider work from a
-previous session: `AGENTS.md`, `INVESTIGATION.md`, `README.md`,
-`backend/ai/discovery.py`, `backend/ai/model_discovery.py`,
-`backend/ai/providers/*`, `backend/bot/handlers/ai.py`,
-`tests/test_17_providers.py`, `backend/ai/providers/nararouter.py`,
-`tests/test_nararouter_provider.py`, and the untracked
-`telegram-self-bot/` directory) were NOT modified, staged, or committed by
-this task.
+Bounded, two-form trigger representation (no expression language, no code):
+
+- `validate_trigger_spec` — the **model-facing (unresolved)** form the AI
+  may emit. `sender`/`chat` are semantic NAMES (never numeric ids — numeric
+  ids are rejected outright because the model can never invent an identity).
+  Allowed fields: `type`, `sender`, `chat`, `contains`, `text_equals`,
+  `starts_with`, `has_media`, `is_reply`, `direction`. Bounded sizes and
+  counts; at least one matching condition required (a trigger can never
+  fire on every message by accident).
+- `validate_resolved_trigger` — the **persisted (resolved)** form after
+  trusted runtime resolution: adds integer `sender_id`/`chat_id` (nonzero;
+  negative chat ids are legal — groups/supergroups) plus display-only
+  `sender_name`/`chat_title`.
+- `is_this_chat_reference` — English/Persian aliases for "this chat / همین
+  چت" resolve to the trusted request `chat_id` at creation time.
+- `resolve_trigger_references` — resolves names against the authenticated
+  Self Bot's dialog snapshot via `resolve_chat_name` /
+  `resolve_sender_name`; fails closed with numbered clarification when
+  ambiguous/unresolvable; the resolved trigger never contains a
+  model-invented id.
+- `event_trigger_matches` — **deterministic** matcher over a bounded event
+  context dict (`chat_id`, `sender_id`, `text`, `has_media`, `is_reply`,
+  `out`). Direction filter (incoming/outgoing/any) + every present
+  condition ANDed. No provider call, no scoring, no LLM per message.
+- `trigger_summary` — bounded user-facing description of a resolved trigger.
+
+### 4.2 Schedule model — `backend/ai/scheduling.py`, `task_candidate.py`, `task_interpreter.py`
+
+- `SUPPORTED_TYPES` and the repository `SCHEDULE_TYPES` now include `event`.
+- `EventSchedule` — frozen schedule with a single validated resolved
+  `trigger`; `next_occurrence()` raises for event schedules (no wall-clock
+  time); `parse_schedule` accepts only `{"trigger": ...}` payloads.
+- `TaskCandidate` validates the model-facing event trigger spec through
+  `validate_trigger_spec` at candidate-build time and skips the
+  timezone-match rule for `event`/`interval`.
+- `TaskInterpreter` CANDIDATE_SCHEMA enum + system guidance now teach the AI
+  the `event` schedule shape, the allowed model-facing fields (names, never
+  ids), English/Persian examples, and a hard rule that time-based requests
+  must NOT become `event` tasks. No regex, no keyword lists — the provider
+  interprets semantics against the schema/guidance.
+
+### 4.3 Persistence — `backend/ai/database/task_repository.py`, `task_creation.py`, `task_management.py`
+
+- Repository interface + in-memory + Supabase implementations gain
+  `list_event_tasks(owner_id, limit)` — one indexed query
+  (`owner_id` + `status='active'` + `schedule_type='event'`), bounded.
+- `TaskCreationService` — event tasks persist with `next_run_at = NULL`
+  (they have no wall-clock due time; the event handler drives execution);
+  timezone-match rule skipped for event/interval.
+- `TaskManagementService._resume_next_run` returns `None` for event tasks —
+  resuming an event task never fabricates a fake run time.
+
+### 4.4 Event execution — `backend/ai/task_event_dispatcher.py` (new)
+
+`TaskEventDispatcher` — the single event-trigger responder, sharing the
+same repository singleton, `TaskExecutionCoordinator`, and outcome notifier
+as the time scheduler (no parallel authorities):
+
+- `extract_event_context` normalizes a Telethon event into a bounded dict.
+- `event_occurrence_key(task_id, chat_id, message_id)` — deterministic key
+  `"<task_id>:ev:<chat_id>:<message_id>"`; duplicate delivery of the same
+  event (redelivery, restart) maps to the same key, so the unique
+  `(task_id, occurrence_key)` index prevents a second occurrence. The claim
+  CAS is the final guard for the concurrent race window.
+- `handle_event` — lists active event tasks (bounded, limit 20), parses and
+  evaluates each stored trigger deterministically, skips non-matching
+  tasks, dispatches up to 5 executions per message, and never raises into
+  the Telegram event path. Per-message logging is bounded structured
+  `TASK_EVENT_TRACE` lines; no Telegram diagnostics.
+- Duplicate handling: when the occurrence key already exists
+  (running/retry_pending/terminal), dispatch is skipped; a claimed
+  occurrence without a wired coordinator is marked `interrupted` for
+  recovery.
+
+### 4.5 Telegram integration — `backend/bot/handlers/task_events.py` (new) + router/supervisor
+
+- `task_events.register` hooks **the existing Telethon update path**
+  (`events.NewMessage()`, both directions — the deterministic `direction`
+  condition decides), normalized per event, handed to the configured
+  dispatcher. No second update loop, no second event dispatcher.
+- `task_events.configure(dispatcher)` — process-wide binding; handler is a
+  no-op when unconfigured (startup ordering/tests).
+- `backend/bot/router.py` registers `task_events`.
+- `backend/runtime/supervisor.py` builds the dispatcher with the shared
+  repository/coordinator/notifier and configures it during task-scheduler
+  startup; **`lifeos-task-scheduler` added to the orphan-cancellation
+  protected set** so full recovery no longer kills the scheduler.
+  Execution always uses the current client via the existing
+  client-provider/coordinator path (recovery-safe; no stale client
+  captured at startup).
+
+### 4.6 Tool-layer sender/chat resolution — `backend/ai/tools/task.py`, `backend/ai/chat_resolution.py`
+
+- `CreateTaskTool` now loads the trusted dialog snapshot once per creation
+  when the destination `chat_name` or an event trigger references a name,
+  capturing user-like fields (`first_name`, `last_name`, `username`).
+- After candidate validation, event triggers go through
+  `resolve_trigger_references(request_chat_id=extra["chat_id"])`; failure
+  returns a clarification `ToolResult` instead of creating an unsafe task.
+- `resolve_sender_name` — new strict scorer against user-like entities
+  (full/first/last/username): exact or containment with a real ratio, plus
+  a `>=3`-char prefix rule; unrelated names score 0.0 (no loose
+  character-overlap guessing), multi-match/ambiguous → fail closed with
+  numbered options. Same `_MATCH_THRESHOLD`/clarification conventions as
+  `resolve_chat_name`.
+
+### 4.7 Presentation — `backend/ai/task_management_interface.py`, `backend/bot/handlers/taskloom.py`
+
+- Task list blocks show `Next: On message event` for event tasks (never a
+  fake run time); `task_inspect` shows a `Trigger:` line via
+  `trigger_summary`. Time-based tasks keep the existing Tehran-local
+  `Next:` formatting from the prior hardening work.
+- Taskloom schedule icon map gains `event → ⚡`.
+
+### 4.8 Database — migration + docs
+
+- New migration `supabase/migrations/20260904000001_add_event_schedule_type.sql`
+  widens the `ai_tasks.schedule_type` CHECK to include `'event'`.
+  **No new tables or columns.** Trigger spec lives in the existing
+  `schedule` JSONB (max 16,384 bytes unchanged).
+- `DATABASE_ARCHITECTURE.md` updated with the resolved trigger spec
+  structure, matching semantics, and occurrence-key identity.
 
 ---
 
-## 6. SCHEDULER CHANGES
+## 5. TRIGGER / SCHEDULE / EVENT MODEL (current state)
 
-- No second scheduler was created. The existing `TaskScheduler` (wired by
-  `RuntimeSupervisor._start_task_scheduler`, immortal-owned) is unchanged
-  in its wake loop: recover → due retries → due tasks → occurrence claim →
-  coordinator → advance `next_run_at`.
-- The scheduler now shares the one repository singleton
-  (`get_task_repository()` → `get_repository_manager().task`), so tasks
-  created through the AI tool layer are guaranteed visible to the scheduler
-  and vice versa, including under Supabase failure.
-- The execution coordinator resolves the CURRENT self client per execution
-  (`client_provider`), so a supervisor rebuild/hard reset can no longer
-  leave scheduled actions pointing at a dead client.
-- Restart-safety was already provided by occurrence-key uniqueness +
-  recovery of `claimed/running/interrupted` occurrences; unchanged and
-  re-verified by the existing recovery tests.
+A task is one row in `ai_tasks`; its `schedule_type` selects how it fires:
 
-## 7. TASK EXECUTION ARCHITECTURE (as implemented)
+| schedule_type | schedule payload | next_run_at | execution driver |
+|---|---|---|---|
+| `once` | `{at, timezone}` | instant | TaskScheduler (due poll) |
+| `interval` | `{seconds}` | rolling | TaskScheduler |
+| `daily` | `{hour, minute, timezone}` | rolling | TaskScheduler |
+| `weekly` | `{weekday, hour, timezone}` | rolling | TaskScheduler |
+| `event` | `{trigger: {…resolved spec…}}` | NULL | TaskEventDispatcher (Telegram message path) |
 
-```
-AI semantic tool selection (provider schemas / validated JSON action)
-  → ToolRegistry → ToolExecutor → service layer
-  → durable ai_tasks definition (label, schedule, timezone, actions,
-    notification_destination, next_run_at, version)
-  → TaskScheduler (durable, owner-scoped, active-only due discovery)
-  → occurrence claim (occurrence_key unique, attempt ≤ 3)
-  → TaskExecutionCoordinator (stored action snapshot → registry check →
-    ToolExecutor with fresh client context)
-  → occurrence finalization (succeeded / retry_pending / failed)
-  → advance_next_run (schedule semantics)
-  → optional explicit notification (notify_on_outcome)
-  → optional explicit result delivery (deliver_result)
+Event trigger (resolved, persisted) — all bounded, at least one condition,
+runtime-evaluated deterministically:
+
+```json
+{"trigger": {
+  "type": "telegram_message",
+  "sender_id": 123456, "sender_name": "John",
+  "chat_id": -100123, "chat_title": "Chat",
+  "contains": ["urgent"], "text_equals": null,
+  "starts_with": null, "has_media": false,
+  "is_reply": null, "direction": "incoming"
+}}
 ```
 
-A stored action is reconstructed from `action_snapshot` (`name` +
-`arguments`); the coordinator validates the name against the registry and
-fails closed (`unregistered_action`) before anything executes. The model
-never invents task ids/versions/occurrence ids — CAS requires the version
-from `task_list`/`task_inspect`.
+Occurrence identity for event executions: `"<task_id>:ev:<chat_id>:<message_id>"`,
+unique with `task_id`. Attempt limit, claim/retry/interrupted semantics, and
+CAS versioning are the existing occurrence contract, unchanged. The unique
+index protects the occurrence record; the claim CAS protects the
+claimed→running race. **Exactly-once Telegram side effects are not claimed.**
 
-## 8. DELETE SEMANTICS
+Architecture of execution (event and time paths converge):
 
-- Deletion remains the existing terminal lifecycle state `status =
-  "deleted"` — the row is NOT physically deleted (by design: `ON DELETE
-  RESTRICT` from occurrences, durable history). Verified: a successful
-  delete issues a PostgREST update with `status='deleted'`,
-  `version = expected_version + 1`, `terminal_at` (first entry only), and
-  CAS filters on `id`, `owner_id`, and `version`.
-- The normal list and every count surface exclude deleted tasks; the row
-  stays inspectable by id and its occurrence history is untouched.
-- A stale version or foreign owner fails with no mutation.
-
-## 9. SUPABASE PERSISTENCE BEHAVIOR
-
-- Delete persistence path: `service.set_status → repository.update_task →
-  PostgREST UPDATE ... eq(id) eq(owner_id) eq(version)` — the fake-client
-  tests assert the exact payload and CAS filters, and that the stored row
-  actually changes (persistence, not UI-only).
-- If Supabase fails, the operation degrades to the shared in-memory
-  fallback and that fact is visible: `fallback_active` on the repository,
-  `fallback_backend` on mutation results, and a `⚠️ Memory fallback` note in
-  the rendered task list/inspect text. Durable-looking success is never
-  fabricated silently.
-- **Live Supabase verification: NOT performed** (no credentials in this
-  workspace). The persistence contract is proven by mocked-client tests
-  (`tests/test_task_hardening.py`, `tests/test_task_repository.py`), not by
-  a live round-trip.
-
-## 10. COUNT / LIST BEHAVIOR
-
-- One authoritative rule: `TaskManagementService` — the normal list excludes
-  terminal deleted tasks; `counts()` reports per-status totals where
-  deleted appears only under its own key, never in active/paused/completed/
-  failed/expired totals.
-- Consumers: `task_list` tool (renders list + `task_count`), `.task list`,
-  Taskloom panel summary (now via `counts()`), all derive from the same
-  service call. No other counting path exists in the current source (web
-  API/dashboard have no task surface).
-
-## 11. TIMEZONE & next_run_at BEHAVIOR
-
-- Display: all user-facing task times (list, inspect, occurrences, Taskloom)
-  convert to `Asia/Tehran` through `zoneinfo` — no hardcoded `+3:30`/`+4`
-  arithmetic anywhere. Persisted `next_run_at` stays timestamptz/UTC.
-- `next_run_at` lifecycle: cleared on pause and on every terminal
-  transition; recomputed from the stored schedule on resume; advanced by
-  the scheduler after each successful occurrence; the UI always renders the
-  actual persisted value.
-- `tzdata` is now a declared dependency so `ZoneInfo("Asia/Tehran")`
-  resolves on every platform.
-
-## 12. SAVED MESSAGES / NOTIFICATION BEHAVIOR
-
-- Scheduled execution is silent by default: outcome → durable occurrence +
-  structured logs only. No Telegram message unless the task definition
-  explicitly opted in.
-- `notify_on_outcome: true` → status notification on succeeded / failed /
-  retry_pending / cancelled, delivered only after the repository confirms
-  the persisted status; deleted tasks never notify; sender failure is
-  isolated and never mutates state.
-- `deliver_result: true` → the execution result text (e.g. a rendered
-  `task_list`) is delivered to the task's destination chat after success;
-  best-effort, bounded, failure never flips the occurrence outcome.
-- The explicit `send_message` action (user-requested task content) is
-  unchanged and remains the only unconditional Telegram send from a task.
-- Structured diagnostics (`TASK_*` log lines, occurrence result/error
-  metadata) remain in place — nothing was removed, only re-routed away from
-  Telegram.
-
-## 13. AI TOOL-SELECTION BEHAVIOR
-
-- Unchanged: no regex task routing; task sentences resolve through provider
-  schemas → native tool call or validated JSON action → `resolve_tool_calls`
-  → ToolExecutor → service. The provider-visible schemas are unchanged
-  except `task_list` data now carrying an honest count and fallback flag.
-- The AI can now express "show me the result" / "notify me" intent through
-  the creation boundary: the interpreter maps those phrases to the two
-  validated destination flags, and execution honors them through the
-  registered tool/service boundary.
-
-## 14. OCCURRENCE BEHAVIOR
-
-- Unchanged and re-verified: `(task_id, occurrence_key)` uniqueness,
-  attempt limit 3, claim semantics (`claimed → running`), terminal states,
-  retry_pending with `retry_at`, recovery of interrupted occurrences on
-  start, and `advance_next_run` after each wake. Occurrence uniqueness
-  protects the occurrence record; exactly-once Telegram delivery is not
-  claimed beyond that.
-
-## 15. SECURITY BOUNDARIES
-
-- Owner-scoping on every repository/service call; CAS versions mandatory
-  for transitions; destinations always come from trusted task definitions
-  or runtime context, never from model output; action names validated
-  against the registered registry before execution (fail closed); no
-  arbitrary RPC/SQL/shell execution added; no secrets introduced; no
-  schema/RLS changes.
+```
+Telegram message event / scheduler due poll
+  → TaskEventDispatcher.handle_event | TaskScheduler
+  → occurrence create/claim (deterministic key, CAS)
+  → TaskExecutionCoordinator
+  → action name re-validated against ToolRegistry
+  → ToolExecutor
+  → registered tool → service layer → real side effect
+  → occurrence finalization → opt-in notification/result delivery
+```
 
 ---
 
-## 16. VALIDATION
+## 6. TIMEZONE BEHAVIOR (current state)
 
-| Validation | Command | Result |
-|---|---|---|
-| Focused task suites (11 files) | `.venv/bin/python -m pytest tests/test_task_hardening.py tests/test_task_management.py tests/test_task_repository.py tests/test_stage10.py tests/test_taskloom_ui.py tests/test_capability_exposure_tools.py tests/test_task_scheduler.py tests/test_task_execution.py tests/test_task_send_execution.py tests/test_taskloom_milestone.py tests/test_task_nl_creation.py -q` | **139 passed** |
-| Full test suite | `.venv/bin/python -m pytest tests/ -q` | **1567 passed, 23 skipped, 1 warning** |
-| Compile check | `.venv/bin/python -m compileall -q backend/ tests/` | **passed** |
-| Diff whitespace check | `git diff --check` | **passed** |
-
-Coverage mapping to the task's required test list (items 1–26): deleted
-excluded from list/counts (1,2,4,5,6), deleted inspectable (3), delete
-persistence through repository/service incl. Supabase CAS payload (7),
-owner isolation (8), stale-version CAS (9), DB failure/fallback visibility
-(10), "no tasks" only when none eligible (11), tool schema/count data (12),
-scheduler reconstructs and executes a stored registered action through the
-real ToolExecutor (13,14), unregistered action fails closed (15 — existing
-`test_unregistered_action_fails_without_execution`), deleted/paused skipped
-(16), occurrence uniqueness (17), success advances next_run (18), retry
-semantics (19), details expose persisted next_run (20), Asia/Tehran
-conversion incl. DST-era instants (21), no hardcoded offset (22), no Saved
-Messages by default (23, plus scheduler-level), explicit notification
-works (24), diagnostics retained (25 — occurrence metadata assertions),
-restart/recovery does not duplicate occurrences (26 — existing recovery
-tests).
-
-## 17. LIVE VERIFICATION STATUS
-
-- **Live Telegram verification: NOT performed.** No session credentials or
-  running bot were available in this workspace. The scheduler/execution
-  chain is proven in-process (unit + integration tests with fake Telegram
-  transports and a real registry/executor), not against live Telegram.
-- **Live Supabase verification: NOT performed.** No Supabase credentials
-  were available. The `SupabaseTaskRepository` behavior (delete CAS payload,
-  terminal_at, fallback markers) is proven with the fake PostgREST client.
-- Distinction used throughout: **UNIT TESTED** (repository/service/presenter
-  contracts) and **INTEGRATION TESTED** (scheduler → coordinator → real
-  ToolExecutor → real registered tools in-process). Nothing here is claimed
-  as LIVE VERIFIED.
-
-## 18. LIMITATIONS
-
-1. Live Telegram and live Supabase verification remain unproven; the
-   report proves the local contract chain only.
-2. `deliver_result`/`notify_on_outcome` depend on the AI interpreter
-   (or deterministic candidates) emitting the flags; a model that ignores
-   the guidance yields silent tasks (safe default), not broken ones.
-3. Resume recomputation of `next_run_at` fails closed for schedules that
-   cannot be parsed (e.g. legacy non-canonical interval payloads) — the
-   task resumes unscheduled and logs a warning.
-4. Deleted tasks are excluded from normal counts/lists but remain in the
-   database by design (terminal state, not physical deletion).
-
-## 19. REMAINING WORK
-
-- Live verification per the task's checklist (create/list/delete through a
-  running bot, confirm Supabase row state, one scheduled execution, Tehran
-  display, no default Saved Messages spam) once credentials are available.
-- Optional: a dashboard/web read surface for tasks (out of scope here — the
-  web API currently has no task endpoints).
+- All user-facing scheduling semantics use `Asia/Tehran` via
+  `ZoneInfo` — never the server local timezone, never UTC as a user
+  default, never hardcoded `+03:30` arithmetic (the `tzdata` dependency was
+  added in the prior hardening task so `ZoneInfo("Asia/Tehran")` resolves
+  on any host).
+- Instants persist as UTC/timestamptz; naive local datetimes in candidates
+  are interpreted in the task's `Asia/Tehran` timezone at parse time.
+- Relative expressions ("tomorrow", "next Monday", "in 2 hours", Persian
+  equivalents) are interpreted by the AI/interpreter against the schema
+  guidance with the current Tehran date/time as reference — no local
+  parser, no regex. The deterministic tests pin the instant math for
+  once/daily/weekly/interval Tehran schedules.
 
 ---
 
-## 20. DELIVERY STATE
+## 7. NOTIFICATION / SAVED-MESSAGES BEHAVIOR
 
-- Implementation commit: `67471b5` (`fix: harden task lifecycle, scheduler
-  execution, and notifications`) — pushed directly to `origin/main`
-  (verified `git push` output `9406ff3..67471b5 main -> main`); no
-  force-push, no PR.
-- Branch: `main`.
-- Remote HEAD: `origin/main` equals local HEAD after the final push
-  (verified with `git rev-parse HEAD` / `git rev-parse origin/main`).
-- Final working tree: clean except the explicitly pre-existing unrelated
-  working-tree changes listed in §5 (NaraRouter session files and the
-  untracked `telegram-self-bot/` directory), which were left untouched.
+Unchanged from the hardening task and preserved here: execution outcomes
+live in `ai_task_occurrences` + structured `TASK_EVENT_TRACE` logs;
+`notify_on_outcome=false` and `deliver_result=false` are the defaults, so
+event/scheduled execution is silent — no Saved Messages status messages by
+default. Only explicit user intent (via the existing opt-in flags) enables
+notification/result delivery, and that flows through the same outcome
+notifier boundary.
+
+---
+
+## 8. SECURITY BOUNDARIES (unchanged and enforced)
+
+- AI proposes/selects registered capabilities; ToolRegistry validates; the
+  ToolExecutor is the sole execution authority; the Self Bot owns all
+  Telegram RPC. Task database never becomes a command execution system.
+- Stored actions re-validated against the registry at every execution;
+  unregistered actions fail closed.
+- All task/occurrence mutations owner-scoped; lifecycle mutations CAS
+  (version) protected.
+- Model-invented Telegram ids are rejected at candidate validation; trigger
+  identities come only from trusted dialog resolution, and ambiguous
+  references fail closed with clarification. No arbitrary SQL/shell/HTTP/
+  code predicates anywhere in the trigger path.
+- The matcher is deterministic local logic — no LLM per incoming message.
+
+---
+
+## 9. FILES CHANGED
+
+**New**
+- `backend/ai/task_trigger.py` — trigger validation, reference resolution, deterministic matcher, summaries
+- `backend/ai/task_event_dispatcher.py` — event→occurrence→execution coordinator handoff
+- `backend/bot/handlers/task_events.py` — Telegram message event handler (existing update path)
+- `supabase/migrations/20260904000001_add_event_schedule_type.sql` — widen `ai_tasks.schedule_type` CHECK
+- `tests/test_task_trigger_events.py` — 34 regression tests
+
+**Modified**
+- `backend/ai/scheduling.py` — `event` schedule type + `EventSchedule` + `is_event_schedule`
+- `backend/ai/task_candidate.py` — model-facing trigger validation; timezone rule exemption
+- `backend/ai/task_interpreter.py` — candidate schema + system guidance for `event` triggers
+- `backend/ai/task_creation.py` — event tasks persist `next_run_at = NULL`
+- `backend/ai/task_management.py` — event tasks never fabricate a next run on resume
+- `backend/ai/database/task_repository.py` — `SCHEDULE_TYPES` + `list_event_tasks` (abstract/in-memory/Supabase)
+- `backend/ai/task_management_interface.py` — trigger line / `On message event` in task presentation
+- `backend/ai/tools/task.py` — `CreateTaskTool` dialog snapshot + trigger reference resolution
+- `backend/ai/chat_resolution.py` — `resolve_sender_name` (strict, fail-closed)
+- `backend/bot/handlers/taskloom.py` — `event` schedule icon ⚡
+- `backend/bot/router.py` — register `task_events`
+- `backend/runtime/supervisor.py` — dispatcher configuration; `lifeos-task-scheduler` orphan protection
+- `DATABASE_ARCHITECTURE.md` — event trigger spec, matching semantics, occurrence identity
+
+**Documentation**
+- `IMPLEMENTATION_REPORT.md` — this report (full replacement)
+
+---
+
+## 10. DATABASE IMPACT
+
+- No new tables, no new columns, no changes to `ai_task_occurrences`.
+- One CHECK-constraint widening on `ai_tasks.schedule_type`
+  (`once/interval/daily/weekly` → + `event`).
+- Migration file created but **NOT applied** (no live Supabase access).
+  Manual application (Supabase SQL editor):
+
+```sql
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
+    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event'));
+```
+
+Rollback:
+
+```sql
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
+    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly'));
+```
+
+**Pre-live-verification data cleanup** (existing test/obsolete rows; the
+user executes this manually — the Self Bot never runs it):
+
+```sql
+-- Dependency-safe order: occurrences first, then task definitions.
+BEGIN;
+DELETE FROM ai_task_occurrences WHERE task_id IN (SELECT id FROM ai_tasks);
+DELETE FROM ai_tasks;
+COMMIT;
+```
+
+---
+
+## 11. TESTS
+
+New `tests/test_task_trigger_events.py` (34 tests) covers, against real
+in-memory repository + real ToolRegistry/ToolExecutor where behavior is
+exercised:
+
+- Trigger spec validation: model-facing shape, invented numeric ids
+  rejected, unknown keys/empty conditions rejected, resolved nonzero
+  integer ids, this-chat resolution (and fail-closed without request
+  chat), sender resolution to trusted ids, ambiguous/unresolvable
+  sender/chat fail closed.
+- Deterministic matcher: all conditions ANDed, direction/content fields.
+- Event schedule parsing, candidate acceptance/rejection of unsafe shapes.
+- Event task creation persists the structured trigger with `next_run_at`
+  NULL.
+- Dispatcher: matching event executes once through a registered tool;
+  non-matching event creates no occurrence; duplicate delivery does not
+  execute twice; paused/deleted/foreign-owner tasks skipped; deterministic
+  unique per-message occurrence keys; unregistered stored action fails
+  closed; retry semantics preserved; missing coordinator marks
+  `interrupted`; notifications require opt-in.
+- Handler context extraction + unconfigured no-op.
+- Tehran schedule math: once/daily/weekly instants, interval semantics.
+- No-task-on-conversation behavior and equivalent NL phrasings resolving to
+  the same registered create-task tool (no regex).
+- Presentation: event task shows trigger and no fake next run.
+- Recovery: full recovery does not cancel the task scheduler.
+
+Prior task suites (unchanged, still green) cover: deleted excluded from
+normal counts/lists, delete persistence + CAS, fallback visibility,
+"no tasks" honesty, timezone display, silent-by-default notifications,
+attempt limit 3, retry, and client-recovery-safe execution.
+
+**Executed (this task):**
+- Focused task suites: `tests/test_task_trigger_events.py` + scheduler/
+  execution/management/repository/hardening/nl-creation/send/candidate/
+  contract/taskloom/stage suites → **267 passed**
+- Interpreter/candidate/capability/action suites → **143 passed**
+- Full suite `python3 -m pytest tests/ -q` → **1601 passed, 23 skipped**
+- `python3 -m compileall -q backend/ tests/` → **passed**
+- `git diff --check` → **passed**
+
+---
+
+## 12. VALIDATION CLASSIFICATION
+
+| Area | Classification |
+|---|---|
+| Trigger validation / reference resolution | UNIT TESTED (real resolver against synthetic trusted dialogs) |
+| Deterministic event matching | UNIT TESTED |
+| Event → occurrence → ToolExecutor execution | INTEGRATION TESTED (in-process, real registry/executor, in-memory repository) |
+| Duplicate delivery / occurrence identity | INTEGRATION TESTED (in-memory uniqueness) |
+| Supabase `list_event_tasks` query path | INTEGRATION TESTED via mocked-client repository tests from prior suite (pattern identical to `list_due_tasks`) |
+| Timezone schedule math (Tehran) | UNIT TESTED |
+| Recovery safety | UNIT/INTEGRATION TESTED (in-process supervisor wiring) |
+| Migration applied | **NOT APPLIED** — file provided; requires manual Supabase execution |
+| Live Supabase persistence round-trip | **NOT LIVE VERIFIED** |
+| Live Telegram event execution | **NOT LIVE VERIFIED** |
+| Live notification/result delivery | **NOT LIVE VERIFIED** |
+
+---
+
+## 13. LIMITATIONS & REMAINING WORK
+
+- **Live verification not performed.** The workspace has no Telegram
+  credentials or live Supabase access. The full live checklist (create a
+  once-task and an event-task, observe the trigger, one occurrence, pause/
+  delete semantics, no Saved Messages spam) remains for the user's
+  environment, after applying the migration and clearing obsolete rows.
+- Event triggers currently react to **new messages** on the existing update
+  path; historical/unread catch-up and chat-listen-only modes are not
+  implemented.
+- The dispatcher performs one bounded indexed query per message while event
+  tasks exist; that is the intended index-friendly filter (no per-message
+  LLM, no unbounded scan).
+- Identity resolution depends on the authenticated Self Bot's visible
+  dialogs; a contact the bot cannot see cannot be referenced by name and
+  fails closed with clarification (by design).
+
+---
+
+## 14. GIT DELIVERY
+
+| Item | Value |
+|---|---|
+| Implementation commit | `de4cde8` (`feat: add event-triggered task automation`) |
+| Push result | pushed to `origin/main` (`98150d9..de4cde8`), no force-push |
+| Docs commit (this report) | `docs:` record — follows below |
+| Branch | `main` |
+| Remote HEAD after delivery | final HEAD verified with `git rev-parse HEAD` / `git rev-parse origin/main` — reported in the delivery summary |
+| Working tree | only pre-existing unrelated files remain uncommitted (NaraRouter-session edits: AGENTS.md, INVESTIGATION.md, README.md, provider files/tests; untracked `telegram-self-bot/`) — all untouched by this task |
