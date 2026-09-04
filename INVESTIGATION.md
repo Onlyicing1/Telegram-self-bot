@@ -6,7 +6,7 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Current HEAD | `1285cdf85ffc2ebfc607ab1d9f4b00b79c1e3021` (`fix: stop event and future-clock requests diverting into send/save actions`) |
+| Current HEAD | `355f18d223ba19258621f47f876a34badf0a0055` (`docs: replace INVESTIGATION.md with AI tool connectivity audit`) |
 | Investigation date | 2026-09-04 |
 | Scope | AI → existing Self Bot capabilities/tools → actual execution path (AI Tool Connectivity) |
 | Status | **INVESTIGATION ONLY** — no production code, tests, schema, or configuration modified |
