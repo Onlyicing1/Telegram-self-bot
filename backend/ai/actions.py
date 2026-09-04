@@ -1369,6 +1369,53 @@ _EN_ACTION_VERBS = frozenset({
 })
 
 
+# Message-event automation requests ("وقتی X پیام داد …", "when X messages
+# me …") must reach the durable task boundary instead of being diverted by
+# the send/save/delete command vocabulary or misread as a recurring interval.
+# Matched against the RAW text (and the token list) because the forms split
+# differently: "هر وقت" tokenizes to ["هر", "وقت"], ZWNJ joins "هرموقع" into
+# one token, and "وقتی" survives as a whole token. "هرزگاه" (rarely) and bare
+# "once" ("save this once") are deliberately NOT event markers.
+_FA_EVENT_MARKERS = ("وقتی", "هر وقت", "هر وقت", "هرموقع", "هر موقع", "هرگاه", "موقعی")
+_EN_EVENT_WORDS = frozenset({"when", "whenever"})
+
+
+def _is_event_intent(text: str, words: list[str]) -> bool:
+    """True when the request describes a message-event automation (وقتی/when)."""
+    if any(w in _EN_EVENT_WORDS for w in words):
+        return True
+    return any(marker in text for marker in _FA_EVENT_MARKERS)
+
+
+def _has_future_clock_request(text: str, words: list[str]) -> bool:
+    """True for a future-anchored clock request ("فردا ساعت 15:35 …").
+
+    A clock reference ("ساعت 15:35", "15:35", "at 5 pm") must co-occur with
+    a future day marker ("فردا"/"tomorrow"). Same-day and historical clock
+    references ("تا ساعت ۶", "ساعت ۹ دیروز") stay on their command paths.
+    Clock times survive _tokenize only as separated digit tokens, so this is
+    matched against the digit-normalized text.
+    """
+    if not any(w in _FUTURE_REF_WORDS for w in words):
+        return False
+    normalized = normalize_digits(text)
+    return (
+        re.search(r"\d{1,2}:\d{2}", normalized) is not None
+        or re.search(r"ساعت\s*\d", normalized) is not None
+        or re.search(r"\bat\s+\d{1,2}\b", normalized) is not None
+    )
+
+
+def _has_delete_imperative(words: list[str]) -> bool:
+    """True when the request carries a delete command (Persian or English)."""
+    if _imperative_present(words, _DELETE_STEMS) or _negated_present(words, _DELETE_STEMS):
+        return True
+    if any(_is_stem_token(w, _DELETE_STEMS) for w in words):
+        return True
+    en_delete, _ = _english_action(words, _EN_DELETE)
+    return en_delete
+
+
 def _has_action_verb(words: list[str]) -> bool:
     return any(w in _FA_ACTION_VERBS or w in _EN_ACTION_VERBS for w in words)
 
@@ -1465,6 +1512,22 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
             schedule_text=request_text,
             tool_calls=[{"name": "create_task", "arguments": {"request": request_text}}],
         )
+
+    # Message-event automations ("وقتی X پیام داد …") and future-anchored
+    # clock requests ("فردا ساعت 15:35 …") are never immediate commands, yet
+    # their wording (ارسال/بفرست/ذخیره) matches the send/save vocabulary and
+    # was diverted into wrong or unsupported actions. Live evidence:
+    # "Unsupported action: send" for event tasks, and an event request
+    # miscreated as a 5-minute interval task. They fall through as
+    # conversational so the provider decides task-ness semantically with the
+    # registered create_task tool — never a pattern list. Explicit delete
+    # commands are excluded: a bounded "delete until <future clock>" keeps
+    # its deterministic delete semantics.
+    if (
+        _is_event_intent(text, words)
+        or (_has_future_clock_request(text, words) and not _has_delete_imperative(words))
+    ):
+        return ActionParseResult(kind=KIND_CONVERSATIONAL)
 
     is_deep = any(w in _DEEP_TOKENS for w in words)
     is_this = any(w in _THIS_TOKENS for w in words)

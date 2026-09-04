@@ -39,6 +39,7 @@ import pytest
 from backend.ai.actions import (
     ACTION_NAMES,
     EXECUTABLE_ACTION_NAMES,
+    KIND_CONVERSATIONAL,
     KIND_EXECUTABLE,
     KIND_UNSUPPORTED,
     parse_command_intent,
@@ -96,6 +97,47 @@ def test_historical_delete_is_not_interpreted_as_scheduling():
     r = parse_command_intent("پیام های ساعت ۹ دیروز رو پاک کن", has_reply=False)
     assert r.action == "delete_messages"
     assert r.kind == KIND_EXECUTABLE
+
+
+def test_event_automation_not_diverted_by_send_vocabulary():
+    # Live evidence: "وقتی X پیام داد، با ابزار ارسال پیام جواب بده …" matched
+    # the send vocabulary and returned "Unsupported action: send" (or was
+    # miscreated as an interval task). It must stay conversational so the
+    # provider decides task-ness semantically with the registered tools.
+    r = parse_command_intent(
+        "وقتی Bs Abolfazl بهم پیام داد، از ابزار ثبت/ذخیره مورد مربوطه استفاده کن",
+        has_reply=True,
+    )
+    assert r.kind == KIND_CONVERSATIONAL
+    assert r.action != "send"
+
+
+def test_future_clock_request_not_diverted_by_send_vocabulary():
+    # Live evidence: "فردا ساعت 15:35 لیست تسک‌هام رو بگیر و نتیجه‌ش رو برام
+    # بفرست" returned "Unsupported action: send" because بفرست matched the
+    # send branch. A future-anchored clock request is never an immediate send.
+    r = parse_command_intent(
+        "فردا ساعت 15:35 لیست تسک‌هام رو بگیر و نتیجه‌ش رو برام بفرست",
+        has_reply=True,
+    )
+    assert r.kind == KIND_CONVERSATIONAL
+    assert r.action != "send"
+
+
+def test_bounded_future_delete_stays_on_delete_path():
+    # "تا فردا ساعت ۶ … پاک کن" is a bounded delete (delete UNTIL tomorrow
+    # 6 o'clock), not a scheduled automation — clock + future marker inside
+    # an explicit delete command keeps the deterministic delete behavior.
+    r = parse_command_intent("تا فردا ساعت ۶ همه پیام هام رو پاک کن", has_reply=False)
+    assert r.kind == KIND_EXECUTABLE
+    assert r.action == "delete_messages"
+
+
+def test_english_when_automation_not_diverted():
+    r = parse_command_intent(
+        "when John sends me a message reply using the send tool", has_reply=True
+    )
+    assert r.kind == KIND_CONVERSATIONAL
 
 
 def test_create_task_is_recognized_action():
