@@ -95,6 +95,10 @@ class TaskManagementService:
         )
 
     async def _resume_next_run(self, task: TaskRecord) -> datetime | None:
+        if task.schedule_type == "event":
+            # Event-triggered tasks have no wall-clock schedule; resuming
+            # them never fabricates a next run time.
+            return None
         try:
             schedule = parse_schedule(task.schedule_type, task.schedule)
             now = datetime.now(timezone.utc)

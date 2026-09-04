@@ -246,6 +246,16 @@ class TaskCandidate:
             raise TaskCandidateError("candidate exceeds bounded payload size")
         if value["schedule_type"] == "interval":
             schedule = _canonicalize_interval_schedule(schedule)
+        if value["schedule_type"] == "event":
+            # Event triggers have no wall-clock time: the schedule must be a
+            # bounded, model-facing trigger spec (names only — ids are
+            # resolved later from trusted runtime context).
+            from backend.ai.task_trigger import TaskTriggerError, validate_trigger_spec
+            trigger = schedule.get("trigger")
+            try:
+                schedule = {"trigger": validate_trigger_spec(trigger)}
+            except TaskTriggerError as exc:
+                raise TaskCandidateError(f"invalid event trigger: {exc}") from exc
         try:
             parsed = parse_schedule(value["schedule_type"], schedule)
         except (ScheduleError, TypeError, ValueError) as exc:
@@ -255,7 +265,10 @@ class TaskCandidate:
             raise TaskCandidateError(
                 f"{exc} [{_schedule_structure(schedule)}]"
             ) from exc
-        if value["schedule_type"] != "interval" and schedule.get("timezone") != timezone:
+        if (
+            value["schedule_type"] not in ("interval", "event")
+            and schedule.get("timezone") != timezone
+        ):
             raise TaskCandidateError("schedule timezone must match task timezone")
         # Validate optional chat_name in notification_destination.
         if "chat_name" in destination:

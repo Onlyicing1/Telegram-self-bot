@@ -244,15 +244,30 @@ class CreateTaskTool(Tool):
         if isinstance(candidate, TaskCandidate):
             destination = dict(candidate.notification_destination)
             chat_name = destination.pop("chat_name", None)
+            schedule_type = candidate.schedule_type
+            candidate_schedule = candidate.schedule or {}
         else:
             destination = dict(candidate.get("notification_destination", {}))
             chat_name = destination.pop("chat_name", None)
-        if chat_name:
-            from backend.ai.chat_resolution import format_clarification_options, resolve_chat_name
-            _trace(
-                "create_task_destination_resolution", mode="chat_name",
-                requested=" ".join(str(chat_name).split())[:64],
+            schedule_type = candidate.get("schedule_type")
+            candidate_schedule = candidate.get("schedule") or {}
+        trigger_spec: dict = {}
+        if schedule_type == "event" and isinstance(candidate_schedule, dict):
+            trigger_spec = dict(candidate_schedule.get("trigger") or {})
+
+        # Trusted dialog snapshot for semantic name resolution (destination
+        # chat_name, event-trigger sender/chat references). Loaded once per
+        # creation, lazily — never per incoming message.
+        from backend.ai.task_trigger import is_this_chat_reference
+        needs_dialogs = bool(chat_name) or bool(
+            trigger_spec.get("sender")
+            or (
+                trigger_spec.get("chat")
+                and not is_this_chat_reference(trigger_spec["chat"])
             )
+        )
+        chats: list[dict] = []
+        if needs_dialogs:
             client = getattr(context, "client", None)
             if client is not None:
                 try:
@@ -261,12 +276,13 @@ class CreateTaskTool(Tool):
                     dialogs = []
             else:
                 dialogs = []
-            chats = []
             for dialog in dialogs:
                 if isinstance(dialog, dict):
                     chat_id = dialog.get("id")
                     title = dialog.get("title") or dialog.get("name") or ""
                     username = dialog.get("username") or ""
+                    first_name = dialog.get("first_name") or ""
+                    last_name = dialog.get("last_name") or ""
                 else:
                     entity = getattr(dialog, "entity", dialog)
                     chat_id = getattr(entity, "id", None) or getattr(dialog, "id", None)
@@ -278,7 +294,19 @@ class CreateTaskTool(Tool):
                         or ""
                     )
                     username = getattr(entity, "username", None) or ""
-                chats.append({"id": chat_id, "title": title, "username": username})
+                    first_name = getattr(entity, "first_name", None) or ""
+                    last_name = getattr(entity, "last_name", None) or ""
+                chats.append({
+                    "id": chat_id, "title": title, "username": username,
+                    "first_name": first_name, "last_name": last_name,
+                })
+
+        if chat_name:
+            from backend.ai.chat_resolution import format_clarification_options, resolve_chat_name
+            _trace(
+                "create_task_destination_resolution", mode="chat_name",
+                requested=" ".join(str(chat_name).split())[:64],
+            )
             resolved = resolve_chat_name(chat_name, chats, owner_id=owner_id)
             if not resolved["resolved"]:
                 _trace(
@@ -310,6 +338,39 @@ class CreateTaskTool(Tool):
 
         if isinstance(candidate, TaskCandidate):
             candidate = candidate.as_creation_candidate()
+
+        if schedule_type == "event":
+            # Resolve the model-facing trigger (names only) to trusted ids
+            # from the authenticated Self Bot's dialogs. The model can never
+            # supply sender/chat ids; an unresolvable or ambiguous reference
+            # fails closed with clarification instead of creating an unsafe
+            # trigger.
+            from backend.ai.task_trigger import resolve_trigger_references
+            _trace(
+                "create_task_trigger_resolution", mode="event",
+                has_sender=bool(trigger_spec.get("sender")),
+                has_chat=bool(trigger_spec.get("chat")),
+            )
+            resolved_trigger, trigger_error = resolve_trigger_references(
+                trigger_spec,
+                request_chat_id=extra.get("chat_id"),
+                chats=chats,
+            )
+            if trigger_error:
+                _trace(
+                    "create_task_trigger_resolution", mode="event",
+                    success=False, reason=str(trigger_error)[:120],
+                )
+                return ToolResult(success=False, message=trigger_error)
+            schedule_payload = dict(candidate_schedule)
+            schedule_payload["trigger"] = resolved_trigger
+            candidate["schedule"] = schedule_payload
+            _trace(
+                "create_task_trigger_resolution", mode="event", success=True,
+                has_sender=bool(resolved_trigger.get("sender_id")),
+                has_chat=bool(resolved_trigger.get("chat_id")),
+            )
+
         candidate["notification_destination"] = destination
 
         _trace(

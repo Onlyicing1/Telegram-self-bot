@@ -13,7 +13,7 @@ from backend.ai.task_contract import validate_ai_instruction, validate_prepared_
 logger = logging.getLogger(__name__)
 TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
 OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted"})
-SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly"})
+SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly", "event"})
 MAX_ACTIONS = 5
 MAX_PAYLOAD_BYTES = 32768
 MAX_METADATA_BYTES = 8192
@@ -99,6 +99,7 @@ class TaskRepository:
     async def get_task(self, owner_id, task_id): raise NotImplementedError
     async def list_tasks(self, owner_id): raise NotImplementedError
     async def list_due_tasks(self, owner_id, now, limit=10): raise NotImplementedError
+    async def list_event_tasks(self, owner_id, limit=10): raise NotImplementedError
     async def update_task(self, owner_id, task_id, expected_version, updates): raise NotImplementedError
     async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): raise NotImplementedError
     async def transition_task(self, owner_id, task_id, status, expected_version=None): raise NotImplementedError
@@ -119,6 +120,8 @@ class InMemoryTaskRepository(TaskRepository):
     async def list_tasks(self, owner_id): return [_copy(r) for r in self._tasks.values() if r.owner_id==owner_id]
     async def list_due_tasks(self, owner_id, now, limit=10):
         ref=_parse_dt(now); return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.next_run_at is not None and r.next_run_at<=ref], key=lambda r:(r.next_run_at,r.id))[:max(0,limit)]
+    async def list_event_tasks(self, owner_id, limit=10):
+        return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.schedule_type=="event"], key=lambda r:r.id)[:max(0,limit)]
     async def update_task(self, owner_id, task_id, expected_version, updates):
         r=self._tasks.get(task_id)
         if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
@@ -227,6 +230,10 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").lte("next_run_at",_serialize(now)).order("next_run_at").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
         except Exception as exc:logger.warning("Supabase due task query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_due_tasks(owner_id,now,limit)
+    async def list_event_tasks(self, owner_id, limit=10):
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").eq("schedule_type","event").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:logger.warning("Supabase event task query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_event_tasks(owner_id,limit)
     async def update_task(self, owner_id, task_id, expected_version, updates):
         current=await self.get_task(owner_id,task_id)
         if current is None or current.version!=expected_version:return None

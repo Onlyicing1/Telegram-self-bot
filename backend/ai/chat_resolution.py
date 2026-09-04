@@ -205,6 +205,98 @@ def resolve_chat_name(
     return {"resolved": False, "error": f"No clear match for '{name}'. Try a more specific chat name."}
 
 
+def resolve_sender_name(
+    sender_name: str,
+    chats: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve a semantic sender NAME to a trusted Telegram user id.
+
+    The AI may refer to "John", "علی", or "that person" — never a numeric
+    id. This resolves the name against the user-like entities visible to the
+    authenticated Self Bot (first/last name and username), with the same
+    fuzzy scoring and fail-closed ambiguity rules as ``resolve_chat_name``.
+
+    Returns a dict with ``resolved`` True/False, ``sender_id`` and
+    ``sender_name`` on success, ``matches``/``error`` on failure. The result
+    never contains a model-supplied id.
+    """
+    if not isinstance(sender_name, str) or not sender_name.strip():
+        return {"resolved": False, "error": "Sender name is empty."}
+    if len(sender_name) > _MAX_CHAT_NAME_CHARS:
+        return {"resolved": False, "error": "Sender name is too long."}
+
+    name = sender_name.strip()
+
+    def _sender_score(query: str, candidate: str) -> float:
+        """Strict sender similarity: exact, containment, or clear prefix.
+
+        Sender identity must never auto-resolve on a loose character-overlap
+        guess, so unrelated names score 0.0 instead of a fuzzy positive — a
+        genuinely unique name resolves, anything else fails closed with
+        clarification options.
+        """
+        n = _normalize(query)
+        c = _normalize(candidate)
+        if not n or not c:
+            return 0.0
+        if n == c:
+            return 1.0
+        if c.startswith(n) and len(n) >= 3:
+            return 0.95
+        if n in c or c in n:
+            ratio = len(n) / len(c) if len(n) <= len(c) else len(c) / len(n)
+            return 0.85 + 0.15 * ratio
+        return 0.0
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for chat in chats:
+        if not isinstance(chat, dict):
+            continue
+        chat_id = chat.get("id")
+        if not isinstance(chat_id, int) or chat_id == 0:
+            continue
+        first = str(chat.get("first_name") or "").strip()
+        last = str(chat.get("last_name") or "").strip()
+        username = str(chat.get("username") or "").strip()
+        full = f"{first} {last}".strip()
+        # Only user-like entities are candidate senders.
+        if not (first or last or username):
+            continue
+        best = max(
+            _sender_score(name, full) if full else 0.0,
+            _sender_score(name, first) if first else 0.0,
+            _sender_score(name, last) if last else 0.0,
+            _sender_score(name, username.lstrip("@")) if username else 0.0,
+            _sender_score(name, f"@{username}") if username else 0.0,
+        )
+        if best > 0:
+            label = username if not full else f"{full} (@{username})" if username else full
+            scored.append((best, {"chat_id": chat_id, "label": label}))
+
+    if not scored:
+        return {"resolved": False, "error": f"No contacts found matching '{name}'."}
+    scored.sort(key=lambda x: (-x[0], x[1]["chat_id"]))
+    top_score, top = scored[0]
+    strong = [(s, c) for s, c in scored if s >= _MATCH_THRESHOLD]
+    if len(strong) >= 2:
+        return {
+            "resolved": False,
+            "error": f"Multiple contacts match '{name}'. Please specify which one:",
+            "matches": [
+                {"rank": i + 1, "chat_id": c["chat_id"], "title": c["label"], "score": s}
+                for i, (s, c) in enumerate(strong[:8])
+            ],
+        }
+    if top_score >= _MATCH_THRESHOLD:
+        return {
+            "resolved": True,
+            "sender_id": top["chat_id"],
+            "sender_name": top["label"],
+            "matches": [],
+        }
+    return {"resolved": False, "error": f"No clear match for '{name}'. Try a more specific name."}
+
+
 def format_clarification_options(result: dict[str, Any]) -> str:
     """Format a multi-match result as a compact numbered clarification prompt.
 

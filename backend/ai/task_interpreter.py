@@ -61,14 +61,16 @@ CANDIDATE_SCHEMA = {
     "required": ["label", "schedule_type", "schedule", "timezone", "actions", "notification_destination"],
     "properties": {
         "label": {"type": "string"},
-        "schedule_type": {"type": "string", "enum": ["once", "interval", "daily", "weekly"]},
+        "schedule_type": {"type": "string", "enum": ["once", "interval", "daily", "weekly", "event"]},
         "schedule": {
             "type": "object",
             "description": (
                 "interval: {'seconds': <positive number>}; "
                 "once: {'at': '<naive local ISO datetime>', 'timezone': '...'}; "
                 "daily: {'hour': 0-23, 'minute': 0-59, 'timezone': '...'}; "
-                "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, 'timezone': '...'}"
+                "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, 'timezone': '...'}; "
+                "event: {'trigger': {'type': 'telegram_message', ...}} — fires when a "
+                "matching Telegram message arrives (no wall-clock time)"
             ),
         },
         "timezone": {"type": "string"},
@@ -150,6 +152,19 @@ class TaskInterpreter:
             "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, "
             "'timezone': '<IANA tz>'}. Do not put unit names like 'minutes' inside "
             "the schedule object — convert them to seconds yourself. "
+            "EVENT SCHEDULES (trigger type): use schedule_type 'event' ONLY when the user "
+            "explicitly asks for an automation that reacts to an incoming Telegram message "
+            "(e.g. 'وقتی جان پیام داد جوابش بده', 'when John sends me a message reply using X', "
+            "'هر وقت از این چت پیام اومد', 'when I receive a message from this chat containing "
+            "urgent'). The schedule must be {'trigger': {'type': 'telegram_message', ...}} with "
+            "the allowed trigger fields: 'sender' (a display NAME such as 'John' or 'علی' — "
+            "never a numeric id), 'chat' (a chat name, or 'this chat'/'همین چت' for the current "
+            "conversation — never a numeric id), 'contains' (list of substrings, all must appear), "
+            "'text_equals', 'starts_with', 'has_media' (boolean), 'is_reply' (boolean), and "
+            "'direction' ('incoming' default, 'outgoing', or 'any'). Include at least one "
+            "condition. Never invent sender/chat ids — the runtime resolves names. "
+            "DO NOT use schedule_type 'event' for time-based requests; those stay once/interval/"
+            "daily/weekly. "
             "\n\n"
             "PERSIAN INTERVAL RECOGNITION: Recognize common Persian interval phrases as scheduling requests. "
             "Examples: 'هر 1 دقیقه یک بار بنویس سلام' (every 1 minute write hello), "

@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SUPPORTED_TYPES = frozenset({"once", "interval", "daily", "weekly"})
+SUPPORTED_TYPES = frozenset({"once", "interval", "daily", "weekly", "event"})
 
 class ScheduleError(ValueError):
     pass
@@ -79,7 +79,25 @@ class WeeklySchedule:
         if not 0 <= self.weekday <= 6: raise ScheduleError("weekday must be between 0 and 6")
         _tz(self.timezone)
 
-Schedule = OnceSchedule | IntervalSchedule | DailySchedule | WeeklySchedule
+@dataclass(frozen=True)
+class EventSchedule:
+    """Event-triggered task: no wall-clock time; fires on matching Telegram events.
+
+    The trigger spec is the PERSISTED (resolved) form: identities are real
+    ids resolved from trusted runtime context at creation time, never
+    model-supplied numbers.
+    """
+    trigger: dict
+    def __post_init__(self):
+        from backend.ai.task_trigger import TaskTriggerError, validate_resolved_trigger
+        if not isinstance(self.trigger, dict):
+            raise ScheduleError("event schedule requires a trigger object")
+        try:
+            object.__setattr__(self, "trigger", validate_resolved_trigger(self.trigger))
+        except TaskTriggerError as exc:
+            raise ScheduleError(f"invalid event trigger: {exc}") from exc
+
+Schedule = OnceSchedule | IntervalSchedule | DailySchedule | WeeklySchedule | EventSchedule
 
 
 def parse_schedule(schedule_type: str, payload: dict) -> Schedule:
@@ -87,6 +105,10 @@ def parse_schedule(schedule_type: str, payload: dict) -> Schedule:
     try:
         if schedule_type == "once": return OnceSchedule(datetime.fromisoformat(payload["at"]), payload["timezone"])
         if schedule_type == "interval": return IntervalSchedule(timedelta(seconds=float(payload["seconds"])))
+        if schedule_type == "event":
+            if set(payload) != {"trigger"}:
+                raise ScheduleError("event schedule must contain only the trigger field")
+            return EventSchedule(payload["trigger"])
         clock = time(int(payload["hour"]), int(payload.get("minute", 0)), int(payload.get("second", 0)))
         if schedule_type == "daily": return DailySchedule(clock, payload["timezone"])
         return WeeklySchedule(int(payload["weekday"]), clock, payload["timezone"])
@@ -94,8 +116,15 @@ def parse_schedule(schedule_type: str, payload: dict) -> Schedule:
         raise ScheduleError("malformed schedule payload") from exc
 
 
+def is_event_schedule(schedule_type: str) -> bool:
+    """True when the schedule type is the event trigger (no wall-clock time)."""
+    return schedule_type == "event"
+
+
 def next_occurrence(schedule: Schedule, reference: datetime, previous: datetime | None = None) -> datetime:
     ref = _utc(reference)
+    if isinstance(schedule, EventSchedule):
+        raise ScheduleError("event schedules have no next time occurrence")
     if isinstance(schedule, OnceSchedule):
         value = schedule.occurrence(); return value if value >= ref else value
     if isinstance(schedule, IntervalSchedule):

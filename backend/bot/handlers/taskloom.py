@@ -45,6 +45,7 @@ _SCHEDULE_ICON = {
     "interval": "⟳",
     "daily": "◷",
     "weekly": "◷",
+    "event": "⚡",
 }
 
 

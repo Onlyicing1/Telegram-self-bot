@@ -800,8 +800,8 @@ Durable owner-scoped AI task definitions for the future scheduler. This table ex
 | `label` | `text` | NO | Nonblank; max 256 enforced by repository |
 | `status` | `text` | NO | `'active'`; CHECK `active`, `paused`, `completed`, `failed`, `expired`, `deleted` |
 | `version` | `integer` | NO | `1`; CHECK `> 0` |
-| `schedule_type` | `text` | NO | CHECK `once`, `interval`, `daily`, `weekly` |
-| `schedule` | `jsonb` | NO | Max 16,384 bytes by migration |
+| `schedule_type` | `text` | NO | CHECK `once`, `interval`, `daily`, `weekly`, `event` (extended by migration `20260904000001_add_event_schedule_type.sql`) |
+| `schedule` | `jsonb` | NO | Max 16,384 bytes by migration. Time schedules: `{seconds}`, `{at,timezone}`, `{hour,minute,timezone}`, `{weekday,hour,timezone}`. Event schedule: `{"trigger": {...}}` — the resolved trigger spec below |
 | `timezone` | `text` | NO | Explicit IANA identifier validated by application |
 | `next_run_at` | `timestamptz` | YES | UTC due instant |
 | `actions` | `jsonb` | NO | JSON array, 1–5 actions, max 32,768 bytes |
@@ -810,6 +810,40 @@ Durable owner-scoped AI task definitions for the future scheduler. This table ex
 | `updated_at` | `timestamptz` | NO | `now()` |
 | `terminal_at` | `timestamptz` | YES | Terminal lifecycle timestamp |
 | `ai_instruction` | `text` | YES | Explicit bounded natural-language instruction for future per-occurrence AI preparation; never an executable action; max 4,096 UTF-8 characters in application contract |
+
+### Event trigger spec (schedule_type `event`)
+
+An event-triggered task has no wall-clock time: `next_run_at` stays NULL and
+`schedule` carries a single `trigger` object. The AI produces the
+model-facing (unresolved) form — `sender`/`chat` are semantic NAMES, never
+numeric ids — and the Self Bot resolves names against its own trusted
+dialogs at creation time. The persisted (resolved) form is:
+
+```json
+{
+  "trigger": {
+    "type": "telegram_message",
+    "sender_id": 123456,            // resolved; optional
+    "sender_name": "John",           // display only
+    "chat_id": -100123456,          // resolved; optional
+    "chat_title": "Chat name",       // display only
+    "contains": ["urgent"],          // all terms must appear (case-insensitive)
+    "text_equals": "...",            // exact match
+    "starts_with": "...",
+    "has_media": true,
+    "is_reply": true,
+    "direction": "incoming"          // incoming | outgoing | any (default incoming)
+  }
+}
+```
+
+Validation is application-side (`backend/ai/task_trigger.py`): bounded
+fields only, at least one matching condition, unknown keys rejected,
+resolved ids must be positive integers. The runtime evaluates triggers
+deterministically against incoming Telegram events — no LLM per message.
+Matching occurrences use key `"<task_id>:ev:<chat_id>:<message_id>"` (unique
+with `task_id`), so duplicate delivery of the same event cannot create a
+second occurrence.
 
 Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no action or step table exists.
 

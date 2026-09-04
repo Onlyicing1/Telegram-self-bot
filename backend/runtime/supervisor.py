@@ -367,6 +367,15 @@ class RuntimeSupervisor:
             self._task_scheduler = TaskScheduler(
                 get_task_repository(), self.owner_id, coordinator, outcome_notifier
             )
+
+            # Event-driven automation shares the same repository, execution
+            # coordinator, and outcome notifier as the time scheduler — no
+            # parallel authorities. The handler is a no-op until configured.
+            from backend.ai.task_event_dispatcher import TaskEventDispatcher
+            from backend.bot.handlers import task_events
+            task_events.configure(TaskEventDispatcher(
+                get_task_repository(), self.owner_id, coordinator, outcome_notifier
+            ))
         await self._task_scheduler.start()
 
     async def _stop_task_scheduler(self) -> None:
@@ -825,6 +834,7 @@ class RuntimeSupervisor:
         protected_names = {
             "lifeos-web", "lifeos-web-server", "lifeos-heartbeat",
             "lifeos-keepalive", "lifeos-task-supervisor",
+            "lifeos-task-scheduler",
             "lifeos-profile-scheduler", "lifeos-tg-supervisor",
             "lifeos-diagnostics", "lifeos-failsafe",
             "lifeos-helper-supervisor", "lifeos-helper",

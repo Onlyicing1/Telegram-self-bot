@@ -66,11 +66,17 @@ def _fallback_active(service: TaskManagementService) -> bool:
 
 
 def _task_block(task: object, *, include_version: bool) -> str:
+    is_event = str(getattr(task, "schedule_type", "") or "") == "event"
+    next_line = (
+        "Next: On message event"
+        if is_event
+        else f"Next: {_format_datetime(getattr(task, 'next_run_at', None), empty='Not scheduled')}"
+    )
     lines = [
         f"Task #{getattr(task, 'id', '?')}",
         f"Title: {getattr(task, 'label', '')}",
         f"Status: {_status_text(getattr(task, 'status', ''))}",
-        f"Next: {_format_datetime(getattr(task, 'next_run_at', None), empty='Not scheduled')}",
+        next_line,
     ]
     if include_version:
         lines.append(f"Version: v{getattr(task, 'version', '?')}")
@@ -115,6 +121,13 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
         f"Schedule: {task.schedule_type}",
         f"Timezone: {task.timezone}",
     ]
+    if str(getattr(task, "schedule_type", "") or "") == "event":
+        from backend.ai.task_trigger import trigger_summary
+        trigger = (getattr(task, "schedule", None) or {}).get("trigger") or {}
+        try:
+            lines.append(f"Trigger: {trigger_summary(trigger)}")
+        except Exception:
+            lines.append("Trigger: Telegram message")
     if _fallback_active(service):
         lines.append(_FALLBACK_NOTE)
     if view.occurrences:

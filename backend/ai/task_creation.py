@@ -65,7 +65,10 @@ class TaskCreationService:
             raise _invalid(f"unsupported task fields: {sorted(set(candidate) - allowed)}")
         if required - set(candidate):
             raise _invalid(f"missing required task fields: {sorted(required - set(candidate))}")
-        if candidate.get("timezone") != candidate["schedule"].get("timezone") and candidate["schedule_type"] != "interval":
+        if (
+            candidate.get("timezone") != candidate["schedule"].get("timezone")
+            and candidate["schedule_type"] not in ("interval", "event")
+        ):
             raise _invalid(
                 "task and schedule timezones must match "
                 f"(task={candidate.get('timezone')} schedule={candidate['schedule'].get('timezone')})"
@@ -73,7 +76,12 @@ class TaskCreationService:
         try:
             schedule = parse_schedule(candidate["schedule_type"], candidate["schedule"])
             initial = candidate.get("next_run_at")
-            if initial is None:
+            if candidate["schedule_type"] == "event":
+                # Event-triggered tasks have no wall-clock time: next_run_at
+                # stays None (the event handler drives executions) and the
+                # UI reports the trigger, never a fake run time.
+                initial = None
+            elif initial is None:
                 if candidate["schedule_type"] == "interval":
                     # A brand-new recurring interval task has no previous
                     # occurrence, so `next_occurrence` (which requires one for
