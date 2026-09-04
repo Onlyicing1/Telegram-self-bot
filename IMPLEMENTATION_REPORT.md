@@ -6,408 +6,573 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `98150d98798efe7a6e9fb26555bac6c7f277ed27` |
-| Implementation commit | `de4cde8` (`feat: add event-triggered task automation`) |
+| Confirmation round-trip commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
+| Model/provider runtime-switch commit | `c5d29f7` + new commit `fix: apply AI model and provider changes at runtime` |
 | Implementation date | 2026-09-04 |
-| Task/chunk | Upgrade the AI Task system into a general-purpose automation system (event triggers + deterministic matching + Telegram message event execution) |
+| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching |
 | Work type | implementation |
-| Final implementation status | **COMPLETE** — full test suite, compile check, and diff hygiene pass; live Telegram/Supabase verification **NOT performed** (no credentials/runtime in this workspace); schema migration **NOT applied** (SQL provided, user applies in Supabase) |
+| Final implementation status | **COMPLETE** — full test suite (`1683 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
 
 This is the single current-state report. It records only behavior and
-validation established from the current source, the working-tree diff, and
-commands actually run.
+validation established from the current source, the committed diffs
+(`c5d29f7`, and the model/provider runtime-switch commit), and commands
+actually run.
+
+### Implementation summary
+
+- **Chunk 1 — confirmation round-trip (committed `c5d29f7`):** an interactive
+  owner-confirmation round-trip that lets ADMIN_ONLY /
+  CONFIRMATION_REQUIRED registered tools complete through the AI execution
+  path after explicit owner approval. Before it, `settings_set` (ADMIN_ONLY)
+  was the only registered AI tool that could be selected but never executed —
+  `ToolExecutor` correctly returned `needs_confirmation` and the Dispatcher
+  had no way to consume an owner approval and re-issue the call.
+- **Chunk 2 — model/provider runtime switching (this task, uncommitted at
+  report time):** fixes the confirmed user-facing bug that the AI could
+  receive and confirm a model/provider change request but the ACTIVE model
+  never changed. `SettingsSetTool` was writing provider/model into
+  `settings_service` (panel_settings) — a store the AI runtime never reads —
+  so the change "succeeded" (settings_get showed it) yet the next AI request
+  was still served by the old provider/model.
+- **Current status by label:**
+  - **IMPLEMENTED** — source present in `c5d29f7` + the runtime-switch commit.
+  - **TESTED** — focused suites `tests/test_confirmation_roundtrip.py` (63
+    tests) and `tests/test_settings_runtime_switch.py` (15 tests) plus the
+    full suite (`1683 passed, 23 skipped`).
+  - **INTEGRATED** — proven in-process through the real
+    provider → registry → ToolExecutor path (service boundary faked where
+    the suite convention requires it) and, for the runtime switch, through
+    the REAL Engine → Dispatcher → ProviderManager path with scripted
+    providers.
+  - **LIVE VERIFIED** — **NOT PERFORMED** (no Telegram/Supabase runtime in
+    this workspace).
+  - **UNVERIFIED** — everything that requires a live environment (see §12).
 
 ---
 
 ## 2. OBJECTIVE
 
-The task system was a time-only scheduler: `ai_tasks` with
-`schedule_type` constrained to `once`/`interval`/`daily`/`weekly`, a single
-`TaskScheduler` that polls `next_run_at`, and a `TaskExecutionCoordinator`
-that replays stored action snapshots through the registered `ToolExecutor`.
-The limitations to solve:
+The preceding AI Tool Connectivity investigation (`INVESTIGATION.md`)
+established, from current source:
 
-1. Natural-language scheduling ("Tomorrow at 5 PM do X", "فردا ساعت ۵ …")
-   needed a precise Tehran-local schedule boundary.
-2. The system behaved like a timer; it could not represent **event-driven**
-   automation ("when John sends me a message, reply using X").
-3. Incoming Telegram messages had no task-evaluation path — no event
-   triggers, no deterministic matcher.
-4. Scheduled/triggered tasks must execute only **registered tools** through
-   the existing `ToolExecutor`; stored actions re-validated at execution.
-5. Task detection must stay **AI-semantic** (no regex/keyword routing) while
-   ordinary conversation never auto-creates a task.
-6. Security boundaries (ToolRegistry → ToolExecutor → Self Bot execution
-   authority; owner scoping; CAS) must remain intact.
-7. A latent recovery bug: full recovery cancelled the `lifeos-task-scheduler`
-   task permanently (not in the orphan-cancellation protected set).
+- 36 registered AI tools.
+- 35 classified `REAL_CONNECTED`.
+- `settings_set` was the single `PROVIDER_REACHABLE_BUT_NOT_EXECUTABLE`
+  tool: `SettingsSetTool.permission_level == PermissionLevel.ADMIN_ONLY`,
+  `ToolExecutor` returned `needs_confirmation`, and the Dispatcher had no
+  confirmation round-trip / re-issue mechanism.
 
-The goal: add the smallest production-safe **event-trigger** model on top of
-the existing two-table architecture, route message events through the
-existing Telethon update path into deterministic trigger matching and the
-existing execution authority, and keep the single scheduler/executor/
-repository/supervisor model.
-
----
-
-## 3. ARCHITECTURE DECISIONS (source-verified)
-
-Inspection of the current source established the following facts that shaped
-the implementation:
-
-- **No trigger concept existed.** `ai_tasks.schedule` JSONB held only time
-  schedules; the `schedule_type` CHECK constraint allowed only the four time
-  types. No event representation was possible.
-- **No incoming-message task path existed.** The only plain
-  `events.NewMessage()` handler in the bot was a health-timestamp hook; the
-  router registered only outgoing/command handlers and the AI unified
-  handler.
-- **Identity-resolution infrastructure existed for chats only.**
-  `backend/ai/chat_resolution.py` had `resolve_chat_name` (fuzzy scoring,
-  multi-match clarification, fail-closed) but no sender resolution and no
-  first/last-name awareness in the dialog snapshot.
-- **Latent recovery bug.** `RuntimeSupervisor._cancel_orphan_tasks` had a
-  protected-name set that omitted `lifeos-task-scheduler`, so a full
-  recovery cancelled the time scheduler permanently.
-- **Shared execution machinery exists and is correct.** One repository
-  singleton (`get_task_repository()`), one `TaskScheduler`, one
-  `TaskExecutionCoordinator`, one outcome notifier; occurrence creation is
-  keyed on `(task_id, occurrence_key)` and returns the existing occurrence
-  when the key already exists (both in-memory and Supabase repositories) —
-  which makes deterministic event dedup safe.
-- **Notifications are already opt-in.** `notify_on_outcome` /
-  `deliver_result` default false after the prior hardening task; Saved
-  Messages is not an execution log sink.
-
----
-
-## 4. IMPLEMENTATION CHANGES
-
-### 4.1 Trigger model — `backend/ai/task_trigger.py` (new)
-
-Bounded, two-form trigger representation (no expression language, no code):
-
-- `validate_trigger_spec` — the **model-facing (unresolved)** form the AI
-  may emit. `sender`/`chat` are semantic NAMES (never numeric ids — numeric
-  ids are rejected outright because the model can never invent an identity).
-  Allowed fields: `type`, `sender`, `chat`, `contains`, `text_equals`,
-  `starts_with`, `has_media`, `is_reply`, `direction`. Bounded sizes and
-  counts; at least one matching condition required (a trigger can never
-  fire on every message by accident).
-- `validate_resolved_trigger` — the **persisted (resolved)** form after
-  trusted runtime resolution: adds integer `sender_id`/`chat_id` (nonzero;
-  negative chat ids are legal — groups/supergroups) plus display-only
-  `sender_name`/`chat_title`.
-- `is_this_chat_reference` — English/Persian aliases for "this chat / همین
-  چت" resolve to the trusted request `chat_id` at creation time.
-- `resolve_trigger_references` — resolves names against the authenticated
-  Self Bot's dialog snapshot via `resolve_chat_name` /
-  `resolve_sender_name`; fails closed with numbered clarification when
-  ambiguous/unresolvable; the resolved trigger never contains a
-  model-invented id.
-- `event_trigger_matches` — **deterministic** matcher over a bounded event
-  context dict (`chat_id`, `sender_id`, `text`, `has_media`, `is_reply`,
-  `out`). Direction filter (incoming/outgoing/any) + every present
-  condition ANDed. No provider call, no scoring, no LLM per message.
-- `trigger_summary` — bounded user-facing description of a resolved trigger.
-
-### 4.2 Schedule model — `backend/ai/scheduling.py`, `task_candidate.py`, `task_interpreter.py`
-
-- `SUPPORTED_TYPES` and the repository `SCHEDULE_TYPES` now include `event`.
-- `EventSchedule` — frozen schedule with a single validated resolved
-  `trigger`; `next_occurrence()` raises for event schedules (no wall-clock
-  time); `parse_schedule` accepts only `{"trigger": ...}` payloads.
-- `TaskCandidate` validates the model-facing event trigger spec through
-  `validate_trigger_spec` at candidate-build time and skips the
-  timezone-match rule for `event`/`interval`.
-- `TaskInterpreter` CANDIDATE_SCHEMA enum + system guidance now teach the AI
-  the `event` schedule shape, the allowed model-facing fields (names, never
-  ids), English/Persian examples, and a hard rule that time-based requests
-  must NOT become `event` tasks. No regex, no keyword lists — the provider
-  interprets semantics against the schema/guidance.
-
-### 4.3 Persistence — `backend/ai/database/task_repository.py`, `task_creation.py`, `task_management.py`
-
-- Repository interface + in-memory + Supabase implementations gain
-  `list_event_tasks(owner_id, limit)` — one indexed query
-  (`owner_id` + `status='active'` + `schedule_type='event'`), bounded.
-- `TaskCreationService` — event tasks persist with `next_run_at = NULL`
-  (they have no wall-clock due time; the event handler drives execution);
-  timezone-match rule skipped for event/interval.
-- `TaskManagementService._resume_next_run` returns `None` for event tasks —
-  resuming an event task never fabricates a fake run time.
-
-### 4.4 Event execution — `backend/ai/task_event_dispatcher.py` (new)
-
-`TaskEventDispatcher` — the single event-trigger responder, sharing the
-same repository singleton, `TaskExecutionCoordinator`, and outcome notifier
-as the time scheduler (no parallel authorities):
-
-- `extract_event_context` normalizes a Telethon event into a bounded dict.
-- `event_occurrence_key(task_id, chat_id, message_id)` — deterministic key
-  `"<task_id>:ev:<chat_id>:<message_id>"`; duplicate delivery of the same
-  event (redelivery, restart) maps to the same key, so the unique
-  `(task_id, occurrence_key)` index prevents a second occurrence. The claim
-  CAS is the final guard for the concurrent race window.
-- `handle_event` — lists active event tasks (bounded, limit 20), parses and
-  evaluates each stored trigger deterministically, skips non-matching
-  tasks, dispatches up to 5 executions per message, and never raises into
-  the Telegram event path. Per-message logging is bounded structured
-  `TASK_EVENT_TRACE` lines; no Telegram diagnostics.
-- Duplicate handling: when the occurrence key already exists
-  (running/retry_pending/terminal), dispatch is skipped; a claimed
-  occurrence without a wired coordinator is marked `interrupted` for
-  recovery.
-
-### 4.5 Telegram integration — `backend/bot/handlers/task_events.py` (new) + router/supervisor
-
-- `task_events.register` hooks **the existing Telethon update path**
-  (`events.NewMessage()`, both directions — the deterministic `direction`
-  condition decides), normalized per event, handed to the configured
-  dispatcher. No second update loop, no second event dispatcher.
-- `task_events.configure(dispatcher)` — process-wide binding; handler is a
-  no-op when unconfigured (startup ordering/tests).
-- `backend/bot/router.py` registers `task_events`.
-- `backend/runtime/supervisor.py` builds the dispatcher with the shared
-  repository/coordinator/notifier and configures it during task-scheduler
-  startup; **`lifeos-task-scheduler` added to the orphan-cancellation
-  protected set** so full recovery no longer kills the scheduler.
-  Execution always uses the current client via the existing
-  client-provider/coordinator path (recovery-safe; no stale client
-  captured at startup).
-
-### 4.6 Tool-layer sender/chat resolution — `backend/ai/tools/task.py`, `backend/ai/chat_resolution.py`
-
-- `CreateTaskTool` now loads the trusted dialog snapshot once per creation
-  when the destination `chat_name` or an event trigger references a name,
-  capturing user-like fields (`first_name`, `last_name`, `username`).
-- After candidate validation, event triggers go through
-  `resolve_trigger_references(request_chat_id=extra["chat_id"])`; failure
-  returns a clarification `ToolResult` instead of creating an unsafe task.
-- `resolve_sender_name` — new strict scorer against user-like entities
-  (full/first/last/username): exact or containment with a real ratio, plus
-  a `>=3`-char prefix rule; unrelated names score 0.0 (no loose
-  character-overlap guessing), multi-match/ambiguous → fail closed with
-  numbered options. Same `_MATCH_THRESHOLD`/clarification conventions as
-  `resolve_chat_name`.
-
-### 4.7 Presentation — `backend/ai/task_management_interface.py`, `backend/bot/handlers/taskloom.py`
-
-- Task list blocks show `Next: On message event` for event tasks (never a
-  fake run time); `task_inspect` shows a `Trigger:` line via
-  `trigger_summary`. Time-based tasks keep the existing Tehran-local
-  `Next:` formatting from the prior hardening work.
-- Taskloom schedule icon map gains `event → ⚡`.
-
-### 4.8 Database — migration + docs
-
-- New migration `supabase/migrations/20260904000001_add_event_schedule_type.sql`
-  widens the `ai_tasks.schedule_type` CHECK to include `'event'`.
-  **No new tables or columns.** Trigger spec lives in the existing
-  `schedule` JSONB (max 16,384 bytes unchanged).
-- `DATABASE_ARCHITECTURE.md` updated with the resolved trigger spec
-  structure, matching semantics, and occurrence-key identity.
-
----
-
-## 5. TRIGGER / SCHEDULE / EVENT MODEL (current state)
-
-A task is one row in `ai_tasks`; its `schedule_type` selects how it fires:
-
-| schedule_type | schedule payload | next_run_at | execution driver |
-|---|---|---|---|
-| `once` | `{at, timezone}` | instant | TaskScheduler (due poll) |
-| `interval` | `{seconds}` | rolling | TaskScheduler |
-| `daily` | `{hour, minute, timezone}` | rolling | TaskScheduler |
-| `weekly` | `{weekday, hour, timezone}` | rolling | TaskScheduler |
-| `event` | `{trigger: {…resolved spec…}}` | NULL | TaskEventDispatcher (Telegram message path) |
-
-Event trigger (resolved, persisted) — all bounded, at least one condition,
-runtime-evaluated deterministically:
-
-```json
-{"trigger": {
-  "type": "telegram_message",
-  "sender_id": 123456, "sender_name": "John",
-  "chat_id": -100123, "chat_title": "Chat",
-  "contains": ["urgent"], "text_equals": null,
-  "starts_with": null, "has_media": false,
-  "is_reply": null, "direction": "incoming"
-}}
-```
-
-Occurrence identity for event executions: `"<task_id>:ev:<chat_id>:<message_id>"`,
-unique with `task_id`. Attempt limit, claim/retry/interrupted semantics, and
-CAS versioning are the existing occurrence contract, unchanged. The unique
-index protects the occurrence record; the claim CAS protects the
-claimed→running race. **Exactly-once Telegram side effects are not claimed.**
-
-Architecture of execution (event and time paths converge):
+Chunk 1 goal: add the smallest production-safe, **generic** confirmation
+round-trip (not a `settings_set`-specific special case) while preserving the
+execution architecture:
 
 ```
-Telegram message event / scheduler due poll
-  → TaskEventDispatcher.handle_event | TaskScheduler
-  → occurrence create/claim (deterministic key, CAS)
-  → TaskExecutionCoordinator
-  → action name re-validated against ToolRegistry
-  → ToolExecutor
-  → registered tool → service layer → real side effect
-  → occurrence finalization → opt-in notification/result delivery
+owner request → AI interpretation / tool selection
+  → ToolRegistry
+  → ToolExecutor            (sole execution authority)
+  → needs_confirmation
+  → explicit owner confirmation
+  → validated re-issue through ToolExecutor
+  → ToolResult
+  → AI response
 ```
 
----
-
-## 6. TIMEZONE BEHAVIOR (current state)
-
-- All user-facing scheduling semantics use `Asia/Tehran` via
-  `ZoneInfo` — never the server local timezone, never UTC as a user
-  default, never hardcoded `+03:30` arithmetic (the `tzdata` dependency was
-  added in the prior hardening task so `ZoneInfo("Asia/Tehran")` resolves
-  on any host).
-- Instants persist as UTC/timestamptz; naive local datetimes in candidates
-  are interpreted in the task's `Asia/Tehran` timezone at parse time.
-- Relative expressions ("tomorrow", "next Monday", "in 2 hours", Persian
-  equivalents) are interpreted by the AI/interpreter against the schema
-  guidance with the current Tehran date/time as reference — no local
-  parser, no regex. The deterministic tests pin the instant math for
-  once/daily/weekly/interval Tehran schedules.
+Chunk 2 goal (this task): fix the confirmed user-facing bug — the AI can
+receive and confirm a model/provider change request, but the active model
+does NOT actually change. The system appeared to succeed before the final
+step: settings_set → persisted → runtime configuration → ProviderManager →
+next AI request.
 
 ---
 
-## 7. NOTIFICATION / SAVED-MESSAGES BEHAVIOR
+## 3. ROOT CAUSE (source-proven)
 
-Unchanged from the hardening task and preserved here: execution outcomes
-live in `ai_task_occurrences` + structured `TASK_EVENT_TRACE` logs;
-`notify_on_outcome=false` and `deliver_result=false` are the defaults, so
-event/scheduled execution is silent — no Saved Messages status messages by
-default. Only explicit user intent (via the existing opt-in flags) enables
-notification/result delivery, and that flows through the same outcome
-notifier boundary.
+### 3.1 Confirmation round-trip gap (fixed by `c5d29f7`)
+
+1. `SettingsSetTool.permission_level` is `PermissionLevel.ADMIN_ONLY`
+   (`backend/ai/tools/settings.py`).
+2. `ToolExecutor._is_auto_executable()` auto-executes only
+   READ_ONLY / READ_WRITE / DANGEROUS tools; ADMIN_ONLY and
+   CONFIRMATION_REQUIRED are excluded.
+3. `_execute_single()` therefore returned
+   `ToolExecutionResult(success=False, needs_confirmation=True,
+   error="confirmation_required")` **without calling `tool.execute()`**.
+4. The Dispatcher recorded the blocked outcome as a tool failure, had no
+   pending-approval state, produced no confirmation-request prompt, and had
+   no path that consumed an owner's approval reply and re-issued the call.
+
+Result: the AI flow stopped at the confirmation boundary. This was a
+**feature gap, not a security gap** — the gate itself was correct.
+
+### 3.2 Model/provider runtime switching (fixed by this task) — CONFIRMED
+
+The exact source-proven chain, before this fix:
+
+1. AI selects `settings_set` with `{"key": "provider"|"model", "value": ...}`.
+2. Owner confirms; `ToolExecutor.execute_confirmed()` reaches
+   `SettingsSetTool.execute()` (commit `c5d29f7`).
+3. `SettingsSetTool.execute()` called `settings_service.set_setting(key,
+   value)` — the **Glass-panel settings system** (`panel_settings` table),
+   whose typed columns are panel concerns only (`language`, `dashboard_font`,
+   timeouts, ...). There is **no `provider`/`model` column and no validator**
+   for them (`_DEFAULTS`/`_VALIDATORS` in
+   `backend/services/settings_service.py`).
+4. `set_setting("provider", ...)` therefore took the unvalidated path:
+   `repo.update_field("provider", ...)` fails against Supabase (no such
+   column) → returns `False` → `set_setting` falls back to
+   `_cache[key] = value; return True` — a **phantom success**: only the
+   in-memory panel cache holds the value, and nothing that matters reads it.
+5. The AI runtime's authoritative provider/model lives in a DIFFERENT store:
+   `backend/ai/config_store.py` (`ai_config` table). At the start of EVERY AI
+   request, `ai_unified._restore_config(owner_id)` reads `config_store`
+   and re-applies it via
+   `engine.apply_runtime_selection(provider, model)` →
+   `ProviderManager.apply_selection()` (switches the registry's active
+   provider and writes `config.default_model` on the live provider instance).
+6. The settings_set path never touched `config_store`, never called
+   `apply_runtime_selection`, and nothing else re-reads `panel_settings` for
+   AI keys — so the next AI request was still served by the OLD
+   provider/model.
+7. `settings_get` returned the phantom cached value, which is why the change
+   **looked** successful end-to-end.
+
+Confirmation of the disconnect (grep-verified): no `config_store` import or
+call exists anywhere under `backend/ai/tools/` or `backend/services/`; the
+only writer of `ai_config.provider/model` is the web API + glass actions
+(`config_store.update_provider/update_model` + `_apply_runtime_selection`).
+
+The same phantom-write defect applied to the other AI-runtime keys
+(`temperature`, `max_tokens`, `system_prompt`, `history_budget`,
+`trigger_en`, `trigger_fa`), which are also not panel_settings columns.
+
+The reported `Supabase event task query failed; using fallback:
+[Errno 11] Resource temporarily unavailable` warnings are **not** part of
+this bug: they come from the task repository's Supabase→in-memory fallback
+and do not touch the model/provider path.
 
 ---
 
-## 8. SECURITY BOUNDARIES (unchanged and enforced)
+## 4. IMPLEMENTED CHANGES
 
-- AI proposes/selects registered capabilities; ToolRegistry validates; the
-  ToolExecutor is the sole execution authority; the Self Bot owns all
-  Telegram RPC. Task database never becomes a command execution system.
-- Stored actions re-validated against the registry at every execution;
-  unregistered actions fail closed.
-- All task/occurrence mutations owner-scoped; lifecycle mutations CAS
-  (version) protected.
-- Model-invented Telegram ids are rejected at candidate validation; trigger
-  identities come only from trusted dialog resolution, and ambiguous
-  references fail closed with clarification. No arbitrary SQL/shell/HTTP/
-  code predicates anywhere in the trigger path.
-- The matcher is deterministic local logic — no LLM per incoming message.
+### 4.1 `backend/ai/confirmation.py` — NEW (chunk 1, production)
+
+Bounded, in-memory owner-approval state. Follows the repository's existing
+bounded in-memory convention (`backend/helper/input_state.py`): process
+memory, monotonic expiry, sync operations (atomic with respect to the asyncio
+event loop — no lock needed for the create/take race), `clear_all()` for
+tests. No persistence, no database table, no migration, no new persistence
+authority.
+
+- `PendingConfirmation` — frozen dataclass: `confirmation_id` (uuid hex),
+  `owner_id`, `chat_id`, `session_id`, `tool_name`, `arguments`
+  (a defensive copy of the ORIGINAL validated tool-call arguments),
+  `created_at`, `expires_at`, `expired` property (monotonic TTL, fails
+  closed).
+- `PendingConfirmationStore` — dict keyed by `(owner_id, chat_id)`:
+  - `create(...)` — stores an entry or returns `None` when an ACTIVE entry
+    already exists for the scope (never silently overwrites); an EXPIRED
+    entry is replaced.
+  - `take(...)` — single-use consume: removes the entry BEFORE returning it,
+    so a replay finds nothing; distinguishes "consumed active entry",
+    "purged expired entry", and "nothing existed".
+  - `pending_count()` / `clear_all()`.
+- `CONFIRMATION_TTL_S = 120.0` — interactive approval lifetime, mirroring the
+  existing pending-input convention (120 s).
+- `_EXPLICIT_CONFIRMATIONS` — the COMPLETE bounded set of explicit
+  confirmation phrases (Persian: بله، آره، اره، بلی، تایید/تائید/تأیید and
+  their «... میکنم» forms incl. «بله تأیید میکنم» / «آره تایید میکنم»;
+  English: yes / yeah / yep / confirm / confirmed / approve / approved /
+  i confirm / go ahead). Exact normalized full-message match only.
+- `normalize_confirmation_text()` — NFKC, ZWNJ → space (so تایید‌میکنم
+  equals تایید میکنم), tatweel removed, only alphanumerics + whitespace kept
+  (punctuation/emoji cannot break the match), whitespace collapsed, ASCII
+  casefolded.
+- `is_explicit_confirmation()` — True only for an exact match against the
+  bounded phrase set. Never a substring/keyword scan.
+- `confirmation_request_text(tool_name, arguments)` — deterministic prompt
+  showing the exact frozen tool name and sorted arguments, plus the expiry
+  and reply instructions («تأیید», «بله», "yes").
+- `CONFIRMATION_ALREADY_PENDING_TEXT` / `_expired_text()` — deterministic
+  already-pending / expired answers.
+
+### 4.2 `backend/ai/engine/dispatcher.py` — MODIFIED (chunk 1, production)
+
+- `Dispatcher.__slots__` and `__init__`: new `_confirmation_store`
+  (`PendingConfirmationStore()`), owned per Dispatcher instance.
+- `_gate_confirmation_results(request, tool_calls, exec_results)` — NEW.
+  Called after every tool-execution batch (each provider tool round, the
+  round-limit salvage batch, and the local deterministic fast path). It
+  collects results with `needs_confirmation`, stores ONLY the FIRST blocked
+  call (tool name + a copy of its arguments) in the store, and returns the
+  deterministic text to show. The caller sets
+  `metadata["confirmation_pending"] = True`, clears the round's tool calls,
+  and stops the loop — no continuation provider round sees the blocked result
+  and no follow-up round can re-request the action on its own.
+- `_try_consume_confirmation(request, rid, status_callback, start, metadata)`
+  — NEW. Runs in `dispatch()` after the conversation-runtime stage and
+  BEFORE any provider round, only when tools are allowed and a ToolExecutor
+  is attached. `take()`s the pending entry for `(owner_id, chat_id)` only on
+  an exact explicit confirmation phrase; rebuilds the tool call EXCLUSIVELY
+  from the frozen `PendingConfirmation` and executes it via
+  `ToolExecutor.execute_confirmed()`; records the real outcome and returns a
+  deterministic `EngineResult` (`kind="confirmed"` / `"expired"` /
+  `"confirmed_error"`).
+- History hygiene: `needs_confirmation` outcomes are skipped when recording
+  tool outcomes into conversation history.
+
+### 4.3 `backend/ai/tools/executor.py` — MODIFIED (chunk 1, production)
+
+- `execute_confirmed(call, owner_id, session_id, status_callback,
+  context_override)` — NEW public method. Executes ONE tool call whose
+  confirmation boundary is satisfied. Only the Dispatcher calls it, and only
+  with a call rebuilt from a consumed `PendingConfirmation`. Delegates to
+  `_execute_single(..., confirmed=True)`.
+- `_execute_single(...)` — gained a keyword-only `confirmed: bool = False`.
+  The permission gate is bypassed ONLY when `confirmed=True`; that flag is
+  out-of-band and never provider-visible. Every other executor guarantee is
+  unchanged on the confirmed path: registry lookup, malformed/non-object
+  arguments rejection, timeout / `long_running` handling, history recording,
+  persistence task, error containment (never raises).
+
+### 4.4 `backend/ai/tools/settings.py` — MODIFIED (chunk 2, production)
+
+The fix for the model/provider runtime-switching bug:
+
+- Module docstring now states the store ownership rule: panel keys →
+  `settings_service` (panel_settings); AI runtime keys → `config_store`
+  (ai_config).
+- `_AI_CONFIG_KEYS` — explicit bounded frozenset of the AI-runtime keys:
+  `provider`, `model`, `temperature`, `max_tokens`, `system_prompt`,
+  `history_budget`, `trigger_en`, `trigger_fa`. Anything not in this set
+  keeps the existing `settings_service` path (panel keys unchanged).
+- `_set_ai_config(context, key, value)` — NEW async router for AI keys:
+  - `provider`: normalized to lowercase, validated against
+    `discovery.get_provider_info()` (must be a KNOWN provider and
+    `capability_kind == "chat"` — a web-search-only provider such as `you`
+    is rejected); persists via `config_store.update_provider(owner_id,
+    provider, default_model)`; then `_apply_runtime_selection(provider,
+    default_model)`.
+  - `model`: must be a non-empty string ≤ 200 chars; requires an already
+    configured provider (fails closed with "set a provider first");
+    persists via `config_store.update_model`; then
+    `_apply_runtime_selection(provider, model)`.
+  - `temperature`: float, must be 0.0–2.0 (mirrors the panel input rule).
+  - `max_tokens` / `history_budget`: positive integers.
+  - `system_prompt`: string.
+  - `trigger_en` / `trigger_fa`: single word (no spaces); must differ from
+    the other trigger (case-insensitive).
+  - Every validation failure returns `ToolResult(success=False)` BEFORE any
+    write — nothing is persisted, the active runtime is never corrupted.
+- `_apply_runtime_selection(provider, model)` — NEW module helper using the
+  SAME authoritative runtime path as the web API, glass actions, and chat
+  entry points (`engine.apply_runtime_selection` →
+  `ProviderManager.apply_selection`). Lazy import (no import cycle with the
+  engine). Failures are logged, never raised: the persisted `config_store`
+  remains the source of truth and `ai_unified._restore_config` re-applies it
+  before the next request anyway.
+- `SettingsGetTool.execute()` — AI keys now read from `config_store` (the
+  real value), panel keys still read `settings_service`.
+- `SettingsSetTool.execute()` — AI keys route to `_set_ai_config`, panel
+  keys keep the unchanged `settings_service.set_setting` path (existing
+  tests that patch `settings_service.set_setting` with `key="language"`
+  still pass unchanged).
+
+### 4.5 `tests/test_confirmation_roundtrip.py` — NEW (chunk 1, test code)
+
+63 tests pinning the store/recognition contracts, the executor permission
+gate, and the full dispatcher AI path (see §7).
+
+### 4.6 `tests/test_settings_runtime_switch.py` — NEW (chunk 2, test code)
+
+15 tests pinning store routing, validation/fail-closed behavior, and —
+critically — runtime propagation through the REAL Engine → Dispatcher →
+ProviderManager path (see §7).
+
+**Intentionally NOT changed by this task:** `ToolRegistry` (no new tool
+registered, no registration API change), provider schemas (`settings_set` is
+still advertised as before; auto-execution is still refused until the owner
+confirms), provider factory/registry/manager, `config_store`,
+`settings_service`, `ai_unified.py`, the web API, task scheduler/coordinator,
+database layer, and `INVESTIGATION.md`.
 
 ---
 
-## 9. FILES CHANGED
+## 5. CONFIRMATION FLOW (as implemented)
 
-**New**
-- `backend/ai/task_trigger.py` — trigger validation, reference resolution, deterministic matcher, summaries
-- `backend/ai/task_event_dispatcher.py` — event→occurrence→execution coordinator handoff
-- `backend/bot/handlers/task_events.py` — Telegram message event handler (existing update path)
-- `supabase/migrations/20260904000001_add_event_schedule_type.sql` — widen `ai_tasks.schedule_type` CHECK
-- `tests/test_task_trigger_events.py` — 34 regression tests
+Actual names/data structures, verified in source:
 
-**Modified**
-- `backend/ai/scheduling.py` — `event` schedule type + `EventSchedule` + `is_event_schedule`
-- `backend/ai/task_candidate.py` — model-facing trigger validation; timezone rule exemption
-- `backend/ai/task_interpreter.py` — candidate schema + system guidance for `event` triggers
-- `backend/ai/task_creation.py` — event tasks persist `next_run_at = NULL`
-- `backend/ai/task_management.py` — event tasks never fabricate a next run on resume
-- `backend/ai/database/task_repository.py` — `SCHEDULE_TYPES` + `list_event_tasks` (abstract/in-memory/Supabase)
-- `backend/ai/task_management_interface.py` — trigger line / `On message event` in task presentation
-- `backend/ai/tools/task.py` — `CreateTaskTool` dialog snapshot + trigger reference resolution
-- `backend/ai/chat_resolution.py` — `resolve_sender_name` (strict, fail-closed)
-- `backend/bot/handlers/taskloom.py` — `event` schedule icon ⚡
-- `backend/bot/router.py` — register `task_events`
-- `backend/runtime/supervisor.py` — dispatcher configuration; `lifeos-task-scheduler` orphan protection
-- `DATABASE_ARCHITECTURE.md` — event trigger spec, matching semantics, occurrence identity
+```
+owner request ("change model to X")
+  → Dispatcher.dispatch(AIRequest)
+  → provider round selects settings_set (native tool call)
+  → ToolExecutor.execute_calls() → _execute_single(confirmed=False)
+  → permission gate: ADMIN_ONLY not auto-executable
+  → ToolExecutionResult(needs_confirmation=True, error="confirmation_required")
+    (tool.execute() is NOT called)
+  → Dispatcher._gate_confirmation_results()
+  → PendingConfirmationStore.create(owner_id, chat_id, session_id,
+        tool_name, frozen arguments)          # one active per owner+chat
+  → deterministic prompt returned as the AI response
+    (confirmation_request_text: "⚠️ Owner approval required … settings_set …")
 
-**Documentation**
-- `IMPLEMENTATION_REPORT.md` — this report (full replacement)
-
----
-
-## 10. DATABASE IMPACT
-
-- No new tables, no new columns, no changes to `ai_task_occurrences`.
-- One CHECK-constraint widening on `ai_tasks.schedule_type`
-  (`once/interval/daily/weekly` → + `event`).
-- Migration file created but **NOT applied** (no live Supabase access).
-  Manual application (Supabase SQL editor):
-
-```sql
-ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
-ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
-    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event'));
+owner replies «تأیید» / «بله» / "yes" to that message
+  → next Dispatcher.dispatch() reaches _try_consume_confirmation()
+    (before any provider round; exact normalized phrase match only)
+  → PendingConfirmationStore.take(owner_id, chat_id)   # single-use
+      · expired entry → deterministic "expired, nothing executed" answer
+      · no entry      → normal conversational flow continues
+  → call rebuilt ONLY from the frozen PendingConfirmation
+      {name: entry.tool_name, arguments: dict(entry.arguments)}
+  → ToolExecutor.execute_confirmed(call, context_override=…)
+  → _execute_single(confirmed=True)
+  → registry lookup → tool.execute(ctx, frozen_arguments) → ToolResult
+  → real service side effect, exactly once
+  → outcome recorded in conversation history
+  → deterministic EngineResult (kind="confirmed")
 ```
 
-Rollback:
+### 5.1 Model/provider propagation (chunk 2, as implemented)
 
-```sql
-ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
-ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
-    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly'));
+```
+confirmed settings_set(key="model", value="model-b")
+  → SettingsSetTool.execute → _set_ai_config
+  → config_store.update_model(owner_id, "model-b")   # ai_config persisted
+  → _apply_runtime_selection(provider, "model-b")
+  → engine.apply_runtime_selection → ProviderManager.apply_selection
+  → registry active provider unchanged; provider.config.default_model = "model-b"
+
+next AI request ("hello")
+  → ai_unified._restore_config(owner_id) (belt: re-applies config_store)
+  → Dispatcher → ProviderManager.chat → active provider serves request
+    with provider.config.default_model == "model-b"
 ```
 
-**Pre-live-verification data cleanup** (existing test/obsolete rows; the
-user executes this manually — the Self Bot never runs it):
-
-```sql
--- Dependency-safe order: occurrences first, then task definitions.
-BEGIN;
-DELETE FROM ai_task_occurrences WHERE task_id IN (SELECT id FROM ai_tasks);
-DELETE FROM ai_tasks;
-COMMIT;
-```
+Provider switch is identical with `update_provider` + `apply_selection`
+switching the registry's active provider to the requested one.
 
 ---
 
-## 11. TESTS
+## 6. SECURITY MODEL
 
-New `tests/test_task_trigger_events.py` (34 tests) covers, against real
-in-memory repository + real ToolRegistry/ToolExecutor where behavior is
-exercised:
+Tied to source behavior, not to test results:
 
-- Trigger spec validation: model-facing shape, invented numeric ids
-  rejected, unknown keys/empty conditions rejected, resolved nonzero
-  integer ids, this-chat resolution (and fail-closed without request
-  chat), sender resolution to trusted ids, ambiguous/unresolvable
-  sender/chat fail closed.
-- Deterministic matcher: all conditions ANDed, direction/content fields.
-- Event schedule parsing, candidate acceptance/rejection of unsafe shapes.
-- Event task creation persists the structured trigger with `next_run_at`
-  NULL.
-- Dispatcher: matching event executes once through a registered tool;
-  non-matching event creates no occurrence; duplicate delivery does not
-  execute twice; paused/deleted/foreign-owner tasks skipped; deterministic
-  unique per-message occurrence keys; unregistered stored action fails
-  closed; retry semantics preserved; missing coordinator marks
-  `interrupted`; notifications require opt-in.
-- Handler context extraction + unconfigured no-op.
-- Tehran schedule math: once/daily/weekly instants, interval semantics.
-- No-task-on-conversation behavior and equivalent NL phrasings resolving to
-  the same registered create-task tool (no regex).
-- Presentation: event task shows trigger and no fake next run.
-- Recovery: full recovery does not cancel the task scheduler.
+- **Owner scoping** — confirmations are keyed by `(owner_id, chat_id)`;
+  `take()` from another chat or another owner finds nothing. The AI
+  activation path itself remains owner-only (`is_owner`) and unchanged.
+- **Confirmation ownership** — the entry is created server-side from the
+  blocked provider call; the reply can only consume it.
+- **Token/state validation** — no client-supplied token exists; the entry is
+  looked up by the trusted `(owner_id, chat_id)` of the incoming request.
+- **Expiration** — 120 s monotonic TTL (`CONFIRMATION_TTL_S`); `expired`
+  fails closed and the store purges the entry on consume attempt.
+- **Single-use / replay protection** — `take()` removes the entry BEFORE
+  returning it; a replay finds nothing and cannot execute twice.
+- **Tool-name validation** — the frozen tool name is re-validated against
+  `ToolRegistry` on every confirmed execution; unregistered names fail
+  closed (`error="not_found"`).
+- **Argument preservation/validation** — arguments are a defensive copy
+  frozen at `create()`; the confirmation reply cannot modify them.
+  Malformed/non-object arguments still fail closed on the confirmed path.
+- **ToolRegistry authority** — unchanged and authoritative: a confirmation
+  can never conjure a tool that is not registered.
+- **ToolExecutor authority** — still the SOLE component that calls
+  `tool.execute()`. `execute_confirmed()` is the only bypass of the
+  auto-execution gate, and only the Dispatcher calls it with a consumed
+  pending record; the `confirmed` flag is out-of-band, never
+  provider-visible.
+- **Self Bot execution authority** — unchanged; tools still delegate to the
+  service layer, which owns Telegram RPC.
+- **Model/provider values** — bounded strings; `provider` must match a known
+  registered provider name with chat capability (validated via
+  `discovery.get_provider_info` before any write), `model` is a plain string
+  that only ever becomes an API parameter (max 200 chars). No value can
+  trigger code execution, environment mutation, filesystem writes, or
+  arbitrary HTTP. Invalid values are rejected BEFORE any write (fail
+  closed); the active runtime configuration is never corrupted.
+- **No new configuration authority** — the fix reuses the existing
+  `config_store` persistence and the existing
+  `engine.apply_runtime_selection` path (the same one the web API, glass
+  actions, and chat entry points use). No second ProviderManager, no second
+  provider-selection architecture.
+- **ADMIN_ONLY unchanged** — a provider/model change still requires the
+  exact explicit confirmation phrase; there is no automatic confirmation and
+  no weakening of the permission boundary.
 
-Prior task suites (unchanged, still green) cover: deleted excluded from
-normal counts/lists, delete persistence + CAS, fallback visibility,
-"no tasks" honesty, timezone display, silent-by-default notifications,
-attempt limit 3, retry, and client-recovery-safe execution.
+Boundary confirmations (all source-verified unchanged): the implementation
+introduces **no** arbitrary tool execution (registry still required), **no**
+arbitrary Telegram RPC, **no** SQL, **no** shell, **no** HTTP, and **no**
+code execution surface.
 
-**Executed (this task):**
-- Focused task suites: `tests/test_task_trigger_events.py` + scheduler/
-  execution/management/repository/hardening/nl-creation/send/candidate/
-  contract/taskloom/stage suites → **267 passed**
-- Interpreter/candidate/capability/action suites → **143 passed**
-- Full suite `python3 -m pytest tests/ -q` → **1601 passed, 23 skipped**
-- `python3 -m compileall -q backend/ tests/` → **passed**
+---
+
+## 7. TESTING
+
+**Tests added:** `tests/test_confirmation_roundtrip.py` — 63 tests (chunk 1);
+`tests/test_settings_runtime_switch.py` — 15 tests (chunk 2).
+**Tests modified:** none. **Relevant existing suites re-run:** unchanged.
+
+### 7.1 Confirmation round-trip tests (63)
+
+- **Store contract (UNIT):** one pending per `(owner, chat)` scope; `create()`
+  never overwrites an active entry; independent scopes (different chat /
+  different owner); `take()` is single-use and returns frozen arguments;
+  expired entries fail closed and can be replaced.
+- **Recognition (UNIT):** the full bounded phrase set (Persian spellings
+  incl. ZWNJ variants, English words, punctuation/emoji tolerance); ambiguous
+  or conversational acknowledgements are never confirmations.
+- **Executor gate (INTEGRATION, in-process):** `settings_set` first attempt →
+  `needs_confirmation`, service never called; `execute_confirmed()` runs the
+  ORIGINAL call exactly once through the real registry with the service
+  faked; unknown tool and malformed-arguments calls fail closed even when
+  "confirmed".
+- **Full AI path (AI-PATH, in-process):** real provider→registry→executor
+  chain with the service boundary faked — pending created + prompt text
+  returned; explicit confirmation consumes the pending and executes the
+  original call exactly once; replay does not double-execute; confirmation
+  reply cannot change arguments; expired confirmation does not execute;
+  cross-chat and cross-owner confirmations are ignored; ambiguous
+  acknowledgement never executes; READ_ONLY `settings_get` still executes
+  directly; conversational "بله" with nothing pending stays conversational.
+
+### 7.2 Model/provider runtime-switch tests (15)
+
+- **Confirmation boundary:** an AI-key `settings_set` first attempt returns
+  `needs_confirmation` and touches nothing (config_store unchanged).
+- **Persistence:** confirmed `model`/`provider` writes reach
+  `config_store` (the authoritative AI store); `settings_get` reads the REAL
+  value for AI keys and the panel value for panel keys.
+- **Panel-key regression:** `key="language"` still routes to
+  `settings_service.set_setting` (patched and asserted).
+- **Model switch (runtime propagation, the core requirement):** REAL
+  `Engine` over a REAL `ProviderManager`/`ProviderRegistry` with scripted
+  providers; `settings_set(model="model-b")` via the real confirmed executor
+  path → `config_store` persisted, `provider.config.default_model ==
+  "model-b"` on the LIVE provider instance, active provider unchanged, and a
+  NEW request through `engine.execute()` is served by prov-a with
+  `model-b` (asserted from the provider's recorded serving model — not from
+  `settings_get`).
+- **Provider switch:** `settings_set(provider="gemini")` → active provider
+  becomes `gemini` (stub registered under that name), its default model
+  matches the persisted one, and the NEXT request is served by `gemini`.
+- **Invalid values fail closed:** empty model, unknown provider, non-chat
+  capability provider (`you`), model with no configured provider, out-of-range
+  temperature, non-positive max_tokens, multi-word / colliding triggers — all
+  return failure with the config AND the live runtime state unchanged.
+- **Routing boundary:** `_AI_CONFIG_KEYS` is explicit, bounded, and disjoint
+  from `settings_service._DEFAULTS`.
+
+### 7.3 Executed (this task)
+
+- Focused: `tests/test_settings_runtime_switch.py` → **15 passed**
+- Adjacent: `tests/test_confirmation_roundtrip.py`,
+  `tests/test_tool_health_audit.py`, `tests/test_10_tool_calls.py`,
+  `tests/test_13_model_selection.py`, `tests/test_17_providers.py` →
+  **171 passed**
+- Full suite `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` →
+  **1683 passed, 23 skipped** (61.98s)
+- `.venv/bin/python -m compileall -q backend tests` → **passed**
+  (chunk 1 session; chunk 2 touched only one module + one test file, both
+  exercised by the suites above)
 - `git diff --check` → **passed**
+
+Categories:
+- UNIT TESTS — store scoping/single-use/expiry, phrase recognition, routing
+  boundary, validation rules.
+- INTEGRATION TESTS (in-process) — executor gate + `execute_confirmed`
+  through the real registry; tool-level persistence/fail-closed behavior
+  with the real `config_store` in-memory fallback.
+- AI-PATH TESTS (in-process) — dispatcher-level provider→registry→executor
+  rounds (chunk 1); REAL Engine→Dispatcher→ProviderManager propagation of a
+  confirmed model/provider switch into the NEXT request (chunk 2).
+- LIVE TELEGRAM TESTS — **NOT PERFORMED**.
+- LIVE SUPABASE TESTS — **NOT PERFORMED** (no DB code path changed).
+
+---
+
+## 8. AI CONNECTIVITY IMPACT
+
+- **`settings_set` is now executable through AI** — after an explicit owner
+  confirmation, the frozen call re-enters `ToolExecutor.execute_confirmed`
+  and reaches the real setting store (chunk 1).
+- **ADMIN_ONLY confirmation is now supported** (proven via `settings_set`).
+- **CONFIRMATION_REQUIRED tools** share the identical executor gate and the
+  identical confirmed bypass; no tool currently registers
+  `CONFIRMATION_REQUIRED`, so the mechanism is generic but exercised only
+  through ADMIN_ONLY today.
+- **REAL_CONNECTED count:** all **36 of 36** registered tools are
+  AI-executable end-to-end (35 auto-executed + `settings_set` via
+  confirmation) — in-process-verified. `INVESTIGATION.md` still carries the
+  pre-chunk matrix (35 `REAL_CONNECTED`, `settings_set`
+  `PROVIDER_REACHABLE_BUT_NOT_EXECUTABLE`) because it was intentionally not
+  modified by these chunks.
+- **Runtime switching (chunk 2):** `settings_set` on `provider`/`model` (and
+  the other `_AI_CONFIG_KEYS`) now writes the store the runtime actually
+  reads and pushes the selection into the live `ProviderManager` — the next
+  AI request is served by the requested provider/model. Provider schemas and
+  the ToolRegistry are unchanged.
+- **ToolExecutor behavior changed:** new `execute_confirmed()` entry point
+  plus the `confirmed` bypass (chunk 1); nothing else.
+- **Dispatcher behavior changed:** blocked outcomes become pending owner
+  approvals, and exact confirmation replies are consumed deterministically
+  before any provider round (chunk 1).
+- **Tool behavior changed:** `SettingsGetTool`/`SettingsSetTool` now route by
+  key ownership (chunk 2); everything else unchanged.
+
+---
+
+## 9. TASK AUTOMATION IMPACT
+
+**Task execution remains unchanged.** The `TaskExecutionCoordinator`
+(`backend/ai/task_execution.py:123`) still invokes
+`ToolExecutor.execute_calls()` — the `confirmed` flag defaults to `False`, so
+a stored ADMIN_ONLY / CONFIRMATION_REQUIRED action would still be refused by
+the gate exactly as before. No task-facing confirmation flow was added (owner
+confirmation is interactive and chat-scoped by design; unattended scheduled /
+event-triggered execution cannot confirm). No change to the task scheduler,
+event dispatcher, occurrence/repository layer, coordinator, or the settings
+tools' task-adjacent behavior.
+
+---
+
+## 10. TELEGRAM / SUPABASE IMPACT
+
+- **Telegram API unchanged** — no new RPC, no new call sites beyond the
+  existing tool → service layer; no new Telegram side effects.
+- **Supabase schema unchanged** — no table, column, index, or RLS change.
+- **No migration created.**
+- **Supabase repositories unchanged** — confirmation state is deliberately
+  in-memory only (bounded, process-scoped); the model/provider fix writes
+  only to the EXISTING `ai_config` table through the existing `config_store`
+  module.
+
+---
+
+## 11. FILES CHANGED
+
+**Production files**
+- `backend/ai/confirmation.py` — NEW (chunk 1): pending-confirmation store,
+  recognition, prompt/answer text.
+- `backend/ai/engine/dispatcher.py` — MODIFIED (chunk 1): pending-approval
+  gating + confirmation consumption + history hygiene.
+- `backend/ai/tools/executor.py` — MODIFIED (chunk 1): `execute_confirmed()`
+  and the out-of-band `confirmed` bypass.
+- `backend/ai/tools/settings.py` — MODIFIED (chunk 2): key-ownership routing
+  to `config_store` + `apply_runtime_selection`; validation of AI keys;
+  `settings_get` reads the real AI store.
+
+**Test files**
+- `tests/test_confirmation_roundtrip.py` — NEW (chunk 1): 63 tests.
+- `tests/test_settings_runtime_switch.py` — NEW (chunk 2): 15 tests.
+
+**Database files**
+- none.
+
+**Documentation files**
+- `IMPLEMENTATION_REPORT.md` — this report (full replacement).
+
+Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
+`README.md`, database/sql files, and the pre-existing untracked
+`telegram-self-bot/` nested clone in the working tree.
 
 ---
 
@@ -415,36 +580,62 @@ attempt limit 3, retry, and client-recovery-safe execution.
 
 | Area | Classification |
 |---|---|
-| Trigger validation / reference resolution | UNIT TESTED (real resolver against synthetic trusted dialogs) |
-| Deterministic event matching | UNIT TESTED |
-| Event → occurrence → ToolExecutor execution | INTEGRATION TESTED (in-process, real registry/executor, in-memory repository) |
-| Duplicate delivery / occurrence identity | INTEGRATION TESTED (in-memory uniqueness) |
-| Supabase `list_event_tasks` query path | INTEGRATION TESTED via mocked-client repository tests from prior suite (pattern identical to `list_due_tasks`) |
-| Timezone schedule math (Tehran) | UNIT TESTED |
-| Recovery safety | UNIT/INTEGRATION TESTED (in-process supervisor wiring) |
-| Migration applied | **NOT APPLIED** — file provided; requires manual Supabase execution |
-| Live Supabase persistence round-trip | **NOT LIVE VERIFIED** |
-| Live Telegram event execution | **NOT LIVE VERIFIED** |
-| Live notification/result delivery | **NOT LIVE VERIFIED** |
+| Pending store scoping / single-use / expiry | UNIT TESTED |
+| Explicit-confirmation recognition (Persian/English, ZWNJ, ambiguity) | UNIT TESTED |
+| Executor permission gate (ADMIN_ONLY refused, service never called) | INTEGRATION TESTED (in-process, real registry) |
+| `execute_confirmed` original-call replay (frozen args, exactly once) | INTEGRATION TESTED (in-process, real registry, service faked) |
+| Dispatcher AI path: pending creation → prompt → consume → re-issue | AI-PATH TESTED (in-process, provider + service faked) |
+| Cross-chat / cross-owner / replay / expiry / argument-immutability | AI-PATH TESTED (in-process) |
+| settings_set persistence for AI keys (config_store is the real store) | INTEGRATION TESTED (in-process, real config_store fallback) |
+| Model switch → live provider config → NEXT request served by new model | AI-PATH TESTED (in-process, REAL Engine → Dispatcher → ProviderManager, scripted providers) |
+| Provider switch → active provider + NEXT request served by new provider | AI-PATH TESTED (in-process, REAL Engine path) |
+| Invalid model/provider/temperature/tokens/triggers fail closed, runtime uncorrupted | UNIT/INTEGRATION TESTED |
+| Panel keys keep the settings_service path | INTEGRATION TESTED (patched boundary) |
+| READ_ONLY tools unaffected (`settings_get` direct) | AI-PATH TESTED (in-process) |
+| Task scheduler / event automation path | UNCHANGED — coordinator still calls `execute_calls()`; full suite green |
+| Full regression suite | `1683 passed, 23 skipped` |
+| Compile check / `git diff --check` | passed |
+| Live Telegram confirmation round-trip | **NOT LIVE VERIFIED** |
+| Live Telegram model/provider switch | **NOT LIVE VERIFIED** |
+| Live Supabase behavior | **NOT LIVE VERIFIED** (no DB path changed) |
 
 ---
 
 ## 13. LIMITATIONS & REMAINING WORK
 
-- **Live verification not performed.** The workspace has no Telegram
-  credentials or live Supabase access. The full live checklist (create a
-  once-task and an event-task, observe the trigger, one occurrence, pause/
-  delete semantics, no Saved Messages spam) remains for the user's
-  environment, after applying the migration and clearing obsolete rows.
-- Event triggers currently react to **new messages** on the existing update
-  path; historical/unread catch-up and chat-listen-only modes are not
-  implemented.
-- The dispatcher performs one bounded indexed query per message while event
-  tasks exist; that is the intended index-friendly filter (no per-message
-  LLM, no unbounded scan).
-- Identity resolution depends on the authenticated Self Bot's visible
-  dialogs; a contact the bot cannot see cannot be referenced by name and
-  fails closed with clarification (by design).
+Source-supported limitations of the current implementation:
+
+- **In-memory, process-scoped confirmation state.** Pending approvals live
+  on the `Dispatcher` instance and are lost on process restart or an engine
+  rebuild. Consistent with the existing bounded pending-input convention —
+  no cross-restart confirmation persistence.
+- **One active pending per (owner, chat).** When several gated calls arrive
+  together, only the first is stored; the others are answered with an
+  explicit "NOT scheduled" notice.
+- **120-second confirmation TTL.** Expired approvals fail closed and require
+  a fresh request.
+- **Exact-phrase recognition only.** Confirmation is deliberately not
+  free-form/LLM-judged.
+- **Consumption requires the AI dispatch path in the same chat.** A
+  confirmation reply reaches `_try_consume_confirmation()` only when
+  dispatched as an AI request in the owner's chat.
+- **CONFIRMATION_REQUIRED not exercised by a real tool.** The code path is
+  identical to ADMIN_ONLY, but only `settings_set` (ADMIN_ONLY) uses a gate
+  level today.
+- **Provider selection through `settings_set` requires a known provider
+  name** (validated against the discovery catalog) and a chat-capability
+  provider; a provider with no API key configured is persisted but the
+  runtime apply is best-effort (the chat entry point re-applies on the next
+  request; if no key exists the request fails over deterministically).
+  This mirrors the existing web/glass selection behavior.
+- **`settings_set` values are typed as strings** (provider schema); numeric
+  keys (`temperature`, `max_tokens`, `history_budget`) are coerced and
+  validated on the tool side.
+- **Live-environment verification not performed.** No live Telegram run of
+  the full «تأیید» round-trip and no live model/provider switch occurred in
+  this workspace.
+- **`INVESTIGATION.md` connectivity matrix predates both chunks** (35 of 36
+  / `settings_set` non-executable) and was intentionally not updated here.
 
 ---
 
@@ -452,9 +643,10 @@ attempt limit 3, retry, and client-recovery-safe execution.
 
 | Item | Value |
 |---|---|
-| Implementation commit | `de4cde8` (`feat: add event-triggered task automation`) |
-| Push result | pushed to `origin/main` (`98150d9..de4cde8`), no force-push |
-| Docs commit (this report) | `docs:` record — follows below |
+| Chunk 1 commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
+| Chunk 2 commit | `fix: apply AI model and provider changes at runtime` (this task) |
 | Branch | `main` |
-| Remote HEAD after delivery | final HEAD verified with `git rev-parse HEAD` / `git rev-parse origin/main` — reported in the delivery summary |
-| Working tree | only pre-existing unrelated files remain uncommitted (NaraRouter-session edits: AGENTS.md, INVESTIGATION.md, README.md, provider files/tests; untracked `telegram-self-bot/`) — all untouched by this task |
+| Push result | pushed to `origin/main` (no force-push) |
+| Remote verification | `git fetch origin` then `git rev-parse HEAD` == `git rev-parse origin/main` |
+| Docs commit (this report) | committed together with chunk 2 per repository workflow |
+| Working tree | only the pre-existing untracked `telegram-self-bot/` nested clone remains; untouched by this task |
