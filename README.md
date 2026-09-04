@@ -186,7 +186,7 @@ accepted; a provider without a key is simply unavailable.
 | `AI_ENABLED` | `false` | Enable the AI subsystem |
 | `AI_PROVIDER` | `dummy` | Active provider name |
 | `AI_PROVIDER_FALLBACK` | `""` | Comma-separated fallback chain |
-| Provider keys | — | `GEMINI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `ZAI_API_KEY`, `CEREBRAS_API_KEY`, `SAMBANOVA_API_KEY`, `NVIDIA_API_KEY`, `COHERE_API_KEY`, `SILICONFLOW_API_KEY`, `FIREWORKS_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` |
+| Provider keys | — | `GEMINI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `ZAI_API_KEY`, `CEREBRAS_API_KEY`, `SAMBANOVA_API_KEY`, `NVIDIA_API_KEY`, `COHERE_API_KEY`, `SILICONFLOW_API_KEY`, `FIREWORKS_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NARAROUTER_API_KEY` (NaraRouter OpenAI-compatible gateway, base URL `https://router.bynara.id/v1`, default model `deepseek-v4-flash`) |
 | Model overrides | — | `<PROVIDER>_MODEL` per provider (e.g. `GEMINI_MODEL`) |
 
 The full variable reference lives in `backend/config.py` and

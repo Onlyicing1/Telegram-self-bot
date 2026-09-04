@@ -127,6 +127,7 @@ _PROVIDER_DISPLAY_FALLBACK = {
     "sambanova": "SambaNova",
     "siliconflow": "SiliconFlow",
     "fireworks": "Fireworks",
+    "nararouter": "NaraRouter",
     "dummy": "Built-in",
     "local": "Built-in",
 }

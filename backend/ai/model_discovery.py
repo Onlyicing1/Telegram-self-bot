@@ -136,6 +136,12 @@ _FALLBACK_CATALOG: dict[str, list[str]] = {
         "accounts/fireworks/models/llama-v3p3-70b-instruct",
         "accounts/fireworks/models/qwen2p5-72b-instruct",
     ],
+    "nararouter": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "kimi-k2.5",
+        "gemini-3.1-pro",
+    ],
 }
 
 

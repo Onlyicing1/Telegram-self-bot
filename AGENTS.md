@@ -304,9 +304,12 @@ error.
 - **Native tools**: the dispatcher passes OpenAI-format tool definitions to
   providers (Gemini translates them to `functionDeclarations`), so the model
   emits real function calls that the `ToolExecutor` runs.
-- **Providers**: `openai`, `gemini`, `openrouter`, `groq`, `cerebras`,
-  `mistral`, and `dummy`. Provider selection and fallback live in
-  `backend/ai/providers/`.
+- **Providers**: `dummy`, `gemini`, `openai`, `openrouter`, `groq`,
+  `cerebras`, `mistral`, `zai`, `sambanova`, `nvidia`, `cohere`,
+  `siliconflow`, `fireworks`, `nararouter` (OpenAI-compatible gateway,
+  base URL `https://router.bynara.id/v1`), and `you` (web-search
+  capability, never a chat engine). Provider selection and fallback live
+  in `backend/ai/providers/`.
 - **Web search capability**: the `you` provider (You.com Search API,
   env `YDC_API_KEY`) is a retrieval capability, not a chat LLM — it is
   never selected as a reasoning engine and serves results only through

@@ -178,6 +178,16 @@ _PROVIDERS: list[dict[str, Any]] = [
         "icon": "🎆",
     },
     {
+        "name": "nararouter",
+        "display_name": "NaraRouter",
+        "env_vars": ["AI_NARAROUTER_API_KEY", "NARAROUTER_API_KEY"],
+        "model_env": ["AI_NARAROUTER_MODEL", "NARAROUTER_MODEL"],
+        "base_url_env": ["AI_NARAROUTER_BASE_URL", "NARAROUTER_BASE_URL"],
+        "default_base_url": "https://router.bynara.id/v1",
+        "default_model": "deepseek-v4-flash",
+        "icon": "🌐",
+    },
+    {
         "name": "you",
         "display_name": "You.com Search",
         "env_vars": ["YDC_API_KEY"],

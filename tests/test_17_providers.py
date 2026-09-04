@@ -65,6 +65,7 @@ def test_core_providers_registered_in_factory():
     for name in (
         "gemini", "mistral", "zai", "groq", "sambanova",
         "nvidia", "cohere", "siliconflow", "cerebras", "fireworks",
+        "nararouter",
     ):
         assert name in available, f"missing provider: {name}"
 

@@ -106,24 +106,40 @@ class OpenAICompatProvider(BaseProvider):
                     retry_after = float(resp.headers.get("retry-after", "5"))
                 except (TypeError, ValueError):
                     retry_after = 5.0
+                provider_request_id = ""
+                try:
+                    error_data = resp.json()
+                    err_obj = error_data.get("error", {}) if isinstance(error_data, dict) else {}
+                    provider_request_id = str(err_obj.get("request_id") or "")
+                except Exception:
+                    pass
                 logger.warning("%s rate limited (retry_after=%ss)", self.name, retry_after)
                 return ProviderResponse(
                     text=f"Rate limited. Try again in {int(retry_after)}s.",
                     provider_name=self.name,
                     success=False,
-                    metadata={"http_status": 429, "retry_after": retry_after, "failure_type": "rate_limited"},
+                    metadata={
+                        "http_status": 429,
+                        "retry_after": retry_after,
+                        "failure_type": "rate_limited",
+                        "provider_request_id": provider_request_id,
+                    },
                 )
 
             if resp.status_code >= 400:
                 error_msg = "Unknown error"
                 provider_error_code = ""
                 provider_error_type = ""
+                provider_request_id = ""
                 try:
                     error_data = resp.json()
                     err_obj = error_data.get("error", {})
                     error_msg = err_obj.get("message", error_msg)
                     provider_error_code = str(err_obj.get("code", ""))
                     provider_error_type = err_obj.get("type", "")
+                    provider_request_id = str(
+                        err_obj.get("request_id") or error_data.get("request_id") or ""
+                    )
                 except Exception:
                     error_msg = resp.text[:200]
                 if resp.status_code in (401, 403):
@@ -143,6 +159,7 @@ class OpenAICompatProvider(BaseProvider):
                         "http_status": resp.status_code,
                         "provider_error_code": provider_error_code,
                         "provider_error_type": provider_error_type,
+                        "provider_request_id": provider_request_id,
                         "failure_type": failure_type,
                         "model": model,
                     },

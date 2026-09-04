@@ -89,6 +89,7 @@ from backend.ai.providers.manager.metrics import (
     ProviderMetricsRegistry,
 )
 from backend.ai.providers.mistral import MistralProvider
+from backend.ai.providers.nararouter import NaraRouterProvider
 from backend.ai.providers.nvidia import NVIDIAProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
@@ -140,4 +141,5 @@ __all__ = [
     "CohereProvider",
     "SiliconFlowProvider",
     "FireworksProvider",
+    "NaraRouterProvider",
 ]

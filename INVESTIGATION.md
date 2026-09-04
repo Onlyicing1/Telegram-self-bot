@@ -186,7 +186,8 @@ Key wiring facts:
 
 Factory registry [SOURCE: ai/providers/factory.py `_PROVIDER_CLASSES`]:
 `dummy`, `gemini`, `openai`, `openrouter`, `cerebras`, `mistral`, `groq`,
-`zai`, `sambanova`, `nvidia`, `cohere`, `siliconflow`, `fireworks`, `you`.
+`zai`, `sambanova`, `nvidia`, `cohere`, `siliconflow`, `fireworks`,
+`nararouter`, `you`.
 Defaults additionally declare `claude`, `glm`, `custom` model names
 [SOURCE: providers/base/defaults.py] — no dedicated adapter class for these
 three; reachable only through config, no `_PROVIDER_CLASSES` entry.
@@ -196,6 +197,7 @@ three; reachable only through config, no `_PROVIDER_CLASSES` entry.
 | gemini | native httpx | generativelanguage.googleapis.com/v1beta | AI_GEMINI_API_KEY / GEMINI_API_KEY | ✅ | ✅ (translates to functionDeclarations) | ✅ | ✅ (as reasoning engine) | EXTERNAL_CONNECTED (if key) |
 | openai | openai_compat | {base_url}/chat/completions | AI_OPENAI_API_KEY / OPENAI_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
 | openrouter | openai_compat | configurable base_url | AI_OPENROUTER_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
+| nararouter | openai_compat | https://router.bynara.id/v1 (configurable) | AI_NARAROUTER_API_KEY / NARAROUTER_API_KEY | ✅ | ✅ (inherits openai_compat contract; not live-verified) | ✅ | ✅ (as reasoning engine) | EXTERNAL_CONNECTED (if key) |
 | cerebras, mistral, groq, zai, sambanova, nvidia, cohere, siliconflow, fireworks | openai_compat | per-provider base_url | AI_<NAME>_API_KEY | ✅ | ✅ | ✅ | ✅ | EXTERNAL_CONNECTED (if key) |
 | dummy | local, no network | — | none | ✅ (honest failure) | ❌ | always registered | ✅ (reports "not configured") | FALLBACK_ONLY |
 | you (You.com Search) | native httpx | POST ydc-index.io/v1/search | YDC_API_KEY | ❌ (`NOT_IMPLEMENTED`, capability_kind=web_search) | ❌ | skipped for chat (`PROVIDER_SKIPPED reason=capability=web_search`) | ✅ via web_search tool only | EXTERNAL_CONNECTED (retrieval-only, if key) |

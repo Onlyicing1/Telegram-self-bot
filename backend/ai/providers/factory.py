@@ -29,6 +29,7 @@ from backend.ai.providers.gemini import GeminiProvider
 from backend.ai.providers.groq import GroqProvider
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.mistral import MistralProvider
+from backend.ai.providers.nararouter import NaraRouterProvider
 from backend.ai.providers.nvidia import NVIDIAProvider
 from backend.ai.providers.openai import OpenAIProvider
 from backend.ai.providers.openrouter import OpenRouterProvider
@@ -54,6 +55,7 @@ _PROVIDER_CLASSES: dict[str, Type[BaseProvider]] = {
     "cohere": CohereProvider,
     "siliconflow": SiliconFlowProvider,
     "fireworks": FireworksProvider,
+    "nararouter": NaraRouterProvider,
     "you": YouSearchProvider,
 }
 
@@ -70,6 +72,7 @@ _ENV_KEY_MAP: dict[str, list[str]] = {
     "cohere": ["AI_COHERE_API_KEY", "COHERE_API_KEY"],
     "siliconflow": ["AI_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY"],
     "fireworks": ["AI_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"],
+    "nararouter": ["AI_NARAROUTER_API_KEY", "NARAROUTER_API_KEY"],
     # Web-search capability (You.com Search API) — never an LLM key.
     "you": ["YDC_API_KEY"],
 }
@@ -87,6 +90,7 @@ _ENV_MODEL_MAP: dict[str, str] = {
     "cohere": "AI_COHERE_MODEL",
     "siliconflow": "AI_SILICONFLOW_MODEL",
     "fireworks": "AI_FIREWORKS_MODEL",
+    "nararouter": "AI_NARAROUTER_MODEL",
 }
 
 _ENV_BASE_URL_MAP: dict[str, str] = {
@@ -98,6 +102,7 @@ _ENV_BASE_URL_MAP: dict[str, str] = {
     "cohere": "AI_COHERE_BASE_URL",
     "siliconflow": "AI_SILICONFLOW_BASE_URL",
     "fireworks": "AI_FIREWORKS_BASE_URL",
+    "nararouter": "AI_NARAROUTER_BASE_URL",
 }
 
 

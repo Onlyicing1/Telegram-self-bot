@@ -239,6 +239,21 @@ def _fireworks_default() -> ProviderConfig:
     )
 
 
+def _nararouter_default() -> ProviderConfig:
+    return ProviderConfig(
+        provider_name="nararouter",
+        base_url="https://router.bynara.id/v1",
+        api_key="",
+        default_model="deepseek-v4-flash",
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=4096,
+        timeout=60,
+        retry_count=3,
+        enabled=False,
+    )
+
+
 def _custom_default() -> ProviderConfig:
     return ProviderConfig(
         provider_name="custom",
@@ -287,6 +302,7 @@ _PROVIDER_DEFAULTS: dict[str, callable] = {
     "cohere": _cohere_default,
     "siliconflow": _siliconflow_default,
     "fireworks": _fireworks_default,
+    "nararouter": _nararouter_default,
     "you": _you_default,
 }
 
