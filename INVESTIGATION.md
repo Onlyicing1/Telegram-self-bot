@@ -602,9 +602,9 @@ Result (all three SHAs identical):
 
 | Check | SHA |
 |---|---|
-| Local HEAD | <SHA_AFTER_PUSH> |
-| origin/main (tracking) | <SHA_AFTER_PUSH> |
-| remote `refs/heads/main` (`ls-remote`) | <SHA_AFTER_PUSH> |
+| Local HEAD | `a6ed8a2c991780c799089e7a545e32b8aafcc49c` |
+| origin/main (tracking) | `a6ed8a2c991780c799089e7a545e32b8aafcc49c` |
+| remote `refs/heads/main` (`ls-remote`) | `a6ed8a2c991780c799089e7a545e32b8aafcc49c` |
 
 Working tree after push: clean except pre-existing untracked `telegram-self-bot/`.
 
