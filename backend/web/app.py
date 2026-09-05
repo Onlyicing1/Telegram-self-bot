@@ -227,6 +227,18 @@ async def api_ai_set_provider(body: dict):
             status_code=400,
             detail=f"Provider '{provider}' is a {info['capability_kind']} capability, not a chat provider",
         )
+    # Discovery metadata knows every supported provider by name, but only
+    # providers whose API key exists in this process's ENV are registered
+    # with the runtime ProviderManager. Persisting an unregistered provider
+    # would create a phantom config the AI menu and settings_get display
+    # while the runtime keeps serving the previous provider — reject it
+    # before persisting.
+    from backend.ai.engine.engine import get_engine
+    if provider not in get_engine().provider_manager.list_providers():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider '{provider}' is not available on this server (no API key configured)",
+        )
     ok = await update_provider(_owner_id, provider)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save provider")

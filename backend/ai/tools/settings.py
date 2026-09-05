@@ -73,6 +73,27 @@ async def _set_ai_config(context: ToolContext, key: str, value: Any) -> ToolResu
             return ToolResult(success=False, message=f"Unknown provider '{value}'. Supported providers: {supported}.")
         if info.get("capability_kind", "chat") != "chat":
             return ToolResult(success=False, message=f"Provider '{provider}' is not a chat provider.")
+        # Discovery metadata describes EVERY supported provider by name, but
+        # only providers whose API key exists in this process's ENV are
+        # registered with the runtime ProviderManager. Persisting an
+        # unregistered provider would create a phantom config that the AI
+        # menu and settings_get display while the runtime keeps serving the
+        # previous provider — reject it before persisting.
+        try:
+            from backend.ai.engine.engine import get_engine
+            registered = get_engine().provider_manager.list_providers()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("settings_set: provider registration check failed: %s", exc)
+            registered = []
+        if provider not in registered:
+            env_var = str((info.get("env_vars") or [""])[0] or "")
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Provider '{provider}' is not available on this server "
+                    f"(no API key configured — set {env_var} and restart)."
+                ),
+            )
         model = str(info.get("default_model", "") or "")
         ok = await config_store.update_provider(owner_id, provider, model)
         if not ok:

@@ -137,12 +137,17 @@ def make_runtime_engine(recorded: list[dict[str, str]], *, extra_provider: str |
 
 
 def _apply_patch(engine: Engine, manager: ProviderManager):
-    """Route the tool's runtime apply into the TEST engine's manager."""
+    """Route the tool's runtime apply + registration check into the TEST engine."""
+    from contextlib import ExitStack
+
     import backend.ai.engine.engine as engine_module
-    return patch.object(
+    stack = ExitStack()
+    stack.enter_context(patch.object(
         engine_module, "apply_runtime_selection",
         side_effect=lambda provider, model: manager.apply_selection(provider, model),
-    )
+    ))
+    stack.enter_context(patch.object(engine_module, "get_engine", return_value=engine))
+    return stack
 
 
 async def _next_request(engine: Engine) -> Any:

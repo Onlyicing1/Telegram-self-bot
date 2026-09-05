@@ -300,8 +300,13 @@ def test_api_ai_set_model_endpoint():
 
 
 def test_api_ai_set_provider_endpoint():
+    from unittest.mock import MagicMock
+
     client = TestClient(app)
-    with patch("backend.ai.config_store.update_provider", new_callable=AsyncMock) as mock_upd:
+    engine = MagicMock()
+    engine.provider_manager.list_providers.return_value = ["dummy", "openai"]
+    with patch("backend.ai.config_store.update_provider", new_callable=AsyncMock) as mock_upd, \
+         patch("backend.ai.engine.engine.get_engine", return_value=engine):
         mock_upd.return_value = True
         resp = client.post("/api/ai/provider", json={"provider": "openai"})
         assert resp.status_code == 200

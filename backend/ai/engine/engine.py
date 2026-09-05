@@ -243,6 +243,50 @@ def apply_runtime_selection(provider: str, model: str = "") -> bool:
         return False
 
 
+async def _heal_phantom_config(
+    engine: Engine, owner_id: int, config: dict, persisted_provider: str,
+) -> tuple[str, str] | None:
+    """Rewrite the persisted provider/model to the ACTIVE runtime pair.
+
+    Called when ``apply_runtime_selection`` failed — the persisted provider
+    is not registered in this process's ProviderManager. The ProviderManager
+    is the single authoritative runtime state, so the persisted config is
+    healed to match it (provider + effective model) and the restore
+    continues with the effective pair. Never raises; returns the effective
+    (provider, model) or None when no heal is possible.
+    """
+    try:
+        active = engine.provider_manager.get_active_name()
+        active_name = active if isinstance(active, str) and active else ""
+        if not active_name or active_name == persisted_provider:
+            return None
+        active_model = ""
+        try:
+            pconfig = engine.provider_manager.get_provider_config(active_name)
+            if pconfig is not None:
+                m = getattr(pconfig, "default_model", "") or ""
+                active_model = m if isinstance(m, str) else ""
+        except Exception:  # noqa: BLE001
+            pass
+        healed = dict(config)
+        healed["provider"] = active_name
+        healed["model"] = active_model
+        from backend.ai import config_store
+        await config_store.save_config(owner_id, healed)
+        logger.warning(
+            "apply_persisted_config: persisted provider '%s' is not registered at "
+            "runtime; healed persisted config to active provider '%s' (model '%s')",
+            persisted_provider, active_name, active_model,
+        )
+        return active_name, active_model
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "apply_persisted_config: phantom-config heal failed for owner=%s: %s",
+            owner_id, exc,
+        )
+        return None
+
+
 async def apply_persisted_config(owner_id: int) -> bool:
     """Apply the persisted AI configuration to the live runtime.
 
@@ -278,7 +322,18 @@ async def apply_persisted_config(owner_id: int) -> bool:
     model = str(config.get("model", "") or "").strip()
 
     if provider:
-        apply_runtime_selection(provider, model)
+        applied = apply_runtime_selection(provider, model)
+        if not applied:
+            # Phantom persisted selection: the provider is NOT registered in
+            # this process (its API key is absent from ENV), so the runtime
+            # keeps serving the previous active provider while every
+            # config-reading surface (AI menu, settings_get) reports the
+            # unappliable pair. Heal the persisted config to the ACTIVE
+            # runtime pair — the ProviderManager is the single authoritative
+            # runtime state — so the two can never diverge silently.
+            healed = await _heal_phantom_config(engine, owner_id, config, provider)
+            if healed is not None:
+                provider, model = healed
         try:
             engine.conversation_manager.create_session(owner_id)
             engine.conversation_manager.set_provider(owner_id, provider, model)

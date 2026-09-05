@@ -110,6 +110,25 @@ def _get_engine_info() -> dict:
     return info
 
 
+def _effective_pair(engine_info: dict, config: dict) -> tuple[str, str]:
+    """Resolve the (provider, model) pair a status surface must display.
+
+    The ProviderManager (surfaced through ``engine_info``) is the
+    authoritative runtime state — the same source the AI request path and
+    the prompt's runtime context read. The persisted config is used only as
+    a fallback when the engine reports nothing yet (e.g. no engine). Never
+    invents a pair, so a persisted provider that is not registered at
+    runtime can never be shown as if it were active.
+    """
+    provider = str(engine_info.get("provider") or "")
+    if provider in ("", "—"):
+        provider = str(config.get("provider", "") or "")
+    model = str(engine_info.get("model") or "")
+    if model in ("", "—"):
+        model = str(config.get("model", "") or "")
+    return provider, model
+
+
 def _status_icon(connected: bool) -> str:
     return "🟢" if connected else "🔴"
 
@@ -206,8 +225,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     engine_info = _get_engine_info()
-    saved_provider = config.get("provider", "") or engine_info["provider"]
-    saved_model = config.get("model", "") or engine_info["model"]
+    saved_provider, saved_model = _effective_pair(engine_info, config)
 
     if not saved_provider or saved_provider == "—":
         lines = ["**AI**\n", "⚠️ **No provider configured**", "",
@@ -888,7 +906,7 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
     engine = _get_engine()
     engine_info = _get_engine_info()
     record = telemetry.last()
-    configured = bool(config.get("provider"))
+    configured = bool(config.get("provider") or engine_info["provider"] not in ("", "—"))
 
     if engine is None or not configured:
         overall = "OFFLINE"
@@ -915,8 +933,8 @@ async def _ai_health_panel_handler(event, extra: str) -> tuple[str, str, list] |
     }[overall]
     lines = [f"**{headline}**"]
     if configured:
-        model_name = config.get("model", "—") or engine_info["model"]
-        lines.append(f"{model_name} · {_provider_display(config.get('provider', ''))}")
+        provider_name, model_name = _effective_pair(engine_info, config)
+        lines.append(f"{model_name or '—'} · {_provider_display(provider_name)}")
     if cause:
         lines.append(cause)
     lines.append("")

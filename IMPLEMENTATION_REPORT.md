@@ -8,16 +8,17 @@
 | Branch | `main` |
 | Confirmation round-trip commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
 | Model/provider runtime-switch commit | `c5d29f7` + `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
-| State-consistency commit | `fix: make AI provider/model state consistent end-to-end` (this task) |
+| State-consistency commit | `fix: make AI provider/model state consistent end-to-end` (chunk 3) |
+| Menu-vs-runtime consistency commit | `fix: stop AI menu from displaying unappliable provider/model` (chunk 4, this task) |
 | Implementation date | 2026-09-04/05 |
-| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching; (3) make AI provider/model state consistent end-to-end |
+| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching; (3) make AI provider/model state consistent end-to-end; (4) fix the AI menu displaying a provider/model the runtime does not serve |
 | Work type | implementation |
-| Final implementation status | **COMPLETE** — full test suite (`1688 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
+| Final implementation status | **COMPLETE** — full test suite (`1694 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
 
 This is the single current-state report. It records only behavior and
 validation established from the current source, the committed diffs
-(`c5d29f7`, `8ac3779`, and the state-consistency commit), and commands
-actually run.
+(`c5d29f7`, `8ac3779`, the state-consistency commit, and the chunk-4
+menu-vs-runtime commit), and commands actually run.
 
 ### Implementation summary
 
@@ -52,12 +53,29 @@ actually run.
   restore (`engine.apply_persisted_config`) applied at boot AND before every
   chat request, a runtime context built from the ProviderManager (the single
   authoritative runtime state), and session sync wired for the first time.
+- **Chunk 4 — AI menu must never display a provider/model the runtime does
+  not serve (this task):** live bug — the Self Bot AI menu showed
+  `cohere / command-a-plus-05-2026` while the AI's runtime context and the
+  actually-served requests used `groq / gpt-oss-20b`. Source-proven root
+  cause: the persisted `ai_config` can reference a provider that is NOT
+  registered in this process's `ProviderManager` (no API key in ENV), and
+  `ProviderManager.apply_selection` returns `False` without switching for
+  unregistered providers — a failure every writer silently swallowed. The
+  menu/health panels displayed the persisted pair first, so they showed an
+  unappliable phantom while the AI truthfully reported the ProviderManager
+  pair. Fix: (a) `apply_persisted_config` now HEALS a phantom persisted
+  pair to the ACTIVE runtime pair; (b) `settings_set` and the web
+  `/api/ai/provider` endpoint refuse to persist a provider that is not
+  registered; (c) the AI menu + health panels display the effective
+  ProviderManager pair (persisted config only as fallback when the engine
+  has no info).
 - **Current status by label:**
-  - **IMPLEMENTED** — source present in `c5d29f7` + `8ac3779` + this task.
+  - **IMPLEMENTED** — source present in `c5d29f7` + `8ac3779` + chunks 3–4.
   - **TESTED** — focused suites `tests/test_confirmation_roundtrip.py` (63
-    tests), `tests/test_settings_runtime_switch.py` (15 tests), and
-    `tests/test_ai_state_consistency.py` (5 tests) plus the full suite
-    (`1688 passed, 23 skipped`).
+    tests), `tests/test_settings_runtime_switch.py` (15 tests),
+    `tests/test_ai_state_consistency.py` (5 tests), and
+    `tests/test_ai_menu_state_consistency.py` (6 tests) plus the full suite
+    (`1694 passed, 23 skipped`).
   - **INTEGRATED** — proven in-process through the real
     provider → registry → ToolExecutor path (service boundary faked where
     the suite convention requires it) and, for the runtime switch, through
@@ -196,6 +214,46 @@ pair. Source-proven causes, each independently confirmed:
    (`openai_compat.py`), and nothing copied the persisted values onto the
    live provider config — the same phantom-divergence class as chunk 2's
    provider/model bug.
+
+### 3.4 AI menu displayed a provider/model the runtime does not serve
+(fixed by this task) — CONFIRMED
+
+Live observation: the AI menu showed `cohere / command-a-plus-05-2026`
+while the AI's runtime context and the actually-served requests used
+`groq / gpt-oss-20b`. Source-proven chain:
+
+1. **Registration is ENV-gated.** `ProviderFactory.create_registry`
+   (`backend/ai/providers/factory.py`) registers ONLY providers whose API
+   key exists in the process ENV (`if not api_key: continue`). Cohere has
+   no `AI_COHERE_API_KEY` in the Render environment (`render.yaml` defines
+   none), so `cohere` is never registered in the runtime registry.
+2. **Writers validate by name only.** `settings_set`
+   (`backend/ai/tools/settings.py::_set_ai_config`) and the web API
+   (`backend/web/app.py::api_ai_set_provider`) validate `provider` against
+   `discovery.get_provider_info(name)` — metadata for EVERY supported
+   provider regardless of key — so an unregistered provider was persisted
+   into `config_store` (`ai_config`).
+3. **Apply failure is silent.** `ProviderManager.apply_selection`
+   (`manager.py`) returns `False` WITHOUT switching when
+   `self._registry.has(provider)` is False; `engine.apply_runtime_selection`
+   returns that `False`; `engine.apply_persisted_config` (chunk 3) IGNORED
+   the return value and continued (session/temperature sync), so the phantom
+   survived boot AND every per-request restore.
+4. **The menu displays persisted state as if it were active.**
+   `_ai_main_panel_handler` / `_ai_health_panel_handler`
+   (`backend/bot/handlers/ai.py`) resolved
+   `config.get("provider") or engine_info["provider"]` — persisted config
+   FIRST — so they rendered the unappliable pair (cohere).
+5. **The AI truthfully reports the runtime.** `Dispatcher._build_context`
+   (chunk 3) reads `ProviderManager.get_active_name()` +
+   `get_provider_config(...).default_model` (groq / gpt-oss-20b) — what the
+   AI answers and what the Details telemetry records as served.
+
+Result: menu = persisted intent (cohere), AI = effective runtime (groq),
+with no reconciliation anywhere. The runtime was NOT wrong and the menu was
+NOT reading a cache — the menu was reading the persisted configuration
+while the runtime read the ProviderManager, and the persisted provider
+could never be applied.
 
 ---
 
@@ -369,6 +427,34 @@ and `INVESTIGATION.md`.
 - `backend/ai/prompt/builder.py` — the `AI: enabled (...)` runtime line now
   renders `model=<active model>`.
 
+### 4.8 Menu-vs-runtime provider/model consistency — MODIFIED (chunk 4,
+production)
+
+- `backend/ai/engine/engine.py` — `apply_persisted_config` now checks the
+  return value of `apply_runtime_selection`; on failure (persisted provider
+  not registered at runtime) it calls NEW `_heal_phantom_config()`: reads
+  the ACTIVE ProviderManager pair (`get_active_name()` + the active
+  provider's `default_model`), rewrites `config_store` to that pair (the
+  ProviderManager remains the single authoritative runtime state — no new
+  authority), logs a clear warning, and continues the restore with the
+  effective pair. Idempotent: after one heal the persisted config equals the
+  runtime, so no further writes occur.
+- `backend/ai/tools/settings.py` — `_set_ai_config` provider branch now
+  requires the provider to be REGISTERED in the runtime
+  (`get_engine().provider_manager.list_providers()`); an unregistered
+  provider (known to discovery but with no API key in this process's ENV)
+  returns `ToolResult(success=False)` with an honest message and is NEVER
+  persisted.
+- `backend/web/app.py` — `/api/ai/provider` applies the same registration
+  guard (HTTP 400, before `update_provider`) so the dashboard cannot create
+  a phantom pair either.
+- `backend/bot/handlers/ai.py` — NEW `_effective_pair(engine_info, config)`:
+  the AI main panel and health panel display the ProviderManager pair
+  (engine_info) FIRST — the same authoritative runtime state the AI request
+  path and runtime context read — falling back to persisted config only
+  when the engine reports nothing (`""`/`"—"`). The health panel's
+  `configured` check now also accepts an engine-reported active provider.
+
 ---
 
 ## 5. CONFIRMATION FLOW (as implemented)
@@ -450,6 +536,33 @@ Surfaces that now agree: persistent AI configuration, ProviderManager active
 provider, active provider's effective model, AI request execution, AI runtime
 context, settings_get, the Self Bot AI menu/status panel, and health/status
 surfaces that read the engine.
+
+### 5.3 Menu-vs-runtime consistency (chunk 4, as implemented)
+
+```
+phantom persisted pair (provider not registered: no API key in ENV)
+  boot: supervisor._apply_ai_config_at_boot()
+  chat: ai_unified._restore_config(owner_id)     # before EVERY request
+    → apply_persisted_config(owner_id)
+    → apply_runtime_selection(provider, model) → ProviderManager.apply_selection
+        → registry.has(provider) == False → returns False, NO switch
+    → _heal_phantom_config(engine, owner_id, config, provider)
+        → active = ProviderManager.get_active_name()      # e.g. groq
+        → model  = active provider's config.default_model # e.g. gpt-oss-20b
+        → config_store.save_config(owner_id, {provider: active, model: model})
+        → restore continues with the EFFECTIVE pair
+    → config_store == ProviderManager from now on (idempotent)
+
+new writes are prevented at the boundary:
+  settings_set(provider=...)  → registration check → reject (not persisted)
+  POST /api/ai/provider       → registration check → HTTP 400 (not persisted)
+
+menu/health rendering:
+  _effective_pair(engine_info, config)   # ProviderManager FIRST
+    → displays groq / gpt-oss-20b (same pair the AI runtime context reports
+      and the next request is served with); persisted config only as a
+      fallback when the engine has no info
+```
 
 ---
 
@@ -581,17 +694,37 @@ code execution surface.
 - **Prompt rendering:** the rendered `AI: enabled (...)` line includes
   `model=<active model>`.
 
-### 7.4 Executed (this task)
+### 7.4 Menu-vs-runtime consistency tests (chunk 4) —
+`tests/test_ai_menu_state_consistency.py` (6 tests)
 
+- Phantom persisted pair healed to the ACTIVE ProviderManager pair by
+  `apply_persisted_config` (boot/per-request restore), idempotent on a
+  second restore, runtime never corrupted.
+- AI menu MAIN panel renders the effective runtime pair (groq /
+  gpt-oss-20b), NOT the persisted phantom (cohere / command-a-plus-05-2026),
+  and the NEXT real request through the same engine is served by exactly
+  that pair — the full `config_store → ProviderManager → request → menu`
+  chain exercised with the real engine and the real menu handler.
+- AI HEALTH panel renders the effective runtime pair.
+- Menu falls back to the persisted pair when no engine exists (regression
+  guard for the no-engine case).
+- `settings_set` rejects an unregistered provider (nothing persisted); a
+  registered provider still persists and applies (positive control).
+- Web API `/api/ai/provider` rejects an unregistered provider with HTTP 400
+  BEFORE persisting (`update_provider` never called).
+
+### 7.5 Executed (this task)
+
+- Focused (chunk 4): `tests/test_ai_menu_state_consistency.py` → **6 passed**
 - Focused (chunk 3): `tests/test_ai_state_consistency.py` → **5 passed**
 - Focused (chunk 2): `tests/test_settings_runtime_switch.py` → **15 passed**
-- Adjacent: `tests/test_10_tool_calls.py`, `tests/test_09_reply_to_ai.py`,
-  `tests/test_18_ai_execution_agent.py`, `tests/test_13_model_selection.py`,
-  `tests/test_34_ai_model_ui.py`, `tests/test_35_ai_retry_ux.py`,
-  `tests/test_36_ai_settings_ux.py` → **110 passed** (with the two focused
-  suites)
+- Adjacent: `tests/test_13_model_selection.py`, `tests/test_model_tester.py`,
+  `tests/test_34_ai_model_ui.py`, `tests/test_36_ai_settings_ux.py` →
+  **60 passed** (web provider/model endpoints + AI menu/details UX; the two
+  web provider-endpoint tests were updated to register `openai` in the
+  patched engine because the endpoint now validates runtime registration)
 - Full suite `python3 -m pytest tests/ -q -p no:cacheprovider` →
-  **1688 passed, 23 skipped** (62.36s)
+  **1694 passed, 23 skipped** (62.17s)
 - `python3 -m py_compile` on every changed module → **passed**
 - `git diff --check` → **passed**
 
@@ -682,7 +815,16 @@ tools' task-adjacent behavior.
   `settings_get` reads the real AI store.
 - `backend/ai/engine/engine.py` — MODIFIED (chunk 3): NEW
   `apply_persisted_config(owner_id)` — the single shared config restore
-  (boot + per-request).
+  (boot + per-request). (chunk 4): phantom-config heal — `apply_runtime_selection`
+  failures now rewrite the persisted pair to the ACTIVE ProviderManager pair
+  (NEW `_heal_phantom_config`).
+- `backend/ai/tools/settings.py` — MODIFIED (chunk 4): provider registration
+  guard in `_set_ai_config` (unregistered providers are rejected, never
+  persisted).
+- `backend/web/app.py` — MODIFIED (chunk 4): `/api/ai/provider` rejects
+  unregistered providers with HTTP 400 before persisting.
+- `backend/bot/handlers/ai.py` — MODIFIED (chunk 4): NEW `_effective_pair`;
+  AI main + health panels display the ProviderManager pair first.
 - `backend/runtime/supervisor.py` — MODIFIED (chunk 3): NEW
   `_apply_ai_config_at_boot()` applied after AI tool wiring on every
   connect/rebuild.
@@ -697,12 +839,16 @@ tools' task-adjacent behavior.
 - `tests/test_confirmation_roundtrip.py` — NEW (chunk 1): 63 tests.
 - `tests/test_settings_runtime_switch.py` — NEW (chunk 2): 15 tests.
 - `tests/test_ai_state_consistency.py` — NEW (chunk 3): 5 tests.
+- `tests/test_ai_menu_state_consistency.py` — NEW (chunk 4): 6 tests.
+- `tests/test_13_model_selection.py` / `tests/test_model_tester.py` —
+  MODIFIED (chunk 4): web provider-endpoint tests register `openai` in the
+  patched engine (the endpoint now validates runtime registration).
 
 **Database files**
 - none.
 
 **Documentation files**
-- `IMPLEMENTATION_REPORT.md` — this report (updated for all three chunks).
+- `IMPLEMENTATION_REPORT.md` — this report (updated for all four chunks).
 
 Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 `README.md`, database/sql files, and the pre-existing untracked
@@ -731,7 +877,13 @@ Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 | Runtime context shows the REAL active provider/model (no more `dummy`) | AI-PATH TESTED (in-process, full dispatch + capture prompt builder) |
 | Session sync (`set_provider` wired; `active_provider`/`active_model` truthful) | INTEGRATION TESTED (in-process) |
 | Prompt renders `model=` in the `AI: enabled` line | UNIT TESTED (real PromptBuilder) |
-| Full regression suite | `1688 passed, 23 skipped` |
+| Phantom persisted pair healed to the ACTIVE runtime pair (idempotent) | AI-PATH TESTED (in-process, REAL Engine → ProviderManager + real config_store fallback) |
+| AI menu main panel renders the effective runtime pair (not the phantom) | AI-PATH TESTED (in-process, REAL menu handler + REAL Engine; next request served by the displayed pair) |
+| AI health panel renders the effective runtime pair | AI-PATH TESTED (in-process, real handler) |
+| Menu falls back to persisted config when no engine exists | AI-PATH TESTED (in-process) |
+| `settings_set` rejects an unregistered provider (nothing persisted) | INTEGRATION TESTED (in-process, real registry/executor + config_store fallback) |
+| Web `/api/ai/provider` rejects an unregistered provider (400, nothing persisted) | INTEGRATION TESTED (TestClient) |
+| Full regression suite | `1694 passed, 23 skipped` |
 | Compile check / `git diff --check` | passed |
 | Live Telegram confirmation round-trip | **NOT LIVE VERIFIED** |
 | Live Telegram model/provider switch | **NOT LIVE VERIFIED** |
@@ -760,12 +912,13 @@ Source-supported limitations of the current implementation:
 - **CONFIRMATION_REQUIRED not exercised by a real tool.** The code path is
   identical to ADMIN_ONLY, but only `settings_set` (ADMIN_ONLY) uses a gate
   level today.
-- **Provider selection through `settings_set` requires a known provider
-  name** (validated against the discovery catalog) and a chat-capability
-  provider; a provider with no API key configured is persisted but the
-  runtime apply is best-effort (the chat entry point re-applies on the next
-  request; if no key exists the request fails over deterministically).
-  This mirrors the existing web/glass selection behavior.
+- **Provider selection requires a REGISTERED provider.** `settings_set`
+  and the web `/api/ai/provider` reject providers whose API key is not
+  present in this process's ENV (never persisted). The Telegram glass
+  provider panel already lists only key-validated providers. A provider
+  whose key is REMOVED from ENV between selection and a later deploy is
+  healed: `apply_persisted_config` rewrites the persisted pair to the
+  ACTIVE runtime pair at boot and before every request.
 - **`settings_set` values are typed as strings** (provider schema); numeric
   keys (`temperature`, `max_tokens`, `history_budget`) are coerced and
   validated on the tool side.
@@ -791,9 +944,10 @@ Source-supported limitations of the current implementation:
 |---|---|
 | Chunk 1 commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
 | Chunk 2 commit | `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
-| Chunk 3 commit | `fix: make AI provider/model state consistent end-to-end` (this task) |
+| Chunk 3 commit | `fix: make AI provider/model state consistent end-to-end` |
+| Chunk 4 commit | `fix: stop AI menu from displaying unappliable provider/model` (this task) |
 | Branch | `main` |
 | Push result | pushed to `origin/main` (no force-push) |
 | Remote verification | `git fetch origin` then `git rev-parse HEAD` == `git rev-parse origin/main` |
-| Docs commit (this report) | committed together with chunk 2 per repository workflow |
+| Docs commit (this report) | committed together with the implementation per repository workflow |
 | Working tree | only the pre-existing untracked `telegram-self-bot/` nested clone remains; untouched by this task |
