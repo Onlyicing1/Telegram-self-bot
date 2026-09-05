@@ -241,3 +241,75 @@ def apply_runtime_selection(provider: str, model: str = "") -> bool:
     except Exception as exc:
         logger.warning("engine.apply_runtime_selection failed for provider=%s: %s", provider, exc)
         return False
+
+
+async def apply_persisted_config(owner_id: int) -> bool:
+    """Apply the persisted AI configuration to the live runtime.
+
+    This is the ONE shared restore, used at boot (``RuntimeSupervisor``)
+    and before every chat request (``ai_unified._restore_config``), so
+    every surface reads the same runtime state:
+
+      - provider/model  → ``apply_runtime_selection`` (switches the
+        registry's active provider and writes the model onto the live
+        provider instance);
+      - temperature/max_tokens → written onto the active provider's OWN
+        config object (the one the provider reads at request time);
+      - the owner's conversation session is synced (``set_provider``);
+      - the system prompt is applied.
+
+    The persisted ``config_store`` remains the source of truth. Failures
+    are logged, never raised.
+    """
+    try:
+        from backend.ai.config_store import get_config
+        config = await get_config(owner_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("apply_persisted_config: config load failed for owner=%s: %s", owner_id, exc)
+        return False
+
+    try:
+        engine = get_engine()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("apply_persisted_config: engine unavailable for owner=%s: %s", owner_id, exc)
+        return False
+
+    provider = str(config.get("provider", "") or "").strip()
+    model = str(config.get("model", "") or "").strip()
+
+    if provider:
+        apply_runtime_selection(provider, model)
+        try:
+            engine.conversation_manager.create_session(owner_id)
+            engine.conversation_manager.set_provider(owner_id, provider, model)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "apply_persisted_config: session sync failed for owner=%s: %s", owner_id, exc
+            )
+        try:
+            pconfig = engine.provider_manager.get_provider_config(provider)
+            if pconfig is not None:
+                try:
+                    pconfig.temperature = float(config.get("temperature"))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    pconfig.max_tokens = int(config.get("max_tokens"))
+                except (TypeError, ValueError):
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "apply_persisted_config: provider config sync failed for owner=%s: %s",
+                owner_id, exc,
+            )
+
+    try:
+        engine.conversation_manager.set_system_prompt(
+            owner_id,
+            str(config.get("system_prompt", "") or "") or "You are LifeOS Assistant.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "apply_persisted_config: system prompt apply failed for owner=%s: %s", owner_id, exc
+        )
+    return True

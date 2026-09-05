@@ -142,27 +142,12 @@ async def _load_triggers(owner_id: int) -> tuple[str, str]:
 
 
 async def _restore_config(owner_id: int) -> None:
+    # Single shared restore: provider/model → apply_runtime_selection,
+    # temperature/max_tokens → the active provider's runtime config,
+    # conversation session sync, system prompt. Same path as boot.
     try:
-        from backend.ai.config_store import get_config
-        config = await get_config(owner_id)
-        provider = config.get("provider", "")
-        model = config.get("model", "")
-
-        engine = _get_engine()
-        if engine and provider:
-            # Authoritative path: switch provider + apply model to the
-            # runtime provider instance (same as web/glass selection).
-            from backend.ai.engine.engine import apply_runtime_selection
-            apply_runtime_selection(provider, model)
-
-        if engine:
-            try:
-                engine.conversation_manager.set_system_prompt(
-                    owner_id,
-                    config.get("system_prompt", "") or "You are LifeOS Assistant.",
-                )
-            except Exception as exc:
-                logger.warning("AI handler: set_system_prompt failed: %s", exc)
+        from backend.ai.engine.engine import apply_persisted_config
+        await apply_persisted_config(owner_id)
     except Exception as exc:
         logger.warning("AI handler: config restore failed: %s", exc)
 

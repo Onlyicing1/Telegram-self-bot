@@ -241,6 +241,26 @@ class RuntimeSupervisor:
             register_input_listener(self.client, self.owner_id)
 
         self._wire_ai_tools()
+        await self._apply_ai_config_at_boot()
+
+    async def _apply_ai_config_at_boot(self) -> None:
+        """Apply the persisted AI config to the live runtime once at startup.
+
+        Without this the engine's active provider stays at the ENV-selected
+        default (``AI_PROVIDER`` or ``dummy``) until the first chat request
+        restores the config, so every engine-read surface (AI menu state,
+        health) can disagree with the persisted config. Re-runs on every
+        reconnect/rebuild so recovery keeps the runtime in sync. Failures
+        are logged, never fatal.
+        """
+        try:
+            from backend.ai.engine.engine import apply_persisted_config
+            ok = await apply_persisted_config(self.owner_id)
+            trace("AI_CONFIG_APPLIED_AT_BOOT", ok=ok)
+            logger.info("AI config applied at boot (ok=%s)", ok)
+        except Exception as exc:
+            trace_exception("AI_CONFIG_APPLY_BOOT_FAILED", exc)
+            logger.warning("AI config boot restore failed: %s", exc)
 
     def _wire_ai_tools(self) -> None:
         try:

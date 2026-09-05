@@ -109,6 +109,7 @@ class RuntimeContext:
     Attributes:
         ai_enabled:       Whether AI is enabled at all.
         active_provider:  Name of the active model provider, or empty.
+        active_model:     Effective model of the active provider, or empty.
         total_requests:   Lifetime AI request count.
         total_responses:  Lifetime AI response count.
         turn_count:       Turns in the current session.
@@ -116,6 +117,7 @@ class RuntimeContext:
 
     ai_enabled: bool = False
     active_provider: str = ""
+    active_model: str = ""
     total_requests: int = 0
     total_responses: int = 0
     turn_count: int = 0

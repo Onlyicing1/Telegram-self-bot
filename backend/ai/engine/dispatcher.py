@@ -1897,12 +1897,39 @@ class Dispatcher:
 
         Uses the Conversation Layer's ContextBuilder so the Prompt
         Builder receives the exact object type it expects.
+
+        The runtime context's provider/model is read from the
+        ProviderManager — the single authoritative runtime state — never
+        from the session default (``RuntimeSession.active_provider`` is
+        ``"dummy"`` and is only synced when the persisted config is
+        applied). The session value is used only as a fallback for test
+        doubles that carry no provider manager.
         """
         from backend.ai.conversation.context_builder import (
             ContextBuilder,
             RuntimeContext,
             ToolContext,
         )
+
+        runtime_provider = ""
+        runtime_model = ""
+        try:
+            name = self._provider_manager.get_active_name()
+            if isinstance(name, str) and name:
+                runtime_provider = name
+        except Exception:  # noqa: BLE001
+            runtime_provider = ""
+        if not runtime_provider:
+            runtime_provider = getattr(session, "active_provider", "") or ""
+        if runtime_provider:
+            try:
+                pconfig = self._provider_manager.get_provider_config(runtime_provider)
+                if pconfig is not None:
+                    model = getattr(pconfig, "default_model", "") or ""
+                    if isinstance(model, str):
+                        runtime_model = model
+            except Exception:  # noqa: BLE001
+                runtime_model = ""
 
         history_items = self._conversation.get_history(
             owner_id=request.owner_id, n=20
@@ -1944,7 +1971,8 @@ class Dispatcher:
             tool=ToolContext(),
             runtime=RuntimeContext(
                 ai_enabled=True,
-                active_provider=session.active_provider,
+                active_provider=runtime_provider,
+                active_model=runtime_model,
                 total_requests=self._metrics.total_executions,
                 total_responses=self._metrics.successful_executions,
                 turn_count=len(history_items),

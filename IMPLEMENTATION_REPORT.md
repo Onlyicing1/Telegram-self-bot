@@ -7,15 +7,16 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Confirmation round-trip commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
-| Model/provider runtime-switch commit | `c5d29f7` + new commit `fix: apply AI model and provider changes at runtime` |
-| Implementation date | 2026-09-04 |
-| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching |
+| Model/provider runtime-switch commit | `c5d29f7` + `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
+| State-consistency commit | `fix: make AI provider/model state consistent end-to-end` (this task) |
+| Implementation date | 2026-09-04/05 |
+| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching; (3) make AI provider/model state consistent end-to-end |
 | Work type | implementation |
-| Final implementation status | **COMPLETE** — full test suite (`1683 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
+| Final implementation status | **COMPLETE** — full test suite (`1688 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
 
 This is the single current-state report. It records only behavior and
 validation established from the current source, the committed diffs
-(`c5d29f7`, and the model/provider runtime-switch commit), and commands
+(`c5d29f7`, `8ac3779`, and the state-consistency commit), and commands
 actually run.
 
 ### Implementation summary
@@ -27,18 +28,36 @@ actually run.
   was the only registered AI tool that could be selected but never executed —
   `ToolExecutor` correctly returned `needs_confirmation` and the Dispatcher
   had no way to consume an owner approval and re-issue the call.
-- **Chunk 2 — model/provider runtime switching (this task, uncommitted at
-  report time):** fixes the confirmed user-facing bug that the AI could
-  receive and confirm a model/provider change request but the ACTIVE model
-  never changed. `SettingsSetTool` was writing provider/model into
-  `settings_service` (panel_settings) — a store the AI runtime never reads —
-  so the change "succeeded" (settings_get showed it) yet the next AI request
-  was still served by the old provider/model.
+- **Chunk 2 — model/provider runtime switching (committed `8ac3779`):**
+  fixes the confirmed user-facing bug that the AI could receive and confirm
+  a model/provider change request but the ACTIVE model never changed.
+  `SettingsSetTool` was writing provider/model into `settings_service`
+  (panel_settings) — a store the AI runtime never reads — so the change
+  "succeeded" (settings_get showed it) yet the next AI request was still
+  served by the old provider/model.
+- **Chunk 3 — end-to-end provider/model state consistency (this task):**
+  the live bot still showed divergent state — the AI menu displayed one
+  model/provider while the AI's own runtime context claimed
+  `provider=dummy` and settings_get reported yet another value. Root causes
+  (source-proven): (a) `RuntimeSession.active_provider` defaults to
+  `"dummy"` and `ConversationManager.set_provider` had ZERO production
+  callers, so the prompt's [Runtime Context] block was rendered from a
+  never-updated session value; (b) the persisted `ai_config` was applied to
+  the runtime only on the first chat request — at boot the engine's active
+  provider stayed at the ENV default (`AI_PROVIDER` or `dummy`), so
+  engine-read surfaces (AI menu state, health) disagreed with config-read
+  surfaces (menu identity, settings_get); (c) `temperature`/`max_tokens`
+  persisted in `config_store` never reached the active provider's runtime
+  config — the object the provider reads at request time. Fix: ONE shared
+  restore (`engine.apply_persisted_config`) applied at boot AND before every
+  chat request, a runtime context built from the ProviderManager (the single
+  authoritative runtime state), and session sync wired for the first time.
 - **Current status by label:**
-  - **IMPLEMENTED** — source present in `c5d29f7` + the runtime-switch commit.
+  - **IMPLEMENTED** — source present in `c5d29f7` + `8ac3779` + this task.
   - **TESTED** — focused suites `tests/test_confirmation_roundtrip.py` (63
-    tests) and `tests/test_settings_runtime_switch.py` (15 tests) plus the
-    full suite (`1683 passed, 23 skipped`).
+    tests), `tests/test_settings_runtime_switch.py` (15 tests), and
+    `tests/test_ai_state_consistency.py` (5 tests) plus the full suite
+    (`1688 passed, 23 skipped`).
   - **INTEGRATED** — proven in-process through the real
     provider → registry → ToolExecutor path (service boundary faked where
     the suite convention requires it) and, for the runtime switch, through
@@ -149,6 +168,34 @@ The reported `Supabase event task query failed; using fallback:
 [Errno 11] Resource temporarily unavailable` warnings are **not** part of
 this bug: they come from the task repository's Supabase→in-memory fallback
 and do not touch the model/provider path.
+
+### 3.3 End-to-end state divergence (fixed by this task) — CONFIRMED
+
+Live observation: the AI menu showed one model/provider, the AI's runtime
+context claimed `provider=dummy`, and settings_get returned yet another
+pair. Source-proven causes, each independently confirmed:
+
+1. **The prompt's [Runtime Context] was never truthful.**
+   `RuntimeSession.active_provider` defaults to `"dummy"`
+   (`backend/ai/runtime/session.py`) and
+   `ConversationManager.set_provider` — the designed sync API — had zero
+   production callers (grep-verified). `Dispatcher._build_context` rendered
+   `session.active_provider` directly into the context the model sees
+   (`dispatcher.py`), so every AI response could claim `provider=dummy`
+   while the ProviderManager was serving groq/gemini/… — exactly the live
+   `AI: enabled (provider=dummy, requests=5, responses=4, turn=17)` line.
+2. **No boot-time application of the persisted config.** The engine's
+   active provider is selected from ENV (`ProviderFactory.create_manager`,
+   `AI_PROVIDER` or `"dummy"`). The persisted `ai_config` was applied only
+   on the first chat request (`ai_unified._restore_config`), so before that
+   moment every engine-read surface (AI menu state, health panels) could
+   disagree with every config-read surface (menu identity, settings_get).
+3. **temperature/max_tokens never reached the runtime.** `settings_set`
+   persisted them into `config_store`, but the providers read
+   `ProviderConfig.temperature/max_tokens` at request time
+   (`openai_compat.py`), and nothing copied the persisted values onto the
+   live provider config — the same phantom-divergence class as chunk 2's
+   provider/model bug.
 
 ---
 
@@ -292,8 +339,35 @@ ProviderManager path (see §7).
 registered, no registration API change), provider schemas (`settings_set` is
 still advertised as before; auto-execution is still refused until the owner
 confirms), provider factory/registry/manager, `config_store`,
-`settings_service`, `ai_unified.py`, the web API, task scheduler/coordinator,
-database layer, and `INVESTIGATION.md`.
+`settings_service`, the web API, task scheduler/coordinator, database layer,
+and `INVESTIGATION.md`.
+
+### 4.7 End-to-end state consistency — MODIFIED (chunk 3, production)
+
+- `backend/ai/engine/engine.py` — `apply_persisted_config(owner_id)` NEW:
+  the ONE shared restore, called at boot AND before every chat request.
+  Provider/model → `apply_runtime_selection` (the existing authoritative
+  path); temperature/max_tokens → written onto the active provider's OWN
+  config object (the one the provider reads at request time); conversation
+  session sync via `ConversationManager.set_provider` (wired for the first
+  time); system prompt applied. Failures logged, never raised; the persisted
+  `config_store` remains the source of truth.
+- `backend/runtime/supervisor.py` — `_apply_ai_config_at_boot()` NEW, called
+  from `_build_and_register` right after AI tool wiring (and therefore on
+  every reconnect/rebuild): applies the persisted config so the runtime and
+  the config-read surfaces agree from the first second of the process.
+- `backend/bot/handlers/ai_unified.py` — `_restore_config` now delegates to
+  the shared `apply_persisted_config` (identical behavior for provider/model
+  + system prompt; adds temperature/max_tokens + session sync).
+- `backend/ai/engine/dispatcher.py` — `_build_context` builds the
+  [Runtime Context] provider/model from `ProviderManager`
+  (`get_active_name()` + the active provider's `default_model`) — the single
+  authoritative runtime state — with a session-value fallback only for test
+  doubles. The model is now also visible in the prompt line.
+- `backend/ai/conversation/context_builder.py` — `RuntimeContext` gains
+  `active_model`.
+- `backend/ai/prompt/builder.py` — the `AI: enabled (...)` runtime line now
+  renders `model=<active model>`.
 
 ---
 
@@ -349,6 +423,33 @@ next AI request ("hello")
 
 Provider switch is identical with `update_provider` + `apply_selection`
 switching the registry's active provider to the requested one.
+
+### 5.2 End-to-end state consistency (chunk 3, as implemented)
+
+```
+persisted config (ai_config) ─┐
+                             ├→ engine.apply_persisted_config(owner_id)
+boot: supervisor._apply_ai_config_at_boot()   (also on every reconnect)
+chat: ai_unified._restore_config(owner_id)    (before EVERY request)
+  → apply_runtime_selection(provider, model)   # existing authoritative path
+  → ProviderManager.apply_selection: registry active provider switched +
+    provider.config.default_model written on the LIVE instance
+  → temperature/max_tokens copied onto provider.config (the object the
+    provider reads at request time)
+  → ConversationManager.create_session + set_provider(owner, provider, model)
+    → RuntimeSession.active_provider/active_model truthful (no more "dummy")
+  → system prompt applied
+
+every request:
+  → Dispatcher._build_context reads ProviderManager.get_active_name() +
+    get_provider_config(name).default_model → [Runtime Context] shows the
+    REAL serving provider/model (model rendered in the AI: enabled line)
+```
+
+Surfaces that now agree: persistent AI configuration, ProviderManager active
+provider, active provider's effective model, AI request execution, AI runtime
+context, settings_get, the Self Bot AI menu/status panel, and health/status
+surfaces that read the engine.
 
 ---
 
@@ -461,18 +562,37 @@ code execution surface.
 - **Routing boundary:** `_AI_CONFIG_KEYS` is explicit, bounded, and disjoint
   from `settings_service._DEFAULTS`.
 
-### 7.3 Executed (this task)
+### 7.3 State-consistency tests (chunk 3) — `tests/test_ai_state_consistency.py` (5 tests)
 
-- Focused: `tests/test_settings_runtime_switch.py` → **15 passed**
-- Adjacent: `tests/test_confirmation_roundtrip.py`,
-  `tests/test_tool_health_audit.py`, `tests/test_10_tool_calls.py`,
-  `tests/test_13_model_selection.py`, `tests/test_17_providers.py` →
-  **171 passed**
-- Full suite `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` →
-  **1683 passed, 23 skipped** (61.98s)
-- `.venv/bin/python -m compileall -q backend tests` → **passed**
-  (chunk 1 session; chunk 2 touched only one module + one test file, both
-  exercised by the suites above)
+- **Shared restore switches the runtime AND the next request:**
+  `apply_persisted_config` over a REAL Engine/ProviderManager with scripted
+  providers — persisted `prov-b`/`persisted-model` become the active
+  provider's runtime pair, and a NEW request through `engine.execute()` is
+  served by exactly that pair (asserted from the provider's recorded
+  serving model).
+- **Session sync:** the owner's `RuntimeSession.active_provider` /
+  `active_model` no longer stay at the `"dummy"` defaults after restore
+  (the designed `set_provider` API is wired for the first time).
+- **temperature/max_tokens runtime sync:** persisted values land on the
+  live provider config object the provider reads at request time.
+- **Runtime context truthfulness:** a full dispatch through the REAL
+  Engine with a capture prompt builder proves the [Runtime Context] the
+  model sees carries the ProviderManager's active provider AND model.
+- **Prompt rendering:** the rendered `AI: enabled (...)` line includes
+  `model=<active model>`.
+
+### 7.4 Executed (this task)
+
+- Focused (chunk 3): `tests/test_ai_state_consistency.py` → **5 passed**
+- Focused (chunk 2): `tests/test_settings_runtime_switch.py` → **15 passed**
+- Adjacent: `tests/test_10_tool_calls.py`, `tests/test_09_reply_to_ai.py`,
+  `tests/test_18_ai_execution_agent.py`, `tests/test_13_model_selection.py`,
+  `tests/test_34_ai_model_ui.py`, `tests/test_35_ai_retry_ux.py`,
+  `tests/test_36_ai_settings_ux.py` → **110 passed** (with the two focused
+  suites)
+- Full suite `python3 -m pytest tests/ -q -p no:cacheprovider` →
+  **1688 passed, 23 skipped** (62.36s)
+- `python3 -m py_compile` on every changed module → **passed**
 - `git diff --check` → **passed**
 
 Categories:
@@ -553,22 +673,36 @@ tools' task-adjacent behavior.
 - `backend/ai/confirmation.py` — NEW (chunk 1): pending-confirmation store,
   recognition, prompt/answer text.
 - `backend/ai/engine/dispatcher.py` — MODIFIED (chunk 1): pending-approval
-  gating + confirmation consumption + history hygiene.
+  gating + confirmation consumption + history hygiene; (chunk 3): runtime
+  context built from the ProviderManager (provider + model).
 - `backend/ai/tools/executor.py` — MODIFIED (chunk 1): `execute_confirmed()`
   and the out-of-band `confirmed` bypass.
 - `backend/ai/tools/settings.py` — MODIFIED (chunk 2): key-ownership routing
   to `config_store` + `apply_runtime_selection`; validation of AI keys;
   `settings_get` reads the real AI store.
+- `backend/ai/engine/engine.py` — MODIFIED (chunk 3): NEW
+  `apply_persisted_config(owner_id)` — the single shared config restore
+  (boot + per-request).
+- `backend/runtime/supervisor.py` — MODIFIED (chunk 3): NEW
+  `_apply_ai_config_at_boot()` applied after AI tool wiring on every
+  connect/rebuild.
+- `backend/bot/handlers/ai_unified.py` — MODIFIED (chunk 3):
+  `_restore_config` delegates to `apply_persisted_config`.
+- `backend/ai/conversation/context_builder.py` — MODIFIED (chunk 3):
+  `RuntimeContext.active_model`.
+- `backend/ai/prompt/builder.py` — MODIFIED (chunk 3): `model=` rendered in
+  the AI runtime line.
 
 **Test files**
 - `tests/test_confirmation_roundtrip.py` — NEW (chunk 1): 63 tests.
 - `tests/test_settings_runtime_switch.py` — NEW (chunk 2): 15 tests.
+- `tests/test_ai_state_consistency.py` — NEW (chunk 3): 5 tests.
 
 **Database files**
 - none.
 
 **Documentation files**
-- `IMPLEMENTATION_REPORT.md` — this report (full replacement).
+- `IMPLEMENTATION_REPORT.md` — this report (updated for all three chunks).
 
 Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 `README.md`, database/sql files, and the pre-existing untracked
@@ -593,7 +727,11 @@ Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 | Panel keys keep the settings_service path | INTEGRATION TESTED (patched boundary) |
 | READ_ONLY tools unaffected (`settings_get` direct) | AI-PATH TESTED (in-process) |
 | Task scheduler / event automation path | UNCHANGED — coordinator still calls `execute_calls()`; full suite green |
-| Full regression suite | `1683 passed, 23 skipped` |
+| `apply_persisted_config` (boot + per-request): provider/model + temperature/max_tokens + session + prompt | AI-PATH TESTED (in-process, REAL Engine → ProviderManager, scripted providers) |
+| Runtime context shows the REAL active provider/model (no more `dummy`) | AI-PATH TESTED (in-process, full dispatch + capture prompt builder) |
+| Session sync (`set_provider` wired; `active_provider`/`active_model` truthful) | INTEGRATION TESTED (in-process) |
+| Prompt renders `model=` in the `AI: enabled` line | UNIT TESTED (real PromptBuilder) |
+| Full regression suite | `1688 passed, 23 skipped` |
 | Compile check / `git diff --check` | passed |
 | Live Telegram confirmation round-trip | **NOT LIVE VERIFIED** |
 | Live Telegram model/provider switch | **NOT LIVE VERIFIED** |
@@ -631,6 +769,14 @@ Source-supported limitations of the current implementation:
 - **`settings_set` values are typed as strings** (provider schema); numeric
   keys (`temperature`, `max_tokens`, `history_budget`) are coerced and
   validated on the tool side.
+- **temperature/max_tokens are runtime-synced, not persisted per provider.**
+  The restore copies them onto the active provider's live config; a provider
+  switch re-applies the stored values through the same restore. Direct
+  per-provider config edits (`update_provider_config`) remain separate.
+- **The runtime context is only as fresh as the last restore.**
+  `apply_persisted_config` runs at boot and before every chat request;
+  between restores the displayed context reflects the last applied state
+  (the ProviderManager remains the authoritative source read at build time).
 - **Live-environment verification not performed.** No live Telegram run of
   the full «تأیید» round-trip and no live model/provider switch occurred in
   this workspace.
@@ -644,7 +790,8 @@ Source-supported limitations of the current implementation:
 | Item | Value |
 |---|---|
 | Chunk 1 commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
-| Chunk 2 commit | `fix: apply AI model and provider changes at runtime` (this task) |
+| Chunk 2 commit | `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
+| Chunk 3 commit | `fix: make AI provider/model state consistent end-to-end` (this task) |
 | Branch | `main` |
 | Push result | pushed to `origin/main` (no force-push) |
 | Remote verification | `git fetch origin` then `git rev-parse HEAD` == `git rev-parse origin/main` |

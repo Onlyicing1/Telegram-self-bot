@@ -238,6 +238,7 @@ class PromptBuilder:
         if ctx.runtime.ai_enabled:
             lines.append(
                 f"AI: enabled (provider={ctx.runtime.active_provider or 'none'}, "
+                f"model={ctx.runtime.active_model or 'unknown'}, "
                 f"requests={ctx.runtime.total_requests}, "
                 f"responses={ctx.runtime.total_responses}, "
                 f"turn={ctx.runtime.turn_count})"
