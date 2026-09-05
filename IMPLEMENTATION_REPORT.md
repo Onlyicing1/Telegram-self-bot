@@ -1098,16 +1098,17 @@ The required report update itself is the delivery-path validation:
 git diff --check                              → OK
 git status                                   → IMPLEMENTATION_REPORT.md modified
 git commit -am "docs: record git delivery investigation and verified remote state"
-                                              → <SHA-1> below
-git push origin main                         → pushed, non-force, fast-forward
+                                              → ff988a1
+git push origin main                         → b16fcec..ff988a1  main -> main (exit 0)
 git fetch origin                             → OK
-git rev-parse HEAD                           → <SHA-1>
-git rev-parse origin/main                    → <SHA-1>
-git ls-remote origin refs/heads/main         → <SHA-1>   refs/heads/main
+git rev-parse HEAD                           → ff988a155c43964f0c914516b98364dbc5972803
+git rev-parse origin/main                    → ff988a155c43964f0c914516b98364dbc5972803
+git ls-remote origin refs/heads/main         → ff988a155c43964f0c914516b98364dbc5972803  refs/heads/main
 ```
 
 Local HEAD == local `origin/main` == remote `refs/heads/main` (via
-`ls-remote`, independent of local refs) is the acceptance criterion.
+`ls-remote`, independent of local refs) is the acceptance criterion —
+all three matched (`ff988a1`).
 
 ### 15.5 Limitations
 
