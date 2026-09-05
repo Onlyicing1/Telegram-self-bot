@@ -9,16 +9,18 @@
 | Confirmation round-trip commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
 | Model/provider runtime-switch commit | `c5d29f7` + `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
 | State-consistency commit | `fix: make AI provider/model state consistent end-to-end` (chunk 3) |
-| Menu-vs-runtime consistency commit | `fix: stop AI menu from displaying unappliable provider/model` (chunk 4, this task) |
+| Menu-vs-runtime consistency commit | `fix: stop AI menu from displaying unappliable provider/model` (chunk 4) |
+| Web provider-switch model commit | `fix: persist the provider default model on web provider switch` (chunk 5, this task) |
 | Implementation date | 2026-09-04/05 |
-| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching; (3) make AI provider/model state consistent end-to-end; (4) fix the AI menu displaying a provider/model the runtime does not serve |
+| Task/chunks | (1) AI confirmation round-trip for ADMIN_ONLY / CONFIRMATION_REQUIRED tools; (2) fix AI model/provider runtime switching; (3) make AI provider/model state consistent end-to-end; (4) fix the AI menu displaying a provider/model the runtime does not serve; (5) make the web `/api/ai/provider` writer persist provider + default model atomically so the persisted model can never go stale after a provider change |
 | Work type | implementation |
-| Final implementation status | **COMPLETE** — full test suite (`1694 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
+| Final implementation status | **COMPLETE** — full test suite (`1695 passed, 23 skipped`), compile check, and diff hygiene pass; **live Telegram / live Supabase verification NOT performed** (no credentials/runtime in this workspace); **no database schema change, no migration** |
 
 This is the single current-state report. It records only behavior and
 validation established from the current source, the committed diffs
-(`c5d29f7`, `8ac3779`, the state-consistency commit, and the chunk-4
-menu-vs-runtime commit), and commands actually run.
+(`c5d29f7`, `8ac3779`, the state-consistency commit, the chunk-4
+menu-vs-runtime commit, and the chunk-5 web-writer commit), and commands
+actually run.
 
 ### Implementation summary
 
@@ -69,13 +71,28 @@ menu-vs-runtime commit), and commands actually run.
   registered; (c) the AI menu + health panels display the effective
   ProviderManager pair (persisted config only as fallback when the engine
   has no info).
+- **Chunk 5 — web provider switch must not leave the persisted model stale
+  (this task):** `POST /api/ai/provider` (the dashboard writer) was the only
+  provider-change writer that did NOT persist the new provider's default
+  model: `settings_set` and the glass provider action persist provider +
+  default model atomically, while the web endpoint called
+  `config_store.update_provider(owner_id, provider)` with no model — the OLD
+  provider's model stayed in `ai_config` even though the runtime applied
+  (and the endpoint response claimed) the new default. The next per-request
+  `apply_persisted_config` then re-applied that stale persisted model onto
+  the runtime, flipping the served model back to one the new provider may
+  not offer — the same persisted-vs-runtime divergence class as chunks 3–4.
+  Fix: the web endpoint now persists provider + default model in ONE atomic
+  write (`update_provider(owner_id, provider, default_model)`), identical
+  to the other writers, so persistence, runtime, and the per-request
+  restore can never disagree after a dashboard provider change.
 - **Current status by label:**
-  - **IMPLEMENTED** — source present in `c5d29f7` + `8ac3779` + chunks 3–4.
+  - **IMPLEMENTED** — source present in `c5d29f7` + `8ac3779` + chunks 3–5.
   - **TESTED** — focused suites `tests/test_confirmation_roundtrip.py` (63
     tests), `tests/test_settings_runtime_switch.py` (15 tests),
     `tests/test_ai_state_consistency.py` (5 tests), and
-    `tests/test_ai_menu_state_consistency.py` (6 tests) plus the full suite
-    (`1694 passed, 23 skipped`).
+    `tests/test_ai_menu_state_consistency.py` (7 tests) plus the full suite
+    (`1695 passed, 23 skipped`).
   - **INTEGRATED** — proven in-process through the real
     provider → registry → ToolExecutor path (service boundary faked where
     the suite convention requires it) and, for the runtime switch, through
@@ -455,6 +472,20 @@ production)
   when the engine reports nothing (`""`/`"—"`). The health panel's
   `configured` check now also accepts an engine-reported active provider.
 
+### 4.9 Web provider switch persists provider + default model — MODIFIED
+(chunk 5, production)
+
+- `backend/web/app.py` — `POST /api/ai/provider` now persists the new
+  provider's DEFAULT model together with the provider
+  (`config_store.update_provider(owner_id, provider, default_model)`),
+  mirroring `settings_set` (`_set_ai_config`) and the glass provider action,
+  which already write provider + default model atomically. Previously the
+  web writer persisted only the provider, so `ai_config.model` kept the OLD
+  provider's model while the runtime applied (and the endpoint response
+  claimed) the new default — and the next per-request
+  `apply_persisted_config` flipped the runtime back to the stale model.
+  The registration guard (chunk 4) is unchanged.
+
 ---
 
 ## 5. CONFIRMATION FLOW (as implemented)
@@ -563,6 +594,27 @@ menu/health rendering:
       and the next request is served with); persisted config only as a
       fallback when the engine has no info
 ```
+
+### 5.4 Web provider-switch writer (chunk 5, as implemented)
+
+```
+dashboard "Select" on a REGISTERED provider
+  → POST /api/ai/provider {provider: "gemini"}
+    → registration check (registered → passes)
+    → config_store.update_provider(owner_id, "gemini", "gemini-default")
+        # ONE atomic write: provider AND its default model (was: no model,
+        # so ai_config.model kept the OLD provider's model)
+    → engine.apply_runtime_selection → ProviderManager.apply_selection
+        → active provider = gemini; provider.config.default_model = "gemini-default"
+    → response {"provider": "gemini", "model": "gemini-default"}
+
+next AI request (or boot): ai_unified._restore_config → apply_persisted_config
+  → reads persisted (gemini, "gemini-default") == runtime → no flip-back
+```
+
+Identical semantics to `settings_set(provider=...)` and the glass provider
+action: provider + default model are persisted and applied together, so no
+writer can leave the previous provider's model behind.
 
 ---
 
@@ -694,8 +746,8 @@ code execution surface.
 - **Prompt rendering:** the rendered `AI: enabled (...)` line includes
   `model=<active model>`.
 
-### 7.4 Menu-vs-runtime consistency tests (chunk 4) —
-`tests/test_ai_menu_state_consistency.py` (6 tests)
+### 7.4 Menu-vs-runtime consistency tests (chunks 4–5) —
+`tests/test_ai_menu_state_consistency.py` (7 tests)
 
 - Phantom persisted pair healed to the ACTIVE ProviderManager pair by
   `apply_persisted_config` (boot/per-request restore), idempotent on a
@@ -712,10 +764,15 @@ code execution surface.
   registered provider still persists and applies (positive control).
 - Web API `/api/ai/provider` rejects an unregistered provider with HTTP 400
   BEFORE persisting (`update_provider` never called).
+- Web API `/api/ai/provider` switch to a REGISTERED provider persists the
+  provider's DEFAULT model together with the provider (never the old
+  provider's model); the runtime serves exactly the persisted pair; and a
+  subsequent `apply_persisted_config` restore cannot flip the runtime back
+  to a stale model (chunk 5 regression).
 
 ### 7.5 Executed (this task)
 
-- Focused (chunk 4): `tests/test_ai_menu_state_consistency.py` → **6 passed**
+- Focused (chunks 4–5): `tests/test_ai_menu_state_consistency.py` → **7 passed**
 - Focused (chunk 3): `tests/test_ai_state_consistency.py` → **5 passed**
 - Focused (chunk 2): `tests/test_settings_runtime_switch.py` → **15 passed**
 - Adjacent: `tests/test_13_model_selection.py`, `tests/test_model_tester.py`,
@@ -724,7 +781,7 @@ code execution surface.
   web provider-endpoint tests were updated to register `openai` in the
   patched engine because the endpoint now validates runtime registration)
 - Full suite `python3 -m pytest tests/ -q -p no:cacheprovider` →
-  **1694 passed, 23 skipped** (62.17s)
+  **1695 passed, 23 skipped** (61.89s)
 - `python3 -m py_compile` on every changed module → **passed**
 - `git diff --check` → **passed**
 
@@ -822,7 +879,10 @@ tools' task-adjacent behavior.
   guard in `_set_ai_config` (unregistered providers are rejected, never
   persisted).
 - `backend/web/app.py` — MODIFIED (chunk 4): `/api/ai/provider` rejects
-  unregistered providers with HTTP 400 before persisting.
+  unregistered providers with HTTP 400 before persisting. (chunk 5):
+  `/api/ai/provider` persists the new provider's DEFAULT model together
+  with the provider (`update_provider(owner_id, provider, default_model)`)
+  so the persisted pair can never diverge from the applied pair.
 - `backend/bot/handlers/ai.py` — MODIFIED (chunk 4): NEW `_effective_pair`;
   AI main + health panels display the ProviderManager pair first.
 - `backend/runtime/supervisor.py` — MODIFIED (chunk 3): NEW
@@ -839,7 +899,8 @@ tools' task-adjacent behavior.
 - `tests/test_confirmation_roundtrip.py` — NEW (chunk 1): 63 tests.
 - `tests/test_settings_runtime_switch.py` — NEW (chunk 2): 15 tests.
 - `tests/test_ai_state_consistency.py` — NEW (chunk 3): 5 tests.
-- `tests/test_ai_menu_state_consistency.py` — NEW (chunk 4): 6 tests.
+- `tests/test_ai_menu_state_consistency.py` — NEW (chunk 4): 6 tests;
+  (chunk 5) +1 regression test for the web provider-switch writer (7 tests).
 - `tests/test_13_model_selection.py` / `tests/test_model_tester.py` —
   MODIFIED (chunk 4): web provider-endpoint tests register `openai` in the
   patched engine (the endpoint now validates runtime registration).
@@ -848,7 +909,7 @@ tools' task-adjacent behavior.
 - none.
 
 **Documentation files**
-- `IMPLEMENTATION_REPORT.md` — this report (updated for all four chunks).
+- `IMPLEMENTATION_REPORT.md` — this report (updated for all five chunks).
 
 Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 `README.md`, database/sql files, and the pre-existing untracked
@@ -883,7 +944,8 @@ Not part of this implementation and intentionally untouched: `INVESTIGATION.md`,
 | Menu falls back to persisted config when no engine exists | AI-PATH TESTED (in-process) |
 | `settings_set` rejects an unregistered provider (nothing persisted) | INTEGRATION TESTED (in-process, real registry/executor + config_store fallback) |
 | Web `/api/ai/provider` rejects an unregistered provider (400, nothing persisted) | INTEGRATION TESTED (TestClient) |
-| Full regression suite | `1694 passed, 23 skipped` |
+| Web `/api/ai/provider` switch to a registered provider persists provider + default model and survives the per-request restore | INTEGRATION TESTED (TestClient + real config_store fallback + REAL ProviderManager) |
+| Full regression suite | `1695 passed, 23 skipped` |
 | Compile check / `git diff --check` | passed |
 | Live Telegram confirmation round-trip | **NOT LIVE VERIFIED** |
 | Live Telegram model/provider switch | **NOT LIVE VERIFIED** |
@@ -933,6 +995,10 @@ Source-supported limitations of the current implementation:
 - **Live-environment verification not performed.** No live Telegram run of
   the full «تأیید» round-trip and no live model/provider switch occurred in
   this workspace.
+- **Provider switches always persist the provider's DEFAULT model.**
+  `settings_set`, the glass provider action, and the web `/api/ai/provider`
+  all write provider + default model in one atomic `update_provider` call —
+  no writer can leave the previous provider's model behind in `ai_config`.
 - **`INVESTIGATION.md` connectivity matrix predates both chunks** (35 of 36
   / `settings_set` non-executable) and was intentionally not updated here.
 
@@ -945,7 +1011,8 @@ Source-supported limitations of the current implementation:
 | Chunk 1 commit | `c5d29f7` (`feat: add AI confirmation round-trip for owner-only tools`) |
 | Chunk 2 commit | `8ac3779` (`fix: apply AI model and provider changes at runtime`) |
 | Chunk 3 commit | `fix: make AI provider/model state consistent end-to-end` |
-| Chunk 4 commit | `fix: stop AI menu from displaying unappliable provider/model` (this task) |
+| Chunk 4 commit | `fix: stop AI menu from displaying unappliable provider/model` |
+| Chunk 5 commit | `fix: persist the provider default model on web provider switch` (this task) |
 | Branch | `main` |
 | Push result | pushed to `origin/main` (no force-push) |
 | Remote verification | `git fetch origin` then `git rev-parse HEAD` == `git rev-parse origin/main` |

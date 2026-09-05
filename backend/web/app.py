@@ -239,13 +239,18 @@ async def api_ai_set_provider(body: dict):
             status_code=400,
             detail=f"Provider '{provider}' is not available on this server (no API key configured)",
         )
-    ok = await update_provider(_owner_id, provider)
+    default_model = info.get("default_model", "") or ""
+    ok = await update_provider(_owner_id, provider, default_model)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save provider")
     # Persistence alone is not enough — the runtime provider instance must
-    # switch immediately so chat uses the same (provider, model) pair.
-    _apply_runtime_selection(provider, info["default_model"])
-    return {"success": True, "provider": provider, "model": info["default_model"]}
+    # switch immediately so chat uses the same (provider, model) pair. The
+    # DEFAULT model is persisted together with the provider (mirroring
+    # settings_set and the glass provider action): otherwise the old
+    # provider's model stays in ai_config and the next per-request restore
+    # flips the runtime back to a model the new provider may not serve.
+    _apply_runtime_selection(provider, default_model)
+    return {"success": True, "provider": provider, "model": default_model}
 
 
 @app.post("/api/ai/model")

@@ -64,6 +64,7 @@ OWNER_MENU = 903002          # main panel + next request served by runtime
 OWNER_HEALTH = 903003        # health panel
 OWNER_FALLBACK = 903004      # menu falls back to persisted config w/o engine
 OWNER_SETTINGS = 903005      # settings_set refuses unregistered provider
+OWNER_WEB_SWITCH = 903006    # web provider switch persists provider + default model
 
 
 class _RecordingProvider(BaseProvider):
@@ -295,3 +296,75 @@ def test_web_api_rejects_unregistered_provider_before_persisting():
     assert resp.status_code == 400
     mock_upd.assert_not_called()
     assert "not available" in resp.json()["detail"]
+
+
+# ── 7. Web provider switch persists the provider's DEFAULT model too ──
+
+
+@pytest.mark.asyncio
+async def test_web_api_provider_switch_persists_default_model_and_survives_restore():
+    """A REGISTERED provider switch through the web API must persist the
+    new provider's DEFAULT model atomically with the provider.
+
+    Regression: ``POST /api/ai/provider`` called ``update_provider(owner,
+    provider)`` with no model, so ``ai_config.model`` kept the OLD
+    provider's model while the runtime applied (and the response claimed)
+    the new provider's default. The next per-request restore then re-applied
+    the stale persisted model onto the runtime — the same
+    persisted-vs-runtime divergence class this suite pins. All other
+    provider-change writers (``settings_set``, the glass provider action)
+    persist provider + default model together; the web writer must match.
+    """
+    from fastapi.testclient import TestClient
+
+    import backend.ai.engine.engine as engine_module
+    from backend.ai import config_store
+    from backend.ai.discovery import get_provider_info as real_get_provider_info
+    from backend.web import app as web_app
+
+    recorded: list[dict[str, str]] = []
+    engine, manager = make_runtime_engine(
+        recorded, extra_provider="gemini",  # gemini registered, default "other-model"
+    )
+
+    # Persisted state BEFORE the switch: groq / gpt-oss-20b (active runtime).
+    await config_store.update_provider(OWNER_WEB_SWITCH, "groq", "gpt-oss-20b")
+    assert manager.get_active_name() == "groq"
+
+    def _fake_provider_info(name: str):
+        real = real_get_provider_info(name)
+        if name == "gemini":
+            return {"capability_kind": "chat", "default_model": "gemini-default"}
+        return real
+
+    prev_owner = web_app._owner_id
+    web_app.set_owner_id(OWNER_WEB_SWITCH)
+    client = TestClient(web_app.app)
+    try:
+        with patch.object(engine_module, "get_engine", return_value=engine), \
+             patch("backend.ai.discovery.get_provider_info", side_effect=_fake_provider_info):
+            resp = client.post("/api/ai/provider", json={"provider": "gemini"})
+    finally:
+        web_app.set_owner_id(prev_owner)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["provider"] == "gemini"
+    assert body["model"] == "gemini-default"
+
+    # Persisted config and runtime AGREE on gemini / gemini-default.
+    cfg = await config_store.get_config(OWNER_WEB_SWITCH)
+    assert cfg["provider"] == "gemini"
+    assert cfg["model"] == "gemini-default"
+    assert manager.get_active_name() == "gemini"
+    assert manager.get_provider_config("gemini").default_model == "gemini-default"
+
+    # The next per-request restore must NOT flip the runtime back to the
+    # old provider's model (gpt-oss-20b) — persisted == runtime already.
+    with patch.object(engine_module, "get_engine", return_value=engine):
+        await engine_module.apply_persisted_config(OWNER_WEB_SWITCH)
+    cfg = await config_store.get_config(OWNER_WEB_SWITCH)
+    assert cfg["provider"] == "gemini"
+    assert cfg["model"] == "gemini-default"
+    assert manager.get_active_name() == "gemini"
+    assert manager.get_provider_config("gemini").default_model == "gemini-default"
