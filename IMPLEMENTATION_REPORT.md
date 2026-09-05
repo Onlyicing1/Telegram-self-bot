@@ -1118,3 +1118,104 @@ all three matched (`ff988a1`).
 - The nested clone remains in the tree (untracked, untouched) per the
   no-delete rule; its continued presence is the one remaining
   workspace-hygiene hazard for future sessions.
+
+---
+
+## 16. RC-5 FIX - `settings_set` UNKNOWN-KEY PHANTOM SUCCESS
+
+### 16.1 Root cause (source-proven + reproduced in-process)
+
+`SettingsSetTool.execute` routes every non-AI key to
+`settings_service.set_setting(key, value)`, which had **no key allowlist**:
+
+- unknown key -> no validator (`_VALIDATORS.get(key)` -> None) -> validation skipped;
+- `repo.update_field(key, value)` fails (the key is not a `panel_settings`
+  column, or no DB in the fallback);
+- the fallback path then did `_cache[key] = value; return True` - a phantom
+  success: the owner EXPLICITLY confirmed (ADMIN_ONLY round-trip) a change
+  that was reported as applied but persisted nowhere, and the arbitrary key
+  polluted the in-memory cache.
+
+Reproduction (2026-09-05, pre-fix): `settings_set {key: "no_such_setting",
+value: "xyz"}` -> `success=True, "Setting 'no_such_setting' updated to
+'xyz'."` while the subsequent `settings_get` returned `no_such_setting =
+None` and nothing was persisted. Recorded as RC-5 in INVESTIGATION.md.
+
+### 16.2 Fix (smallest, at the correct boundary)
+
+**`backend/services/settings_service.py`** - the service is the owner of the
+panel-key vocabulary (columns/validators/typed accessors are all defined by
+`_DEFAULTS`):
+
+- new `known_keys()` / `is_valid_key()` helpers derived from `_DEFAULTS`
+  (the single existing source of truth - no duplicated names);
+- `set_setting` now fails closed FIRST: an unknown key returns `False`
+  before validation, before the repository, and before the cache - no DB
+  write attempt, no cache pollution.
+
+**`backend/ai/tools/settings.py`** - `SettingsSetTool.execute` rejects an
+unknown panel key before calling the service, with an explicit message
+naming the key and the allowed panel settings.
+
+**`backend/web/app.py`** - NOT changed: the `/api/settings` PATCH writer
+already maps `set_setting(...) == False` to HTTP 400, so it now returns 400
+for unknown keys automatically (previously a phantom 200 with the full
+settings map).
+
+### 16.3 Behavior after the fix (requirements check)
+
+1. Unknown panel keys fail closed: `False` / `ToolResult(success=False)`. Yes
+2. No cache pollution: `get_all()` never contains the unknown key. Yes
+3. No DB write attempt for unknown keys (rejected before the repository). Yes
+4. AI-runtime keys (`provider`, `model`, `temperature`, `max_tokens`,
+   `system_prompt`, `history_budget`, `trigger_en`, `trigger_fa`) unchanged:
+   still routed to `config_store` via `_AI_CONFIG_KEYS`. Yes
+5. Valid panel keys (`language`, ...) unchanged: still route through
+   `settings_service` (write-through cache design intact). Yes
+6. ADMIN_ONLY confirmation boundary unchanged; `execute_confirmed()` still
+   executes valid confirmed settings changes normally and fails closed for
+   unknown keys. Yes
+7. No second configuration authority; no schema change; no migration. Yes
+
+### 16.4 Files changed
+
+| File | Change |
+|---|---|
+| `backend/services/settings_service.py` | `known_keys()`/`is_valid_key()`; `set_setting` unknown-key rejection before repo/cache |
+| `backend/ai/tools/settings.py` | `SettingsSetTool` explicit unknown-key failure with allowed list |
+| `tests/test_settings_unknown_key.py` | NEW - 8 focused tests (service unit, tool unit, confirmed-path integration, routing pins) |
+
+### 16.5 Tests (exact commands and results)
+
+- `./.venv/bin/python -m py_compile backend/services/settings_service.py backend/ai/tools/settings.py tests/test_settings_unknown_key.py` -> OK.
+- Focused: `./.venv/bin/python -m pytest tests/test_settings_unknown_key.py -q -p no:cacheprovider` -> **8 passed**.
+- Regression: `tests/test_confirmation_roundtrip.py tests/test_settings_runtime_switch.py tests/test_tool_health_audit.py tests/test_capability_exposure_tools.py tests/test_36_ai_settings_ux.py` -> **169 passed** (re-run with `--durations=0` to confirm real execution).
+- Full suite: `./.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` -> **1703 passed, 23 skipped** (previously 1695 passed, 23 skipped; the +8 are the new RC-5 tests).
+- `git diff --check` -> clean.
+
+### 16.6 Security / DB impact
+
+- Security: boundary strengthened, never weakened - an owner-confirmed
+  settings write can no longer claim success without persisting.
+  Confirmation store, `execute_confirmed`, ToolRegistry/ToolExecutor
+  authority, and all permission levels unchanged.
+- Database/schema: NO schema change, NO migration. `panel_settings` columns
+  untouched; only the application-layer allowlist rejects non-column keys.
+
+### 16.7 Live verification
+
+**NOT PERFORMED** - this workspace has no Telegram/Supabase credentials or
+runtime (identical to all prior chunks). Live checks required when the bot
+is reachable: (1) a valid confirmed settings change (e.g. `language`)
+applies and `settings_get` reflects it; (2) an unknown-key request fails
+honestly with the explicit unknown-setting message and never claims
+success. Both behaviors are in-process-tested only.
+
+### 16.8 Git delivery
+
+| Item | Value |
+|---|---|
+| Commit | `<SHA_AFTER_COMMIT>` |
+| Push result | `git push origin main` (non-force, fast-forward) |
+| Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` (recorded in the follow-up docs commit) |
+| Working tree after push | clean except pre-existing untracked `telegram-self-bot/` |

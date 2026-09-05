@@ -270,6 +270,16 @@ class SettingsSetTool(Tool):
             return await _set_ai_config(context, key, value)
 
         from backend.services import settings_service
+        # Unknown keys are not panel_settings columns: nothing can be
+        # persisted for them, so fail closed with an explicit error instead
+        # of reporting a phantom success. The allowlist is derived from the
+        # service's own defaults/columns table — no duplicated names.
+        if not settings_service.is_valid_key(key):
+            allowed = ", ".join(sorted(settings_service.known_keys()))
+            return ToolResult(
+                success=False,
+                message=f"Unknown setting key '{key}'. Allowed panel settings: {allowed}.",
+            )
         try:
             success = settings_service.set_setting(key, value)
             if success:

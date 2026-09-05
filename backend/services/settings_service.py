@@ -177,8 +177,30 @@ def get_all() -> dict[str, Any]:
     return dict(_cache)
 
 
+def known_keys() -> tuple[str, ...]:
+    """All valid panel setting keys (the real panel_settings columns).
+
+    Derived from the authoritative defaults table — the same keys that
+    define the columns, validators, and typed accessors — so the allowlist
+    can never drift from the actual settings.
+    """
+    return tuple(_DEFAULTS.keys())
+
+
+def is_valid_key(key: str) -> bool:
+    """True only for keys that are real panel_settings columns."""
+    return key in _DEFAULTS
+
+
 def set_setting(key: str, value: Any) -> bool:
     """Validate, write to DB via repository, refresh cache. Returns True on success."""
+    # Fail closed for keys that are not real panel_settings columns: an
+    # unknown key is not a table column, so no DB write can succeed and
+    # caching it would be a phantom success (reported as applied, persisted
+    # nowhere). Reject before validation, the repository, and the cache.
+    if not is_valid_key(key):
+        logger.warning("settings_service: unknown setting key '%s' rejected", key)
+        return False
     validator = _VALIDATORS.get(key)
     if validator and not validator(value):
         logger.warning("settings_service: validation failed for '%s' = %r", key, value)

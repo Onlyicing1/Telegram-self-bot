@@ -192,7 +192,7 @@ Key invariants (verified in source):
 - Permission: **ADMIN_ONLY** (`permission_level`, `safe=False`) — executes ONLY through the owner-confirmation round-trip.
 - Confirmation round-trip (fixed in `c5d29f7`): executor returns `needs_confirmation` → Dispatcher `_gate_confirmation_results` stores a `PendingConfirmation` (frozen tool name + arguments, 120 s TTL, one per owner+chat) → confirmation prompt delivered → owner replies «تأیید»/«بله»/“yes” → Dispatcher `_try_consume_confirmation` takes the entry (single-use) and re-issues the ORIGINAL stored call through `ToolExecutor.execute_confirmed` — the only gate bypass, never model-invented.
 - Provider/model keys additionally push into the live runtime via `engine.apply_runtime_selection` → `ProviderManager.apply_selection` (same authoritative path as web/glass writers); unregistered providers are rejected before persisting.
-- Known defect (see RC-5): unknown/non-column keys are reported as success without persistence.
+- RC-5 (fixed): unknown/non-column panel keys now fail closed with an explicit unknown-setting error (see RC-5).
 - Evidence: `backend/ai/confirmation.py` (store + exact-phrase recognition), `dispatcher.py` (`_gate_confirmation_results`/`_try_consume_confirmation`), `executor.py` (`execute_confirmed`); AI-path tests in `tests/test_confirmation_roundtrip.py` (14 dispatcher-level tests).
 
 #### organize_list / organize_clean — REAL_CONNECTED (×2)
@@ -336,10 +336,11 @@ The architecture uses **all four** mechanisms — and is NOT regex/keyword-routi
 ### RC-4 — Documentation drift (source-proven, NOT fixed — this investigation documents it)
 Previous INVESTIGATION.md classified `task_list`/`task_inspect`/`task_transition` and `retrieve_save` as IMPLEMENTED_NOT_REGISTERED and event automation as design-only; the current registry registers all of them and `task_events` is live-wired in `router.py`/`supervisor.py`. Tool count drift 32 → 36 (incl. `nararouter` provider per AGENTS.md §9, matching source).
 
-### RC-5 — `settings_set` phantom success on unknown keys (source-proven + reproduced in-process, NOT fixed)
+### RC-5 — `settings_set` phantom success on unknown keys (source-proven + reproduced in-process, FIXED)
 - `SettingsSetTool.execute` routes every non-AI key to `settings_service.set_setting(key, value)`, which has **no key allowlist**: an unknown key skips validation (`_VALIDATORS.get(key)` → None), `repo.update_field` fails (no such column in Supabase; no DB in the fallback), and the function then does `_cache[key] = value; return True` — a phantom key + reported success.
 - Reproduced in-process (2026-09-05): `settings_set {key: "no_such_setting", value: "xyz"}` → `success=True, "Setting 'no_such_setting' updated to 'xyz'."`, while the subsequent `settings_get` returns `no_such_setting = None` (cache rebuilt from defaults) and nothing is persisted.
 - Impact: the owner EXPLICITLY confirms (ADMIN_ONLY round-trip) a change that silently never happens; the AI is told it succeeded. Same defect class as the provider/model phantom-pair issue. Fix belongs at the service/tool boundary: reject unknown keys before write.
+- Fix (2026-09-05, committed): `settings_service.set_setting` now fails closed FIRST for keys outside `_DEFAULTS` (new `known_keys()` / `is_valid_key()` — allowlist derived from the existing column/defaults table, no duplicated names); `SettingsSetTool` rejects unknown panel keys with an explicit message before calling the service; the web `/api/settings` PATCH now returns HTTP 400 for unknown keys automatically. No DB write attempt, no cache pollution. Regression tests: `tests/test_settings_unknown_key.py` (8 tests). See IMPLEMENTATION_REPORT.md §16.
 
 ### RC-6 — DANGEROUS permission docstring drift (source-proven, NOT fixed — documentation only)
 - `ToolExecutor._is_auto_executable()` auto-executes READ_ONLY / READ_WRITE / DANGEROUS (owner message = authorization; deterministic argument validation in the tools themselves) — this is the documented, tested, intended behavior (IMPLEMENTATION_REPORT.md §6).
@@ -349,7 +350,7 @@ Previous INVESTIGATION.md classified `task_list`/`task_inspect`/`task_transition
 
 ## 8. LIKELY RISKS
 
-- **`settings_set` unknown-key phantom success (proven, RC-5)**: an owner-confirmed settings write can report success without persisting anything. Fix: reject unknown keys at the service/tool boundary + one regression test.
+- **`settings_set` unknown-key phantom success (RC-5, FIXED 2026-09-05)**: unknown keys now return `False` / `ToolResult(success=False)` at the service and tool boundaries — no DB attempt, no cache pollution — and are regression-tested in `tests/test_settings_unknown_key.py` (8 tests).
 - **DANGEROUS docstring drift (proven, RC-6)**: base.py / delete.py / organize.py docstrings contradict the executor's auto-execute behavior. Documentation-only fix.
 - **Task-action name exactness (strongly indicated)**: non-send task actions must match registered names exactly; near-miss names fail closed at execution (safe, but user-visible as failed tasks). No alias layer exists beyond `_SEND_ACTION_ALIASES`.
 - **Key-dependent tool honesty (proven)**: `web_search` is always exposed; without `YDC_API_KEY` it fails honestly — a model may repeatedly select it against a misconfigured environment.
@@ -485,6 +486,8 @@ Rationale:
 
 Runner-up (explicitly NOT chosen for this chunk): memory write tool adapters (§13.1) — valuable but adds new capabilities rather than completing an existing one.
 
+**STATUS: IMPLEMENTED (2026-09-05)** — see IMPLEMENTATION_REPORT.md §16; the required tests from §15 were added as `tests/test_settings_unknown_key.py` (8 tests, all passing).
+
 ---
 
 ## 15. REQUIRED TESTS FOR NEXT CHUNK (RC-5 fix)
@@ -518,6 +521,7 @@ Runner-up (explicitly NOT chosen for this chunk): memory write tool adapters (§
 - **Final git diff reviewed**: only `INVESTIGATION.md`.
 - **Final git status reviewed**: clean except pre-existing untracked `telegram-self-bot/`.
 - **Git delivery verified (2026-09-05)**: local HEAD == local `origin/main` == remote `refs/heads/main` (`git ls-remote origin refs/heads/main`) at `347ac1d`; `git push --dry-run origin main` exit 0 (remote write authorization works); see §17.4.
+- **RC-5 fix validated (2026-09-05)**: `tests/test_settings_unknown_key.py` -> **8 passed**; regression `tests/test_confirmation_roundtrip.py tests/test_settings_runtime_switch.py tests/test_tool_health_audit.py tests/test_capability_exposure_tools.py tests/test_36_ai_settings_ux.py` -> **169 passed**; full suite `./.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` -> **1703 passed, 23 skipped**; `py_compile` on the two changed modules + new test -> OK; `git diff --check` -> clean.
 
 ---
 
@@ -549,7 +553,7 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 
 ### 17.2 New findings (proven this session)
 
-- **F-1 / RC-5 — `settings_set` phantom success on unknown keys** (reproduced in-process; see RC-5). Source: `settings_service.set_setting` has no key allowlist and falls back to a cache write + `True`.
+- **F-1 / RC-5 — `settings_set` phantom success on unknown keys** (reproduced in-process; see RC-5). Source: `settings_service.set_setting` had no key allowlist and fell back to a cache write + `True`. **FIXED 2026-09-05** — unknown keys are rejected before validation/repo/cache at both the service and tool boundaries; 8 regression tests.
 - **F-2 / RC-6 — DANGEROUS permission docstring drift** (see RC-6). Behavior intentional; docstrings stale.
 - **A-1 — `delete_messages_by_ids` description overclaims turn-scoped ID provenance** ("MUST have been returned by list_recent_messages in this turn" is prompt guidance; the enforced boundary is re-fetch + outgoing-only + same chat). P3.
 - **A-2 — `settings_get` on an unset AI key returns success with an empty value** (`config.get(key, "")` → `key = `). P3.
@@ -561,7 +565,7 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 
 - 36/36 registered (counted by executing `create_default_registry`), all schema-exposed, all reachable through the real ToolExecutor path.
 - Executor-chain tests: 31 tools parametrized in `test_tool_health_audit.py` (service boundary faked) + dedicated real-path suites (bio/username through real services with in-memory DB, `create_task` through the real repository, task tools, retrieve_save, confirmation AI-path).
-- Classification: **35 REAL_CONNECTED** + **1 CONFIRMATION_GATED** (`settings_set`) = 36 AI-executable; **1 PARTIAL** (`settings_set` unknown-key defect, RC-5); 0 BROKEN/STALE/UNREACHABLE.
+- Classification: **35 REAL_CONNECTED** + **1 CONFIRMATION_GATED** (`settings_set`) = 36 AI-executable; **1 PARTIAL -> FIXED** (`settings_set` unknown-key defect, RC-5 — now fail-closed + tested); 0 BROKEN/STALE/UNREACHABLE.
 - Live side effects (Telegram uploads/deletes, provider network calls, Supabase-backed writes) remain **NOT LIVE VERIFIED**.
 
 ### 17.4 Git delivery verification (2026-09-05)
@@ -577,7 +581,7 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 | 36 tools registered + schema-exposed + executor-reachable | SOURCE-VERIFIED + TESTED (in-process) |
 | `settings_set` confirmation round-trip (frozen args, TTL, single-use, owner/chat scope) | SOURCE-VERIFIED + TESTED (dispatcher AI-path) |
 | provider/model runtime switching + menu/runtime/settings_get consistency | SOURCE-VERIFIED + TESTED (in-process) |
-| F-1 phantom success on unknown settings keys | SOURCE-VERIFIED + REPRODUCED IN-PROCESS |
+| F-1 phantom success on unknown settings keys | SOURCE-VERIFIED + REPRODUCED IN-PROCESS + FIXED + TESTED (8 new tests, 2026-09-05) |
 | RC-6 DANGEROUS docstring drift | SOURCE-VERIFIED |
 | Full suite | 1695 passed, 23 skipped (2026-09-05) |
 | Git remote state | REMOTE-VERIFIED (`ls-remote` == HEAD, pre- and post-push) |
