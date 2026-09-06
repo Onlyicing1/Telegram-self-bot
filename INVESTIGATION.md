@@ -193,6 +193,7 @@ Key invariants (verified in source):
 - Confirmation round-trip (fixed in `c5d29f7`): executor returns `needs_confirmation` → Dispatcher `_gate_confirmation_results` stores a `PendingConfirmation` (frozen tool name + arguments, 120 s TTL, one per owner+chat) → confirmation prompt delivered → owner replies «تأیید»/«بله»/“yes” → Dispatcher `_try_consume_confirmation` takes the entry (single-use) and re-issues the ORIGINAL stored call through `ToolExecutor.execute_confirmed` — the only gate bypass, never model-invented.
 - Provider/model keys additionally push into the live runtime via `engine.apply_runtime_selection` → `ProviderManager.apply_selection` (same authoritative path as web/glass writers); unregistered providers are rejected before persisting.
 - RC-5 (fixed): unknown/non-column panel keys now fail closed with an explicit unknown-setting error (see RC-5).
+- Key contract (RC-7, fixed): the tool schemas now enumerate the canonical keys (`model`, never `ai_model`) so the model stops inventing key names; the prompt renders `Provider:`/`Model:` labels matching the canonical keys.
 - Evidence: `backend/ai/confirmation.py` (store + exact-phrase recognition), `dispatcher.py` (`_gate_confirmation_results`/`_try_consume_confirmation`), `executor.py` (`execute_confirmed`); AI-path tests in `tests/test_confirmation_roundtrip.py` (14 dispatcher-level tests).
 
 #### organize_list / organize_clean — REAL_CONNECTED (×2)
@@ -345,6 +346,31 @@ Previous INVESTIGATION.md classified `task_list`/`task_inspect`/`task_transition
 ### RC-6 — DANGEROUS permission docstring drift (source-proven, NOT fixed — documentation only)
 - `ToolExecutor._is_auto_executable()` auto-executes READ_ONLY / READ_WRITE / DANGEROUS (owner message = authorization; deterministic argument validation in the tools themselves) — this is the documented, tested, intended behavior (IMPLEMENTATION_REPORT.md §6).
 - But `backend/ai/tools/base.py` PermissionLevel docstring (“DANGEROUS → AI must ask the owner first”) and the module docstrings of `delete.py` / `organize.py` (“the AI must ask the owner for confirmation before calling them”) still claim otherwise. No behavior change is proposed — only the docstrings are stale.
+
+### RC-7 — Model-facing settings key contract gap: `ai_model` vs `model` (live failure, FIXED)
+- Live failure: the owner asked the AI to change the model; the AI called
+  `settings_set {key: "ai_model", value: "gpt-oss-1200"}` and the backend
+  correctly rejected it — `Unknown setting key 'ai_model'`. The canonical
+  AI runtime key is `model`.
+- Root cause (source-proven): the routing was CORRECT (`ai_model` is in
+  neither `_AI_CONFIG_KEYS` nor the panel allowlist, so RC-5 fail-closed
+  held); the model invented the key because (1) the prompt's
+  `[Reply to AI Message]` block rendered `AI Model: <model>` — the ONLY
+  "AI Model" token sequence in the entire model-facing prompt (the
+  `[Runtime Context]` block uses `model=...`) — and (2) the
+  `settings_get`/`settings_set` schemas described the `key` argument
+  without enumerating any valid keys, forcing the model to guess.
+- Fix (2026-09-06, committed): `_setting_key_contract()` in
+  `backend/ai/tools/settings.py` derives the bounded valid-key list from
+  `_AI_CONFIG_KEYS` + `settings_service.known_keys()` (the two existing
+  authorities — no new key list, no alias) and disambiguates explicitly
+  ("key 'model', never 'ai_model'"). Both settings tools now carry the
+  contract in `description` + `parameters[key].description`, so native
+  tool-call schemas AND the text `[Available Tools]` block expose it.
+  `backend/ai/prompt/builder.py` renders `Provider:`/`Model:` labels
+  matching the canonical key names. No alias layer was added — `ai_model`
+  remains rejected as unknown. Regression tests:
+  `tests/test_settings_model_key_contract.py` (7 tests).
 
 ---
 
@@ -555,6 +581,7 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 
 - **F-1 / RC-5 — `settings_set` phantom success on unknown keys** (reproduced in-process; see RC-5). Source: `settings_service.set_setting` had no key allowlist and fell back to a cache write + `True`. **FIXED 2026-09-05** — unknown keys are rejected before validation/repo/cache at both the service and tool boundaries; 8 regression tests.
 - **F-2 / RC-6 — DANGEROUS permission docstring drift** (see RC-6). Behavior intentional; docstrings stale.
+- **F-3 / RC-7 — model-facing settings key contract gap** (live failure; see RC-7). The AI generated `key="ai_model"` for a model change; the backend correctly failed closed (RC-5). **FIXED 2026-09-06** — settings tool schemas enumerate the canonical keys (`model`/`provider`, disambiguated), the prompt renders `Model:`/`Provider:` labels, and `ai_model` remains rejected as unknown; 7 regression tests in `tests/test_settings_model_key_contract.py`.
 - **A-1 — `delete_messages_by_ids` description overclaims turn-scoped ID provenance** ("MUST have been returned by list_recent_messages in this turn" is prompt guidance; the enforced boundary is re-fetch + outgoing-only + same chat). P3.
 - **A-2 — `settings_get` on an unset AI key returns success with an empty value** (`config.get(key, "")` → `key = `). P3.
 - **A-3 — `web_search` swallows the concrete failure reason** into a generic `❌ Web search failed.` (exception type logged only). P3.

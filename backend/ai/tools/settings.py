@@ -42,6 +42,35 @@ _AI_CONFIG_KEYS: frozenset[str] = frozenset({
 _MAX_MODEL_LENGTH = 200
 
 
+#: Model-facing key lists. The model chooses the ``key`` argument for
+#: ``settings_get``/``settings_set`` from THESE names — there is no other
+#: key vocabulary in the prompt. The AI model is canonically ``model``
+#: (the live failure produced ``ai_model`` because the prompt showed an
+#: "AI Model:" label and the schema enumerated no keys; both are fixed).
+_AI_KEY_LIST: str = ", ".join(sorted(_AI_CONFIG_KEYS))
+_PANEL_KEY_LIST: str = ""
+
+
+def _setting_key_contract() -> str:
+    """Model-facing contract: every valid key, both stores, no aliases.
+
+    Derived from the two authoritative key sources (``_AI_CONFIG_KEYS``
+    and ``settings_service.known_keys()``) so it can never drift. The
+    disambiguation sentence is deliberate: the live model chose
+    ``ai_model`` for a model change, which does not exist.
+    """
+    global _PANEL_KEY_LIST
+    if not _PANEL_KEY_LIST:
+        from backend.services import settings_service
+        _PANEL_KEY_LIST = ", ".join(sorted(settings_service.known_keys()))
+    return (
+        f"Valid keys — AI runtime: {_AI_KEY_LIST}; "
+        f"panel settings: {_PANEL_KEY_LIST}. "
+        "The AI model setting is key 'model', never 'ai_model'; "
+        "the AI provider setting is key 'provider', never 'ai_provider'."
+    )
+
+
 def _apply_runtime_selection(provider: str, model: str) -> None:
     """Push a (provider, model) selection into the live runtime engine.
 
@@ -176,14 +205,14 @@ class SettingsGetTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read a bot setting value by key."
+        return f"Read a bot setting value by key. {_setting_key_contract()}"
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "key": {
                 "type": "string",
-                "description": "The setting key to read.",
+                "description": f"The setting key to read. {_setting_key_contract()}",
             },
         }
 
@@ -233,14 +262,14 @@ class SettingsSetTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Set a bot setting value by key. Requires owner confirmation."
+        return f"Set a bot setting value by key. Requires owner confirmation. {_setting_key_contract()}"
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "key": {
                 "type": "string",
-                "description": "The setting key to write.",
+                "description": f"The setting key to write. {_setting_key_contract()}",
             },
             "value": {
                 "type": "string",

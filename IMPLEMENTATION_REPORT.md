@@ -1215,7 +1215,115 @@ success. Both behaviors are in-process-tested only.
 
 | Item | Value |
 |---|---|
-| Commit | `<SHA_AFTER_COMMIT>` |
+| Commit | `4a226a0` (RC-5 fix) + `1dda645` (test-isolation follow-up) |
 | Push result | `git push origin main` (non-force, fast-forward) |
 | Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` (recorded in the follow-up docs commit) |
+| Working tree after push | clean except pre-existing untracked `telegram-self-bot/` |
+
+## 17. AI SETTINGS KEY CONTRACT FIX — `ai_model` vs `model` (live failure)
+
+### 17.1 Live failure (reported)
+
+The owner asked the AI to change the model. The AI selected
+`settings_set` with `key="ai_model"`, `value="gpt-oss-1200"`. The backend
+rejected it with `Unknown setting key 'ai_model'`. The canonical AI
+runtime configuration key is `model`, not `ai_model`.
+
+### 17.2 Root cause (source-proven)
+
+The backend routing was CORRECT — `ai_model` is in neither `_AI_CONFIG_KEYS`
+(`backend/ai/tools/settings.py`) nor the `settings_service` panel-key
+allowlist (RC-5 fix), so it failed closed. The defect was in the
+**model-facing contract** that caused the model to invent the key:
+
+1. **Misleading prompt label** — `backend/ai/prompt/builder.py` rendered
+   the replied-to AI message metadata as `AI Model: <model>` in the
+   `[Reply to AI Message]` block. This is the ONLY occurrence of the token
+   sequence "AI Model" in the entire model-facing prompt (the
+   `[Runtime Context]` block correctly uses `model=...`). Replying to an AI
+   message while asking to change the model exposes exactly this label.
+2. **Under-specified tool schema** — `SettingsGetTool` / `SettingsSetTool`
+   described the `key` argument as "The setting key to read/write." with no
+   key enumeration, so the model had to guess the name. The authoritative
+   key sets (`_AI_CONFIG_KEYS`, `settings_service.known_keys()`) were never
+   exposed to the model.
+3. **No alias layer** — a repository-wide search (source + tests) found no
+   intentional `ai_model` setting anywhere: the only `ai_model`
+   occurrences are the internal `ReplyContext.ai_model` field, the
+   `panel:ai_model` Glass UI panel name, and the prompt label above.
+
+### 17.3 Fix (model-facing contract only — no second authority, no alias)
+
+**`backend/ai/tools/settings.py`**:
+
+- new `_setting_key_contract()` — derived at runtime from `_AI_CONFIG_KEYS`
+  and `settings_service.known_keys()` (both pre-existing single sources of
+  truth, no duplicated names) — renders the bounded valid-key list plus the
+  explicit disambiguation: the AI model setting is key `'model'`, never
+  `'ai_model'`; the provider key is `'provider'`, never `'ai_provider'`.
+- `SettingsSetTool.description`, `SettingsSetTool.parameters[key].description`,
+  `SettingsGetTool.description`, and
+  `SettingsGetTool.parameters[key].description` now carry the contract, so
+  BOTH the native tool-call schema (dispatcher `_build_tool_definitions`)
+  and the text `[Available Tools]` block (dispatcher `_render_tool_schemas`)
+  show it to every provider.
+
+**`backend/ai/prompt/builder.py`**:
+
+- `AI Model:` → `Model:` and `AI Provider:` → `Provider:` in the
+  `[Reply to AI Message]` block — labels now use the canonical key names,
+  matching the `[Runtime Context]` block. No behavior change for the reply
+  metadata itself.
+
+No routing change, no new key, no alias, no schema/migration, no second
+configuration authority. `ai_model` remains rejected as unknown.
+
+### 17.4 Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/tools/settings.py` | `_setting_key_contract()`; schema/description enrichment for `settings_get` + `settings_set` |
+| `backend/ai/prompt/builder.py` | reply-block labels use canonical `Provider:` / `Model:` names |
+| `tests/test_settings_model_key_contract.py` | NEW — 7 focused regression tests |
+| `IMPLEMENTATION_REPORT.md` | this section |
+| `INVESTIGATION.md` | RC-7 finding (see that document) |
+
+### 17.5 Tests (exact commands and results)
+
+- Focused: `./.venv/bin/python -m pytest tests/test_settings_model_key_contract.py -v` -> **7 passed**.
+- Adjacent suites (settings + confirmation + prompt/reply + tool audit):
+  `test_settings_model_key_contract.py test_settings_unknown_key.py
+  test_settings_runtime_switch.py test_confirmation_roundtrip.py
+  test_ai_menu_state_consistency.py test_tool_health_audit.py
+  test_13_model_selection.py test_37_ai_memory_db.py test_09_reply_to_ai.py`
+  -> **199 passed**.
+- Full suite: `./.venv/bin/python -m pytest tests/` -> **1710 passed, 23 skipped**.
+  (First full run exposed an owner-ID collision between the new file and
+  `test_ai_state_consistency.py` (902xxx range); the new file moved to the
+  unused 904xxx range and the full suite passes.)
+- `git diff --check` -> clean.
+
+### 17.6 Security / DB impact
+
+- Security: unchanged — ADMIN_ONLY confirmation boundary intact (regression
+  test `test_model_change_still_requires_confirmation`), ToolRegistry /
+  ToolExecutor authority unchanged, unknown keys still fail closed.
+- Database/schema: NO schema change, NO migration.
+
+### 17.7 Live verification
+
+**NOT PERFORMED** — this workspace has no Telegram/Supabase credentials.
+The live failure itself was reported externally; the fix is source- and
+in-process-tested only. Live check required when the bot is reachable:
+ask the AI to change the model in a chat that includes a replied-to AI
+message; the tool call must now use `key="model"` and, after owner
+confirmation, the next request must be served by the new model.
+
+### 17.8 Git delivery
+
+| Item | Value |
+|---|---|
+| Commit | `5453752` |
+| Push result | `git push origin main` (non-force, fast-forward) |
+| Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` |
 | Working tree after push | clean except pre-existing untracked `telegram-self-bot/` |

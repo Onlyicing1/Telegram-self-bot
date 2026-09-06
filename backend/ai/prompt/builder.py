@@ -260,10 +260,14 @@ class PromptBuilder:
                 lines.append(f"Message ID: {ctx.reply.message_id}")
                 lines.append(f"AI Session: {ctx.reply.ai_session_id or 'Unknown'}")
                 lines.append(f"AI Role: {ctx.reply.ai_role or 'assistant'}")
+                # Labels use the canonical setting key names (provider /
+                # model), matching the [Runtime Context] block — a label
+                # like "AI Model:" taught the model a non-existent key
+                # ('ai_model') for settings_set.
                 if ctx.reply.ai_provider:
-                    lines.append(f"AI Provider: {ctx.reply.ai_provider}")
+                    lines.append(f"Provider: {ctx.reply.ai_provider}")
                 if ctx.reply.ai_model:
-                    lines.append(f"AI Model: {ctx.reply.ai_model}")
+                    lines.append(f"Model: {ctx.reply.ai_model}")
                 if ctx.reply.ai_timestamp:
                     lines.append(f"AI Timestamp: {ctx.reply.ai_timestamp}")
                 if ctx.reply.chat_title:
