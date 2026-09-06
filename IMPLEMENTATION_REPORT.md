@@ -229,3 +229,84 @@ Executed commands and actual results (this session):
 | Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main`, verified after push |
 | Final working tree | clean except pre-existing untracked `telegram-self-bot/` nested clone (untouched) |
 | Live Telegram / Supabase verification | **NOT performed** (no credentials in this workspace) — RC-5 is source-verified and in-process-test-verified only |
+
+---
+
+## 15. REMEDIATION OF SMALL SOURCE-PROVEN FINDINGS (RC-6 / A-1 / A-2 / A-3) — 2026-09-06
+
+Current-state section for the bounded remediation delivered after §14. Sections §1–§14
+remain the RC-5 current-state report and the retained `8b73497` audit.
+
+### 15.1 Scope decision
+
+| Finding | Addressed? | Basis (current source) |
+|---|---|---|
+| RC-6 / F-2 — DANGEROUS permission docstring drift | YES (documentation only) | `ToolExecutor._is_auto_executable()` (executor.py:338) executes READ_ONLY/READ_WRITE/DANGEROUS directly; only ADMIN_ONLY/CONFIRMATION_REQUIRED gate. `base.py`/`delete.py`/`organize.py` docstrings claimed the opposite — stale, aligned now. `settings.py`'s ADMIN_ONLY docstring was already accurate (ADMIN_ONLY genuinely gates) and was left untouched. |
+| A-1 — `delete_messages_by_ids` description overclaim | YES (model-facing description only) | The enforced boundary lives in `delete_service.delete_verified_self_messages` (re-fetch per chunk, `_is_self_owned` fail-closed: server `out` flag + sender==me) — untouched. Only the schema text changed. |
+| A-2 — `settings_get` unset AI key phantom value | YES (read-path honesty) | `SettingsGetTool.execute` returned `success=True, "key = "` for empty/missing AI keys. Now fails with an explicit not-set message. Routing/authorities untouched. |
+| A-3 — `web_search` swallowed failure reason | YES (bounded reason) | `ProviderManager.web_search` already produced detailed `error` strings (flowed via `⚠️ Web search failed: {error}`); only the two catch-alls collapsed to a generic message. Both now surface a bounded, secret-redacted reason. |
+| A-4 — save/save_by_link long_running exemption | NOT implemented — by decision | Re-examined per instructions: NOT a correctness defect. A tool-level timeout would abort legitimate large Deep Save transfers mid-flight; the 60 s request-level `wait_for` plus the 120 s pending-input expiry remain the real bounds. Left as the documented bounded design. |
+
+### 15.2 Files changed
+
+| Path | Category | Change |
+|---|---|---|
+| `backend/ai/tools/base.py` | production (docstring) | `PermissionLevel` docstring now states the real authorization model: owner's outgoing message IS the authorization; READ_ONLY/READ_WRITE/DANGEROUS execute directly; ADMIN_ONLY/CONFIRMATION_REQUIRED go through the owner-confirmation round-trip via `execute_confirmed` |
+| `backend/ai/tools/delete.py` | production (docstring) | module docstring aligned (DANGEROUS executes directly; deletions bounded by re-fetch + outgoing-only + same chat) |
+| `backend/ai/tools/organize.py` | production (docstring) | module docstring aligned (same model; cleanup bounded by service argument validation) |
+| `backend/ai/tools/semantic.py` | production (model-facing description) | `DeleteMessagesByIdsTool.description`: removed the unenforced "MUST have been returned by list_recent_messages in this turn" provenance claim; now "Use IDs from list_recent_messages — never invent IDs" + the enforced boundary (re-fetched and re-validated before deletion; invalid/non-outgoing IDs skipped and reported) |
+| `backend/ai/tools/settings.py` | production (behavior) | `SettingsGetTool`: unset/empty/None AI-key value → `ToolResult(success=False, "<key> is not set (no value stored for this AI runtime key).", data={key, value:""})`; set keys unchanged (`key = value`, success=True) |
+| `backend/ai/tools/websearch.py` | production (behavior) | `WebSearchTool` catch-all now returns `❌ Web search failed: <reason>.` using `web_search_service.sanitize_reason(exc)` |
+| `backend/services/web_search_service.py` | production (behavior) | new `sanitize_reason()` — exception type + message, Bearer/header credentials redacted defensively, whitespace-collapsed, ≤200 chars; service catch-all returns `❌ Web search failed: <reason>.`; invalid-result message includes the received type |
+| `tests/test_remediation_rc6_a123.py` | test (NEW) | 15 regression tests (see §15.4) |
+
+No schema, migration, configuration, dependency, provider-routing, ToolExecutor, ToolRegistry, or permission-semantics change.
+
+### 15.3 Behavior before → after
+
+| Area | Before | After |
+|---|---|---|
+| DANGEROUS docs | base/delete/organize docstrings claimed an owner-confirmation round-trip that never exists | docstrings match `_is_auto_executable()`; drift guarded by a source-scanning test |
+| `delete_messages_by_ids` schema | claimed turn-scoped ID provenance that is not enforced | states enforced boundary; runtime behavior byte-identical |
+| `settings_get` unset AI key | `success=True`, `key = ` (implies a value exists) | `success=False`, `<key> is not set (no value stored for this AI runtime key).` |
+| `web_search` unexpected error | generic `❌ Web search failed.` (reason logged as type only) | `❌ Web search failed: <Type>: <message>.` (≤200 chars, Bearer/header secrets redacted) |
+| Provider dict errors | `⚠️ Web search failed: {error}` | unchanged |
+
+### 15.4 Tests added — `tests/test_remediation_rc6_a123.py` (15)
+
+RC-6: direct-execution matrix (READ_ONLY/READ_WRITE/DANGEROUS all execute with no confirmation); ADMIN_ONLY never auto-executes (`needs_confirmation=True`, zero tool calls); `execute_confirmed` is the only gate bypass; CONFIRMATION_REQUIRED never auto-executes; docstring-drift guard (no "must ask the owner" in the three files; "IS the authorization" present).
+A-1: description states the enforced boundary and no longer contains "in this turn"/"MUST have been returned"; runtime enforcement pinned through the real service path — a non-outgoing ID (server `out=False`) is rejected, `delete_messages` never called, `get_messages` awaited against the same chat.
+A-2: unset AI key → `success=False` + "is not set" (empty string and None both covered); set key unchanged (`model = gemini-2.5-flash`, success=True, data preserved).
+A-3: `sanitize_reason` keeps type, redacts `X-API-Key`/`Authorization: Bearer` values, truncates ≤200, handles empty messages; service catch-all propagates the reason; tool catch-all propagates the reason; provider dict-error path unchanged (`⚠️ Web search failed: Web search request timed out.`).
+
+### 15.5 Executed validation (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_remediation_rc6_a123.py -q -p no:cacheprovider` | **15 passed** |
+| `.venv/bin/python -m pytest tests/test_26_silent_delete.py tests/test_27_delete_ownership.py tests/test_20_advanced_execution.py tests/test_30_delete_timeout_hardening.py tests/test_52_you_search.py tests/test_tool_health_audit.py tests/test_settings_model_key_contract.py tests/test_settings_unknown_key.py tests/test_confirmation_roundtrip.py -q -p no:cacheprovider` | **243 passed, 1 warning** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1726 passed, 23 skipped, 1 warning in 62.81s** |
+| `.venv/bin/python -m py_compile backend/ai/tools/base.py backend/ai/tools/delete.py backend/ai/tools/organize.py backend/ai/tools/semantic.py backend/ai/tools/settings.py backend/ai/tools/websearch.py backend/services/web_search_service.py tests/test_remediation_rc6_a123.py` | OK |
+| `git diff --check` | clean |
+
+### 15.6 Security / architecture impact
+
+- No change to ToolExecutor, ToolRegistry, permission semantics, confirmation flow, provider routing, model/provider state authority, Telegram identity/destination/delete security, or Supabase schema.
+- RC-6 is documentation-only; the executor's authorization contract is now PINNED by tests (previously only documented).
+- A-1 keeps the real boundary (`delete_verified_self_messages` re-fetch + `_is_self_owned` fail-closed) and the test proves a non-outgoing ID cannot be deleted regardless of where the ID came from.
+- A-3 is defense-in-depth: provider error strings are already credential-free (pinned by `test_52_you_search.py`), and `sanitize_reason` redacts header/Bearer patterns in the untrusted message text before it reaches the model or logs. No secret material enters the new output.
+
+### 15.7 Limitations / unverified
+
+- Live Telegram and live Supabase verification: **NOT performed** (no credentials in this workspace).
+- Live You.com search behavior remains UNKNOWN (`YDC_API_KEY` unreadable here); the failure-reason changes are verified in-process only.
+- `settings_get` unset-key wording is new user-visible text; the Glass UI does not consume `SettingsGetTool`, so no UI impact is expected (source-verified: no importer of `SettingsGetTool` outside the registry/dispatcher path).
+
+### 15.8 Delivery
+
+| Item | Value |
+|---|---|
+| Implementation commit | 514b9758e6c55472bcfed80ef66785efc332486c |
+| Push | `git push origin main` (non-force fast-forward) |
+| Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` after push |
+| Final working tree | clean except pre-existing untracked `telegram-self-bot/` nested clone (untouched) |
