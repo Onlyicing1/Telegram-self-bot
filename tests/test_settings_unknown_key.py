@@ -33,6 +33,18 @@ OWNER = 905001
 UNKNOWN_KEY = "no_such_setting"
 
 
+@pytest.fixture(autouse=True)
+def _restore_settings_cache():
+    """The settings service caches panel settings process-wide; restore the
+    exact snapshot so values written here never leak into other suites."""
+    from backend.services import settings_service
+
+    before = dict(settings_service.get_all())
+    yield
+    settings_service._cache.clear()
+    settings_service._cache.update(before)
+
+
 def make_executor(owner_id: int = OWNER):
     ctx = ToolContext(telegram=None, owner_id=owner_id, tz_str="UTC")
     registry = create_default_registry(ctx)
