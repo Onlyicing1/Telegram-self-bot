@@ -17,7 +17,10 @@ These tests pin the fix:
     for unknown keys even after owner approval;
   - valid AI-runtime keys (temperature) still route through `config_store`;
   - valid panel keys (language) still route through `settings_service`;
-  - invalid values for known keys are still rejected by the validators.
+  - invalid values for known keys are still rejected by the validators;
+  - the web dashboard boundary (`PATCH /api/settings`), the remaining direct
+    consumer of `set_setting`, propagates the rejection as HTTP 400 and the
+    unknown key never enters the cache.
 """
 from __future__ import annotations
 
@@ -163,3 +166,32 @@ async def test_execute_confirmed_valid_panel_key_still_executes():
 
     assert result.success is True
     assert "updated" in result.message
+
+
+# ── Web dashboard boundary ──
+
+
+@pytest.mark.asyncio
+async def test_patch_settings_endpoint_unknown_key_fails_closed():
+    """PATCH /api/settings calls set_setting directly; an unknown key must
+    surface as HTTP 400 and never reach the repository or the cache."""
+    from backend.services import settings_service
+
+    with patch(
+        "backend.services.panel_settings_repository.load", return_value=None
+    ):
+        settings_service.load_all()
+
+    from fastapi import HTTPException
+    from backend.web.app import update_setting
+
+    with patch(
+        "backend.services.panel_settings_repository.update_field",
+        return_value=False,
+    ) as updater:
+        with pytest.raises(HTTPException) as exc:
+            await update_setting({"key": UNKNOWN_KEY, "value": "xyz"})
+
+    assert exc.value.status_code == 400
+    updater.assert_not_called()
+    assert UNKNOWN_KEY not in settings_service.get_all()
