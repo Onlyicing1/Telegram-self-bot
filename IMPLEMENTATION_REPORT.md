@@ -412,3 +412,14 @@ the engine is unreachable).
   task-management routing precedent in `actions.py`).
 - ShortMemory remains per-request RAM-only by design and is intentionally
   not tool-exposed.
+
+### 16.8 Delivery record (verified)
+
+| Item | Value |
+|---|---|
+| Delivery commit | `e2680846c3d1e55390d7c186382b8f5b75ba01b7` (`feat: connect memory subsystem to the AI tool surface (memory_store/memory_list)`) |
+| Push | `git push origin main` from `/home/daytona/codebase` → `ab8050e..e268084 main -> main` (non-force fast-forward, succeeded) |
+| Remote proof | `git ls-remote origin refs/heads/main` → `e2680846c3d1e55390d7c186382b8f5b75ba01b7` == `git rev-parse HEAD` == `git rev-parse origin/main` (after fresh `git fetch origin`) |
+| Validation on the committed tree | `tests/test_memory_tools.py` 20 passed; adjacent set (memory DB, tool health audit, capability exposure, tool calls, confirmation round-trip, settings RC-5, RC-6/A-1/A-2/A-3) 211 passed; full suite **1746 passed, 23 skipped** in 63.76s; `py_compile` OK on all changed modules; `git diff --check` clean |
+| Working tree after delivery | clean except the pre-existing untracked nested clone `telegram-self-bot/` (separate stale repository, intentionally untouched) |
+| Not verified | Live Telegram / live Supabase round-trip (no credentials in this workspace) |
