@@ -197,7 +197,8 @@ async def save_memory(owner_id: int, tier: str, category: str, content: str,
 
 def _query_memories_sync(owner_id: int, tier: str | None = None, limit: int = 20,
                          min_importance: float = 0.0,
-                         category: str | None = None) -> list[dict]:
+                         category: str | None = None,
+                         content: str | None = None) -> list[dict]:
     db = _get_db()
     if not db:
         return []
@@ -207,6 +208,8 @@ def _query_memories_sync(owner_id: int, tier: str | None = None, limit: int = 20
             q = q.eq("tier", tier)
         if category:
             q = q.eq("category", category)
+        if content is not None:
+            q = q.eq("content", content)
         if min_importance > 0:
             q = q.gte("importance", min_importance)
         # Deterministic order: importance first, then recency, then id.
@@ -224,9 +227,13 @@ def _query_memories_sync(owner_id: int, tier: str | None = None, limit: int = 20
 
 
 async def query_memories(owner_id: int, tier: str | None = None, limit: int = 20,
-                          min_importance: float = 0.0) -> list[dict]:
+                          min_importance: float = 0.0,
+                          category: str | None = None,
+                          content: str | None = None) -> list[dict]:
     try:
-        return await _run_sync(_query_memories_sync, owner_id, tier, limit, min_importance)
+        return await _run_sync(
+            _query_memories_sync, owner_id, tier, limit, min_importance, category, content,
+        )
     except Exception as exc:
         logger.warning("AI query_memories failed: %s", exc)
         return []

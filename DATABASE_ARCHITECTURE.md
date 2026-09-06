@@ -579,7 +579,7 @@ Three-tier memory system: short, long, and permanent memories.
 | `content` | `text` | NO | — | Memory text (truncated to 8000 chars on write) |
 | `importance` | `real` | YES | `0.5` | Score 0.0–1.0 (higher = more relevant) |
 | `expires_at` | `timestamptz` | YES | — | When the memory expires (NULL = never) |
-| `metadata` | `jsonb` | YES | — | Arbitrary extra metadata |
+| `metadata` | `jsonb` | YES | `'{}'` | Arbitrary extra metadata |
 | `created_at` | `timestamptz` | YES | `now()` | When the memory was created |
 
 ### Indexes

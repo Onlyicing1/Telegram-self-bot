@@ -153,14 +153,13 @@ class SupabaseMemoryRepository(MemoryRepository):
         from backend.ai import persistence
 
         # Idempotent write: an identical (owner, tier, content) row already
-        # persisted is never duplicated.
+        # persisted is never duplicated. The pre-check filters by content
+        # equality so a duplicate is found regardless of its rank — a
+        # top-1 probe would miss lower-ranked duplicates and insert twice.
         existing = persistence._query_memories_sync(
-            entry.owner_id, tier=entry.tier.value, limit=1,
+            entry.owner_id, tier=entry.tier.value, limit=1, content=entry.content,
         )
-        if any(
-            row.get("tier") == entry.tier.value and row.get("content") == entry.content
-            for row in existing
-        ):
+        if existing:
             return True
         return persistence._save_memory_sync(
             entry.owner_id,
@@ -185,13 +184,18 @@ class SupabaseMemoryRepository(MemoryRepository):
         entries: list[MemoryEntry] = []
         for row in rows:
             try:
+                importance_raw = row.get("importance")
+                importance = (
+                    float(importance_raw) if importance_raw is not None
+                    else 0.5  # ai_memories.importance DEFAULT 0.5 (schema contract)
+                )
                 entry = MemoryEntry(
                     id=str(row.get("id") or ""),
                     owner_id=int(row.get("owner_id") or 0),
                     tier=MemoryTier(row.get("tier") or MemoryTier.LONG.value),
                     category=MemoryCategory(row.get("category") or MemoryCategory.CONTEXT.value),
                     content=row.get("content") or "",
-                    importance=float(row.get("importance") or 0.0),
+                    importance=importance,
                     created_at=_parse_dt(row.get("created_at")) or datetime.now(timezone.utc),
                     expires_at=_parse_dt(row.get("expires_at")),
                     metadata=dict(row.get("metadata") or {}),
