@@ -6,24 +6,28 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Audited commit | `8b734976a2e1b9a5df463dad051c1dad4c3482b3` |
-| Commit subject | `fix: expose canonical settings key contract to the AI (ai_model vs model)` |
-| Parent commit | `1dda645b57068e5cba11c26bdde6ffde3313c384` (`test: isolate RC-5 regression tests from the shared settings cache`) |
-| Audit date | 2026-09-06 |
-| Implementation status | Delivered — `8b73497` verified on `origin/main` via `git ls-remote` during this audit |
-| Report type | Implementation audit / documentation replacement (no production code changed by this report) |
-| Audit basis | `git show` / `git diff 8b73497^ 8b73497`, current source files, tests executed during this audit. Commit messages and INVESTIGATION.md were NOT used as evidence sources; they were only compared against the diff. |
+| Report type | Current-state implementation report — RC-5 final state (this session), with the retained implementation audit of commit `8b73497` (§3–§12) |
+| Retained audited commit | `8b734976a2e1b9a5df463dad051c1dad4c3482b3` (`fix: expose canonical settings key contract to the AI (ai_model vs model)`), parent `1dda645` |
+| RC-5 fix commits (historical) | `4a226a0` (`fix: fail closed on unknown panel setting keys (RC-5)`); test-isolation follow-up `1dda645` |
+| This session's change | `tests/test_settings_unknown_key.py` only — added the one genuinely missing consumer test (web `PATCH /api/settings` unknown-key fail-closed). **No production code changed this session.** |
+| Date | 2026-09-06 |
+| RC-5 status | **FIXED — source-verified + in-process-test-verified. LIVE VERIFIED: NO** (no live Telegram/Supabase access in this workspace) |
 
 ## 2. EXECUTIVE SUMMARY
 
-Commit `8b73497` fixes the **model-facing settings key contract** (investigation finding RC-7 / F-3). A live AI request to change the model produced `settings_set {key: "ai_model", value: "gpt-oss-1200"}` and the backend correctly rejected it with `Unknown setting key 'ai_model'` — the RC-5 fail-closed behavior worked. The commit does not touch that routing, which was already correct. Instead it fixes the two source-level reasons the model invented the key:
+**RC-5 current state (verified from current source this session):** `settings_set` fails closed for every unknown/nonexistent panel settings key.
 
-1. `backend/ai/prompt/builder.py` rendered the replied-to AI message metadata as `AI Model: <model>` / `AI Provider: <provider>` — the only occurrence of the token sequence "AI Model" in the model-facing prompt. The commit relabels these lines to `Model:` / `Provider:`, matching the canonical setting keys and the existing `[Runtime Context]` block.
-2. `backend/ai/tools/settings.py` — `SettingsGetTool` / `SettingsSetTool` described the `key` argument with no key enumeration ("The setting key to read/write."), so the model had to guess. The commit adds `_setting_key_contract()`, which derives the full valid-key list from the two pre-existing authorities (`_AI_CONFIG_KEYS` and `settings_service.known_keys()`) and carries it in both tools' `description` and `parameters["key"].description`, plus an explicit disambiguation: the AI model setting is key `'model'`, never `'ai_model'`.
+- `settings_service.set_setting()` (`backend/services/settings_service.py`) rejects any key not in `_DEFAULTS` — via `is_valid_key()` — *before* validation, the repository write, and the cache. An unknown key can never reach `repo.update_field`, never fall through the DB-failure fallback, and never pollute `_cache`.
+- `SettingsSetTool.execute()` (`backend/ai/tools/settings.py`) independently rejects unknown panel keys with `ToolResult(success=False, "Unknown setting key '...'")`.
+- The confirmed path (`ToolExecutor.execute_confirmed`) fails closed identically even after owner approval.
+- The remaining direct consumer, the web dashboard boundary `PATCH /api/settings` (`backend/web/app.py::update_setting`), surfaces the rejection as HTTP 400.
+- AI-runtime keys (`provider`, `model`, `temperature`, `max_tokens`, `system_prompt`, `history_budget`, `trigger_en`, `trigger_fa`) keep routing through `config_store` (`_AI_CONFIG_KEYS`), and the RC-7 canonical model-facing key contract (`model`/`provider` canonical; `ai_model`/`ai_provider` invalid) is preserved.
 
-It also adds `tests/test_settings_model_key_contract.py` (7 regression tests, 316 lines) and updates `INVESTIGATION.md` (RC-7) and `IMPLEMENTATION_REPORT.md` (§17). No alias is introduced — `ai_model` remains rejected as unknown. No routing, confirmation-boundary, schema, or runtime-authority change.
+All 15 required invariants hold (mapped in §13). The 8 required behavioral proofs are pinned by `tests/test_settings_unknown_key.py` (now 9 tests) and `tests/test_settings_model_key_contract.py` (7 tests). This session added only the web-boundary regression test. Full suite: **1711 passed, 23 skipped**.
 
-## 3. EXACT FILES CHANGED
+**Retained audit (§3–§12):** the implementation audit of commit `8b73497`, which fixed the model-facing settings key contract (RC-7/F-3) — the reason a live request produced `key="ai_model"`. That commit did not change RC-5's routing (already correct and fail-closed since `4a226a0`); it fixed the prompt/schema contract that made the model invent the key, and documents the delivery verification including the pre-amend SHA artifact (`5453752` → superseded by `8b73497`).
+
+## 3. EXACT FILES CHANGED (by retained commit 8b73497)
 
 `git show --numstat 8b73497` (authoritative):
 
@@ -33,11 +37,20 @@ It also adds `tests/test_settings_model_key_contract.py` (7 regression tests, 31
 | `backend/ai/prompt/builder.py` | production | 6 | 2 | Relabel reply-block metadata lines `AI Provider:`→`Provider:`, `AI Model:`→`Model:`; add a 4-line why-comment |
 | `tests/test_settings_model_key_contract.py` | test (NEW file) | 316 | 0 | 7 regression tests pinning the repaired model-facing contract |
 | `INVESTIGATION.md` | documentation | 27 | 0 | RC-7 finding, confirmation-invariant note, F-3 index line |
-| `IMPLEMENTATION_REPORT.md` | documentation | 109 | 1 | §17 (this commit's report) and filling the `<SHA_AFTER_COMMIT>` placeholder in §16.8 |
+| `IMPLEMENTATION_REPORT.md` | documentation | 109 | 1 | §17 (that commit's report) and filling the `<SHA_AFTER_COMMIT>` placeholder in §16.8 |
 
-No other files were touched. No configuration, schema, migration, or dependency files changed.
+No other files were touched by that commit. No configuration, schema, migration, or dependency files changed.
 
-## 4. EXACT IMPLEMENTATION CHANGES
+### 3a. Files changed by this session's RC-5 completion
+
+| Path | Category | Change |
+|---|---|---|
+| `tests/test_settings_unknown_key.py` | test | Add `test_patch_settings_endpoint_unknown_key_fails_closed` (web `PATCH /api/settings` unknown key → HTTP 400, repository write never attempted, cache never polluted); module docstring extended; trailing newline restored |
+
+No production code, configuration, schema, or dependency file changed this session.
+## 4. EXACT IMPLEMENTATION CHANGES (retained audit — commit `8b73497`)
+
+RC-5's own production implementation (`4a226a0`, test-isolation follow-up `1dda645`) is summarized in §2 and detailed in `INVESTIGATION.md` (RC-5). The subsections below are the retained source-grounded audit of the settings-key-contract commit `8b73497`, preserved for continuity.
 
 ### 4.1 `backend/ai/tools/settings.py` — `_setting_key_contract()` and schema enrichment
 
@@ -179,4 +192,40 @@ The audit-time results match the results recorded in the commit's own §17.5 (17
 | Working tree at audit start | Clean except pre-existing untracked `telegram-self-bot/` nested clone (untouched, excluded from all operations) |
 | Pre-amend artifact | `5453752b4e816f8093f266b7b6e294251d4be64e` — same change pre-amend; unreferenced by any branch; superseded by `8b73497` (see §11) |
 
-This report documents only commit `8b73497` and the verified repository state around it. It replaces all prior report content.
+The audit above documents commit `8b73497` and the repository state at its audit time. The current delivered state (including this session's RC-5 completion) is recorded in §13–§14.
+
+## 13. RC-5 VERIFICATION LEDGER (current state, this session)
+
+All 8 behavioral proofs required for RC-5 completion, with the tests that pin them:
+
+| Required proof | Result | Evidence |
+|---|---|---|
+| 1. Unknown panel key through `SettingsSetTool` fails | PASS | `test_settings_set_tool_unknown_key_fails_closed` |
+| 2. Unknown key never enters the settings cache | PASS | `UNKNOWN_KEY not in settings_service.get_all()` asserted in the service, tool, confirmed, and web tests |
+| 3. Unknown key never persists | PASS | `patch("backend.services.panel_settings_repository.update_field").assert_not_called()` in the service and web tests |
+| 4. Unknown key through the real `ToolExecutor` path fails closed | PASS | `test_execute_confirmed_unknown_key_fails_closed` |
+| 5. Confirmed unknown key also fails closed | PASS | same test: `needs_confirmation=False` (gate satisfied), `success=False`, `Unknown setting key` in message, cache clean |
+| 6. Existing valid panel key still works | PASS | `test_known_key_valid_value_still_succeeds_through_service`, `test_settings_set_tool_valid_panel_key_still_works`, `test_execute_confirmed_valid_panel_key_still_executes` |
+| 7. Existing AI-runtime key routing still works | PASS | `test_settings_set_tool_ai_key_still_routes_to_config_store`; RC-7 contract suite `tests/test_settings_model_key_contract.py` (7 tests) |
+| 8. Confirmation requirement for `settings_set` remains intact | PASS | `test_settings_model_key_contract.py::test_model_change_still_requires_confirmation`; `ADMIN_ONLY` gate unchanged in source |
+
+Executed commands and actual results (this session):
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_settings_unknown_key.py tests/test_settings_model_key_contract.py tests/test_settings_runtime_switch.py tests/test_confirmation_roundtrip.py -q` | **94 passed in 0.81s** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1711 passed, 23 skipped in 62.52s** |
+| `.venv/bin/python -m py_compile backend/services/settings_service.py backend/ai/tools/settings.py backend/ai/tools/executor.py backend/ai/confirmation.py backend/web/app.py tests/test_settings_unknown_key.py` | OK |
+| `git diff --check` | clean |
+
+## 14. GIT DELIVERY (current state)
+
+| Item | Value |
+|---|---|
+| Branch | `main` |
+| Implementation commit | 2cc63032d8bc9137dd06afc68c8e29d74b4bc78d (`fix: complete RC-5 regression coverage (web PATCH /api/settings boundary)`) |
+| Report/delivery commit | the commit carrying the final version of this file |
+| Push result | `git push origin main` — non-force fast-forward |
+| Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main`, verified after push |
+| Final working tree | clean except pre-existing untracked `telegram-self-bot/` nested clone (untouched) |
+| Live Telegram / Supabase verification | **NOT performed** (no credentials in this workspace) — RC-5 is source-verified and in-process-test-verified only |
