@@ -6,26 +6,108 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Report type | Current-state implementation report — RC-5 final state (this session), with the retained implementation audit of commit `8b73497` (§3–§12) |
-| Retained audited commit | `8b734976a2e1b9a5df463dad051c1dad4c3482b3` (`fix: expose canonical settings key contract to the AI (ai_model vs model)`), parent `1dda645` |
-| RC-5 fix commits (historical) | `4a226a0` (`fix: fail closed on unknown panel setting keys (RC-5)`); test-isolation follow-up `1dda645` |
-| This session's change | `tests/test_settings_unknown_key.py` only — added the one genuinely missing consumer test (web `PATCH /api/settings` unknown-key fail-closed). **No production code changed this session.** |
+| Report type | Current-state implementation report — memory persistence/repository compatibility with the fixed `public.ai_memories` schema (this session); §4–§16 below are retained historical audits from prior sessions |
+| This session's change | Memory persistence/repository schema-compatibility fix + 27 focused regression tests (`tests/test_memory_repository_supabase.py`). Production: `backend/ai/database/memory_repository.py`, `backend/ai/persistence.py`. Doc: `DATABASE_ARCHITECTURE.md` (one metadata-default cell) |
 | Date | 2026-09-06 |
-| RC-5 status | **FIXED — source-verified + in-process-test-verified. LIVE VERIFIED: NO** (no live Telegram/Supabase access in this workspace) |
+| Status | **COMPLETE — in-process tests verified. LIVE SUPABASE VERIFICATION: NOT PERFORMED** (no live credentials in this workspace) |
+| Commit (this session) | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`) |
+| Push result | `3ae2e44..f6c3bcc main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
+| Remote `refs/heads/main` | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (authoritative `ls-remote`) |
 
 ## 2. EXECUTIVE SUMMARY
 
-**RC-5 current state (verified from current source this session):** `settings_set` fails closed for every unknown/nonexistent panel settings key.
+**Current state (verified from current source this session):** the AI memory repository (`SupabaseMemoryRepository`) and the `backend.ai.persistence` memory helpers are fully compatible with the EXISTING fixed `public.ai_memories` table — 9 columns (`id`, `owner_id`, `tier`, `category`, `content`, `importance`, `expires_at`, `metadata`, `created_at`).
 
-- `settings_service.set_setting()` (`backend/services/settings_service.py`) rejects any key not in `_DEFAULTS` — via `is_valid_key()` — *before* validation, the repository write, and the cache. An unknown key can never reach `repo.update_field`, never fall through the DB-failure fallback, and never pollute `_cache`.
-- `SettingsSetTool.execute()` (`backend/ai/tools/settings.py`) independently rejects unknown panel keys with `ToolResult(success=False, "Unknown setting key '...'")`.
-- The confirmed path (`ToolExecutor.execute_confirmed`) fails closed identically even after owner approval.
-- The remaining direct consumer, the web dashboard boundary `PATCH /api/settings` (`backend/web/app.py::update_setting`), surfaces the rejection as HTTP 400.
-- AI-runtime keys (`provider`, `model`, `temperature`, `max_tokens`, `system_prompt`, `history_budget`, `trigger_en`, `trigger_fa`) keep routing through `config_store` (`_AI_CONFIG_KEYS`), and the RC-7 canonical model-facing key contract (`model`/`provider` canonical; `ai_model`/`ai_provider` invalid) is preserved.
+- The save payload serializes exactly the 7 application-owned columns (`owner_id`, `tier`, `category`, `content`, `importance`, `expires_at`, `metadata`); `id`/`created_at` are database-generated and never written.
+- Duplicate-content idempotency is now complete: the pre-write check filters by content equality, so an identical (owner, tier, content) row is found **regardless of rank** (the old top-1 probe missed lower-ranked duplicates and inserted twice).
+- Row reconstruction handles the exact nine-column schema honestly: NULL `importance` reconstructs as the schema default **0.5** (never silently coerced to 0.0), NULL `expires_at`/`metadata` are preserved, and database-generated `id`/`created_at` are read back.
+- Honest failure semantics preserved: repository rejection/exception → `save()` returns `False` → tier store returns `None` → `memory_store` reports `success=False`. `MEMORY_WRITE_TIMEOUT_S = 3.0` unchanged.
+- Owner isolation, the single MemoryManager authority, the in-memory fallback, and the `memory_store`/`memory_list` tool behavior are unchanged. No SQL was executed; no migration was created; no schema was modified.
 
-All 15 required invariants hold (mapped in §13). The 8 required behavioral proofs are pinned by `tests/test_settings_unknown_key.py` (now 9 tests) and `tests/test_settings_model_key_contract.py` (7 tests). This session added only the web-boundary regression test. Full suite: **1711 passed, 23 skipped**.
+Full suite: **1773 passed, 23 skipped** (this session). Live Supabase verification was NOT performed.
 
-**Retained audit (§3–§12):** the implementation audit of commit `8b73497`, which fixed the model-facing settings key contract (RC-7/F-3) — the reason a live request produced `key="ai_model"`. That commit did not change RC-5's routing (already correct and fail-closed since `4a226a0`); it fixed the prompt/schema contract that made the model invent the key, and documents the delivery verification including the pre-amend SHA artifact (`5453752` → superseded by `8b73497`).
+## 3. CURRENT STATE — MEMORY REPOSITORY SCHEMA COMPATIBILITY (2026-09-06)
+
+### 3.1 Exact defect fixed
+
+The Supabase-backed memory repository was not fully compatible with the existing fixed `ai_memories` schema in two concrete ways:
+
+1. **Incomplete duplicate-content idempotency** — `SupabaseMemoryRepository.save()` probed only the top-1 row (`limit=1`, importance-desc) before inserting. An identical (owner, tier, content) row that was not the top-ranked row was missed, so a duplicate row was inserted. The in-memory fallback and the repository's own module docstring both guarantee “identical (owner, tier, content) writes are idempotent — duplicate entries are never created”; the Supabase implementation violated that guarantee.
+2. **Silent NULL-importance substitution** — row reconstruction coerced a NULL `importance` (nullable column, `DEFAULT 0.5`) to `0.0`, silently substituting a value that is neither the schema default nor the `MemoryEntry` default, and changing retrieval ranking semantics.
+
+### 3.2 Exact files changed
+
+| Path | Change |
+|---|---|
+| `backend/ai/persistence.py` | `_query_memories_sync()` gains a `content` equality filter (`eq("content", ...)`); async `query_memories()` passes `category`/`content` through to the sync helper |
+| `backend/ai/database/memory_repository.py` | `save()` pre-check now queries with `content=entry.content` and treats any returned row as the duplicate (complete idempotency); `query()` reconstructs NULL `importance` as `0.5` (explicit `None` check — a stored `0.0` stays `0.0`) |
+| `tests/test_memory_repository_supabase.py` | NEW — 27 focused tests driving the repository through a recording fake Supabase client injected via `backend.ai.persistence._get_db` |
+| `DATABASE_ARCHITECTURE.md` | §10 `ai_memories` column table: `metadata` default corrected from `—` to `'{}'` (matches the actual schema) |
+
+No migration created, no SQL executed, no Supabase object modified, no other production module touched.
+
+### 3.3 Root cause → fix mapping
+
+| Finding | Root cause | Fix |
+|---|---|---|
+| Duplicate rows possible via `memory_store` when the identical content already exists with lower importance | Idempotency probe read only the top-1 row; duplicates below the top rank were invisible | Content-equality pre-check in `_query_memories_sync`; `save()` treats any matching row as the duplicate and never inserts twice |
+| Reconstructed entries silently reported `importance=0.0` for NULL rows | `float(row.get("importance") or 0.0)` coerced NULL to `0.0` | Explicit `None` check → schema default `0.5`; stored `0.0` preserved |
+| (Verified compatible — no change needed) Save payload columns, select columns, ordering, delete/expire/count filters already matched the fixed 9-column schema | — | Pinned by tests so drift fails CI |
+
+### 3.4 Behavior before / after
+
+| Operation | Before | After |
+|---|---|---|
+| `save()` of identical content ranked below the top row | Duplicate row inserted | Idempotent: no second insert |
+| Reconstruct a row with NULL `importance` | `0.0` | `0.5` (schema default) |
+| Reconstruct a row with `importance = 0.0` | `0.0` | `0.0` (unchanged, still preserved) |
+| Save payload | 7 app-owned columns | 7 app-owned columns (unchanged, pinned by test) |
+| Rejection/exception on write | `save() → False` → tier store `None` → tool `success=False` | Identical (unchanged, pinned by test) |
+| `MEMORY_WRITE_TIMEOUT_S` | 3.0 | 3.0 (unchanged, pinned by test) |
+
+### 3.5 Tests added / executed
+
+`tests/test_memory_repository_supabase.py` (27 tests) covers, per the task contract: payload uses only compatible columns; owner/tier/category/content/importance/expires_at/metadata persisted correctly; DB-generated `id`/`created_at` not written and read back; exact nine-column row reconstruction (NULL importance → 0.5, NULL expires_at/metadata, stored 0.0 preserved); duplicate-content idempotency regardless of rank; rejection and exception → honest failure (`False` → tier store `None`); owner isolation on query/count and through the tools; tier/category/importance filters + ordering + limits; delete by database id; tier-scoped expired cleanup; the global “no nonexistent `ai_memories` column is ever referenced” assertion; long/permanent `memory_store` and `memory_list` behavior through the Supabase repository; and the 3.0s write-timeout bound.
+
+Exact commands and real results (this session, `.venv/bin/python`, pytest 9.x, `-p no:cacheprovider`):
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_memory_repository_supabase.py tests/test_memory_tools.py tests/test_37_ai_memory_db.py -q` | **64 passed** |
+| Adjacent AI/tool regression set (tool health audit, capability exposure, tool calls, confirmation round-trip, settings RC-5/RC-7 suites, memory tools, memory DB) | **243 passed, 1 warning** |
+| `pytest tests/ -q` (full suite) | **1773 passed, 23 skipped, 1 warning in 64.30s** |
+| `py_compile backend/ai/database/memory_repository.py backend/ai/persistence.py tests/test_memory_repository_supabase.py` | OK |
+| `git diff --check` | clean |
+
+### 3.6 Database / Supabase impact
+
+- **NO schema change.** No migration created or modified. No SQL executed against Supabase. No table/column/index/constraint/RLS object changed.
+- The repository adapts to the existing fixed schema; nothing in the database was “corrected” to match code.
+- **Live Supabase verification: NOT PERFORMED.** Tests use a recording fake DB client; the in-memory fallback is what the rest of the suite exercises.
+
+### 3.7 Security / architecture
+
+- Single memory authority preserved: the Engine-owned `MemoryManager` is still the only entry point; no second repository/manager/client was introduced.
+- Owner scoping preserved on every persistence operation (writes store `context.owner_id`; reads/counts filter `owner_id`); owner identity never comes from model-supplied input.
+- Honest failure semantics preserved (None-on-failure, bounded 3.0s write timeout, `asyncio.to_thread` off-loop execution).
+- Unchanged: ToolExecutor permission semantics, dispatcher, providers, Telegram boundaries, settings, save/delete/profile systems.
+
+### 3.8 Limitations
+
+- Delete-by-id addresses the database-generated `id` (stringified bigint, as returned by row reconstruction); application-generated UUID ids never exist in the DB and therefore never match — `delete()` fails honestly (`False`), it never corrupts.
+- No live Supabase round-trip was performed in this workspace.
+
+### 3.9 Git delivery
+
+- Commit: `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`, 4 files, +610/−11)
+- Push: `3ae2e44..f6c3bcc main -> main` — succeeded, independently verified (`git fetch origin`; `rev-parse HEAD` == `rev-parse origin/main` == `git ls-remote origin refs/heads/main` == `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b`).
+- Working tree after delivery: clean except pre-existing untracked `telegram-self-bot/` (nested clone, untouched).
+
+---
+
+## RETAINED HISTORICAL RECORD
+
+The sections below are retained audits and delivery records from prior sessions (unchanged): §4–§12 audit the settings-key-contract commit `8b73497`; §13–§14 the RC-5 ledger; §15 the RC-6/A-1/A-2/A-3 remediation; §16 the memory tool connection. The memory repository schema-compatibility work in §3 supersedes nothing in those records.
 
 ## 3. EXACT FILES CHANGED (by retained commit 8b73497)
 
