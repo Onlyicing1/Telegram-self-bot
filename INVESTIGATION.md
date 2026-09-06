@@ -490,6 +490,19 @@ Ranked (implemented + safe + utility + integration effort):
    - Security: owner-scoped writes to AI memory tables; no Telegram side effect — safe.
    - Tests: unit (tool), registry exposure, tool-call chain, dummy-provider AI-path.
 
+   **STATUS: IMPLEMENTED (2026-09-06)** — `memory_store` (READ_WRITE) and
+   `memory_list` (READ_ONLY) added in `backend/ai/tools/memory.py`, registered
+   in `create_default_registry` (registry 36 → 38). Both resolve the SAME
+   engine-owned `MemoryManager` the dispatcher's bounded read path uses — no
+   second memory authority. The write path is bounded by the new
+   `MEMORY_WRITE_TIMEOUT_S` (`backend/ai/memory/limits.py`), mirroring the
+   dispatcher's `MEMORY_READ_TIMEOUT_S` discipline. The tier stores
+   (`LongMemory.store` / `PermanentMemory.store`) now honor the repository's
+   `save()` boolean (reject → None) so an unpersisted entry can never be
+   reported as stored. Regression coverage: `tests/test_memory_tools.py`
+   (20 tests); full suite 1746 passed, 23 skipped. See
+   IMPLEMENTATION_REPORT.md §16.
+
 2. **Confirmation round-trip for ADMIN_ONLY/CONFIRMATION_REQUIRED tools** — **IMPLEMENTED** (`c5d29f7`; see RC-2 fix + §17). `settings_set` is now AI-executable through the owner-confirmation boundary. No remaining work in this item.
 
 3. **`TelegramAPI` facade methods without adapters** (`edit_message`, `search_messages`, `download_media`).

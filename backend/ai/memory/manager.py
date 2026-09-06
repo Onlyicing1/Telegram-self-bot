@@ -104,12 +104,20 @@ tiers. The Engine receives this manager and calls ``retrieve_for_prompt()``
 
     def store_long(self, owner_id: int, content: str, category: MemoryCategory = MemoryCategory.SUMMARY,
                    importance: float = 0.5, metadata: dict[str, Any] | None = None) -> Any:
-        """Convenience proxy for LongMemory.store()."""
+        """Convenience proxy for LongMemory.store().
+
+        Returns the created entry, or None when the tier rejected or
+        failed to persist the content (matches the tier-level contract).
+        """
         return self._long.store(owner_id, content, category, importance, metadata)
 
     def store_permanent(self, owner_id: int, content: str, category: MemoryCategory = MemoryCategory.FACT,
                         importance: float = 1.0, metadata: dict[str, Any] | None = None) -> Any:
-        """Convenience proxy for PermanentMemory.store()."""
+        """Convenience proxy for PermanentMemory.store().
+
+        Returns the created entry, or None when the tier rejected or
+        failed to persist the content (matches the tier-level contract).
+        """
         return self._permanent.store(owner_id, content, category, importance, metadata)
 
     def status(self) -> dict[str, Any]:

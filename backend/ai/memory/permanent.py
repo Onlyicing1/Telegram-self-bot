@@ -59,9 +59,13 @@ class PermanentMemory:
         )
         if self._repository is not None:
             try:
-                self._repository.save(entry)
+                saved = self._repository.save(entry)
             except Exception as exc:
                 logger.warning("PermanentMemory: repository save failed: %s", exc)
+                return None
+            if not saved:
+                # Rejected by the repository (e.g. oversized entry): report
+                # failure honestly instead of returning an unpersisted entry.
                 return None
         return entry
 

@@ -310,3 +310,105 @@ A-3: `sanitize_reason` keeps type, redacts `X-API-Key`/`Authorization: Bearer` v
 | Push | `git push origin main` (non-force fast-forward) |
 | Remote verification | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` after push |
 | Final working tree | clean except pre-existing untracked `telegram-self-bot/` nested clone (untouched) |
+
+---
+
+## 16. MEMORY TOOL CONNECTION (§13.1) — 2026-09-06
+
+Current-state section for the memory write/read tool connection delivered after §15.
+Sections §13–§15 remain the RC-5 and RC-6/A-1/A-2/A-3 current-state reports.
+
+### 16.1 Scope
+
+Implements INVESTIGATION.md §13.1 (ranked #1 remaining chunk): the three-tier
+memory subsystem (`backend/ai/memory/`, repository-backed via
+`get_repository_manager().memory`) had a fully wired RETRIEVAL path
+(`dispatcher.py` bounded `retrieve_for_prompt` → prompt `[Memory]` section)
+and a fully implemented WRITE path with **zero production callers** —
+`MemoryManager.store_long/store_permanent` were reachable only from tests.
+
+### 16.2 Files changed
+
+| Path | Category | Change |
+|---|---|---|
+| `backend/ai/tools/memory.py` | production (NEW) | `MemoryStoreTool` (`memory_store`, READ_WRITE) and `MemoryListTool` (`memory_list`, READ_ONLY). Both resolve the engine-owned `MemoryManager` via `_resolve_memory_manager()` (`get_engine().memory_manager`, in-memory fallback only when the engine is unreachable) — the SAME instance the dispatcher's read path uses; no second memory authority. `memory_store`: owner-scoped, tier (`long`/`permanent`) + category (enum, permanent-restricted to fact/preference/instruction) + importance (0.0–1.0) validation, `MAX_MEMORY_ENTRY_CHARS` pre-check, secret-avoidance guidance in the description; executes the sync store via `asyncio.to_thread` bounded by `MEMORY_WRITE_TIMEOUT_S` (mirrors the dispatcher's `MEMORY_READ_TIMEOUT_S` discipline). `memory_list`: tier/query/limit(1–20) filters over `permanent.retrieve_all` + `long.retrieve`, owner-scoped. |
+| `backend/ai/tools/registry.py` | production | Registers both tools in `create_default_registry` (36 → 38 tools). |
+| `backend/ai/tools/executor.py` | production | `_STATUS_LABELS` entries for the two new tool names. |
+| `backend/ai/memory/limits.py` | production | New `MEMORY_WRITE_TIMEOUT_S = 3.0` (single source of memory bounds). |
+| `backend/ai/memory/long.py` | production (honesty) | `store()` now honors the repository's `save()` boolean: rejected → `None` (matches the documented "None if persistence failed" contract). Previously a rejected (e.g. oversized) write returned an unpersisted entry. |
+| `backend/ai/memory/permanent.py` | production (honesty) | Same `save()` boolean fix. |
+| `backend/ai/memory/manager.py` | production (docstring) | `store_long`/`store_permanent` docstrings state the None-on-failure contract explicitly. |
+| `tests/test_memory_tools.py` | test (NEW) | 20 regression tests (§16.4). |
+| `tests/test_tool_health_audit.py` | test | `EXPECTED_TOOLS` += `memory_store`(READ_WRITE), `memory_list`(READ_ONLY); count 36 → 38. |
+| `tests/test_capability_exposure_tools.py` | test | Duplicate-registration count 36 → 38. |
+| `INVESTIGATION.md` | docs | §13.1 marked IMPLEMENTED with the delivery summary. |
+
+No schema, migration, configuration, dependency, provider-routing,
+ToolExecutor-logic, permission-semantics, or Telegram-boundary change. The
+executor, dispatcher, and confirmation flow are untouched.
+
+### 16.3 Behavior before → after
+
+| Area | Before | After |
+|---|---|---|
+| AI memory writes | Unreachable from the tool surface ("remember that …" requests could only be simulated by the model's prose) | `memory_store` persists through the engine-owned manager; confirmation of truth is the tool result, not model narration |
+| Memory reads | Prompt injection only (implicit) | `memory_list` gives the model explicit, filtered read access |
+| Tier-store rejected writes | Returned an unpersisted `MemoryEntry` (dishonest success) | Return `None` → tool reports `success=False` |
+| Slow/hanging memory store | Would have blocked the calling tool for the generic 10s tool timeout | Fails honestly at `MEMORY_WRITE_TIMEOUT_S` (3s) |
+| Registry | 36 tools | 38 tools (audit tests updated) |
+
+### 16.4 Tests added — `tests/test_memory_tools.py` (20)
+
+Registration (38 unique names) and schema/permission contract; long-tier and
+permanent-tier store success (default categories `summary`/`fact`, data
+payload); missing/oversized content, unknown tier/category, permanent-tier
+category restriction, invalid importance; honest failure on repository
+rejection (save → False → None) and repository exception; bounded execution
+against a hanging repository (timeout surfaces as honest failure);
+owner-scoping (owner 2 cannot see owner 1's entries); repository-level
+duplicate-content dedup (idempotent writes); list rendering with tier and
+query filters, empty-state, unknown tier/limit validation, bounded read; and
+the resolver contract (engine manager preferred, in-memory fallback only when
+the engine is unreachable).
+
+### 16.5 Executed validation (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_memory_tools.py -q -p no:cacheprovider` | **20 passed** |
+| `.venv/bin/python -m pytest tests/test_37_ai_memory_db.py tests/test_tool_health_audit.py tests/test_capability_exposure_tools.py tests/test_10_tool_calls.py tests/test_confirmation_roundtrip.py tests/test_settings_unknown_key.py tests/test_settings_model_key_contract.py tests/test_remediation_rc6_a123.py -q -p no:cacheprovider` | **211 passed, 1 warning** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1746 passed, 23 skipped, 1 warning in 63.88s** |
+| `.venv/bin/python -m py_compile backend/ai/tools/memory.py backend/ai/tools/registry.py backend/ai/tools/executor.py backend/ai/memory/limits.py backend/ai/memory/manager.py backend/ai/memory/long.py backend/ai/memory/permanent.py tests/test_memory_tools.py` | OK |
+| `git diff --check` | clean |
+
+### 16.6 Security / architecture impact
+
+- Single memory authority preserved: tools call the manager the Engine owns;
+  no new manager, no new repository, no second state. `test_resolver_*` pins
+  this.
+- Owner-scoped by construction (`context.owner_id` on every write/read);
+  cross-owner isolation covered by test.
+- WRITE permission is READ_WRITE (auto-executable): memory writes have no
+  Telegram side effect, are owner-scoped, size- and time-bounded — the same
+  authorization class as bio/username writes, consistent with the
+  executor's documented model (owner's outgoing message IS the
+  authorization; DANGEROUS/ADMIN_ONLY semantics unchanged).
+- The model-facing description discourages storing secrets; content is
+  capped at `MAX_MEMORY_ENTRY_CHARS` and the write is time-bounded.
+- Retrieval-side bounds (records, token budget, ordering, dedup) were
+  already pinned by `test_37_ai_memory_db.py` and are unaffected (verified:
+  211-test adjacent run green, including "no writes during normal
+  execution").
+
+### 16.7 Limitations / unverified
+
+- Live Telegram / live Supabase verification: **NOT performed** (no
+  credentials in this workspace). Persistence is verified through the
+  in-memory repository and the Supabase repository's existing unit coverage;
+  a live `ai_memories` round-trip remains unverified.
+- The model must CHOOSE `memory_store` — no deterministic parser route was
+  added (memory phrasing is open-ended; the provider path with the
+  registered tool schema is the authority, consistent with the
+  task-management routing precedent in `actions.py`).
+- ShortMemory remains per-request RAM-only by design and is intentionally
+  not tool-exposed.

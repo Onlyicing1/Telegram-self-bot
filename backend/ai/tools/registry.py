@@ -150,6 +150,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     )
     from backend.ai.tools.retrieve_save import RetrieveSaveTool
     from backend.ai.tools.message import SendMessageTool
+    from backend.ai.tools.memory import MemoryListTool, MemoryStoreTool
 
     if context.telegram is None and context.client is not None:
         from backend.telegram_api import TelegramAPI
@@ -199,5 +200,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(TaskTransitionTool(context))
     registry.register(RetrieveSaveTool(context))
     registry.register(SendMessageTool(context))
+    registry.register(MemoryStoreTool(context))
+    registry.register(MemoryListTool(context))
 
     return registry

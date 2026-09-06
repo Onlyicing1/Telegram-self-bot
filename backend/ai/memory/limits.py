@@ -24,8 +24,9 @@ MAX_MEMORY_PROMPT_TOKENS = DEFAULT_MAX_MEMORY_TOKENS  # 1000
 # ── Write bounds ──
 MAX_MEMORY_ENTRY_CHARS = 2000      # per-entry content cap (rejected, never truncated)
 
-# ── Latency bound ──
+# ── Latency bounds ──
 MEMORY_READ_TIMEOUT_S = 2.0        # bounded memory retrieval inside the dispatcher
+MEMORY_WRITE_TIMEOUT_S = 3.0       # bounded memory_store/memory_list tool execution
 
 
 def fit_entries_to_token_budget(
