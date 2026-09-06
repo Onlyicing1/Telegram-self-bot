@@ -8,12 +8,33 @@ the normalized result into text the reasoning model can cite honestly.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _MAX_LISTED = 8
 _MAX_SNIPPET = 220
+_MAX_REASON = 200
+
+_SENSITIVE_HEADER_RE = re.compile(
+    r"(?i)\b(x-api-key|authorization|cookie|set-cookie)\b\s*[:=]\s*\S+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+\S+")
+
+
+def sanitize_reason(exc: BaseException) -> str:
+    """Bounded, secret-free description of an unexpected failure.
+
+    Exception type + message, whitespace-collapsed and truncated. Providers
+    never embed credentials in error strings (tested), but the message text
+    is untrusted input at this boundary, so header-style credentials are
+    redacted defensively before the reason reaches the model.
+    """
+    text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _SENSITIVE_HEADER_RE.sub(r"\1=[REDACTED]", text)
+    return " ".join(text.split())[:_MAX_REASON]
 
 
 async def do_web_search(
@@ -45,11 +66,12 @@ async def do_web_search(
             include_domains=include_domains,
         )
     except Exception as exc:
-        logger.warning("web_search: manager call failed: %s", type(exc).__name__)
-        return False, "❌ Web search failed.", {}
+        reason = sanitize_reason(exc)
+        logger.warning("web_search: manager call failed: %s", reason)
+        return False, f"❌ Web search failed: {reason}.", {}
 
     if not isinstance(result, dict):
-        return False, "❌ Web search returned an invalid result.", {}
+        return False, f"❌ Web search returned an invalid result ({type(result).__name__}).", {}
 
     if not result.get("success"):
         error = str(result.get("error") or "unknown error")

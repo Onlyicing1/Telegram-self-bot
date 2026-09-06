@@ -237,8 +237,14 @@ class SettingsGetTool(Tool):
             from backend.ai import config_store
             try:
                 config = await config_store.get_config(context.owner_id)
-                value = config.get(key, "")
-                return ToolResult(success=True, message=f"{key} = {value}", data={"key": key, "value": str(value)})
+                if key in config and config[key] not in (None, ""):
+                    value = str(config[key])
+                    return ToolResult(success=True, message=f"{key} = {value}", data={"key": key, "value": value})
+                return ToolResult(
+                    success=False,
+                    message=f"{key} is not set (no value stored for this AI runtime key).",
+                    data={"key": key, "value": ""},
+                )
             except Exception as exc:  # noqa: BLE001
                 return ToolResult(success=False, message=f"Settings get failed: {exc}")
 

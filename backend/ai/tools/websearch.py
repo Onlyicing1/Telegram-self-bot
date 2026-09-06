@@ -105,6 +105,7 @@ class WebSearchTool(Tool):
                 include_domains=domains,
                 provider_manager=runtime_manager,
             )
-        except Exception:
-            return ToolResult(success=False, message="❌ Web search failed.")
+        except Exception as exc:
+            reason = web_search_service.sanitize_reason(exc)
+            return ToolResult(success=False, message=f"❌ Web search failed: {reason}.")
         return ToolResult(success=ok, message=text, data=data)

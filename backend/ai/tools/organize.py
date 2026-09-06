@@ -2,7 +2,9 @@
 Organize tools — wrap ``organize_service`` functions.
 
 ``OrganizeListTool`` is READ_ONLY. ``OrganizeCleanTool`` is DANGEROUS —
-the AI must ask the owner for confirmation before purging old logs.
+the ToolExecutor executes it directly (the owner's outgoing message is
+the authorization); the cleanup is bounded deterministically by the
+service's argument validation.
 """
 from __future__ import annotations
 

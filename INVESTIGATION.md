@@ -206,7 +206,7 @@ Key invariants (verified in source):
 - Implementation: `WebSearchTool` (`backend/ai/tools/websearch.py`); `web_search_service.do_web_search` → `ProviderManager.web_search`.
 - Permission: READ_ONLY. Arguments: `{query, count? (1..100, default 10), freshness? (day/week/month/year), include_domains?}`.
 - **Key dependency**: without `YDC_API_KEY` the tool returns an honest failure (tested: `test_web_search_failure_is_honest_without_configuration`); the tool is always registered and exposed regardless. Env key unreadable in this workspace → live behavior UNKNOWN.
-- Minor: the concrete failure reason is swallowed into a generic `❌ Web search failed.` (see A-3).
+- Failure reasons: catch-all errors now surface a bounded, secret-redacted reason — `❌ Web search failed: <type>: <message>.` (see A-3, fixed); provider-level dict errors already flowed through `⚠️ Web search failed: {error}` unchanged.
 
 #### create_task — REAL_CONNECTED
 - Purpose: Durable automation/task creation (time or event trigger + 1–5 actions).
@@ -343,9 +343,9 @@ Previous INVESTIGATION.md classified `task_list`/`task_inspect`/`task_transition
 - Impact: the owner EXPLICITLY confirms (ADMIN_ONLY round-trip) a change that silently never happens; the AI is told it succeeded. Same defect class as the provider/model phantom-pair issue. Fix belongs at the service/tool boundary: reject unknown keys before write.
 - Fix (2026-09-05, committed): `settings_service.set_setting` now fails closed FIRST for keys outside `_DEFAULTS` (new `known_keys()` / `is_valid_key()` — allowlist derived from the existing column/defaults table, no duplicated names); `SettingsSetTool` rejects unknown panel keys with an explicit message before calling the service; the web `/api/settings` PATCH now returns HTTP 400 for unknown keys automatically. No DB write attempt, no cache pollution. Regression tests: `tests/test_settings_unknown_key.py` (9 tests — including the web `PATCH /api/settings` fail-closed boundary). See IMPLEMENTATION_REPORT.md.
 
-### RC-6 — DANGEROUS permission docstring drift (source-proven, NOT fixed — documentation only)
+### RC-6 — DANGEROUS permission docstring drift (source-proven, FIXED — documentation only)
 - `ToolExecutor._is_auto_executable()` auto-executes READ_ONLY / READ_WRITE / DANGEROUS (owner message = authorization; deterministic argument validation in the tools themselves) — this is the documented, tested, intended behavior (IMPLEMENTATION_REPORT.md §6).
-- But `backend/ai/tools/base.py` PermissionLevel docstring (“DANGEROUS → AI must ask the owner first”) and the module docstrings of `delete.py` / `organize.py` (“the AI must ask the owner for confirmation before calling them”) still claim otherwise. No behavior change is proposed — only the docstrings are stale.
+- Fixed (2026-09-06): the `backend/ai/tools/base.py` PermissionLevel docstring and the module docstrings of `delete.py` / `organize.py` now state the REAL authorization model (owner's outgoing message = authorization; DANGEROUS executes directly; only ADMIN_ONLY / CONFIRMATION_REQUIRED go through the owner-confirmation round-trip via `execute_confirmed`). Executor logic untouched. Pinned by `tests/test_remediation_rc6_a123.py` (direct-execution matrix + ADMIN_ONLY/CONFIRMATION_REQUIRED gating + docstring drift guard).
 
 ### RC-7 — Model-facing settings key contract gap: `ai_model` vs `model` (live failure, FIXED)
 - Live failure: the owner asked the AI to change the model; the AI called
@@ -580,12 +580,12 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 ### 17.2 New findings (proven this session)
 
 - **F-1 / RC-5 — `settings_set` phantom success on unknown keys** (reproduced in-process; see RC-5). Source: `settings_service.set_setting` had no key allowlist and fell back to a cache write + `True`. **FIXED 2026-09-05** — unknown keys are rejected before validation/repo/cache at both the service and tool boundaries; 9 regression tests.
-- **F-2 / RC-6 — DANGEROUS permission docstring drift** (see RC-6). Behavior intentional; docstrings stale.
+- **F-2 / RC-6 — DANGEROUS permission docstring drift** (see RC-6). Behavior intentional; docstrings stale. **FIXED 2026-09-06** — docstrings aligned with the executor's real authorization model; behavior untouched; pinned by `tests/test_remediation_rc6_a123.py`.
 - **F-3 / RC-7 — model-facing settings key contract gap** (live failure; see RC-7). The AI generated `key="ai_model"` for a model change; the backend correctly failed closed (RC-5). **FIXED 2026-09-06** — settings tool schemas enumerate the canonical keys (`model`/`provider`, disambiguated), the prompt renders `Model:`/`Provider:` labels, and `ai_model` remains rejected as unknown; 7 regression tests in `tests/test_settings_model_key_contract.py`.
-- **A-1 — `delete_messages_by_ids` description overclaims turn-scoped ID provenance** ("MUST have been returned by list_recent_messages in this turn" is prompt guidance; the enforced boundary is re-fetch + outgoing-only + same chat). P3.
-- **A-2 — `settings_get` on an unset AI key returns success with an empty value** (`config.get(key, "")` → `key = `). P3.
-- **A-3 — `web_search` swallows the concrete failure reason** into a generic `❌ Web search failed.` (exception type logged only). P3.
-- **A-4 — `save`/`save_by_link` long_running exemption** is bounded only by the 60 s request-level `wait_for` (plus 120 s pending-input expiry), not by a tool timeout. P3 design constraint.
+- **A-1 — `delete_messages_by_ids` description overclaims turn-scoped ID provenance** ("MUST have been returned by list_recent_messages in this turn" is prompt guidance; the enforced boundary is re-fetch + outgoing-only + same chat). P3. **FIXED 2026-09-06** — description now states the enforced boundary (re-fetch + re-validate before deletion; invalid/non-outgoing IDs skipped and reported); implementation untouched, pinned by `tests/test_remediation_rc6_a123.py`.
+- **A-2 — `settings_get` on an unset AI key returns success with an empty value** (`config.get(key, "")` → `key = `). P3. **FIXED 2026-09-06** — an unset/empty AI key now returns `success=False` with `<key> is not set (no value stored for this AI runtime key).`; set keys are unchanged; panel routing and RC-5 fail-closed behavior untouched; pinned by `tests/test_remediation_rc6_a123.py`.
+- **A-3 — `web_search` swallows the concrete failure reason** into a generic `❌ Web search failed.` (exception type logged only). P3. **FIXED 2026-09-06** — both catch-alls (service + tool) now surface `❌ Web search failed: <Type>: <message>.` through the new bounded `web_search_service.sanitize_reason()` (whitespace-collapsed, ≤200 chars, header/Bearer credentials redacted defensively); provider dict errors still flow via `⚠️ Web search failed: {error}`; no secrets in output (pinned by tests, including a redaction test).
+- **A-4 — `save`/`save_by_link` long_running exemption** is bounded only by the 60 s request-level `wait_for` (plus 120 s pending-input expiry), not by a tool timeout. P3 design constraint. Re-examined 2026-09-06: NOT a correctness defect — a tool-level timeout would abort legitimate large Deep Saves mid-transfer; left as documented bounded design.
 - **No security regressions found**: ToolExecutor fail-closed paths (unknown tool, malformed args, non-object args), `MAX_TOOLS_PER_TURN=5`, `MAX_TOOL_ROUNDS=3`, per-tool timeouts, outgoing-only deletes, data-minimized `account_show`/`get_bio`, trusted-destination `send_message`/`retrieve_save` — all verified in source. The confirmation store is owner+chat scoped, single-use, 120 s TTL, exact-phrase, frozen-argument; `execute_confirmed` is the only gate bypass and only the Dispatcher calls it with a consumed `PendingConfirmation`.
 
 ### 17.3 Verification status of the 36-tool matrix (2026-09-05)
@@ -610,6 +610,7 @@ persisted ai_config (config_store) → apply_persisted_config (boot via supervis
 | provider/model runtime switching + menu/runtime/settings_get consistency | SOURCE-VERIFIED + TESTED (in-process) |
 | F-1 phantom success on unknown settings keys | SOURCE-VERIFIED + REPRODUCED IN-PROCESS + FIXED + TESTED (8 new tests, 2026-09-05) |
 | RC-6 DANGEROUS docstring drift | SOURCE-VERIFIED |
+| RC-6 / A-1 / A-2 / A-3 remediation (2026-09-06) | SOURCE-VERIFIED + TESTED (15 new tests in `tests/test_remediation_rc6_a123.py`; full suite 1726 passed, 23 skipped) |
 | Full suite | 1695 passed, 23 skipped (2026-09-05) |
 | Git remote state | REMOTE-VERIFIED (`ls-remote` == HEAD, pre- and post-push) |
 | Live Telegram «تأیید» round-trip, live provider/model switch, live menu rendering, live Supabase | **UNVERIFIED** (no credentials/runtime in this workspace) |

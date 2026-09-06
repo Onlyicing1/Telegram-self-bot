@@ -1,8 +1,10 @@
 """
 Delete tools — wrap ``delete_service.do_del_n`` and ``do_del_id``.
 
-These tools are classified as DANGEROUS. The AI must ask the owner for
-confirmation before calling them.
+These tools are classified as DANGEROUS. The ToolExecutor executes them
+directly: in this single-owner self-bot the owner's outgoing message is
+the authorization, and every deletion is bounded deterministically inside
+the tool/service (re-fetch + outgoing-only + same chat).
 """
 from __future__ import annotations
 

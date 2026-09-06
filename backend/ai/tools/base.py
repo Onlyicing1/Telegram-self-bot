@@ -42,11 +42,19 @@ from typing import Any, Protocol, runtime_checkable
 class PermissionLevel(str, Enum):
     """Safety classification for tools.
 
-    The AI Core checks this before executing a tool:
-      - READ_ONLY / READ_WRITE  → AI can call autonomously.
-      - DANGEROUS               → AI must ask the owner first.
-      - ADMIN_ONLY              → AI must ask the owner first.
-      - CONFIRMATION_REQUIRED   → Always ask, regardless of base level.
+    The ToolExecutor — the sole caller of ``tool.execute()`` — applies this
+    before executing. In this single-owner self-bot the owner's outgoing
+    message IS the authorization, so:
+
+      - READ_ONLY / READ_WRITE / DANGEROUS → execute directly. DANGEROUS
+        is NOT held behind an extra confirmation round-trip; its destructive
+        effect is bounded deterministically inside the tool/service itself
+        (e.g. deletes re-fetch every ID and enforce outgoing-only).
+      - ADMIN_ONLY            → never auto-executed; the Dispatcher must
+        surface an owner confirmation and re-issue the stored call via
+        ``ToolExecutor.execute_confirmed()``.
+      - CONFIRMATION_REQUIRED → same confirmation gate regardless of the
+        tool's base level.
     """
     READ_ONLY = "read_only"
     READ_WRITE = "read_write"

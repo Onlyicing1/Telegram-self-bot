@@ -221,11 +221,11 @@ class DeleteMessagesByIdsTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Delete specific outgoing messages by their message IDs. The IDs "
-            "MUST have been returned by list_recent_messages in this turn — "
-            "never invent IDs. Only outgoing (owner-sent) messages in the "
-            "current chat are deleted; every ID is re-validated locally and "
-            "invalid/non-outgoing IDs are skipped."
+            "Delete specific outgoing messages by their message IDs. Use IDs "
+            "from list_recent_messages — never invent IDs. Only outgoing "
+            "(owner-sent) messages in the current chat are deleted; every ID "
+            "is re-fetched and re-validated before deletion, and invalid/"
+            "non-outgoing IDs are skipped and reported."
         )
 
     @property
