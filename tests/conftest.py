@@ -19,6 +19,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def pytest_configure(config):
+    """Register custom markers (no pytest.ini/setup.cfg/pyproject.toml exists)."""
+    config.addinivalue_line(
+        "markers",
+        "live_supabase: opt-in live integration test against a real Supabase "
+        "database (requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY; skips otherwise)",
+    )
+
+
 @pytest.fixture
 def event_loop():
     loop = asyncio.new_event_loop()
