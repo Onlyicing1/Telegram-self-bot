@@ -7,12 +7,12 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Report type | Current-state implementation report — memory persistence/repository compatibility with the fixed `public.ai_memories` schema (this session); §4–§16 below are retained historical audits from prior sessions |
-| This session's change | Memory persistence/repository schema-compatibility fix + 27 focused regression tests (`tests/test_memory_repository_supabase.py`). Production: `backend/ai/database/memory_repository.py`, `backend/ai/persistence.py`. Doc: `DATABASE_ARCHITECTURE.md` (one metadata-default cell) |
+| This session's change | Memory persistence/repository schema-compatibility fix + 27 focused regression tests (`tests/test_memory_repository_supabase.py`). Production: `backend/ai/database/memory_repository.py`, `backend/ai/persistence.py`. Doc: `DATABASE_ARCHITECTURE.md` (one metadata-default cell). Follow-ups (2026-09-06): source-level live-integration audit of the production memory path (§3.10), then opt-in LIVE Supabase integration-test mechanism (§3.11 — `tests/test_live_supabase_memory.py` + marker registration) |
 | Date | 2026-09-06 |
-| Status | **COMPLETE — in-process tests verified. LIVE SUPABASE VERIFICATION: NOT PERFORMED** (no live credentials in this workspace) |
-| Commit (this session) | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`) |
-| Push result | `3ae2e44..f6c3bcc main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
-| Remote `refs/heads/main` | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (authoritative `ls-remote`) |
+| Status | **COMPLETE — in-process tests verified. LIVE SUPABASE EXECUTION: BLOCKED in this workspace** (opt-in test implemented; real run requires `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, which are absent here — the test skips honestly) |
+| Commit (this session) | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`); latest delivery `0944e6ecad1dece76edb84df79e405b8ecff966f` (`test: add opt-in live Supabase integration test for AI memory`) |
+| Push result | `ed67d28..0944e6e main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
+| Remote `refs/heads/main` | `0944e6ecad1dece76edb84df79e405b8ecff966f` (authoritative `ls-remote`, post-push) |
 
 ## 2. EXECUTIVE SUMMARY
 
@@ -24,7 +24,9 @@
 - Honest failure semantics preserved: repository rejection/exception → `save()` returns `False` → tier store returns `None` → `memory_store` reports `success=False`. `MEMORY_WRITE_TIMEOUT_S = 3.0` unchanged.
 - Owner isolation, the single MemoryManager authority, the in-memory fallback, and the `memory_store`/`memory_list` tool behavior are unchanged. No SQL was executed; no migration was created; no schema was modified.
 
-Full suite: **1773 passed, 23 skipped** (this session). Live Supabase verification was NOT performed.
+Full suite: **1773 passed, 23 skipped** (this session). Live Supabase verification was NOT performed. A follow-up source audit (§3.10) verified the production write/read path through the real Supabase client wiring and established that NO safe live-test mechanism exists in this architecture, so none was added — live verification remains NOT PERFORMED.
+
+Follow-up (§3.11): the smallest safe opt-in live-test mechanism was then implemented (`tests/test_live_supabase_memory.py`, `@pytest.mark.live_supabase`). In this workspace it SKIPS honestly — `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are absent — so no live claim is made. Full suite with the new test: **1773 passed, 24 skipped** (23 pre-existing + 1 live skip).
 
 ## 3. CURRENT STATE — MEMORY REPOSITORY SCHEMA COMPATIBILITY (2026-09-06)
 
@@ -102,6 +104,99 @@ Exact commands and real results (this session, `.venv/bin/python`, pytest 9.x, `
 - Commit: `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`, 4 files, +610/−11)
 - Push: `3ae2e44..f6c3bcc main -> main` — succeeded, independently verified (`git fetch origin`; `rev-parse HEAD` == `rev-parse origin/main` == `git ls-remote origin refs/heads/main` == `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b`).
 - Working tree after delivery: clean except pre-existing untracked `telegram-self-bot/` (nested clone, untouched).
+
+### 3.10 Live-integration verification audit (2026-09-06)
+
+Source-level audit of the REAL production path (no code changed, no live execution). Task rule applied: a live test is added ONLY if the repository already has an established safe way to run against real Supabase credentials — it does not, so none was added (see assessment below).
+
+**Verified production WRITE path (source-traced):**
+
+```
+memory_store tool (backend/ai/tools/memory.py)
+  → _resolve_memory_manager() → Engine.memory_manager (engine.py:96-111)
+  → MemoryManager.store_long / store_permanent (memory/manager.py)
+  → LongMemory.store / PermanentMemory.store (long.py:59-66, permanent.py)
+  → SupabaseMemoryRepository.save — selected by RepositoryManager when
+    SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are set (database/manager.py)
+  → backend.ai.persistence._save_memory_sync
+  → _get_db() → backend.db.client.get_db() → supabase.create_client(...)
+  → INSERT into public.ai_memories with exactly the 7 app-owned columns
+    (owner_id, tier, category, content, importance, expires_at, metadata)
+```
+
+Pre-write idempotency: `save()` probes `_query_memories_sync(owner_id, tier, limit=1, content=...)` (content-equality filter) — an identical (owner, tier, content) row is found regardless of rank and never re-inserted. `owner_id` always comes from the tool context, never from model input.
+
+**Verified production READ path (source-traced):**
+
+```
+public.ai_memories rows
+  → persistence._query_memories_sync — SELECT * filtered by owner_id (+ optional
+    tier/category/content equality, min_importance gte); ORDER BY importance DESC,
+    created_at DESC, id; LIMIT
+  → SupabaseMemoryRepository.query — exact nine-column row reconstruction
+    (NULL importance → 0.5 schema default; stored 0.0 preserved; NULL
+    expires_at/metadata preserved; DB-generated id/created_at read back)
+  → LongMemory.retrieve / PermanentMemory.retrieve_all
+  → memory_list tool / MemoryManager.retrieve_for_prompt
+```
+
+**Verified ancillary operations (source):** `delete(entry_id)` (`eq("id", ...)` on the database-generated id), `delete_expired(tier)` (`eq tier` + `lt expires_at now`), `count(owner_id, tier)` (`count="exact"`, owner-filtered) — all owner-scoped where applicable. RLS: the backend uses the service-role key by design (bypasses RLS); the client-role policy lockdown described by the user is orthogonal and untouched.
+
+**Live-test path assessment — NO established safe mechanism exists:**
+
+- `tests/conftest.py` states fixtures are "in-memory (no-network) instances of every subsystem, so tests run deterministically without Supabase, Telegram, or external AI providers".
+- No `pytest.ini`/`setup.cfg`/`pyproject.toml` marker registration, no `-m live` or equivalent opt-in gate anywhere in the suite.
+- No existing test constructs a real Supabase client; the only `os.getenv` usage in tests is `patch("os.getenv", return_value="")` (absence mocking). All Supabase behavior tests inject a recording fake via `monkeypatch.setattr("backend.ai.persistence._get_db", ...)`.
+- No `scripts/` utility or standalone live-verification entry point exists.
+
+**Conclusion:** per the task's stop condition, a live test was NOT added. Precisely what is missing for a future safe live test (reported, not built): (1) an opt-in gate — a `live` pytest marker (or separate `tests_live/` directory) that the default run never collects; (2) a credential-presence skip that never reads/prints secret values; (3) a self-cleaning data contract — dedicated test `owner_id` distinct from the real owner, unique content marker, teardown deletes; (4) live credentials in the execution environment (unavailable in this workspace — env access blocked by the sandbox).
+
+**What remains unverified (unchanged):** real PostgREST round-trip (write → read → dedup → NULL/default handling) against the live `ai_memories` table, actual jsonb/timestamptz row shapes as returned by the REST API, and service-role RLS bypass in production. The fake-client tests approximate these but cannot prove them.
+
+**Tests executed this audit (no production code changed):** focused memory suites (`test_memory_repository_supabase.py` + `test_memory_tools.py` + `test_37_ai_memory_db.py`) — **64 passed**; full suite — **1773 passed, 23 skipped, 1 warning in 63.73s**. `git diff --check` clean.
+
+### 3.11 Opt-in LIVE Supabase integration-test mechanism (2026-09-06)
+
+Implements the smallest safe opt-in live-test mechanism requested after §3.10. No production code, schema, migration, or RLS change.
+
+**Files changed:**
+
+| Path | Change |
+|---|---|
+| `tests/test_live_supabase_memory.py` | NEW — opt-in live test driving the REAL production path (`SupabaseMemoryRepository` → `backend.ai.persistence` → `backend.db.client.get_db()` → real `supabase.create_client`) against the existing `public.ai_memories` table |
+| `tests/conftest.py` | `pytest_configure` registers the `live_supabase` marker (no `pytest.ini`/`setup.cfg`/`pyproject.toml` exists in this repo, so the conftest hook is the established mechanism) |
+
+**Opt-in gating (normal suite never performs live operations):**
+
+- `@pytest.mark.live_supabase` on the test.
+- Module-level `skipif(not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY))` — honest SKIP with reason when either credential is absent; secrets are never read into test output, printed, or asserted on.
+- Explicit run: `SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... pytest tests/test_live_supabase_memory.py -m live_supabase -v`.
+
+**What the live test verifies (when executed with real credentials):**
+
+- **A. REAL INSERT** — long-tier memory through `repo.save()`; success asserted; read-back row has a real database-generated bigint `id`, a real `created_at`, and correct `owner_id`/`tier`/`category`/`content`/`importance`/`expires_at`/`metadata`.
+- **B. REAL SELECT** — exact record retrievable through `repo.query()`.
+- **C. REAL NULL/DEFAULT** — the repository path always serializes `importance` (never NULL), so the ONE controlled direct insert uses the same production service-role client to create a NULL-importance/NULL-expires/NULL-metadata row; reconstruction through the repository read path must map importance → 0.5 (schema default, never 0.0) and preserve NULL expires_at/metadata. Schema defaults untouched.
+- **D. REAL DUPLICATE IDEMPOTENCY** — second identical (owner, tier, content) `save()` creates no new row; `count()` stays stable.
+- **E. REAL OWNER ISOLATION** — owner B's repository query cannot see owner A's rows (repository `owner_id` scoping, asserted independently of RLS).
+- **F. REAL DELETE** — `repo.delete(<database-generated id>)`; record no longer retrievable.
+- **G. CLEANUP** — `finally`-based; strictly limited to rows created by this test (tracked ids + owner+content-scoped fallback; never tier/category-broad, never other owners). Cleanup failures are reported explicitly (pytest.fail when the body passed; stderr note when the body already failed).
+- **H. RLS / ACCESS PATH** — same service-role configuration as production; no client policies created, RLS not disabled; the client is asserted non-None and the round-trip itself proves service-role access.
+
+Test-only data: runtime-generated NEGATIVE `owner_id`s (never real Telegram ids) and a unique content marker (`live-supabase-memory-<uuid hex>`), so production rows cannot collide.
+
+**Exact live-test result in THIS workspace: `1 skipped`** — `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are absent from the execution environment (`os.getenv` probe returned False; the sandbox blocks env access). **Live execution was NOT performed and is NOT claimed.** The skip reason is explicit and the mechanism is ready to run wherever credentials exist.
+
+**Verification categories (explicit distinction):**
+
+| Category | State |
+|---|---|
+| Migration / schema change | NONE — no migration created, no schema object modified |
+| Manual Supabase change (performed OUTSIDE this repository, by the owner, previously reported) | `ai_memories` table verified with the 9 fixed columns; PK on `id`; indexes `(owner_id, tier)` and `(importance)`; RLS enabled; public SELECT policy for anon/authenticated REMOVED; ALL direct table privileges revoked from anon/authenticated; no client-role INSERT/UPDATE/DELETE policies; backend uses the service-role path (RLS bypass by design) |
+| Live Supabase verification | NOT PERFORMED in this workspace — credentials absent; opt-in test skips honestly |
+| Unit / in-process verification | GREEN — focused memory suites 64 passed; full suite 1773 passed, 24 skipped (23 pre-existing + 1 live skip), 1 warning in 63.39s |
+
+**Remaining limitation:** the live test's assertions are only exercised when it actually runs with real credentials. Until then, the real PostgREST round-trip (write → read → dedup → NULL/default → isolation → delete) remains unverified.
 
 ---
 
