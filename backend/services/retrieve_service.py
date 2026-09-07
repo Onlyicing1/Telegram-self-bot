@@ -122,7 +122,11 @@ async def do_retrieve(self_client, owner_id: int, save_code: str, target_chat: i
         logger.error("retrieve db error: %s", exc)
         record_event("database", "query_save", 0, "ERROR", str(exc))
         return f"❌ DB error: {exc}"
-    if not row:
+    # Owner isolation, identical to do_rename/do_move/do_delete: checked
+    # BEFORE any Telegram side effect (entity resolution / forwarding) and
+    # reported with the same not-found wording so another owner's item is
+    # never distinguishable from a missing one.
+    if not row or row.get("owner_id") != owner_id:
         return f"❌ No item found for `{save_code}`"
 
     saved_chat_id = row.get("saved_chat_id")
