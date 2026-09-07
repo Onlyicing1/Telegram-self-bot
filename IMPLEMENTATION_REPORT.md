@@ -600,3 +600,73 @@ the engine is unreachable).
 | Validation on the committed tree | `tests/test_memory_tools.py` 20 passed; adjacent set (memory DB, tool health audit, capability exposure, tool calls, confirmation round-trip, settings RC-5, RC-6/A-1/A-2/A-3) 211 passed; full suite **1746 passed, 23 skipped** in 63.76s; `py_compile` OK on all changed modules; `git diff --check` clean |
 | Working tree after delivery | clean except the pre-existing untracked nested clone `telegram-self-bot/` (separate stale repository, intentionally untouched) |
 | Not verified | Live Telegram / live Supabase round-trip (no credentials in this workspace) |
+
+---
+
+## 17. SAVED-ITEM RETRIEVAL OWNER ISOLATION — 2026-09-07
+
+### 17.1 Exact defect
+
+`retrieve_service.do_retrieve(client, owner_id, save_code, chat_id)` looked up the
+`saved_items` row by `save_code` alone and forwarded it without ever comparing
+`row["owner_id"]` to the trusted `owner_id`. The `retrieve_save` AI tool passes the
+trusted `context.owner_id`, but the service ignored it for authorization — so a
+save-code collision with another owner's row would forward that row to the
+requesting chat.
+
+### 17.2 Root cause
+
+`do_retrieve` was the only saved-item operation missing the ownership gate that
+`do_rename` / `do_move` / `do_delete` already enforce
+(`if not row or row.get("owner_id") != owner_id`). The Retrieve audit
+(section on retrieval/file-retrieval, previous session) flagged this as the one
+real gap in an otherwise sound chain.
+
+### 17.3 Fix (before / after)
+
+| | Behavior |
+|---|---|
+| **Before** | Any row matching the save code was forwarded: `get_input_entity` + `forward_messages` ran regardless of `owner_id`. |
+| **After** | `do_retrieve` returns the established not-found wording `❌ No item found for \`{save_code}\`` when `not row or row.get("owner_id") != owner_id` — BEFORE any `get_input_entity` / `forward_messages` / caption edit. Cross-owner rows are indistinguishable from missing rows (no data leak). Missing/absent `owner_id` fails closed. Authorized-owner success behavior is byte-identical to before. |
+
+### 17.4 Files changed
+
+| File | Change |
+|---|---|
+| `backend/services/retrieve_service.py` | Added owner check in `do_retrieve` before all Telegram side effects (5 insertions, 1 deletion). |
+| `tests/test_retrieve_owner_isolation.py` | New regression suite — 9 tests covering all 8 required cases plus destination-protection pinning. |
+
+### 17.5 Tests added
+
+1. Authorized owner retrieves their own item successfully (`✅`, `forward_messages` called).
+2. Different owner cannot retrieve the item (`❌ No item found …`).
+3. Cross-owner retrieval does NOT call `get_input_entity`.
+4. Cross-owner retrieval does NOT call `forward_messages` (nor `edit_message`).
+5. Missing/absent `owner_id` on the row fails closed.
+6. Unknown code still fails without Telegram side effects.
+7. Cross-owner failure wording is identical to missing-code wording (no data leak).
+8. Full executor → `retrieve_save` tool → service chain returns `success=False` and never touches the Telegram client for a cross-owner row.
+9. Destination protection unchanged (model-supplied `destination`/`chat_id` ignored; trusted context `chat_id` used) and success/result mapping unchanged for authorized owners.
+
+### 17.6 Validation results (committed tree `8c7e705`)
+
+- Focused: `tests/test_retrieve_owner_isolation.py` + `test_capability_exposure_tools.py` + `test_new_tool_action_path.py` → **73 passed** in 0.32s.
+- Full suite: `pytest tests/ -q` → **1782 passed, 24 skipped** in 63.36s.
+- `py_compile` OK on both changed Python files.
+- `git diff --check` clean.
+
+### 17.7 Delivery record (verified)
+
+| Item | Value |
+|---|---|
+| Delivery commit | `8c7e70596239094ae0901db61f1c8aa49b720b53` (`fix: enforce owner isolation for saved-item retrieval`) |
+| Push | `git push origin main` → `83b0dac..8c7e705 main -> main` (non-force fast-forward, succeeded) |
+| Remote proof | `git fetch origin`; `git rev-parse HEAD` == `git rev-parse origin/main` == `git ls-remote origin refs/heads/main` → `8c7e70596239094ae0901db61f1c8aa49b720b53` |
+| Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (separate stale repository, intentionally untouched) |
+
+### 17.8 Explicit statements
+
+- **No database / schema / migration change was made.** `saved_items` schema, RLS, indexes, and `ai_memories` are untouched.
+- **Live Telegram / live Supabase verification was NOT performed** (no credentials in this workspace). The fix is verified through the in-process suite against the seeded in-memory fallback database layer.
+- Bare-number resolution (`379` → `S0379`) was intentionally NOT implemented — it remains a separate future task.
+- Remaining known limitation: `query_save(save_code)` still resolves by code alone (shared with the sibling mutation ops); the owner check now makes a cross-owner collision fail closed instead of forwarding.
