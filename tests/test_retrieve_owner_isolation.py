@@ -229,3 +229,122 @@ async def test_service_failure_mapping_unchanged():
     result = await retrieve_service.do_retrieve(client, OWNER, CODE, CHAT)
     assert result == "❌ Saved location data is missing for this entry."
     client.get_input_entity.assert_not_awaited()
+
+
+# ── canonical Save Code contract (search/list → retrieve_save) ─────────────
+
+
+def _run_search(executor, ctx, query):
+    return _run_tool(executor, ctx, "search", {"query": query})
+
+
+@pytest.mark.asyncio
+async def test_search_results_expose_canonical_save_code():
+    """search output carries the exact canonical code retrieve_save needs."""
+    _seed_row(owner_id=OWNER)
+    ctx = _ctx(owner_id=OWNER)
+    registry, executor = _registry_executor(ctx)
+
+    result = await _run_search(executor, ctx, "cap")
+
+    assert result.success is True
+    assert f"`{CODE}`" in result.message
+    assert "S0001" in result.message
+
+
+@pytest.mark.asyncio
+async def test_list_results_expose_canonical_save_code():
+    _seed_row(owner_id=OWNER)
+    ctx = _ctx(owner_id=OWNER)
+    registry, executor = _registry_executor(ctx)
+
+    result = await _run_tool(executor, ctx, "list_saves", {"limit": 10})
+
+    assert result.success is True
+    assert f"`{CODE}`" in result.message
+
+
+@pytest.mark.asyncio
+async def test_search_is_owner_scoped():
+    """Another owner's matching item never appears in search results."""
+    _seed_row(owner_id=OTHER_OWNER)
+    ctx = _ctx(owner_id=OWNER)
+    registry, executor = _registry_executor(ctx)
+
+    result = await _run_search(executor, ctx, "cap")
+
+    assert result.success is True
+    assert "No matches" in result.message
+    assert "S0001" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_search_then_retrieve_workflow_uses_canonical_code():
+    """End-to-end contract: search output → extract code → retrieve_save.
+
+    The code is taken from the search tool's real output (never invented),
+    then fed to retrieve_save, which must reach the Telegram forward.
+    """
+    import re
+
+    _seed_row(owner_id=OWNER)
+    ctx = _ctx(owner_id=OWNER)
+    ctx.telegram.client.get_input_entity = AsyncMock(side_effect=lambda e: e)
+    ctx.telegram.client.forward_messages = AsyncMock(return_value=MagicMock(id=555))
+    ctx.telegram.client.edit_message = AsyncMock()
+    registry, executor = _registry_executor(ctx)
+
+    found = await _run_search(executor, ctx, "cap")
+    assert found.success is True
+    match = re.search(r"`(S[A-Z0-9]+)`", found.message)
+    assert match is not None, "search output must expose the canonical code"
+    code = match.group(1)
+    assert code == CODE  # the seeded canonical code, nothing synthesized
+
+    result = await _run_tool(executor, ctx, "retrieve_save", {"save_code": code})
+
+    assert result.success is True
+    assert result.data == {"save_code": CODE, "chat_id": CHAT}
+    ctx.telegram.client.forward_messages.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bare_number_not_synthesized_into_save_code():
+    """No numeric alias/padding/prefix: a bare number fails honestly and
+    never touches Telegram — the system never invents a Save Code."""
+    _seed_row(owner_id=OWNER)
+    ctx = _ctx(owner_id=OWNER)
+    ctx.telegram.client.get_input_entity = AsyncMock()
+    ctx.telegram.client.forward_messages = AsyncMock()
+    registry, executor = _registry_executor(ctx)
+
+    for bare in ("123", "0001", "379"):
+        result = await _run_tool(executor, ctx, "retrieve_save", {"save_code": bare})
+        assert result.success is False
+        assert "No item found" in result.message  # honest, no synthesized code
+        assert f"`{bare}`" in result.message
+    # Non-canonical formats (dash-prefixed legacy style) are also rejected
+    # outright without any Telegram side effect.
+    for invalid in ("SV-000379", "S-0379", ""):
+        result = await _run_tool(executor, ctx, "retrieve_save", {"save_code": invalid})
+        assert result.success is False
+    ctx.telegram.client.get_input_entity.assert_not_called()
+    ctx.telegram.client.forward_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_valid_code_is_not_special_cased():
+    """Retrieval works for any real canonical code — no per-code hardcoding."""
+    unusual = "S9Z2K"
+    _seed_row(owner_id=OWNER, code=unusual)
+    ctx = _ctx(owner_id=OWNER)
+    ctx.telegram.client.get_input_entity = AsyncMock(side_effect=lambda e: e)
+    ctx.telegram.client.forward_messages = AsyncMock(return_value=MagicMock(id=555))
+    ctx.telegram.client.edit_message = AsyncMock()
+    registry, executor = _registry_executor(ctx)
+
+    result = await _run_tool(executor, ctx, "retrieve_save", {"save_code": unusual.lower()})
+
+    assert result.success is True
+    assert result.data == {"save_code": unusual, "chat_id": CHAT}
+    ctx.telegram.client.forward_messages.assert_awaited_once()

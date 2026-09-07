@@ -670,3 +670,71 @@ real gap in an otherwise sound chain.
 - **Live Telegram / live Supabase verification was NOT performed** (no credentials in this workspace). The fix is verified through the in-process suite against the seeded in-memory fallback database layer.
 - Bare-number resolution (`379` → `S0379`) was intentionally NOT implemented — it remains a separate future task.
 - Remaining known limitation: `query_save(save_code)` still resolves by code alone (shared with the sibling mutation ops); the owner check now makes a cross-owner collision fail closed instead of forwarding.
+
+
+---
+
+## 18. SAVED-ITEM RETRIEVAL FINALIZATION (canonical Save Code → search/list → retrieve_save) — 2026-09-07
+
+### 18.1 Objective
+
+Finalize and verify the saved-item retrieval flow end-to-end: canonical Save Code → search/list when needed → `retrieve_save` → real Telegram re-send. Source-first verification of every requirement; no production redesign.
+
+### 18.2 Verdict: production source already satisfies every requirement
+
+| Requirement | Source evidence | Status |
+|---|---|---|
+| Owner isolation before Telegram side effects | `retrieve_service.do_retrieve` returns the not-found wording when `not row or row.get("owner_id") != owner_id` BEFORE `get_input_entity`/`forward_messages`/`edit_message` (§17) | Already fixed — left unchanged |
+| Trusted destination only | `RetrieveSaveTool.parameters` exposes ONLY `save_code` (no destination/chat_id parameter exists); destination comes exclusively from `context.extra["chat_id"]` | Already correct — left unchanged |
+| Search/list expose canonical Save Code | `discover_service.format_find_entry`/`format_list_entry` render `` `S0001` `` in backticks; `retrieve_save` parameter description references "from search/list_saves" | Already correct — left unchanged |
+| Owner-scoped search/list | `search_saves`/`list_recent_saves` filter `.eq("owner_id", owner_id)` (Supabase and in-memory fallback both) | Already correct — left unchanged |
+| No bare-number synthesis | `RetrieveSaveTool.execute` only `.strip().upper()` + alnum validation; no prefix/padding/alias/numeric heuristic anywhere on the tool path; `123` → honest "No item found for `123`" | Already correct — left unchanged |
+| Real retrieval side effect | `RetrieveSaveTool` → `retrieve_service.do_retrieve` → `client.forward_messages` (+ caption edit) via the trusted self-client from the supervisor | Already correct — left unchanged |
+| Single retrieval authority | One registry (`create_default_registry`), one executor, one `retrieve_save` tool, one retrieve service | Already correct — left unchanged |
+
+### 18.3 What was actually wrong
+
+Nothing in production. The prior owner-isolation defect (§17) is fixed and verified; the search/list → `retrieve_save` contract is sound in source but was NOT pinned by behavioral regression tests (the §17 suite covered isolation, destination, and mapping, not the canonical-code search/list workflow or non-synthesis guarantees).
+
+### 18.4 What was changed
+
+Tests only — `tests/test_retrieve_owner_isolation.py` (+119 lines, 6 new behavioral tests through the real registry/executor/service path):
+
+1. `test_search_results_expose_canonical_save_code` — `search` output contains the exact `` `S0001` `` code.
+2. `test_list_results_expose_canonical_save_code` — `list_saves` output contains the exact `` `S0001` `` code.
+3. `test_search_is_owner_scoped` — another owner's matching item never appears in `search` results.
+4. `test_search_then_retrieve_workflow_uses_canonical_code` — code is regex-extracted from REAL `search` output, fed to `retrieve_save`, forward asserted — the exact workflow the model must follow.
+5. `test_bare_number_not_synthesized_into_save_code` — `123`/`0001`/`379` fail honestly ("No item found for `123`"), legacy formats (`SV-000379`, `S-0379`, empty) are rejected, and NO Telegram call ever happens.
+6. `test_arbitrary_valid_code_is_not_special_cased` — an unusual real code (`S9Z2K`) retrieves fine; no per-code hardcoding exists.
+
+### 18.5 Validation results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_retrieve_owner_isolation.py -q` | **15 passed** in 0.29s |
+| `pytest tests/test_capability_exposure_tools.py tests/test_new_tool_action_path.py tests/test_memory_tools.py -q` | **84 passed** in 1.54s |
+| `pytest tests/ -q` (full suite) | **1788 passed, 24 skipped, 1 warning** in 63.14s |
+| `py_compile tests/test_retrieve_owner_isolation.py` | OK |
+| `git diff --check` | clean |
+| `git status` | only the test file modified; pre-existing untracked `telegram-self-bot/` untouched |
+
+### 18.6 Security / database
+
+- Owner isolation, trusted-destination, and honest-failure behavior: unchanged (verified in source, pinned by §17 + §18 tests).
+- **NO database / schema / migration change.** `saved_items`, `ai_memories`, RLS, indexes: untouched.
+- **Live Telegram / live Supabase verification: NOT performed** (no credentials in this workspace). All verification is in-process against the seeded in-memory fallback DB layer.
+
+### 18.7 Delivery record (verified)
+
+| Item | Value |
+|---|---|
+| Commit | see delivery commit below |
+| Push | `git push origin main` (non-force fast-forward) |
+| Remote proof | `git fetch origin`; `rev-parse HEAD` == `rev-parse origin/main` == `ls-remote refs/heads/main` (verified post-push) |
+| Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` |
+
+### 18.8 Remaining limitations
+
+- Live Telegram/Supabase round-trip remains unverified in this workspace.
+- Bare-number resolution remains intentionally absent (by design).
+- `query_save` still resolves by code alone (shared with sibling mutation ops); the owner check makes cross-owner collisions fail closed.
