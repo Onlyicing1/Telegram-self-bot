@@ -162,3 +162,123 @@ These are source/in-process checks, not live Telegram, provider-network, or live
 ## Delivery scope
 
 Only `INVESTIGATION.md` is intended to change for this handoff. No backend code, tests, provider configuration, environment file, database schema, migration, or deployment setting is changed. The pre-existing untracked nested `telegram-self-bot/` checkout is unrelated and remains untouched.
+
+---
+
+# Phase 2 Audit — AI Task/Scheduler + Tool Execution Pipeline (2026-09-08)
+
+A NEW source-first audit of the complete existing task/scheduler/tool pipeline on the
+current `main` baseline. No code was modified during this phase. The Phase 1 findings
+above were re-verified against current source; every claim below is re-derived from
+the actual files, not carried forward.
+
+## VERDICT (Phase 2)
+
+The pipeline is implemented, connected, and internally consistent end-to-end.
+Nothing is broken in the traced paths. Two confirmed architectural gaps (dormant
+`ai_instruction`/`preparation_metadata` machinery; event-direction asymmetry) and
+several bounded risks exist — all are limitations, not defects requiring redesign.
+
+## Primary question matrix
+
+| # | Question | Verdict | Evidence (path → mechanism) |
+|---|---|---|---|
+| A | Create durable task with registered tool action | WORKS | `ai/tools/task.py::CreateTaskTool.execute` → `ai/task_interpreter.py::TaskInterpreter.interpret` → `ai/task_candidate.py::TaskCandidate.from_untrusted` → `ai/task_creation.py::TaskCreationService.create` → `ai/database/task_repository.py::create_task` |
+| B | Persist action safely | WORKS | `task_repository._validate_task_input` (bounded JSONB, owner-scoped); schema `supabase/migrations/20260829000001_create_ai_tasks.sql` matches repository validation exactly |
+| C | Wake at correct scheduled time | WORKS | `ai/task_scheduler.py::TaskScheduler.run_once` → `ai/scheduling.py::parse_schedule` + `catch_up_occurrence`; 60s wake interval; DST-safe `_localize` with nonexistent-time normalization |
+| D | Exactly one occurrence created and claimed | WORKS | deterministic `occurrence_key` + unique index `uq_ai_task_occurrences_task_key` + CAS claim (`claim_occurrence` updates `.eq("status", current.status)`) |
+| E | Execute through the SAME ToolExecutor as interactive AI | WORKS | `ai/task_execution.py::TaskExecutionCoordinator.execute` calls `executor.execute_calls(...)` — the identical authority the Dispatcher uses |
+| F | Execute the correct registered tool | WORKS | `ai/tools/executor.py::_execute_single` registry lookup; unknown tool → structured failure, never executed |
+| G | AI-reasoning tools from tasks | PARTIAL — gap confirmed (see §G below) |
+| H | Event-triggered tasks execute the same way | WORKS | `bot/handlers/task_events.py` → `ai/task_event_dispatcher.py::TaskEventDispatcher` → same `TaskExecutionCoordinator` |
+| I | Prevent duplicate execution | WORKS | unique index + dedup-status skip in `_dispatch` + CAS claim as the final race guard |
+| J | Tool failure never reported as success | WORKS | executor never raises; failed `ToolResult` → `TaskExecutionCoordinator.handle_failure` → failed/retry occurrence |
+| K | Three-attempt retry contract | WORKS | `ai/retry.py` `MAX_ATTEMPTS=3`, `can_retry`, 30s→60s backoff; `retry_pending` recovery pass on scheduler start |
+| L | Owner isolation preserved | WORKS | every repository operation filters `.eq("owner_id", owner_id)`; owner identity never comes from model input |
+| M | Survive scheduler polling / runtime lifecycle | WORKS | scheduler owned solely by `RuntimeSupervisor` (`_start_task_scheduler` at READY, `_stop_task_scheduler` in stop); recovery pass; bounded per-wake work |
+| N | Telegram execution inside the Self Bot boundary | WORKS | only `TelegramAPI`/self-client; no arbitrary RPC/SQL/shell/filesystem reachability found from any task path |
+
+## §G — The AI-assisted tool question
+
+**Tool inventory (37 registered via `ai/tools/registry.py::create_default_registry`):**
+all bio/username tools take fully deterministic arguments (template/text/mood
+strings) — no AI reasoning is needed at execution time. The same holds for send,
+save, delete, retrieve, settings, memory, and task-management tools. `web_search`
+is deterministic per query. **No registered tool requires AI interpretation to
+execute from a static action snapshot.**
+
+**Supporting machinery for future AI-reasoning tools exists but is dormant:**
+- The `ai_tasks.ai_instruction` column, `validate_ai_instruction`, and the
+  `TaskCreationService` persistence path exist — but a repository-wide search finds
+  **zero runtime consumers** (no reader of `ai_instruction` anywhere outside
+  validation/persistence).
+- The `preparation_metadata` / `PreparedAction` contract (`ai/task_contract.py`)
+  is validated, persisted, and recovered — **no runtime producer or consumer**.
+- Consequence: if a future tool needs model-generated content at occurrence time,
+  the *transport* exists but the *invocation path* (coordinator → ProviderManager)
+  does not. This is a confirmed architectural gap, currently latent.
+
+**Confirmation gates:** `TaskExecutionCoordinator` calls `execute_calls` without
+`confirmed=True`, so an ADMIN_ONLY/CONFIRMATION_REQUIRED action returns
+`needs_confirmation`, is counted as a failure, retries, and fails after 3 attempts.
+No registered task-relevant tool is ADMIN_ONLY, so no false block today — but it is
+a latent trap if one is registered.
+
+**No arbitrary authority:** `ai/tools/message.py::SendMessageTool` accepts only a
+bounded `text` argument; the destination comes from trusted context
+(`notification_destination.chat_id` or the owner's own chat). Trigger identities are
+runtime-resolved (`ai/task_trigger.py::resolve_trigger_references`); model-invented
+numeric ids are rejected at creation.
+
+## Event-direction finding
+
+`bot/handlers/task_events.py::register` subscribes to `events.NewMessage()` (both
+directions), but `ai/task_trigger.py::_has_condition` treats `direction` as a
+non-condition — so a trigger with `direction: "outgoing"` alone is rejected at
+creation ("needs at least one condition"). Outgoing-trigger tasks are therefore not
+creatable through the AI path. Deterministic and fail-closed, no safety issue — but
+a functional limitation worth knowing.
+
+## Incomplete / risks (ranked)
+
+1. **Dormant AI-task contract** — `ai_instruction` and `preparation_metadata` are
+   validated and persisted but never executed; dead weight until wired.
+2. **Outgoing-only event triggers** are not creatable (condition rule above).
+3. **Static action snapshot** — a later tool rename/contract change fails closed at
+   execution time (by design; no compatibility layer exists).
+4. **Silent failures** — no Telegram notification unless `notify_on_outcome`/
+   `deliver_result` was explicitly opted in; occurrences and logs are the record.
+5. **Supabase fallback divergence** — `SupabaseTaskRepository` degrades to ONE shared
+   in-memory fallback (good), but a fallback write is non-durable and lost on
+   restart; `fallback_active` is surfaced for diagnostics but not user-visible.
+6. **Provider-dependent creation** — interpretation failures prevent creation
+   (fail-closed, correct behavior).
+7. **Event list bound** — `MAX_EVENT_TASKS_PER_MESSAGE = 20`; a 21st+ active event
+   task is silently never matched for that message.
+8. **Encapsulation smell** — `TaskExecutionCoordinator` reaches into
+   `executor._registry` (private attribute) for its fail-closed registry check.
+
+## Ruled out
+
+- No second scheduler, second executor, or second update loop anywhere.
+- No model-invented destinations, ids, or Telegram RPC paths.
+- No false-success path: every failure classifies and persists honestly.
+- No schema/code drift: repository validation ↔ migrations match exactly
+  (statuses, bounds, CHECK constraints, unique index).
+
+## Phase 2 test execution (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_scheduler.py tests/test_task_execution.py tests/test_task_trigger_events.py tests/test_task_send_execution.py tests/test_task_candidate_contract.py tests/test_task_repository.py -q -p no:cacheprovider` | **133 passed in 0.48s** |
+| `.venv/bin/python -m pytest tests/test_task_nl_creation.py tests/test_task_hardening.py tests/test_task_management.py tests/test_taskloom_milestone.py tests/test_task_creation_diagnostics.py tests/test_task_show_intent.py tests/test_task_contract.py -q -p no:cacheprovider` | **94 passed in 2.42s** |
+
+227 task-focused tests, 0 failures. These are source/in-process checks only — no
+live Telegram, provider-network, or live Supabase verification was performed.
+
+## Phase 2 delivery scope
+
+Only `INVESTIGATION.md` changed in this phase (documentation-only). No backend code,
+tests, provider configuration, environment file, database schema, migration, or
+deployment setting was changed. The pre-existing untracked nested `telegram-self-bot/`
+checkout remains untouched.
