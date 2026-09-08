@@ -39,6 +39,7 @@ class TaskScheduler:
         self.outcome_notifier = outcome_notifier
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._recovery_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -62,18 +63,32 @@ class TaskScheduler:
                 pass
 
     async def recover(self) -> int:
-        recovered = 0
-        for occurrence in await self.repository.list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START):
-            if occurrence.status in {"claimed", "running"}:
-                occurrence = await self.repository.transition_occurrence(
-                    self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
-                )
-                if occurrence is None:
+        """Resolve occurrences left unfinished by a previous process.
+
+        Serialized and single-pass: a concurrent recovery returns 0 instead
+        of re-resolving the same occurrences, so attempt counts can never
+        multiply across restarts or racing recoveries. A ValueError from a
+        transition means another writer moved the occurrence first — the
+        persisted state already decides the outcome, so it is skipped.
+        """
+        if self._recovery_lock.locked():
+            return 0
+        async with self._recovery_lock:
+            recovered = 0
+            for occurrence in await self.repository.list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START):
+                try:
+                    if occurrence.status in {"claimed", "running"}:
+                        occurrence = await self.repository.transition_occurrence(
+                            self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
+                        )
+                        if occurrence is None:
+                            continue
+                    if occurrence.status == "interrupted":
+                        resolved = await self._resolve_interrupted(occurrence)
+                        recovered += resolved is not None
+                except ValueError:
                     continue
-            if occurrence.status == "interrupted":
-                resolved = await self._resolve_interrupted(occurrence)
-                recovered += resolved is not None
-        return recovered
+            return recovered
 
     async def _resolve_interrupted(self, occurrence: OccurrenceRecord) -> OccurrenceRecord | None:
         metadata = {"error_class": "restart_interrupted", "attempt": occurrence.attempt}
@@ -146,9 +161,28 @@ class TaskScheduler:
                     "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
                     "action_snapshot": task.actions, "scheduled_for": scheduled,
                 })
-                claimed = True
+                claimed = False
                 if self.execution_coordinator is not None:
-                    claimed = await self._execute_claimed(occurrence)
+                    # Only an occurrence whose persisted state proves it was
+                    # never started may be executed here. retry_pending is
+                    # owned by the bounded retry path (which honors retry_at —
+                    # critical after a restart, where recovery has just armed
+                    # the backoff), and running/interrupted/terminal states
+                    # belong to recovery or are already finished. The claim
+                    # CAS below remains the final duplicate guard.
+                    if occurrence.status == "claimed":
+                        claimed = await self._execute_claimed(occurrence)
+                elif occurrence.status == "claimed":
+                    # No execution authority: park the occurrence for
+                    # deterministic recovery (same contract as the event
+                    # dispatcher) instead of leaving it silently claimed.
+                    try:
+                        await self.repository.transition_occurrence(
+                            self.owner_id, task.id, key, "interrupted"
+                        )
+                    except ValueError:
+                        pass
+                    claimed = True
                 if following is None or task.schedule_type == "once":
                     next_run = None
                 else:

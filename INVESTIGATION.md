@@ -365,3 +365,101 @@ Production: `backend/ai/task_execution.py`. Tests: `tests/test_task_ai_preparati
 already covered by `tests/test_task_candidate_contract.py`) is preserved and included
 in this delivery. The untracked nested `telegram-self-bot/` checkout remains
 untouched.
+
+---
+
+# Phase 4 — Restart/reconnect must never cause task spam (2026-09-08)
+
+> Requirement: one logical scheduled occurrence executes at most once across
+> restart, scheduler recovery, polling, reconnect, duplicate wake-up, and
+> concurrent recovery. Recovery resumes unfinished work ONLY when the persisted
+> occurrence state proves it is legitimately executable. Completed occurrences
+> are never recreated or re-executed. Retries stay bounded and never multiply
+> across restart. Single Scheduler → TaskExecutionCoordinator → ToolExecutor
+> authority preserved; no second scheduler, no duplicate executor, no
+> fire-and-forget execution, no Telegram-side workaround.
+
+## 4.1 Source-traced duplicate-execution analysis (before the fix)
+
+Already correct (verified in source, pinned by existing + new tests):
+
+| Safeguard | Where |
+|---|---|
+| Deterministic occurrence identity — `{task_id}:{scheduled_for.isoformat()}` (`occurrence_key`), `{task_id}:ev:{chat_id}:{message_id}` (events) | `backend/ai/task_scheduler.py`, `backend/ai/task_event_dispatcher.py` |
+| Unique `(task_id, occurrence_key)` identity: duplicate creation returns the SAME row | `InMemoryTaskRepository.create_occurrence`; `SupabaseTaskRepository.create_occurrence` (pre-select) + unique index in migration |
+| CAS claim — only one writer can move an occurrence to `running`; terminal/running states are unclaimable | `claim_occurrence` (`.eq("status", current.status)` / in-memory check), `_ALLOWED_OCCURRENCE_TRANSITIONS` |
+| Terminal occurrences are never recreated (idempotent occurrence creation) and never re-executed | `create_occurrence` + unclaimable terminal statuses |
+
+Confirmed gaps (all closed in `backend/ai/task_scheduler.py` only):
+
+1. **Restart backoff bypass (the spam vector).** After `recover()` marked an
+   interrupted occurrence `retry_pending` with a future `retry_at`, the wake
+   path in `run_once` still claimed any claimable occurrence it found under a
+   due task (retry_pending is claimable) and executed it IMMEDIATELY —
+   defeating the persisted backoff armed by recovery and re-executing the
+   occurrence right after a restart.
+2. **Unbounded wake-path resume surface.** The wake loop could execute any
+   claimable status; only `claimed` (provably never started) is legitimately
+   executable there. `retry_pending` belongs to the bounded retry path, and
+   `running`/`interrupted`/terminal states belong to recovery or are finished.
+3. **Concurrent recovery could multiply attempts.** Two overlapping
+   `recover()` calls (e.g. start + full-recovery restart) could each push the
+   same occurrence through `interrupted → retry_pending`, consuming attempts
+   twice; a racing external transition also raised `ValueError` out of
+   `start()`.
+4. **Deterministic no-authority parking.** With no coordinator wired, a due
+   occurrence stayed `claimed` forever (undiscoverable by recovery). It is now
+   parked as `interrupted` — the same contract the event dispatcher already
+   used — so a later restart resolves it deterministically through the retry
+   contract instead of blindly executing stale state.
+
+## 4.2 Changes (single file, single authority)
+
+`backend/ai/task_scheduler.py` (+47/−13):
+
+| Change | Guarantee restored |
+|---|---|
+| Wake path executes ONLY `occurrence.status == "claimed"` | Retry-pending occurrences are executed solely by `_run_due_retries`, which honors `retry_at` — restart backoff is respected; no early re-execution |
+| `recover()` serialized by an `asyncio.Lock`; a concurrent recovery returns 0 | Attempt counts cannot multiply across racing recoveries/restarts |
+| `recover()` treats `ValueError` from a transition as "another writer decided first" and skips | Recovery is deterministic on persisted state; never raises into `start()` |
+| No-coordinator due occurrence → `interrupted` | Recovery owns it later; no silently-stuck claimed rows |
+| `claimed` default (was `True`) so a skipped occurrence never counts as processed | `run_once` returns an honest count |
+
+Nothing else changed: no second scheduler, no duplicate executor, no schema or
+migration change, no notification or event-path change. The claim CAS remains
+the final duplicate guard; `MAX_ATTEMPTS = 3` remains the bounded retry
+contract across restarts.
+
+## 4.3 Regression coverage (new: `tests/test_task_restart_recovery.py`, 9 tests)
+
+| Scenario | Assertion |
+|---|---|
+| Recovered occurrence honors backoff | Wake before armed `retry_at` executes nothing; wake at `retry_at` executes exactly once |
+| Wake loop never executes retry_pending before backoff | Independent `retry_pending` occurrence untouched by the wake path until due |
+| Recovery at attempt limit | `failed` at attempt 3, no fourth attempt, no re-execution |
+| Repeated wake-ups (3×) | Exactly one occurrence, executed once |
+| Two overlapping schedulers on one repository | Exactly one execution (claim CAS) |
+| Concurrent recoveries | One recovers, the other returns 0; attempt = 2 exactly once; later recover is a no-op |
+| Recover after legitimate completion | Terminal occurrence never resurrected, attempt unchanged |
+| Due occurrence without coordinator | Parked `interrupted`, later resolved via retry contract |
+| Completed occurrence vs later wakes + restart recovery | Never re-executed |
+
+## 4.4 Test execution (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_restart_recovery.py -q -p no:cacheprovider` | **9 passed in 0.18s** |
+| `.venv/bin/python -m pytest tests/test_task_scheduler.py tests/test_task_execution.py tests/test_task_hardening.py tests/test_task_trigger_events.py tests/test_task_repository.py tests/test_task_contract.py tests/test_task_ai_preparation.py tests/test_task_send_execution.py tests/test_task_nl_creation.py tests/test_task_candidate_contract.py -q -p no:cacheprovider` | **192 passed in 1.62s** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1810 passed, 24 skipped, 1 warning in 63.97s** (baseline 1801+24; +9 = the new restart/recovery tests) |
+| `.venv/bin/python -m py_compile backend/ai/task_scheduler.py` | OK |
+
+## 4.5 Phase 4 conclusion
+
+Restart/reconnect can no longer cause task spam: an interrupted occurrence is
+resolved exactly once from its persisted state, re-execution goes through the
+bounded retry path that honors the persisted backoff, duplicate wake-ups and
+overlapping schedulers collapse onto the single claim CAS, terminal occurrences
+are never recreated, and attempts cannot multiply across restarts — all inside
+the existing single scheduler/executor authority. No production behavior for
+normal (non-restart) scheduling changed; the prior static and AI-assisted task
+suites pin that unchanged.
