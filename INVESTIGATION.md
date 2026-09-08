@@ -282,3 +282,86 @@ Only `INVESTIGATION.md` changed in this phase (documentation-only). No backend c
 tests, provider configuration, environment file, database schema, migration, or
 deployment setting was changed. The pre-existing untracked nested `telegram-self-bot/`
 checkout remains untouched.
+
+---
+
+# Phase 3 Implementation — Occurrence-Time AI-Assisted Task Preparation (2026-09-08)
+
+Implements the confirmed architectural gap from Phase 2 (finding #1): the dormant
+`ai_instruction` / `preparation_metadata` contract is now an ACTIVE execution path,
+inside the existing single authority. No redesign, no second executor, no new
+scheduler.
+
+## What changed (exact files)
+
+| Path | Change |
+|---|---|
+| `backend/ai/task_execution.py` | `TaskExecutionCoordinator` gains occurrence-time AI preparation: when the task record carries an `ai_instruction`, the coordinator resolves final tool arguments through the existing `ProviderManager` (`AIActionPreparator`) BEFORE execution, then runs the prepared calls through the SAME `ToolExecutor.execute_calls()`. Adds `AIActionPreparator` (single bounded provider round, `tools=[]`, fail-closed JSON contract), `_validate_prepared_calls` (defense-in-depth re-validation at the execution boundary), `_preparation_updates` (single-action audit record persisted to `occurrence.preparation_metadata` via the existing schema), and the optional `preparator=` constructor seam (defaults to the process ProviderManager; tests inject doubles). |
+| `tests/test_task_ai_preparation.py` | NEW — 13 focused tests: static tasks never invoke a provider; AI tasks resolve arguments through the executor; prepared-tool-name swap / malformed arguments / wrong action count / provider failure / preparation timeout / missing authority all fail closed with no execution; preparation timeout maps to the retryable path (attempt 2, `retry_at` set); `preparation_metadata` audit record verified; preparator unit contract (fence tolerance, no-tools request, instruction+templates travel to the model, prose/failed-response rejection). |
+| `INVESTIGATION.md` | This section. |
+
+No other production file changed. No schema/migration change: `ai_instruction` and
+`preparation_metadata` columns, their CHECK constraints, and the repository
+validation already existed — this phase only adds the missing runtime consumer.
+
+## Architecture (unchanged authority, new seam)
+
+```text
+Task / Event
+  → TaskScheduler / TaskEventDispatcher
+  → TaskExecutionCoordinator
+      ├─ static task:  action_snapshot → ToolExecutor (zero provider calls — unchanged)
+      └─ ai task:      action_snapshot → AIActionPreparator (ProviderManager, tools=[])
+                          → validated PreparedAction arguments
+                          → defense-in-depth re-validation
+                          → ToolExecutor → registered Tool → service
+```
+
+One execution authority is preserved: `ToolExecutor` remains the sole caller of
+tools. The model can only produce arguments for the task's OWN tool names, in the
+task's own order, with no destination/owner/chat identity — those come from trusted
+runtime context exactly as before. The provider never receives tool definitions,
+so it can never trigger an execution itself.
+
+## Fail-closed contract (verified by tests)
+
+| Failure | Behavior |
+|---|---|
+| Provider failure / malformed output / prose response | Occurrence `failed`, nothing executed |
+| Preparation timeout | Mapped to `TimeoutError` → existing retryable classification → `retry_pending`, attempt+1 |
+| Prepared tool-name swap, extra/missing actions, non-object arguments | Rejected at the coordinator boundary BEFORE execution; occurrence `failed` |
+| Unregistered template tool | Existing pre-preparation registry check fires first (`unregistered_action`) |
+| No preparation authority available | `failed` (`task preparation authority is unavailable`) |
+| Confirmation-gated (ADMIN_ONLY/CONFIRMATION_REQUIRED) prepared action | Unchanged pre-existing behavior: counts as failed and retries/fails — no unattended execution |
+
+## Phase 3 test execution (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_ai_preparation.py -q -p no:cacheprovider` | **13 passed in 0.14s** |
+| `.venv/bin/python -m pytest tests/test_task_execution.py tests/test_task_contract.py tests/test_task_hardening.py tests/test_task_scheduler.py tests/test_task_trigger_events.py tests/test_task_repository.py tests/test_task_send_execution.py tests/test_task_nl_creation.py tests/test_task_candidate_contract.py tests/test_task_management.py -q -p no:cacheprovider` | **184 passed in 1.59s** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1801 passed, 24 skipped, 1 warning in 64.03s** |
+| `.venv/bin/python -m py_compile backend/ai/task_execution.py` | OK |
+
+Static task behavior is pinned as unchanged by the existing suites
+(`test_task_execution.py`, `test_task_hardening.py`, `test_task_scheduler.py`):
+identical code path, zero provider calls.
+
+## Remaining limitations (unchanged or newly known)
+
+1. Multi-action AI tasks (rare) persist execution results only — the single-slot
+   `preparation_metadata` schema records the prepared action for single-action
+   occurrences (the dominant case). Diagnostic only; never part of the outcome.
+2. Outgoing-only event triggers remain uncreatable (Phase 2 finding #2).
+3. Findings #3–#8 from Phase 2 are untouched by this phase.
+4. Live Telegram / provider-network / live Supabase verification remains NOT
+   performed; in-process and fake-provider checks only.
+
+## Phase 3 delivery scope
+
+Production: `backend/ai/task_execution.py`. Tests: `tests/test_task_ai_preparation.py`
+(new). Docs: `INVESTIGATION.md`. The pre-existing working-tree change to
+`backend/ai/task_candidate.py` (dormant-contract persistence from an earlier session,
+already covered by `tests/test_task_candidate_contract.py`) is preserved and included
+in this delivery. The untracked nested `telegram-self-bot/` checkout remains
+untouched.
