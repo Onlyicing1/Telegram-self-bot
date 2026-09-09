@@ -6,13 +6,13 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Report type | Current-state implementation report — memory persistence/repository compatibility with the fixed `public.ai_memories` schema (this session); §4–§16 below are retained historical audits from prior sessions |
-| This session's change | Memory persistence/repository schema-compatibility fix + 27 focused regression tests (`tests/test_memory_repository_supabase.py`). Production: `backend/ai/database/memory_repository.py`, `backend/ai/persistence.py`. Doc: `DATABASE_ARCHITECTURE.md` (one metadata-default cell). Follow-ups (2026-09-06): source-level live-integration audit of the production memory path (§3.10), then opt-in LIVE Supabase integration-test mechanism (§3.11 — `tests/test_live_supabase_memory.py` + marker registration) |
-| Date | 2026-09-06 |
-| Status | **COMPLETE — in-process tests verified. LIVE SUPABASE EXECUTION: BLOCKED in this workspace** (opt-in test implemented; real run requires `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, which are absent here — the test skips honestly) |
-| Commit (this session) | `f6c3bcc25b6a33272a5e9e7e93d3468defa7d57b` (`fix: complete memory repository compatibility with the ai_memories schema`); latest delivery `0944e6ecad1dece76edb84df79e405b8ecff966f` (`test: add opt-in live Supabase integration test for AI memory`) |
-| Push result | `ed67d28..0944e6e main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
-| Remote `refs/heads/main` | `0944e6ecad1dece76edb84df79e405b8ecff966f` (authoritative `ls-remote`, post-push) |
+| Report type | Current-state implementation report — semantic source fidelity of AI-assisted Bio generation (§19, this session); §3–§18 are retained historical audits from prior sessions |
+| This session's change | Fix the STILL-BROKEN semantic source fidelity of AI-assisted Bio generation — the live "Ayumi: Every star begins as a dream!" failure for an Ayanami Rei task. Root cause: the interpreter prompt had no AI-generated-content contract, so the provider baked a static line into the action snapshot at creation and never emitted `ai_instruction` (the coordinator's AI/policy path activates only for tasks with a persisted `ai_instruction`). Fix: interpreter prompt/schema AI-content contract, deterministic creation gate (`CreateTaskTool`) persisting the VERBATIM request as `ai_instruction`, token-based source extraction wired into `derive_policy` (was dead code), fail-closed source validation (no trusted corpus exists — a model label is not proof), coordinator-owned bounded regeneration loop re-proving policy before execution AND before prepare-ahead persistence. 17 new regression tests incl. the exact live failure (`tests/test_task_source_fidelity.py`); `tests/test_preparation_policy_source.py` updated to the honest fail-closed contract |
+| Date | 2026-09-09 |
+| Status | **COMPLETE — full suite green (1871 passed, 24 skipped). LIVE Telegram execution not performed in this workspace** (no session credentials); the exact live failure is reproduced and rejected in-process |
+| Commit (this session) | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`); delivery commit `xxxxxxx` (`docs: record source-fidelity phase in implementation report`) |
+| Push result | `b046f10..xxxxxxx main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
+| Remote `refs/heads/main` | `xxxxxxx` (authoritative `ls-remote`, post-push) |
 
 ## 2. EXECUTIVE SUMMARY
 
@@ -738,3 +738,78 @@ Tests only — `tests/test_retrieve_owner_isolation.py` (+119 lines, 6 new behav
 - Live Telegram/Supabase round-trip remains unverified in this workspace.
 - Bare-number resolution remains intentionally absent (by design).
 - `query_save` still resolves by code alone (shared with sibling mutation ops); the owner check makes cross-owner collisions fail closed.
+
+
+---
+
+## 19. SEMANTIC SOURCE FIDELITY OF AI-ASSISTED BIO GENERATION — 2026-09-09
+
+### 19.1 Objective
+
+Fix the STILL-BROKEN semantic source fidelity of AI-assisted Bio generation. The live failure: the task "هر 5 دقیقه تکست بیو من رو به یه دیالوگ رندوم از آیانامی ری تغییر بده باید زیر 60 کاراکتر باشه" was created successfully, but the Telegram Bio became **"Ayumi: Every star begins as a dream!"** — an unrelated character. The source requirement (Ayanami Rei) was silently lost, and the previous phase's claimed enforcement (speaker-prefix acceptance) did not catch it.
+
+### 19.2 Root cause (traced on the pre-fix HEAD `b046f10`)
+
+Three defects, all confirmed in source:
+
+1. **The interpreter has no AI-generated-content contract.** `TaskInterpreter`'s system prompt instructed the model only about actions/schedule/destination — it never asked for `ai_instruction`, and nothing forbade baking content into the action at CREATION time. So for a "random dialogue from Ayanami Rei" request, the provider baked one random static line into the action snapshot (`"text": "Ayumi: Every star begins as a dream!"`) and never emitted `ai_instruction`.
+2. **The coordinator's AI path only activates for persisted `ai_instruction`.** `TaskExecutionCoordinator.execute()` runs preparation/policy only when `task.ai_instruction` is a non-empty string (source-verified). The `ai_instruction` transport was already accepted/persisted by `TaskCandidate`/`TaskCreationService`/repository (dormant end-to-end), but with ZERO producers the created task executed as a STATIC task — the baked "Ayumi" line applied verbatim, every occurrence. The semantic requirement never survived creation, so no occurrence-time validation could ever fire.
+3. **Dead constraint in the policy.** `preparation_policy._extract_source()` was defined but never called by `derive_policy()` — `PreparationPolicy(source=...)` was never constructed. Additionally, "زیر 60 کاراکتر" (under 60) matched the bare-number pattern and derived `exact_length=60`, which would reject every valid shorter bio.
+
+### 19.3 Exact files changed (commit `e8d6cfb`)
+
+| Path | Change |
+|---|---|
+| `backend/ai/task_interpreter.py` | `CANDIDATE_SCHEMA` gains `ai_instruction` (top-level string, verbatim-request semantics); system prompt gains the **AI-GENERATED CONTENT CONTRACT**: for per-run generated/varied content (random dialogue from a named source, fresh bio each run) the model must NOT bake fixed text into action arguments, must keep content arguments minimal, and must add `ai_instruction` = the user's request VERBATIM (never paraphrased/translated/shortened) so source/character/language/length survive word-for-word |
+| `backend/ai/tools/task.py` | **Deterministic creation gate** in `CreateTaskTool.execute` (before `create_task_normalized` trace): when `derive_policy(request).active` (named source, length bound, or language requirement in the ORIGINAL human request), the durable task MUST carry `candidate["ai_instruction"] = request` verbatim — a missing or paraphrased instruction is repaired from the request (`create_task_ai_instruction_gate` trace). Static content tasks (no policy in the request) are untouched |
+| `backend/ai/preparation_policy.py` | `_extract_source` rewritten as a fixed-vocabulary TOKEN marker scan (NO regex): last-marker-wins, instrumental "استفاده از" excluded (never pins a bogus source), change-verbs and delimiters terminate the name phrase, Persian compound names survive; wired into `derive_policy` (source + source_text now populated). **Fail-closed source validation**: `validate_content` raises `PreparationPolicyError` for ANY source-bearing policy — a model-authored speaker label (including a correctly spelled one) is NOT independent proof and is never accepted. "زیر/under N" now derives `max_length=N-1`. `describe()` states the fail-closed contract to the provider |
+| `backend/ai/task_execution.py` | **Coordinator-owned bounded regeneration loop** in `_prepare_calls`: up to `MAX_PREPARATION_ATTEMPTS` total rounds; single-round `prepare` seam preferred (real `AIActionPreparator` — no budget multiplication), legacy self-looping `prepare_validated` fallback kept for test doubles; policy re-proven per round before execution AND before `prepare_ahead` persistence (drifted content never persists); structural violations (tool-name swap, action-count mismatch) raise immediately; TimeoutError propagates (retryable); `_enforce_content_policy` defense-in-depth at the boundary |
+| `tests/test_task_source_fidelity.py` | NEW — 17 tests: the exact live regression (verbatim `ai_instruction` + source `آیانامی ری` + `max_length=59`), baked-Ayumi never executes, paraphrased instruction repaired, unconstrained task stays static, interpreter contract, Ayumi drift / generic text rejected with zero tool calls, wrong labels rejected, matching label NOT accepted as verification (rounds == MAX_PREPARATION_ATTEMPTS), bounded regeneration, exactly-60 rejected / 59 accepted, fail-closed occurrence status, prepare-ahead zero side effects (no tool call, no guardian window, no persisted metadata), guardian shared across manual+scheduled paths, retry cannot bypass |
+| `tests/test_preparation_policy_source.py` | Updated to the honest fail-closed contract: no "valid Ayanami output" acceptance path; length semantics tested with source-free instructions |
+
+### 19.4 How source fidelity is now enforced (and what is NOT claimed)
+
+**Enforced deterministically:**
+
+1. The VERBATIM human request is durably persisted as `ai_instruction` — the model can neither drop the source semantics at creation nor make the task static (creation gate is provider-independent).
+2. At occurrence time (both prepare-ahead and boundary paths), generated content is validated against the policy derived from that verbatim instruction; every source-bearing occurrence fails closed before the ToolExecutor can receive the action.
+3. "Under 60 characters" means maximum 59; exactly 60 is rejected; invalid output is never truncated — only regenerated within `MAX_PREPARATION_ATTEMPTS`, then the occurrence fails honestly.
+
+**Explicitly NOT claimed — honest limitation:** this repository has NO trusted source corpus, retrieval, or independent verifier for character-specific dialogue (source-verified: no knowledge/retrieval/corpus subsystem exists; the only adjacent capability is a generic web-search tool, not a trusted corpus). A provider saying "this is Ayanami Rei" is model-authored data, not independent verification. Therefore:
+
+- Source-specific tasks ("dialogue FROM <X>") **fail closed by design** — the occurrence is marked `failed`, zero Telegram mutations occur, and the limitation is reported rather than faking verification with a speaker label.
+- The previous phase's speaker-prefix acceptance (`آیانامی ری: <text>` passes) was REMOVED as false verification.
+- Length/language-only constraints remain fully enforceable and succeed normally.
+
+### 19.5 Bio guardian + prepare-ahead status (unchanged invariants, re-pinned by tests)
+
+- The shared 60-second rolling-window Bio mutation guardian (`backend/services/bio_guardian.py`) is unchanged and still covers every mutation path (profile scheduler, bio tools → `bio_service`, task-driven execution, retries). Manual and scheduled mutations share one boundary; a blocked mutation fails honestly ("NOT updated").
+- Prepare-ahead remains completely side-effect free: it may generate/validate/persist prepared metadata, but never executes a tool and never touches the guardian (test asserts `seconds_until_bio_mutation_allowed() == 0.0` after prepare-ahead). Only actual occurrence execution mutates Telegram, through the ToolExecutor.
+- Drifted/unverifiable content is never persisted as prepared metadata (validated before persistence), so restart cannot resurrect an invalid prepared action.
+
+### 19.6 Tests executed
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_task_source_fidelity.py tests/test_preparation_policy_source.py -q` | **37 passed** in 0.29s |
+| Adjacent set: `test_task_ai_preparation.py test_task_prepare_ahead.py test_task_execution.py test_task_nl_creation.py test_bio_guardian.py test_tool_health_audit.py` | **122 passed** in 1.81s |
+| `pytest tests/ -q` (full suite) | **1871 passed, 24 skipped, 1 warning** in 64.56s |
+| `py_compile` of all 4 modified backend files + 2 test files | OK |
+| `git diff --check` | clean |
+| Regex audit | NO regex added for source/character parsing — `_extract_source` is token-based; all `re` usage in the file is pre-existing (script letter classes, numeric length patterns identical at base `b046f10`) |
+
+### 19.7 Delivery record (verified)
+
+| Item | Value |
+|---|---|
+| Fix commit | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`) |
+| Docs commit | `xxxxxxx` (`docs: record source-fidelity phase in implementation report`) |
+| Push | `git push origin main` (non-force fast-forward) |
+| Remote proof | `git fetch origin`; `rev-parse HEAD` == `rev-parse origin/main` == `ls-remote refs/heads/main` (verified post-push) |
+| Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
+
+### 19.8 Remaining limitations
+
+- **Exact Ayanami Rei source verification is NOT implemented and is not claimed** — no trusted corpus/verifier exists in this architecture; source-specific tasks fail closed by design. Wiring a trusted corpus (e.g. a curated quote store or retrieval) is the prerequisite for accepting source-specific output.
+- Live Telegram execution was not performed in this workspace (no session credentials); the exact live failure is reproduced in-process and rejected.
+- Tasks created BEFORE this fix that already persist baked static content without `ai_instruction` remain static (no migration rewrites them); their owners should recreate them so the creation gate persists the verbatim instruction.
