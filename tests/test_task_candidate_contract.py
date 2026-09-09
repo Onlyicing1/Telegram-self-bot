@@ -153,6 +153,12 @@ def _candidate_with_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
     ({"days": 1}, 86400.0),
     ({"weeks": 2}, 1209600.0),
     ({"minutes": 1.5}, 90.0),
+    # Compound durations: multiple known unit keys sum deterministically.
+    ({"minutes": 3, "hours": 1}, 3780.0),
+    ({"hours": 1, "minutes": 30}, 5400.0),
+    ({"hours": 2, "days": 1}, 93600.0),
+    ({"weeks": 1, "days": 2, "hours": 6}, 799200.0),
+    ({"hours": 1, "minutes": 30, "timezone": "UTC"}, 5400.0),
 ])
 def test_unit_keyed_interval_schedules_are_canonicalized(schedule, expected_seconds):
     candidate = parse_candidate_output(_candidate_with_schedule(schedule))
@@ -161,12 +167,15 @@ def test_unit_keyed_interval_schedules_are_canonicalized(schedule, expected_seco
 
 
 @pytest.mark.parametrize("schedule", [
-    {"minutes": 3, "hours": 1},
     {"minutes": "سه"},
     {"minutes": True},
     {"minutes": 0},
     {"hours": -1},
     {"minutes": [3]},
+    {"minutes": 0, "hours": 1},
+    {"months": 1},  # calendar units are never fabricated as seconds
+    {"years": 1},
+    {"months": 1, "days": 2},
 ])
 def test_invalid_unit_keyed_interval_schedules_are_still_rejected(schedule):
     with pytest.raises(TaskCandidateError):

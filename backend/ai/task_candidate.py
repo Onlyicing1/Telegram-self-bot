@@ -33,6 +33,11 @@ _UNIT_WORD_SECONDS = {
     **_INTERVAL_UNIT_SECONDS,
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,
 }
+# Upper bound for a canonicalized interval (10 years). Calendar month/year
+# units are deliberately NOT in any vocabulary above — converting them to
+# fixed seconds would fabricate calendar semantics the scheduler cannot
+# represent; such shapes fall through to honest rejection.
+_MAX_INTERVAL_SECONDS = 366 * 24 * 3600 * 10
 # Value STRING forms that embed their own unit ("5 minutes", "5 دقیقه") —
 # split on whitespace into number + unit word; anything else stays rejected.
 _EMBEDDED_UNIT_MAX_WORDS = 2
@@ -123,7 +128,10 @@ def _convert_value_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | N
         return None
     if not math.isfinite(number) or number <= 0:
         return None
-    return {"seconds": number * _UNIT_WORD_SECONDS[unit]}
+    seconds = number * _UNIT_WORD_SECONDS[unit]
+    if seconds > _MAX_INTERVAL_SECONDS:
+        return None
+    return {"seconds": seconds}
 
 
 def _convert_compound_key_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
@@ -138,22 +146,37 @@ def _convert_compound_key_schedule(schedule: dict[str, Any]) -> dict[str, Any] |
         if number is None or not math.isfinite(number) or number <= 0:
             return None
         unit = match.group(1)
-        return {"seconds": number * _INTERVAL_UNIT_SECONDS[unit]}
+        seconds = number * _INTERVAL_UNIT_SECONDS[unit]
+        if seconds > _MAX_INTERVAL_SECONDS:
+            return None
+        return {"seconds": seconds}
     return None
 
 
 def _convert_flat_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
-    """{"minutes": 3} -> {"seconds": 180}; exactly one unit key allowed."""
+    """{"minutes": 3} -> {"seconds": 180}; one or more unit keys allowed.
+
+    Multiple unit keys are a COMPOUND duration ("1 hour and 30 minutes" →
+    {"hours": 1, "minutes": 30} → 5400). Every key must be a known duration
+    unit with a bounded positive value; the sum is bounded. Calendar
+    month/year keys are not in the vocabulary and fall through to honest
+    rejection — never fabricated seconds.
+    """
     units = [key for key in schedule if key in _INTERVAL_UNIT_SECONDS]
-    if len(units) != 1:
+    if not units:
         return None
     extras = set(schedule) - set(units)
     if extras - {"timezone"}:
         return None
-    number = _as_number(schedule[units[0]])
-    if number is None or not math.isfinite(number) or number <= 0:
+    total = 0.0
+    for key in units:
+        number = _as_number(schedule[key])
+        if number is None or not math.isfinite(number) or number <= 0:
+            return None
+        total += number * _INTERVAL_UNIT_SECONDS[key]
+    if total <= 0 or total > _MAX_INTERVAL_SECONDS:
         return None
-    return {"seconds": number * _INTERVAL_UNIT_SECONDS[units[0]]}
+    return {"seconds": total}
 
 
 def _canonicalize_interval_schedule(schedule: Any) -> Any:
@@ -164,7 +187,7 @@ def _canonicalize_interval_schedule(schedule: Any) -> Any:
         return schedule
     if "seconds" in schedule:
         number = _as_number(schedule["seconds"])
-        if number is not None and math.isfinite(number) and number > 0:
+        if number is not None and math.isfinite(number) and 0 < number <= _MAX_INTERVAL_SECONDS:
             return {"seconds": number}
         return schedule
     for converter in (

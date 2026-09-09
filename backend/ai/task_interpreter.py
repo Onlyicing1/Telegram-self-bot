@@ -105,6 +105,18 @@ class TaskInterpretationError(ValueError):
     """Natural-language interpretation did not yield a safe candidate."""
 
 
+class TaskUnsupportedError(TaskInterpretationError):
+    """The request is semantically clear but asks for a capability the
+    current task/schedule/event model cannot represent (e.g. monthly/yearly
+    calendar recurrence). Distinct from ambiguity so the caller can answer
+    honestly instead of with the generic ambiguity rejection.
+    """
+
+    def __init__(self, capability: str) -> None:
+        super().__init__(f"unsupported capability: {capability}")
+        self.capability = capability
+
+
 def _load_candidate_json(raw: str) -> Any:
     """Parse the model's JSON, tolerating the common markdown-fence wrapper.
 
@@ -141,8 +153,23 @@ class TaskInterpreter:
         )
         instructions = (
             "Return exactly one JSON object matching the supplied task candidate schema. "
-            "Do not include owner identity, chat ids, or raw Telegram destinations. Do not execute tools. "
-            "If any required detail is ambiguous or missing, return JSON null. "
+            "SEMANTIC INTERPRETATION: interpret the user's INTENT in Persian or English; "
+            "never require exact phrasing, a fixed template, or a specific word order. "
+            "Multi-line requests and colloquial phrasings are normal. A clear action plus "
+            "any recognizable schedule/trigger expression is a valid task — unfamiliar "
+            "wording is not ambiguity. "
+            "NULL RULE: return JSON null ONLY when the message has NO recognizable "
+            "schedule/trigger expression AND no clear action (pure chit-chat). Never "
+            "return null for a clear interval, time, or event phrase just because the "
+            "wording is unusual, the number is written as a word, 'every'/'هر' is omitted, "
+            "or the request spans multiple lines. "
+            "UNSUPPORTED CAPABILITY: if the request is semantically CLEAR but asks for a "
+            "capability this schema cannot express — calendar month/year recurrence "
+            "('هر ماه', 'ماهانه', 'monthly', 'هر سال', 'سالانه', 'yearly', 'every year', "
+            "'اول هر ماه', 'first of month', '15th of month', 'every year on January 1', "
+            "'هر آخر هفته', 'every weekend') — return EXACTLY the single JSON object "
+            "{\"unsupported\": \"<short capability name>\"} and nothing else. Do not "
+            "fabricate seconds for months/years and do not return null for them. "
             "ACTION OBJECT CONTRACT: every element of 'actions' MUST be an object of the "
             "exact form {'name': <action name>, 'arguments': <object>} — a 'name' string "
             "plus an 'arguments' object, no other keys inside the action object. Example: "
@@ -152,8 +179,9 @@ class TaskInterpreter:
             "bounded 'text' key containing the exact message content; the destination "
             "is fixed by the runtime and must not be included. Use no other action name "
             "for message writing. "
-            "PROFILE ACTIONS: for bio/profile updates ('تو بیو بزارش', 'بیو رو عوض کن', "
-            "'update my bio', 'آپدیت کن بیو پروفایلم'), use exactly the REGISTERED action "
+            "PROFILE ACTIONS: for bio/profile updates ('تو بیو بزارش', 'توی بیو بزاری', "
+            "'بیو رو عوض کن', 'بیو پروفایلم رو آپدیت کن', 'update my bio', 'آپدیت کن بیو "
+            "پروفایلم'), use exactly the REGISTERED action "
             "name 'bio_set_text' with arguments {'text': ''} — EMPTY, because the content is "
             "AI-generated per occurrence under ai_instruction; never bake a finished sentence "
             "into the arguments. For first_name/username changes use exactly 'username_set_text' "
@@ -180,16 +208,37 @@ class TaskInterpreter:
             "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, "
             "'timezone': '<IANA tz>'}. Do not put unit names like 'minutes' inside "
             "the schedule object — convert them to seconds yourself. "
+            "COMPOUND INTERVALS: 'every 1 hour and 30 minutes', 'هر 1 ساعت و 30 دقیقه', "
+            "'هر یک ساعت و نیم' → compute the total yourself ({'seconds': 5400}); you "
+            "may also emit the structured compound form {'hours': 1, 'minutes': 30} — "
+            "the runtime sums the known units. 'هر نیم ساعت' / 'every half hour' = "
+            "{'seconds': 1800}. Never use month or year as a duration unit (see "
+            "UNSUPPORTED CAPABILITY). "
+            "TIME-OF-DAY & CALENDAR TRIGGERS: 'today at 5' / 'امروز ساعت 5' → once at "
+            "today 17:00; 'tomorrow at 8 AM' / 'فردا ساعت 8 صبح' → once tomorrow 08:00; "
+            "'every day at 9' / 'هر روز ساعت 9' / 'روزانه' → daily; 'every night at "
+            "11' / 'هر شب ساعت 11' → daily 23:00; 'every Monday at 10' / 'هر دوشنبه "
+            "ساعت 10' → weekly. WEEKDAY NUMBERS (0=Monday .. 6=Sunday): دوشنبه=0، "
+            "سه‌شنبه=1، چهارشنبه=2، پنجشنبه=3، جمعه=4، شنبه=5، یکشنبه=6؛ English: "
+            "Monday=0 .. Sunday=6. Time-of-day uses the 24-hour clock. Monthly/yearly "
+            "calendar triggers are UNSUPPORTED (see UNSUPPORTED CAPABILITY). "
             "EVENT SCHEDULES (trigger type): use schedule_type 'event' ONLY when the user "
-            "explicitly asks for an automation that reacts to an incoming Telegram message "
+            "explicitly asks for an automation that reacts to a Telegram message "
             "(e.g. 'وقتی جان پیام داد جوابش بده', 'when John sends me a message reply using X', "
             "'هر وقت از این چت پیام اومد', 'when I receive a message from this chat containing "
             "urgent'). The schedule must be {'trigger': {'type': 'telegram_message', ...}} with "
             "the allowed trigger fields: 'sender' (a display NAME such as 'John' or 'علی' — "
             "never a numeric id), 'chat' (a chat name, or 'this chat'/'همین چت' for the current "
-            "conversation — never a numeric id), 'contains' (list of substrings, all must appear), "
-            "'text_equals', 'starts_with', 'has_media' (boolean), 'is_reply' (boolean), and "
-            "'direction' ('incoming' default, 'outgoing', or 'any'). Include at least one "
+            "conversation — never a numeric id; channel names work for 'وقتی کانال X پست گذاشت' / "
+            "'when channel X posts' — a channel post arrives as a message in that chat), "
+            "'contains' (list of substrings, all must appear), "
+            "'text_equals', 'starts_with', 'has_media' (boolean — ANY media), 'media_type' "
+            "(one of photo, video, voice, audio, document, sticker, animation — 'عکس'/'photo' "
+            "→ 'photo', 'ویدیو'/'video' → 'video', 'فایل'/'file' → 'document'), 'is_reply' "
+            "(boolean — 'وقتی جواب دادن' / 'when someone replies'), 'is_mention' (boolean — "
+            "'وقتی کسی منو منشن کرد' / 'when someone mentions me'), and "
+            "'direction' ('incoming' default for 'وقتی X بهم پیام داد' / 'when X messages me'; "
+            "'outgoing' for 'وقتی من نوشتم X' / 'when I write X'; 'any'). Include at least one "
             "condition. Never invent sender/chat ids — the runtime resolves names. "
             "DO NOT use schedule_type 'event' for time-based requests; those stay once/interval/"
             "daily/weekly. "
@@ -222,6 +271,17 @@ class TaskInterpreter:
             "actions. Set 'notify_on_outcome': true ONLY when the user explicitly asks to be notified "
             "when the task runs or fails ('notify me', 'خبرم کن', 'به من اطلاع بده'). Otherwise omit "
             "both flags: scheduled execution must stay silent by default."
+            "\n\n"
+            "EXAMPLE (mirrors the multi-line Persian structure): user writes:\n"
+            "هر ۵ دقیقه\n"
+            "میخوام بیو پروفایلم رو آپدیت کنید\n"
+            "یه دیالوگ رندوم از کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری\n"
+            "که زیر 60 کاراکتر باشه\n"
+            "Return: {\"label\": \"Bio update\", \"schedule_type\": \"interval\", "
+            "\"schedule\": {\"seconds\": 300}, \"timezone\": \"<owner timezone>\", "
+            "\"actions\": [{\"name\": \"bio_set_text\", \"arguments\": {\"text\": \"\"}}], "
+            "\"notification_destination\": {}, \"ai_instruction\": \"<the user's request "
+            "VERBATIM, including the Persian text exactly as written>\"}."
         )
         if isinstance(timezone, str) and timezone.strip():
             instructions += (
@@ -287,7 +347,19 @@ class TaskInterpreter:
         value: Any = None
         try:
             value = _load_candidate_json(raw)
+            # Semantically clear but unrepresentable capability: the model
+            # returns {"unsupported": "..."} — surfaced distinctly from
+            # ambiguity so the caller can answer honestly.
+            if (
+                isinstance(value, dict)
+                and set(value) == {"unsupported"}
+                and isinstance(value.get("unsupported"), str)
+                and value["unsupported"].strip()
+            ):
+                raise TaskUnsupportedError(value["unsupported"].strip()[:200])
             candidate = parse_candidate_output(value)
+        except TaskUnsupportedError:
+            raise
         except (json.JSONDecodeError, TaskCandidateError) as exc:
             if isinstance(value, dict):
                 actions = value.get("actions")

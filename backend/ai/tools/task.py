@@ -137,7 +137,7 @@ class CreateTaskTool(Tool):
             unbind(bind_token)
 
     async def _execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-        from backend.ai.task_interpreter import TaskInterpreter
+        from backend.ai.task_interpreter import TaskInterpreter, TaskUnsupportedError
         from backend.ai.task_creation import TaskCreationService
 
         started = time.perf_counter()
@@ -227,6 +227,23 @@ class CreateTaskTool(Tool):
                     request_id,
                 )
                 return _fail("create_task_interpretation", "timeout", exc)
+            except TaskUnsupportedError as exc:
+                # Semantically clear but unrepresentable capability: answer
+                # honestly instead of with the generic ambiguity rejection.
+                logger.warning(
+                    "AI_TASK_TRACE request_id=%s stage=create_task_failed "
+                    "failed_stage=create_task_interpretation category=unsupported_capability "
+                    "capability=%s elapsed_ms=%s persisted=false",
+                    request_id, exc.capability,
+                    int((time.perf_counter() - started) * 1000),
+                )
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"I understood your request, but {exc.capability} is not "
+                        "supported yet, so I did not create the task."
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 category = _classify_interpretation_failure(exc)
                 logger.warning(

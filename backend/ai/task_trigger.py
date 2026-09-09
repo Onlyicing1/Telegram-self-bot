@@ -24,6 +24,14 @@ from typing import Any
 TRIGGER_TYPES = frozenset({"telegram_message"})
 _DIRECTIONS = frozenset({"incoming", "outgoing", "any"})
 
+# Specific media types observable on a Telegram message (photo/video/voice/
+# audio/document/sticker/animation). ``has_media`` remains the ANY-media
+# flag; ``media_type`` narrows it. Unknown types are rejected — the matcher
+# can only evaluate what the event layer can deterministically observe.
+_MEDIA_TYPES = frozenset({
+    "photo", "video", "voice", "audio", "document", "sticker", "animation",
+})
+
 MAX_SENDER_NAME_CHARS = 128
 MAX_CHAT_NAME_CHARS = 256
 MAX_CONTAINS_TERMS = 10
@@ -41,7 +49,7 @@ _THIS_CHAT_ALIASES = frozenset({
 
 _ALLOWED_UNRESOLVED_KEYS = frozenset({
     "type", "sender", "chat", "contains", "text_equals", "starts_with",
-    "has_media", "is_reply", "direction",
+    "has_media", "media_type", "is_reply", "is_mention", "direction",
 })
 _ALLOWED_RESOLVED_KEYS = _ALLOWED_UNRESOLVED_KEYS | frozenset({
     "sender_id", "sender_name", "chat_id", "chat_title",
@@ -89,7 +97,8 @@ def _has_condition(spec: dict[str, Any]) -> bool:
         spec.get(key) not in (None, False, [], "", 0)
         for key in (
             "sender", "chat", "sender_id", "chat_id", "contains",
-            "text_equals", "starts_with", "has_media", "is_reply",
+            "text_equals", "starts_with", "has_media", "media_type",
+            "is_reply", "is_mention",
         )
     )
 
@@ -129,7 +138,14 @@ def validate_trigger_spec(value: Any) -> dict[str, Any]:
     for key, max_chars in (("text_equals", MAX_TEXT_EQUALS_CHARS), ("starts_with", MAX_STARTS_WITH_CHARS)):
         if key in value:
             normalized[key] = _require(value[key], key, str, max_chars)
-    for key in ("has_media", "is_reply"):
+    if "media_type" in value:
+        media_type = value["media_type"]
+        if not isinstance(media_type, str) or media_type.strip().lower() not in _MEDIA_TYPES:
+            raise TaskTriggerError(
+                f"trigger media_type must be one of {sorted(_MEDIA_TYPES)}"
+            )
+        normalized["media_type"] = media_type.strip().lower()
+    for key in ("has_media", "is_reply", "is_mention"):
         if key in value:
             if not isinstance(value[key], bool):
                 raise TaskTriggerError(f"trigger {key} must be a boolean")
@@ -237,8 +253,9 @@ def event_trigger_matches(trigger: dict[str, Any], event: dict[str, Any]) -> boo
     """Deterministically evaluate a resolved trigger against a Telegram event.
 
     ``event`` keys: ``chat_id``, ``sender_id``, ``text``, ``has_media``,
-    ``is_reply``, ``out``. Every condition is ANDed; a None/absent trigger
-    field is not a constraint. No provider call, no content scoring.
+    ``media_type``, ``is_reply``, ``mentioned``, ``out``. Every condition is
+    ANDed; a None/absent trigger field is not a constraint. No provider call,
+    no content scoring.
     """
     direction = trigger.get("direction", "incoming")
     out = bool(event.get("out"))
@@ -269,8 +286,14 @@ def event_trigger_matches(trigger: dict[str, Any], event: dict[str, Any]) -> boo
     has_media = trigger.get("has_media")
     if has_media is not None and bool(event.get("has_media")) != has_media:
         return False
+    media_type = trigger.get("media_type")
+    if media_type is not None and event.get("media_type") != media_type:
+        return False
     is_reply = trigger.get("is_reply")
     if is_reply is not None and bool(event.get("is_reply")) != is_reply:
+        return False
+    is_mention = trigger.get("is_mention")
+    if is_mention is not None and bool(event.get("mentioned")) != is_mention:
         return False
     return True
 
@@ -284,21 +307,22 @@ def trigger_summary(trigger: dict[str, Any]) -> str:
     chat = trigger.get("chat_title")
     if chat:
         parts.append(f"chat: {chat}")
+    media_type = trigger.get("media_type")
+    if media_type:
+        parts.append(f"media: {media_type}")
     for key, label in (
         ("contains", "contains"),
         ("text_equals", "text equals"),
         ("starts_with", "starts with"),
         ("has_media", "has media"),
         ("is_reply", "is reply"),
+        ("is_mention", "is a mention"),
     ):
         value = trigger.get(key)
         if value is None or value is False:
             continue
-        if key == "has_media":
-            parts.append("has media")
-            continue
-        if key == "is_reply":
-            parts.append("is a reply")
+        if key in ("has_media", "is_reply", "is_mention"):
+            parts.append(label)
             continue
         if isinstance(value, list):
             parts.append(f"contains {', '.join(str(v)[:60] for v in value)}")

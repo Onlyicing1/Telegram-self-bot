@@ -47,6 +47,21 @@ def event_occurrence_key(task_id: int, chat_id: int, message_id: int) -> str:
     return f"{task_id}:ev:{chat_id}:{message_id}"
 
 
+def _media_type(message: Any) -> str | None:
+    """Deterministic media-type label from a Telethon Message, or None.
+
+    Only the bounded observable kinds map to the trigger vocabulary; any
+    other media object is "other" so a media-type condition can never match
+    a kind the event layer cannot distinguish.
+    """
+    if message is None or getattr(message, "media", None) is None:
+        return None
+    for kind in ("photo", "video", "voice", "audio", "sticker", "animation", "document"):
+        if getattr(message, kind, None):
+            return kind
+    return "other"
+
+
 def extract_event_context(event: Any) -> dict[str, Any]:
     """Normalize a Telethon event into the bounded matcher context.
 
@@ -64,7 +79,9 @@ def extract_event_context(event: Any) -> dict[str, Any]:
         "message_id": getattr(message, "id", None) or getattr(event, "id", None),
         "text": str(text or "")[:8192],
         "has_media": bool(getattr(message, "media", None)),
+        "media_type": _media_type(message),
         "is_reply": bool(getattr(message, "reply_to_msg_id", None)),
+        "mentioned": bool(getattr(event, "mentioned", False)),
         "out": bool(getattr(event, "out", False)),
         "date": getattr(message, "date", None),
     }
