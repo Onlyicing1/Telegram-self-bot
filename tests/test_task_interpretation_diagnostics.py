@@ -320,3 +320,143 @@ async def test_create_task_maps_failure_modes_to_distinct_messages():
     assert len(tasks) == 1
     assert tasks[0].schedule == {"seconds": 300.0}
     assert tasks[0].ai_instruction == LIVE_PERSIAN_REQUEST
+
+
+# ═══════════════════════ 5. JSON-EXTRACTION TOLERANCE & DIAGNOSTICS ═══════════════════════
+#
+# Live evidence: the exact multi-line Persian request reached
+# `[failure category: candidate_invalid_json]` — a JSONDecodeError BEFORE
+# candidate validation. Source contract: provider adapters (Gemini text-part
+# join, OpenAI-compat message content) deliver ONE plain text string; the
+# interpreter prompt does not forbid prose around the object. The tolerated
+# wrapper shapes below are deterministic parse tolerances only — every parsed
+# result still passes the FULL parse_candidate_output validation.
+
+
+def _good_candidate_json() -> str:
+    return json.dumps({
+        "label": "Bio update", "schedule_type": "interval", "schedule": {"seconds": 300},
+        "timezone": TZ,
+        "actions": [{"name": "bio_set_text", "arguments": {"text": ""}}],
+        "notification_destination": {},
+        "ai_instruction": LIVE_PERSIAN_REQUEST,
+    }, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("wrapped", [
+    _good_candidate_json(),
+    "```json\n" + _good_candidate_json() + "\n```",
+    "Here is the JSON:\n```json\n" + _good_candidate_json() + "\n```\nHope this helps!",
+    "Here is the JSON:\n" + _good_candidate_json() + "\nHope this helps!",
+    json.dumps(_good_candidate_json()),
+    _good_candidate_json().replace("\\n", "\n"),
+], ids=["direct", "fenced", "prose_plus_fenced", "prose_unfenced", "double_encoded", "raw_newlines"])
+@pytest.mark.asyncio
+async def test_json_extraction_tolerates_contract_permitted_wrappers(wrapped):
+    """Every wrapper shape the provider contract permits must parse and then
+    pass the FULL candidate validation — the live multi-line request is the
+    raw-newlines case (unescaped control characters)."""
+    candidate = await _interpret(wrapped)
+    assert candidate.schedule_type == "interval"
+    assert candidate.schedule == {"seconds": 300.0}
+    assert candidate.actions == [{"name": "bio_set_text", "arguments": {"text": ""}}]
+    assert candidate.ai_instruction == LIVE_PERSIAN_REQUEST
+
+
+@pytest.mark.parametrize("bad, category", [
+    (_good_candidate_json()[:-40], "candidate_invalid_json:truncated"),
+    ("{\"label\": 12x3}", "candidate_invalid_json"),
+    ("", "candidate_invalid_json:empty"),
+    ("Sure, here is the JSON you asked for!", "candidate_invalid_json"),
+], ids=["truncated", "malformed", "empty", "prose_only"])
+@pytest.mark.asyncio
+async def test_json_extraction_fails_closed_with_distinct_categories(bad, category):
+    """Genuinely unparseable output is rejected (never fabricated into a
+    candidate) and the user-facing category distinguishes truncated JSON from
+    other malformed shapes."""
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.context import ToolContext
+    from backend.ai.tools.task import CreateTaskTool
+    from tests.test_task_semantic_triggers import _FakeProvider  # noqa: PLC0415
+    from backend.ai.providers.manager.manager import ProviderManager
+
+    pm = ProviderManager()
+    provider = _FakeProvider(bad)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+    ctx = ToolContext(
+        telegram=None, owner_id=778, tz_str=TZ, client=None,
+        extra={"provider_manager": pm, "chat_id": -1001},
+    )
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with patch.object(dbm, "get_repository_manager", return_value=manager):
+        result = await CreateTaskTool(ctx).execute(ctx, {"request": LIVE_PERSIAN_REQUEST})
+    assert result.success is False
+    assert f"[failure category: {category}]" in result.message
+    tasks = await manager.task.list_tasks(778)
+    assert tasks == []  # zero persistence on unparseable output
+
+
+@pytest.mark.asyncio
+async def test_json_diagnostics_log_parser_metadata_without_content(caplog):
+    """The candidate_rejected trace for malformed JSON carries content-free
+    parser metadata (error type, line, column, position, bounded length,
+    truncation flag) and NEVER the raw response or the user request."""
+    from backend.ai.providers.base.contract import ProviderResponse
+
+    truncated_raw = _good_candidate_json()[:-40]
+
+    class _MetaProvider:
+        async def chat(self, messages, tools=None):
+            return ProviderResponse(
+                text=truncated_raw, provider_name="stub", success=True,
+                metadata={"finish_reason": "MAX_TOKENS"},
+            )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(TaskInterpretationError):
+            await TaskInterpreter(_MetaProvider()).interpret(
+                LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-42"
+            )
+    line = next(
+        r.getMessage() for r in caplog.records
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=candidate_rejected" in r.getMessage()
+    )
+    assert "response_shape=malformed" in line
+    assert "json_error=JSONDecodeError" in line
+    assert "line=" in line and "col=" in line and "pos=" in line
+    assert "raw_len=" in line
+    assert "truncated=True" in line
+    assert "provider_finish_reason=MAX_TOKENS" in line
+    assert "request_id=req-42" in line
+    assert LIVE_PERSIAN_REQUEST not in line  # never the user's request
+    assert "bio_set_text" not in line  # never the candidate content
+
+
+@pytest.mark.asyncio
+async def test_finish_reason_truncation_classifies_even_when_json_parses(caplog):
+    """A provider finish_reason of MAX_TOKENS/length is a truncation signal
+    the trace must surface even if the partial JSON happens to parse."""
+    from backend.ai.providers.base.contract import ProviderResponse
+
+    partial = _good_candidate_json()
+    partial = partial[: partial.rfind("}")] + "}"  # structurally valid, semantically cut
+
+    class _CutProvider:
+        async def chat(self, messages, tools=None):
+            return ProviderResponse(
+                text=partial, provider_name="stub", success=True,
+                metadata={"finish_reason": "length"},
+            )
+
+    with caplog.at_level(logging.INFO):
+        await TaskInterpreter(_CutProvider()).interpret(
+            LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-43"
+        )
+    line = next(
+        r.getMessage() for r in caplog.records
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=candidate_parsed" in r.getMessage()
+    )
+    assert "request_id=req-43" in line
+    assert "provider_finish_reason=length" in line

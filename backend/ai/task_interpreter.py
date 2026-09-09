@@ -137,24 +137,94 @@ def _response_shape(value: Any) -> str:
     return f"other:{type(value).__name__}"
 
 
-def _load_candidate_json(raw: str) -> Any:
-    """Parse the model's JSON, tolerating the common markdown-fence wrapper.
+def _outer_object_span(raw: str) -> tuple[int, int] | None:
+    """Locate the outermost balanced {...} span in prose, string-aware.
 
-    Providers frequently wrap a compliant JSON object in ``` fences (with or
-    without the ``json`` tag). The candidate itself is still validated by
-    ``parse_candidate_output`` — this only fixes the extraction step.
+    Deterministic character scan (no regex): tracks JSON string literals and
+    escapes so braces INSIDE string values (e.g. inside the verbatim
+    ai_instruction) never confuse the depth counter. Returns None when no
+    balanced object exists.
     """
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return (start, i + 1)
+    return None
+
+
+def _load_candidate_json(raw: str) -> Any:
+    """Parse the model's JSON, tolerating the wrapper shapes the provider
+    contract legitimately permits.
+
+    The provider adapters deliver the model's output as ONE plain text
+    string (Gemini joins text parts, OpenAI-compat uses message content) and
+    the interpreter prompt does not forbid prose around the object, so the
+    following deterministic tolerances are applied — each one still feeds
+    the FULL candidate validation afterwards, so nothing is weakened:
+
+    1. the entire raw response (control characters like literal newlines in
+       strings accepted via ``strict=False`` — the common multi-line
+       ai_instruction escape failure);
+    2. one markdown-fenced JSON block (with or without the ``json`` tag);
+    3. prose-wrapped UNFENCED JSON ("Here is the JSON: {...}") via a
+       string-aware outer-brace span;
+    4. double-encoded JSON (a JSON string whose content is itself JSON).
+
+    Anything else re-raises the real JSONDecodeError against the raw text so
+    the caller can classify it with the parser's own line/column metadata.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise json.JSONDecodeError("empty response", raw if isinstance(raw, str) else "", 0)
     try:
-        return json.loads(raw)
+        decoded = json.loads(raw, strict=False)
     except json.JSONDecodeError:
-        pass
+        decoded = None
+    if isinstance(decoded, (dict, list)):
+        return decoded
+    if isinstance(decoded, str) and decoded.strip():
+        # Double-encoded JSON: the top level is a JSON string whose content
+        # is itself the candidate object. Unwrap exactly one level.
+        try:
+            inner = json.loads(decoded, strict=False)
+        except json.JSONDecodeError:
+            inner = None
+        if isinstance(inner, (dict, list)):
+            return inner
     match = _JSON_BLOCK_RE.search(raw)
-    if not match:
-        # Re-parse without fences so the raised error is the real
-        # JSONDecodeError (a bare `raise` here would surface as a generic
-        # RuntimeError and hide the parse failure from diagnostics).
-        return json.loads(raw)
-    return json.loads(match.group(1))
+    if match:
+        try:
+            return json.loads(match.group(1), strict=False)
+        except json.JSONDecodeError:
+            pass
+    span = _outer_object_span(raw)
+    if span is not None:
+        try:
+            return json.loads(raw[span[0]:span[1]], strict=False)
+        except json.JSONDecodeError:
+            pass
+    # Re-parse without tolerance so the raised error is the real
+    # JSONDecodeError for the raw text (with lineno/colno/pos metadata).
+    return json.loads(raw)
 
 
 class TaskInterpreter:
@@ -367,7 +437,9 @@ class TaskInterpreter:
         )
         raw = response.text
         if not isinstance(raw, str) or not raw.strip():
-            raise TaskInterpretationError("task interpretation returned no structured output")
+            raise TaskInterpretationError(
+                "task interpretation returned no structured output (empty response)"
+            )
         value: Any = None
         shape = "unknown"
         try:
@@ -389,7 +461,27 @@ class TaskInterpreter:
         except (json.JSONDecodeError, TaskCandidateError) as exc:
             if shape == "unknown":
                 shape = "malformed"
-            if isinstance(value, dict):
+            json_truncated = False
+            if isinstance(exc, json.JSONDecodeError) and isinstance(raw, str):
+                json_truncated = (
+                    "Unterminated" in str(exc)
+                    or (exc.pos >= max(0, len(raw) - 8) and len(raw) >= 20)
+                )
+                finish = meta.get("finish_reason")
+                provider_truncated = (
+                    isinstance(finish, str)
+                    and finish.upper() in ("MAX_TOKENS", "LENGTH")
+                )
+                logger.info(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
+                    "response_shape=malformed json_error=%s line=%s col=%s "
+                    "pos=%s raw_len=%s truncated=%s provider_finish_reason=%s",
+                    request_id or "-", type(exc).__name__, exc.lineno,
+                    exc.colno, exc.pos, len(raw),
+                    bool(json_truncated or provider_truncated),
+                    finish if isinstance(finish, str) else "-",
+                )
+            elif isinstance(value, dict):
                 actions = value.get("actions")
                 logger.info(
                     "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
@@ -412,9 +504,14 @@ class TaskInterpreter:
                 "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
                 str(exc)[:200],
             )
+            json_suffix = (
+                f" json_truncated={json_truncated}"
+                if isinstance(exc, json.JSONDecodeError)
+                else ""
+            )
             raise TaskInterpretationError(
                 f"task interpretation did not return a valid candidate "
-                f"(response_shape={shape})"
+                f"(response_shape={shape}{json_suffix})"
             ) from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -422,16 +519,18 @@ class TaskInterpreter:
                 shape, exc,
             )
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+        finish = meta.get("finish_reason")
         logger.info(
             "AI_TASK_TRACE request_id=%s stage=candidate_parsed response_shape=%s "
             "candidate_type=%s "
             "action_count=%s action_field_names=%s schedule_type=%s timezone=%s "
-            "destination_keys=%s",
+            "destination_keys=%s provider_finish_reason=%s",
             request_id or "-", shape, "object",
             len(candidate.actions),
             ",".join(sorted(candidate.actions[0])) if candidate.actions else "-",
             candidate.schedule_type, candidate.timezone,
             ",".join(sorted(candidate.notification_destination)) or "-",
+            finish if isinstance(finish, str) else "-",
         )
         logger.info(
             "AI_TASK_TRACE request_id=%s stage=interpretation_end success=true "

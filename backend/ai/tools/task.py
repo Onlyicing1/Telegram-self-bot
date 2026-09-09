@@ -52,7 +52,11 @@ def _classify_interpretation_failure(exc: Exception) -> str:
         cause = exc.__cause__
         cause_name = type(cause).__name__ if cause is not None else ""
         if cause_name == "JSONDecodeError":
+            if "json_truncated=True" in text:
+                return "candidate_invalid_json:truncated"
             return "candidate_invalid_json"
+        if "empty response" in text:
+            return "candidate_invalid_json:empty"
         if cause_name == "TaskCandidateError":
             marker = "response_shape="
             if marker in text:
