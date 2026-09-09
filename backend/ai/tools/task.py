@@ -54,6 +54,11 @@ def _classify_interpretation_failure(exc: Exception) -> str:
         if cause_name == "JSONDecodeError":
             return "candidate_invalid_json"
         if cause_name == "TaskCandidateError":
+            marker = "response_shape="
+            if marker in text:
+                shape = text.split(marker, 1)[1].split(")", 1)[0].strip()
+                if shape:
+                    return f"candidate_invalid:{shape}"
             return "candidate_invalid"
         return "interpretation_error"
     if isinstance(exc, TaskCandidateError):
@@ -165,7 +170,15 @@ class CreateTaskTool(Tool):
             )
 
         def _fail(stage: str, category: str, exc: Exception | None = None) -> ToolResult:
-            """Single terminal failure record — last stage + safe detail."""
+            """Single terminal failure record — last stage + safe detail.
+
+            The user-facing message carries the bounded failure category so a
+            live reproduction self-identifies the failing layer (interpretation
+            vs provider vs persistence) instead of collapsing every failure
+            into one indistinguishable rejection text. The token is
+            sanitized to one line, bounded, and content-free (no raw provider
+            output, no secrets).
+            """
             logger.warning(
                 "AI_TASK_TRACE request_id=%s stage=create_task_failed failed_stage=%s "
                 "category=%s exception=%s detail=%s elapsed_ms=%s persisted=false",
@@ -174,10 +187,12 @@ class CreateTaskTool(Tool):
                 str(exc)[:200] if exc is not None else "-",
                 int((time.perf_counter() - started) * 1000),
             )
+            safe_category = " ".join(str(category).split())[:80]
             return ToolResult(success=False, message=(
                 "I could not turn that into a safe, unambiguous schedule, so I "
                 "did not create any task. Restate it as an interval (e.g. 'every "
                 "X minutes'), a time, or a daily/weekly cadence with a clear action."
+                + (f" [failure category: {safe_category}]" if safe_category else "")
             ))
 
         _trace(

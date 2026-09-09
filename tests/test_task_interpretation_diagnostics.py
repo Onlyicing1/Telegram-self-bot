@@ -257,9 +257,12 @@ async def test_placeholder_timezone_candidate_is_rejected_deterministically():
 
 @pytest.mark.asyncio
 async def test_create_task_maps_failure_modes_to_distinct_messages():
-    """Null/malformed/schema violations keep the generic ambiguity message
-    (trace classifies the shape); unsupported capabilities get the distinct
-    honest message; a compliant candidate creates the task."""
+    """Every rejection layer now carries a bounded, content-free failure
+    category in the user-facing message, so one live reproduction identifies
+    the exact layer (provider-null vs malformed JSON vs schema violation vs
+    provider failure) instead of one indistinguishable generic text.
+    Unsupported capabilities keep the distinct honest message; a compliant
+    candidate creates the task."""
     from backend.ai.database import manager as dbm
     from backend.ai.tools.context import ToolContext
     from backend.ai.tools.task import CreateTaskTool
@@ -285,6 +288,19 @@ async def test_create_task_maps_failure_modes_to_distinct_messages():
     null_result, _ = await run("null")
     assert null_result.success is False
     assert "could not turn that into a safe, unambiguous schedule" in null_result.message
+    assert "[failure category: candidate_invalid:null]" in null_result.message
+
+    malformed_result, _ = await run("{\"label\": \"x\"")
+    assert malformed_result.success is False
+    assert "[failure category: candidate_invalid_json]" in malformed_result.message
+
+    schema_result, _ = await run(json.dumps({
+        "label": "T", "schedule_type": "interval", "schedule": {"seconds": 300},
+        "actions": [{"name": "bio_set_text", "arguments": {"text": ""}}],
+        "notification_destination": {},
+    }))  # missing required top-level timezone
+    assert schema_result.success is False
+    assert "[failure category: candidate_invalid:object]" in schema_result.message
 
     unsupported_result, _ = await run(json.dumps({"unsupported": "monthly recurrence"}))
     assert unsupported_result.success is False

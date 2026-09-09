@@ -412,7 +412,10 @@ class TaskInterpreter:
                 "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
                 str(exc)[:200],
             )
-            raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+            raise TaskInterpretationError(
+                f"task interpretation did not return a valid candidate "
+                f"(response_shape={shape})"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "TASK_INTERPRET_REJECTED reason=candidate_parse_error response_shape=%s detail=%r",
