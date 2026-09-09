@@ -6,13 +6,13 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Report type | Current-state implementation report — semantic source fidelity of AI-assisted Bio generation (§19, this session); §3–§18 are retained historical audits from prior sessions |
-| This session's change | Fix the STILL-BROKEN semantic source fidelity of AI-assisted Bio generation — the live "Ayumi: Every star begins as a dream!" failure for an Ayanami Rei task. Root cause: the interpreter prompt had no AI-generated-content contract, so the provider baked a static line into the action snapshot at creation and never emitted `ai_instruction` (the coordinator's AI/policy path activates only for tasks with a persisted `ai_instruction`). Fix: interpreter prompt/schema AI-content contract, deterministic creation gate (`CreateTaskTool`) persisting the VERBATIM request as `ai_instruction`, token-based source extraction wired into `derive_policy` (was dead code), fail-closed source validation (no trusted corpus exists — a model label is not proof), coordinator-owned bounded regeneration loop re-proving policy before execution AND before prepare-ahead persistence. 17 new regression tests incl. the exact live failure (`tests/test_task_source_fidelity.py`); `tests/test_preparation_policy_source.py` updated to the honest fail-closed contract |
+| Report type | Current-state implementation report — source-attributed dialogue generation (§21, this session); §3–§20 are retained historical audits from prior sessions |
+| This session's change | Replace the previous fail-closed-for-all-sources policy with the two-class contract: (1) ordinary source requests are GENERATED in-character dialogue — content must deterministically self-attribute to the requested source (full spoken name + separator, token-based, no regex) and is rejected/regenerated under the existing bounded contract when drifted, short-form, or unattributed; (2) explicit exact-canonical-quote requests still fail closed (no trusted corpus/verifier exists — a generated line is never presented as an authenticated quotation). The live "Ayumi: Every star begins as a dream!" line remains rejected for an Ayanami Rei task. Files: `backend/ai/preparation_policy.py` (quote_exact flag + `_check_attribution`); tests updated/added: `test_preparation_policy_source.py`, `test_task_source_fidelity.py`, `test_task_nl_interval_creation.py`. Bio guardian, prepare-ahead, creation gate, interpreter, coordinator unchanged and re-pinned by tests |
 | Date | 2026-09-09 |
-| Status | **COMPLETE — full suite green (1871 passed, 24 skipped). LIVE Telegram execution not performed in this workspace** (no session credentials); the exact live failure is reproduced and rejected in-process |
-| Commit (this session) | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`) + docs commits `f71ff84`/`a8628d9`, `6c6a28b`, `8189140` (report + delivery record — exact SHAs and tip verified post-push, §19.7) |
-| Push result | `b046f10..<tip> main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` (exact tip in §19.7) |
-| Remote `refs/heads/main` | equals local HEAD post-push (authoritative `ls-remote` — exact SHA in §19.7) |
+| Status | **COMPLETE — full suite green (1923 passed, 24 skipped). LIVE Telegram/provider execution not performed in this workspace** (no session credentials); behavior verified in-process through the real deterministic layers with a scripted provider |
+| Commit (this session) | `73d0daf` (`fix: generate source-attributed dialogue with deterministic self-attribution`) + report commit (exact tip verified post-push, §21.6) |
+| Push result | `97f7e92..<tip> main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` (exact tip in §21.6) |
+| Remote `refs/heads/main` | equals local HEAD post-push (authoritative `ls-remote` — exact SHA in §21.6) |
 
 ## 2. EXECUTIVE SUMMARY
 
@@ -879,3 +879,61 @@ A second, related defect surfaced while reproducing the live requests: `_extract
 - Live Telegram verification was not performed in this workspace (no session credentials); behavior is verified in-process with the real deterministic layers and a scripted provider following the (now explicit) prompt contract.
 - The deterministic router still routes interval-without-intro phrasings ("پنج دقیقه یکبار") conversationally; that is by design — the provider interprets them semantically and may still create the task. It is never a hard rejection.
 - Months ("ماه"/"month") are recognized as recurrence markers but their exact length is the model's semantic choice (the deterministic layer only checks the resulting positive seconds).
+
+
+## 21. SOURCE-ATTRIBUTED DIALOGUE GENERATION — THE TWO-CLASS SOURCE CONTRACT — 2026-09-09
+
+### 21.1 Objective
+
+The user's concrete scenario is a recurring AI Bio task from this natural-language request:
+
+> "هر 5 دقیقه تکست بیو من رو به یه دیالوگ رندوم از آیانامی ری تغییر بده باید زیر 60 کاراکتر باشه"
+
+Intended meaning: recurring 5-minute interval, Bio update action, AI-generated content at occurrence time, character Rei Ayanami, dialogue content type, random selection, strictly below 60 characters, exactly one Telegram mutation at the scheduled boundary. On the pre-fix HEAD the task CREATED correctly (interval 300s, verbatim `ai_instruction`, source pinned) but every occurrence FAILED CLOSED: `validate_content` rejected ALL source-bearing content ("source-specific content cannot be independently verified"), so the Bio could never change. This phase implements the required two-class contract: ordinary source requests are GENERATED in-character dialogue and execute when deterministically self-attributed; explicit exact-canonical-quote requests still fail closed.
+
+### 21.2 Root cause (traced in source at `97f7e92`)
+
+`backend/ai/preparation_policy.py::validate_content` raised `PreparationPolicyError` for any `policy.source` (the previous phase's honest-but-total fail-closed stance). The occurrence path (`TaskExecutionCoordinator.execute` → `_prepare_calls` → `prepare`/`validate_prepared_arguments` → `validate_content`) therefore failed every source-bearing occurrence with zero tool calls — the user's live scenario could never mutate the Bio. The task spec explicitly distinguishes the request classes: "This is GENERATED content, not an exact-canonical-quote retrieval request… This task is asking for generated in-character dialogue unless the user explicitly requests an exact quote."
+
+### 21.3 Exact files changed (commit `73d0daf`)
+
+| Path | Change |
+|---|---|
+| `backend/ai/preparation_policy.py` | (1) New `_EXACT_QUOTE_MARKERS` fixed vocabulary (نقل قول / نقل‌قول / عین جمله / کلمه به کلمه / exact quote / verbatim / word for word / word-for-word) — substring scan like the existing language markers, no regex. (2) `PreparationPolicy.quote_exact: bool` — set in `derive_policy` only when a named source AND an exact-quote marker are both present (an exact-quote phrase without a source constrains nothing). (3) New `_check_attribution(text, source)`: deterministic token-based self-attribution — the content must OPEN with the source's full name (all tokens, spoken order, case-insensitive; opening quotes tolerated; separator may attach to the last name token) followed by a dialogue separator (`:` `؛` `،` `,` `-` `—` `–` `(` `«` `「` `（`) and a non-empty line. Rejects a different speaker, a short form, an in-text mention, a name-only line, and unattributed generic text. (4) `validate_content`: source + `quote_exact` → fail closed ("cannot be independently verified: no trusted source corpus or verifier is configured"); source (generated dialogue) → `_check_attribution`; language/length checks unchanged ("زیر 60" still derives `max_length=59`, never truncates). (5) `describe()` now states the enforced format ("open with '<source>:' followed by the line") so every preparation round's prompt carries the contract; the exact-quote branch states the fail-closed rule. |
+| `tests/test_preparation_policy_source.py` | Updated to the new contract: 31 tests — wrong-speaker/short-form/in-text/name-only/generic (incl. Persian generic) rejected; matching attributed lines accepted (Persian + English source); separator format variants accepted; exact-quote requests (Persian/English) fail closed; exact-quote without a named source is inert; under-60 length semantics unchanged (59 ok, 60/61 rejected, never truncated); describe() states the attribution contract and the exact-quote fail-closed rule. |
+| `tests/test_task_source_fidelity.py` | Updated to the new contract: the exact live "Ayumi: Every star begins as a dream!" line and unattributed generic text still rejected with ZERO tool calls; wrong-speaker/short-form/in-text labels still rejected; a matching attributed line now EXECUTES EXACTLY ONCE through the ToolExecutor (rounds == 1, occurrence succeeded); drift-then-attributed regenerates within the bounded loop and succeeds once; an exact-quote task (PERSIAN_TASK + "، نقل قول دقیق") fails closed after exactly `MAX_PREPARATION_ATTEMPTS` rounds with zero mutations and a failed occurrence; prepare-ahead for a valid attributed line persists `prepared_action` metadata with zero tool calls and zero guardian window, and the boundary later executes it with zero additional provider rounds; drifted content still never persists. Part A creation-gate tests and Part C guardian tests unchanged. |
+| `tests/test_task_nl_interval_creation.py` | One Part E test updated to the new contract: Ayumi + generic text rejected; a self-attributed Persian line accepted (no canonical claim). |
+
+### 21.4 What is enforced vs. what is NOT claimed
+
+- **Enforced deterministically:** strict `<60` (max 59, rejected-not-truncated); Persian/Chinese/Arabic script constraints when the instruction names a language; garbage/failure-payload rejection; and for a named source — the line's opening SELF-ATTRIBUTION (full spoken name + separator), rejecting drifted speakers (Ayumi), short forms (Rei), in-text mentions, and unattributed generic text. Bounded regeneration (max 3 rounds) then fail-closed; the Bio guardian and prepare-ahead separation are untouched.
+- **NOT claimed (documented limitation, not faked):** the system does NOT verify that a line is an exact canonical Ayanami Rei quotation — no trusted source corpus or independent verifier exists in this architecture, and a provider/speaker label is never treated as canon. Explicit exact-quote requests therefore fail closed. A self-attributed line is enforced only as the generated line's own opening attribution.
+
+### 21.5 Validation
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_preparation_policy_source.py -q` | **31 passed** |
+| `pytest tests/test_task_source_fidelity.py tests/test_preparation_policy_source.py tests/test_task_nl_interval_creation.py tests/test_bio_guardian.py tests/test_task_prepare_ahead.py tests/test_task_ai_preparation.py -q` | **124 passed** |
+| `pytest tests/ -q` (full suite) | **1923 passed, 24 skipped, 1 warning** in 63.71s |
+| `py_compile` (modified backend + 3 test files) | OK |
+| `git diff --check` | clean |
+| Regex audit | no new regex (attribution is token-based; diff contains only prose mentions) |
+| Changed files | exactly 4 (1 backend + 3 tests); `telegram-self-bot/` nested clone untouched |
+| Live Telegram / live provider / live Supabase | NOT performed in this workspace (no session credentials) — verified in-process through the real deterministic layers with scripted providers |
+
+### 21.6 Delivery record (verified)
+
+| Item | Value |
+|---|---|
+| Fix commit | `73d0daf` (`fix: generate source-attributed dialogue with deterministic self-attribution`) |
+| Report commit | (tip — this section's commit) |
+| Push | `git push origin main` (non-force fast-forward); remote proof via `fetch` + `rev-parse` + `ls-remote` post-push |
+| Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` |
+
+### 21.7 Remaining limitations
+
+- Live Telegram/provider/Supabase verification was not performed in this workspace (no session credentials); behavior is verified in-process with the real deterministic layers and a scripted provider.
+- Canonical-quote authenticity is still NOT verifiable: no trusted corpus/verifier exists, so exact-quote requests fail closed and self-attributed lines are generated in-character dialogue, never authenticated quotations.
+- The attribution contract requires the line to open with the exact spoken source name; a model that writes the name in a different script or order (e.g. "Rei Ayanami" for "Ayanami Rei") is rejected and regenerated within the bounded budget.
+
