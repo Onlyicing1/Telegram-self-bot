@@ -10,9 +10,9 @@
 | This session's change | Fix the STILL-BROKEN semantic source fidelity of AI-assisted Bio generation — the live "Ayumi: Every star begins as a dream!" failure for an Ayanami Rei task. Root cause: the interpreter prompt had no AI-generated-content contract, so the provider baked a static line into the action snapshot at creation and never emitted `ai_instruction` (the coordinator's AI/policy path activates only for tasks with a persisted `ai_instruction`). Fix: interpreter prompt/schema AI-content contract, deterministic creation gate (`CreateTaskTool`) persisting the VERBATIM request as `ai_instruction`, token-based source extraction wired into `derive_policy` (was dead code), fail-closed source validation (no trusted corpus exists — a model label is not proof), coordinator-owned bounded regeneration loop re-proving policy before execution AND before prepare-ahead persistence. 17 new regression tests incl. the exact live failure (`tests/test_task_source_fidelity.py`); `tests/test_preparation_policy_source.py` updated to the honest fail-closed contract |
 | Date | 2026-09-09 |
 | Status | **COMPLETE — full suite green (1871 passed, 24 skipped). LIVE Telegram execution not performed in this workspace** (no session credentials); the exact live failure is reproduced and rejected in-process |
-| Commit (this session) | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`); delivery commits `f71ff84` + `a8628d9` (docs + SHA record) |
-| Push result | `b046f10..a8628d9 main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` |
-| Remote `refs/heads/main` | `a8628d9` (authoritative `ls-remote`, post-push) |
+| Commit (this session) | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`) + docs commits `f71ff84`/`a8628d9`/`6c6a28b`/`a26291b` (report + delivery record — exact SHAs and tip verified post-push, §19.7) |
+| Push result | `b046f10..<tip> main -> main` — succeeded, then independently verified via `fetch` + `rev-parse` + `ls-remote` (exact tip in §19.7) |
+| Remote `refs/heads/main` | equals local HEAD post-push (authoritative `ls-remote` — exact SHA in §19.7) |
 
 ## 2. EXECUTIVE SUMMARY
 
@@ -803,7 +803,7 @@ Three defects, all confirmed in source:
 | Item | Value |
 |---|---|
 | Fix commit | `e8d6cfb` (`fix: enforce semantic source fidelity for AI-assisted bio tasks`) |
-| Docs commits | `f71ff84` (report) + `a8628d9` (SHA record) |
+| Docs commits | `f71ff84` (report) + `a8628d9`/`6c6a28b`/`a26291b` (delivery record) — tip verified post-push |
 | Push | `git push origin main` (non-force fast-forward) |
 | Remote proof | `git fetch origin`; `rev-parse HEAD` == `rev-parse origin/main` == `ls-remote refs/heads/main` (verified post-push) |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
