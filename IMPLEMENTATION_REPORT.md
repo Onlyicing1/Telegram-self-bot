@@ -14,9 +14,9 @@
 | Branch | `main` |
 | Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
 | Phase | Diagnose and fix the STILL-OPEN production rejection of the exact multi-line Persian bio-task request; failure-layer diagnostics |
-| Implementation commit | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) |
+| Implementation commits | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) · `c35f75f` (`fix: make task-creation rejection carry the bounded failure category`) |
 | Report commit | see §10 delivery record |
-| Status | **CODE-COMPLETE — full suite green (2021 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials); root cause source-proven; live classification requires one production log line (see §6) |
+| Status | **CODE-COMPLETE — full suite green (2021 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials); deterministic layers proven compliant; the live rejection persisted after `33727f3` — the remaining causes are (A) stale deployed runtime or (B) provider-output compliance, and the `c35f75f` failure-category suffix now makes ONE live reproduction conclusive (see §6) |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 
 ---
@@ -77,7 +77,9 @@ wrong) outcome regardless of the new prompt text.
 
 | Check | Result |
 |---|---|
-| `pytest tests/test_task_interpretation_diagnostics.py -q` | **18 passed** |
+| `pytest tests/test_task_interpretation_diagnostics.py -q` | **18 passed** (post-`c35f75f`: suffix contract pinned for null / malformed / schema-violation / unsupported / success) |
+| Adjacent task suites (6 files, post-`c35f75f`) | **196 passed** |
+| `pytest tests/ -q` (full suite, post-`c35f75f`) | **2021 passed, 24 skipped** in 63.53s |
 | Adjacent routing/AI suites (7 files) | **186 passed** |
 | `pytest tests/ -q` (full suite) | **2021 passed, 24 skipped, 1 warning** in 63.69s |
 | `py_compile` (modified files) | OK |
@@ -95,7 +97,10 @@ this workspace; production classification requires one log line, §6).
 
 ## 6. How one live reproduction now classifies the failure
 
-Production `AI_TASK_TRACE` (LOG_LEVEL=INFO) now distinguishes:
+Production `AI_TASK_TRACE` (LOG_LEVEL=INFO) now distinguishes, and — since
+`c35f75f` — so does the USER-FACING rejection: the generic message ends
+with a bounded `[failure category: ...]` token that one live reproduction
+can paste back verbatim (no log access needed):
 
 - `stage=candidate_rejected response_shape=null` → the model returned JSON null.
 - `response_shape=malformed` → malformed JSON (incl. unescaped multi-line ai_instruction).
@@ -104,8 +109,16 @@ Production `AI_TASK_TRACE` (LOG_LEVEL=INFO) now distinguishes:
 - `response_shape=unsupported` → the unsupported-capability contract fired.
 - `stage=candidate_parsed response_shape=object` → interpretation succeeded
   (then any downstream failure is NOT the interpreter).
-- If none of these lines appear but the user still gets the generic message,
-  the deployed runtime predates this commit — a stale Render deployment.
+- The user-facing reply shows `[failure category: candidate_invalid:null]`
+  (provider returned JSON null), `candidate_invalid_json` (malformed JSON),
+  `candidate_invalid:object` (schema violation, e.g. missing timezone),
+  `timeout`, `provider_manager_unavailable`, `repository_failure`, or a
+  `provider=... category=...` token (provider-side failure) — each maps to a
+  distinct layer.
+- If the reply has NO `[failure category: ...]` suffix, the deployed runtime
+  predates `c35f75f` — a stale Render deployment (Render auto-deploys on
+  push to `main` only when connected; verify the service picked up
+  `fb76fc8`/`c35f75f` and restart it).
 
 ---
 
@@ -133,15 +146,23 @@ column.
 
 ## 9. Remaining limitations / blockers
 
-1. **Live verification NOT PROVEN**: no Telegram/provider credentials in this
-   workspace. The exact Persian request is proven through the real
-   deterministic layers with a scripted provider, but production confirmation
-   requires a live run (or the one trace line in §6).
+1. **Live verification NOT PROVEN — and the live rejection RECURRED after
+   `33727f3` was pushed** (user reproduction: identical generic message).
+   Two live-state causes remain: (A) the deployed Render runtime predates
+   the fix (deployment lag/failure — plausible: the reproduction ran
+   immediately after push; Render auto-deploys on push only when the
+   service is connected), or (B) the production provider returns
+   null/schema-violating output despite the prompt (prompt contract is
+   explicit but no provider is guaranteed compliant). The `c35f75f`
+   failure-category suffix makes one new live run conclusive: no suffix →
+   stale deployment; `candidate_invalid:null` / `candidate_invalid:object`
+   / `candidate_invalid_json` → provider output compliance; `repository_failure`
+   → persistence.
 2. **Provider-output compliance** cannot be guaranteed for arbitrary models;
-   the diagnostics now classify any non-compliant output, and the prompt
-   contract is explicit.
+   the diagnostics + user-facing category now classify any non-compliant
+   output, and the prompt contract is explicit.
 3. **Stale deployment** possibility (A) cannot be excluded from this
-   workspace; if the generic message persists after deploying `33727f3`
+   workspace; if the generic message persists after deploying `c35f75f`
    WITH the trace showing `candidate_parsed`, the issue is downstream.
 4. Monthly/yearly/weekend triggers remain honestly unsupported; canonical-
    quote authenticity remains unverified by design.
@@ -152,7 +173,8 @@ column.
 
 | Item | Value |
 |---|---|
-| Implementation commit | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) |
+| Implementation commits | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) · `c35f75f` (`fix: make task-creation rejection carry the bounded failure category`) |
+| Base commit (this phase) | `fb76fc8` (clean tree, `origin/main` equal) |
 | Report commit | `(filled after creation — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
 | Verified remote HEAD | equals local HEAD post-push (authoritative `ls-remote`) |
