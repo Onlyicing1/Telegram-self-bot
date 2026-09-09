@@ -421,7 +421,7 @@ async def test_json_diagnostics_log_parser_metadata_without_content(caplog):
             )
     line = next(
         r.getMessage() for r in caplog.records
-        if "AI_TASK_TRACE" in r.getMessage() and "stage=candidate_rejected" in r.getMessage()
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=candidate_parse_error" in r.getMessage()
     )
     assert "response_shape=malformed" in line
     assert "json_error=JSONDecodeError" in line
@@ -460,3 +460,134 @@ async def test_finish_reason_truncation_classifies_even_when_json_parses(caplog)
     )
     assert "request_id=req-43" in line
     assert "provider_finish_reason=length" in line
+
+
+# ═══════════════ 6. PROVIDER-RESPONSE INSTRUMENTATION (behavior-unchanged) ═══════════════
+#
+# Instrumentation-only phase: the raw_response_shape trace classifies
+# the REAL provider response content-free BEFORE parsing; the
+# candidate_parse_error trace enriches the JSON failure with provider/model/
+# structural metadata. NO parser, prompt, or validation behavior is changed
+# — the tolerance matrix above still passes unchanged with instrumentation
+# in place.
+
+
+def _meta_provider(text: str):
+    from backend.ai.providers.base.contract import ProviderResponse
+
+    class _MetaProvider:
+        async def chat(self, messages, tools=None):
+            return ProviderResponse(
+                text=text, provider_name="stub", success=True,
+                metadata={"model": "stub-model", "finish_reason": "stop"},
+            )
+
+    return _MetaProvider()
+
+
+@pytest.mark.parametrize("wrapped, first, extra", [
+    (_good_candidate_json(), "object", {}),
+    ("```json\n" + _good_candidate_json() + "\n```", "fence", {"contains_fence": "True"}),
+    ("Here is the JSON:\n" + _good_candidate_json(), "other", {"leading_prose": "True"}),
+    (json.dumps(_good_candidate_json()), "quote", {}),
+    (_good_candidate_json().replace("\\n", "\n"), "object", {"has_control_chars": "True"}),
+    (_good_candidate_json()[:-30], "object", {"trailing_prose": "True", "object_span": "False"}),
+    ("", "empty", {}),
+    ("[1,2,3]", "array", {}),
+    ("Sure thing!", "other", {"trailing_prose": "True"}),
+], ids=["direct", "fenced", "prose_unfenced", "double_encoded", "raw_newlines", "truncated", "empty", "array", "prose_only"])
+@pytest.mark.asyncio
+async def test_provider_response_shape_trace_classifies_structure(wrapped, first, extra, caplog):
+    """The raw_response_shape trace carries content-free structural
+    categories (never request/candidate content) for every synthetic
+    ProviderResponse shape the provider contract permits."""
+    with caplog.at_level(logging.INFO):
+        try:
+            await TaskInterpreter(_meta_provider(wrapped)).interpret(
+                LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-shape"
+            )
+        except TaskInterpretationError:
+            pass
+    shape_line = next(
+        r.getMessage() for r in caplog.records
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=raw_response_shape" in r.getMessage()
+    )
+    assert "request_id=req-shape" in shape_line
+    assert "provider=stub" in shape_line
+    assert "model=stub-model" in shape_line
+    assert "success=True" in shape_line
+    assert f"first_non_ws={first}" in shape_line
+    for key, value in extra.items():
+        assert f"{key}={value}" in shape_line
+    assert "raw_len=" in shape_line
+    assert "finish_reason=stop" in shape_line
+    # Content-free: never the user's request, the action name, or config values
+    assert LIVE_PERSIAN_REQUEST not in shape_line
+    assert "bio_set_text" not in shape_line
+    assert "Asia/Tehran" not in shape_line
+
+
+@pytest.mark.asyncio
+async def test_parse_error_trace_carries_provider_and_json_metadata(caplog):
+    """The candidate_parse_error trace identifies provider, model, JSON error
+    position metadata, and the structural classification — content-free."""
+    truncated = _good_candidate_json()[:-30]
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(TaskInterpretationError):
+            await TaskInterpreter(_meta_provider(truncated)).interpret(
+                LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-perr"
+            )
+    err_line = next(
+        r.getMessage() for r in caplog.records
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=candidate_parse_error" in r.getMessage()
+    )
+    assert "request_id=req-perr" in err_line
+    assert "category=candidate_invalid_json" in err_line
+    assert "provider=stub" in err_line
+    assert "model=stub-model" in err_line
+    assert "json_error=JSONDecodeError" in err_line
+    assert "line=" in err_line and "col=" in err_line and "pos=" in err_line
+    assert "raw_len=" in err_line
+    assert "first_non_ws=object" in err_line
+    assert "object_span=False" in err_line
+    assert LIVE_PERSIAN_REQUEST not in err_line
+    assert "bio_set_text" not in err_line
+
+
+@pytest.mark.asyncio
+async def test_schema_invalid_json_is_not_labeled_a_parse_error(caplog):
+    """Valid JSON that fails candidate schema validation reaches schema
+    validation (response_shape=object) and is never mislabeled
+    candidate_invalid_json."""
+    from backend.ai.tools.context import ToolContext
+    from backend.ai.tools.task import CreateTaskTool
+    from tests.test_task_semantic_triggers import _FakeProvider  # noqa: PLC0415
+    from backend.ai.providers.manager.manager import ProviderManager
+
+    schema_bad = json.dumps({
+        "label": "T", "schedule_type": "interval", "schedule": {"seconds": 300},
+        "actions": [{"name": "bio_set_text", "arguments": {"text": ""}}],
+        "notification_destination": {},
+    })  # missing required top-level timezone
+    pm = ProviderManager()
+    provider = _FakeProvider(schema_bad)
+    pm.register_provider(provider)
+    pm.switch_provider("fake")
+    pm._fallback_chain = []
+    ctx = ToolContext(
+        telegram=None, owner_id=779, tz_str=TZ, client=None,
+        extra={"provider_manager": pm, "chat_id": -1001},
+    )
+    from backend.ai.database import manager as dbm
+    manager = dbm.RepositoryManager(supabase_available=False)
+    with caplog.at_level(logging.INFO):
+        with patch.object(dbm, "get_repository_manager", return_value=manager):
+            result = await CreateTaskTool(ctx).execute(ctx, {"request": LIVE_PERSIAN_REQUEST})
+    assert result.success is False
+    assert "candidate_invalid:object" in result.message
+    assert "candidate_invalid_json" not in result.message
+    trace_lines = [r.getMessage() for r in caplog.records if "AI_TASK_TRACE" in r.getMessage()]
+    assert any("response_shape=object" in line for line in trace_lines)
+    assert not any("stage=candidate_parse_error" in line for line in trace_lines)
+    # The shape trace ran on this path too
+    assert any("stage=raw_response_shape" in line for line in trace_lines)

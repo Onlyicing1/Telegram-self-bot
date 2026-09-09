@@ -172,6 +172,80 @@ def _outer_object_span(raw: str) -> tuple[int, int] | None:
     return None
 
 
+def _classify_response_structure(raw: Any) -> dict[str, Any]:
+    """Content-free structural classification of the raw provider text.
+
+    Parser-independent and never emits response content: only character
+    CLASS categories (object/array/fence/quote/other/empty), booleans, and
+    lengths — safe for one live production reproduction to identify the
+    exact provider-response shape reaching the interpreter.
+    """
+    if not isinstance(raw, str):
+        return {
+            "text_type": type(raw).__name__, "empty": True,
+            "first_non_ws": "empty", "raw_len": 0,
+        }
+    stripped = raw.strip()
+    first = stripped[:1] if stripped else ""
+    if not first:
+        first_cat = "empty"
+    elif first == "{":
+        first_cat = "object"
+    elif first == "[":
+        first_cat = "array"
+    elif stripped.startswith("```"):
+        first_cat = "fence"
+    elif first == '"':
+        first_cat = "quote"
+    else:
+        first_cat = "other"
+    last = stripped[-1:] if stripped else ""
+    return {
+        "text_type": "str",
+        "empty": not stripped,
+        "first_non_ws": first_cat,
+        "starts_fence": stripped.startswith("```"),
+        "contains_fence": "```" in raw,
+        "leading_prose": first_cat in ("other",),
+        "trailing_prose": bool(stripped) and last not in ("}", "]", '"', "`"),
+        "has_control_chars": any(ord(c) < 32 and c not in "\t\n\r" for c in raw) or "\n" in raw or "\r" in raw,
+        "object_span": _outer_object_span(raw) is not None,
+        "raw_len": len(raw),
+    }
+
+
+def _log_response_shape_trace(
+    request_id: str, response: ProviderResponse, meta: dict[str, Any], structure: dict[str, Any],
+) -> None:
+    """One content-free AI_TASK_TRACE record for the raw provider response.
+
+    Emitted BEFORE any parsing/transformation — the observable boundary
+    between the provider mesh and the task interpreter.
+    """
+    finish = meta.get("finish_reason")
+    provider_truncated = (
+        isinstance(finish, str) and finish.upper() in ("MAX_TOKENS", "LENGTH")
+    )
+    logger.info(
+        "AI_TASK_TRACE request_id=%s stage=raw_response_shape "
+        "provider=%s model=%s success=%s text_type=%s empty=%s "
+        "first_non_ws=%s starts_fence=%s contains_fence=%s "
+        "leading_prose=%s trailing_prose=%s has_control_chars=%s "
+        "object_span=%s raw_len=%s truncated=%s finish_reason=%s "
+        "http_status=%s failure_type=%s",
+        request_id or "-", response.provider_name or "unknown",
+        meta.get("model") or "-", bool(response.success),
+        structure.get("text_type", "-"), bool(structure.get("empty")),
+        structure.get("first_non_ws", "-"),
+        bool(structure.get("starts_fence")), bool(structure.get("contains_fence")),
+        bool(structure.get("leading_prose")), bool(structure.get("trailing_prose")),
+        bool(structure.get("has_control_chars")), bool(structure.get("object_span")),
+        structure.get("raw_len", 0), bool(provider_truncated),
+        finish if isinstance(finish, str) else "-",
+        meta.get("http_status", "-"), meta.get("failure_type", "-"),
+    )
+
+
 def _load_candidate_json(raw: str) -> Any:
     """Parse the model's JSON, tolerating the wrapper shapes the provider
     contract legitimately permits.
@@ -436,6 +510,11 @@ class TaskInterpreter:
             int((time.perf_counter() - started) * 1000),
         )
         raw = response.text
+        # Content-free structural instrumentation of the REAL provider
+        # response — emitted before any parsing/transformation. Diagnostics
+        # only: nothing here changes parsing or acceptance behavior.
+        structure = _classify_response_structure(raw)
+        _log_response_shape_trace(request_id, response, meta, structure)
         if not isinstance(raw, str) or not raw.strip():
             raise TaskInterpretationError(
                 "task interpretation returned no structured output (empty response)"
@@ -473,13 +552,22 @@ class TaskInterpreter:
                     and finish.upper() in ("MAX_TOKENS", "LENGTH")
                 )
                 logger.info(
-                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
-                    "response_shape=malformed json_error=%s line=%s col=%s "
-                    "pos=%s raw_len=%s truncated=%s provider_finish_reason=%s",
-                    request_id or "-", type(exc).__name__, exc.lineno,
+                    "AI_TASK_TRACE request_id=%s stage=candidate_parse_error "
+                    "category=candidate_invalid_json response_shape=malformed "
+                    "provider=%s model=%s json_error=%s line=%s col=%s "
+                    "pos=%s raw_len=%s truncated=%s provider_finish_reason=%s "
+                    "first_non_ws=%s contains_fence=%s leading_prose=%s "
+                    "trailing_prose=%s object_span=%s",
+                    request_id or "-", response.provider_name or "unknown",
+                    meta.get("model") or "-", type(exc).__name__, exc.lineno,
                     exc.colno, exc.pos, len(raw),
                     bool(json_truncated or provider_truncated),
                     finish if isinstance(finish, str) else "-",
+                    structure.get("first_non_ws", "-"),
+                    bool(structure.get("contains_fence")),
+                    bool(structure.get("leading_prose")),
+                    bool(structure.get("trailing_prose")),
+                    bool(structure.get("object_span")),
                 )
             elif isinstance(value, dict):
                 actions = value.get("actions")
