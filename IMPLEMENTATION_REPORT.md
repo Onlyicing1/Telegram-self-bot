@@ -13,10 +13,10 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
-| Phase | Diagnose and fix the STILL-OPEN production rejection of the exact multi-line Persian bio-task request; failure-layer diagnostics |
-| Implementation commits | `33727f3` · `c35f75f` · `012f738` (`fix: tolerate contract-permitted JSON wrappers and classify parse failures`) |
+| Phase | Instrument the provider/interpreter boundary with content-free production diagnostics (the actual live provider response has NEVER been captured; prior parser-tolerance work `012f738` was assumption-driven) |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` · **`a75d463` (instrumentation-only: provider-response shape + parse-failure boundary)** |
 | Report commit | see §10 delivery record |
-| Status | **CODE-COMPLETE — full suite green (2033 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials). Live category `candidate_invalid_json` proved the failure is JSON PARSING, not semantics; root cause source-traced to an unnecessarily strict parser vs the provider text contract; fixed with deterministic parse tolerances + shape diagnostics (see §3A/§4) |
+| Status | **INSTRUMENTATION-ONLY — full suite green (2044 passed, 24 skipped). NO parser/semantic/validation behavior changed in `a75d463`. The exact live provider response remains UNCAPTURED; the next live reproduction now records its complete content-free shape** (see §6B) |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 
 ---
@@ -77,9 +77,9 @@ wrong) outcome regardless of the new prompt text.
 
 | Check | Result |
 |---|---|
-| `pytest tests/test_task_interpretation_diagnostics.py -q` | **30 passed** (post-`012f738`: +12 JSON-extraction tolerance/diagnostic tests) |
-| Adjacent task suites (8 files, post-`012f738`) | **267 passed** |
-| `pytest tests/ -q` (full suite, post-`012f738`) | **2033 passed, 24 skipped** in 63.77s |
+| `pytest tests/test_task_interpretation_diagnostics.py -q` | **41 passed** (post-`a75d463`: +11 instrumentation-only tests; tolerance matrix unchanged) |
+| Adjacent suites incl. correlation-leak test | **50 passed** (diagnostics files) |
+| `pytest tests/ -q` (full suite, post-`a75d463`) | **2044 passed, 24 skipped** in 64.44s |
 | Adjacent routing/AI suites (7 files) | **186 passed** |
 | `pytest tests/ -q` (full suite) | **2021 passed, 24 skipped, 1 warning** in 63.69s |
 | `py_compile` (modified files) | OK |
@@ -167,6 +167,71 @@ shapes (direct/fenced/prose+fenced/prose-unfenced/double-encoded/truncated/
 raw-newlines/content-wrapper/empty/prose-only) — exact live provider
 response unavailable (no credentials in this workspace).
 
+## 6B. Instrumentation-only phase (commit `a75d463`) — observe, do not fix
+
+**Explicitly:** this phase changed NO parser behavior, NO semantic
+interpretation, NO prompts, NO validation, NO scheduling/guardian/executor/
+schema, NO provider selection. It adds two content-free `AI_TASK_TRACE`
+records so the NEXT live reproduction of `candidate_invalid_json` is
+conclusive. Synthetic-fixture evidence (§6A, §5) is NOT live provider
+evidence and is never presented as such.
+
+**Provider audit (source-verified, not assumed):**
+- Chat-eligible providers registered by `ProviderFactory`: `gemini` plus
+  13 `OpenAICompatProvider` subclasses (`openai`, `openrouter`, `cerebras`,
+  `mistral`, `groq`, `zai`, `sambanova`, `nvidia`, `cohere`, `siliconflow`,
+  `fireworks`, `nararouter`; `you` is web-search-only, `dummy` serves
+  nothing). `ProviderManager.chat` routes active-first-then-scored.
+- Extraction: Gemini joins `candidates[0].content.parts[*].text`;
+  OpenAI-compat uses `choices[0].message.content`. Both return a plain
+  text `ProviderResponse` — no adapter emits fences/envelopes itself.
+- Metadata already exposed (reused, not re-invented): `model` +
+  `finish_reason` on BOTH families (Gemini: `MAX_TOKENS`/`SAFETY`/`RECITATION`;
+  OpenAI-compat: `length`/`content_filter`/`stop`); `http_status` +
+  `failure_type` on failures. NOT exposed by any adapter: provider request
+  id, content type. Reported as unavailable rather than invented.
+- TaskInterpreter receives the response directly from
+  `ProviderManager.chat(...)` and reads `response.text` + `response.metadata`.
+
+**New trace fields (emitted in `backend/ai/task_interpreter.py`):**
+
+1. `stage=raw_response_shape` — logged immediately after the provider
+   response arrives, BEFORE any parsing/transformation:
+   `provider model success text_type empty first_non_ws
+   {object|array|fence|quote|other|empty} starts_fence contains_fence
+   leading_prose trailing_prose has_control_chars object_span raw_len
+   truncated finish_reason http_status failure_type`. Character boundaries
+   are logged as CLASS categories only — never the actual characters.
+2. `stage=candidate_parse_error category=candidate_invalid_json` — at the
+   exact point where a `JSONDecodeError` becomes the parse-failure category:
+   adds `provider model` to the existing `json_error line col pos raw_len
+   truncated provider_finish_reason` and the structural flags
+   `first_non_ws contains_fence leading_prose trailing_prose object_span`.
+
+**Cases distinguishable from one live run (metadata only):** A empty ·
+B plain JSON object · C fenced JSON · D prose+JSON · E JSON+prose ·
+F prose+fenced JSON · G JSON string containing JSON (double-encoded,
+`first_non_ws=quote`) · H raw control characters · I truncated/incomplete
+(`truncated=True` from error position and/or provider `finish_reason`) ·
+J JSON array · K non-JSON prose · L provider failure (success=false path)
+· M valid JSON that later fails schema validation (`response_shape=object`
+traces, never labeled a parse error).
+
+**Tests (instrumentation-only, +11):** every tolerance-matrix case still
+passes with instrumentation active (parser result unchanged); the shape
+trace is verified content-free (never the request, `bio_set_text`, or
+config values) across 9 synthetic shapes; the parse-error trace carries
+provider/model/JSON metadata; schema-invalid JSON reaches schema
+validation and is never mislabeled `candidate_invalid_json`; the
+correlation-layer leak test stays green (stage named `raw_response_shape`
+to avoid substring-colliding with the manager's whitelisted
+`stage=provider_response`).
+
+**What the next live run will settle:** reproduce the exact Persian
+request once; the `raw_response_shape` + `candidate_parse_error` lines
+identify the real provider response shape conclusively. Only then should
+any further behavioral change be considered.
+
 ## 7. Architecture boundaries preserved
 
 `RuntimeSupervisor` · `TaskScheduler` · `TaskExecutionCoordinator` ·
@@ -218,7 +283,7 @@ column.
 
 | Item | Value |
 |---|---|
-| Implementation commits | `33727f3` · `c35f75f` · `012f738` (`fix: tolerate contract-permitted JSON wrappers and classify parse failures`) |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` · `a75d463` (instrumentation-only: provider-response shape + parse-failure boundary) |
 | Base commit (this phase) | `fb76fc8` (clean tree, `origin/main` equal) |
 | Report commits | `a3dbd1b` (report update) + `(final delivery record commit — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
