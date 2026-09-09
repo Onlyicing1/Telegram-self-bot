@@ -15,6 +15,14 @@ MAX_TASKS_PER_WAKE = 10
 MAX_RECOVERY_PER_START = 100
 MAX_RETRIES_PER_WAKE = 10
 WAKE_INTERVAL_SECONDS = 60.0
+# Prepare-ahead: AI-assisted occurrences whose boundary is within this
+# horizon are prepared (content generated + validated, NO side effects)
+# during the interval BEFORE the boundary. The wake loop does not wait for
+# preparation; each preparation is one tracked, bounded task per occurrence
+# key, cancelled on stop. Static tasks never enter this path.
+PREPARE_AHEAD_HORIZON_SECONDS = 120.0
+# Worst case: bounded preparation rounds x per-round provider timeout.
+PREPARE_AHEAD_TIMEOUT_SECONDS = 150.0
 
 
 def occurrence_key(task_id: int, scheduled_for: datetime) -> str:
@@ -40,6 +48,7 @@ class TaskScheduler:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._recovery_lock = asyncio.Lock()
+        self._preparations: dict[str, asyncio.Task] = {}
 
     @property
     def running(self) -> bool:
@@ -61,6 +70,12 @@ class TaskScheduler:
                 await task
             except asyncio.CancelledError:
                 pass
+        pending = list(self._preparations.values())
+        self._preparations.clear()
+        for preparation in pending:
+            preparation.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def recover(self) -> int:
         """Resolve occurrences left unfinished by a previous process.
@@ -75,8 +90,20 @@ class TaskScheduler:
             return 0
         async with self._recovery_lock:
             recovered = 0
+            now = datetime.now(timezone.utc)
             for occurrence in await self.repository.list_recoverable_occurrences(self.owner_id, MAX_RECOVERY_PER_START):
                 try:
+                    # A pre-created occurrence whose boundary is still in the
+                    # future was never started — it must stay untouched so the
+                    # wake loop executes it exactly once AT its boundary (with
+                    # its durably prepared action if one was persisted).
+                    # Recovery must not arm a backoff on it or execute early.
+                    if (
+                        occurrence.status == "claimed"
+                        and occurrence.scheduled_for is not None
+                        and occurrence.scheduled_for > now
+                    ):
+                        continue
                     if occurrence.status in {"claimed", "running"}:
                         occurrence = await self.repository.transition_occurrence(
                             self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
@@ -189,6 +216,8 @@ class TaskScheduler:
                     next_run = following
                 await self.repository.advance_next_run(self.owner_id, task.id, task.version, next_run)
                 processed += occurrence is not None and claimed
+                if following is not None and task.schedule_type != "once":
+                    await self._prepare_next_ahead(task, following, reference)
             except (ScheduleError, ValueError) as exc:
                 logger.warning("Task %s was not scheduled: %s", task.id, exc)
             except asyncio.CancelledError:
@@ -207,3 +236,57 @@ class TaskScheduler:
                     continue
         except asyncio.CancelledError:
             raise
+
+    async def _prepare_next_ahead(self, task, boundary: datetime, reference: datetime) -> None:
+        """Ensure the NEXT occurrence of a recurring AI task is prepared before
+        its boundary (content only — never a Telegram side effect).
+
+        The occurrence is created idempotently (deterministic key). Only an
+        unstarted (``claimed``) occurrence without durable preparation is
+        prepared, and at most one bounded tracked task per occurrence key
+        runs at a time; the wake loop never waits for it. If preparation
+        misses the boundary, execution still happens through the existing
+        occurrence-time preparation path — honestly, never as a guessed run.
+        """
+        coordinator = self.execution_coordinator
+        if coordinator is None or not hasattr(coordinator, "prepare_ahead"):
+            return
+        instruction = getattr(task, "ai_instruction", None)
+        if not isinstance(instruction, str) or not instruction.strip():
+            return
+        if (boundary - reference).total_seconds() > PREPARE_AHEAD_HORIZON_SECONDS:
+            return
+        try:
+            occurrence = await self.repository.create_occurrence(self.owner_id, {
+                "task_id": task.id,
+                "occurrence_key": occurrence_key(task.id, boundary),
+                "definition_version": task.version,
+                "action_snapshot": task.actions,
+                "scheduled_for": boundary,
+            })
+        except (ValueError, TypeError):
+            return
+        if occurrence is None or occurrence.status != "claimed":
+            return
+        if occurrence.preparation_metadata:
+            return
+        key = occurrence.occurrence_key
+        existing = self._preparations.get(key)
+        if existing is not None and not existing.done():
+            return
+        self._preparations[key] = asyncio.create_task(
+            self._run_preparation(occurrence), name=f"lifeos-task-prepare:{key}"
+        )
+
+    async def _run_preparation(self, occurrence) -> None:
+        try:
+            await asyncio.wait_for(
+                self.execution_coordinator.prepare_ahead(occurrence),
+                timeout=PREPARE_AHEAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Prepare-ahead failed for occurrence %s", occurrence.occurrence_key)
+        finally:
+            self._preparations.pop(occurrence.occurrence_key, None)

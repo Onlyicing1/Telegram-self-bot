@@ -463,3 +463,122 @@ are never recreated, and attempts cannot multiply across restarts — all inside
 the existing single scheduler/executor authority. No production behavior for
 normal (non-restart) scheduling changed; the prior static and AI-assisted task
 suites pin that unchanged.
+
+---
+
+# Phase 5 — Deterministic prepare-ahead execution for recurring AI-assisted tasks (2026-09-09)
+
+> Requirement: for a recurring AI-assisted task (e.g. "every minute, change my
+> bio to a random 50-character Persian dialogue"), content generation and
+> validation happen DURING the interval BEFORE the scheduled boundary; the
+> Telegram side effect happens exactly once AT the boundary. No Telegram
+> mutation during preparation. If preparation misses its deadline, execution
+> falls back to the honest occurrence-time path — never a late mutation
+> presented as on-time, never a shifted occurrence, never double execution.
+
+## 5.1 Architecture (no redesign — existing authority preserved)
+
+```
+Wake at T (TaskScheduler.run_once — the single scheduler)
+  → execute occurrence N (boundary T) — existing occurrence-time path, or its
+    durably prepared action from occurrence N-1's wake
+  → advance next_run to T+60
+  → _prepare_next_ahead(task, T+60): create the N+1 occurrence idempotently
+    (deterministic occurrence_key), spawn ONE tracked bounded task
+    → TaskExecutionCoordinator.prepare_ahead(occurrence)
+        AI generation (provider, tools=[], no execution ability)
+        + deterministic validation (task contract + content policy)
+        → persist PreparedAction into occurrence.preparation_metadata
+          (existing column, no schema change)
+        NEVER calls the ToolExecutor, NEVER touches Telegram
+At T+60: the wake claims the occurrence; execute() re-proves the persisted
+  prepared action (kind, SAME definition_version, tool name == action
+  snapshot, contract-valid, policy-valid) and executes it exactly once
+  through the SAME ToolExecutor boundary. Stale/invalid → honest
+  occurrence-time preparation (or bounded failure), never a guessed run.
+```
+
+Constants (derived, not invented): `PREPARE_AHEAD_HORIZON_SECONDS = 120.0`
+(2 × `WAKE_INTERVAL_SECONDS = 60` — a wake at T can only prepare a boundary
+it can see within its horizon; two consecutive wakes cover any interval ≥ 60s),
+`PREPARE_AHEAD_TIMEOUT_SECONDS = 150.0` (bounded rounds × per-round provider
+timeout), `MAX_PREPARATION_ATTEMPTS = 3` (= `MAX_ATTEMPTS` retry contract).
+
+## 5.2 Content policy — deterministic enforcement (`backend/ai/preparation_policy.py`, new)
+
+Derived ONLY from the task's `ai_instruction`: named language (persian/chinese/
+arabic, script-based detection — digits/punctuation/emoji never violate) and
+numeric character requirements (exact / at-most, Persian and Arabic-Indic
+digits accepted). Validation fails closed and NEVER truncates: invalid content
+is regenerated (bounded rounds), then preparation fails into the existing
+retry/failure contract. Applied at BOTH preparation points:
+- inside `AIActionPreparator` (generation + `prepare_validated` regeneration loop),
+- at the execution boundary via `TaskExecutionCoordinator._enforce_content_policy`
+  (defense-in-depth: even a hostile preparator cannot push policy-violating
+  content into the ToolExecutor),
+- when re-proving a durably prepared action (`_prepared_from_metadata`).
+
+## 5.3 Restart / anti-spam guarantees (extends Phase 4)
+
+- Recovery exempts ONLY a `claimed` occurrence whose `scheduled_for` is still
+  in the future (pre-created by prepare-ahead, never started). A claimed
+  occurrence whose boundary has passed resolves through the existing
+  interrupted → retry/failed contract.
+- Preparation is idempotent: deterministic occurrence key, one tracked task
+  per key, durable `preparation_metadata` checked before any provider round.
+- A late preparation persisting onto a running/terminal occurrence hits the
+  transition state machine (`claimed` not reachable from `running`/terminal →
+  `ValueError`) and the Supabase CAS; both fail closed, no spam.
+- Stale preparation (task edited → `definition_version` bump) is rejected at
+  the boundary and re-prepared honestly.
+
+## 5.4 Bio tool execution hardening (`backend/services/bio_service.py`)
+
+`do_template` / `do_text` / `do_mood` now apply the bio to Telegram
+immediately via a shared `_apply_profile` boundary (one
+`UpdateProfileRequest(about=...)` through the profile scheduler's client,
+30s bound, FloodWait surfaced, `last_bio` persisted only after a successful
+RPC) and report honestly ("saved, but the Telegram bio was NOT updated") on
+failure. The Glass-UI cron path is unchanged; the borrow never starts/stops
+the cron loop.
+
+## 5.5 Regression coverage (new: `tests/test_task_prepare_ahead.py`, 16 tests; extended `tests/test_task_restart_recovery.py`, +2)
+
+| Scenario | Assertion |
+|---|---|
+| `prepare_ahead` persists validated content, executes nothing | no tool call, occurrence stays `claimed` with `prepared_action` metadata |
+| Static tasks / no coordinator support / beyond horizon | no preparation, no occurrence row |
+| Idempotent preparation across duplicate arms | one provider round, one metadata record |
+| Failed preparation | logged, no side effect, occurrence stays unprepared for the honest path |
+| Full lifecycle across restart | T executes N + prepares N+1; fresh scheduler recovers 0; T+60 executes the PRE-prepared action exactly once (content-level proof, no boundary provider round) |
+| Duplicate wakes at the boundary | one execution |
+| Stale prepared action (version bump) | rejected at the boundary |
+| Policy-invalid content, bounded regeneration | 3 provider rounds max, zero tool executions, permanent failure — never a guess |
+| Regenerated valid content | exactly one execution with the valid content |
+| Policy units | exact-length/language derivation, Persian-only script check with digits/emoji tolerated, no truncation |
+| Real preparator wraps policy violations | fail closed |
+| Recovery: future claimed occurrence | untouched (no backoff, no early execution), executes once at its boundary |
+| Recovery: past-due claimed occurrence | still resolved via the retry contract (narrow exemption) |
+
+## 5.6 Test execution (exact commands, actual results)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_prepare_ahead.py tests/test_task_restart_recovery.py -q -p no:cacheprovider` | **27 passed** |
+| `.venv/bin/python -m pytest tests/test_task_*.py -q -p no:cacheprovider` (all task suites) | **118 passed** |
+| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1827 passed, 24 skipped, 1 warning in 63.78s** (Phase-4 baseline 1810+24; +16 = prepare-ahead suite, +1 = recovery exemption pair) |
+| `.venv/bin/python -m py_compile backend/ai/task_scheduler.py backend/ai/task_execution.py backend/ai/preparation_policy.py backend/services/bio_service.py tests/test_task_prepare_ahead.py tests/test_task_restart_recovery.py` | OK |
+
+During the session a work-in-progress edit had accidentally removed
+`TaskScheduler.run()` (the wake loop) — restored verbatim from git HEAD and
+pinned by `test_scheduler_lifecycle_is_idempotent_and_cancel_safe`.
+
+## 5.7 Phase 5 conclusion
+
+Recurring AI-assisted tasks now prepare content ahead of the boundary and
+mutate Telegram exactly once at it; a missed deadline degrades to the existing
+honest occurrence-time contract instead of a late or duplicated mutation.
+Single scheduler/coordinator/executor authority, the occurrence state machine,
+and the bounded retry contract are unchanged; no schema, migration, or UI
+change was made. Live Telegram/provider verification remains NOT performed
+(in-process + fake-provider tests only), consistent with all prior phases.

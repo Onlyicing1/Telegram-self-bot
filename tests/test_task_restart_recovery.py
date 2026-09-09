@@ -254,6 +254,54 @@ async def test_due_occurrence_without_coordinator_parks_for_recovery():
     assert resolved.status == "retry_pending" and resolved.attempt == 2
 
 
+# ── Recovery must not touch pre-created future occurrences ───────────────
+
+
+@pytest.mark.asyncio
+async def test_future_claimed_occurrence_stays_untouched_by_recovery():
+    """A pre-created (prepare-ahead) occurrence whose boundary is still in
+    the future was never started: recovery must neither arm a backoff on it
+    nor execute it early. It executes exactly once AT its boundary."""
+    repo = InMemoryTaskRepository()
+    boundary = datetime.now(timezone.utc) + timedelta(seconds=120)
+    task = await repo.create_task(1, task_data(next_run_at=boundary))
+    await repo.create_occurrence(1, {
+        "task_id": task.id, "occurrence_key": occurrence_key(task.id, boundary), "definition_version": task.version,
+        "action_snapshot": task.actions, "scheduled_for": boundary,
+    })
+    coordinator = RecordingCoordinator(repo)
+    scheduler = TaskScheduler(repo, 1, execution_coordinator=coordinator)
+
+    assert await scheduler.recover() == 0
+    untouched = await repo.get_occurrence(1, task.id, occurrence_key(task.id, boundary))
+    assert untouched.status == "claimed" and untouched.attempt == 1
+    assert untouched.retry_at is None
+    assert coordinator.executed_keys == []
+
+    # Before the boundary a wake must not run it; at the boundary it runs once.
+    assert await scheduler.run_once(boundary - timedelta(seconds=1)) == 0
+    assert await scheduler.run_once(boundary) == 1
+    assert coordinator.executed_keys == [occurrence_key(task.id, boundary)]
+    assert (await repo.get_occurrence(1, task.id, occurrence_key(task.id, boundary))).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_past_due_claimed_occurrence_is_still_recovered_after_restart():
+    """The future-occurrence exemption is narrow: a claimed occurrence whose
+    boundary has ALREADY passed when the process restarts is exactly the
+    shutdown-interrupted case and must resolve through the retry contract."""
+    repo = InMemoryTaskRepository()
+    task = await repo.create_task(1, task_data())
+    await repo.create_occurrence(1, {
+        "task_id": task.id, "occurrence_key": "past", "definition_version": task.version,
+        "action_snapshot": task.actions, "scheduled_for": NOW - timedelta(seconds=1),
+    })
+    scheduler = TaskScheduler(repo, 1)
+    assert await scheduler.recover() == 1
+    resolved = await repo.get_occurrence(1, task.id, "past")
+    assert resolved.status == "retry_pending" and resolved.attempt == 2
+
+
 # ── Terminal occurrences are never recreated or re-executed ────────────────
 
 

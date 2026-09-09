@@ -324,6 +324,22 @@ error.
   timeout.
 - **HTTP**: providers use `httpx.AsyncClient` (async) — no sync HTTP in the
   loop. The handler wraps the AI request in a bounded `wait_for`.
+- **Durable scheduled tasks (Taskloom)**: `backend/ai/task_scheduler.py` is
+  the single scheduler; it hands claimed occurrences to the
+  `TaskExecutionCoordinator` (`backend/ai/task_execution.py`), which executes
+  them through the `ToolExecutor` — never a second executor. Occurrences are
+  idempotent (deterministic `occurrence_key`), claimed via CAS, and retries
+  are bounded (`MAX_ATTEMPTS = 3`). **Prepare-ahead**: recurring AI-assisted
+  tasks prepare (generate + validate, NO side effects) their next action
+  within a 120s horizon before the boundary and persist it in the
+  occurrence's `preparation_metadata`; the boundary re-proves it (same task
+  version, same tool, policy-valid) and executes exactly once. Generated
+  content is enforced by the deterministic policy in
+  `backend/ai/preparation_policy.py` (language/length derived from the
+  instruction; fail-closed, never truncated). Recovery exempts only future
+  `claimed` occurrences (pre-created, never started); anything past-due
+  resolves through the interrupted → retry/failed contract, so restart can
+  never duplicate or spam executions.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.
