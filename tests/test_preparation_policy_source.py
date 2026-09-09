@@ -1,11 +1,12 @@
 """Deterministic preparation-policy regression tests: source attribution.
 
 Contract under test: a task instruction that names a source/person/character
-("dialogue from Ayanami Rei" / "دیالوگ ... از آیانامی ری") pins that source in
-the derived policy; generated content that drifts to another speaker
-(the live bug: "Ayumi: Ready for adventure!") is REJECTED, never executed,
-never truncated. Also pins the "below/under N characters" semantics as a
-MAXIMUM of N-1, not an exact-length requirement.
+("dialogue from Ayanami Rei" / "دیالوگ ... از آیانامی ری") preserves that
+source in the derived policy. This repository has no trusted source corpus or
+independent verifier, so every generated source-specific result — including a
+model-authored matching speaker label — is REJECTED, never executed, never
+truncated. Also pins the "below/under N characters" semantics as a MAXIMUM of
+N-1, not an exact-length requirement.
 """
 from __future__ import annotations
 
@@ -53,13 +54,11 @@ def test_last_marker_wins_earlier_از_ignored():
 def test_instrumental_استفاده_از_never_pins_a_source():
     policy = derive_policy("تکست بیو من رو تغییر بده استفاده از متن ذخیره شده")
     assert policy.source == ""
-    assert not policy.speaker_prefix_required
 
 
 def test_no_marker_means_no_source_constraint():
     policy = derive_policy("هر دقیقه بیو را با یک دیالوگ ۵۰ کاراکتری فارسی عوض کن")
     assert policy.source == ""
-    assert not policy.speaker_prefix_required
     assert policy.exact_length == 50 and policy.language == "persian"
 
 
@@ -89,16 +88,17 @@ def test_wrong_speaker_content_is_rejected(drifted):
         validate_content(drifted, policy)
 
 
-def test_correct_speaker_prefix_is_accepted():
+def test_model_authored_matching_speaker_label_is_not_source_evidence():
+    """A matching label is still provider output, not a trusted quotation."""
     policy = derive_policy(PERSIAN_TASK)
-    assert validate_content("آیانامی ری: سلام دنیا", policy) == "آیانامی ری: سلام دنیا"
+    with pytest.raises(PreparationPolicyError, match="cannot be independently verified"):
+        validate_content("آیانامی ری: سلام دنیا", policy)
 
 
-def test_speaker_enforced_for_english_source_too():
+def test_source_specific_content_fails_closed_for_english_too():
     policy = derive_policy(ENGLISH_TASK)
-    with pytest.raises(PreparationPolicyError):
-        validate_content("Ayumi: Ready!", policy)
-    assert validate_content("Ayanami Rei: Ready!", policy)
+    with pytest.raises(PreparationPolicyError, match="cannot be independently verified"):
+        validate_content("Ayanami Rei: Ready!", policy)
 
 
 def test_policy_without_source_imposes_no_speaker_prefix():
@@ -137,11 +137,11 @@ def test_exact_and_at_most_requirements_unchanged():
 # ── Policy description feeds the enforced prompt ─────────────────────────────
 
 
-def test_describe_states_source_and_prefix():
+def test_describe_states_source_and_missing_verifier():
     policy = derive_policy(PERSIAN_TASK)
     text = policy.describe()
     assert "آیانامی ری" in text
-    assert "آیانامی ری: " in text
+    assert "NO TRUSTED SOURCE CORPUS/VERIFIER" in text
 
 
 def test_inactive_policy_is_inert():

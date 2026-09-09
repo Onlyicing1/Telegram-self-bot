@@ -503,6 +503,17 @@ class TaskExecutionCoordinator:
         instruction: str,
         execution_context: ToolContext | None = None,
     ) -> list[dict[str, Any]]:
+        """Bounded preparation loop owned by the coordinator.
+
+        Each round runs the preparation seam ONCE and re-proves BOTH the
+        structure (task's own tools, same order, same count) and the
+        deterministic content policy. Content-policy rejections are
+        regenerated (the enforced policy is stated in every round's prompt),
+        up to ``MAX_PREPARATION_ATTEMPTS`` total rounds, then fail closed.
+        Structural violations (tool-name swap, wrong action count) raise
+        immediately — regeneration cannot fix them. TimeoutError propagates
+        (retryable under the existing failure contract).
+        """
         preparator = self.preparator
         if preparator is None:
             preparator = _default_preparator()
@@ -510,14 +521,43 @@ class TaskExecutionCoordinator:
             raise TaskPreparationError("task preparation authority is unavailable")
         owner_id = self.owner_id
         tz_str = execution_context.tz_str if execution_context is not None else "UTC"
-        prepare = getattr(preparator, "prepare_validated", None)
+        # Single-round seam preferred: the coordinator owns the attempt
+        # budget. Preparators implementing only the legacy self-looping
+        # ``prepare_validated`` interface stay supported through the fallback.
+        prepare = getattr(preparator, "prepare", None)
         if prepare is None:
-            prepare = preparator.prepare
-        return await prepare(
-            instruction,
-            [{"name": c["name"], "arguments": c["arguments"]} for c in templates],
-            owner_id=owner_id,
-            tz_str=tz_str,
+            prepare = preparator.prepare_validated
+        policy = derive_policy(instruction)
+        last_error: Exception | None = None
+        attempt = 0
+        for attempt in range(1, MAX_PREPARATION_ATTEMPTS + 1):
+            try:
+                prepared = await prepare(
+                    instruction,
+                    [{"name": c["name"], "arguments": c["arguments"]} for c in templates],
+                    owner_id=owner_id,
+                    tz_str=tz_str,
+                )
+            except TaskPreparationError as exc:
+                message = str(exc)
+                if "tool name" in message or "number of actions" in message:
+                    raise  # structural — regeneration cannot fix it
+                last_error = exc
+                continue
+            # Structural re-proof for the coordinator (defense-in-depth for
+            # preparators that do not validate themselves).
+            self._validate_prepared_calls(templates, prepared)
+            try:
+                for call in prepared:
+                    validate_prepared_arguments(call.get("arguments", {}), policy)
+            except PreparationPolicyError as exc:
+                last_error = TaskPreparationError(
+                    f"prepared content violates the task policy: {exc}"
+                )
+                continue
+            return prepared
+        raise TaskPreparationError(
+            f"task preparation failed after {attempt} attempts: {last_error}"
         )
 
     @staticmethod

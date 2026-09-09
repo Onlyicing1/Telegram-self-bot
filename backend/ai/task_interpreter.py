@@ -89,6 +89,14 @@ CANDIDATE_SCHEMA = {
             },
         },
         "notification_destination": {"type": "object"},
+        "ai_instruction": {
+            "type": "string",
+            "description": (
+                "For AI-generated per-run content ONLY: the user's request VERBATIM "
+                "(never paraphrased or translated) so source/character/language/length "
+                "requirements are enforced at each occurrence. Omit for static content."
+            ),
+        },
     },
 }
 
@@ -144,6 +152,19 @@ class TaskInterpreter:
             "bounded 'text' key containing the exact message content; the destination "
             "is fixed by the runtime and must not be included. Use no other action name "
             "for message writing. Keep exactly one action object in 'actions'. "
+            "AI-GENERATED CONTENT CONTRACT: when the task's content must be generated "
+            "or varied at each run — random dialogues or quotes from a specific "
+            "person/character/source, a fresh bio each time, any request like 'random X "
+            "from Y' or 'change my bio to ...' — DO NOT bake one fixed text into the "
+            "action arguments. Instead keep the content arguments minimal (empty text) "
+            "and add the field 'ai_instruction' at the TOP LEVEL of the candidate with "
+            "the user's request VERBATIM — never paraphrased, never translated, never "
+            "shortened — so the exact source/person/character, language and length "
+            "requirements survive word-for-word; the runtime generates and validates "
+            "the content at each occurrence and rejects unrelated characters. A request "
+            "for 'a dialogue from <X>' must keep '<X>' inside ai_instruction exactly as "
+            "spoken. Only truly static one-time content (say exactly 'hello') omits "
+            "ai_instruction. "
             "SCHEDULE CONTRACT: 'schedule' must match the schedule_type exactly — "
             "interval: {'seconds': <positive number>} (every X minutes = X*60 seconds, "
             "e.g. 'هر سه دقیقه' or 'every 3 minutes' = {'seconds': 180}); "

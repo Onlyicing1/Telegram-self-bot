@@ -25,6 +25,7 @@ from backend.ai.task_trace import bind_request, unbind
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
+from backend.ai.preparation_policy import derive_policy
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,26 @@ class CreateTaskTool(Tool):
             )
 
         candidate["notification_destination"] = destination
+
+        # Deterministic source-fidelity gate: when the ORIGINAL human request
+        # itself derives a content policy (a named source/person/character,
+        # a length bound, a language requirement), the durable task must
+        # carry the request VERBATIM as its ai_instruction so the occurrence
+        # path generates and validates content under the exact semantics.
+        # A model that omits or paraphrases ai_instruction cannot weaken the
+        # contract; the verbatim request repairs it. Static content tasks
+        # (no policy in the request) are untouched.
+        if isinstance(candidate, dict):
+            policy = derive_policy(request)
+            if policy.active and candidate.get("ai_instruction") != request:
+                model_supplied = bool(candidate.get("ai_instruction"))
+                candidate["ai_instruction"] = request
+                _trace(
+                    "create_task_ai_instruction_gate", applied=True,
+                    reason="model_repaired" if model_supplied else "omitted",
+                    source_present=bool(policy.source),
+                    length_constrained=policy.max_length is not None or policy.exact_length is not None,
+                )
 
         _trace(
             "create_task_normalized", schedule_type=candidate.get("schedule_type"),

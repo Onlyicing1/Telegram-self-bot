@@ -6,6 +6,11 @@ DETERMINISTIC code, not trusted to the model's self-report: preparation
 output is validated against this policy before it can ever be executed,
 and rejected output is regenerated — never truncated, never guessed.
 
+Named-source requests are carried through the contract, but this repository
+has no trusted source corpus or independent source verifier. A provider's
+speaker label is therefore not evidence: source-specific output fails closed
+rather than being presented as an authenticated quotation.
+
 Language policy is DERIVED FROM THE INSTRUCTION ONLY. If the instruction
 does not name a language, no language constraint is imposed. Detection is
 script-based, not ASCII-based: digits, punctuation, whitespace, emoji and
@@ -51,11 +56,6 @@ _SOURCE_STOP_TOKENS = frozenset({
     "change", "set", "update", "make", "put",
 })
 
-# Persian "head noun" + possessive ezâfe: "دیالوگی از آیانامی ری" — a
-# dialogue/quote word near the marker confirms the attributive reading.
-_SOURCE_HEAD_NOUNS = ("دیالوگ", "دیالوگی", "جمله", "جمله‌ای", "نقل", "قول", "دیالوگها", "دیالوگ‌ها")
-_SOURCE_HEAD_NOUNS_EN = ("dialogue", "dialogues", "quote", "quotes", "line", "lines", "saying")
-
 # "X از Y" where X is one of these means INSTRUMENTAL "using X from Y",
 # not attribution ("استفاده از متن ذخیره شده" = using the saved text).
 # Such a marker is skipped, so an instrumental از never pins a bogus
@@ -65,12 +65,9 @@ _INSTRUMENTAL_TOKENS = frozenset({
     "using", "based", "per", "according", "with",
 })
 
-# A generated line in "<Speaker>: <text>" form attributes itself to a
-# speaker. When the task pins the source, deterministic validation enforces
-# this form (bounded prefix), because a bare line cannot be proven to come
-# from the required source by any deterministic means — the AI prompt says
-# so, and the enforcement boundary makes drift fail closed.
-_SPEAKER_PREFIX_MAX = 48
+# There is intentionally no source-verification implementation here. A
+# generated "<Speaker>: <text>" label is model-authored data and cannot prove
+# that the text came from that speaker.
 
 # "below/under N" length words — a MAXIMUM, never an exact requirement.
 # Persian "زیر" and its English siblings are matched as whole tokens.
@@ -99,9 +96,8 @@ class PreparationPolicy:
     exact_length: int | None = None
     max_length: int | None = None
     length_text: str = ""
-    source: str = ""           # required source/person/character, "" = unconstrained
-    source_text: str = ""      # the raw spoken source phrase (diagnostics)
-    speaker_prefix_required: bool = False  # demand "<Source>: <line>" form
+    source: str = ""       # required source/person/character, "" = unconstrained
+    source_text: str = ""  # the raw spoken source phrase (diagnostics)
 
     @property
     def active(self) -> bool:
@@ -122,15 +118,14 @@ class PreparationPolicy:
             parts.append(f"at most {self.max_length} characters")
         if self.source:
             parts.append(
-                f"content MUST BE a dialogue/quote SPOKEN BY {self.source} "
-                f"(or a narration line ABOUT them from their story) — never "
-                f"another character, never generic dialogue"
+                f"requested source/person/character={self.source}; content MUST BE "
+                f"a dialogue/quote from that source — never another character and "
+                f"never generic dialogue"
             )
-            if self.speaker_prefix_required:
-                parts.append(
-                    f"the line MUST start with the speaker prefix "
-                    f"\"{self.source}: \" (then the dialogue text)"
-                )
+            parts.append(
+                "NO TRUSTED SOURCE CORPUS/VERIFIER IS CONFIGURED: source-specific "
+                "content must fail closed rather than trust a provider label"
+            )
         return ", ".join(parts) if parts else "no content constraints"
 
 
@@ -139,24 +134,19 @@ def _contains_any(text: str, words: tuple[str, ...]) -> bool:
     return any(word in lowered for word in words)
 
 
-def _extract_source(text: str) -> tuple[str, bool, str]:
+def _extract_source(text: str) -> tuple[str, str]:
     """Extract the spoken source/person/character from the instruction.
 
-    Returns ``(source, head_noun_present, raw_phrase)`` — or
-    ``("", False, "")`` when no source marker appears. This is a
-    fixed-vocabulary MARKER scan over whitespace tokens, not a sentence
-    parser: it identifies the construct "content FROM <name>" in the
-    owner's languages and reads the name that follows. Everything the model
-    must KNOW about the source stays its semantic job; only the name is
-    pinned so it can be enforced deterministically.
+    Returns ``(source, raw_phrase)`` — or ``("", "")`` when no source
+    marker appears. This is a fixed-vocabulary marker scan over whitespace
+    tokens, not a sentence-pattern parser. It preserves the source identity
+    for the durable contract; it does not authenticate generated content.
 
     The LAST marker wins: later markers sit closer to the actual source;
-    earlier ones typically belong to an unrelated clause. The head-noun
-    window looks back a few tokens so "یه دیالوگ رندوم از آیانامی ری"
-    ("a random dialogue from Ayanami Rei") still sees the noun.
+    earlier ones typically belong to an unrelated clause.
     """
     if not isinstance(text, str) or not text.strip():
-        return "", False, ""
+        return "", ""
     raw_words = text.split()
     lowered_tokens = [w.lower() for w in raw_words]
     marker_idx = -1
@@ -169,11 +159,7 @@ def _extract_source(text: str) -> tuple[str, bool, str]:
             continue
         marker_idx = i
     if marker_idx < 0:
-        return "", False, ""
-    head_noun = any(
-        tok in _SOURCE_HEAD_NOUNS or tok in _SOURCE_HEAD_NOUNS_EN
-        for tok in lowered_tokens[max(0, marker_idx - 3):marker_idx]
-    )
+        return "", ""
     collected = []
     for word in raw_words[marker_idx + 1:marker_idx + 7]:
         stripped = word.strip("\u060c،,.؛:!؟?\"'")
@@ -187,26 +173,8 @@ def _extract_source(text: str) -> tuple[str, bool, str]:
     raw_phrase = " ".join(raw_words[marker_idx + 1:marker_idx + 7]).strip()
     source = " ".join(collected).strip()
     if not source or len(source) > 64:
-        return "", False, ""
-    return source, head_noun, raw_phrase
-
-
-def _speaker_prefix_ok(text: str, source: str) -> bool:
-    """True when the line carries a "<Speaker>:" prefix naming the source.
-
-    Case variants (Persian and Latin) are tolerated; the prefix must appear
-    within a bounded head of the line so a random mention of the source
-    deep in the text cannot satisfy it.
-    """
-    source_normalized = " ".join(source.split()).casefold()
-    head = text[:_SPEAKER_PREFIX_MAX]
-    colon = head.find(":")
-    if colon <= 0 or colon > _SPEAKER_PREFIX_MAX - 2:
-        return False
-    speaker = head[:colon].strip(" \t\u200c\u0640\u00ab\u00bb\"'")
-    if not speaker:
-        return False
-    return " ".join(speaker.split()).casefold() == source_normalized
+        return "", ""
+    return source, raw_phrase
 
 
 def derive_policy(instruction: str) -> PreparationPolicy:
@@ -271,7 +239,7 @@ def derive_policy(instruction: str) -> PreparationPolicy:
                 exact_length = int(match.group(1))
                 length_text = match.group(0)
 
-    source, head_noun, source_phrase = _extract_source(instruction)
+    source, source_phrase = _extract_source(instruction)
 
     return PreparationPolicy(
         language=language,
@@ -280,7 +248,6 @@ def derive_policy(instruction: str) -> PreparationPolicy:
         length_text=length_text,
         source=source,
         source_text=source_phrase,
-        speaker_prefix_required=bool(source),
     )
 
 
@@ -349,14 +316,19 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
     if not isinstance(text, str):
         raise PreparationPolicyError("content must be a string")
     _check_garbage(text)
+    if policy.source:
+        # A provider-authored label (including "<source>: <text>") is not an
+        # independent fact. With no trusted corpus/verifier in this process,
+        # accepting it would silently convert a source request into arbitrary
+        # generated text. Fail before language/length checks and before the
+        # ToolExecutor can receive the action.
+        raise PreparationPolicyError(
+            f"source-specific content for {policy.source!r} cannot be independently "
+            "verified: no trusted source corpus or verifier is configured"
+        )
     if policy.language is not None:
         _check_language(text, policy.language)
     _check_length(text, policy)
-    if policy.speaker_prefix_required and not _speaker_prefix_ok(text, policy.source):
-        raise PreparationPolicyError(
-            f"content must be a dialogue attributed to {policy.source} as "
-            f"\"{policy.source}: <text>\" but no such speaker prefix was found"
-        )
     return text
 
 
@@ -368,7 +340,13 @@ def validate_prepared_arguments(arguments: dict[str, Any], policy: PreparationPo
     """
     if not isinstance(arguments, dict):
         return
+    found_content = False
     for field in CONTENT_FIELDS:
         value = arguments.get(field)
         if isinstance(value, str):
+            found_content = True
             validate_content(value, policy)
+    if policy.source and not found_content:
+        raise PreparationPolicyError(
+            f"source-specific content for {policy.source!r} has no verifiable content field"
+        )
