@@ -352,7 +352,7 @@ deterministic layers with scripted providers; no production claim is made.
 | Item | Value |
 |---|---|
 | Implementation commit | `ac3fe40` (`test: pin flood-wait guardian semantics and honest rejection classification`) |
-| Report commit | `(filled after creation — see git log)` |
+| Report commit | `4597fb2` (`docs: rewrite implementation report as current-state document`) |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
 | Verified remote HEAD | equals local HEAD post-push (authoritative `ls-remote`) |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
