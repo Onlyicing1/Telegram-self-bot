@@ -14,9 +14,9 @@
 | Branch | `main` |
 | Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
 | Phase | Diagnose and fix the STILL-OPEN production rejection of the exact multi-line Persian bio-task request; failure-layer diagnostics |
-| Implementation commits | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) · `c35f75f` (`fix: make task-creation rejection carry the bounded failure category`) |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` (`fix: tolerate contract-permitted JSON wrappers and classify parse failures`) |
 | Report commit | see §10 delivery record |
-| Status | **CODE-COMPLETE — full suite green (2021 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials); deterministic layers proven compliant; the live rejection persisted after `33727f3` — the remaining causes are (A) stale deployed runtime or (B) provider-output compliance, and the `c35f75f` failure-category suffix now makes ONE live reproduction conclusive (see §6) |
+| Status | **CODE-COMPLETE — full suite green (2033 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials). Live category `candidate_invalid_json` proved the failure is JSON PARSING, not semantics; root cause source-traced to an unnecessarily strict parser vs the provider text contract; fixed with deterministic parse tolerances + shape diagnostics (see §3A/§4) |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 
 ---
@@ -77,9 +77,9 @@ wrong) outcome regardless of the new prompt text.
 
 | Check | Result |
 |---|---|
-| `pytest tests/test_task_interpretation_diagnostics.py -q` | **18 passed** (post-`c35f75f`: suffix contract pinned for null / malformed / schema-violation / unsupported / success) |
-| Adjacent task suites (6 files, post-`c35f75f`) | **196 passed** |
-| `pytest tests/ -q` (full suite, post-`c35f75f`) | **2021 passed, 24 skipped** in 63.53s |
+| `pytest tests/test_task_interpretation_diagnostics.py -q` | **30 passed** (post-`012f738`: +12 JSON-extraction tolerance/diagnostic tests) |
+| Adjacent task suites (8 files, post-`012f738`) | **267 passed** |
+| `pytest tests/ -q` (full suite, post-`012f738`) | **2033 passed, 24 skipped** in 63.77s |
 | Adjacent routing/AI suites (7 files) | **186 passed** |
 | `pytest tests/ -q` (full suite) | **2021 passed, 24 skipped, 1 warning** in 63.69s |
 | `py_compile` (modified files) | OK |
@@ -121,6 +121,51 @@ can paste back verbatim (no log access needed):
   `fb76fc8`/`c35f75f` and restart it).
 
 ---
+
+## 6A. `candidate_invalid_json` root cause & fix (live category evidence, commit `012f738`)
+
+**Live evidence:** after `c35f75f` the bot's reply carried
+`[failure category: candidate_invalid_json]` — a `JSONDecodeError` during
+`_load_candidate_json`, BEFORE candidate validation/persistence. Semantics
+are therefore NOT the cause (the deterministic chain + prompt were already
+proven compliant).
+
+**Source-traced root cause (contract mismatch):**
+- `ProviderResponse.text` is ONE plain text string. Gemini joins text parts
+  (`" ".join(text_parts)`), OpenAI-compat uses message content; no adapter
+  adds fences or JSON envelopes. The interpreter prompt does not forbid
+  prose around the object.
+- The old parser accepted exactly TWO shapes: whole-text JSON, or one
+  markdown-fenced block. It therefore rejected, with `JSONDecodeError`:
+  (1) prose-wrapped UNFENCED JSON (`Here is the JSON: {...}`) — legitimately
+  permitted by the contract; (2) the multi-line `ai_instruction` case with
+  unescaped literal newlines inside the string (`json.loads` strict mode
+  rejects control characters) — the most likely live shape; (3)
+  double-encoded JSON (a JSON string whose content is the object).
+- Truncation (Gemini `MAX_TOKENS` / OpenAI `length` `finish_reason` already
+  surfaced in `response.metadata`) was indistinguishable from malformed.
+
+**Fix (`012f738`, parser tolerance only — validation untouched):**
+- `strict=False` on every parse (stdlib control-character tolerance → raw
+  newlines in `ai_instruction` parse); one-level double-encoded unwrap;
+  string-aware outer-brace scan (`_outer_object_span`, plain character
+  scanning — zero regex) for prose-wrapped unfenced objects.
+- Every parsed result STILL passes the full `parse_candidate_output`
+  schema validation; genuinely unparseable output still fails closed
+  (never fabricated into a candidate).
+- Diagnostics (content-free): `candidate_rejected` now logs
+  `json_error=JSONDecodeError line=.. col=.. pos=.. raw_len=.. truncated=..
+  provider_finish_reason=..`; user-facing categories gained
+  `candidate_invalid_json:truncated` and `candidate_invalid_json:empty`;
+  `candidate_parsed` logs `provider_finish_reason`.
+- Content-array envelopes (`{"content": [...]}`) are deliberately NOT
+  auto-unwrapped: no adapter produces them (verified in gemini.py /
+  openai_compat.py), and they fail validation honestly.
+
+**Reproduced in-process** with deterministic synthetic fixtures for all ten
+shapes (direct/fenced/prose+fenced/prose-unfenced/double-encoded/truncated/
+raw-newlines/content-wrapper/empty/prose-only) — exact live provider
+response unavailable (no credentials in this workspace).
 
 ## 7. Architecture boundaries preserved
 
@@ -173,7 +218,7 @@ column.
 
 | Item | Value |
 |---|---|
-| Implementation commits | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) · `c35f75f` (`fix: make task-creation rejection carry the bounded failure category`) |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` (`fix: tolerate contract-permitted JSON wrappers and classify parse failures`) |
 | Base commit (this phase) | `fb76fc8` (clean tree, `origin/main` equal) |
 | Report commits | `a3dbd1b` (report update) + `(final delivery record commit — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
