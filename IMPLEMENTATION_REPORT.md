@@ -13,10 +13,10 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
-| Phase | Instrument the provider/interpreter boundary with content-free production diagnostics (the actual live provider response has NEVER been captured; prior parser-tolerance work `012f738` was assumption-driven) |
-| Implementation commits | `33727f3` · `c35f75f` · `012f738` · **`a75d463` (instrumentation-only: provider-response shape + parse-failure boundary)** |
+| Phase | Instrumentation-visibility investigation: why `a75d463` boundary traces were absent from the supplied 02:41 Render excerpt; minimum instrumentation-only correction |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` · `a75d463` · **`7fbaba3` (escalate boundary instrumentation to WARNING for log visibility)** |
 | Report commit | see §10 delivery record |
-| Status | **INSTRUMENTATION-ONLY — full suite green (2044 passed, 24 skipped). NO parser/semantic/validation behavior changed in `a75d463`. The exact live provider response remains UNCAPTURED; the next live reproduction now records its complete content-free shape** (see §6B) |
+| Status | **INSTRUMENTATION-ONLY — full suite green (2046 passed, 24 skipped). Control-flow audit PROVES `raw_response_shape` executes before any JSONDecodeError classification; supplied logs contained only WARNING-level lines, so INFO visibility is unproven and the two decisive records were escalated to WARNING (no behavior change). Actual provider response content remains unobserved.** (see §6C) |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 
 ---
@@ -77,9 +77,9 @@ wrong) outcome regardless of the new prompt text.
 
 | Check | Result |
 |---|---|
-| `pytest tests/test_task_interpretation_diagnostics.py -q` | **41 passed** (post-`a75d463`: +11 instrumentation-only tests; tolerance matrix unchanged) |
-| Adjacent suites incl. correlation-leak test | **50 passed** (diagnostics files) |
-| `pytest tests/ -q` (full suite, post-`a75d463`) | **2044 passed, 24 skipped** in 64.44s |
+| `pytest tests/test_task_interpretation_diagnostics.py -q` | **43 passed** (post-`7fbaba3`: +2 ordering/missing-metadata tests) |
+| Adjacent suites incl. correlation-leak test | **52 passed** (diagnostics files) |
+| `pytest tests/ -q` (full suite, post-`7fbaba3`) | **2046 passed, 24 skipped** in 63.84s |
 | Adjacent routing/AI suites (7 files) | **186 passed** |
 | `pytest tests/ -q` (full suite) | **2021 passed, 24 skipped, 1 warning** in 63.69s |
 | `py_compile` (modified files) | OK |
@@ -232,6 +232,77 @@ request once; the `raw_response_shape` + `candidate_parse_error` lines
 identify the real provider response shape conclusively. Only then should
 any further behavioral change be considered.
 
+## 6C. Instrumentation-visibility investigation (commit `7fbaba3`)
+
+**Starting state (verified, not assumed):** starting HEAD = `8acc986` ==
+`origin/main` (`ls-remote` equal). All prior commits (`33727f3`, `c35f75f`,
+`012f738`, `a75d463`, report `8acc986`) are ancestors of `origin/main`
+(`git merge-base --is-ancestor`). `a75d463` was committed 2026-09-09
+23:06 UTC; the user's log excerpt is from 2026-09-10 02:41 — i.e. AFTER
+the instrumentation existed on the default branch.
+
+**Control-flow finding (source-proven):** in
+`TaskInterpreter.interpret` the flow is
+`provider success gate → provider_result trace → raw = response.text →
+_classify_response_structure + _log_response_shape_trace → empty check →
+_load_candidate_json → except JSONDecodeError → candidate_parse_error
+trace`. `_log_response_shape_trace` executes UNCONDITIONALLY before any
+JSON parsing — the only bypass is `response.success=false` (a different,
+already-logged path). Therefore, IF the live failure ran code including
+`a75d463` at INFO-visible level, BOTH `raw_response_shape` AND
+`candidate_parse_error` must be present in the logs. Their total absence,
+while the `[failure category: candidate_invalid_json]` reply (from
+`c35f75f`'s `_fail`, logging at WARNING) DID appear, is itself evidence.
+
+**Logging-visibility analysis (source + installed-package verified):**
+- Every line quoted from the supplied excerpt (`RUNTIME_HEARTBEAT`,
+  `KEEPALIVE_OK`, `ASYNC_TASK_DUMP`, `heartbeat stale`) is emitted by
+  `backend/runtime/tracer.py::trace()` at **WARNING** — not by an INFO
+  logger. The excerpt demonstrably shows WARNING-level `backend.*`
+  records; it contains NO INFO-level record of any kind.
+- `main.py` bootstraps root at WARNING but raises `backend` to INFO.
+- NOT the cause (checked and excluded): uvicorn's
+  `uvicorn.Config(log_level="warning")` calls `dictConfig` on
+  `LOGGING_CONFIG`, which has `disable_existing_loggers: False`, no `root`
+  key, and only `uvicorn`/`uvicorn.error`/`uvicorn.access` logger entries —
+  verified against the installed uvicorn 0.29.0 source (`config.py`
+  `configure_logging`); it does NOT lower `backend`. `LOG_LEVEL` env is
+  dead config (read into `config.py` cfg, never applied to logging).
+- Therefore the honest conclusion: **INFO-level visibility in the
+  production log stream is unproven** (the excerpt proves WARNING
+  visibility). Rather than speculate further, the two decisive records
+  were escalated to WARNING — the same level as the lines the excerpt
+  provably contains. No INFO record was removed; tests capture both.
+
+**Supplied Render log fields (semantics from source, no over-reading):**
+`ai_active` / `ai_stage` / `ai_last_provider_s` come from
+`backend/ai/diagnostics.py` and are updated ONLY by the Dispatcher's
+conversation path (`engine/dispatcher.py` `_stage/_mark_success`). The
+TaskInterpreter calls `ProviderManager.chat` directly and never touches
+those markers — so `ai_active=0`, `ai_stage=-`, `ai_last_provider_s=-1.0`
+say NOTHING about whether a task-creation AI request ran (and `-1.0` means
+"no successful PROVIDER_REQUEST recorded since boot"). `Last command: 81.9s
+ago` measures the last recognized bot command, not AI activity. These
+fields can neither prove nor disprove that the failed request reached the
+provider. Deployment identity (Render actually serving `a75d463`+) remains
+unproven from the workspace.
+
+**Evidence categories (kept separate):** 1) source-proven: control-flow
+ordering, tracer/uvicorn/bootstrap logging facts, provider extraction; 2)
+synthetic: all parser-tolerance and instrumentation tests; 3) user-supplied
+Render: runtime healthy, WARNING lines visible, no AI_TASK_TRACE at all; 4)
+actual live provider evidence: **none — actual provider response content
+remains unobserved.**
+
+**Trace fields available for the next reproduction (now WARNING-level):**
+`raw_response_shape`: request_id, provider, model, success, text_type,
+empty, first_non_ws{object|array|fence|quote|other|empty}, starts_fence,
+contains_fence, leading_prose, trailing_prose, has_control_chars,
+object_span, raw_len, truncated, finish_reason, http_status, failure_type ·
+`candidate_parse_error`: adds category, json_error, line, col, pos. No raw
+response, request, ai_instruction, keys, tokens, or arbitrary metadata
+values are ever logged.
+
 ## 7. Architecture boundaries preserved
 
 `RuntimeSupervisor` · `TaskScheduler` · `TaskExecutionCoordinator` ·
@@ -283,7 +354,8 @@ column.
 
 | Item | Value |
 |---|---|
-| Implementation commits | `33727f3` · `c35f75f` · `012f738` · `a75d463` (instrumentation-only: provider-response shape + parse-failure boundary) |
+| Implementation commits | `33727f3` · `c35f75f` · `012f738` · `a75d463` · `7fbaba3` (escalate boundary instrumentation to WARNING for log visibility) |
+| Base commit (visibility phase) | `8acc986` (clean tree, `origin/main` equal, ancestry of all prior commits verified) |
 | Base commit (this phase) | `fb76fc8` (clean tree, `origin/main` equal) |
 | Report commits | `a3dbd1b` (report update) + `(final delivery record commit — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
