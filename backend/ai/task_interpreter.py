@@ -117,6 +117,26 @@ class TaskUnsupportedError(TaskInterpretationError):
         self.capability = capability
 
 
+def _response_shape(value: Any) -> str:
+    """Content-free classification of the provider's raw JSON for diagnostics.
+
+    Lets one live reproduction distinguish null / object / array / string /
+    unsupported-envelope responses WITHOUT logging any content: a single
+    word in the AI_TASK_TRACE candidate_rejected / candidate_parsed lines.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        if set(value) == {"unsupported"} and isinstance(value.get("unsupported"), str):
+            return "unsupported"
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return f"other:{type(value).__name__}"
+
+
 def _load_candidate_json(raw: str) -> Any:
     """Parse the model's JSON, tolerating the common markdown-fence wrapper.
 
@@ -198,7 +218,9 @@ class TaskInterpreter:
             "requirements survive word-for-word; the runtime generates and validates "
             "the content at each occurrence and rejects unrelated characters. A request "
             "for 'a dialogue from <X>' must keep '<X>' inside ai_instruction exactly as "
-            "spoken. Only truly static one-time content (say exactly 'hello') omits "
+            "spoken. When you embed the request in 'ai_instruction', escape line breaks "
+            "as \\n inside the JSON string so the JSON stays valid. Only truly static "
+            "one-time content (say exactly 'hello') omits "
             "ai_instruction. "
             "SCHEDULE CONTRACT: 'schedule' must match the schedule_type exactly — "
             "interval: {'seconds': <positive number>} (every X minutes = X*60 seconds, "
@@ -278,15 +300,17 @@ class TaskInterpreter:
             "یه دیالوگ رندوم از کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری\n"
             "که زیر 60 کاراکتر باشه\n"
             "Return: {\"label\": \"Bio update\", \"schedule_type\": \"interval\", "
-            "\"schedule\": {\"seconds\": 300}, \"timezone\": \"<owner timezone>\", "
+            "\"schedule\": {\"seconds\": 300}, \"timezone\": \"Asia/Tehran\", "
             "\"actions\": [{\"name\": \"bio_set_text\", \"arguments\": {\"text\": \"\"}}], "
             "\"notification_destination\": {}, \"ai_instruction\": \"<the user's request "
             "VERBATIM, including the Persian text exactly as written>\"}."
         )
         if isinstance(timezone, str) and timezone.strip():
             instructions += (
-                f" Use the IANA timezone '{timezone.strip()}' for both the schedule "
-                "timezone and the task timezone; interval schedules carry no timezone field."
+                f" Use the IANA timezone '{timezone.strip()}' for the candidate's "
+                "TOP-LEVEL 'timezone' field — it is REQUIRED by the schema for every "
+                "schedule type. Only the SCHEDULE OBJECT itself carries no timezone "
+                "field for interval schedules."
             )
         messages = [
             {"role": "system", "content": instructions},
@@ -345,8 +369,10 @@ class TaskInterpreter:
         if not isinstance(raw, str) or not raw.strip():
             raise TaskInterpretationError("task interpretation returned no structured output")
         value: Any = None
+        shape = "unknown"
         try:
             value = _load_candidate_json(raw)
+            shape = _response_shape(value)
             # Semantically clear but unrepresentable capability: the model
             # returns {"unsupported": "..."} — surfaced distinctly from
             # ambiguity so the caller can answer honestly.
@@ -361,17 +387,26 @@ class TaskInterpreter:
         except TaskUnsupportedError:
             raise
         except (json.JSONDecodeError, TaskCandidateError) as exc:
+            if shape == "unknown":
+                shape = "malformed"
             if isinstance(value, dict):
                 actions = value.get("actions")
                 logger.info(
-                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected reason=%s "
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
+                    "response_shape=%s reason=%s "
                     "candidate_type=object action_count=%s "
                     "action_field_names=%s schedule_type=%s",
-                    request_id or "-", str(exc)[:260],
+                    request_id or "-", shape, str(exc)[:260],
                     len(actions) if isinstance(actions, list) else "-",
                     (",".join(sorted(actions[0])) if isinstance(actions, list) and actions
                      and isinstance(actions[0], dict) else "-"),
                     value.get("schedule_type", "-"),
+                )
+            else:
+                logger.info(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
+                    "response_shape=%s reason=%s",
+                    request_id or "-", shape, str(exc)[:260],
                 )
             logger.info(
                 "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
@@ -379,13 +414,18 @@ class TaskInterpreter:
             )
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
         except Exception as exc:  # noqa: BLE001
-            logger.warning("TASK_INTERPRET_REJECTED reason=candidate_parse_error detail=%r", exc)
+            logger.warning(
+                "TASK_INTERPRET_REJECTED reason=candidate_parse_error response_shape=%s detail=%r",
+                shape, exc,
+            )
             raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
         logger.info(
-            "AI_TASK_TRACE request_id=%s stage=candidate_parsed candidate_type=%s "
+            "AI_TASK_TRACE request_id=%s stage=candidate_parsed response_shape=%s "
+            "candidate_type=%s "
             "action_count=%s action_field_names=%s schedule_type=%s timezone=%s "
             "destination_keys=%s",
-            request_id or "-", "object", len(candidate.actions),
+            request_id or "-", shape, "object",
+            len(candidate.actions),
             ",".join(sorted(candidate.actions[0])) if candidate.actions else "-",
             candidate.schedule_type, candidate.timezone,
             ",".join(sorted(candidate.notification_destination)) or "-",

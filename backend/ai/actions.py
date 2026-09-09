@@ -991,6 +991,20 @@ def _is_show_verb_token(tok: str) -> bool:
 def _has_bio_mention(words: list[str]) -> bool:
     """True when any token looks like a bio word (Persian stem or English)."""
     return any(w == "bio" or w.startswith(_BIO_STEMS[0]) or w.startswith(_BIO_STEMS[1]) for w in words)
+
+
+# Bio WRITE verbs: "change/update/set my bio to …", "بیو رو عوض کن",
+# "بیو رو تغییر بده", "آپدیت کن بیو پروفایلم". Presence marks a write
+# intent so the deterministic read branch (get_bio) never answers a bio
+# update request with the CURRENT bio.
+_BIO_CHANGE_WORDS = frozenset({
+    "change", "update", "replace", "edit", "put",
+    "عوض", "تغییر", "آپدیت", "تغییر بده",
+})
+
+
+def _has_bio_change_intent(words: list[str]) -> bool:
+    return any(w in _BIO_CHANGE_WORDS for w in words)
 _STATUS_WORDS = frozenset({
     "وضعیت", "وضعیتش", "چیه", "چی", "چه", "بگو", "نشون", "ببین", "چطور",
     "چطوره", "هست", "هستن", "status", "show", "what", "current", "state", "info",
@@ -1302,7 +1316,12 @@ def _parse_status_intent(words: list[str], *, has_at: bool = False) -> ActionPar
     # reads the ACTUAL Telegram bio via get_bio — never a hallucinated or
     # engine-state value. It runs BEFORE the account branch so
     # "بیو اکانتم رو بگو" resolves to bio retrieval, not account identity.
-    if _has_bio_mention(words) and (
+    # A CHANGE/UPDATE verb on the bio ("change my bio to …", "بیو رو عوض
+    # کن") is a WRITE intent — it must never be captured as a read. Such
+    # requests fall through to the provider path (which can create a task or
+    # run the bio tool semantically) instead of answering with the current
+    # bio.
+    if _has_bio_mention(words) and not _has_bio_change_intent(words) and (
         (wordset & _STATUS_WORDS)
         or (wordset & _BIO_QUERY_WORDS)
         or any(_is_show_verb_token(w) for w in words)
@@ -1366,6 +1385,7 @@ _EN_ACTION_VERBS = frozenset({
     "write", "say", "send", "post", "delete", "remove", "clean", "clear",
     "greet", "tell", "notify", "print", "repeat", "remind", "set",
     "create", "share", "ask", "deliver", "repeat",
+    "change", "update", "put", "replace", "edit",
 })
 
 
