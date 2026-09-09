@@ -813,3 +813,69 @@ Three defects, all confirmed in source:
 - **Exact Ayanami Rei source verification is NOT implemented and is not claimed** — no trusted corpus/verifier exists in this architecture; source-specific tasks fail closed by design. Wiring a trusted corpus (e.g. a curated quote store or retrieval) is the prerequisite for accepting source-specific output.
 - Live Telegram execution was not performed in this workspace (no session credentials); the exact live failure is reproduced in-process and rejected.
 - Tasks created BEFORE this fix that already persist baked static content without `ai_instruction` remain static (no migration rewrites them); their owners should recreate them so the creation gate persists the verbatim instruction.
+
+
+---
+
+## 20. NATURAL-LANGUAGE INTERVAL TASK CREATION — SEMANTIC, NOT REGEX — 2026-09-09
+
+### 20.1 Objective
+
+Fix the live rejection of valid natural-language recurring-task requests. Both of these requests were rejected with "I could not turn that into a safe, unambiguous schedule, so I did not create any task." even though each contains a clear recurring interval (هر پنج دقیقه / هر ۵ دقیقه) and a clear action (bio update):
+
+- "یه تسک بساز هر پنج دقیقه یه دیالوگ رندوم از آیانامی ری از انیمه نئون جنسیس انتخاب کن که زیر ۶۰ کاراکتر باشه و تو بیو بزارش"
+- "هر ۵ دقیقه\nمیخوام بیو پروفایلم رو آپدیت کنید\nیه دیالوگ رندوم از کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری\nکه زیر 60 کاراکتر باشه"
+
+### 20.2 Root cause (traced in source)
+
+The pipeline is semantic end-to-end (NL → TaskInterpreter (provider) → parse_candidate_output → deterministic parse_schedule → TaskCreationService); no regex parses the user's phrasing. The deterministic router correctly routed both requests to create_task (هر+دقیقه markers). The failure was inside `TaskInterpreter.interpret()` — the provider produced no valid candidate because:
+
+1. **The action contract never named a registered bio/profile tool.** The interpreter prompt defined exactly one message-writing action (`send_message`); for "تو بیو بزارش" / "بیو پروفایلم رو آپدیت کنید" the model had to invent an action name. Per the prompt's "If any required detail is ambiguous or missing, return JSON null", a cautious model returns null → TaskInterpretationError → the generic rejection. The registered tools (`bio_set_text`, `username_set_text` — source-verified in `backend/ai/tools/`) were invisible to the interpreter.
+2. **Interval guidance was thin.** The prompt's PERSIAN INTERVAL RECOGNITION paragraph demonstrated a few fixed examples; number words (پنج), once-per-interval markers (یه بار/یکبار), English "once every N", and multi-line requests (interval on its own line) were not covered, so semantically clear intervals could be misread as ambiguous.
+3. **A deterministic gap in structured tolerance.** Model-emitted shapes like `{"interval": "5 minutes"}` or `{"every": "5 دقیقه"}` (unit embedded in the value string) fell through every canonicalization converter and were rejected by `parse_schedule`, even though they unambiguously mean 300 seconds.
+
+A second, related defect surfaced while reproducing the live requests: `_extract_source` picked the LAST "از" marker, so "از آیانامی ری از انیمه نئون جنسیس" pinned the ANIME as the source ("انیمه نئون جنسیس انتخاب") instead of the character.
+
+### 20.3 Exact files changed
+
+| Path | Change |
+|---|---|
+| `backend/ai/task_interpreter.py` | (1) ACTION contract now declares the REGISTERED profile tools: `bio_set_text` / `username_set_text` with EMPTY `{"text": ""}` arguments (content is AI-generated per occurrence under ai_instruction — never baked), and unknown action names are rejected. (2) PERSIAN INTERVAL RECOGNITION replaced by a semantic INTERVAL RECOGNITION contract: digits in any script OR Persian/English number words, minute/hour/day/week/second units, یک بار/یه بار/یکبار/once/one-time markers, multi-line requests with the interval on its own line, explicit "do not return null for a clear interval — only when no schedule expression exists" |
+| `backend/ai/task_candidate.py` | Bounded structured-output tolerance (NOT NL parsing): value-unit shapes accept a unit EMBEDDED in the value string (`{"interval": "5 minutes"}`, `{"every": "5 دقیقه"}` — whitespace split, max 2 words, bounded unit vocab); Persian unit words (ثانیه/دقیقه/ساعت/روز/هفته) added to flat/key vocabularies; bools/lists/dicts and unknown units still fall through to honest rejection (no crash path) |
+| `backend/ai/preparation_policy.py` | `_extract_source` marker ranking: among attributive markers, the LAST marker whose 3-token prefix window contains a content head noun (دیالوگ/quote/…) wins — "از آیانامی ری از انیمه نئون جنسیس" now pins "آیانامی ری", not the anime; descriptor prefixes (کاراکتر/شخصیت/character) are skipped; another marker token terminates the name phrase |
+| `tests/test_task_nl_interval_creation.py` | NEW — 41 tests: the exact two live requests create valid 300s interval bio tasks with `ai_instruction` verbatim and EMPTY action arguments; 13 interval phrasings (Persian digits/words, Latin digits, English words, once-every, یک بار/یه بار/یکبار, seconds, trailing position) route to create_task; no-intro phrasing ("پنج دقیقه یکبار") stays conversational (provider path — never a hard rejection); plain conversational text creates nothing; 11 model-emitted schedule shapes normalize to seconds; 7 ambiguous/invalid shapes stay rejected; the interpreter prompt names `bio_set_text`/`username_set_text` and the semantic interval contract; genuinely ambiguous requests ("یه وقتایی") still fail honestly with zero tasks created; `max_length=59` and source fail-closed (Ayumi + falsely labeled lines rejected) remain intact; the Bio guardian still allows exactly one mutation per rolling window |
+
+### 20.4 What was NOT done (constraints honored)
+
+- No regex was added for any natural-language parsing (verified: `git diff | grep '^+.*re\.(compile|search|match)'` → none). The only regex in these files is the pre-existing `_COMPOUND_KEY_RE` (structured key normalization) and length-pattern regexes in `derive_policy` (unchanged).
+- No phrase dictionary, no exact-string matching, no second interpreter/scheduler/executor/provider path.
+- The interpreter remains the semantic authority; deterministic validation still runs on the structured candidate (parse_schedule bounds, shape canonicalization).
+- Genuinely ambiguous schedules ("sometime later", "یه وقتایی") still return the honest rejection and create nothing.
+- Source fidelity stays fail-closed: "Ayumi: Every star begins as a dream!" and a falsely labeled "آیانامی ری: ..." line are both rejected; no trusted corpus exists and none was invented.
+- The Bio guardian (`backend/services/bio_guardian.py`) is untouched and re-pinned by test: two rapid real mutations → exactly one success, one honest "NOT updated".
+
+### 20.5 Validation
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_task_nl_interval_creation.py -q` | **41 passed** |
+| Adjacent (two runs): 11 task/source/guardian suites **199 passed**; `test_task_candidate_contract.py` **60 passed** | **259 passed** |
+| `pytest tests/ -q` (full suite) | **1912 passed, 24 skipped, 1 warning** in 63.93s |
+| `py_compile` (3 modified backend files + new test) | OK |
+| `git diff --check` | clean |
+| Regex audit | no new regex |
+| Changed files | exactly 3 backend files + 1 new test file (`telegram-self-bot/` nested clone untouched) |
+
+### 20.6 Delivery record
+
+| Item | Value |
+|---|---|
+| Fix commit | `bf98fed` (`fix: interpret natural-language interval task requests semantically`) |
+| Push | `git push origin main` (non-force fast-forward); remote proof via `fetch` + `rev-parse` + `ls-remote` post-push |
+| Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` |
+
+### 20.7 Remaining limitations
+
+- Live Telegram verification was not performed in this workspace (no session credentials); behavior is verified in-process with the real deterministic layers and a scripted provider following the (now explicit) prompt contract.
+- The deterministic router still routes interval-without-intro phrasings ("پنج دقیقه یکبار") conversationally; that is by design — the provider interprets them semantically and may still create the task. It is never a hard rejection.
+- Months ("ماه"/"month") are recognized as recurrence markers but their exact length is the model's semantic choice (the deterministic layer only checks the resulting positive seconds).
