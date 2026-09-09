@@ -20,16 +20,17 @@ Fix under test (two independent layers):
    paraphrased instruction is repaired from the request — the model can
    neither drop the source semantics nor make the task static.
 2. EXECUTION FIDELITY (deterministic, at the boundary): generated content
-   must satisfy an independently verifiable policy before ToolExecutor sees
-   it. Drifted characters, generic text, and even a matching model-authored
-   source label fail closed and are regenerated only within the bounded
-   preparation contract — never executed, never truncated.
+   must satisfy the deterministic policy before ToolExecutor sees it.
+   Source requests are GENERATED in-character dialogue: the line must open
+   with the requested source's full name (self-attribution) — drifted
+   characters, short forms, and unattributed generic text are rejected and
+   regenerated only within the bounded preparation contract; an explicitly
+   requested EXACT canonical quote fails closed (no trusted corpus).
 
 Honest limitation (documented, not faked): there is NO trusted Ayanami Rei
-corpus or independent source verifier in this architecture. A provider's
-speaker label is not evidence, so every source-specific occurrence fails
-closed rather than pretending to verify a quotation. Length/language-only
-requests remain independently enforceable.
+corpus or independent source verifier in this architecture. A self-attributed
+line is enforced only as the generated line's own opening attribution — the
+system never claims a line is an exact canonical quotation.
 """
 from __future__ import annotations
 
@@ -374,16 +375,14 @@ async def test_wrong_speaker_labels_are_rejected():
 
 
 @pytest.mark.asyncio
-async def test_matching_source_label_is_not_source_verification():
-    """Even a correctly spelled provider label cannot authenticate a quote.
-
-    This is the explicit false-positive guard: the matching label is rejected
-    before the registered tool can perform a Telegram mutation.
-    """
+async def test_matching_attributed_line_executes_exactly_once():
+    """A line that opens with the requested source satisfies the generated
+    in-character dialogue contract: it executes exactly once through the
+    ToolExecutor — self-attribution, never a canonical-quote claim."""
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, ai_task_data())
-    claimed = "آیانامی ری: " + "ت" * 40
-    preparator = ScriptedPreparator([claimed] * MAX_PREPARATION_ATTEMPTS)
+    valid = "آیانامی ری: " + "د" * 40  # 51 chars, attributed, Persian script
+    preparator = ScriptedPreparator([valid])
     calls = []
     coordinator = build_coordinator(repo, preparator, calls=calls)
     occurrence = await make_claimed_occurrence(repo, task)
@@ -392,9 +391,10 @@ async def test_matching_source_label_is_not_source_verification():
     result = await coordinator.execute(
         await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
     )
-    assert result.success is False
-    assert preparator.rounds == MAX_PREPARATION_ATTEMPTS
-    assert calls == []
+    assert result.success is True
+    assert preparator.rounds == 1
+    assert calls == [("set_bio", {"text": valid}, 1)]
+    assert (await repo.get_occurrence(1, task.id, occurrence.occurrence_key)).status == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -420,13 +420,13 @@ async def test_regeneration_is_bounded_then_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_drift_then_matching_label_still_fails_closed():
-    """A later matching label does not turn an unverified source into a
-    successful occurrence: no source corpus means no source proof."""
+async def test_drift_then_attributed_line_succeeds_once():
+    """The bounded loop regenerates after a drifted round; the first
+    self-attributed line executes exactly once."""
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, ai_task_data())
-    claimed = "آیانامی ری: " + "د" * 45
-    preparator = ScriptedPreparator([LIVE_DRIFT_LINE, claimed, claimed])
+    valid = "آیانامی ری: " + "د" * 40
+    preparator = ScriptedPreparator([LIVE_DRIFT_LINE, valid])
     calls = []
     coordinator = build_coordinator(repo, preparator, calls=calls)
     occurrence = await make_claimed_occurrence(repo, task)
@@ -435,9 +435,9 @@ async def test_drift_then_matching_label_still_fails_closed():
     result = await coordinator.execute(
         await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
     )
-    assert result.success is False
-    assert calls == []
-    assert preparator.rounds == MAX_PREPARATION_ATTEMPTS
+    assert result.success is True
+    assert preparator.rounds == 2
+    assert calls == [("set_bio", {"text": valid}, 1)]
 
 
 @pytest.mark.asyncio
@@ -472,12 +472,16 @@ async def test_exactly_60_chars_rejected_under_60_accepted_at_boundary():
 
 
 @pytest.mark.asyncio
-async def test_source_task_fails_closed_when_no_independent_verifier_exists():
-    """Failure to establish source fidelity is an honest failed occurrence,
-    not a random Bio mutation."""
+async def test_exact_quote_task_fails_closed_zero_mutation():
+    """An explicit exact-canonical-quote request cannot be satisfied without
+    a trusted corpus: every round fails closed and the occurrence fails —
+    zero tool calls, zero Telegram mutations."""
     repo = InMemoryTaskRepository()
-    task = await repo.create_task(1, ai_task_data())
-    preparator = ScriptedPreparator(["آیانامی ری: هر متنی"] * MAX_PREPARATION_ATTEMPTS)
+    instruction = PERSIAN_TASK + "، نقل قول دقیق"
+    task = await repo.create_task(1, ai_task_data(ai_instruction=instruction))
+    assert derive_policy(instruction).quote_exact is True
+    claimed = "آیانامی ری: " + "م" * 30  # even correctly attributed: not a verified quote
+    preparator = ScriptedPreparator([claimed] * (MAX_PREPARATION_ATTEMPTS + 2))
     calls = []
     coordinator = build_coordinator(repo, preparator, calls=calls)
     occurrence = await make_claimed_occurrence(repo, task)
@@ -487,32 +491,45 @@ async def test_source_task_fails_closed_when_no_independent_verifier_exists():
         await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
     )
     assert result.success is False
+    assert preparator.rounds == MAX_PREPARATION_ATTEMPTS
     assert calls == []
     assert (await repo.get_occurrence(1, task.id, occurrence.occurrence_key)).status == "failed"
 
 
 @pytest.mark.asyncio
-async def test_prepare_ahead_source_task_is_side_effect_free_and_fails_closed():
-    """Prepare-ahead never runs the tool or guardian; without a trusted source
-    verifier it also must not persist a model-authored result."""
+async def test_prepare_ahead_source_task_is_side_effect_free_then_executes_once():
+    """Prepare-ahead never runs the tool or guardian; a validated
+    self-attributed action is persisted durably, and the boundary later
+    executes it exactly once from the metadata — no new provider round."""
     from backend.services import bio_guardian
 
     bio_guardian.reset_window_for_tests()
     try:
         repo = InMemoryTaskRepository()
         task = await repo.create_task(1, ai_task_data())
-        preparator = ScriptedPreparator(["آیانامی ری: " + "م" * 30])
+        valid = "آیانامی ری: " + "م" * 30
+        preparator = ScriptedPreparator([valid])
         calls = []
         coordinator = build_coordinator(repo, preparator, calls=calls)
         occurrence = await make_claimed_occurrence(repo, task)
 
         prepared = await coordinator.prepare_ahead(occurrence)
-        assert prepared is None
-        assert preparator.rounds == MAX_PREPARATION_ATTEMPTS
+        assert prepared is not None
+        assert preparator.rounds == 1
         assert calls == []  # no tool execution
         assert bio_guardian.seconds_until_bio_mutation_allowed() == 0.0  # no window opened
         stored = await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
-        assert not stored.preparation_metadata
+        assert stored.preparation_metadata["kind"] == "prepared_action"
+
+        # At the boundary, the durably prepared action runs exactly once
+        # with ZERO additional provider rounds.
+        repo._occurrences[(task.id, occurrence.occurrence_key)].status = "running"
+        stored = await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
+        rounds_before = preparator.rounds
+        result = await coordinator.execute(stored)
+        assert result.success is True
+        assert preparator.rounds == rounds_before  # metadata path, no provider call
+        assert calls == [("set_bio", {"text": valid}, 1)]
     finally:
         bio_guardian.reset_window_for_tests()
 

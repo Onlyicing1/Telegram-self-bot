@@ -6,10 +6,15 @@ DETERMINISTIC code, not trusted to the model's self-report: preparation
 output is validated against this policy before it can ever be executed,
 and rejected output is regenerated — never truncated, never guessed.
 
-Named-source requests are carried through the contract, but this repository
-has no trusted source corpus or independent source verifier. A provider's
-speaker label is therefore not evidence: source-specific output fails closed
-rather than being presented as an authenticated quotation.
+Named-source requests are carried through the contract as GENERATED
+in-character dialogue: the content must open with the requested source's
+name followed by a separator (a deterministic token match — never a regex,
+never a corpus lookup), so a different speaker, a short form, or
+unattributed generic text is rejected and regenerated. The system never
+claims canonical-quote verification: an explicit exact-quote request fails
+closed because no trusted source corpus or independent verifier is
+configured, and a speaker label is enforced only as self-attribution of the
+generated line — never presented as an authenticated quotation.
 
 Language policy is DERIVED FROM THE INSTRUCTION ONLY. If the instruction
 does not name a language, no language constraint is imposed. Detection is
@@ -85,9 +90,25 @@ _SOURCE_DESCRIPTORS = frozenset({
     "character", "person", "figure", "بازیگر",
 })
 
-# There is intentionally no source-verification implementation here. A
-# generated "<Speaker>: <text>" label is model-authored data and cannot prove
-# that the text came from that speaker.
+# Explicit EXACT-QUOTE requests ("نقل قول دقیق", "verbatim quote"). For
+# these, generated self-attributed content is NOT acceptable: without a
+# trusted corpus the system cannot authenticate a canonical quotation, so
+# the occurrence fails closed instead of presenting a guess as a quote.
+_EXACT_QUOTE_MARKERS = (
+    "نقل قول", "نقل‌قول", "عین جمله", "کلمه به کلمه",
+    "exact quote", "verbatim", "word for word", "word-for-word",
+)
+
+# Deterministic self-attribution tokens. A generated dialogue line from a
+# named source must OPEN with the source's full name (all tokens, spoken
+# order, case-insensitive) followed by a dialogue separator — the only
+# deterministic signal that the line is attributed to the requested source.
+# This rejects a different speaker, a short form, an in-text mention, and
+# unattributed generic text. It does NOT authenticate canon: the system
+# never claims the line is an exact quotation.
+_ATTRIBUTION_SEPARATORS = frozenset({":", "؛", "،", ",", "-", "—", "–", "(", "«", "「", "（"})
+_ATTRIBUTION_NAME_SUFFIX = frozenset(":؛،,;.؟?!-—–»”」)'\"")
+_ATTRIBUTION_OPENERS = frozenset({'"', "'", "«", "“", "「", "("})
 
 # "below/under N" length words — a MAXIMUM, never an exact requirement.
 # Persian "زیر" and its English siblings are matched as whole tokens.
@@ -118,6 +139,7 @@ class PreparationPolicy:
     length_text: str = ""
     source: str = ""       # required source/person/character, "" = unconstrained
     source_text: str = ""  # the raw spoken source phrase (diagnostics)
+    quote_exact: bool = False  # explicit exact-canonical-quote request: fails closed
 
     @property
     def active(self) -> bool:
@@ -137,15 +159,19 @@ class PreparationPolicy:
         elif self.max_length is not None:
             parts.append(f"at most {self.max_length} characters")
         if self.source:
-            parts.append(
-                f"requested source/person/character={self.source}; content MUST BE "
-                f"a dialogue/quote from that source — never another character and "
-                f"never generic dialogue"
-            )
-            parts.append(
-                "NO TRUSTED SOURCE CORPUS/VERIFIER IS CONFIGURED: source-specific "
-                "content must fail closed rather than trust a provider label"
-            )
+            if self.quote_exact:
+                parts.append(
+                    f"requested source/person/character={self.source}; EXACT CANONICAL "
+                    f"QUOTE requested — no trusted source corpus/verifier is configured, "
+                    f"so content fails closed (never presented as an authenticated quote)"
+                )
+            else:
+                parts.append(
+                    f"requested source/person/character={self.source}; content MUST BE "
+                    f"a GENERATED dialogue from that source: open with "
+                    f"'{self.source}:' followed by the line — never another speaker, "
+                    f"never a short form, never generic text"
+                )
         return ", ".join(parts) if parts else "no content constraints"
 
 
@@ -273,6 +299,7 @@ def derive_policy(instruction: str) -> PreparationPolicy:
                 length_text = match.group(0)
 
     source, source_phrase = _extract_source(instruction)
+    quote_exact = bool(source) and _contains_any(instruction, _EXACT_QUOTE_MARKERS)
 
     return PreparationPolicy(
         language=language,
@@ -281,6 +308,7 @@ def derive_policy(instruction: str) -> PreparationPolicy:
         length_text=length_text,
         source=source,
         source_text=source_phrase,
+        quote_exact=quote_exact,
     )
 
 
@@ -340,6 +368,61 @@ def _check_garbage(text: str) -> None:
         raise PreparationPolicyError("content looks like a provider failure payload, not the requested content")
 
 
+def _check_attribution(text: str, source: str) -> None:
+    """Deterministic self-attribution: the line must OPEN with the requested
+    source's name (all tokens, spoken order, case-insensitive) followed by a
+    dialogue separator and the line itself.
+
+    Token-based — no regex, no corpus, no model trust beyond the exact name
+    match. A different speaker, a short form, an in-text mention, and
+    unattributed generic text are all rejected.
+    """
+    source_tokens = source.split()
+    if not source_tokens:
+        return
+    stripped = text.lstrip()
+    while stripped and stripped[0] in _ATTRIBUTION_OPENERS:
+        stripped = stripped[1:].lstrip()
+    parts = stripped.split(maxsplit=len(source_tokens))
+    if len(parts) < len(source_tokens):
+        raise PreparationPolicyError(
+            f"content must be a dialogue attributed to {source!r}: open with "
+            f"'{source}:' followed by the line"
+        )
+    name_tokens = parts[: len(source_tokens)]
+    last = name_tokens[-1]
+    if last.lower() == source_tokens[-1].lower():
+        separator_attached = False
+    else:
+        core = last.rstrip("".join(sorted(_ATTRIBUTION_NAME_SUFFIX)))
+        if core.lower() != source_tokens[-1].lower():
+            raise PreparationPolicyError(
+                f"content is attributed to a different speaker; expected the "
+                f"requested source {source!r} as the opening speaker"
+            )
+        separator_attached = True
+    for expected, actual in zip(source_tokens[:-1], name_tokens[:-1], strict=True):
+        if expected.lower() != actual.lower():
+            raise PreparationPolicyError(
+                f"content is attributed to a different speaker; expected the "
+                f"requested source {source!r} as the opening speaker"
+            )
+    rest = " ".join(parts[len(source_tokens):]).strip()
+    if separator_attached:
+        line = rest
+    else:
+        if not rest or rest[0] not in _ATTRIBUTION_SEPARATORS:
+            raise PreparationPolicyError(
+                f"content must open with {source!r} followed by a separator "
+                f"and the dialogue line"
+            )
+        line = rest[1:].strip()
+    if not line:
+        raise PreparationPolicyError(
+            f"content must include the dialogue line after the {source!r} attribution"
+        )
+
+
 def validate_content(text: Any, policy: PreparationPolicy) -> str:
     """Validate one generated content string; return it unchanged when valid.
 
@@ -350,15 +433,19 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
         raise PreparationPolicyError("content must be a string")
     _check_garbage(text)
     if policy.source:
-        # A provider-authored label (including "<source>: <text>") is not an
-        # independent fact. With no trusted corpus/verifier in this process,
-        # accepting it would silently convert a source request into arbitrary
-        # generated text. Fail before language/length checks and before the
-        # ToolExecutor can receive the action.
-        raise PreparationPolicyError(
-            f"source-specific content for {policy.source!r} cannot be independently "
-            "verified: no trusted source corpus or verifier is configured"
-        )
+        if policy.quote_exact:
+            # An explicit exact-canonical-quote request cannot be honored
+            # without a trusted corpus/verifier: a generated line — even
+            # correctly self-attributed — is not an authenticated quotation.
+            raise PreparationPolicyError(
+                f"exact canonical quote from {policy.source!r} cannot be "
+                "independently verified: no trusted source corpus or verifier "
+                "is configured"
+            )
+        # Generated in-character dialogue: deterministic self-attribution is
+        # enforced (a provider label is never treated as canon, only as the
+        # line's own opening attribution).
+        _check_attribution(text, policy.source)
     if policy.language is not None:
         _check_language(text, policy.language)
     _check_length(text, policy)

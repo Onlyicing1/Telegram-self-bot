@@ -324,13 +324,17 @@ def test_max_length_semantics_still_strict():
     assert policy.max_length == 59
 
 
-def test_source_fidelity_still_fails_closed():
+def test_source_fidelity_still_enforced():
+    """The live Ayumi drift and unattributed generic text are still rejected;
+    a self-attributed generated dialogue passes (no canonical claim)."""
     policy = derive_policy(LIVE_REQUEST_1)
     assert policy.source == "آیانامی ری"
     with pytest.raises(PreparationPolicyError):
         validate_content("Ayumi: Every star begins as a dream!", policy)
     with pytest.raises(PreparationPolicyError):
-        validate_content("آیانامی ری: هر متنی", policy)
+        validate_content("Every star begins as a dream!", policy)
+    line = "آیانامی ری: " + "د" * 40
+    assert validate_content(line, policy) == line
 
 
 @pytest.mark.asyncio
