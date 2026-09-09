@@ -175,7 +175,7 @@ column.
 |---|---|
 | Implementation commits | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) · `c35f75f` (`fix: make task-creation rejection carry the bounded failure category`) |
 | Base commit (this phase) | `fb76fc8` (clean tree, `origin/main` equal) |
-| Report commit | `(filled after creation — see git log)` |
+| Report commits | `a3dbd1b` (report update) + `(final delivery record commit — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
 | Verified remote HEAD | equals local HEAD post-push (authoritative `ls-remote`) |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
