@@ -12,258 +12,148 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Base commit (this phase) | `9f84ade` (clean tree, `origin/main` equal) |
-| Phase | Expand the natural-language task trigger / schedule interpretation system into a broad semantic trigger layer; fix the live rejection of the multi-line Persian bio-task request |
-| Implementation commit | `cce41df` (`feat: broaden semantic trigger interpretation and fix live rejection path`) |
-| Report commit | see §13 delivery record |
-| Status | **COMPLETE — full suite green (2003 passed, 24 skipped). LIVE Telegram/provider/Supabase verification NOT performed in this workspace** (no session credentials); behavior verified in-process through the real deterministic layers with scripted providers following the interpreter prompt contract |
+| Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
+| Phase | Diagnose and fix the STILL-OPEN production rejection of the exact multi-line Persian bio-task request; failure-layer diagnostics |
+| Implementation commit | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) |
+| Report commit | see §10 delivery record |
+| Status | **CODE-COMPLETE — full suite green (2021 passed, 24 skipped). LIVE Telegram/provider verification: NOT PROVEN in this workspace** (no session credentials); root cause source-proven; live classification requires one production log line (see §6) |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 
 ---
 
-## 2. Root cause of the observed live rejection
+## 2. The exact request under investigation
 
-Request: "هر ۵ دقیقه / میخوام بیو پروفایلم رو آپدیت کنید / یه دیالوگ رندوم از
-کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری / که زیر 60 کاراکتر باشه"
+```
+هر ۵ دقیقه
+میخوام بیو پروفایلم رو آپدیت کنید
+یه دیالوگ رندوم از کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری
+که زیر 60 کاراکتر باشه
+```
 
 Observed response: "I could not turn that into a safe, unambiguous schedule,
-so I did not create any task." — a single generic terminal failure in
-`CreateTaskTool` used for every interpretation failure.
+so I did not create any task. Restate it as an interval (e.g. 'every X
+minutes'), a time, or a daily/weekly cadence with a clear action."
 
-**Verified in source and by reproduction (before any change):** the
-deterministic layers (router, `TaskCandidate`, `parse_schedule`, creation
-gate) fully ACCEPT this request — with a compliant structured candidate the
-task is created with `{"seconds": 300}`, verbatim multi-line `ai_instruction`,
-empty bio arguments, source `آیانامی ری`, `max_length=59`. Therefore the live
-rejection originated in the **AI interpretation layer**:
-
-1. The interpreter prompt contained a blanket "If any required detail is
-   ambiguous or missing, return JSON null" rule and NO few-shot example, so a
-   cautious production model returns `null` for this multi-line Persian
-   structure (Persian digit ۵, "بزاری", "میخوام ... آپدیت کنید") even though
-   the interval is unambiguous → the generic ambiguity rejection.
-2. There was NO structured channel for "semantically clear but
-   unrepresentable" capabilities (monthly/yearly calendar recurrence), so
-   those also collapsed into the same generic ambiguity message.
+Intended semantics: recurring 5-minute interval · update Telegram bio ·
+AI-generated content · character Rei Ayanami · franchise Neon Genesis
+Evangelion · random dialogue · strictly under 60 characters.
 
 ---
 
-## 3. Architecture (preserved authority chain)
+## 3. Root cause (source-traced on `6087d2e`, i.e. AFTER commit `cce41df`)
 
-```
-Natural language
-→ AI semantic interpretation (TaskInterpreter → TaskCandidate → parse_candidate_output)
-→ deterministic validation (TaskCandidate.from_untrusted + parse_schedule + task_trigger)
-→ TaskCreationService → durable ai_task definition (ai_tasks table)
-→ TaskScheduler / TaskEventDispatcher → occurrence (ai_task_occurrences, CAS claim)
-→ AIActionPreparator → provider → candidate → deterministic policy validation
-→ PreparedAction (occurrence-specific, version-stamped, in preparation_metadata)
-→ TaskExecutionCoordinator (re-proves prepared action at the boundary)
-→ ToolExecutor (SOLE execution authority) → registered tool → service → Telegram
-```
+The failure-layer audit distinguished the ten candidate conditions:
 
-Unchanged and re-pinned by tests: `RuntimeSupervisor` (lifecycle/recovery),
-`TaskScheduler` (scheduler authority), `TaskExecutionCoordinator`,
-`Dispatcher` (AI orchestration), `ProviderManager` (selection/fallback),
-`ToolRegistry`/`ToolExecutor` (capability boundary + sole execution
-authority), `TaskInterpreter` (semantic interpretation), Bio guardian,
-prepare-ahead, source fidelity, exactly-once occurrence state machine. The
-AI never receives Telegram RPC, SQL, shell, filesystem, or unrestricted
-HTTP authority.
-
----
-
-## 4. Semantic interpretation changes (backend/ai/task_interpreter.py)
-
-- **Narrowed NULL RULE**: return `null` ONLY when the message has no
-  recognizable schedule/trigger expression AND no clear action (pure
-  chit-chat). Clear intervals/times/events are never ambiguous because of
-  wording, number words, omitted "every"/"هر", or multi-line layout.
-- **UNSUPPORTED CAPABILITY contract**: semantically clear but
-  unrepresentable requests (monthly/yearly calendar recurrence, "هر آخر
-  هفته"/"every weekend", "first of month", "every year on January 1")
-  return the single envelope `{"unsupported": "<capability>"}` — never
-  fabricated seconds, never a null.
-- **`TaskUnsupportedError(TaskInterpretationError)`** with `.capability`;
-  `interpret()` recognizes the envelope; `CreateTaskTool` surfaces it as an
-  honest distinct message ("I understood your request, but <capability> is
-  not supported yet...") instead of the ambiguity rejection.
-- **Few-shot EXAMPLE** mirroring the exact failing multi-line Persian
-  structure → the expected compliant JSON (300s interval, `bio_set_text`
-  empty args, verbatim `ai_instruction`).
-- **COMPOUND INTERVALS**: guidance to compute totals (`every 1 hour and 30
-  minutes` → 5400s; `هر نیم ساعت` → 1800s) or emit the structured compound
-  shape (`{"hours": 1, "minutes": 30}`).
-- **TIME-OF-DAY & CALENDAR**: once (`today at 5` / `فردا ساعت 8 صبح`), daily
-  (`every day at 9`, `هر شب ساعت 11`), weekly with the full Persian weekday
-  table (دوشنبه=0 .. یکشنبه=6; English Monday=0 .. Sunday=6).
-- **EVENT TRIGGERS**: `direction outgoing` for "when I write X", `incoming`
-  + sender for "when X messages me", `media_type` for photo/video/voice/
-  audio/document/sticker/animation, `is_mention`, `is_reply`, `contains`/
-  `text_equals`/`starts_with`, chat names (incl. channel names for channel
-  posts) — names only, never ids.
-
----
-
-## 5. Deterministic validation changes
-
-- **`backend/ai/task_candidate.py`** — compound multi-unit interval
-  canonicalization: one or more known duration unit keys sum to seconds
-  (`{"hours": 1, "minutes": 30}` → 5400), bounded by a 10-year maximum.
-  Calendar `months`/`years` keys are NOT in any unit vocabulary — they fall
-  through to honest rejection, never fabricated seconds. All other shape
-  bounds unchanged (bool/list/unknown-unit/oversized → rejection with
-  structure diagnostics).
-- **`backend/ai/task_trigger.py`** — trigger spec/resolved/matcher/summary
-  extended with `media_type` (bounded enum: photo/video/voice/audio/
-  document/sticker/animation) and `is_mention` (bool), both optional,
-  ANDed with the other conditions, counted as trigger conditions (a
-  mention-only trigger is valid). Unknown media kinds ("gif") and
-  non-bool flags are rejected.
-- **`backend/ai/task_event_dispatcher.py`** — `extract_event_context` now
-  derives `media_type` deterministically from the Telethon message
-  (photo/video/voice/audio/sticker/animation/document/other/None) and
-  `mentioned` from `event.mentioned` — both genuinely observable, no new
-  execution authority.
-
----
-
-## 6. Trigger/schedule capabilities now supported
-
-| Capability | Representation | Status |
+| # | Condition | Verdict |
 |---|---|---|
-| interval seconds/minutes/hours/days/weeks | `interval` + `{"seconds": N}` (digits any script or number words, Persian + English) | SUPPORTED (incl. `هر نیم ساعت` → 1800) |
-| compound durations (1h30m, 2d6h) | `{"seconds": total}` or structured `{"hours":1,"minutes":30}` → canonicalized sum | SUPPORTED |
-| monthly / yearly calendar recurrence | — | HONEST UNSUPPORTED (`{"unsupported": ...}` → "not supported yet") |
-| one-time at time | `once` `{"at", "timezone"}` (today/tomorrow at HH) | SUPPORTED |
-| daily at time | `daily` `{"hour", "minute", "timezone"}` (هر روز/روزانه/هر شب) | SUPPORTED |
-| weekly at time | `weekly` `{"weekday" 0-6, "hour", ...}` (Persian + English weekday names) | SUPPORTED |
-| message received (sender/chat/content) | `event` trigger: `direction=incoming` + `sender`/`chat`/`contains`/`text_equals`/`starts_with` | SUPPORTED (names resolved from trusted dialogs; unresolvable → honest failure) |
-| self-message ("when I write X") | `direction=outgoing` + content condition | SUPPORTED |
-| media received (any) | `has_media=true` | SUPPORTED |
-| media type (photo/video/voice/audio/document/sticker/animation) | `media_type` | SUPPORTED |
-| reply received | `is_reply=true` | SUPPORTED |
-| mention | `is_mention=true` (event.mentioned) | SUPPORTED |
-| channel posts | chat-name trigger (a channel post arrives as a message in that chat) | SUPPORTED via chat field |
-| weekend ("هر آخر هفته") | — | HONEST UNSUPPORTED (two weekdays, not representable in one weekly task) |
-| sender/chat ids from the model | — | REJECTED (names only; runtime resolution) |
+| 7 / 8 | Deterministic routing / request string | **NOT the cause.** `parse_command_intent` routes the EXACT request to `create_task` passing the FULL multi-line text (`کنید` action verb + `هر`/`دقیقه` interval intro). `ai_unified` trigger-stripping preserves the remaining text (`split(None, 1)` keeps multi-line). Proven by tests. |
+| 3 / 4 | Candidate validation | **NOT the cause for compliant output.** The exact request with a compliant candidate creates the 300s bio task (proven). Schema-violating output is rejected — which is correct behavior. |
+| 5 / 6 | TaskInterpretationError / TaskUnsupportedError | The generic message is the single `CreateTaskTool._fail` for interpretation failures; `TaskUnsupportedError` already maps to the distinct "not supported yet" message. The observed message is the interpretation-failure path. |
+| 2 | Malformed JSON / 1 JSON null | Possible provider-output modes — both raise `TaskInterpretationError` → the observed message. NOT distinguishable from the user message alone. |
+| **F** | **Prompt/schema contradiction — REAL SOURCE DEFECT** | The timezone instruction said **"interval schedules carry no timezone field"** while `CANDIDATE_SCHEMA` **REQUIRES** the top-level `"timezone"` for every schedule type. A model reading the instruction literally omits the required field → `TaskCandidateError("candidate fields are incomplete or unsupported")` → the exact generic rejection. This wording pre-dated `cce41df` and was NOT touched by it. Additionally, the `cce41df` few-shot example contained the echoable placeholder `"timezone": "<owner timezone>"`. |
+| — | **Bio-read hijack — SECOND REAL SOURCE DEFECT (English variants)** | `_BIO_QUERY_WORDS` contains `"my"`, so ANY sentence containing "my bio" — including *"change my bio to …"* — matched the deterministic `get_bio` READ branch. The English equivalent of the live request was answered with the current bio instead of task creation. |
+| A | Deployed runtime ≠ GitHub main | **CANNOT be verified from this workspace** (no Render/live access). The observed message text is IDENTICAL in pre- and post-`cce41df` code, so the message alone cannot distinguish a stale deployment from provider-output compliance. `render.yaml` deploys `python -m backend.main` on push to `main` when connected. |
+
+**Why `cce41df` did not prevent the live failure:** its prompt improvements
+(addressing null-returning models) are necessary but not sufficient — the
+deterministic chain was already compliant, and the two source defects above
+(F timezone contradiction, bio-read hijack) were introduced earlier, were
+not touched by `cce41df`, and each can produce the observed (or an equally
+wrong) outcome regardless of the new prompt text.
 
 ---
 
-## 7. AI-generated content system (preserved, re-pinned)
+## 4. Behavioral fixes (commit `33727f3`)
 
-Verbatim `ai_instruction` (creation gate + interpreter contract), source
-extraction and self-attribution policy, exact-quote fail-closed,
-language/length (`زیر 60` ⇒ max 59, never truncated), bounded regeneration
-(max 3 rounds) then fail closed, prepare-ahead side-effect freedom,
-occurrence-specific prepared actions with boundary re-proof, Bio guardian
-(60s rolling window at the shared mutation boundary, concurrency-safe,
-success-only advancement, FloodWait honesty), retry semantics (guardian
-rejection ⇒ permanent, no retry storm), exactly-once CAS occurrence
-lifecycle. No changes to these layers in this phase.
-
----
-
-## 8. Tests added (tests/test_task_semantic_triggers.py — 70 tests)
-
-- Exact live-failing Persian request → 300s bio task with verbatim
-  multi-line `ai_instruction`, empty arguments, source `آیانامی ری`,
-  `max_length=59`; English equivalent.
-- Interval matrix (24 phrasings): seconds/minutes/hours/days/weeks in
-  Persian + English, digits + number words, no-هر forms, half hour.
-- Compound intervals (5 phrasings) + structured compound canonicalization
-  through the real path.
-- Monthly/yearly (10 phrasings) → honest "not supported yet", never the
-  ambiguity text, zero tasks persisted.
-- Time-of-day (9): daily/nightly/weekly Persian + English weekday mapping,
-  once today/tomorrow.
-- Event triggers (8): self-message text_equals/contains, incoming content
-  match, mention (EN+FA), reply; this-chat + media_type → trusted chat_id;
-  unresolvable sender → honest failure.
-- Genuine ambiguity (3) → unchanged honest rejection (and NOT the
-  unsupported text).
-- Deterministic matcher units: photo vs video distinction, mention flag,
-  media_type derivation from message objects, bounded spec validation,
-  summary labels.
-- Prompt contract test (semantic-interpretation, null-rule, unsupported,
-  compound, time-of-day, weekday, media_type, is_mention, example strings
-  present) and `TaskUnsupportedError` envelope surfacing.
-
-Updated: `tests/test_task_candidate_contract.py` — compound unit-keyed
-shapes now canonicalize (5 new cases); month/year keys, zero/negative
-compound parts stay rejected.
-
----
-
-## 9. Validation
-
-| Command | Result |
+| File | Change |
 |---|---|
-| `pytest tests/test_task_semantic_triggers.py -q` | **70 passed** |
-| Adjacent suites (10 task/trigger/source/prepare/guardian files) | **322 passed** |
-| `pytest tests/ -q` (full suite) | **2003 passed, 24 skipped, 1 warning** in 64.40s |
-| `py_compile` (5 backend + 2 test files) | OK |
+| `backend/ai/task_interpreter.py` | (1) Timezone instruction reworded: the candidate's TOP-LEVEL `timezone` is REQUIRED for every schedule type; only the SCHEDULE OBJECT carries no timezone for intervals — the contradiction is gone. (2) Few-shot example now uses a concrete `"timezone": "Asia/Tehran"` (no echoable placeholder). (3) AI-GENERATED CONTENT CONTRACT teaches escaping line breaks as `\n` inside `ai_instruction` JSON strings (multi-line robustness). (4) NEW content-free `response_shape` diagnostic (`null`/`object`/`array`/`string`/`unsupported`/`malformed`) emitted on every `candidate_rejected`/`candidate_parse_error`/`candidate_parsed` AI_TASK_TRACE line — one live reproduction now classifies the exact failure mode WITHOUT exposing provider content. |
+| `backend/ai/actions.py` | (1) `_has_bio_change_intent` guard: bio WRITE verbs (`change/update/replace/edit/put`, `عوض`, `تغییر`, `آپدیت`) block the deterministic `get_bio` read branch — a write request is never answered with the current bio; it stays conversational (provider/semantic path). (2) `change/update/put/replace/edit` added to `_EN_ACTION_VERBS` so English scheduling variants ("Every 5 minutes, change my bio …") route deterministically to `create_task` with the full text, matching the Persian behavior. Pure vocabulary additions — no new regex, no new parsers. |
+| `tests/test_task_interpretation_diagnostics.py` | NEW — 18 failure-layer tests: exact-request routing (full multi-line text preserved), Persian word/ASCII-digit variants, English equivalent routes to create_task (hijack regression), bio write-vs-read distinction, read queries still deterministic, JSON null/malformed/array/schema-violation → distinct `response_shape` traces, unsupported envelope → distinct error, valid + fence-wrapped valid → parsed, prompt contract (no contradiction, concrete timezone, `\n` escape hint), placeholder-timezone candidate rejected, `CreateTaskTool` message mapping (generic vs unsupported vs success, persistence verified). |
+
+---
+
+## 5. Verification
+
+| Check | Result |
+|---|---|
+| `pytest tests/test_task_interpretation_diagnostics.py -q` | **18 passed** |
+| Adjacent routing/AI suites (7 files) | **186 passed** |
+| `pytest tests/ -q` (full suite) | **2021 passed, 24 skipped, 1 warning** in 63.69s |
+| `py_compile` (modified files) | OK |
 | `git diff --check` | clean |
-| Regex audit | no new regex (interpretation remains provider-semantic; trigger matching is deterministic field logic) |
-| Changed files | exactly 7 (5 backend + 2 tests) |
+| Regex audit | no new regex (vocabulary tokens only) |
+| Changed files | exactly 3 (2 backend + 1 new test) |
 
-Live Telegram / live provider / live Supabase verification: **NOT performed**
-(no session credentials in this workspace). The exact failing path was
-exercised end-to-end in-process: the request flows through the real
-`CreateTaskTool` → `TaskInterpreter` → deterministic candidate validation →
-persistence; the scripted provider plays the role the (now explicit) prompt
-contract assigns the model.
-
----
-
-## 10. Database impact
-
-**NO DATABASE / SCHEMA CHANGE.** The existing `ai_tasks` / `ai_task_occurrences`
-two-table model represents every supported trigger: schedules persist in
-`ai_tasks.schedule` (JSONB), event triggers in `schedule.trigger` (resolved
-form: trusted ids + conditions), `ai_instruction` in its existing column.
+**Verification status legend:** routing = reproduced & fixed in tests ·
+deterministic chain = reproduced & proven compliant in tests · timezone
+contradiction = source-proven, fixed, pinned · bio hijack = source-proven,
+fixed, pinned · **live Telegram/provider = NOT PROVEN** (no credentials in
+this workspace; production classification requires one log line, §6).
 
 ---
 
-## 11. Architecture boundaries preserved
+## 6. How one live reproduction now classifies the failure
 
-`RuntimeSupervisor` = lifecycle/recovery · `TaskScheduler` = scheduler ·
-`TaskExecutionCoordinator` = execution orchestration · `Dispatcher` = AI
-orchestration · `ProviderManager` = provider selection/fallback ·
-`ToolRegistry`/`ToolExecutor` = capability boundary + sole execution
-authority · Telethon = Telegram authority · AI = reasoning/generation only.
-No second scheduler/executor/event authority; no arbitrary RPC/SQL/shell/
-filesystem/HTTP authority given to the AI; no regex-based intent parsing;
-no UI/Taskloom/provider/bio-guardian changes.
+Production `AI_TASK_TRACE` (LOG_LEVEL=INFO) now distinguishes:
 
----
-
-## 12. Remaining limitations / blockers
-
-1. **Live verification**: no live Telegram/provider/Supabase run in this
-   workspace; in-process tests exercise the real deterministic layers with
-   scripted providers.
-2. **Monthly/yearly recurrence and weekend triggers**: semantically clear
-   but not representable by the existing scheduler — returned as the honest
-   "not supported yet" response (by design; implementing them requires
-   scheduler/calendar support, out of scope).
-3. **Semantic-content triggers** ("messages about X") are expressed as
-   `contains` substrings; deep semantic matching is not executed — the
-   matcher is deterministic substring logic.
-4. **Sender/chat resolution** requires the model to name resolvable
-   entities; unresolvable names fail honestly with clarification.
-5. **Canonical-quote authenticity** remains unverified by design (no trusted
-   corpus; exact-quote requests fail closed; accepted lines are
-   self-attributed generated dialogue).
+- `stage=candidate_rejected response_shape=null` → the model returned JSON null.
+- `response_shape=malformed` → malformed JSON (incl. unescaped multi-line ai_instruction).
+- `response_shape=object reason=...` → schema violation (e.g. missing required
+  timezone) with the exact reason.
+- `response_shape=unsupported` → the unsupported-capability contract fired.
+- `stage=candidate_parsed response_shape=object` → interpretation succeeded
+  (then any downstream failure is NOT the interpreter).
+- If none of these lines appear but the user still gets the generic message,
+  the deployed runtime predates this commit — a stale Render deployment.
 
 ---
 
-## 13. Delivery record (verified)
+## 7. Architecture boundaries preserved
+
+`RuntimeSupervisor` · `TaskScheduler` · `TaskExecutionCoordinator` ·
+`Dispatcher` · `ProviderManager` · `ToolRegistry`/`ToolExecutor` (sole
+execution authority) · Telethon · AI-as-reasoning-only. Execution path
+unchanged: scheduler → coordinator → prepared/validated action →
+ToolExecutor → bio tool → `bio_service._apply_profile` →
+`guard_bio_mutation` → Telegram. Bio guardian unchanged (one successful
+mutation per rolling 60s, concurrency-safe, success-only advancement).
+No second scheduler/executor/event authority; no arbitrary AI RPC/SQL/shell/
+filesystem/HTTP; no regex-based intent parsing; no quote database.
+
+---
+
+## 8. Database impact
+
+**NO DATABASE / SCHEMA CHANGE.** The existing `ai_tasks`/`ai_task_occurrences`
+two-table model represents everything; `ai_instruction` uses its existing
+column.
+
+---
+
+## 9. Remaining limitations / blockers
+
+1. **Live verification NOT PROVEN**: no Telegram/provider credentials in this
+   workspace. The exact Persian request is proven through the real
+   deterministic layers with a scripted provider, but production confirmation
+   requires a live run (or the one trace line in §6).
+2. **Provider-output compliance** cannot be guaranteed for arbitrary models;
+   the diagnostics now classify any non-compliant output, and the prompt
+   contract is explicit.
+3. **Stale deployment** possibility (A) cannot be excluded from this
+   workspace; if the generic message persists after deploying `33727f3`
+   WITH the trace showing `candidate_parsed`, the issue is downstream.
+4. Monthly/yearly/weekend triggers remain honestly unsupported; canonical-
+   quote authenticity remains unverified by design.
+
+---
+
+## 10. Delivery record (verified)
 
 | Item | Value |
 |---|---|
-| Implementation commit | `cce41df` (`feat: broaden semantic trigger interpretation and fix live rejection path`) |
-| Report commit | `0bea89b` (`docs: rewrite implementation report as current-state after semantic trigger phase`) |
+| Implementation commit | `33727f3` (`fix: remove timezone contradiction and bio-read hijack on the live request`) |
+| Report commit | `(filled after creation — see git log)` |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
 | Verified remote HEAD | equals local HEAD post-push (authoritative `ls-remote`) |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
