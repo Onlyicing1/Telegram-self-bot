@@ -26,6 +26,7 @@ from telethon.tl.functions.account import UpdateProfileRequest
 from backend.diagnostics import record_event
 from backend.runtime.tracer import trace, trace_exception
 from backend.runtime.task_guard import guarded_create_task
+from backend.services import bio_guardian
 
 logger = logging.getLogger(__name__)
 
@@ -170,11 +171,22 @@ async def _cron_loop(owner_id: int, tz_str: str) -> None:
                 continue
 
             t0 = time.monotonic()
-            try:
+
+            async def _send_update() -> None:
                 await asyncio.wait_for(
                     client(UpdateProfileRequest(**updates)),
                     timeout=_API_TIMEOUT,
                 )
+
+            try:
+                # The bio mutation boundary applies only when the tick
+                # touches the bio: a username-only tick must not open the
+                # 60-second bio window. A guarded rejection must not mask
+                # the tick's other fields.
+                if "about" in updates:
+                    await bio_guardian.guard_bio_mutation(_send_update)
+                else:
+                    await _send_update()
                 record_event("profile", "UpdateProfileRequest", (time.monotonic() - t0) * 1000, "SUCCESS",
                               f"fields={list(updates.keys())}")
                 try:
@@ -182,6 +194,16 @@ async def _cron_loop(owner_id: int, tz_str: str) -> None:
                     tick_loop("lifeos-profile-scheduler", state="RUNNING", success=True)
                 except Exception:
                     pass
+            except bio_guardian.BioMutationGuarded as exc:
+                # Only the bio side is rate-limited: a username-only update
+                # proceeds, and the next minute's tick retries the bio.
+                if "about" in updates:
+                    logger.warning("Profile scheduler bio update rejected: %s", exc)
+                    record_event("profile", "UpdateProfileRequest", 0, "GUARDED", str(exc))
+                    updates.pop("about")
+                    if updates:
+                        await client(UpdateProfileRequest(**updates))
+                continue
             except asyncio.TimeoutError:
                 logger.warning("Profile API call timed out (%ds) — will retry next minute", _API_TIMEOUT)
                 record_event("profile", "UpdateProfileRequest", _API_TIMEOUT * 1000, "TIMEOUT")

@@ -593,14 +593,31 @@ async def test_create_task_fails_honestly_without_interpretation_capability():
 )
 async def test_bio_engine_tools_execute_through_real_services(tool_name, service_kwargs):
     """Bio tools run the REAL bio_service against the in-memory DB fallback."""
-    api = FakeTelegramAPI()
-    registry, ctx, executor = make_registry(api)
-    results = await executor.execute_calls(
-        [{"name": tool_name, "arguments": service_kwargs}],
-        owner_id=OWNER,
-        session_id="s",
-        context_override=ctx,
-    )
+    from backend.profile import scheduler as profile_scheduler
+    from backend.services import bio_guardian
+
+    # bio_service mutates Telegram through the shared profile-scheduler
+    # client and through the 60s bio guardian: give the test its own client
+    # and a clean window so each case is deterministic and independent.
+    bio_guardian.reset_window_for_tests()
+    previous_client = profile_scheduler._client
+
+    async def _fake_profile_rpc(request):
+        return MagicMock()
+
+    profile_scheduler._client = MagicMock(side_effect=_fake_profile_rpc)
+    try:
+        api = FakeTelegramAPI()
+        registry, ctx, executor = make_registry(api)
+        results = await executor.execute_calls(
+            [{"name": tool_name, "arguments": service_kwargs}],
+            owner_id=OWNER,
+            session_id="s",
+            context_override=ctx,
+        )
+    finally:
+        profile_scheduler._client = previous_client
+        bio_guardian.reset_window_for_tests()
     r = results[0]
     assert r.success is True, f"{tool_name}: {r.message}"
     assert r.message.startswith(("✅", "**Bio", "📝"))

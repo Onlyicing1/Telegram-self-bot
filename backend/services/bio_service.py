@@ -32,6 +32,7 @@ async def _apply_profile(owner_id: int, tz_str: str | None = None) -> str:
     change.
     """
     from backend.profile import scheduler as profile_scheduler
+    from backend.services.bio_guardian import guard_bio_mutation
     from telethon.errors import FloodWaitError
     from telethon.tl.functions.account import UpdateProfileRequest
 
@@ -44,22 +45,30 @@ async def _apply_profile(owner_id: int, tz_str: str | None = None) -> str:
         state.get("custom_text", ""),
         tz_str or "UTC",
     )
-    client = profile_scheduler._client
-    if client is None:
-        raise RuntimeError("no active Telegram client for profile update")
-    try:
-        await asyncio.wait_for(
-            client(UpdateProfileRequest(about=about)),
-            timeout=_PROFILE_TIMEOUT,
-        )
-    except FloodWaitError as exc:
-        raise RuntimeError(f"telegram flood wait {exc.seconds}s") from exc
-    except asyncio.TimeoutError as exc:
-        raise RuntimeError("telegram profile update timed out") from exc
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"telegram profile update failed: {exc}") from exc
+
+    async def _mutate() -> str:
+        client = profile_scheduler._client
+        if client is None:
+            raise RuntimeError("no active Telegram client for profile update")
+        try:
+            await asyncio.wait_for(
+                client(UpdateProfileRequest(about=about)),
+                timeout=_PROFILE_TIMEOUT,
+            )
+        except FloodWaitError as exc:
+            raise RuntimeError(f"telegram flood wait {exc.seconds}s") from exc
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("telegram profile update timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"telegram profile update failed: {exc}") from exc
+        return about
+
+    # Every bio mutation path passes this boundary. A rejected mutation
+    # raises and is never reported as a successful bio change; a failed RPC
+    # never starts the 60-second window.
+    about = await guard_bio_mutation(_mutate)
     await db_client.update_bio_state(owner_id, {"last_bio": about})
     record_event("bio", "UpdateProfileRequest", 0, "SUCCESS", "direct apply")
     return about
