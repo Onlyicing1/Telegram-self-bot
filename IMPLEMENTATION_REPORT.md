@@ -927,7 +927,7 @@ Intended meaning: recurring 5-minute interval, Bio update action, AI-generated c
 | Item | Value |
 |---|---|
 | Fix commit | `73d0daf` (`fix: generate source-attributed dialogue with deterministic self-attribution`) |
-| Report commit | (tip — this section's commit) |
+| Report commit | `0cf2590` (`docs: record source-attributed dialogue generation phase in implementation report`) |
 | Push | `git push origin main` (non-force fast-forward); remote proof via `fetch` + `rev-parse` + `ls-remote` post-push |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` |
 
