@@ -24,14 +24,18 @@ _INTERVAL_UNIT_SECONDS = {
     "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
     "day": 86400, "days": 86400,
     "week": 604800, "weeks": 604800,
+    # Persian unit words, incl. flat shapes a Persian-request model may emit.
+    "ثانیه": 1, "دقیقه": 60, "ساعت": 3600, "روز": 86400, "هفته": 604800,
 }
 # Unit STRING values accepted in (value, unit) pair shapes, incl. the Persian
 # unit words a Persian-request model may echo back.
 _UNIT_WORD_SECONDS = {
     **_INTERVAL_UNIT_SECONDS,
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,
-    "دقیقه": 60, "ساعت": 3600, "روز": 86400, "هفته": 604800,
 }
+# Value STRING forms that embed their own unit ("5 minutes", "5 دقیقه") —
+# split on whitespace into number + unit word; anything else stays rejected.
+_EMBEDDED_UNIT_MAX_WORDS = 2
 _VALUE_KEYS = frozenset({"interval", "value", "every", "amount", "count", "number", "n", "repeat"})
 _UNIT_VALUE_KEYS = frozenset({"unit", "units", "time_unit", "unit_name", "granularity"})
 _COMPOUND_KEY_RE = re.compile(
@@ -82,23 +86,41 @@ def _schedule_structure(schedule: Any) -> str:
 def _convert_value_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
     """{"interval": 3, "unit": "minutes"} -> {"seconds": 180}.
 
-    Accepts exactly one numeric value key and one string unit key from the
-    bounded vocabularies; a stray timezone key is dropped (interval schedules
-    carry no timezone). Any other extra key, unknown unit word, or invalid
-    number leaves the shape unmatched (the schedule is then rejected
+    Accepts exactly one numeric value key and at most one string unit key
+    from the bounded vocabularies. The unit may also be EMBEDDED in the
+    value string ({"interval": "5 minutes"}, {"every": "5 دقیقه"}) — split
+    on whitespace into number + unit word; a numeric value together with a
+    unit key takes precedence. A stray timezone key is dropped (interval
+    schedules carry no timezone). Any other extra key, unknown unit word, or
+    invalid number leaves the shape unmatched (the schedule is then rejected
     downstream with its structure attached).
     """
-    value_keys = [k for k in schedule if k in _VALUE_KEYS and _as_number(schedule[k]) is not None]
+    value_keys = [k for k in schedule if k in _VALUE_KEYS]
     unit_keys = [k for k in schedule if k in _UNIT_VALUE_KEYS and isinstance(schedule[k], str)]
-    if len(value_keys) != 1 or len(unit_keys) != 1:
+    if len(value_keys) != 1 or len(unit_keys) > 1:
         return None
-    unit = schedule[unit_keys[0]].strip().lower()
-    if unit not in _UNIT_WORD_SECONDS:
+    raw = schedule[value_keys[0]]
+    number = _as_number(raw)
+    unit = schedule[unit_keys[0]].strip().lower() if unit_keys else None
+    if number is None:
+        # Only a STRING value may carry an embedded unit ("5 minutes");
+        # bools/lists/dicts never do — leave the shape unmatched so the
+        # schedule is rejected downstream instead of crashing.
+        if not isinstance(raw, str):
+            return None
+        parts = raw.strip().split()
+        if len(parts) != _EMBEDDED_UNIT_MAX_WORDS or len(parts[1]) > 24:
+            return None
+        number = _as_number(parts[0])
+        if unit is None:
+            unit = parts[1].strip().lower()
+        if number is None:
+            return None
+    if unit is None or unit not in _UNIT_WORD_SECONDS:
         return None
-    extras = set(schedule) - {value_keys[0], unit_keys[0]}
+    extras = set(schedule) - {value_keys[0]} - set(unit_keys)
     if extras - {"timezone"}:
         return None
-    number = _as_number(schedule[value_keys[0]])
     if not math.isfinite(number) or number <= 0:
         return None
     return {"seconds": number * _UNIT_WORD_SECONDS[unit]}

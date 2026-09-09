@@ -65,6 +65,26 @@ _INSTRUMENTAL_TOKENS = frozenset({
     "using", "based", "per", "according", "with",
 })
 
+# Content head nouns: "<head noun> از <name>" marks the ATTRIBUTIVE marker
+# ("یه دیالوگ رندوم از آیانامی ری"). When several "از" markers compete
+# ("... از آیانامی ری از انیمه نئون جنسیس ..."), the marker nearest a head
+# noun names the requested source; the later clause is the source's own
+# context (anime), not the source. Preference is bounded to the 3 tokens
+# before a marker so unrelated clauses cannot hijack it.
+_SOURCE_HEAD_NOUNS = frozenset({
+    "دیالوگ", "تکست", "متن", "گفتگو", "جمله", "خط", "کلام", "سخن",
+    "مونولوگ", "جمله‌ای", "عبارت",
+    "quote", "dialogue", "line", "text", "speech", "sentence",
+    "monologue", "phrase", "remark", "saying", "dialog",
+})
+
+# Descriptors that may PREFIX the name after the marker ("از کاراکتر
+# آیانامی ری") — skipped so the pinned source is the name itself.
+_SOURCE_DESCRIPTORS = frozenset({
+    "کاراکتر", "شخصیت", "نقش", "شخص",
+    "character", "person", "figure", "بازیگر",
+})
+
 # There is intentionally no source-verification implementation here. A
 # generated "<Speaker>: <text>" label is model-authored data and cannot prove
 # that the text came from that speaker.
@@ -142,31 +162,44 @@ def _extract_source(text: str) -> tuple[str, str]:
     tokens, not a sentence-pattern parser. It preserves the source identity
     for the durable contract; it does not authenticate generated content.
 
-    The LAST marker wins: later markers sit closer to the actual source;
-    earlier ones typically belong to an unrelated clause.
+    Attribution markers are ranked: instrumental "X از Y" (استفاده/using) is
+    skipped; among the remaining markers, the LAST one whose 3-token prefix
+    window contains a content head noun (دیالوگ/quote/…) wins — that is the
+    "<content> از <source>" construct — and otherwise the LAST marker wins
+    (it sits closest to the actual source in a plain single-clause request).
+    The name phrase after the winning marker stops at delimiters, another
+    marker, or a change-verb/clause token.
     """
     if not isinstance(text, str) or not text.strip():
         return "", ""
     raw_words = text.split()
     lowered_tokens = [w.lower() for w in raw_words]
-    marker_idx = -1
+    attributive: list[int] = []
     for i, tok in enumerate(lowered_tokens):
         if tok not in _SOURCE_MARKER_TOKENS:
             continue
-        # "X از Y" with instrumental X (استفاده/using/…) is not attribution:
-        # skip it so the last ATTRIBUTIVE marker decides the source.
+        # "X از Y" with instrumental X (استفاده/using/…) is not attribution.
         if i > 0 and lowered_tokens[i - 1] in _INSTRUMENTAL_TOKENS:
             continue
-        marker_idx = i
-    if marker_idx < 0:
+        attributive.append(i)
+    if not attributive:
         return "", ""
+    marker_idx = attributive[-1]
+    for i in reversed(attributive):
+        window = lowered_tokens[max(0, i - 3):i]
+        if any(tok in _SOURCE_HEAD_NOUNS for tok in window):
+            marker_idx = i
+            break
     collected = []
     for word in raw_words[marker_idx + 1:marker_idx + 7]:
         stripped = word.strip("\u060c،,.؛:!؟?\"'")
         if not stripped:
             break
-        if stripped.lower() in _SOURCE_STOP_TOKENS:
+        lowered = stripped.lower()
+        if lowered in _SOURCE_STOP_TOKENS or lowered in _SOURCE_MARKER_TOKENS:
             break
+        if not collected and lowered in _SOURCE_DESCRIPTORS:
+            continue
         collected.append(stripped)
         if len(collected) >= 4:
             break
