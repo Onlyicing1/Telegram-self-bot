@@ -591,3 +591,50 @@ async def test_schema_invalid_json_is_not_labeled_a_parse_error(caplog):
     assert not any("stage=candidate_parse_error" in line for line in trace_lines)
     # The shape trace ran on this path too
     assert any("stage=raw_response_shape" in line for line in trace_lines)
+
+
+@pytest.mark.asyncio
+async def test_raw_response_shape_reached_before_json_parsing_on_malformed_path(caplog):
+    """Control-flow guarantee: the boundary shape record executes BEFORE the
+    parser — even on the malformed path where parsing fails, both records
+    appear, so the shape classification can never be skipped by a parse
+    failure."""
+    malformed = "{\"label\": 12x3}"
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(TaskInterpretationError):
+            await TaskInterpreter(_meta_provider(malformed)).interpret(
+                LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-order"
+            )
+    messages = [r.getMessage() for r in caplog.records if "AI_TASK_TRACE" in r.getMessage()]
+    shape_idx = next(i for i, m in enumerate(messages) if "stage=raw_response_shape" in m)
+    err_idx = next(i for i, m in enumerate(messages) if "stage=candidate_parse_error" in m)
+    assert shape_idx < err_idx
+    assert "provider=stub" in messages[shape_idx]
+    assert "raw_len=15" in messages[err_idx]  # len('{"label": 12x3}')
+
+
+@pytest.mark.asyncio
+async def test_missing_optional_metadata_does_not_crash_instrumentation(caplog):
+    """A ProviderResponse with NO model/finish_reason/http_status/failure_type
+    metadata still produces the complete shape record with '-' placeholders."""
+    from backend.ai.providers.base.contract import ProviderResponse
+
+    class _BareProvider:
+        async def chat(self, messages, tools=None):
+            return ProviderResponse(
+                text=_good_candidate_json(), provider_name="bare", success=True,
+            )  # metadata defaults to {}
+
+    with caplog.at_level(logging.INFO):
+        await TaskInterpreter(_BareProvider()).interpret(
+            LIVE_PERSIAN_REQUEST, timezone=TZ, request_id="req-bare"
+        )
+    line = next(
+        r.getMessage() for r in caplog.records
+        if "AI_TASK_TRACE" in r.getMessage() and "stage=raw_response_shape" in r.getMessage()
+    )
+    assert "provider=bare" in line
+    assert "model=-" in line
+    assert "finish_reason=-" in line
+    assert "http_status=-" in line
+    assert "failure_type=-" in line

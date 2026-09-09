@@ -226,7 +226,7 @@ def _log_response_shape_trace(
     provider_truncated = (
         isinstance(finish, str) and finish.upper() in ("MAX_TOKENS", "LENGTH")
     )
-    logger.info(
+    logger.warning(
         "AI_TASK_TRACE request_id=%s stage=raw_response_shape "
         "provider=%s model=%s success=%s text_type=%s empty=%s "
         "first_non_ws=%s starts_fence=%s contains_fence=%s "
@@ -551,7 +551,7 @@ class TaskInterpreter:
                     isinstance(finish, str)
                     and finish.upper() in ("MAX_TOKENS", "LENGTH")
                 )
-                logger.info(
+                logger.warning(
                     "AI_TASK_TRACE request_id=%s stage=candidate_parse_error "
                     "category=candidate_invalid_json response_shape=malformed "
                     "provider=%s model=%s json_error=%s line=%s col=%s "
