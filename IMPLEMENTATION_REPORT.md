@@ -263,7 +263,7 @@ no UI/Taskloom/provider/bio-guardian changes.
 | Item | Value |
 |---|---|
 | Implementation commit | `cce41df` (`feat: broaden semantic trigger interpretation and fix live rejection path`) |
-| Report commit | `(filled after creation — see git log)` |
+| Report commit | `0bea89b` (`docs: rewrite implementation report as current-state after semantic trigger phase`) |
 | Push | `git push origin main` (non-force fast-forward); verified via `fetch` + `rev-parse` + `ls-remote` |
 | Verified remote HEAD | equals local HEAD post-push (authoritative `ls-remote`) |
 | Working tree | Clean except the pre-existing untracked nested clone `telegram-self-bot/` (untouched) |
