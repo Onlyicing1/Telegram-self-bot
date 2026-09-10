@@ -215,10 +215,10 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 | Item | Value |
 |---|---|
 | Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== origin/main at start) |
-| Implementation commit | single `feat:` commit on `main` (see git log) |
-| Report commit | this document is part of the same phase commit |
-| Push result | recorded after push below |
-| Remote HEAD verification | `git fetch origin` + `rev-parse origin/main` executed after push; recorded in the commit message delivery note |
-| Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
+| Implementation commit | `7ccd372709c45eee53f30c03f4862d54c5e29a7d` — `feat: model-level fallback pool and coalesced Unicode Test Modules` (includes this report) |
+| Report commit | same commit (report rewritten to the final behavior before commit) |
+| Push result | `7f28bdb..7ccd372  main -> main` (exit 0) |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `7ccd372709c45eee53f30c03f4862d54c5e29a7d` == local HEAD; `git show --stat origin/main` contains exactly the 12 phase files |
+| Working tree | clean after push (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
 
 ---
