@@ -275,9 +275,9 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 | Item | Value |
 |---|---|
 | Starting HEAD (feed-fix patch) | `f0220d5e388ed2470800ed021fc1ffb60a741d64` (== origin/main at start) |
-| Feed-fix commit | recorded after push (see below) — `fix: keep production candidate feed complete independent of display cap` |
-| Push result | recorded after push |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` after push, == local HEAD |
+| Feed-fix commit | `c96c8bd4f2b69306aed5b085ed6ba43280e4bcad` — `fix: keep production candidate feed complete independent of display cap` (4 files, 312+/34−) |
+| Push result | `f0220d5..c96c8bd  main -> main` (exit 0) |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `c96c8bd4f2b69306aed5b085ed6ba43280e4bcad` == local HEAD; `git show --stat origin/main` contains exactly the 4 feed-fix files |
 | Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
 | Live Telegram verification | **NOT performed** (no credentials in this workspace) — source- and test-verified only; the exact Persian bio-task request remains the end-to-end probe |
 
