@@ -65,7 +65,8 @@ async def test_ai_flow_prompt_sections_in_deterministic_order(prompt_builder, co
 
 @pytest.mark.asyncio
 async def test_ai_flow_provider_returns_response(provider_manager):
-    """Stage 4: Provider returns a response (DummyProvider)."""
+    """Stage 4: no real provider configured → the manager builds the honest
+    "not configured" failure itself. Dummy is never the production answer."""
     messages = [
         {"role": "system", "content": "You are a test assistant."},
         {"role": "user", "content": "Say hello"},
@@ -73,7 +74,9 @@ async def test_ai_flow_provider_returns_response(provider_manager):
     response = await provider_manager.chat(messages)
     assert response is not None
     assert response.text != ""
-    assert response.provider_name == "dummy"
+    assert response.success is False
+    assert "not configured" in response.text
+    assert response.provider_name == ""
 
 
 @pytest.mark.asyncio

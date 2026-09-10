@@ -456,9 +456,10 @@ async def test_failed_rate_limited_request_records_honest_unavailable_tokens():
     assert len(records) == 1
     rec = records[0]
     assert rec.status == "failed"
-    # Emergency fallback answered the terminal failure.
+    # Terminal failure is attributed honestly: no provider served it
+    # (the dispatcher falls back to the active provider name for telemetry).
     assert rec.fallback_used is True
-    assert rec.provider == "dummy"
+    assert rec.provider == "scripted34"
     assert rec.error_reason == "Rate limited"
     # A failed request consumed nothing — no estimated tokens dressed up
     # as usage, no stale context figure.

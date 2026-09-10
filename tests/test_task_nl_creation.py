@@ -614,9 +614,10 @@ async def test_provider_failure_preserves_concrete_reason_and_terminal_event(cap
     assert result.success is False
     messages = [r.getMessage() for r in _trace_records(caplog)]
     # The exhausted chain is reconstructable: 'attempted' lists the tried
-    # provider(s), 'provider' names the terminal fallback responder.
+    # provider(s); 'provider' stays unknown because NO provider served the
+    # manager-built terminal failure (Dummy never answers production).
     assert any(
-        "stage=provider_result success=false provider=dummy attempted=fake" in m
+        "stage=provider_result success=false provider=unknown attempted=fake" in m
         for m in messages
     )
     assert any("category=all_providers_failed" in m for m in messages)

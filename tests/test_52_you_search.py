@@ -416,13 +416,15 @@ class TestRoutingExclusionAndManager:
         p._last_success_monotonic = 1.0  # even when fully healthy...
         manager = _manager_with(p)
         response = await manager.chat([{"role": "user", "content": "hi"}])
-        # ...the mesh must skip it and land on the dummy fallback.
+        # ...the mesh must skip it and return the manager-built honest
+        # failure — no provider (and never Dummy) answered.
         matrix = (response.metadata or {}).get("provider_matrix", [])
         assert any(
             e.get("provider") == "you" and e.get("outcome") == "skipped"
             for e in matrix
         )
-        assert response.provider_name == "dummy"
+        assert response.success is False
+        assert response.provider_name == ""
 
     @pytest.mark.asyncio
     async def test_manager_search_success_records_health(self):

@@ -15,8 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 @pytest.mark.asyncio
-async def test_provider_crash_falls_back_to_dummy(provider_manager):
-    """When the active provider crashes, ProviderManager falls back to dummy."""
+async def test_provider_crash_exhaustion_returns_honest_failure(provider_manager):
+    """When the only active provider crashes and no real candidate remains,
+    the manager returns an honest failure — Dummy is never the fallback."""
     from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
     from backend.ai.providers.base.config import ProviderConfig
 
@@ -46,7 +47,9 @@ async def test_provider_crash_falls_back_to_dummy(provider_manager):
     messages = [{"role": "user", "content": "test"}]
     response = await provider_manager.chat(messages)
     assert response is not None
-    assert response.provider_name == "dummy"
+    assert response.success is False
+    assert response.provider_name == ""
+    assert response.metadata.get("fallback_exhausted") is True
 
 
 @pytest.mark.asyncio

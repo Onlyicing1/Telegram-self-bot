@@ -13,8 +13,8 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== `origin/main` at phase start, clean tree) |
-| Phase | (1) MODEL-level fallback candidate pool for production AI requests; (2) Test Modules redesigned as a compact Taskloom-like Unicode panel with coalesced edits; (3) removal of the hidden 6-model-per-provider test cap |
-| Status | **IMPLEMENTED — full suite green (2074 passed, 24 skipped, 0 failed)** |
+| Phase | (1) MODEL-level fallback candidate pool for production AI requests; (2) Test Modules redesigned as a compact Taskloom-like Unicode panel with coalesced edits; (3) removal of the hidden 6-model-per-provider test cap; **(4) corrective patch: no per-provider production pool cap + Dummy removed from production fallback entirely** |
+| Status | **IMPLEMENTED — full suite green (2079 passed, 24 skipped, 0 failed)** |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 | Delivery record | see §9 |
 
@@ -62,12 +62,13 @@ round-robin distribution, both providers represented),
 second registry, router, or discovery system):
 
 1. **Pool construction** (`_candidate_models`): for EVERY eligible provider,
-   `[configured model] + discovery-fed candidate models` (free-first,
-   deduplicated, configured model never demoted), bounded by
-   `_MODEL_CANDIDATE_LIMIT = 6` per provider so attempts stay bounded even
-   when discovery returns dozens of models. This bound is a PRODUCTION
-   fallback bound (bounded attempts per request), not a test-coverage cap —
-   Test Modules remains the component that must cover everything.
+   `[configured model] + EVERY discovery-fed candidate model` (free-first,
+   deduplicated, configured model never demoted). There is **NO per-provider
+   cap** — the complete eligible real/free model set enters the pool
+   (corrective patch removed the former `_MODEL_CANDIDATE_LIMIT = 6`).
+   Bounded request EXECUTION is a separate, explicit policy: one attempt per
+   candidate, one immediate retry for transient failures, per-request RPC
+   timeout — never a hidden truncation of the pool before the policy runs.
 2. **Feeding** (`set_model_candidates`): the Test Modules discovery pass
    feeds the pool — one discovery pass serves both diagnostics and the
    production router (Test Modules bug fixed here too: the feed previously
@@ -93,18 +94,24 @@ second registry, router, or discovery system):
    unchanged so the caller's fail-closed parser owns final classification);
    deterministic/user/repository/Telegram/security failures never trigger
    content failover (the validator only sees parseability; permanent
-   config/request errors advance deterministically instead).
-
-**Dummy exclusion (verified + regression-tested):** `dummy` is filtered from
-the eligible pool at every layer (`_ordered_candidates` never includes it;
-the chat loop explicitly skips it; the terminal "no real provider configured"
-case returns the dummy's own diagnostic response instead of synthesizing
-one). It is reachable ONLY as the terminal emergency fallback via
-`_fallback()`, which always returns `success=False` with the failure matrix
-preserved — never a fake successful answer, never an inflation of the
-candidate count. Tests:
-`test_dummy_never_enters_production_candidate_pool`,
-`test_dummy_only_terminal_when_all_real_candidates_exhausted`.
+   config/request errors advance deterministically instead).**Dummy exclusion (ABSOLUTE — corrective patch, regression-tested):** the
+   Dummy provider is removed from the production fallback path ENTIRELY.
+   `_ordered_candidates()` never returns it (even when registered or active),
+   `ProviderManager.chat()` never selects it (even as the active name), the
+   terminal "no real provider configured" case returns a manager-built
+   honest failure (`reason=no_provider_configured`), and `_fallback()` — the
+   exhaustion path — builds its own `success=False` response with the
+   preserved failure matrix, errors, and retry count, invoking NO provider.
+   `vision`/`stream` crash paths likewise return manager-built honest
+   failures (`provider_name=""`). Dummy remains ONLY as a development/test
+   double (`backend/ai/providers/dummy/provider.py`). Tests:
+   `test_dummy_never_invoked_even_when_registered_and_active` (active+dummy
+   registered, zero Dummy calls),
+   `test_dummy_only_registry_returns_manager_built_not_configured`,
+   `test_dummy_never_enters_production_candidate_pool`,
+   `test_dummy_only_terminal_when_all_real_candidates_exhausted`
+   (honest exhaustion: `provider_name == ""`, matrix + retry count intact,
+   `ai_retry_count == 2` preserved).
 
 ## 4. Test Modules UX — compact Unicode panel
 
@@ -192,16 +199,21 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 
 ## 8. Tests and verification
 
-- **New/updated regression tests**: 2 new tester tests (full-coverage
-  streaming + pool feed; error-path terminal render), 1 new tester test for
-  the global budget (fair distribution), 2 rewritten tester tests (old cap
-  → full coverage), 1 new wiring test (second-tap rejection), 3 new mesh
-  tests (dummy pool exclusion ×2; Unicode inventory sweep), 1 new UI test
-  (60-model pagination), 5 tests rewritten to the Unicode/streaming
-  contract.
-- **Focused suites** (model tester, runtime wiring, model selection, tool
-  honesty/glass, provider mesh, structured output, model UI): **142 passed**.
-- **Full suite**: **2074 passed, 24 skipped, 0 failed**.
+- **Corrective-patch tests (this phase)**: `test_candidate_models_complete_and_ordered`
+  (40 discovery models all enter the pool — old cap would truncate at 6),
+  `test_production_pool_not_truncated_to_six_models` (ten candidates all
+  eligible, bounded execution intact: 404s attempted once each, live model
+  served second), `test_multiple_providers_contribute_complete_model_sets`
+  (two providers contribute complete sets; deterministic matrix order;
+  model-level failover across providers), `test_active_configured_model_stays_first_in_complete_pool`,
+  `test_dummy_never_invoked_even_when_registered_and_active`,
+  `test_dummy_only_registry_returns_manager_built_not_configured`;
+  updated Dummy-contract tests (test_02, test_06, test_11, test_34, test_52,
+  test_task_nl_creation).
+- **Focused suites** (provider mesh, structured output, runtime wiring,
+  ai flow, failure simulation, tool calls, model UI, you-search, NL
+  creation): **all green**.
+- **Full suite**: **2079 passed, 24 skipped, 0 failed**.
 - `python -m py_compile` on all changed Python files — OK.
 - `git diff --check` — clean.
 - **Live Telegram verification: NOT performed** (no credentials in this
@@ -214,11 +226,10 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 
 | Item | Value |
 |---|---|
-| Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== origin/main at start) |
-| Implementation commit | `7ccd372709c45eee53f30c03f4862d54c5e29a7d` — `feat: model-level fallback pool and coalesced Unicode Test Modules` (includes this report) |
-| Report commit | same commit (report rewritten to the final behavior before commit) |
-| Push result | `7f28bdb..7ccd372  main -> main` (exit 0) |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `7ccd372709c45eee53f30c03f4862d54c5e29a7d` == local HEAD; `git show --stat origin/main` contains exactly the 12 phase files |
-| Working tree | clean after push (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
+| Starting HEAD (corrective patch) | `e636921e08cd2e68ae6888e6f71b606da6a14b12` (== origin/main at start) |
+| Corrective commit | `fix: remove per-provider pool cap and Dummy from production fallback` — see git log for SHA |
+| Push result | recorded after push below |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` after push |
+| Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
 
 ---

@@ -291,7 +291,8 @@ async def test_provider_manager_emergency_fallback_never_fake_success():
 
     response = await pm.chat([{"role": "user", "content": "hi"}])
     assert response.success is False
-    assert response.provider_name == "dummy"
+    # Honest manager-built failure — no Dummy invocation anywhere.
+    assert response.provider_name == ""
     assert "quota exceeded" in response.text
     assert response.metadata.get("emergency") is True
     assert response.metadata.get("fallback_exhausted") is True

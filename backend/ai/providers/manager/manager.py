@@ -8,13 +8,13 @@ a ``ProviderResponse``. The manager:
 
   1. Gets the active provider from the registry.
   2. Validates it (health + enabled).
-  3. If unhealthy → uses the fallback provider.
+  3. If unhealthy → uses the next eligible REAL provider.
   4. Calls ``provider.chat()`` inside a guarded await.
   5. If the call crashes OR returns ``success=False`` (429/500/quota/
-     invalid request/...), the configured fallback chain is tried, then
-     the emergency fallback. The emergency fallback ALWAYS returns
-     ``success=False`` with the original failures preserved — never fake
-     success.
+     invalid request/...), every other eligible REAL candidate is tried.
+     Exhaustion returns an honest failure response built by the manager —
+     the Dummy provider is NEVER selected, never a terminal fallback, and
+     never a fake success.
   6. Records latency + success/failure in per-provider metrics.
 
 The manager also exposes:
@@ -63,9 +63,6 @@ from backend.runtime.operation_watchdog import guarded_await
 logger = logging.getLogger(__name__)
 
 _PROVIDER_RPC_TIMEOUT = 30.0
-# Hard ceiling on candidate models per provider so the model-level pool
-# keeps attempts bounded even when discovery returns dozens of models.
-_MODEL_CANDIDATE_LIMIT = 6
 _MAX_RETRIES = 1
 _RETRY_BACKOFF_SECONDS = 1.0
 # A rate limit is only worth waiting out when the provider's own Retry-After
@@ -99,7 +96,6 @@ class ProviderManager:
         )
         self._unavailable_models: dict[tuple[str, str], float] = {}
         self._model_candidates: dict[str, list[str]] = {}
-        self._ensure_dummy_fallback()
         self._load_env_fallback_chain()
 
     # ── Public API ──
@@ -126,12 +122,25 @@ class ProviderManager:
         """
         needs_tools = bool(kwargs.get("tools"))
         needs_json = bool(kwargs.get("response_format"))
-        provider_candidates = self._ordered_candidates(include_all=True)
+        # Dummy is never a production candidate — filter it out of the
+        # enumeration before ANY routing decision (even when a test/registry
+        # registers it or it is the active name).
+        provider_candidates = [
+            (n, p) for n, p in self._ordered_candidates(include_all=True)
+            if n != "dummy"
+        ]
 
-        # Terminal case: no real provider configured — return the dummy's
-        # own "not configured" response instead of a fallback synthesis.
-        if provider_candidates and provider_candidates[0][0] == "dummy":
-            return await self._call_once(provider_candidates[0][1], messages, kwargs)
+        # Terminal case: no real provider configured — the manager builds
+        # the honest "not configured" failure itself; Dummy is NEVER the
+        # production answer.
+        if not provider_candidates:
+            logger.warning("ProviderManager: no real provider configured")
+            return ProviderResponse(
+                text="AI is not configured. Set an API key for a supported provider to enable AI.",
+                provider_name="",
+                success=False,
+                metadata={"reason": "no_provider_configured"},
+            )
 
         first = provider_candidates[0][0] if provider_candidates else ""
         matrix: list[dict[str, Any]] = []
@@ -299,6 +308,13 @@ class ProviderManager:
     def vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
         """Send a vision request. Never raises."""
         provider = self._get_healthy_provider()
+        if provider is None:
+            return ProviderResponse(
+                text="All AI providers failed. Last error: no healthy vision provider",
+                provider_name="",
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
+            )
         provider_name = provider.name
         start = time.perf_counter()
         try:
@@ -313,19 +329,35 @@ class ProviderManager:
             return self._fallback_vision(messages, images, **kwargs)
 
     def stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[ProviderResponse]:
-        """Stream a chat response. Falls back to dummy on error."""
+        """Stream a chat response. Yields an honest failure on error."""
         provider = self._get_healthy_provider()
+        if provider is None:
+            yield ProviderResponse(
+                text="All AI providers failed. Last error: no healthy streaming provider",
+                provider_name="",
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
+            )
+            return
         try:
             yield from provider.stream(messages, **kwargs)
         except Exception as exc:
             logger.warning("ProviderManager: '%s' crashed during stream: %s", provider.name, exc)
             self._metrics.record(provider.name, latency=0.0, error=str(exc))
-            yield from self._fallback_stream(messages, **kwargs)
+            yield ProviderResponse(
+                text=f"All AI providers failed. Last error: {exc}",
+                provider_name="",
+                success=False,
+                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
+            )
 
     def count_tokens(self, text: str) -> int:
         """Estimate token count using the active provider. Never raises."""
+        provider = self._get_healthy_provider()
+        if provider is None:
+            return max(1, len(text) // 4)
         try:
-            return self._get_healthy_provider().count_tokens(text)
+            return provider.count_tokens(text)
         except Exception:
             return max(1, len(text) // 4)
 
@@ -528,15 +560,18 @@ class ProviderManager:
 
     # ── Internal ──
 
-    def _get_healthy_provider(self) -> BaseProvider:
-        """Return the first healthy, available provider (active → chain → fallback)."""
+    def _get_healthy_provider(self) -> BaseProvider | None:
+        """Return the first healthy, available REAL provider, else None.
+
+        Dummy is never returned — production routing has no Dummy fallback.
+        """
         for name, provider in self._ordered_candidates():
             if name == "dummy":
                 continue
             if self._health.is_available(name) and self._provider_healthy(provider):
                 return provider
-        logger.warning("ProviderManager: no healthy provider available — using emergency fallback")
-        return self._registry.get_fallback()
+        logger.warning("ProviderManager: no healthy real provider available")
+        return None
 
     # ── Routing helpers ──
 
@@ -545,8 +580,8 @@ class ProviderManager:
 
         The active provider is always included (obtained via
         ``registry.get_active()``, which is also the interface a mock registry
-        exposes). The dummy provider is never part of the fallback chain — it
-        is only reached as the terminal emergency fallback via ``_fallback()``.
+        exposes). Dummy is NEVER part of the production candidate set —
+        production routing has no Dummy fallback under any circumstance.
 
         When ``include_all`` is True, every other registered non-dummy
         provider is appended as an additional safety net so a mesh with a
@@ -555,7 +590,8 @@ class ProviderManager:
         candidates: list[tuple[str, BaseProvider]] = []
         active = self._registry.get_active()
         active_name = self._safe_provider_name(active)
-        candidates.append((active_name, active))
+        if active_name != "dummy":
+            candidates.append((active_name, active))
 
         for name in self._fallback_chain:
             if not name or name == "dummy" or any(c[0] == name for c in candidates):
@@ -695,12 +731,16 @@ class ProviderManager:
         logger.warning("PROVIDER_MODEL_UNAVAILABLE provider=%s model=%s", name, model)
 
     def _candidate_models(self, provider: BaseProvider) -> list[str]:
-        """Return the ordered model-level candidate list for one provider.
+        """Return the COMPLETE ordered model-level candidate list for a provider.
 
         First the provider's configured model (the user's selection, never
-        demoted), then discovery-fed candidate models in free-first order
-        (duplicates and the configured model removed). The whole pool is
-        deterministic: same discovery data → same candidate order.
+        demoted), then EVERY discovery-fed candidate model in free-first
+        order (duplicates and the configured model removed). There is
+        deliberately NO per-provider cap: candidate-pool completeness is the
+        router's input. Bounded EXECUTION is a separate, explicit policy
+        (one attempt per candidate, one immediate retry for transient
+        failures, request-level RPC timeout) — never a hidden truncation of
+        the pool before the fallback policy runs.
         """
         name = self._safe_provider_name(provider)
         configured = ""
@@ -718,8 +758,6 @@ class ProviderManager:
                 continue
             seen.add(mid)
             pool.append(mid)
-            if len(pool) >= _MODEL_CANDIDATE_LIMIT:
-                break
         return pool or [""]
 
     def set_model_candidates(self, provider_name: str, models: list[str]) -> None:
@@ -1038,32 +1076,23 @@ class ProviderManager:
         retries: int = 0,
         **kwargs: Any,
     ) -> ProviderResponse:
-        """Emergency fallback — always returns success=False with diagnostics.
+        """Terminal exhaustion — honest failure built by the manager.
 
-        Even though the dummy provider "succeeds" deterministically, a
-        fallback after real provider failures must NEVER look like a
-        successful AI answer. The original failure information (and the
-        provider failure matrix) is preserved.
+        NO provider (and never the Dummy provider) is invoked here: when
+        every real eligible candidate failed, the manager returns its own
+        ``success=False`` response with the preserved failure matrix,
+        per-candidate errors, and true retry count. Nothing is fabricated,
+        nothing is executed, nothing is persisted.
         """
-        fallback = self._registry.get_fallback()
         errors = list(failures or [])
         detail = "; ".join(errors) if errors else "no additional provider error information"
         task_trace(
             "provider_fallback_exhausted", providers_tried=len(errors),
             final_category="all_providers_failed", final_error=bound_text(detail, 240),
         )
-        try:
-            await guarded_await(
-                fallback.chat(messages, **kwargs),
-                name=f"provider:fallback:{fallback.name}",
-                timeout=_PROVIDER_RPC_TIMEOUT,
-            )
-        except Exception as exc:
-            logger.error("ProviderManager: FALLBACK CRASHED: %s", exc)
-            errors.append(f"fallback: {type(exc).__name__}: {exc}")
         return ProviderResponse(
             text=f"All AI providers failed. Last error: {detail}",
-            provider_name=fallback.name,
+            provider_name="",
             success=False,
             metadata={
                 "fallback": True,
@@ -1077,37 +1106,22 @@ class ProviderManager:
         )
 
     def _fallback_vision(self, messages: list[dict[str, Any]], images: list[bytes], **kwargs: Any) -> ProviderResponse:
-        fallback = self._registry.get_fallback()
-        try:
-            return fallback.vision(messages, images, **kwargs)
-        except Exception as exc:
-            logger.error("ProviderManager: FALLBACK VISION CRASHED: %s", exc)
-            return ProviderResponse(
-                text=f"All AI providers failed. Last error: {exc}",
-                provider_name=fallback.name,
-                success=False,
-                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
-            )
+        return ProviderResponse(
+            text="All AI providers failed. Last error: no healthy vision provider",
+            provider_name="",
+            success=False,
+            metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
+        )
 
     def _fallback_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Iterator[ProviderResponse]:
-        fallback = self._registry.get_fallback()
-        try:
-            yield from fallback.stream(messages, **kwargs)
-        except Exception as exc:
-            logger.error("ProviderManager: FALLBACK STREAM CRASHED: %s", exc)
-            yield ProviderResponse(
-                text=f"All AI providers failed. Last error: {exc}",
-                provider_name=fallback.name,
-                success=False,
-                metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
-            )
+        yield ProviderResponse(
+            text="All AI providers failed. Last error: no healthy streaming provider",
+            provider_name="",
+            success=False,
+            metadata={"fallback": True, "emergency": True, "fallback_exhausted": True},
+        )
 
-    def _ensure_dummy_fallback(self) -> None:
-        from backend.ai.providers.dummy.provider import DummyProvider
-        if not self._registry.has("dummy"):
-            dummy = DummyProvider()
-            self._registry.register(dummy)
-        self._registry.set_fallback("dummy")
+
 
     def _load_env_fallback_chain(self) -> None:
         import os

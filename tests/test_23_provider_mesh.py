@@ -21,6 +21,7 @@ import pytest
 from backend.ai.providers.base.capabilities import ProviderCapabilities
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.dummy.provider import DummyProvider
 from backend.ai.providers.manager.health import (
     ProviderHealthState,
     ProviderHealthTracker,
@@ -407,10 +408,75 @@ async def test_model_not_found_fails_over_without_retrying_dead_pair():
 
 
 @pytest.mark.asyncio
+class _CountingDummy(DummyProvider):
+    """Test-double Dummy with a call counter — proves Dummy is never
+    invoked by production routing even when it IS registered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat(self, messages, **kwargs):
+        self.calls += 1
+        return await super().chat(messages, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_dummy_never_invoked_even_when_registered_and_active():
+    """A Dummy provider registered in the registry (e.g. via the factory)
+    is NEVER selected by chat() — even when it is the ACTIVE provider and
+    even when a real provider is present to serve the request."""
+    from backend.ai.providers.dummy.provider import DummyProvider
+
+    dummy = _CountingDummy()
+    live = _StubProvider("live", [ProviderResponse(text="ok", provider_name="live", success=True)])
+
+    pm = ProviderManager()
+    pm.register_provider(dummy)
+    pm.register_provider(live)
+    # Dummy is active — the most hostile possible routing state.
+    pm.switch_provider("dummy")
+    pm._fallback_chain = ["live"]
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    # The real provider served the request; the registered+active Dummy
+    # was never contacted.
+    assert response.success is True
+    assert response.provider_name == "live"
+    assert dummy.calls == 0
+
+    # Dummy is never in the candidate enumeration either.
+    names = [n for n, _ in pm._ordered_candidates(include_all=True)]
+    assert "dummy" not in names
+    assert names[0] == "live"
+
+
+@pytest.mark.asyncio
+async def test_dummy_only_registry_returns_manager_built_not_configured():
+    """A manager whose registry holds ONLY Dummy returns the manager's own
+    honest 'not configured' failure — Dummy.chat is never invoked."""
+    from backend.ai.providers.dummy.provider import DummyProvider
+
+    dummy = _CountingDummy()
+    pm = ProviderManager()
+    pm.register_provider(dummy)
+    pm.switch_provider("dummy")
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert response.provider_name == ""
+    assert "not configured" in response.text
+    assert response.metadata.get("reason") == "no_provider_configured"
+    assert dummy.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_dummy_never_enters_production_candidate_pool():
-    """Dummy is the terminal emergency fallback ONLY: it is never part of
-    the eligible candidate pool (never appended after real candidates,
-    never tried when a real candidate fails, never inflates the pool)."""
+    """Dummy is never part of the eligible candidate pool (never appended
+    after real candidates, never tried when a real candidate fails, never
+    inflates the pool)."""
     dead = _StubProvider("dead", [
         _failure("server down", failure_type="server"),
         _failure("server down 2", failure_type="server"),
@@ -440,9 +506,9 @@ async def test_dummy_never_enters_production_candidate_pool():
 
 @pytest.mark.asyncio
 async def test_dummy_only_terminal_when_all_real_candidates_exhausted():
-    """Exhaustion returns the emergency failure — success=False, never a
-    fake successful answer from dummy, and dummy never inflates the count
-    of real candidates tried."""
+    """Exhaustion returns the manager-built honest failure — success=False,
+    provider_name empty (no provider produced it), matrix preserved, and a
+    registered Dummy is NEVER invoked even as a terminal."""
     a = _StubProvider("a", [_failure("down", failure_type="server"), _failure("down", failure_type="server")])
     b = _StubProvider("b", [_failure("down", failure_type="server"), _failure("down", failure_type="server")])
 
@@ -455,12 +521,98 @@ async def test_dummy_only_terminal_when_all_real_candidates_exhausted():
     response = await pm.chat([{"role": "user", "content": "hi"}])
 
     assert response.success is False
+    assert response.provider_name == ""
     assert (response.metadata or {}).get("emergency") is True
+    assert (response.metadata or {}).get("fallback_exhausted") is True
     assert "All AI providers failed" in response.text
-    # Both REAL candidates were tried; no dummy attempt pad the matrix.
+    # Both REAL candidates were tried; no dummy attempt pads the matrix.
     assert a.calls == 2 and b.calls == 2
     matrix = response.metadata.get("provider_matrix", [])
     assert all(entry.get("provider") != "dummy" for entry in matrix)
+    # Retry information preserved.
+    assert (response.metadata or {}).get("ai_retry_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_production_pool_not_truncated_to_six_models():
+    """A provider with TEN eligible models contributes ALL TEN to the
+    production pool — no six-model-per-provider truncation. Bounded
+    execution stays intact: each candidate attempted once (404s never
+    retried), the first valid model wins."""
+    flaky = _StubProvider("flaky", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="dead-model"),
+        ProviderResponse(text="ok", provider_name="flaky", success=True),
+    ])
+
+    pm = ProviderManager()
+    pm.register_provider(flaky)
+    pm.switch_provider("flaky")
+    pm.set_model_candidates("flaky", [f"candidate-{i}" for i in range(10)])
+
+    pool = pm._candidate_models(flaky)
+    # The COMPLETE discovery-fed pool enters the router: all ten candidates
+    # (the stub has no configured default model) — the old hidden cap would
+    # stop at six.
+    assert len(pool) == 10
+    assert pool == [f"candidate-{i}" for i in range(10)]
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+    assert response.success is True
+    assert response.provider_name == "flaky"
+    # Bounded execution preserved: dead model once (no retry), live model once.
+    assert flaky.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_multiple_providers_contribute_complete_model_sets():
+    """Every eligible real provider contributes its COMPLETE model set to
+    the pool; ordering stays deterministic (active provider first, then
+    provider order), and a dead provider's models fail over to the next
+    provider's models at MODEL level."""
+    dead = _StubProvider("dead", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="d0"),
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="d1"),
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="d2"),
+    ])
+    live = _StubProvider("live", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="l0"),
+        ProviderResponse(text="ok", provider_name="live", success=True),
+    ])
+
+    pm = ProviderManager()
+    pm.register_provider(dead)
+    pm.register_provider(live)
+    pm.switch_provider("dead")
+    pm.set_model_candidates("dead", [f"d{i}" for i in range(3)])
+    pm.set_model_candidates("live", [f"l{i}" for i in range(3)])
+
+    # Both providers contribute their FULL model sets — 6 candidates total
+    # (stubs carry no configured default model).
+    assert len(pm._candidate_models(dead)) == 3
+    assert len(pm._candidate_models(live)) == 3
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+    assert response.success is True
+    assert response.provider_name == "live"
+    assert response.metadata.get("requested_model") == "l1"
+    assert dead.calls == 3
+    assert live.calls == 2
+    # Deterministic order observable in the matrix.
+    matrix = response.metadata.get("provider_matrix", [])
+    assert [m["model"] for m in matrix if m.get("outcome") != "success"] == ["d0", "d1", "d2", "l0"]
+
+
+def test_active_configured_model_stays_first_in_complete_pool():
+    """With the pool uncapped, the active provider's configured model still
+    leads the candidate order."""
+    p = _StubProvider("p")
+    p._config = ProviderConfig(provider_name="p", enabled=True, default_model="cfg-model")
+
+    pm = ProviderManager()
+    pm.set_model_candidates("p", [f"m{i}" for i in range(12)])
+    pool = pm._candidate_models(p)
+    assert pool[0] == "cfg-model"
+    assert len(pool) == 13
 
 
 def test_unicode_progress_and_status_marks_only():
@@ -791,11 +943,10 @@ async def test_model_pool_marks_dead_models_unavailable():
     assert second.calls == 1
 
 
-def test_candidate_models_order_and_bounds():
-    """Configured model first, discovery models after (dedup, empty dropped),
-    bounded by the candidate limit."""
-    from backend.ai.providers.manager.manager import _MODEL_CANDIDATE_LIMIT
-
+def test_candidate_models_complete_and_ordered():
+    """Configured model first, then EVERY discovery model (dedup, empty
+    dropped) — NO per-provider cap: pool completeness is the router's
+    input; bounded execution is a separate explicit policy."""
     p = _StubProvider("p")
     p._config = ProviderConfig(provider_name="p", enabled=True, default_model="cfg-model")
 
@@ -805,10 +956,13 @@ def test_candidate_models_order_and_bounds():
     pool = pm._candidate_models(p)
     assert pool == ["cfg-model", "free-1", "free-2"]
 
-    pm.set_model_candidates("p", [f"m{i}" for i in range(_MODEL_CANDIDATE_LIMIT + 5)])
+    # A provider whose discovery surfaces 40 models contributes ALL of
+    # them — the old hidden 6-model cap would have truncated here.
+    pm.set_model_candidates("p", [f"m{i}" for i in range(40)])
     pool = pm._candidate_models(p)
-    assert len(pool) == _MODEL_CANDIDATE_LIMIT
+    assert len(pool) == 41
     assert pool[0] == "cfg-model"
+    assert pool[-1] == "m39"
 
     pm.set_model_candidates("p", [])
     assert pm._candidate_models(p) == ["cfg-model"]
