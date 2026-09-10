@@ -213,8 +213,9 @@ persisted task payload shape is unchanged.
 | Item | Value |
 |---|---|
 | Starting HEAD | `dfeebf4643ef4b1724d82b58bf34c7bc7d7e1ba9` (== origin/main at start) |
-| Change commit | _pending_ |
+| Change commit | `772390709061a84d8b8a585ff4fe488dd6039a16` — `fix: persist scheduled bio updates as the bio tool and de-emoji the AI panel` (8 files) |
+| Push result | `dfeebf4..7723907  main -> main` (exit 0) |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `772390709061a84d8b8a585ff4fe488dd6039a16` == local HEAD; `git show --stat origin/main` lists exactly the 8 phase files |
 | Report commit | _pending_ |
-| Remote HEAD verification | _pending_ |
 | Working tree | pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched |
 | Live Telegram verification | **NOT performed** (no credentials in this workspace) |
