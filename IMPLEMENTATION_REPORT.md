@@ -176,7 +176,7 @@ malformed first response** (verbatim `ai_instruction`, `آیانامی ری` and
 | Base commit | `3ff880a` (== origin/main at phase start) |
 | Implementation commit | `542f85d` |
 | Report commit | follows the implementation commit |
-| Push result | `3ff880a..b290f8f main -> main` |
+| Push result | `3ff880a..5d67739 main -> main` |
 | Remote HEAD | verified == local HEAD after push (see below) |
 | Working tree | clean except pre-existing untracked `telegram-self-bot/` |
 
