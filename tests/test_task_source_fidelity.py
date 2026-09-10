@@ -616,3 +616,142 @@ async def test_retry_within_window_cannot_bypass_guardian(_guardian_env):
             owner_id=9, session_id="s", context_override=ctx,
         )
         assert results[0].success is False
+
+
+# ═════════════ Part C — bio action fidelity at the creation boundary ═════════
+# THE live failure class: a scheduled BIO update request was persisted with the
+# generic message-write action (send_message), so every occurrence sent a chat
+# message instead of updating the bio. Semantic interpretation stays the source
+# of the action; the deterministic creation gate repairs ONLY a request that
+# explicitly names the bio AND asks to change it.
+
+PERSIAN_BIO_REQUEST = "هر ۵ دقیقه بیو پروفایلم رو آپدیت کن"
+ENGLISH_BIO_REQUEST = "every 5 minutes update my bio with a new random quote"
+PLAIN_SEND_REQUEST = "هر 5 دقیقه بنویس سلام"
+
+
+def _message_action_candidate(text: str = "میو", ai_instruction: str | None = None) -> str:
+    import json as _json
+    payload: dict = {
+        "label": "Bio",
+        "schedule_type": "interval",
+        "schedule": {"seconds": 300},
+        "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": text}}],
+        "notification_destination": {},
+    }
+    if ai_instruction is not None:
+        payload["ai_instruction"] = ai_instruction
+    return _json.dumps(payload, ensure_ascii=False)
+
+
+async def _create_task(provider_text: str, request: str, deterministic: dict | None = None):
+    from backend.ai.database import manager as dbm
+    from backend.ai.tools.task import CreateTaskTool
+
+    pm, provider = _provider_manager_with(provider_text)
+    manager = dbm.RepositoryManager(supabase_available=False)
+    ctx = _create_context(pm)
+    if deterministic is not None:
+        ctx.extra["deterministic_task_candidate"] = deterministic
+    with patch.object(dbm, "get_repository_manager", return_value=manager):
+        result = await CreateTaskTool(ctx).execute(ctx, {"request": request})
+    return result, provider, manager
+
+
+@pytest.mark.asyncio
+async def test_persian_bio_update_misclassified_as_message_persists_bio_tool():
+    """A clear Persian bio-update request whose candidate came back as
+    send_message must persist the canonical registered bio tool."""
+    result, _provider, manager = await _create_task(
+        _message_action_candidate(), PERSIAN_BIO_REQUEST,
+    )
+    assert result.success is True, result.message
+    task = (await manager.task.list_tasks(777))[0]
+    assert task.actions == [
+        {"name": "bio_set_text", "arguments": {"text": "میو"}}
+    ], "a bio update must never persist as send_message"
+
+
+@pytest.mark.asyncio
+async def test_english_bio_update_misclassified_as_message_persists_bio_tool():
+    result, _provider, manager = await _create_task(
+        _message_action_candidate("hello"), ENGLISH_BIO_REQUEST,
+    )
+    assert result.success is True, result.message
+    task = (await manager.task.list_tasks(777))[0]
+    assert [a["name"] for a in task.actions] == ["bio_set_text"]
+
+
+@pytest.mark.asyncio
+async def test_plain_message_task_still_persists_send_message():
+    """A request that genuinely asks to send a chat message is untouched."""
+    result, _provider, manager = await _create_task(
+        _message_action_candidate("سلام"), PLAIN_SEND_REQUEST,
+    )
+    assert result.success is True, result.message
+    task = (await manager.task.list_tasks(777))[0]
+    assert task.actions == [
+        {"name": "send_message", "arguments": {"text": "سلام"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bio_request_keeps_verbatim_ai_instruction_when_action_repaired():
+    """Repairing the tool name must not weaken the AI-generated-content
+    contract: the verbatim request still becomes the ai_instruction."""
+    paraphrased = _message_action_candidate("Ayumi: hi", "change my bio to anime quotes")
+    result, _provider, manager = await _create_task(paraphrased, PERSIAN_TASK)
+    assert result.success is True, result.message
+    task = (await manager.task.list_tasks(777))[0]
+    assert task.ai_instruction == PERSIAN_TASK
+    assert [a["name"] for a in task.actions] == ["bio_set_text"]
+
+
+@pytest.mark.asyncio
+async def test_deterministic_message_write_candidate_for_bio_request_is_repaired():
+    """The deterministic interval+write shortcut only ever builds send_message;
+    for a bio request that candidate must be repaired, with no provider call."""
+    deterministic = {
+        "label": "میو",
+        "schedule_type": "interval",
+        "schedule": {"seconds": 300},
+        "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": "میو"}}],
+        "notification_destination": {},
+    }
+    result, provider, manager = await _create_task(
+        "null", "هر 5 دقیقه توی بیو بنویس میو", deterministic=deterministic,
+    )
+    assert result.success is True, result.message
+    assert provider.calls == 0, "deterministic candidate must not hit a provider"
+    task = (await manager.task.list_tasks(777))[0]
+    assert task.actions == [
+        {"name": "bio_set_text", "arguments": {"text": "میو"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bio_occurrence_executes_bio_tool_not_message_tool():
+    """The resulting scheduled occurrence reaches the bio tool through the
+    existing TaskExecutionCoordinator -> ToolExecutor path, and never the
+    message tool."""
+    repo = InMemoryTaskRepository()
+    task = await repo.create_task(1, ai_task_data(
+        actions=[{"name": "bio_set_text", "arguments": {"text": "میو"}}],
+        ai_instruction=None,
+    ))
+    calls: list = []
+    registry = ToolRegistry()
+    registry.register(FakeTool("bio_set_text", calls))
+    registry.register(FakeTool("send_message", calls))
+    ctx = ToolContext(None, 1, "UTC")
+    coordinator = TaskExecutionCoordinator(repo, ToolExecutor(registry, ctx), 1, ctx)
+    occurrence = await make_claimed_occurrence(repo, task)
+    repo._occurrences[(task.id, occurrence.occurrence_key)].status = "running"
+
+    result = await coordinator.execute(
+        await repo.get_occurrence(1, task.id, occurrence.occurrence_key)
+    )
+    assert result.success is True
+    assert calls == [("bio_set_text", {"text": "میو"}, 1)]

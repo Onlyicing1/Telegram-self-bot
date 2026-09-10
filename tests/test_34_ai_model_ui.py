@@ -174,7 +174,7 @@ async def test_two_column_selector_renders_pinned_grid_within_callback_limit():
          patch("backend.ai.model_discovery.get_base_url_for_provider", return_value="https://x"):
         title, body, buttons = await ai_module._ai_model_panel_handler(None, "")
 
-    assert title == "🤖 Model"
+    assert title == "◇ Model"
     assert "Free" in body
     rows = _flatten_buttons(buttons)
     grid_rows = [
@@ -245,7 +245,7 @@ async def test_pick_idx_action_rerenders_on_stale_hash():
         title, body, buttons = await ai_module._ai_model_pick_idx_action(None, "0:1:deadbeef", 0)
 
     # A stale index/hash must re-render the panel, never select blindly.
-    assert title == "🤖 Model"
+    assert title == "◇ Model"
     assert body  # panel content present
 
 

@@ -673,6 +673,52 @@ def test_unicode_progress_and_status_marks_only():
 
 
 @pytest.mark.asyncio
+async def test_ai_and_test_modules_panels_use_no_colorful_emoji():
+    """The AI / Test Modules panel family renders plain Unicode only — panel
+    titles, bodies, and every button label, including the provider panel
+    (whose catalog metadata still legitimately carries emoji icons)."""
+    from unittest.mock import AsyncMock, patch
+
+    from backend.ai.discovery import ProviderStatus
+    from backend.bot.handlers import ai as ai_module
+
+    forbidden = "🧪🟢✅⚠️🔄🤖🔍🔎💳🚫🔵🟡🟠🔴⚪❓⚡🧠💬🧵📈🩺📖🔧❤️⬅🏠🔁"
+
+    def _labels(buttons) -> list[str]:
+        return [str(getattr(btn, "text", "")) for row in buttons for btn in row]
+
+    def _sweep(title: str, body: str, buttons) -> None:
+        assert not any(ch in forbidden for ch in title + body), title + body
+        labels = _labels(buttons)
+        assert not any(any(ch in label for ch in forbidden) for label in labels), labels
+
+    with patch.object(ai_module, "_get_owner_id", AsyncMock(return_value=1)), \
+         patch.object(ai_module, "_get_saved_config", AsyncMock(return_value={"provider": "", "model": ""})):
+        title, body, buttons = await ai_module._ai_main_panel_handler(None, "")
+    _sweep(title, body, buttons)
+    assert "Test Modules" in _labels(buttons)
+
+    provider = ProviderStatus(
+        name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY",
+        status="available", has_key=True, validated=True, default_model="gpt-4o",
+        base_url="https://api.openai.com/v1", icon="🧠",
+    )
+    with patch.object(ai_module, "_get_owner_id", AsyncMock(return_value=1)), \
+         patch.object(ai_module, "_get_saved_config", AsyncMock(return_value={"provider": "openai", "model": "gpt-4o"})), \
+         patch.object(ai_module, "_discover", AsyncMock(return_value=[provider])):
+        title, body, buttons = await ai_module._ai_provider_panel_handler(None, "")
+    _sweep(title, body, buttons)
+
+    with patch.object(ai_module, "_get_owner_id", AsyncMock(return_value=1)), \
+         patch.object(ai_module, "_get_saved_config", AsyncMock(return_value={"provider": "", "model": ""})), \
+         patch.object(ai_module, "_save_config", AsyncMock(return_value=True)), \
+         patch.object(ai_module, "_apply_runtime_selection"), \
+         patch("backend.ai.discovery.get_provider_info", return_value={"name": "openai"}):
+        title, body, buttons = await ai_module._ai_pick_model_action(None, "openai:gpt-4o", 0)
+    _sweep(title, body, buttons)
+
+
+@pytest.mark.asyncio
 async def test_empty_response_fails_over_to_next_provider():
     empty = _StubProvider("empty", [
         ProviderResponse(text="", provider_name="empty", success=True),

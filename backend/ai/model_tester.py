@@ -467,7 +467,7 @@ async def test_all_models(
     tested_at = datetime.now(timezone.utc).isoformat()
 
     for idx, task in enumerate(tasks):
-        target_info = targets[idx] if idx < len(targets) else {"provider": "unknown", "display_name": "Unknown", "icon": "❓", "model": "unknown"}
+        target_info = targets[idx] if idx < len(targets) else {"provider": "unknown", "display_name": "Unknown", "icon": "◈", "model": "unknown"}
         if task in pending:
             results.append({
                 "provider": target_info["provider"],
@@ -692,7 +692,7 @@ async def test_all_models_streaming(
     results: list[dict[str, Any]] = []
     for idx, task in enumerate(tasks):
         target_info = targets[idx] if idx < len(targets) else {
-            "provider": "unknown", "display_name": "Unknown", "icon": "❓", "model": "unknown",
+            "provider": "unknown", "display_name": "Unknown", "icon": "◈", "model": "unknown",
         }
         if task in pending:
             results.append(await _note({

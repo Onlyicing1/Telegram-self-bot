@@ -142,7 +142,7 @@ async def test_ai_pick_model_selects_persists_and_applies():
 
         title, body, buttons = await ai_module._ai_pick_model_action(None, "groq:llama-3.3-70b-versatile", 0)
 
-    assert title == "🧠 AI"
+    assert title == "◉ AI"
     assert "Model selected" in body
     assert saved["provider"] == "groq"
     assert saved["model"] == "llama-3.3-70b-versatile"

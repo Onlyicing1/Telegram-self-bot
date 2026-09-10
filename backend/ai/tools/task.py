@@ -430,6 +430,38 @@ class CreateTaskTool(Tool):
                     length_constrained=policy.max_length is not None or policy.exact_length is not None,
                 )
 
+        # Deterministic profile-fidelity gate: a request that explicitly asks
+        # to change the Telegram bio must persist the canonical REGISTERED bio
+        # tool, never the message-write action the semantic layer misclassified
+        # (live: a scheduled bio update persisted as send_message). The
+        # semantic interpreter stays the source of the action — this only
+        # repairs the known message-write misclassification, and only for a
+        # request that both names the bio and asks to change it. A request that
+        # genuinely sends a message is untouched.
+        if isinstance(candidate, dict):
+            from backend.ai.actions import (
+                _has_bio_change_intent,
+                _has_bio_mention,
+                _tokenize,
+                _write_text_present,
+            )
+            words = _tokenize(request)
+            if words and _has_bio_mention(words) and (
+                _has_bio_change_intent(words) or _write_text_present(words)
+            ):
+                actions = candidate.get("actions")
+                repaired = 0
+                if isinstance(actions, list):
+                    for action in actions:
+                        if isinstance(action, dict) and action.get("name") == "send_message":
+                            action["name"] = "bio_set_text"
+                            repaired += 1
+                if repaired:
+                    _trace(
+                        "create_task_bio_action_gate", applied=True,
+                        action="bio_set_text", repaired=repaired,
+                    )
+
         _trace(
             "create_task_normalized", schedule_type=candidate.get("schedule_type"),
             action_count=len(candidate.get("actions") or []),
