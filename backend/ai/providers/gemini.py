@@ -101,6 +101,11 @@ class GeminiProvider(BaseProvider):
                 "maxOutputTokens": kwargs.get("max_tokens", self._config.max_tokens),
             },
         }
+        # Structured output: Gemini's JSON-MIME mode constrains generation to
+        # valid JSON (no code fences, no prose). Serialized only when the
+        # caller requests it and the capability is declared.
+        if kwargs.get("response_format") and self.capabilities.supports_json:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 

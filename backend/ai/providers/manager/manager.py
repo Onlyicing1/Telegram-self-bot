@@ -116,6 +116,7 @@ class ProviderManager:
         retried forever.
         """
         needs_tools = bool(kwargs.get("tools"))
+        needs_json = bool(kwargs.get("response_format"))
         candidates = self._ordered_candidates(include_all=True)
 
         # Terminal case: no real provider configured — return the dummy's
@@ -135,7 +136,7 @@ class ProviderManager:
         for name, provider in candidates:
             if name == "dummy":
                 continue
-            skip = self._skip_reason(name, provider, needs_tools)
+            skip = self._skip_reason(name, provider, needs_tools, needs_json)
             if skip:
                 matrix.append({"provider": name, "outcome": "skipped", "reason": skip})
                 logger.info("PROVIDER_SKIPPED provider=%s reason=%s", name, skip)
@@ -146,8 +147,22 @@ class ProviderManager:
 
         # The active provider is the user's explicit choice — keep it first
         # when eligible; the rest are ordered by score (capability ×
-        # reliability × availability × latency). Deterministic and stable.
-        eligible.sort(key=lambda item: (item[1] != first, -item[0]))
+        # reliability × availability × latency). When JSON output is
+        # required, providers that DO declare the capability sort before
+        # ones that do not (within each group the previous order holds).
+        eligible.sort(
+            key=lambda item: (
+                # Capability-aware routing: when JSON output is required,
+                # providers that DECLARE the capability outrank ones that
+                # do not (a structured task must not be served first by a
+                # provider known to lack the contract). Within each group
+                # the previous order holds: active provider first, then
+                # by score.
+                bool(needs_json and not self._supports_json_output(item[2])),
+                item[1] != first,
+                -item[0],
+            )
+        )
 
         for idx, (score, name, provider) in enumerate(eligible):
             model = self._effective_model(provider) or "-"
@@ -168,8 +183,35 @@ class ProviderManager:
                 # quality metrics; a single provider keeps the dispatcher's
                 # own bounded nudge-retry as its recovery path.
                 no_output = self._has_no_usable_output(response)
-                if no_output and idx + 1 < len(eligible):
-                    category = "STRUCTURED_OUTPUT" if (response.tool_calls or []) else "EMPTY_RESPONSE"
+                # Structured-output contract failure: the caller may attach
+                # a validator (e.g. "the text must parse as a task-candidate
+                # JSON object"). A transport-success response whose content
+                # VIOLATES the requested structured contract is the provider
+                # model's fault — the same failover treatment as no_output,
+                # gated identically (bounded, no cooldown, only when another
+                # eligible candidate remains). The validator is called with
+                # a copy of the text; it must be deterministic and content-
+                # free from the manager's perspective.
+                validator = kwargs.get("output_validator")
+                contract_violation = False
+                if validator is not None and not no_output:
+                    try:
+                        contract_violation = not bool(validator(response))
+                    except Exception:
+                        # A crashing validator must never turn a valid
+                        # response into a provider failure.
+                        contract_violation = False
+                if (no_output or contract_violation) and idx + 1 < len(eligible):
+                    category = (
+                        "STRUCTURED_OUTPUT" if (response.tool_calls or [])
+                        else "MALFORMED_JSON" if contract_violation
+                        else "EMPTY_RESPONSE"
+                    )
+                    if contract_violation:
+                        # Same quality feedback as the empty-output path: a
+                        # model that returns non-JSON for a structured request
+                        # is penalized in the router score (never cooled down).
+                        self._metrics.record_quality(name, False)
                     matrix.append({"provider": name, "outcome": category.lower(), "score": round(score, 3)})
                     logger.info(
                         "AI_PROVIDER_FAILURE provider=%s model=%s category=%s failover=1",
@@ -178,9 +220,15 @@ class ProviderManager:
                     task_trace(
                         "provider_fallback", failed_provider=name, failure_category=category.lower(),
                         next_provider=eligible[idx + 1][1] if idx + 1 < len(eligible) else "-",
-                        reason="empty_response", attempt=idx + 1,
+                        reason="structured_output_contract" if contract_violation else "empty_response",
+                        attempt=idx + 1,
                     )
                     continue
+                # Last candidate: the response is returned unchanged and the
+                # CALLER owns the final classification (the interpreter's
+                # fail-closed parser reports the precise category and can
+                # never admit unparseable content — no fabricated candidate
+                # can reach task creation/persistence).
                 matrix.append({"provider": name, "outcome": "success", "score": round(score, 3)})
                 if name != first:
                     meta = dict(response.metadata or {})
@@ -521,8 +569,17 @@ class ProviderManager:
         except Exception:
             return "chat"
 
-    def _skip_reason(self, name: str, provider: BaseProvider, needs_tools: bool) -> str:
-        """Return a skip reason when a provider is not eligible, else ""."""
+    def _skip_reason(
+        self, name: str, provider: BaseProvider, needs_tools: bool, needs_json: bool = False,
+    ) -> str:
+        """Return a skip reason when a provider is not eligible, else "".
+
+        ``needs_json`` is soft-capability routing: providers that do not
+        declare ``supports_json`` are demoted (tried only after capable
+        ones), never hard-skipped — a JSON-mode field omitted from the
+        request still yields ordinary prose output that the caller's own
+        validation accepts or rejects downstream.
+        """
         if self._capability_kind(provider) != "chat":
             # Retrieval capabilities (e.g. web search) are never candidates
             # for chat routing regardless of health or selection state.
@@ -537,6 +594,14 @@ class ProviderManager:
         if needs_tools and not self._supports_tools(provider):
             return "capability=no_tool_calls"
         return ""
+
+    @staticmethod
+    def _supports_json_output(provider: BaseProvider) -> bool:
+        """True when the provider declares structured/JSON output support."""
+        try:
+            return bool(provider.capabilities.supports_json)
+        except Exception:
+            return False
 
     @staticmethod
     def _supports_tools(provider: BaseProvider) -> bool:

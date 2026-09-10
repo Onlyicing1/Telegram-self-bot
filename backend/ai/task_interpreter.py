@@ -304,8 +304,54 @@ def _load_candidate_json(raw: str) -> Any:
 class TaskInterpreter:
     """Uses only ProviderManager.chat and returns validated candidate data."""
 
+    # Structured-output request: providers that declare the capability
+    # receive ``response_format`` (OpenAI-compat JSON mode / Gemini JSON
+    # MIME) so the model is constrained to emit valid JSON. Malformed
+    # output from a provider that was asked AND claimed the capability is
+    # the provider contract's failure — reported to the manager through the
+    # ``output_validator`` probe so routing can fail over to another
+    # eligible provider (bounded, no cooldown) instead of ending the
+    # request at the first non-compliant model.
+    _RESPONSE_FORMAT = {"type": "json_object"}
+
     def __init__(self, provider_manager: Any) -> None:
         self._providers = provider_manager
+
+    @staticmethod
+    def _valid_structured_output(response: ProviderResponse) -> bool:
+        """Content-free probe: does this response parse as JSON at all?
+
+        Deliberately LOOSE — it only reports whether the model's output
+        satisfies the structured-output CONTRACT (a parseable JSON value).
+        It never validates task-candidate semantics; that remains the
+        interpreter's own full validation, and a JSON that parses but fails
+        the candidate schema is NOT a provider-contract failure (the model
+        answered coherently — the interpretation is at fault). The manager
+        uses this result only to decide bounded failover BEFORE any
+        task/persistence/Telegram side effect.
+        """
+        text = getattr(response, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            return False
+        try:
+            json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            # Known contract-permitted wrappers: fenced block and
+            # prose-wrapped object — the same tolerances the interpreter's
+            # own parser accepts. (Double-encoded JSON needs no special
+            # case: it parses as a JSON string on the happy path above.)
+            # Anything looser is NOT added here: the probe must never become
+            # a repair layer.
+            if "```" in text:
+                match = _JSON_BLOCK_RE.search(text)
+                if match:
+                    try:
+                        json.loads(match.group(1), strict=False)
+                        return True
+                    except json.JSONDecodeError:
+                        return False
+            return _outer_object_span(text) is not None
+        return True
 
     async def interpret(self, request: str, timezone: str = "", request_id: str = "") -> TaskCandidate:
         started = time.perf_counter()
@@ -463,7 +509,13 @@ class TaskInterpreter:
         ]
         try:
             response: ProviderResponse = await asyncio.wait_for(
-                self._providers.chat(messages, tools=[]), timeout=INTERPRET_TIMEOUT_SECONDS
+                self._providers.chat(
+                    messages,
+                    tools=[],
+                    response_format=self._RESPONSE_FORMAT,
+                    output_validator=self._valid_structured_output,
+                ),
+                timeout=INTERPRET_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             raise

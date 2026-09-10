@@ -85,6 +85,15 @@ class OpenAICompatProvider(BaseProvider):
         }
         if "top_p" in kwargs:
             payload["top_p"] = kwargs["top_p"]
+        # Structured output (JSON mode): when a caller requests it and the
+        # provider declares the capability, serialize OpenAI-compatible
+        # ``response_format`` into the request. A provider without the
+        # capability is sent WITHOUT the field — a request it may reject —
+        # and capability-aware routing (``_skip_reason``) prefers providers
+        # that can honor the contract.
+        response_format = kwargs.get("response_format")
+        if response_format and self.capabilities.supports_json:
+            payload["response_format"] = response_format
         tools = kwargs.get("tools")
         if tools:
             payload["tools"] = tools

@@ -53,7 +53,7 @@ class _Provider:
         self.response_text = response_text
         self.last_messages = None
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, **kwargs):
         from backend.ai.providers.base.contract import ProviderResponse
 
         self.last_messages = messages
@@ -408,7 +408,7 @@ async def test_json_diagnostics_log_parser_metadata_without_content(caplog):
     truncated_raw = _good_candidate_json()[:-40]
 
     class _MetaProvider:
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, **kwargs):
             return ProviderResponse(
                 text=truncated_raw, provider_name="stub", success=True,
                 metadata={"finish_reason": "MAX_TOKENS"},
@@ -444,7 +444,7 @@ async def test_finish_reason_truncation_classifies_even_when_json_parses(caplog)
     partial = partial[: partial.rfind("}")] + "}"  # structurally valid, semantically cut
 
     class _CutProvider:
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, **kwargs):
             return ProviderResponse(
                 text=partial, provider_name="stub", success=True,
                 metadata={"finish_reason": "length"},
@@ -476,7 +476,7 @@ def _meta_provider(text: str):
     from backend.ai.providers.base.contract import ProviderResponse
 
     class _MetaProvider:
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, **kwargs):
             return ProviderResponse(
                 text=text, provider_name="stub", success=True,
                 metadata={"model": "stub-model", "finish_reason": "stop"},
@@ -620,7 +620,7 @@ async def test_missing_optional_metadata_does_not_crash_instrumentation(caplog):
     from backend.ai.providers.base.contract import ProviderResponse
 
     class _BareProvider:
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, **kwargs):
             return ProviderResponse(
                 text=_good_candidate_json(), provider_name="bare", success=True,
             )  # metadata defaults to {}
