@@ -227,9 +227,9 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 | Item | Value |
 |---|---|
 | Starting HEAD (corrective patch) | `e636921e08cd2e68ae6888e6f71b606da6a14b12` (== origin/main at start) |
-| Corrective commit | `fix: remove per-provider pool cap and Dummy from production fallback` — see git log for SHA |
-| Push result | recorded after push below |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` after push |
+| Corrective commit | `9ab8beecad109744a8eed349dc8bd1cd62906151` — `fix: remove per-provider pool cap and Dummy from production fallback` (9 files, 327+/137−) |
+| Push result | `e636921..9ab8bee  main -> main` (exit 0) |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `9ab8beecad109744a8eed349dc8bd1cd62906151` == local HEAD; `git show --stat origin/main` contains exactly the 9 corrective files |
 | Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
 
 ---
