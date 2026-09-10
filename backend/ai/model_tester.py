@@ -58,7 +58,9 @@ _SECRET_PATTERNS = [
 _GLOBAL_TEST_BUDGET = int(os.getenv("MODEL_TEST_GLOBAL_TEST_BUDGET", "60"))
 # Bounded concurrency: never spawn an unbounded task explosion.
 _TEST_CONCURRENCY = int(os.getenv("MODEL_TEST_CONCURRENCY", "4"))
-# Cap on discovered models included in the response payload (per provider).
+# Cap on discovered models included in the RESPONSE PAYLOAD (per provider).
+# Display/diagnostic metadata ONLY — it must NEVER bound the production
+# candidate feed, which uses the complete discovery result separately.
 _MODELS_IN_RESPONSE = 30
 
 
@@ -296,20 +298,24 @@ async def _build_targets(
     active_config: dict[str, Any],
     max_per_provider: int | None = None,
     global_budget: int | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, list[Any]]]:
     """Select models to test per provider (discovery-driven).
 
-    Returns ``(targets, discovered_models)`` where ``targets`` is the
-    flat list of (provider, display_name, icon, model) to test and
-    ``discovered_models`` is the capped model list for the response.
+    Returns ``(targets, discovered_models, complete_models)`` where:
+      - ``targets`` is the flat list of (provider, display_name, icon,
+        model) to test (bounded by the explicit global diagnostic budget)
+      - ``discovered_models`` is the CAPPED model list for the response
+        payload (``_MODELS_IN_RESPONSE`` per provider — display only)
+      - ``complete_models`` is the COMPLETE chat-capable ModelInfo list per
+        provider — the production candidate feed. A display cap must never
+        determine which models production fallback is allowed to see.
 
-    There is deliberately NO per-provider cap: every chat-capable candidate
-    is eligible. The ONLY truncation is the explicit global diagnostic
-    budget (``global_budget``), applied ONCE to the flat target list — and
-    fairly: every provider's configured/default model is kept first, the
-    remainder is distributed round-robin across providers in discovery
-    order, so one large catalog can never push a later provider out of a
-    complete run. Priority per provider:
+    There is deliberately NO per-provider test cap: every chat-capable
+    candidate is eligible. The ONLY truncation of the TEST target list is
+    the explicit global diagnostic budget (``global_budget``), applied
+    ONCE to the flat list — fairly: every provider's configured/default
+    model is kept first, the remainder is distributed round-robin across
+    providers in discovery order. Priority per provider:
       1. the user's currently selected model (when this provider is active)
       2. the provider's default model
       3. discovered chat-capable models (deduped)
@@ -318,6 +324,7 @@ async def _build_targets(
     """
     targets: list[dict[str, str]] = []
     discovered_models: list[dict[str, Any]] = []
+    complete_models: dict[str, list[Any]] = {}
 
     for p in providers_status:
         if p.capability_kind != "chat":
@@ -340,8 +347,20 @@ async def _build_targets(
                 logger.warning("Model discovery failed for %s: %s", p.name, exc)
                 models = []
 
+        # COMPLETE production feed: every chat-capable model from this
+        # discovery result, uncapped and deduped — never sliced by the
+        # display limit below.
+        full: list[Any] = []
+        seen_full: set[str] = set()
+        for m in models:
+            if m.id in seen_full or not is_chat_capable(m.id):
+                continue
+            seen_full.add(m.id)
+            full.append(m)
+        complete_models[p.name] = full
+
         for m in models[: _MODELS_IN_RESPONSE]:
-            # Response model list must contain only chat-capable models.
+            # Response payload list must contain only chat-capable models.
             if is_chat_capable(m.id):
                 discovered_models.append(m.__dict__)
 
@@ -396,7 +415,7 @@ async def _build_targets(
                 break
             idx += 1
         targets = fair[:budget]
-    return targets, discovered_models
+    return targets, discovered_models, complete_models
 
 
 async def _run_test_with_semaphore(
@@ -430,7 +449,7 @@ async def test_all_models(
     providers_status = await discover_providers(force_refresh=True)
     active_config = await get_config(owner_id)
 
-    targets, discovered_models = await _build_targets(
+    targets, discovered_models, _complete = await _build_targets(
         providers_status, active_config, global_budget=global_budget,
     )
 
@@ -583,7 +602,7 @@ async def test_all_models_streaming(
     providers_status = await discover_providers(force_refresh=True)
     active_config = await get_config(owner_id)
 
-    targets, discovered_models = await _build_targets(
+    targets, discovered_models, complete_models = await _build_targets(
         providers_status, active_config, global_budget=global_budget,
     )
 
@@ -594,18 +613,16 @@ async def test_all_models_streaming(
     # diagnostics UI and the production router — no second discovery system.
     try:
         from backend.ai.engine.engine import get_engine
-        from backend.ai.model_discovery import ModelInfo, order_models_for_selector
+        from backend.ai.model_discovery import order_models_for_selector
 
         pm = get_engine().provider_manager
         for p in providers_status:
             if p.capability_kind != "chat" or not p.has_key:
                 continue
-            # discovered_models entries are serialized ModelInfo dicts —
-            # rebuild the dataclass so the selector can read metadata.
-            infos = [
-                ModelInfo(**m) for m in discovered_models
-                if m.get("provider") == p.name
-            ]
+            # COMPLETE discovery feed for the production pool — the display
+            # cap (_MODELS_IN_RESPONSE) lives only in the response payload
+            # and can never bound what production fallback may see.
+            infos = complete_models.get(p.name, [])
             mids = [
                 m.id for m in order_models_for_selector(infos)
                 if m.id != p.default_model

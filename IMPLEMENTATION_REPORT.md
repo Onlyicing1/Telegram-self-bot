@@ -13,8 +13,8 @@
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
 | Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== `origin/main` at phase start, clean tree) |
-| Phase | (1) MODEL-level fallback candidate pool for production AI requests; (2) Test Modules redesigned as a compact Taskloom-like Unicode panel with coalesced edits; (3) removal of the hidden 6-model-per-provider test cap; **(4) corrective patch: no per-provider production pool cap + Dummy removed from production fallback entirely** |
-| Status | **IMPLEMENTED — full suite green (2079 passed, 24 skipped, 0 failed)** |
+| Phase | (1) MODEL-level fallback candidate pool for production AI requests; (2) Test Modules redesigned as a compact Taskloom-like Unicode panel with coalesced edits; (3) removal of the hidden 6-model-per-provider test cap; (4) corrective patch: no per-provider production pool cap + Dummy removed from production fallback entirely; **(5) corrective patch: discovery display cap no longer leaks into the production candidate feed** |
+| Status | **IMPLEMENTED — full suite green (2083 passed, 24 skipped, 0 failed)** |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 | Delivery record | see §9 |
 
@@ -113,6 +113,49 @@ second registry, router, or discovery system):
    (honest exhaustion: `provider_name == ""`, matrix + retry count intact,
    `ai_retry_count == 2` preserved).
 
+## 3A. Corrective patch — discovery display cap no longer leaks into production
+
+**The bug (source-verified on `origin/main`):** `_build_targets(...)` built
+`discovered_models` from `models[:_MODELS_IN_RESPONSE]` (30 per provider),
+and `test_all_models_streaming` converted THAT capped list into `ModelInfo`
+objects for `ProviderManager.set_model_candidates(...)`. A fully
+discovered, eligible model positioned past index 29 could never reach the
+production fallback pool — the display cap silently determined production
+eligibility.
+
+**The fix — three independent data flows from ONE discovery result:**
+
+```
+complete provider discovery
+  ├──→ COMPLETE chat-capable ModelInfo list per provider
+  │      (complete_models — the ONLY source for set_model_candidates)
+  ├──→ explicit global diagnostic execution budget
+  │      (MODEL_TEST_GLOBAL_TEST_BUDGET — bounds Test Modules targets only)
+  └──→ _MODELS_IN_RESPONSE display cap
+         (response payload metadata only — never read by the feed)
+```
+
+- `_build_targets` now returns `(targets, discovered_models, complete_models)`;
+  `complete_models` is the deduped, chat-capable-filtered FULL discovery list
+  per provider (real `ModelInfo` objects — no dict→dataclass rebuild needed).
+- `test_all_models_streaming` feeds `complete_models` into
+  `set_model_candidates`; `_MODELS_IN_RESPONSE` remains ONLY in the response
+  payload path. `test_all_models` (batch/dashboard) ignores the complete
+  list — dashboard display semantics unchanged.
+- `MODEL_TEST_GLOBAL_TEST_BUDGET` is untouched and still bounds diagnostic
+  TEST EXECUTION only; it never touches the production feed.
+- No new hard-coded model count; no second discovery request; no other
+  truncation exists on the discovery→pool path (web `/api/ai/models`
+  `[:30]` is a display endpoint that never feeds the pool; the model
+  picker paginates its own display fetch).
+
+**Regression tests:** `test_production_feed_exceeds_display_cap_and_payload_stays_bounded`
+(50 models → all 50 fed, payload ≤ 30), `test_global_budget_limits_test_execution_not_production_feed`
+(budget 5 → 5 tested, 50 fed), `test_multiple_providers_each_feed_complete_sets`
+(two providers × 40 models → both feeds complete), `test_late_discovered_model_selected_by_production_fallback`
+(40-model pool, first 31 fail → the model at index 31 actually serves the
+request through the real `ProviderManager`).
+
 ## 4. Test Modules UX — compact Unicode panel
 
 Vocabulary (no colorful emoji anywhere in the Test Modules surfaces):
@@ -210,10 +253,15 @@ the handler before the task starts; cleared in `run_streaming_test`'s
   `test_dummy_only_registry_returns_manager_built_not_configured`;
   updated Dummy-contract tests (test_02, test_06, test_11, test_34, test_52,
   test_task_nl_creation).
-- **Focused suites** (provider mesh, structured output, runtime wiring,
-  ai flow, failure simulation, tool calls, model UI, you-search, NL
-  creation): **all green**.
-- **Full suite**: **2079 passed, 24 skipped, 0 failed**.
+- **Discovery-feed corrective tests (this phase)**:
+  `test_production_feed_exceeds_display_cap_and_payload_stays_bounded`,
+  `test_global_budget_limits_test_execution_not_production_feed`,
+  `test_multiple_providers_each_feed_complete_sets`,
+  `test_late_discovered_model_selected_by_production_fallback`.
+- **Focused suites** (provider mesh, model tester, structured output,
+  runtime wiring, ai flow, failure simulation, tool calls, model UI,
+  you-search, NL creation): **all green**.
+- **Full suite**: **2083 passed, 24 skipped, 0 failed**.
 - `python -m py_compile` on all changed Python files — OK.
 - `git diff --check` — clean.
 - **Live Telegram verification: NOT performed** (no credentials in this
@@ -226,10 +274,11 @@ the handler before the task starts; cleared in `run_streaming_test`'s
 
 | Item | Value |
 |---|---|
-| Starting HEAD (corrective patch) | `e636921e08cd2e68ae6888e6f71b606da6a14b12` (== origin/main at start) |
-| Corrective commit | `9ab8beecad109744a8eed349dc8bd1cd62906151` — `fix: remove per-provider pool cap and Dummy from production fallback` (9 files, 327+/137−) |
-| Push result | `e636921..9ab8bee  main -> main` (exit 0) |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `9ab8beecad109744a8eed349dc8bd1cd62906151` == local HEAD; `git show --stat origin/main` contains exactly the 9 corrective files |
+| Starting HEAD (feed-fix patch) | `f0220d5e388ed2470800ed021fc1ffb60a741d64` (== origin/main at start) |
+| Feed-fix commit | recorded after push (see below) — `fix: keep production candidate feed complete independent of display cap` |
+| Push result | recorded after push |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` after push, == local HEAD |
 | Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
+| Live Telegram verification | **NOT performed** (no credentials in this workspace) — source- and test-verified only; the exact Persian bio-task request remains the end-to-end probe |
 
 ---

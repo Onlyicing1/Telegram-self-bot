@@ -602,6 +602,33 @@ async def test_multiple_providers_contribute_complete_model_sets():
     assert [m["model"] for m in matrix if m.get("outcome") != "success"] == ["d0", "d1", "d2", "l0"]
 
 
+@pytest.mark.asyncio
+async def test_late_discovered_model_selected_by_production_fallback():
+    """A model positioned PAST a display cap (e.g. index 30 of 40) is
+    reachable by production fallback: the pool holds the complete
+    discovery feed, so when every earlier candidate fails, the late model
+    serves the request."""
+    # 31 failures (model 404s, never retried) then a success at index 31.
+    responses = [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model=f"m{i:03d}")
+        for i in range(31)
+    ]
+    responses.append(ProviderResponse(text="ok", provider_name="p", success=True))
+    p = _StubProvider("p", responses)
+
+    pm = ProviderManager()
+    pm.register_provider(p)
+    pm.switch_provider("p")
+    pm.set_model_candidates("p", [f"m{i:03d}" for i in range(40)])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert response.provider_name == "p"
+    assert response.metadata.get("requested_model") == "m031"
+    assert p.calls == 32, "31 dead models + the late live model, one attempt each"
+
+
 def test_active_configured_model_stays_first_in_complete_pool():
     """With the pool uncapped, the active provider's configured model still
     leads the candidate order."""

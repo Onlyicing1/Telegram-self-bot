@@ -410,6 +410,191 @@ async def test_streaming_twin_covers_full_discovery_and_feeds_candidate_pool():
 
 
 @pytest.mark.asyncio
+async def test_production_feed_exceeds_display_cap_and_payload_stays_bounded():
+    """A discovery result LARGER than ``_MODELS_IN_RESPONSE`` feeds the
+    COMPLETE set into the production candidate pool — the display/response
+    cap must never determine what production fallback is allowed to see."""
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+    from backend.ai.model_tester import _MODELS_IN_RESPONSE
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+    ]
+
+    total_models = _MODELS_IN_RESPONSE + 20  # 50: 20 beyond the display cap
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [
+            ModelInfo(id=f"m{i:03d}", name=f"m{i:03d}", provider=provider_name)
+            for i in range(total_models)
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    class _FakePM:
+        def __init__(self):
+            self.candidates: dict[str, list[str]] = {}
+
+        def set_model_candidates(self, name, models):
+            self.candidates[name] = models
+
+    class _FakeEngine:
+        provider_manager = _FakePM()
+
+    fake_pm = _FakeEngine.provider_manager
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=_FakeEngine):
+        mock_disc.return_value = fake_providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0)
+
+    # The COMPLETE eligible discovery result reached the production pool —
+    # including models positioned after the display cap index.
+    fed = fake_pm.candidates.get("openai", [])
+    assert len(fed) == total_models
+    assert fed[0] == "m000"
+    assert fed[-1] == f"m{total_models - 1:03d}"
+    # A model past the display cap (index >= _MODELS_IN_RESPONSE) is fed.
+    assert f"m{_MODELS_IN_RESPONSE:03d}" in fed
+    assert f"m{total_models - 1:03d}" in fed
+    # The response/display payload stays bounded by the display cap.
+    assert len(data["models"]) <= _MODELS_IN_RESPONSE
+    # Diagnostic test execution ran the full set (no global budget passed).
+    assert len(data["results"]) == total_models + 1  # configured model + all discovered
+
+
+@pytest.mark.asyncio
+async def test_global_budget_limits_test_execution_not_production_feed():
+    """The explicit diagnostic budget bounds TEST EXECUTION only; the
+    production candidate feed still receives the complete discovery set."""
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+    from backend.ai.model_tester import _MODELS_IN_RESPONSE
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+    ]
+
+    total_models = _MODELS_IN_RESPONSE + 20
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [
+            ModelInfo(id=f"m{i:03d}", name=f"m{i:03d}", provider=provider_name)
+            for i in range(total_models)
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    class _FakePM:
+        def __init__(self):
+            self.candidates: dict[str, list[str]] = {}
+
+        def set_model_candidates(self, name, models):
+            self.candidates[name] = models
+
+    class _FakeEngine:
+        provider_manager = _FakePM()
+
+    fake_pm = _FakeEngine.provider_manager
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=_FakeEngine):
+        mock_disc.return_value = fake_providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0, global_budget=5)
+
+    # Diagnostic execution bounded by the explicit budget (fair round-robin
+    # keeps the configured/default model first).
+    assert len(data["results"]) == 5
+    assert "gpt-4o" in [r["model"] for r in data["results"]]
+    # Production feed NOT truncated by the diagnostic budget — the complete
+    # discovery set is fed regardless.
+    fed = fake_pm.candidates.get("openai", [])
+    assert len(fed) == total_models
+
+
+@pytest.mark.asyncio
+async def test_multiple_providers_each_feed_complete_sets():
+    """Every real provider contributes its COMPLETE discovered eligible set
+    to the production pool — the display cap never binds any provider."""
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+    from backend.ai.model_tester import _MODELS_IN_RESPONSE
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+        ProviderStatus(name="groq", display_name="Groq", env_var="AI_GROQ_API_KEY", status="available", has_key=True, validated=True, default_model="llama", base_url="https://api.groq.com/openai/v1", icon="⚡"),
+    ]
+
+    per_provider = _MODELS_IN_RESPONSE + 10
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [
+            ModelInfo(id=f"{provider_name}-m{i:03d}", name=f"{provider_name}-m{i:03d}", provider=provider_name)
+            for i in range(per_provider)
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    class _FakePM:
+        def __init__(self):
+            self.candidates: dict[str, list[str]] = {}
+
+        def set_model_candidates(self, name, models):
+            self.candidates[name] = models
+
+    class _FakeEngine:
+        provider_manager = _FakePM()
+
+    fake_pm = _FakeEngine.provider_manager
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=_FakeEngine):
+        mock_disc.return_value = fake_providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0)
+
+    assert len(fake_pm.candidates.get("openai", [])) == per_provider
+    assert len(fake_pm.candidates.get("groq", [])) == per_provider
+    assert fake_pm.candidates["openai"][-1] == f"openai-m{per_provider - 1:03d}"
+    assert fake_pm.candidates["groq"][-1] == f"groq-m{per_provider - 1:03d}"
+    # Both providers' display payloads stay bounded.
+    assert len(data["models"]) <= _MODELS_IN_RESPONSE * 2
+
+
+@pytest.mark.asyncio
 async def test_streaming_tester_error_path_renders_terminal_failure():
     """A crashing tester still renders a terminal state and clears the
     running flag — a failed run can never strand the module in 'running'."""
