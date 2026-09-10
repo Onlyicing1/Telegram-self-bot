@@ -202,7 +202,13 @@ def _flatten_button_datas(buttons) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_ai_test_models_action_shows_usable_buttons_and_keeps_existing():
+    """The streaming completion view reuses the canonical results renderer:
+    only AVAILABLE models become one-tap pick buttons, all standard
+    navigation preserved. The run itself is stubbed at the streaming
+    tester boundary — the launch view is covered in runtime-wiring tests.
+    """
     from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
 
     payload = {
         "results": [
@@ -217,23 +223,34 @@ async def test_ai_test_models_action_shows_usable_buttons_and_keeps_existing():
                     "invalid": 1, "insufficient_credits": 0},
     }
 
-    with patch("backend.ai.model_tester.test_all_models", new_callable=AsyncMock) as mock_test, \
-         patch.object(ai_module, "_get_owner_id", AsyncMock(return_value=42)):
-        mock_test.return_value = payload
-        title, body, buttons = await ai_module._ai_test_models_action(None, "", 0)
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    with patch.object(
+        ai_test_progress, "test_all_models_streaming", AsyncMock(return_value=payload),
+    ), patch("backend.helper.panels._safe_edit", AsyncMock()) as mock_edit:
+        await ai_test_progress.run_streaming_test(42, fake_event)
 
-    assert title == "🧪 Test Models"
-    assert "Usable Models" in body
+    # The final edit carries the canonical results view (shared with the
+    # batch action path): usable models first, full diagnostics one tap away.
+    body, buttons = ai_module._render_test_results(payload)
+    assert "**✓ Usable Models**" in body
+    assert "◇ **Groq**" in body
     datas = _flatten_button_datas(buttons)
     # Only the AVAILABLE model becomes a one-tap selection button.
     assert "action:ai_pick_model:groq:openai/gpt-oss-120b" in datas
     assert not any("INVALID_MODEL" in d or "old-model" in d for d in datas)
     # Existing buttons preserved.
     assert "action:ai_test_models" in datas
+    assert "action:ai_test_details" in datas
     assert "panel:ai_model" in datas
     # Obsolete ai_status removed — the entry now points at the Overview.
     assert "panel:ai" in datas
     assert "panel:ai_status" not in datas
+    # Streaming path actually attempted the final results edit.
+    assert mock_edit.await_count >= 1
+    assert "Usable Models" in mock_edit.await_args.args[1]
+    assert ai_module._test_running is False
 
 
 # ── Web API applies selection to the runtime ──

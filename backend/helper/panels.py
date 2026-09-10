@@ -66,6 +66,24 @@ async def _safe_edit(event, text: str, buttons: list, chat_id: int | None, msg_i
         return False
 
 
+def _progress_buttons() -> list:
+    """Minimal nav row for transient states (progress, working panels)."""
+    builder = InlinePanelBuilder()
+    builder.add_row("⌂ Home", "panel:_nav:home")
+    return builder.build()
+
+
+async def _edit_panel_message(
+    event, chat_id: int, msg_id: int, text: str, buttons: list,
+) -> bool:
+    """Edit a Glass UI panel message through the production edit path.
+
+    Same dedupe + error handling as the callback render path so background
+    flows (model test progress) never spam Telegram with identical edits.
+    """
+    return await _safe_edit(event, text, buttons, chat_id or None, msg_id or None)
+
+
 def resolve_callback_message(event) -> tuple[int | None, int | None, str | None]:
     chat_id = None
     msg_id = None

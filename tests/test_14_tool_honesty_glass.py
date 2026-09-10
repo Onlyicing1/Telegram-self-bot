@@ -18,7 +18,7 @@ Also covers:
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.ai.tools.base import ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
@@ -360,26 +360,38 @@ def _sample_payload() -> dict:
 
 @pytest.mark.asyncio
 async def test_glass_test_models_message_is_compact_and_preserves_buttons():
+    """Streaming completion view is compact: provider-grouped usable list,
+    model name dominant, no per-model diagnostic paragraphs, buttons
+    preserved. The run is stubbed at the streaming tester boundary.
+    """
     from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
 
-    with patch("backend.ai.model_tester.test_all_models", AsyncMock(return_value=_sample_payload())):
-        title, body, buttons = await ai_module._ai_test_models_action(None, "", 0)
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    with patch.object(
+        ai_test_progress, "test_all_models_streaming",
+        AsyncMock(return_value=_sample_payload()),
+    ), patch("backend.helper.panels._safe_edit", AsyncMock()) as mock_edit:
+        await ai_test_progress.run_streaming_test(42, fake_event)
 
-    assert title == "🧪 Test Models"
+    assert mock_edit.await_count == 1
+    body = mock_edit.await_args.args[1]
     # Compact: provider-grouped usable list, model name dominant.
-    assert "**✅ Usable Models**" in body
-    assert "🟢 **Groq**" in body
+    assert "**✓ Usable Models**" in body
+    assert "◇ **Groq**" in body
     assert "• `gpt-oss-120b`" in body
     assert "• `gpt-oss-20b`" in body
     # Summary chips still present.
-    assert "Available: 3" in body
+    assert "✓ 3 · × 3" in body
     # No diagnostic paragraphs in the main message.
     assert "HTTP" not in body
     assert "retry-after" not in body
     # Failed models: one compact line each, capped.
-    assert "**⚠️ Not usable: 3**" in body
+    assert "**× Not usable: 3**" in body
     # Buttons preserved: pick-model rows + re-run + details.
-    datas = _flatten_button_datas(buttons)
+    datas = _flatten_button_datas(mock_edit.await_args.args[2])
     assert any(d.startswith("action:ai_pick_model:groq:openai/gpt-oss-120b") for d in datas)
     assert "action:ai_test_models" in datas
     assert "action:ai_test_details" in datas
@@ -398,8 +410,7 @@ async def test_glass_test_models_no_usable_state():
     payload["results"] = [r for r in payload["results"] if r["status"] != "AVAILABLE"]
     payload["summary"]["available"] = 0
 
-    with patch("backend.ai.model_tester.test_all_models", AsyncMock(return_value=payload)):
-        title, body, buttons = await ai_module._ai_test_models_action(None, "", 0)
+    body, buttons = ai_module._render_test_results(payload)
 
     assert "No usable chat models right now" in body
     datas = _flatten_button_datas(buttons)
@@ -410,9 +421,16 @@ async def test_glass_test_models_no_usable_state():
 @pytest.mark.asyncio
 async def test_glass_test_details_shows_full_diagnostics_from_cache():
     from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
 
-    with patch("backend.ai.model_tester.test_all_models", AsyncMock(return_value=_sample_payload())):
-        await ai_module._ai_test_models_action(None, "", 0)
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    with patch.object(
+        ai_test_progress, "test_all_models_streaming",
+        AsyncMock(return_value=_sample_payload()),
+    ), patch("backend.helper.panels._safe_edit", AsyncMock()):
+        await ai_test_progress.run_streaming_test(42, fake_event)
 
     title, body, buttons = await ai_module._ai_test_details_action(None, "", 0)
     assert "All Results" in body

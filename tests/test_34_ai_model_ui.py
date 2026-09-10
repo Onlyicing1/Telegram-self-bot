@@ -492,6 +492,51 @@ def test_fast_path_records_exactly_once_per_execution():
     assert rec.provider == "local"
 
 
+@pytest.mark.asyncio
+async def test_model_selector_paginates_large_candidate_sets():
+    """A large discovery result paginates instead of overflowing Telegram's
+    limits; every page renders a full grid with Prev/Next navigation."""
+    from backend.bot.handlers import ai as ai_module
+    from backend.ai.model_discovery import ModelInfo
+
+    big = [
+        ModelInfo(id=f"m{i:03d}", name=f"m{i:03d}", provider="groq")
+        for i in range(60)
+    ]
+    config = {"provider": "groq", "model": ""}
+    with patch.object(ai_module, "_get_saved_config", AsyncMock(return_value=config)), \
+         patch("backend.ai.model_discovery.fetch_models", AsyncMock(return_value=big)), \
+         patch("backend.ai.model_discovery.get_api_key_for_provider", return_value="k"), \
+         patch("backend.ai.model_discovery.get_base_url_for_provider", return_value="https://x"):
+        title, body, buttons = await ai_module._ai_model_panel_handler(None, "")
+
+    assert f"60 models · page 1/{ai_module._MODEL_PAGE_SIZE and (60 + ai_module._MODEL_PAGE_SIZE - 1) // ai_module._MODEL_PAGE_SIZE}" in body
+    datas = [d for row in _flatten_buttons(buttons) for _, d in row]
+    assert any(str(d).endswith("panel:ai_model:page:1") or str(d) == "panel:ai_model:page:1" for d in datas) or any(
+        "page:1" in str(d) for d in datas
+    )
+
+    # Page 2 renders the next slice, navigation stays bounded.
+    with patch.object(ai_module, "_get_saved_config", AsyncMock(return_value=config)), \
+         patch("backend.ai.model_discovery.fetch_models", AsyncMock(return_value=big)), \
+         patch("backend.ai.model_discovery.get_api_key_for_provider", return_value="k"), \
+         patch("backend.ai.model_discovery.get_base_url_for_provider", return_value="https://x"):
+        _, body2, buttons2 = await ai_module._ai_model_panel_handler(None, "page:1")
+    assert "page 2/" in body2
+    datas2 = [d for row in _flatten_buttons(buttons2) for _, d in row]
+    assert any("page:0" in str(d) for d in datas2)  # ‹ Prev
+    assert any("page:2" in str(d) for d in datas2)  # Next ›
+
+    # Out-of-range page clamps instead of erroring.
+    with patch.object(ai_module, "_get_saved_config", AsyncMock(return_value=config)), \
+         patch("backend.ai.model_discovery.fetch_models", AsyncMock(return_value=big)), \
+         patch("backend.ai.model_discovery.get_api_key_for_provider", return_value="k"), \
+         patch("backend.ai.model_discovery.get_base_url_for_provider", return_value="https://x"):
+        _, body3, _ = await ai_module._ai_model_panel_handler(None, "page:99")
+    last_page = (60 + ai_module._MODEL_PAGE_SIZE - 1) // ai_module._MODEL_PAGE_SIZE
+    assert f"page {last_page}/" in body3
+
+
 def test_engine_stage_failure_is_recorded_safely():
     engine, _pm = _engine_with(_ScriptedProvider())
     before = len(telemetry.recent(50))

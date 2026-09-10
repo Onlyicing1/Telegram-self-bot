@@ -18,6 +18,7 @@ a ``ProviderResponse``. The manager:
   6. Records latency + success/failure in per-provider metrics.
 
 The manager also exposes:
+  - ``set_model_candidates(p, models)`` → discovery-fed extra candidate models
   - ``switch_provider(name)``  → switch the active provider
   - ``register_provider(p)``   → add a new provider at runtime
   - ``unregister_provider(name)``→ remove a provider
@@ -62,6 +63,9 @@ from backend.runtime.operation_watchdog import guarded_await
 logger = logging.getLogger(__name__)
 
 _PROVIDER_RPC_TIMEOUT = 30.0
+# Hard ceiling on candidate models per provider so the model-level pool
+# keeps attempts bounded even when discovery returns dozens of models.
+_MODEL_CANDIDATE_LIMIT = 6
 _MAX_RETRIES = 1
 _RETRY_BACKOFF_SECONDS = 1.0
 # A rate limit is only worth waiting out when the provider's own Retry-After
@@ -81,7 +85,7 @@ class ProviderManager:
 
     __slots__ = (
         "_registry", "_metrics", "_config_mgr", "_fallback_chain", "_health",
-        "_unavailable_models",
+        "_unavailable_models", "_model_candidates",
     )
 
     def __init__(self, registry: ProviderRegistry | None = None) -> None:
@@ -94,6 +98,7 @@ class ProviderManager:
             concurrency_overrides=_PROVIDER_CONCURRENCY,
         )
         self._unavailable_models: dict[tuple[str, str], float] = {}
+        self._model_candidates: dict[str, list[str]] = {}
         self._ensure_dummy_fallback()
         self._load_env_fallback_chain()
 
@@ -102,11 +107,15 @@ class ProviderManager:
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ProviderResponse:
         """Route a request through the provider mesh. Never raises.
 
-        Eligible providers (the active provider first, then the configured
+        Eligible candidates (the active provider first, then the configured
         fallback chain, then any other registered provider) are scored by
         capability match, health, and recent reliability, and tried in score
-        order until one succeeds. Skipped and failed providers are recorded
-        in a failure matrix attached to the returned response metadata so the
+        order until one succeeds. The pool is MODEL-level: every eligible
+        provider contributes its configured model first, then its discovery-
+        fed candidate models (free-first ordering), so a dead (provider,
+        model) pair fails over to the next MODEL candidate, not just the
+        next provider. Skipped and failed candidates are recorded in a
+        failure matrix attached to the returned response metadata so the
         full routing decision is observable without exposing secrets.
 
         A successful fallback response carries ``fallback`` / ``fallback_from``
@@ -117,23 +126,23 @@ class ProviderManager:
         """
         needs_tools = bool(kwargs.get("tools"))
         needs_json = bool(kwargs.get("response_format"))
-        candidates = self._ordered_candidates(include_all=True)
+        provider_candidates = self._ordered_candidates(include_all=True)
 
         # Terminal case: no real provider configured — return the dummy's
         # own "not configured" response instead of a fallback synthesis.
-        if candidates and candidates[0][0] == "dummy":
-            return await self._call_once(candidates[0][1], messages, kwargs)
+        if provider_candidates and provider_candidates[0][0] == "dummy":
+            return await self._call_once(provider_candidates[0][1], messages, kwargs)
 
-        first = candidates[0][0] if candidates else ""
+        first = provider_candidates[0][0] if provider_candidates else ""
         matrix: list[dict[str, Any]] = []
         failures: list[str] = []
         # Retries experienced by failed candidates before the eventual
         # success — preserved so telemetry reports the request's true
         # recovery effort, not just the winning candidate's.
         total_retries = 0
-        eligible: list[tuple[float, str, BaseProvider]] = []
+        eligible: list[tuple[float, str, str, BaseProvider]] = []
 
-        for name, provider in candidates:
+        for name, provider in provider_candidates:
             if name == "dummy":
                 continue
             skip = self._skip_reason(name, provider, needs_tools, needs_json)
@@ -142,8 +151,13 @@ class ProviderManager:
                 logger.info("PROVIDER_SKIPPED provider=%s reason=%s", name, skip)
                 continue
             score = self._score(name, provider)
-            eligible.append((score, name, provider))
-            logger.info("ROUTER_SCORE provider=%s score=%.3f", name, score)
+            models = self._candidate_models(provider)
+            for model in models:
+                eligible.append((score, name, model, provider))
+            logger.info(
+                "ROUTER_SCORE provider=%s models=%d score=%.3f",
+                name, len(models), score,
+            )
 
         # The active provider is the user's explicit choice — keep it first
         # when eligible; the rest are ordered by score (capability ×
@@ -158,20 +172,24 @@ class ProviderManager:
                 # provider known to lack the contract). Within each group
                 # the previous order holds: active provider first, then
                 # by score.
-                bool(needs_json and not self._supports_json_output(item[2])),
+                bool(needs_json and not self._supports_json_output(item[3])),
                 item[1] != first,
                 -item[0],
             )
         )
 
-        for idx, (score, name, provider) in enumerate(eligible):
-            model = self._effective_model(provider) or "-"
-            logger.info("ROUTER_SELECTED provider=%s model=%s score=%.3f", name, model, score)
-            task_trace(
-                "provider_selection", provider=name, model=model, score=round(score, 3),
-                attempt=idx + 1, selection_reason="active_first_then_score",
+        total = len(eligible)
+        for idx, (score, name, model, provider) in enumerate(eligible):
+            logger.info(
+                "ROUTER_SELECTED provider=%s model=%s score=%.3f",
+                name, model or "-", score,
             )
-            response = await self._attempt_with_retry(provider, messages, kwargs)
+            task_trace(
+                "provider_selection", provider=name, model=model or "-", score=round(score, 3),
+                attempt=idx + 1, pool_size=total,
+                selection_reason="active_first_then_score_model_pool",
+            )
+            response = await self._attempt_with_retry(provider, messages, kwargs, model)
             if response.success:
                 # A semantically-empty or all-malformed "success" is not a
                 # usable execution answer. When another eligible provider is
@@ -212,16 +230,21 @@ class ProviderManager:
                         # model that returns non-JSON for a structured request
                         # is penalized in the router score (never cooled down).
                         self._metrics.record_quality(name, False)
-                    matrix.append({"provider": name, "outcome": category.lower(), "score": round(score, 3)})
+                    matrix.append({
+                        "provider": name, "model": model or "-",
+                        "outcome": category.lower(), "score": round(score, 3),
+                    })
                     logger.info(
                         "AI_PROVIDER_FAILURE provider=%s model=%s category=%s failover=1",
-                        name, model, category,
+                        name, model or "-", category,
                     )
                     task_trace(
-                        "provider_fallback", failed_provider=name, failure_category=category.lower(),
-                        next_provider=eligible[idx + 1][1] if idx + 1 < len(eligible) else "-",
+                        "provider_fallback", failed_provider=name,
+                        failed_model=model or "-", failure_category=category.lower(),
+                        next_provider=eligible[idx + 1][1],
+                        next_model=eligible[idx + 1][2],
                         reason="structured_output_contract" if contract_violation else "empty_response",
-                        attempt=idx + 1,
+                        attempt=idx + 1, pool_size=total,
                     )
                     continue
                 # Last candidate: the response is returned unchanged and the
@@ -229,17 +252,23 @@ class ProviderManager:
                 # fail-closed parser reports the precise category and can
                 # never admit unparseable content — no fabricated candidate
                 # can reach task creation/persistence).
-                matrix.append({"provider": name, "outcome": "success", "score": round(score, 3)})
+                matrix.append({
+                    "provider": name, "model": model or "-",
+                    "outcome": "success", "score": round(score, 3),
+                })
                 if name != first:
                     meta = dict(response.metadata or {})
                     meta["fallback"] = True
                     meta["fallback_from"] = first or None
                     meta["fallback_to"] = name
+                    meta["fallback_to_model"] = model or None
                     from_provider = self._registry.get(first) if first else None
-                    from_model = self._effective_model(from_provider) if from_provider is not None else "-"
+                    from_model = (
+                        self._effective_model(from_provider) if from_provider is not None else "-"
+                    )
                     logger.info(
                         "AI_PROVIDER_FAILOVER from=%s/%s to=%s/%s",
-                        first or "-", from_model, name, model,
+                        first or "-", from_model, name, model or "-",
                     )
                     response = replace(response, metadata=meta)
                 meta = dict(response.metadata or {})
@@ -248,12 +277,19 @@ class ProviderManager:
                 meta["provider_matrix"] = matrix
                 return replace(response, metadata=meta)
             total_retries += int((response.metadata or {}).get("ai_retry_count", 0) or 0)
-            matrix.append({"provider": name, "outcome": "failed", "reason": (response.text or "")[:200]})
-            failures.append(f"{name}: success=False ({response.text[:200]})")
+            matrix.append({
+                "provider": name, "model": model or "-",
+                "outcome": "failed", "reason": (response.text or "")[:200],
+            })
+            failures.append(
+                f"{name}/{model or '-'}: success=False ({(response.text or '')[:200]})"
+            )
             task_trace(
-                "provider_fallback", failed_provider=name, failure_category=self._failure_type(response),
+                "provider_fallback", failed_provider=name, failed_model=model or "-",
+                failure_category=self._failure_type(response),
                 next_provider=(eligible[idx + 1][1] if idx + 1 < len(eligible) else "emergency_fallback"),
-                reason=bound_text(response.text, 160), attempt=idx + 1,
+                next_model=(eligible[idx + 1][2] if idx + 1 < len(eligible) else "-"),
+                reason=bound_text(response.text, 160), attempt=idx + 1, pool_size=total,
             )
 
         return await self._fallback(
@@ -658,36 +694,89 @@ class ProviderManager:
         self._unavailable_models[(name, model)] = time.monotonic() + _MODEL_UNAVAILABLE_TTL
         logger.warning("PROVIDER_MODEL_UNAVAILABLE provider=%s model=%s", name, model)
 
+    def _candidate_models(self, provider: BaseProvider) -> list[str]:
+        """Return the ordered model-level candidate list for one provider.
+
+        First the provider's configured model (the user's selection, never
+        demoted), then discovery-fed candidate models in free-first order
+        (duplicates and the configured model removed). The whole pool is
+        deterministic: same discovery data → same candidate order.
+        """
+        name = self._safe_provider_name(provider)
+        configured = ""
+        try:
+            configured = (provider.config.default_model or "").strip()
+        except Exception:
+            configured = ""
+        pool: list[str] = []
+        if configured:
+            pool.append(configured)
+        seen = {configured}
+        for mid in self._model_candidates.get(name, []):
+            mid = (mid or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            pool.append(mid)
+            if len(pool) >= _MODEL_CANDIDATE_LIMIT:
+                break
+        return pool or [""]
+
+    def set_model_candidates(self, provider_name: str, models: list[str]) -> None:
+        """Feed discovery-derived candidate models for one provider.
+
+        Called by the Test Modules discovery pass. Empty input clears the
+        entry. The list is trusted as-is — it must already be chat-capable,
+        free-first ordered (``order_models_for_selector``), and bounded by
+        the caller.
+        """
+        if models:
+            self._model_candidates[provider_name] = [str(m) for m in models if m]
+        else:
+            self._model_candidates.pop(provider_name, None)
+
     async def _call_once(
         self,
         provider: BaseProvider,
         messages: list[dict[str, Any]],
         kwargs: dict[str, Any],
+        model: str = "",
     ) -> ProviderResponse:
         """Call a provider exactly once (bounded). Never raises.
 
         Hard exceptions are converted into a structured ``success=False``
         response with a ``failure_type`` so the routing machine can classify
-        and cooldown without ever leaking an exception upward.
+        and cooldown without ever leaking an exception upward. A non-empty
+        ``model`` override is forwarded to the provider adapter (used by the
+        model-level candidate pool); the configured default is used otherwise.
         """
         name = self._safe_provider_name(provider)
         start = time.perf_counter()
         task_trace(
-            "provider_request_start", provider=name, model=self._effective_model(provider) or "-",
+            "provider_request_start", provider=name,
+            model=model or self._effective_model(provider) or "-",
             request_size=sum(len(str(m.get("content", ""))) for m in messages),
             timeout_s=_PROVIDER_RPC_TIMEOUT,
         )
         try:
+            call_kwargs = dict(kwargs)
+            if model:
+                call_kwargs["model"] = model
             response = await guarded_await(
-                provider.chat(messages, **kwargs),
+                provider.chat(messages, **call_kwargs),
                 name=f"provider:chat:{name or 'unknown'}",
                 timeout=_PROVIDER_RPC_TIMEOUT,
             )
             latency = time.perf_counter() - start
             self._metrics.record(name, latency=latency, error="" if response.success else (response.text or "")[:200])
+            if model and isinstance(response.metadata, dict):
+                meta = dict(response.metadata)
+                meta.setdefault("requested_model", model)
+                response = replace(response, metadata=meta)
             raw = (response.text or "").strip().lower()
             task_trace(
-                "provider_response", provider=name, model=self._effective_model(provider) or "-",
+                "provider_response", provider=name,
+                model=model or self._effective_model(provider) or "-",
                 success="true" if response.success else "false", elapsed_ms=int(latency * 1000),
                 output_category=("json" if raw.startswith("{") else "null" if raw in {"null", "json null"} else "prose" if raw else "empty"),
                 response_length=len(response.text or ""),
@@ -733,19 +822,22 @@ class ProviderManager:
         provider: BaseProvider,
         messages: list[dict[str, Any]],
         kwargs: dict[str, Any],
+        model: str = "",
     ) -> ProviderResponse:
-        """Attempt one provider with at most ONE immediate retry.
+        """Attempt one (provider, model) with at most ONE immediate retry.
 
         Applies the per-provider concurrency semaphore for the whole
         attempt. On success the provider is marked healthy. On failure the
         provider's health state is updated (cooldown/disabled) so the caller
-        advances to the next candidate.
+        advances to the next candidate. A non-empty ``model`` override is
+        passed through to the provider adapter; the provider's configured
+        default model is used otherwise.
         """
         name = self._safe_provider_name(provider)
-        model = self._effective_model(provider) or "-"
+        label = model or self._effective_model(provider) or "-"
         async with self._health.acquire(name):
-            logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, model)
-            response = await self._call_once(provider, messages, kwargs)
+            logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=1", name, label)
+            response = await self._call_once(provider, messages, kwargs, model)
             if response.success:
                 self._health.record_success(name)
                 self._note_response_quality(name, response, kwargs)
@@ -768,7 +860,7 @@ class ProviderManager:
                             "AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2 reason=rate_limit_window",
                             name, model,
                         )
-                        retry_response = await self._call_once(provider, messages, kwargs)
+                        retry_response = await self._call_once(provider, messages, kwargs, model)
                         if retry_response.success:
                             self._health.record_success(name)
                             self._note_response_quality(name, retry_response, kwargs)
@@ -788,7 +880,7 @@ class ProviderManager:
             # short backoff so a burst cannot hammer the upstream API.
             await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
             logger.info("AI_PROVIDER_ATTEMPT provider=%s model=%s attempt=2", name, model)
-            retry_response = await self._call_once(provider, messages, kwargs)
+            retry_response = await self._call_once(provider, messages, kwargs, model)
             if retry_response.success:
                 self._health.record_success(name)
                 self._note_response_quality(name, retry_response, kwargs)
@@ -861,6 +953,11 @@ class ProviderManager:
                 )
                 if model:
                     self._mark_model_unavailable(name, model)
+                    # The adapter's failure metadata carries the override
+                    # model when the candidate pool supplied one.
+                    override = str((response.metadata or {}).get("requested_model") or "")
+                    if override:
+                        self._mark_model_unavailable(name, override)
             logger.warning(
                 "provider-health: '%s' config/request error (%s) — not cooling down",
                 name, ftype,

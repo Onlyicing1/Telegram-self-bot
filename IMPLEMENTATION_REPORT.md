@@ -12,172 +12,213 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Base commit (this phase) | `6087d2e` (clean tree, `origin/main` equal) |
-| Phase | Structured-output reliability: JSON-mode request + capability-aware routing + bounded content-failure failover at the provider boundary (root cause PROVEN: groq/allam-2-7b returned malformed JSON) |
-| Implementation commits | `33727f3` · `c35f75f` · `012f738` · `a75d463` · **`7fbaba3` (escalate boundary instrumentation to WARNING for log visibility)** |
-| Report commit | see §10 delivery record |
-| Status | **INSTRUMENTATION-ONLY — full suite green (2046 passed, 24 skipped). Control-flow audit PROVES `raw_response_shape` executes before any JSONDecodeError classification; supplied logs contained only WARNING-level lines, so INFO visibility is unproven and the two decisive records were escalated to WARNING (no behavior change). Actual provider response content remains unobserved.** (see §6C) |
+| Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== `origin/main` at phase start, clean tree) |
+| Phase | (1) MODEL-level fallback candidate pool for production AI requests; (2) Test Modules redesigned as a compact Taskloom-like Unicode panel with coalesced edits; (3) removal of the hidden 6-model-per-provider test cap |
+| Status | **IMPLEMENTED — full suite green (2074 passed, 24 skipped, 0 failed)** |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
+| Delivery record | see §9 |
 
 ---
 
-## 2. Live root cause (PROVEN — production trace, 2026-09-10)
+## 2. Fixed bug — hidden 6-model-per-provider test cap
 
-The exact multi-line Persian bio-task request produced the user-facing
-`[failure category: candidate_invalid_json]`, and the WARNING-level
-boundary instrumentation (commit `7fbaba3`) captured the conclusive trace:
+**The bug:** `backend/ai/model_tester.py` carried
+`_MAX_PER_PROVIDER = int(os.getenv("MODEL_TEST_MAX_PER_PROVIDER", "6"))`,
+and `_build_targets(...)` applied `candidates[:max_per_provider]`. Discovery
+could surface dozens of real chat-capable models, but a complete Test Modules
+run silently tested only six per provider — directly conflicting with the
+requirement that Test Modules evaluate ALL eligible real/free models that
+are actually available and compatible.
 
-| Field | Value |
+**The fix (not just a bigger number):**
+
+- The per-provider cap was REMOVED entirely. Every chat-capable candidate is
+  eligible; no hidden truncation remains anywhere in the test path.
+- The ONLY truncation is an explicit, documented GLOBAL diagnostic budget:
+  `_GLOBAL_TEST_BUDGET = int(os.getenv("MODEL_TEST_GLOBAL_TEST_BUDGET", "60"))`.
+  Rationale: discovery may surface hundreds of candidates; a complete run
+  must not spend unbounded API calls. `MODEL_TEST_GLOBAL_TEST_BUDGET=0`
+  removes the cap entirely — a resource tradeoff chosen explicitly via env,
+  never an accident of a per-provider slice.
+- The budget is applied FAIRLY: every provider's configured/default model is
+  kept first, the remainder is distributed round-robin across providers in
+  discovery order, so one large catalog can never push a later provider out
+  of a complete run.
+- Unchanged bounded resources: per-model timeout (8s), overall run timeout
+  (60s), bounded concurrency (`MODEL_TEST_CONCURRENCY`, semaphore), and the
+  payload display cap `_MODELS_IN_RESPONSE` (response metadata only — never
+  affects which models are tested).
+
+**Regression tests:** `test_test_all_models_covers_full_discovery_and_filters`
+(42 candidates tested across 2 providers — impossible under the old cap),
+`test_test_all_models_global_budget_is_explicit_not_per_provider` (fair
+round-robin distribution, both providers represented),
+`test_streaming_twin_covers_full_discovery_and_feeds_candidate_pool` (12 of
+12 candidates; old cap would have produced 6).
+
+## 3. Production fallback — model level, bounded, deterministic
+
+`backend/ai/providers/manager/manager.py` (the EXISTING ProviderManager — no
+second registry, router, or discovery system):
+
+1. **Pool construction** (`_candidate_models`): for EVERY eligible provider,
+   `[configured model] + discovery-fed candidate models` (free-first,
+   deduplicated, configured model never demoted), bounded by
+   `_MODEL_CANDIDATE_LIMIT = 6` per provider so attempts stay bounded even
+   when discovery returns dozens of models. This bound is a PRODUCTION
+   fallback bound (bounded attempts per request), not a test-coverage cap —
+   Test Modules remains the component that must cover everything.
+2. **Feeding** (`set_model_candidates`): the Test Modules discovery pass
+   feeds the pool — one discovery pass serves both diagnostics and the
+   production router (Test Modules bug fixed here too: the feed previously
+   passed raw dicts to a `ModelInfo`-typed selector and silently died; it
+   now rebuilds the dataclass). Runtime-only; rebuilt on the next pass.
+3. **Routing**: eligible pool is `(score, provider, model)` tuples —
+   MODEL level. Deterministic order:
+   `needs_json capability group → active-first → score`. The active
+   provider/model stays first when eligible. A dead (provider, model) pair
+   fails over to the next MODEL candidate.
+4. **Model-unavailable marking**: 404 `model_not_found` marks the
+   `(provider, model)` pair unavailable for a 1h TTL (including the
+   `requested_model` override from the pool); `_skip_reason` reports it in
+   the matrix.
+5. **Model override plumbing**: `model` kwarg forwarded through
+   `_call_once`/`_attempt_with_retry` to the adapters (explicit payloads;
+   nothing leaks into HTTP bodies). `requested_model` stamped in metadata.
+6. **Preserved semantics**: active-first; health/cooldown/quarantine; ONE
+   bounded immediate retry per candidate for transient failures; JSON
+   capability demotion; structured-contract failover (malformed JSON from a
+   transport-success response is provider-fault failover — no cooldown,
+   quality-penalized, and the LAST candidate's response is returned
+   unchanged so the caller's fail-closed parser owns final classification);
+   deterministic/user/repository/Telegram/security failures never trigger
+   content failover (the validator only sees parseability; permanent
+   config/request errors advance deterministically instead).
+
+**Dummy exclusion (verified + regression-tested):** `dummy` is filtered from
+the eligible pool at every layer (`_ordered_candidates` never includes it;
+the chat loop explicitly skips it; the terminal "no real provider configured"
+case returns the dummy's own diagnostic response instead of synthesizing
+one). It is reachable ONLY as the terminal emergency fallback via
+`_fallback()`, which always returns `success=False` with the failure matrix
+preserved — never a fake successful answer, never an inflation of the
+candidate count. Tests:
+`test_dummy_never_enters_production_candidate_pool`,
+`test_dummy_only_terminal_when_all_real_candidates_exhausted`.
+
+## 4. Test Modules UX — compact Unicode panel
+
+Vocabulary (no colorful emoji anywhere in the Test Modules surfaces):
+
+| Mark | Meaning |
 |---|---|
-| provider / model | `groq` / `allam-2-7b` |
-| success / finish_reason | `true` / `stop` (NOT truncated, NOT empty) |
-| response_length | 2778 |
-| first_non_ws | `object` (starts with `{`) |
-| trailing_prose | `True` — unbalanced object; no closing `}` consumed everything |
-| has_control_chars / object_span | `False` / `False` |
-| JSONDecodeError | line 1, col 87, pos 86 — `Expecting ':' delimiter` |
+| ▰ / ▱ | filled / empty progress segment (exactly FIVE segments, 20 pp each) |
+| ✓ | success |
+| × | failure |
+| … | testing / timeout |
+| ◇ | provider/model line |
+| ★ | selected |
+| ◌ / · | running / not-configured |
 
-**Classification:** the provider returned transport-success content that is
-NOT valid JSON. The interpreter's fail-closed parser correctly rejected it
-BEFORE candidate validation/persistence — no downstream layer was involved.
-Render runtime, Telethon, deterministic routing, scheduler, timezone,
-bio routing, timeout, truncation, and control characters are all excluded
-by the same trace. The prior parser-tolerance work (`012f738`) remains
-correct: the live shape was none of the tolerated wrappers.
+- Launch (`action:ai_test_models`): non-blocking. Sets `_test_running`,
+  starts ONE guarded background run, returns a short "… Starting" view.
+- Progress view: `▰▰▰▱▱  n/total` + the latest completed `◇ provider · model ✓/×`
+  line. Content-free and compact — details stay behind the existing
+  results/details navigation.
+- Final view: the canonical `_render_test_results` body (shared verbatim by
+  the batch path — the two entry points cannot drift), now Unicode-only.
+  All previous buttons preserved (pick-model, Re-run, All Results,
+  Pick Model, Overview, nav).
 
-## 3. Fix — provider boundary only (parser unchanged, fail-closed)
+## 5. Progress edit guardian (`_PanelEditGuardian`)
 
-The success condition was NOT "make the parser accept the output". The fix
-makes the structured-output contract explicit end-to-end:
+Focused, Test-Modules-only coalescing layer (no generic Telegram framework):
 
-1. **Structured-output request** (`backend/ai/task_interpreter.py`):
-   `TaskInterpreter.interpret` now calls the provider mesh with
-   `response_format={"type": "json_object"}` plus an `output_validator`
-   probe (`_valid_structured_output` — content-free: "does the text parse
-   as JSON under the same tolerances the interpreter's own parser accepts?"
-   It never validates task-candidate semantics; a JSON that parses but
-   fails the candidate schema is NOT a contract failure).
+- **Coalescing**: submissions are state updates; a single serialized chain
+  task renders at most ONE progress edit per 12s window, always the NEWEST
+  submitted state (a newer submission cancels the pending window wait —
+  never stale). The FIRST progress edit renders immediately (epoch-0
+  timestamp) for fast feedback after the launch view.
+- **No duplicate renders**: identical (text + button-label) renders are
+  skipped against the last state actually applied by Telegram.
+- **No edit storms**: edits are strictly serialized; responses can never
+  overtake requests.
+- **Terminal state is never lost**: the final render bypasses the progress
+  window, is applied exactly once (dedupe-guarded), and on Telegram errors
+  retries a bounded 2 times with backoff before logging an error. A
+  crashing tester still renders the `× Test run failed` terminal view.
+- **No stranded lock**: `guardian.done` is set when the terminal render
+  settles OR when the chain task dies (done-callback), so awaiting callers
+  can never hang; `_test_running` is cleared in `finally` on success,
+  failure, cancellation, and unexpected exception alike.
 
-2. **Adapter serialization** (`backend/ai/providers/openai_compat.py`,
-   `backend/ai/providers/gemini.py`): `ProviderCapabilities.supports_json`
-   existed but nothing consumed it. Now OpenAI-compat providers serialize
-   `payload["response_format"]` (JSON mode) and Gemini maps it to
-   `generationConfig.responseMimeType="application/json"` (JSON MIME) —
-   only when the caller requests it AND the provider declares the
-   capability. CANDIDATE_SCHEMA travels in the interpreter's system
-   message only — no schema duplication; no new structured-output
-   abstraction.
+## 6. Concurrent-run protection
 
-3. **Capability-aware routing** (`backend/ai/providers/manager/manager.py`):
-   when a request carries `response_format`, providers that DECLARE
-   `supports_json` are ordered before ones that do not (within each group:
-   active provider first, then score). `supports_json=False` is a demotion,
-   never a hard skip (soft-capability routing).
+The module-level `_test_running` flag spans the WHOLE background run (set by
+the handler before the task starts; cleared in `run_streaming_test`'s
+`finally`):
 
-4. **Bounded content-failure failover** (same file): a transport-success
-   response whose content VIOLATES the structured contract (validator
-   rejects) is treated exactly like the existing empty-output failure:
-   fail over to the next eligible candidate — bounded (only while one
-   remains), NO cooldown/quarantine (request-level quality signal), recorded
-   in the provider matrix as `malformed_json` + `AI_PROVIDER_FAILURE`
-   + `provider_fallback` trace with reason `structured_output_contract`,
-   penalized via quality metrics. The LAST candidate's response is returned
-   unchanged — the caller owns final classification (the interpreter's
-   fail-closed parser reports the precise `candidate_invalid_json`
-   category). Fallback NEVER triggers for deterministic/user/unsupported
-   capability/schema-validation/repository/Telegram/security failures: the
-   validator only sees parseability, and every other failure layer raises
-   before or after the provider call without touching the manager.
+1. First tap starts exactly one run.
+2. A second tap while running does NOT start another run —
+   `test_ai_test_models_second_tap_while_running_is_rejected` proves the
+   tester is never invoked twice (`assert_not_called`).
+3. The second tap renders the existing "Already running" panel.
+4. The flag clears on success, failure, cancellation, and unexpected
+   exception (`finally`; proven by
+   `test_streaming_tester_error_path_renders_terminal_failure`).
+5. A failed run cannot leave the module locked.
+6. Callback handlers run on the single asyncio loop; the flag is set and
+   checked synchronously inside the handler before any await, so two
+   callbacks cannot interleave between check and set.
+7. Guardian death cannot strand the flag (done-callback + `finally`).
 
-5. **Loop safety**: attempts remain bounded (one per eligible provider, at
-   most one in-place retry for transport failures — unchanged). Failover
-   happens BEFORE task creation/persistence and BEFORE any Telegram side
-   effect; the interpreter is invoked pre-persistence by design.
+## 7. Pagination & capability/free-model eligibility
 
-## 4. Files changed
+- **Pagination**: the model selector already paginates (`_MODEL_PAGE_SIZE`,
+  two-column grid, index+hash callbacks, clamped pages) — now regression-
+  tested with 60 candidates:
+  `test_model_selector_paginates_large_candidate_sets`.
+- **Free eligibility**: `is_free` is metadata-driven ONLY (`_is_free_pricing`:
+  both prompt and completion priced $0; a "free" name never sets it). The
+  pool feeds candidates through `order_models_for_selector` (free-first,
+  alphabetical within groups, graceful degradation without metadata). No
+  hard-coded free-model list exists anywhere.
+- **Capability filtering**: candidates pass `capability_kind == "chat"`,
+  health/availability, tool support when tools are required, and JSON
+  capability is routed capability-first when structured output is required
+  (demotion, not hard skip). A model that cannot satisfy the requested
+  contract is outranked; a transport-success but contract-violating output
+  fails over per §3.
 
-| File | Change |
-|---|---|
-| `backend/ai/task_interpreter.py` | `_RESPONSE_FORMAT` request; `_valid_structured_output` probe; pass `response_format` + `output_validator` through `ProviderManager.chat`. No prompt change; no parser change. |
-| `backend/ai/providers/openai_compat.py` | Serialize `response_format` when declared (`supports_json`). |
-| `backend/ai/providers/gemini.py` | Map `response_format` → JSON MIME mode when declared. |
-| `backend/ai/providers/manager/manager.py` | `needs_json` awareness; capability-aware ordering; `_supports_json_output`; contract-violation failover (bounded, no cooldown, quality penalty, matrix + trace). |
-| `tests/test_provider_structured_output.py` | NEW — 15 focused tests (below). |
-| `tests/test_task_interpretation_diagnostics.py` | Stub `chat(**kwargs)` tolerance only (new call kwargs). |
-| `IMPLEMENTATION_REPORT.md` | This rewrite. |
+## 8. Tests and verification
 
-## 5. Tests added and executed
+- **New/updated regression tests**: 2 new tester tests (full-coverage
+  streaming + pool feed; error-path terminal render), 1 new tester test for
+  the global budget (fair distribution), 2 rewritten tester tests (old cap
+  → full coverage), 1 new wiring test (second-tap rejection), 3 new mesh
+  tests (dummy pool exclusion ×2; Unicode inventory sweep), 1 new UI test
+  (60-model pagination), 5 tests rewritten to the Unicode/streaming
+  contract.
+- **Focused suites** (model tester, runtime wiring, model selection, tool
+  honesty/glass, provider mesh, structured output, model UI): **142 passed**.
+- **Full suite**: **2074 passed, 24 skipped, 0 failed**.
+- `python -m py_compile` on all changed Python files — OK.
+- `git diff --check` — clean.
+- **Live Telegram verification: NOT performed** (no credentials in this
+  workspace; this phase is source-verified and test-verified only). The
+  next live Test Modules run arms the production pool; the exact Persian
+  bio-task request remains the end-to-end probe for structured-output
+  failover.
 
-**New `tests/test_provider_structured_output.py` (15):**
-interpreter requests `response_format` + validator · probe accepts valid
-JSON / rejects malformed-empty-prose · probe accepts fenced / prose-wrapped /
-double-encoded wrappers · OpenAI-compat serializes `response_format` only
-when declared · Gemini maps to JSON MIME · no schema duplication ·
-malformed-JSON-from-active-provider fails over to the next provider (the
-exact live `groq` → `gemini` shape) · failover records NO cooldown and
-state stays `healthy` · quality metrics penalized · bounded attempts on
-exhaustion with the last response unchanged · valid content passes through
-without failover · no-validator callers keep previous behavior ·
-capability-aware ordering with JSON requested (matrix order proven) ·
-active-first preserved without the JSON request · **the exact Persian
-request creates the 300s bio task through the REAL ProviderManager after a
-malformed first response** (verbatim `ai_instruction`, `آیانامی ری` and
-`زیر 60 کاراکتر` preserved) · exhaustion fails closed with
-`response_shape=malformed`, one attempt per provider, zero fabrication.
-
-**Executed:**
-- `tests/test_provider_structured_output.py` — 15 passed
-- Adjacent suites (8 files: provider mesh, providers, interpretation
-  diagnostics, creation diagnostics, NL creation, semantic triggers,
-  source fidelity) — **221 passed**
-- Full suite — **2060 passed, 24 skipped, 1 failed** — the single failure
-  (`test_40_usage_read_side.py::test_daily_usage_read`, `assert 0 == 40`)
-  is **pre-existing on clean `3ff880a`** (verified via `git stash`:
-  fails identically without this phase's changes) and is unrelated
-  (usage read-side vs provider boundary).
-- `py_compile` on all modified files — OK · `git diff --check` — clean ·
-  zero new regex · zero prompt changes · zero scheduler/executor/guardian/
-  schema changes.
-
-## 6. Boundaries preserved
-
-- **NO DATABASE / SCHEMA CHANGE** (two-table task model untouched).
-- Parser remains **fail-closed**; `_load_candidate_json` untouched; no
-  regex parser introduced; no candidate fabrication.
-- ToolExecutor stays the sole execution authority; AI remains
-  reasoning-only; no second scheduler/executor/router.
-- Bio Guardian untouched; TaskCreationService untouched; provider
-  selection/fallback policy extended only along its existing seams.
-- `supports_json`/`ProviderCapabilities` reused — no duplicate capability
-  abstraction; no provider-specific branch in the interpreter.
-
-## 7. Live verification status
-
-- **Live provider response content: STILL UNOBSERVED** (no credentials in
-  this workspace) — the fix is proven by the production trace's structural
-  metadata plus in-process tests; it is NOT yet live-verified.
-- **Groq JSON-mode capability is EXTERNAL-DOCUMENTATION evidence**
-  (console.groq.com/docs/structured-outputs: `response_format
-  {"type":"json_object"}` JSON Object Mode; availability varies per model
-  and `allam-2-7b` support is NOT verified from source). The repository
-  code now sends the field only to providers that declare the capability;
-  whether `allam-2-7b` honors it will be visible in the next live run:
-  a compliant response removes `candidate_invalid_json`; a provider-side
-  rejection of the field surfaces as `failure_type=request` (transport
-  failure) and still fails over to the next eligible provider.
-- After Render redeploys, ONE reproduction of the exact request settles it:
-  success → task created; failure → the unchanged category token +
-  `AI_TASK_TRACE` lines identify the remaining layer precisely.
-
-## 8. Delivery record
+## 9. Delivery record
 
 | Item | Value |
 |---|---|
-| Base commit | `3ff880a` (== origin/main at phase start) |
-| Implementation commit | `542f85d` |
-| Report commit | follows the implementation commit |
-| Push result | `3ff880a..5d67739 main -> main` |
-| Remote HEAD | verified == local HEAD after push (see below) |
-| Working tree | clean except pre-existing untracked `telegram-self-bot/` |
+| Starting HEAD | `7f28bdbf0a7a3c0878063920a087d8df2915a3c0` (== origin/main at start) |
+| Implementation commit | single `feat:` commit on `main` (see git log) |
+| Report commit | this document is part of the same phase commit |
+| Push result | recorded after push below |
+| Remote HEAD verification | `git fetch origin` + `rev-parse origin/main` executed after push; recorded in the commit message delivery note |
+| Working tree | clean after commit (pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched — unrelated to this phase) |
 
 ---

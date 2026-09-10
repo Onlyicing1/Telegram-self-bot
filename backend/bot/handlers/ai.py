@@ -35,7 +35,9 @@ from backend.helper import (
     register_action,
     register_input,
     render,
+    render_edit,
 )
+from backend.runtime.task_guard import guarded_create_task
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +234,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
                  "_Tap **Provider** to select one._"]
         builder = InlinePanelBuilder()
         builder.add_row("🔄 Select Provider", "panel:ai_provider")
-        builder.add_row("🧪 Test Models", "action:ai_test_models")
+        builder.add_row("Test Modules", "action:ai_test_models")
         _nav_buttons(builder)
         return "AI", "\n".join(lines), builder.build()
 
@@ -272,7 +274,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder.add_buttons(("📈 Usage", "panel:ai_usage"), ("🩺 Health", "panel:ai_health"))
     builder.add_buttons(("🔍 Details", "panel:ai_details"), ("🤖 Model", "panel:ai_model"))
     builder.add_buttons(("🔄 Provider", "panel:ai_provider"), ("⚙️ Settings", "panel:ai_settings"))
-    builder.add_row("🧪 Test Models", "action:ai_test_models")
+    builder.add_row("Test Modules", "action:ai_test_models")
     _nav_buttons(builder)
     return "AI", "\n".join(lines), builder.build()
 
@@ -1209,18 +1211,20 @@ async def _ai_start_chat_action(event, extra: str, chat_id: int) -> tuple[str, s
     ), []
 
 
+# Test Modules status marks — plain Unicode symbols only (no colorful
+# emoji) so the diagnostics view stays monochrome and compact.
 _TEST_STATUS_ICONS: dict[str, str] = {
-    "AVAILABLE": "🟢",
-    "NOT_CONFIGURED": "⚪",
-    "AUTH_ERROR": "🔴",
-    "RATE_LIMITED": "🟠",
-    "TIMEOUT": "🟡",
-    "PROVIDER_ERROR": "🔴",
-    "INVALID_MODEL": "🔵",
-    "BLOCKED": "🚫",
-    "INSUFFICIENT_CREDITS": "💳",
-    "UNKNOWN_ERROR": "❓",
-    "ERROR": "❓",
+    "AVAILABLE": "✓",
+    "NOT_CONFIGURED": "·",
+    "AUTH_ERROR": "×",
+    "RATE_LIMITED": "×",
+    "TIMEOUT": "…",
+    "PROVIDER_ERROR": "×",
+    "INVALID_MODEL": "×",
+    "BLOCKED": "×",
+    "INSUFFICIENT_CREDITS": "×",
+    "UNKNOWN_ERROR": "×",
+    "ERROR": "×",
 }
 
 # Most recent Test Models payload — powers the compact message and the
@@ -1235,39 +1239,22 @@ def _short_model_name(model_id: str) -> str:
     return model_id.split("/")[-1]
 
 
-async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Run the model availability diagnostics inside the existing glass UI.
+def _render_test_results(results_payload: dict) -> tuple[str, list]:
+    """Canonical Test Models results view (body + buttons).
 
-    Uses the same isolated tester as the web dashboard — it never touches
-    conversation history, the active provider configuration, or the DB.
+    Single render path shared by the batch action result and the streaming
+    completion view — the two entry points can never drift apart.
     """
-    from backend.ai.model_tester import test_all_models
-
-    owner_id = await _get_owner_id()
-    try:
-        results_payload = await test_all_models(owner_id=owner_id)
-    except Exception as exc:
-        logger.error("[AI_TRACE] test_models action failed: %s", exc)
-        builder = InlinePanelBuilder()
-        builder.add_row("🔄 Retry", "action:ai_test_models")
-        builder.add_row("Overview", "panel:ai")
-        _nav_buttons(builder)
-        return "🧪 Test Models", f"**🧪 Test Models**\n\n❌ Diagnostic run failed: {exc}", builder.build()
-
-    global _last_test_payload
-    _last_test_payload = results_payload
-
     results = results_payload.get("results", [])
     summary = results_payload.get("summary", {})
 
     def s(key: str, default: int = 0) -> int:
         return summary.get(key, default)
 
-    lines = ["**🧪 Model Tests**\n"]
+    lines = ["**Model Tests**\n"]
     lines.append(
-        f"_Available: {s('available')} · Failed: {s('failed')} · "
-        f"Rate limited: {s('rate_limited')} · Not configured: {s('not_configured')} · "
-        f"Invalid: {s('invalid')} · No credits: {s('insufficient_credits')}_"
+        f"_✓ {s('available')} · × {s('failed')} · × rate {s('rate_limited')} · · not configured {s('not_configured')} · "
+        f"× invalid {s('invalid')} · × no credits {s('insufficient_credits')}_"
     )
     lines.append("")
 
@@ -1281,13 +1268,13 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     )
 
     if usable_sorted:
-        lines.append("**✅ Usable Models**")
+        lines.append("**✓ Usable Models**")
         current_provider = None
         for r in usable_sorted:
             provider = r.get("provider", "?")
             if provider != current_provider:
                 current_provider = provider
-                lines.append(f"🟢 **{r.get('display_name', provider)}**")
+                lines.append(f"◇ **{r.get('display_name', provider)}**")
             lines.append(f"• `{_short_model_name(r.get('model', '?'))}`")
         lines.append("")
     else:
@@ -1296,10 +1283,10 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
 
     failed = [r for r in results if r.get("status") != "AVAILABLE"]
     if failed:
-        lines.append(f"**⚠️ Not usable: {len(failed)}**")
+        lines.append(f"**× Not usable: {len(failed)}**")
         for r in failed[:8]:
             status = r.get("status", "UNKNOWN_ERROR")
-            icon = _TEST_STATUS_ICONS.get(status, "❓")
+            icon = _TEST_STATUS_ICONS.get(status, "×")
             lines.append(f"{icon} `{_short_model_name(r.get('model', '?'))}` — {status}")
         if len(failed) > 8:
             lines.append(f"_…and {len(failed) - 8} more_")
@@ -1310,18 +1297,58 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     builder = InlinePanelBuilder()
     if usable_sorted:
         for r in usable_sorted[:12]:
-            label = f"🟢 {r.get('display_name', r.get('provider', '?'))} — {_short_model_name(r.get('model', '?'))}"
+            label = f"✓ {r.get('display_name', r.get('provider', '?'))} — {_short_model_name(r.get('model', '?'))}"
             latency = r.get("latency_s")
             if latency is not None:
                 label += f" ({latency}s)"
             builder.add_row(label[:64], f"action:ai_pick_model:{r['provider']}:{r['model']}")
-    builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
+    builder.add_row("↻ Re-run Tests", "action:ai_test_models")
     if results:
-        builder.add_row("🔍 All Results", "action:ai_test_details")
-    builder.add_row("🤖 Pick Model", "panel:ai_model")
+        builder.add_row("⌕ All Results", "action:ai_test_details")
+    builder.add_row("≡ Pick Model", "panel:ai_model")
     builder.add_row("Overview", "panel:ai")
     _nav_buttons(builder)
-    return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
+    return "\n".join(lines).rstrip(), builder.build()
+
+
+_test_running = False
+
+
+async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Launch the model availability diagnostics without blocking the panel.
+
+    The run executes in a guarded background task against the SAME isolated
+    tester the web dashboard uses (never conversation history, active config,
+    or the DB). The panel is edited by the throttled progress renderer — at
+    most one progress edit per segment window — and the final view reuses
+    the canonical results renderer below, so both paths stay identical.
+    """
+    global _test_running
+    from backend.bot.handlers import ai_test_progress
+
+    owner_id = await _get_owner_id()
+
+    # One run at a time: the flag spans the whole background run (the handler
+    # returns long before it finishes), so a second tap re-renders the notice
+    # instead of racing a second tester pass.
+    if _test_running:
+        builder = InlinePanelBuilder()
+        builder.add_row("⌂ Home", "panel:_nav:home")
+        return "Test Modules", "◌ Already running — this panel will update when done.", builder.build()
+
+    _test_running = True
+    guarded_create_task(
+        ai_test_progress.run_streaming_test(owner_id, event),
+        name="ai_test_models:run",
+    )
+    builder = InlinePanelBuilder()
+    builder.add_row("⌂ Home", "panel:_nav:home")
+    builder.add_row("Overview", "panel:ai")
+    return (
+        "Test Modules",
+        "… Starting the model test run\n\n_This panel will update with progress and results — no spam._",
+        builder.build(),
+    )
 
 
 async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -1334,11 +1361,11 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
     results = (_last_test_payload or {}).get("results", [])
     if not results:
         builder = InlinePanelBuilder()
-        builder.add_row("🧪 Run Tests", "action:ai_test_models")
+        builder.add_row("Run Tests", "action:ai_test_models")
         _nav_buttons(builder)
-        return "🧪 Test Models", "**🧪 Model Tests**\n\n_No results yet. Tap **Run Tests** first._", builder.build()
+        return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
 
-    lines = ["**🧪 Model Tests — All Results**\n"]
+    lines = ["**All Results**\n"]
     current_provider = None
     for r in sorted(results, key=lambda x: (x.get("provider", ""), x.get("model", ""))):
         provider = r.get("provider", "?")
@@ -1346,7 +1373,7 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
             current_provider = provider
             lines.append(f"**{r.get('display_name', provider)}**")
         status = r.get("status", "UNKNOWN_ERROR")
-        icon = _TEST_STATUS_ICONS.get(status, "❓")
+        icon = _TEST_STATUS_ICONS.get(status, "×")
         model = r.get("model", "?")
         line = f"  {icon} `{model}` — {status}"
         latency = r.get("latency_s")
@@ -1362,10 +1389,10 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
         lines.append("")
 
     builder = InlinePanelBuilder()
-    builder.add_row("🔄 Re-run Tests", "action:ai_test_models")
-    builder.add_row("🤖 Pick Model", "panel:ai_model")
+    builder.add_row("↻ Re-run Tests", "action:ai_test_models")
+    builder.add_row("≡ Pick Model", "panel:ai_model")
     _nav_buttons(builder)
-    return "🧪 Test Models", "\n".join(lines).rstrip(), builder.build()
+    return "Test Modules", "\n".join(lines).rstrip(), builder.build()
 
 
 async def _finish_input(

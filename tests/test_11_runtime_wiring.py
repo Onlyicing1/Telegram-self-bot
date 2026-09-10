@@ -799,16 +799,62 @@ async def test_ai_panel_ready_branch_keeps_all_existing_buttons():
 
 
 @pytest.mark.asyncio
-async def test_ai_test_models_action_renders_results():
+async def test_ai_test_models_action_launches_streaming_run():
     from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
 
-    result = await ai_module._ai_test_models_action(None, "", 0)
-    assert result is not None
-    title, body, buttons = result
-    assert title == "🧪 Test Models"
-    assert "Model Tests" in body
-    datas = _flatten_button_datas(buttons)
-    assert "action:ai_test_models" in datas  # Re-run button
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    with patch.object(
+        ai_test_progress, "test_all_models_streaming",
+        AsyncMock(return_value={"success": True, "results": [], "summary": {}}),
+    ), patch("backend.helper.panels._safe_edit", AsyncMock(return_value=True)) as mock_edit:
+        title, body, buttons = await ai_module._ai_test_models_action(fake_event, "", 0)
+
+        assert title == "Test Modules"
+        # Launch view: async run acknowledged, panel promises a progress update.
+        assert "update" in body.lower()
+        datas = _flatten_button_datas(buttons)
+        assert "panel:_nav:home" in datas
+
+        # Flush the background run INSIDE the patch context: the guarded
+        # task runs to completion (stubbed tester + terminal results edit
+        # through the guardian), so no real network call can leak past the
+        # patches and the running flag is proven cleared.
+        for _ in range(30):
+            await asyncio.sleep(0)
+
+    assert ai_module._test_running is False
+    assert ai_module._last_test_payload.get("success") is True
+    # The terminal results edit was applied exactly once through _safe_edit.
+    assert mock_edit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_test_models_second_tap_while_running_is_rejected():
+    """A second tap while a run is active renders the 'already running'
+    state and never spawns a second tester pass."""
+    from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
+
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    ai_module._test_running = True
+    try:
+        with patch.object(
+            ai_test_progress, "test_all_models_streaming",
+            AsyncMock(return_value={"success": True, "results": [], "summary": {}}),
+        ) as mock_run:
+            title, body, buttons = await ai_module._ai_test_models_action(fake_event, "", 0)
+    finally:
+        ai_module._test_running = False
+
+    assert title == "Test Modules"
+    assert "Already running" in body
+    # The rejected tap did NOT launch a second streaming run.
+    mock_run.assert_not_called()
 
 
 @pytest.mark.asyncio

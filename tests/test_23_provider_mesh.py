@@ -407,6 +407,93 @@ async def test_model_not_found_fails_over_without_retrying_dead_pair():
 
 
 @pytest.mark.asyncio
+async def test_dummy_never_enters_production_candidate_pool():
+    """Dummy is the terminal emergency fallback ONLY: it is never part of
+    the eligible candidate pool (never appended after real candidates,
+    never tried when a real candidate fails, never inflates the pool)."""
+    dead = _StubProvider("dead", [
+        _failure("server down", failure_type="server"),
+        _failure("server down 2", failure_type="server"),
+    ])
+    live = _StubProvider("live", [ProviderResponse(text="ok", provider_name="live", success=True)])
+
+    pm = ProviderManager()
+    pm.register_provider(dead)
+    pm.register_provider(live)
+    pm.switch_provider("dead")
+    pm._fallback_chain = ["live"]
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    # The real backup served the request; dummy was never contacted.
+    assert response.success is True
+    assert response.provider_name == "live"
+    # Bounded attempts only: dead got its single immediate retry (server
+    # failures are retryable), live one attempt — no dummy attempt anywhere.
+    assert dead.calls == 2 and live.calls == 1
+    # Pool inspection: dummy absent from ordered candidates and from the
+    # model-level eligible pool.
+    assert "dummy" not in [n for n, _ in pm._ordered_candidates(include_all=True)]
+    matrix = response.metadata.get("provider_matrix", [])
+    assert all(entry.get("provider") != "dummy" for entry in matrix)
+
+
+@pytest.mark.asyncio
+async def test_dummy_only_terminal_when_all_real_candidates_exhausted():
+    """Exhaustion returns the emergency failure — success=False, never a
+    fake successful answer from dummy, and dummy never inflates the count
+    of real candidates tried."""
+    a = _StubProvider("a", [_failure("down", failure_type="server"), _failure("down", failure_type="server")])
+    b = _StubProvider("b", [_failure("down", failure_type="server"), _failure("down", failure_type="server")])
+
+    pm = ProviderManager()
+    pm.register_provider(a)
+    pm.register_provider(b)
+    pm.switch_provider("a")
+    pm._fallback_chain = ["b"]
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is False
+    assert (response.metadata or {}).get("emergency") is True
+    assert "All AI providers failed" in response.text
+    # Both REAL candidates were tried; no dummy attempt pad the matrix.
+    assert a.calls == 2 and b.calls == 2
+    matrix = response.metadata.get("provider_matrix", [])
+    assert all(entry.get("provider") != "dummy" for entry in matrix)
+
+
+def test_unicode_progress_and_status_marks_only():
+    """Test Modules UI uses plain Unicode marks (▰▱ ✓ × … ◇ ·◌) — no
+    colorful emoji anywhere in the progress or status vocabulary."""
+    from backend.bot.handlers import ai_test_progress
+    from backend.bot.handlers.ai import _TEST_STATUS_ICONS, _render_test_results
+
+    # Exactly five segments at every fill level.
+    for step in range(6):
+        bar = ai_test_progress.render_progress_bar(step / 5)
+        assert len(bar) == 5
+        assert set(bar) <= {"▰", "▱"}
+        assert bar.count("▰") == step
+    # The known statuses and the fallback mark are all plain Unicode.
+    assert set(_TEST_STATUS_ICONS.values()) <= {"✓", "×", "…", "·"}
+    # Emoji sweep across the whole test-modules UI vocabulary.
+    forbidden = "🧪🟢✅⚠️🔄🤖🔍💳🚫🔵🟡🟠🔴⚪❓⚡🧠"
+    payload = {
+        "results": [
+            {"provider": "groq", "display_name": "Groq", "icon": "⚡", "model": "m1",
+             "status": "AVAILABLE", "latency_s": 0.2, "http_status": 200, "error": None},
+        ],
+        "summary": {"available": 1, "failed": 0, "rate_limited": 0, "not_configured": 0,
+                    "invalid": 0, "insufficient_credits": 0},
+    }
+    body, buttons = _render_test_results(payload)
+    assert not any(ch in forbidden for ch in body)
+    labels = [str(getattr(btn, "text", "")) for row in buttons for btn in row]
+    assert not any(any(ch in label for ch in forbidden) for label in labels)
+
+
+@pytest.mark.asyncio
 async def test_empty_response_fails_over_to_next_provider():
     empty = _StubProvider("empty", [
         ProviderResponse(text="", provider_name="empty", success=True),
@@ -616,3 +703,142 @@ async def test_unknown_tool_from_provider_rejected_by_executor():
     assert len(results) == 1
     assert results[0].success is False
     assert results[0].error == "not_found"
+
+
+# ── Model-level candidate pool ──
+
+
+def _json_caps() -> ProviderCapabilities:
+    return ProviderCapabilities(supports_tools=True, supports_function_call=True, supports_json=True)
+
+
+@pytest.mark.asyncio
+async def test_model_pool_fails_over_within_provider_before_next_provider():
+    """A dead (provider, model) candidate pair fails over to the next MODEL
+    of the same provider before any other provider is touched."""
+    flaky = _StubProvider("flaky", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="dead-model"),
+        ProviderResponse(text="ok", provider_name="flaky", success=True),
+    ])
+    other = _StubProvider("other")
+
+    pm = ProviderManager()
+    pm.register_provider(flaky)
+    pm.register_provider(other)
+    pm.switch_provider("flaky")
+    pm.set_model_candidates("flaky", ["dead-model", "live-model"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert response.provider_name == "flaky"
+    assert response.metadata.get("requested_model") == "live-model"
+    assert flaky.calls == 2, "one attempt per (provider, model) candidate"
+    assert other.calls == 0, "a same-provider model must be tried before another provider"
+
+
+@pytest.mark.asyncio
+async def test_model_pool_exhausted_fails_over_to_next_provider():
+    """All model candidates of the active provider fail → the NEXT provider
+    serves the request at model level too."""
+    dead = _StubProvider("dead", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="m1"),
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="m2"),
+    ])
+    backup = _StubProvider("backup", [
+        ProviderResponse(text="ok", provider_name="backup", success=True),
+    ])
+
+    pm = ProviderManager()
+    pm.register_provider(dead)
+    pm.register_provider(backup)
+    pm.switch_provider("dead")
+    pm.set_model_candidates("dead", ["m1", "m2"])
+
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert response.success is True
+    assert response.provider_name == "backup"
+    assert dead.calls == 2
+    assert (response.metadata or {}).get("fallback") is True
+
+
+@pytest.mark.asyncio
+async def test_model_pool_marks_dead_models_unavailable():
+    """A model_not_found candidate is marked (provider, model)-unavailable
+    via its override metadata so later requests skip it immediately."""
+    dead = _StubProvider("dead", [
+        _failure("model not found", http_status=404, failure_type="model_not_found", model="m1"),
+        ProviderResponse(text="ok", provider_name="dead", success=True),
+    ])
+
+    pm = ProviderManager()
+    pm.register_provider(dead)
+    pm.switch_provider("dead")
+    pm.set_model_candidates("dead", ["m1"])
+
+    await pm.chat([{"role": "user", "content": "hi"}])
+
+    assert ("dead", "m1") in pm._unavailable_models
+    # Next request must skip the dead model entirely: one direct success.
+    second = _StubProvider("dead2", [
+        ProviderResponse(text="ok2", provider_name="dead", success=True),
+    ])
+    pm.register_provider(second)  # replaces nothing; same-name lookup is by active
+    pm._registry._providers["dead"] = second
+    response = await pm.chat([{"role": "user", "content": "hi"}])
+    assert response.success is True
+    assert second.calls == 1
+
+
+def test_candidate_models_order_and_bounds():
+    """Configured model first, discovery models after (dedup, empty dropped),
+    bounded by the candidate limit."""
+    from backend.ai.providers.manager.manager import _MODEL_CANDIDATE_LIMIT
+
+    p = _StubProvider("p")
+    p._config = ProviderConfig(provider_name="p", enabled=True, default_model="cfg-model")
+
+    pm = ProviderManager()
+    pm.set_model_candidates("p", ["", "cfg-model", "free-1", "free-2"])
+
+    pool = pm._candidate_models(p)
+    assert pool == ["cfg-model", "free-1", "free-2"]
+
+    pm.set_model_candidates("p", [f"m{i}" for i in range(_MODEL_CANDIDATE_LIMIT + 5)])
+    pool = pm._candidate_models(p)
+    assert len(pool) == _MODEL_CANDIDATE_LIMIT
+    assert pool[0] == "cfg-model"
+
+    pm.set_model_candidates("p", [])
+    assert pm._candidate_models(p) == ["cfg-model"]
+    p._config = ProviderConfig(provider_name="p", enabled=True, default_model="")
+    assert pm._candidate_models(p) == [""]
+
+
+@pytest.mark.asyncio
+async def test_structured_output_validator_fails_over_within_model_pool():
+    """output_validator contract violation on one model fails over to the
+    next candidate (bounded, no cooldown, recorded in the matrix)."""
+    bad = _StubProvider("bad", [
+        ProviderResponse(text="not json at all", provider_name="bad", success=True),
+        ProviderResponse(text='{"ok": true}', provider_name="bad", success=True),
+    ])
+
+    pm = ProviderManager()
+    pm.register_provider(bad)
+    pm.switch_provider("bad")
+    pm.set_model_candidates("bad", ["free-a", "free-b"])
+
+    validator = lambda r: r.text.strip().startswith("{")  # noqa: E731
+    response = await pm.chat(
+        [{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+        output_validator=validator,
+    )
+
+    assert response.success is True
+    assert response.metadata.get("requested_model") == "free-b"
+    matrix = (response.metadata or {}).get("provider_matrix", [])
+    assert any(m.get("outcome") == "malformed_json" for m in matrix)
+    assert bad.calls == 2

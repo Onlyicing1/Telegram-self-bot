@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 
 from backend.ai.model_tester import sanitize_error_message, test_single_model, test_all_models
@@ -213,7 +213,9 @@ async def test_single_model_not_configured_makes_no_request():
 
 
 @pytest.mark.asyncio
-async def test_test_all_models_caps_per_provider_and_filters():
+async def test_test_all_models_covers_full_discovery_and_filters():
+    """No hidden per-provider truncation: EVERY chat-capable candidate is
+    tested, bounded only by the explicit global diagnostic budget."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
 
@@ -242,20 +244,73 @@ async def test_test_all_models_caps_per_provider_and_filters():
          patch("backend.ai.model_tester.test_single_model", new_callable=AsyncMock) as mock_test:
         mock_disc.return_value = fake_providers
         mock_test.side_effect = fake_test
-        data = await test_all_models(owner_id=0, per_model_timeout=0.5, overall_timeout=10, max_per_provider=3)
+        data = await test_all_models(owner_id=0, per_model_timeout=0.5, overall_timeout=10)
 
     results = data["results"]
-    assert len(results) == 6  # 2 providers × max 3
+    # Full candidate coverage: default model + all 20 discovered chat
+    # models per provider (whisper filtered by capability) — far beyond the
+    # old hidden 6-per-provider truncation.
+    assert len(results) == 42
     by_provider: dict[str, list[str]] = {}
     for r in results:
         by_provider.setdefault(r["provider"], []).append(r["model"])
-    assert len(by_provider["openai"]) <= 3
-    assert len(by_provider["groq"]) <= 3
+    assert len(by_provider["openai"]) == 21
+    assert len(by_provider["groq"]) == 21
     all_models = by_provider["openai"] + by_provider["groq"]
     assert all("whisper" not in m and "embedding" not in m for m in all_models)
-    assert data["summary"]["available"] == 6
+    assert data["summary"]["available"] == 42
     assert data["summary"]["discovered"] >= 1
     assert data["summary"]["total"] == len(results)
+
+
+@pytest.mark.asyncio
+async def test_test_all_models_global_budget_is_explicit_not_per_provider():
+    """The ONLY truncation is the explicit global diagnostic budget,
+    applied once to the flat target list (configured model first)."""
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+        ProviderStatus(name="groq", display_name="Groq", env_var="AI_GROQ_API_KEY", status="available", has_key=True, validated=True, default_model="llama-3.3-70b-versatile", base_url="https://api.groq.com/openai/v1", icon="⚡"),
+    ]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        prefix = provider_name
+        return [
+            ModelInfo(id=f"{prefix}-m{i:02d}", name=f"{prefix}-m{i:02d}", provider=provider_name)
+            for i in range(20)
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", new_callable=AsyncMock) as mock_test:
+        mock_disc.return_value = fake_providers
+        mock_test.side_effect = fake_test
+        data = await test_all_models(
+            owner_id=0, per_model_timeout=0.5, overall_timeout=10, global_budget=7,
+        )
+
+    by_provider: dict[str, list[str]] = {}
+    for r in data["results"]:
+        by_provider.setdefault(r["provider"], []).append(r["model"])
+    # Fair distribution: BOTH providers keep their configured/default
+    # model, then the remaining budget is split round-robin — one large
+    # catalog can never push a later provider out of the run.
+    assert "gpt-4o" in by_provider.get("openai", [])
+    assert "llama-3.3-70b-versatile" in by_provider.get("groq", [])
+    assert len(data["results"]) == 7
+    assert len(by_provider.get("openai", [])) == 4
+    assert len(by_provider.get("groq", [])) == 3
 
 
 @pytest.mark.asyncio
@@ -285,6 +340,102 @@ async def test_test_all_models_partial_on_overall_timeout():
     assert data["partial"] is True
     assert any(r["status"] == "TIMEOUT" for r in data["results"])
     assert data["summary"]["timeout"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_twin_covers_full_discovery_and_feeds_candidate_pool():
+    """The streaming tester (Test Modules path) covers the COMPLETE intended
+    candidate set — no 6-per-provider truncation — and one discovery pass
+    feeds the production router's model-level candidate pool."""
+    from backend.ai.discovery import ProviderStatus
+    from backend.ai.model_discovery import ModelInfo
+
+    fake_providers = [
+        ProviderStatus(name="openai", display_name="OpenAI", env_var="AI_OPENAI_API_KEY", status="available", has_key=True, validated=True, default_model="gpt-4o", base_url="https://api.openai.com/v1", icon="🧠"),
+    ]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [
+            ModelInfo(id=f"m{i:02d}", name=f"m{i:02d}", provider=provider_name)
+            for i in range(11)
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return {
+            "provider": provider, "display_name": display, "icon": icon, "model": model,
+            "status": "AVAILABLE", "error": None, "latency_s": 0.1, "http_status": 200,
+            "retry_after": None, "error_type": None, "provider_code": None,
+            "finish_reason": "stop", "capabilities": [],
+        }
+
+    class _FakePM:
+        def __init__(self):
+            self.candidates: dict[str, list[str]] = {}
+
+        def set_model_candidates(self, name, models):
+            self.candidates[name] = models
+
+    class _FakeEngine:
+        provider_manager = _FakePM()
+
+    fake_pm = _FakeEngine.provider_manager
+
+    progress_events: list[tuple[int, int]] = []
+    result_events: list[dict] = []
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as mock_disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=_FakeEngine):
+        mock_disc.return_value = fake_providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(
+            owner_id=0,
+            on_progress=lambda d, t: progress_events.append((d, t)),
+            on_result=lambda item: result_events.append(item),
+        )
+
+    # All 12 candidates tested (configured model + 11 discovered) — the old
+    # hidden 6-per-provider cap would have produced exactly 6.
+    assert len(data["results"]) == 12
+    assert data["summary"]["available"] == 12
+    # Streaming callbacks fired per completion.
+    assert progress_events[-1] == (12, 12)
+    assert len(result_events) == 12
+    # One discovery pass armed the production candidate pool (free-first,
+    # configured model excluded).
+    assert fake_pm.candidates.get("openai") == [f"m{i:02d}" for i in range(11)]
+
+
+@pytest.mark.asyncio
+async def test_streaming_tester_error_path_renders_terminal_failure():
+    """A crashing tester still renders a terminal state and clears the
+    running flag — a failed run can never strand the module in 'running'."""
+    from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_test_progress
+
+    fake_event = MagicMock()
+    fake_event.chat_id = 111
+    fake_event.message_id = 222
+    ai_module._test_running = True
+    try:
+        with patch.object(
+            ai_test_progress, "test_all_models_streaming",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ), patch("backend.helper.panels._safe_edit", AsyncMock(return_value=True)) as mock_edit:
+            await ai_test_progress.run_streaming_test(42, fake_event)
+            for _ in range(30):
+                await asyncio.sleep(0)
+    finally:
+        ai_module._test_running = False
+
+    assert ai_module._test_running is False
+    # Terminal failure view rendered: unicode × mark, no colorful emoji.
+    assert mock_edit.await_count >= 1
+    assert "× Test run failed" in mock_edit.await_args.args[1]
+    assert "🧪" not in mock_edit.await_args.args[1]
 
 
 def test_api_ai_set_model_endpoint():
