@@ -307,4 +307,14 @@ What would confirm the fix in production, in order of value:
 
 ## 16. Delivery record
 
-*(commit + remote verification appended after the push.)*
+| Item | Value |
+|---|---|
+| Implementation commit | `40b57e0d9fc6a21f60b31fddb1c67eb8d12f025a` — `fix: bound the synchronous Supabase resource lifecycle` |
+| Files in commit | `backend/db/client.py`, `backend/ai/database/task_repository.py`, `backend/ai/persistence.py`, `backend/ai/tools/executor.py`, `backend/ai/engine/dispatcher.py`, `backend/ai/runtime/manager.py`, `backend/runtime/supervisor.py`, `tests/test_local_resource_bounds.py`, `IMPLEMENTATION_REPORT.md` |
+| Push | `ec93345..40b57e0  main -> main` (no force) |
+| Local HEAD | `40b57e0d9fc6a21f60b31fddb1c67eb8d12f025a` |
+| `origin/main` | `40b57e0d9fc6a21f60b31fddb1c67eb8d12f025a` |
+| `git ls-remote origin refs/heads/main` | `40b57e0d9fc6a21f60b31fddb1c67eb8d12f025a` |
+| `git rev-list --left-right --count HEAD...origin/main` | `0 0` |
+| Working tree | clean (`git status --short` empty) |
+| Pre-commit checks | `py_compile` OK · `git diff --check` clean · full suite 2186 passed / 24 skipped / 0 failed |
