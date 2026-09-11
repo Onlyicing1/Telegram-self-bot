@@ -12,24 +12,30 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `2551970701900116e56c6dff67aec51600696e48` (`== origin/main` at phase start) |
-| Phase | **NaraRouter discovery visibility** — a configured `AI_NARAROUTER_API_KEY` provider was hidden from the provider/model list |
-| Status | **IMPLEMENTED — full suite green (2164 passed, 24 skipped, 0 failed)** |
+| Starting HEAD | `1edb0e989a45f67aef1e86f01a0016777e82b8db` (`== origin/main` at phase start) |
+| Phase | **NaraRouter probe diagnostic instrumentation** — the discovery fix shipped in `1edb0e9` is preserved unchanged; this phase adds a sanitized probe/classification trace so a live "Invalid Key" report can be explained |
+| Status | **IMPLEMENTED — full suite green (2174 passed, 24 skipped, 0 failed)** |
 | Database impact | **NONE** (no schema, migration, RLS, table, or configuration change) |
-| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §6 |
-| Delivery record | see §7 |
+| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §7 |
+| Delivery record | see §8 |
 
 ---
 
 ## 2. Reported behavior
 
-After setting `AI_NARAROUTER_API_KEY` in the Render environment, the NaraRouter
-provider — and therefore its models — did not appear in the Telegram AI
-provider/model list, even though the key was configured.
+Original report (previous phase): after setting `AI_NARAROUTER_API_KEY` in the
+Render environment, the NaraRouter provider — and therefore its models — did
+not appear in the Telegram AI provider/model list, even though the key was
+configured.
+
+Current report (this phase): NaraRouter now appears in the provider panel but
+**under "Invalid Key"** in the running Render instance. The HTTP status (or
+transport exception) that production actually produced is **not yet known**;
+this phase adds the trace that will reveal it.
 
 ---
 
-## 3. Root cause (source-traced)
+## 3. Root cause (source-traced, previous phase)
 
 NaraRouter is wired end-to-end and was never the missing piece. The first and
 only point where it disappeared was **provider discovery classification**.
@@ -64,7 +70,7 @@ Supporting source facts:
 
 ---
 
-## 4. Exact fix
+## 4. Exact fix (previous phase, preserved unchanged)
 
 `backend/ai/discovery.py` only — no key, base URL, or model value was changed.
 
@@ -85,47 +91,108 @@ rejection is reported as invalid.
 
 ---
 
-## 5. Tests
+## 5. Diagnostic instrumentation (this phase)
 
-`tests/test_nararouter_provider.py` — 8 new tests (all in-process, HTTP mocked):
+**Where "invalid" can come from (re-verified at HEAD).** For chat providers,
+`ProviderStatus.status == "invalid"` is produced in exactly one place:
+`discovery._make_invalid`, and that is reachable only from
+`discovery._classify_probe` when the probe returns 401/403. The "Invalid Key"
+section in `backend/bot/handlers/ai.py` renders exclusively from that status.
+Therefore a live "Invalid Key: NaraRouter" line means either the probe really
+returned 401/403 from the gateway, or the running instance predates `1edb0e9`.
+The trace below distinguishes the two cases without guessing.
 
-| Behavior | Test |
+**Added to `backend/ai/discovery.py` (logging only — classification semantics,
+timeouts, clients, retries, env names, and provider configuration are all
+unchanged).** Each chat-provider probe now emits exactly one INFO line tagged
+`PROVIDER_DISCOVERY_PROBE` (`LOG_LEVEL` default is `INFO`, so it reaches the
+Render logs on every discovery refresh):
+
+| Field | Meaning |
 |---|---|
-| A 200 probe is verified | `test_discovery_verifies_nararouter_on_200` |
-| Redirect / rate limit / 5xx keep the provider listed | `test_non_auth_probe_failure_keeps_nararouter_in_the_provider_list` (`307, 429, 500, 503`) |
-| A real auth rejection is still reported invalid | `test_auth_rejection_marks_nararouter_invalid` (`401, 403`) |
-| A transport failure keeps the provider listed | `test_transport_failure_keeps_nararouter_in_the_provider_list` |
+| `provider` | provider name (e.g. `nararouter`) |
+| `probe_url` | **sanitized** probe URL: scheme, host, port, path only — query string and credentials dropped |
+| `http_status` | the received status code, or `none` when no response arrived |
+| `classification` | `available` / `available_unverified` / `invalid` |
+| `validated` | `True` only for HTTP 200 |
+| `detail` | `probe_ok` · `auth_rejected` · `non_auth_http_status` · `transport_error …` |
+
+For a transport failure the detail additionally carries
+`exc_type=<ExceptionClass>` (the actual failure class, e.g. `ConnectTimeout`,
+`ConnectError`, `OSError`), `cause=<Class>[>Class]…` — the type-only chain of
+`__cause__`/`__context__` (bounded to 4, so the underlying cause that
+determines the failure is visible) — and a bounded, sanitized
+`message='…'`.
+
+**Sanitization guarantees (never logged):** API keys (the exact configured key
+is replaced with `***`; `?…` query strings are replaced with `?<redacted>`,
+covering the Gemini `key=` parameter), Authorization headers, request headers,
+cookies, response bodies, and arbitrary user content. Messages are
+whitespace-collapsed and truncated to 200 characters. Only exception class
+names — never nested exception messages — are traced for the cause chain.
+
+**Reading the trace after deploy:**
+
+| Observed trace | Conclusion |
+|---|---|
+| `http_status=401` / `403`, `classification=invalid`, `detail=auth_rejected` | The gateway genuinely rejected the key; the key/env value is wrong or expired (and the provider panel is behaving correctly). |
+| `http_status=200`, `validated=True` | The probe succeeds; any remaining display issue is elsewhere. |
+| `http_status=<other>`, `classification=available_unverified` | Non-auth outcome; the provider stays listed (post-`1edb0e9` behavior). |
+| `http_status=none`, `detail=transport_error …` | No response arrived; `exc_type`/`cause` identify timeout vs connection/redirect/transport failure. |
+| **No `provider=nararouter` line at all** | The probe never ran — no key was detected in that process (stale env/deploy) or the instance predates `1edb0e9`. |
+
+No claim is made here about the production cause until that trace exists.
 
 ---
 
-## 6. Verification and limitations
+## 6. Tests
+
+`tests/test_nararouter_provider.py` — the 8 discovery tests from the previous
+phase are preserved, plus 10 new instrumentation tests (all in-process, HTTP
+mocked, no live credentials):
+
+| Behavior | Test |
+|---|---|
+| Probe URL/text sanitizers strip credentials and query strings | `test_probe_url_and_text_sanitizers_strip_credentials` |
+| `200` trace: `http_status=200`, `classification=available`, `validated=True`, `detail=probe_ok` | `test_probe_trace_reports_verified_classification` |
+| `401`/`403` trace: `classification=invalid`, `validated=False`, `detail=auth_rejected` | `test_probe_trace_shows_auth_rejection_caused_invalid` |
+| `302`/`429`/`500`/`503` trace: `classification=available_unverified`, `detail=non_auth_http_status` | `test_probe_trace_shows_non_auth_status_available_unverified` |
+| Transport failure trace: `http_status=none`, `exc_type` and nested `cause` classes | `test_probe_trace_shows_transport_exception_type_and_cause` |
+| The API key never appears in the trace (including when an exception message echoes it) | `test_probe_trace_never_contains_credentials` |
+
+---
+
+## 7. Verification and limitations
 
 - `python -m py_compile backend/ai/discovery.py tests/test_nararouter_provider.py` — OK.
 - `git diff --check` — clean.
-- Focused NaraRouter suite — **32 passed**.
-- **Full suite (`pytest tests`): `2164 passed, 24 skipped, 0 failed`**
-  (previous tip: 2156 passed / 24 skipped).
+- Focused NaraRouter suite — **42 passed** (32 before; +10 instrumentation tests).
+- **Full suite (`pytest tests`): `2174 passed, 24 skipped, 0 failed`**
+  (previous tip: 2164 passed / 24 skipped).
+- Diff scope: `backend/ai/discovery.py` + `tests/test_nararouter_provider.py` +
+  this report only.
 
 **Live Render verification: NOT performed.** What remains unverified in
 production:
 
-1. That the NaraRouter provider now appears in the Telegram provider list after
-   a refresh, and its models appear in the model picker.
-2. The exact non-200/exception the Render egress produced for
-   `https://router.bynara.id/v1/models`; the fix is correct for every
-   non-auth outcome (redirect, rate limit, 5xx, timeout, connection error), so
-   this does not affect behavior — it only changes whether `validated` is
-   `True` or `False`.
+1. The exact HTTP status or exception the Render egress produces for
+   `https://router.bynara.id/v1/models`, and therefore which classification the
+   live instance reaches.
+2. That the deployed revision contains `1edb0e9` (the previous phase) and this
+   instrumentation commit.
+
+This phase deliberately does not change classification behavior, so it cannot
+alter the production outcome — it only makes the production outcome observable.
 
 ---
 
-## 7. Delivery record
+## 8. Delivery record
 
 | Item | Value |
 |---|---|
-| Starting HEAD | `2551970701900116e56c6dff67aec51600696e48` (`== origin/main` at start) |
+| Starting HEAD | `1edb0e989a45f67aef1e86f01a0016777e82b8db` (`== origin/main` at start) |
 | Change set | `backend/ai/discovery.py` + `tests/test_nararouter_provider.py` + this report |
-| Commit | `fix: expose configured NaraRouter providers` — pushed to `origin/main`, remote SHA verified after push |
+| Commit | `feat: trace NaraRouter discovery probe classification` — pushed to `origin/main`, remote SHA verified after push |
 | Database impact | NONE |
-| Previous phase (record) | `2551970` — `fix: stop reporting local resource errors as Supabase unavailability` |
-| Live Render / Telegram verification | **NOT performed** — the owner verifies the provider list after refresh |
+| Previous phase (record) | `1edb0e9` — `fix: expose configured NaraRouter providers` |
+| Live Render / Telegram verification | **NOT performed** — the owner reads the `PROVIDER_DISCOVERY_PROBE` line for `nararouter` after the next deploy |

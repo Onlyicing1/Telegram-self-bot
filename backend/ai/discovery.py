@@ -26,15 +26,22 @@ Usage:
     from backend.ai.discovery import discover_providers, get_available_providers
     results = discover_providers()  # list of ProviderStatus
     available = get_available_providers()  # only validated ones
+
+Every chat-provider probe emits exactly one ``PROVIDER_DISCOVERY_PROBE`` log
+line recording the probe URL, the HTTP status (or ``none``), the resulting
+classification, and the ``validated`` flag. The line is sanitized: it never
+contains the API key, request headers, or a response body.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -49,6 +56,20 @@ _validate_lock = asyncio.Lock()
 #: error) is an availability/transport failure — never an invalid key — and
 #: must not remove a configured provider from the provider/model list.
 _AUTH_REJECT_STATUSES = frozenset({401, 403})
+
+#: Grep this tag in the runtime logs to see exactly what a probe returned and
+#: how discovery classified it (status code vs transport failure).
+_PROBE_TRACE_TAG = "PROVIDER_DISCOVERY_PROBE"
+
+#: Sanitized classification labels recorded in the probe trace.
+_CLASSIFIED_AVAILABLE = "available"
+_CLASSIFIED_AVAILABLE_UNVERIFIED = "available_unverified"
+_CLASSIFIED_INVALID = "invalid"
+
+#: URL query string embedded in an untrusted message (Gemini carries its key
+#: as a query parameter, so a transport error may echo it).
+_QUERY_RE = re.compile(r"\?[^\s'\")]+")
+_MAX_TRACE_TEXT = 200
 
 
 @dataclass(frozen=True)
@@ -215,6 +236,67 @@ _PROVIDERS: list[dict[str, Any]] = [
 ]
 
 
+def _sanitize_url(url: str) -> str:
+    """Return a log-safe probe URL: scheme, host, port, and path only.
+
+    Credentials and the query string are dropped.
+    """
+    try:
+        parts = urlsplit(url)
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return "<unparseable-url>"
+    if not parts.scheme or not parts.hostname:
+        return "<unparseable-url>"
+    return f"{parts.scheme}://{parts.hostname}{port}{parts.path}"
+
+
+def _sanitize_text(text: str, secret: str = "") -> str:
+    """Redact a credential and any URL query string, collapse, and truncate."""
+    out = str(text)
+    if secret:
+        out = out.replace(secret, "***")
+    out = _QUERY_RE.sub("?<redacted>", out)
+    return " ".join(out.split())[:_MAX_TRACE_TEXT]
+
+
+def _cause_chain(exc: BaseException) -> str:
+    """Return the class-name chain of an exception's cause/context.
+
+    Only type names are traced — never the nested messages, which are
+    untrusted and may echo transport internals.
+    """
+    names: list[str] = []
+    seen: set[int] = set()
+    cause = exc.__cause__ or exc.__context__
+    while cause is not None and id(cause) not in seen and len(names) < 4:
+        seen.add(id(cause))
+        names.append(type(cause).__name__)
+        cause = cause.__cause__ or cause.__context__
+    return ">".join(names) if names else "none"
+
+
+def _trace_probe(
+    provider: str,
+    probe_url: str,
+    http_status: int | None,
+    classification: str,
+    validated: bool,
+    detail: str,
+) -> None:
+    """Emit the sanitized probe/classification diagnostic trace."""
+    logger.info(
+        "%s provider=%s probe_url=%s http_status=%s classification=%s validated=%s detail=%s",
+        _PROBE_TRACE_TAG,
+        provider,
+        _sanitize_url(probe_url),
+        http_status if http_status is not None else "none",
+        classification,
+        validated,
+        detail,
+    )
+
+
 def _get_env(keys: list[str]) -> str:
     for key in keys:
         val = os.getenv(key, "").strip()
@@ -276,34 +358,59 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
     if status.capability_kind != "chat":
         return _make_available(status)
 
+    if status.name == "gemini":
+        url = f"{status.base_url}/models?key={api_key}&pageSize=1"
+        headers: dict[str, str] = {}
+    else:
+        url = f"{status.base_url}/models"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
     try:
-        if status.name == "gemini":
-            url = f"{status.base_url}/models?key={api_key}&pageSize=1"
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url)
-                return _classify_probe(status, resp.status_code)
-        else:
-            url = f"{status.base_url}/models"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url, headers=headers)
-                return _classify_probe(status, resp.status_code)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+        return _classify_probe(status, resp.status_code, url)
     except Exception as exc:
         # A transport failure (timeout, connection error, ...) says nothing
         # about the key: the provider stays configured and selectable.
+        _trace_probe(
+            status.name,
+            url,
+            None,
+            _CLASSIFIED_AVAILABLE_UNVERIFIED,
+            False,
+            "transport_error "
+            f"exc_type={type(exc).__name__} cause={_cause_chain(exc)} "
+            f"message='{_sanitize_text(exc, api_key)}'",
+        )
         logger.warning(
             "Provider discovery: '%s' probe inconclusive (%s) — keeping it configured",
-            status.name, exc,
+            status.name, _sanitize_text(exc, api_key),
         )
         return _make_available(status, verified=False)
 
 
-def _classify_probe(status: ProviderStatus, http_status: int) -> ProviderStatus:
+def _classify_probe(
+    status: ProviderStatus, http_status: int, url: str = ""
+) -> ProviderStatus:
     """Map a probe HTTP status to a provider status (never a false rejection)."""
     if http_status == 200:
+        _trace_probe(
+            status.name, url, http_status, _CLASSIFIED_AVAILABLE, True, "probe_ok"
+        )
         return _make_available(status)
     if http_status in _AUTH_REJECT_STATUSES:
+        _trace_probe(
+            status.name, url, http_status, _CLASSIFIED_INVALID, False, "auth_rejected"
+        )
         return _make_invalid(status, f"HTTP {http_status}")
+    _trace_probe(
+        status.name,
+        url,
+        http_status,
+        _CLASSIFIED_AVAILABLE_UNVERIFIED,
+        False,
+        "non_auth_http_status",
+    )
     logger.warning(
         "Provider discovery: '%s' probe inconclusive (HTTP %d) — keeping it configured",
         status.name, http_status,

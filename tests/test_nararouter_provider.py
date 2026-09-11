@@ -476,3 +476,130 @@ async def test_transport_failure_keeps_nararouter_in_the_provider_list(monkeypat
     status = await _nararouter_status(monkeypatch, client)
     assert status.status == "available"
     assert status.validated is False
+
+
+# ── Discovery probe diagnostic trace (instrumentation only) ──
+
+
+def _probe_trace(caplog) -> str:
+    """The discovery probe trace lines captured by a test, or ""."""
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "PROVIDER_DISCOVERY_PROBE" in record.getMessage()
+    ]
+    return "\n".join(lines)
+
+
+def _raising(exc: BaseException):
+    def _raiser(*_args, **_kwargs):
+        raise exc
+
+    return _raiser
+
+
+def test_probe_url_and_text_sanitizers_strip_credentials():
+    from backend.ai.discovery import _sanitize_text, _sanitize_url
+
+    assert _sanitize_url("https://router.bynara.id/v1/models") == (
+        "https://router.bynara.id/v1/models"
+    )
+    assert _sanitize_url(
+        "https://generativelanguage.googleapis.com/v1beta/models?key=sk-secret&pageSize=1"
+    ) == "https://generativelanguage.googleapis.com/v1beta/models"
+    assert "sk-secret" not in _sanitize_text("GET https://x/models?key=sk-secret failed")
+    assert "sk-secret" not in _sanitize_text("boom sk-secret", "sk-secret")
+
+
+@pytest.mark.asyncio
+async def test_probe_trace_reports_verified_classification(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        status = await _nararouter_status(monkeypatch, _probe_client(200))
+
+    trace = _probe_trace(caplog)
+    assert "provider=nararouter" in trace
+    assert "probe_url=https://router.bynara.id/v1/models" in trace
+    assert "http_status=200" in trace
+    assert "classification=available" in trace
+    assert "validated=True" in trace
+    assert "detail=probe_ok" in trace
+    assert status.validated is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [401, 403])
+async def test_probe_trace_shows_auth_rejection_caused_invalid(monkeypatch, caplog, code):
+    with caplog.at_level(logging.INFO):
+        status = await _nararouter_status(monkeypatch, _probe_client(code))
+
+    trace = _probe_trace(caplog)
+    assert f"http_status={code}" in trace
+    assert "classification=invalid" in trace
+    assert "validated=False" in trace
+    assert "detail=auth_rejected" in trace
+    assert status.status == "invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [302, 429, 500, 503])
+async def test_probe_trace_shows_non_auth_status_available_unverified(
+    monkeypatch, caplog, code
+):
+    with caplog.at_level(logging.INFO):
+        status = await _nararouter_status(monkeypatch, _probe_client(code))
+
+    trace = _probe_trace(caplog)
+    assert f"http_status={code}" in trace
+    assert "classification=available_unverified" in trace
+    assert "validated=False" in trace
+    assert "detail=non_auth_http_status" in trace
+    assert status.status == "available"
+
+
+@pytest.mark.asyncio
+async def test_probe_trace_shows_transport_exception_type_and_cause(monkeypatch, caplog):
+    exc = OSError("[Errno 11] Resource temporarily unavailable")
+    exc.__cause__ = ConnectionRefusedError("[Errno 111] Connection refused")
+
+    client = AsyncMock()
+    client.get.side_effect = _raising(exc)
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+
+    with caplog.at_level(logging.INFO):
+        status = await _nararouter_status(monkeypatch, client)
+
+    trace = _probe_trace(caplog)
+    assert "http_status=none" in trace
+    assert "classification=available_unverified" in trace
+    assert "validated=False" in trace
+    assert "detail=transport_error" in trace
+    assert "exc_type=OSError" in trace
+    assert "cause=ConnectionRefusedError" in trace
+    assert status.status == "available"
+
+
+@pytest.mark.asyncio
+async def test_probe_trace_never_contains_credentials(monkeypatch, caplog):
+    from backend.ai import discovery
+
+    secret = "sk-nry-super-secret-value"
+    monkeypatch.setenv("AI_NARAROUTER_API_KEY", secret)
+    _clear_discovery_cache()
+
+    failing = AsyncMock()
+    failing.get.side_effect = _raising(RuntimeError(f"upstream rejected {secret}"))
+    failing.__aenter__.return_value = failing
+    failing.__aexit__.return_value = False
+
+    with caplog.at_level(logging.INFO):
+        with patch("backend.ai.discovery.httpx.AsyncClient", return_value=failing):
+            results = await discovery.discover_providers(force_refresh=True)
+    _clear_discovery_cache()
+
+    nararouter = next(r for r in results if r.name == "nararouter")
+    assert nararouter.status == "available"
+    assert secret not in caplog.text
+    assert "***" in caplog.text
+    assert "Authorization" not in caplog.text
+    assert "Bearer" not in caplog.text
