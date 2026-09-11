@@ -261,19 +261,32 @@ class TaskTransitionTool(Tool):
             "deleted": "deleted",
         }
         prefix = "🗑" if str(task.status) == "deleted" else "✅"
-        return ToolResult(
-            success=True,
-            message=(
-                f"{prefix} Task #{task.id} "
-                f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
-                f"· version {task.version}."
-            ),
-            data={
-                "task_id": int(task.id),
-                "status": str(task.status),
-                "version": int(task.version),
-            },
+        message = (
+            f"{prefix} Task #{task.id} "
+            f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
+            f"· version {task.version}."
         )
+        data = {
+            "task_id": int(task.id),
+            "status": str(task.status),
+            "version": int(task.version),
+        }
+        # A degraded write is NOT a durable write — mirror the create path:
+        # the transition still succeeds through the shared in-memory fallback,
+        # but the owner must never be told the change is persisted when the
+        # durable store never received it (a later healthy read or a restart
+        # reverts it). The repository annotates the record via
+        # _annotate_fallback exactly when its Supabase update degraded.
+        fallback_backend = str(getattr(task, "fallback_backend", "") or "")
+        if fallback_backend:
+            from backend.ai.task_management_interface import FALLBACK_NOTE
+
+            message = f"{message}\n\n{FALLBACK_NOTE}"
+            data["durable"] = False
+            data["fallback_backend"] = fallback_backend
+        else:
+            data["durable"] = True
+        return ToolResult(success=True, message=message, data=data)
 
 
 def _coerce_positive_int(value: Any) -> int | None:

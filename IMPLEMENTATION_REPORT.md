@@ -12,9 +12,9 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `bf1eee543f32bbca0d1985d3bf91d777ac93ea60` (== `origin/main` at phase start) |
-| Phase | **"Task #N created" but absent from the very next task list** — degraded-store (in-memory fallback) creation reported as a durable success, a double read in `task_list`, and a non-authoritative `task_list` response |
-| Status | **IMPLEMENTED — full suite green (2101 passed, 24 skipped, 0 failed)** |
+| Starting HEAD | `9b4af95e2b74c249bd0771515585ae90cb1f9cb1` (== `origin/main` at phase start) |
+| Phase | **Degraded task-transition honesty** — a `task_transition` whose Supabase update degraded into the in-memory fallback was still reported as a plain durable success (the same false-persistence class fixed for `create_task` in the previous phase) |
+| Status | **IMPLEMENTED — full suite green (2103 passed, 24 skipped, 0 failed)** |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
 | Live verification | **NOT performed** (no credentials in this workspace) — see §7 |
 | Delivery record | see §8 |
@@ -111,7 +111,7 @@ removed*" over a fresh tool result that said otherwise.
   `task_count`, `task_ids`, and `fallback_active` from that same snapshot —
   identical content, count, and marker by construction.
 
-### 3.2 A non-durable creation can no longer look durable (`backend/ai/tools/task.py`)
+### 3.2 A non-durable creation can no longer look durable (`backend/ai/tools/task.py`) — and neither can a non-durable transition (`.../task_management_tools.py`)
 
 When the created record came from the in-memory fallback
 (`fallback_backend` set), the tool result now says so:
@@ -127,6 +127,26 @@ plus `data = {..., "durable": false, "fallback_backend": "InMemoryTaskRepository
 A durable creation carries `"durable": true` and no note. The graceful
 fallback architecture is preserved — creation still succeeds — but the owner
 is never told a memory-only task is persisted.
+
+**Current-phase extension (same class, sibling path):** the sweep for further
+instances of this defect class found `TaskTransitionTool` (pause / resume /
+complete / delete) reporting a degraded update as a plain durable success:
+`SupabaseTaskRepository.update_task` degrades through `_annotate_fallback`
+exactly like `create_task`, but the tool never checked the annotation. The
+tool now applies the identical contract: `fallback_backend` set → append the
+shared `FALLBACK_NOTE` and report `"durable": false`; otherwise
+`"durable": true` with no note. The honest-failure semantics the tests
+exposed are preserved: when the durable task is not (yet) in the fallback
+(a durable task whose update fails outright cannot be mirrored into an empty
+fallback), the repository returns `None` and the tool still says "nothing
+was changed" — that was already correct and is unchanged.
+
+Verified non-defects on the same class: `TaskInspectTool`/`inspect_text`
+render the degraded marker from the live repository state at render time
+(single read, no second store possible); `TaskManagementService.counts()` is
+diagnostic-only with no user-facing durability claim; `advance_next_run`
+(scheduler-internal) degrades inside the same repository and is re-proven by
+the restart-safe occurrence contract rather than by a user-facing message.
 
 ### 3.3 `task_list` is now response-authoritative (`backend/ai/engine/dispatcher.py`)
 
@@ -182,6 +202,8 @@ it end-to-end (§7).
 | G — `task_count` matches the returned/rendered ids | `test_task_count_matches_returned_ids_in_one_snapshot` |
 | Live root cause — a memory-only creation is reported honestly | `test_non_durable_creation_is_reported_honestly` (drives the REAL `CreateTaskTool` with a degrading repo: `durable=False`, note present, fresh local id ≠ durable `#27`, and the durable read cannot see the task) |
 | Healthy path — a durable creation is reported and listed as durable | `test_durable_creation_is_reported_and_listed_as_durable` |
+| H — a degraded transition is honest, never durable-looking | `test_non_durable_transition_is_reported_honestly` (task created during a degraded window lives only in the fallback; a further degraded pause reports `durable=False` + note; after recovery the durable store proves the pause never landed) |
+| H — a healthy transition reports durable | `test_durable_transition_is_reported_as_durable` |
 
 Test-double update: `tests/test_stage10.py::PresentationService` gained
 `snapshot()` to mirror the real service contract (presentation assertions
@@ -229,17 +251,16 @@ memory-fallback view.
 - Focused suites: task-list consistency, stage10 presentation, task hardening,
   task management, task repository, taskloom UI/milestone, tool health audit,
   current-bio determinism — **all green**.
-- **Full suite: `2101 passed, 24 skipped, 0 failed`** (previous tip: 2090
-  passed, +11 new tests; one presentation test double updated).
+- **Full suite: `2103 passed, 24 skipped, 0 failed`** (previous tip: 2101
+  passed, +2 new tests for the transition-honesty contract).
 - `python -m py_compile` on every changed Python file — OK.
 - `git diff --check` — clean.
 
 | Item | Value |
 |---|---|
-| Starting HEAD | `bf1eee543f32bbca0d1985d3bf91d777ac93ea60` (== origin/main at start) |
-| Change commit | `56b5e2c36c7c98ba33a8078640fa000519c6643f` — `fix: keep the task list authoritative and never report a memory-only creation as durable` (8 files) |
-| Push result | `bf1eee5..56b5e2c  main -> main` (exit 0) |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `56b5e2c36c7c98ba33a8078640fa000519c6643f` == local HEAD; `git show --stat origin/main` lists exactly the 8 phase files |
+| Starting HEAD | `9b4af95e2b74c249bd0771515585ae90cb1f9cb1` (== origin/main at start) |
+| Change commit | _this phase_ — `fix: report a degraded task transition as non-durable` (2 files: `backend/ai/tools/task_management_tools.py`, `tests/test_task_list_consistency.py`) |
+| Previous phase (record) | `56b5e2c36c7c98ba33a8078640fa000519c6643f` — `fix: keep the task list authoritative and never report a memory-only creation as durable` (8 files); pushed `bf1eee5..56b5e2c`, remote HEAD verified |
 | Report commit | _this commit_ (delivery record update) |
 | Working tree | pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched |
 | Live Telegram verification | **NOT performed** (no credentials in this workspace) |

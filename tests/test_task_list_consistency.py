@@ -115,6 +115,8 @@ class _FakeQuery:
         self.client.last_query = self
         if self.operation == "insert" and self.client.fail_insert:
             raise RuntimeError("insert unavailable")
+        if self.operation == "update" and self.client.fail_update:
+            raise RuntimeError("update unavailable")
         if self.operation == "select" and self.client.fail_select:
             raise RuntimeError("read unavailable")
         if self.operation == "select" and self.client.fail_select_times > 0:
@@ -148,7 +150,7 @@ class _FakeQuery:
 
 class _FakeClient:
     def __init__(self, task_rows=None, fail_insert=False, fail_select=False,
-                 fail_select_times=0):
+                 fail_select_times=0, fail_update=False):
         self.rows = {
             "ai_tasks": [dict(r) for r in (task_rows or [])],
             "ai_task_occurrences": [],
@@ -159,6 +161,7 @@ class _FakeClient:
         # Fail only the next N reads (models a transient outage that recovers
         # between two reads of the same logical list request).
         self.fail_select_times = fail_select_times
+        self.fail_update = fail_update
         self.last_query = None
 
     def table(self, name):
@@ -609,3 +612,69 @@ async def test_durable_creation_is_reported_and_listed_as_durable():
     assert listed.data["task_count"] == 2
     assert listed.data["fallback_active"] is False
     assert f"Task #{result.data['task_id']}" in listed.message
+
+
+# ── H: a degraded transition is reported honestly, never as durable ─────────
+
+
+async def _pause_via_tool(repo, task_id, version):
+    from backend.ai.tools.task_management_tools import TaskTransitionTool
+
+    ctx = ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC", extra={})
+    with patch.object(dbm, "get_repository_manager", return_value=_manager(repo)):
+        return await TaskTransitionTool(ctx).execute(
+            ctx,
+            {"task_id": task_id, "action": "paused", "expected_version": version},
+        )
+
+
+@pytest.mark.asyncio
+async def test_non_durable_transition_is_reported_honestly():
+    """Sibling of the create-path root cause: a Supabase update that degrades
+    into the in-memory fallback must say so, exactly like a degraded create.
+
+    A pause that only landed in memory is silently reverted by the next healthy
+    durable read or a restart — reporting it as a plain durable success is the
+    same false persistence claim this file exists to prevent.
+    """
+    client = _FakeClient([row_task(label="durable old task")], fail_insert=True)
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    created = await _create_task_via_tool(repo, "هر 5 دقیقه بنویس سلام", _candidate_json())
+    assert created.data["durable"] is False  # task lives ONLY in the fallback
+    task_id = created.data["task_id"]
+
+    # Supabase stays degraded: the read serves the fallback copy, the write
+    # degrades into the same fallback — and the result must not look durable.
+    client.fail_select = True
+    client.fail_update = True
+    result = await _pause_via_tool(repo, task_id, 1)
+
+    assert result.success is True  # the fallback architecture still succeeds
+    assert result.data["durable"] is False
+    assert result.data["fallback_backend"] == "InMemoryTaskRepository"
+    assert FALLBACK_NOTE in result.message
+    assert result.data["status"] == "paused"
+
+    # Once Supabase recovers, a healthy durable read proves the pause was
+    # never durable: the durable store never saw the task at all.
+    client.fail_select = False
+    client.fail_update = False
+    durable = await TaskManagementService(repo, OWNER).snapshot()
+    assert durable.fallback_active is False
+    assert [t.label for t in durable.tasks] == ["durable old task"]
+
+
+@pytest.mark.asyncio
+async def test_durable_transition_is_reported_as_durable():
+    """A healthy Supabase update is reported durable with no fallback note."""
+    client = _FakeClient([row_task(label="bio task")])
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+
+    result = await _pause_via_tool(repo, 27, 1)
+
+    assert result.success is True
+    assert result.data["durable"] is True
+    assert "fallback_backend" not in result.data
+    assert FALLBACK_NOTE not in result.message
+    assert result.data["status"] == "paused"
+    assert result.data["version"] == 2
