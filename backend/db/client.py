@@ -6,21 +6,28 @@ vars are missing or the connection fails, all operations degrade to
 in-memory storage so the bot never crashes.
 
 CRITICAL: All public functions that touch Supabase are async and run
-the synchronous HTTP calls via asyncio.to_thread() with a bounded
-timeout. The supabase-py library uses httpx synchronously — calling
-db.table(...).execute() directly in an asyncio coroutine blocks the
-entire event loop until the HTTP response arrives. If the Supabase
-REST API is slow or the TCP connection stalls, the whole runtime
-freezes (no commands, no heartbeat, no bio updates).
+the synchronous HTTP calls on one bounded, reusable worker pool
+(``run_sync_db``) with a bounded timeout. The supabase-py library uses
+httpx synchronously — calling db.table(...).execute() directly in an
+asyncio coroutine blocks the entire event loop until the HTTP response
+arrives. If the Supabase REST API is slow or the TCP connection stalls,
+the whole runtime freezes (no commands, no heartbeat, no bio updates).
 
-By running each DB operation in a thread with a timeout, the event
-loop stays responsive even when Supabase is slow or unreachable.
+By running each DB operation on that bounded pool with a timeout the
+event loop stays responsive — and the process's Supabase concurrency,
+and the sockets the one shared client must keep alive, stay bounded —
+even when Supabase is slow or unreachable. The transport's own deadline
+is pinned below the dispatch budget so a slow call can never pin a
+worker thread longer than the application is willing to wait.
 """
 import asyncio
+import functools
 import logging
 import os
 import random
 import string
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from backend.diagnostics import record_event
@@ -38,6 +45,24 @@ _SHORT_CODE_NUM_LEN = 4
 _SHORT_CODE_ALPHABET = string.ascii_uppercase + string.digits
 
 _DB_TIMEOUT = 10.0
+
+# The Supabase HTTP transport's OWN deadline. It must be strictly shorter than
+# ``_DB_TIMEOUT``: the watchdog abandons the awaiting coroutine at
+# ``_DB_TIMEOUT``, but a thread blocked inside a synchronous HTTP call cannot be
+# cancelled — only the transport deadline releases it. supabase-py defaults the
+# postgrest client to a 120s timeout, so without this override a slow call kept
+# a worker thread and its pooled connection pinned twelve times longer than the
+# application was ever willing to wait, and every abandoned call pushed the next
+# one onto a new thread and a new socket.
+_DB_HTTP_TIMEOUT = 8.0
+
+# The one bounded pool for synchronous Supabase work. Threads are reused across
+# calls, so concurrent Supabase calls — and the number of sockets the single
+# shared httpx client must keep alive — stay bounded no matter how many callers
+# (DB layer, task repository, AI persistence) are active.
+_DB_MAX_WORKERS = 4
+_db_executor: ThreadPoolExecutor | None = None
+_db_executor_lock = threading.Lock()
 
 
 def _check_available() -> bool:
@@ -58,10 +83,13 @@ def get_db():
         return None
 
     try:
-        from supabase import create_client
+        from supabase import ClientOptions, create_client
+        # The transport deadline is pinned to the application's own dispatch
+        # budget so no synchronous call can outlive the operation that owns it.
         _client = create_client(
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            ClientOptions(postgrest_client_timeout=_DB_HTTP_TIMEOUT),
         )
         _available = True
         logger.info("[SAVE_DB] Supabase client initialised.")
@@ -76,21 +104,59 @@ def is_available() -> bool:
     return _available
 
 
-async def _run_sync(fn, *args, **kwargs):
-    """Run a synchronous DB function in a thread with a bounded timeout.
+def _get_db_executor() -> ThreadPoolExecutor:
+    """Return the one bounded pool used for synchronous Supabase work."""
+    global _db_executor
+    executor = _db_executor
+    if executor is None:
+        with _db_executor_lock:
+            if _db_executor is None:
+                _db_executor = ThreadPoolExecutor(
+                    max_workers=_DB_MAX_WORKERS,
+                    thread_name_prefix="lifeos-supabase",
+                )
+            executor = _db_executor
+    return executor
 
-    Uses the centralized operation watchdog so that stuck DB operations
-    emit structured OP_TIMEOUT diagnostics (operation name, elapsed time,
-    runtime state, client generation) instead of dying silently.
+
+async def run_sync_db(fn, *args, timeout=_DB_TIMEOUT, **kwargs):
+    """The ONE bounded dispatch for synchronous Supabase HTTP work.
+
+    ``asyncio.to_thread`` draws a fresh worker from the event loop's shared
+    default executor, which every other subsystem also uses, and applies no
+    bound of its own — a burst of DB, task and persistence calls could occupy an
+    unbounded share of that pool and keep that many sockets alive on the one
+    shared client. Supabase work therefore goes through this single bounded,
+    reusable pool instead. Uses the centralized operation watchdog so a stuck
+    operation emits structured OP_TIMEOUT diagnostics instead of dying silently.
     """
     from backend.runtime.operation_watchdog import guarded_await
 
     op_name = getattr(fn, "__name__", "db_unknown")
-    return await guarded_await(
-        asyncio.to_thread(fn, *args, **kwargs),
-        name=f"db:{op_name}",
-        timeout=_DB_TIMEOUT,
+    loop = asyncio.get_running_loop()
+    coro = loop.run_in_executor(
+        _get_db_executor(), functools.partial(fn, *args, **kwargs)
     )
+    return await guarded_await(coro, name=f"db:{op_name}", timeout=timeout)
+
+
+async def _run_sync(fn, *args, **kwargs):
+    """Run a synchronous DB function on the bounded Supabase pool."""
+    return await run_sync_db(fn, *args, **kwargs)
+
+
+def shutdown_db_executor() -> None:
+    """Release the bounded Supabase pool (deterministic shutdown only).
+
+    Threads blocked inside the HTTP transport cannot be interrupted, but the
+    transport deadline guarantees they return, so shutdown does not wait.
+    """
+    global _db_executor
+    executor = _db_executor
+    if executor is None:
+        return
+    _db_executor = None
+    executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ── bot_logs ──

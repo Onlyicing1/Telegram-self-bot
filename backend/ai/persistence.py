@@ -6,8 +6,11 @@ When Supabase is available, conversation history and memories persist
 across restarts. When unavailable, falls back to in-memory storage.
 
 This module provides thin async wrappers that run synchronous
-supabase-py calls via asyncio.to_thread with bounded timeouts,
-matching the pattern in backend/db/client.py.
+supabase-py calls on the bounded shared pool owned by
+backend/db/client.py (``run_sync_db``). ``schedule_audit`` is the only
+way best-effort audit writes are dispatched: it bounds the number of
+in-flight records so audit persistence can never accumulate without
+limit behind the primary execution path.
 """
 from __future__ import annotations
 
@@ -27,10 +30,64 @@ def _get_db():
 
 
 async def _run_sync(fn, *args, **kwargs):
-    return await asyncio.wait_for(
-        asyncio.to_thread(fn, *args, **kwargs),
-        timeout=_DB_TIMEOUT,
-    )
+    # The same single bounded Supabase pool the DB and task layers use, so audit
+    # writes share one bounded resource instead of each drawing its own worker.
+    from backend.db.client import run_sync_db
+    return await run_sync_db(fn, *args, timeout=_DB_TIMEOUT, **kwargs)
+
+
+# Best-effort audit persistence must never multiply without bound: every
+# in-flight record holds a worker thread and a pooled Supabase connection for
+# the whole HTTP round trip. The primary execution path must stay non-blocking,
+# so saturation drops the record (counted and logged) instead of queueing it.
+_AUDIT_MAX_INFLIGHT = 8
+_audit_inflight = 0
+_audit_dropped = 0
+
+
+def audit_inflight() -> int:
+    """Number of audit persistence records currently in flight."""
+    return _audit_inflight
+
+
+def audit_dropped() -> int:
+    """Number of audit records dropped because the in-flight bound was full."""
+    return _audit_dropped
+
+
+def schedule_audit(factory, *, name: str) -> bool:
+    """Schedule one best-effort audit coroutine under a hard in-flight bound.
+
+    ``factory`` is a zero-arg callable returning a FRESH coroutine, so a record
+    dropped for saturation never leaves an unawaited coroutine behind. Returns
+    True only when the coroutine was actually scheduled; a failure to schedule
+    is never raised at the caller.
+    """
+    global _audit_inflight, _audit_dropped
+    if _audit_inflight >= _AUDIT_MAX_INFLIGHT:
+        _audit_dropped += 1
+        logger.warning(
+            "AI audit persistence saturated — dropped record name=%s inflight=%d dropped_total=%d",
+            name, _audit_inflight, _audit_dropped,
+        )
+        return False
+    _audit_inflight += 1
+
+    async def _runner() -> None:
+        global _audit_inflight
+        try:
+            await factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - audit must never crash
+            logger.warning("AI audit persistence failed name=%s: %r", name, exc)
+        finally:
+            _audit_inflight -= 1
+
+    # Resolved at call time so the guard stays patchable by existing tests.
+    from backend.runtime.task_guard import guarded_create_task
+    guarded_create_task(_runner(), name=name)
+    return True
 
 
 # ── Session persistence ──

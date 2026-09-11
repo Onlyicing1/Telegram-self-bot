@@ -1104,9 +1104,10 @@ class Dispatcher:
         """Persist the normalized execution record exactly once, off the loop.
 
         Mirrors the message/tool-history persistence convention
-        (``guarded_create_task``): the async recorder runs the sync repository
-        writes in a worker thread with a bounded timeout, and failures are
-        logged — never raised, never affecting the AI response or telemetry.
+        (``persistence.schedule_audit``): the async recorder runs the sync
+        repository writes in a bounded worker thread with a bounded timeout
+        and a bounded number of in-flight records, and failures are logged —
+        never raised, never affecting the AI response or telemetry.
         """
         if record is None:
             return
@@ -1118,10 +1119,10 @@ class Dispatcher:
         except RuntimeError:
             return
         try:
+            from backend.ai import persistence
             from backend.ai.database.usage_recorder import record_usage
-            from backend.runtime.task_guard import guarded_create_task
-            guarded_create_task(
-                record_usage(record, session_id=session_id),
+            persistence.schedule_audit(
+                lambda: record_usage(record, session_id=session_id),
                 name="ai:persist-usage",
             )
         except Exception as exc:  # noqa: BLE001

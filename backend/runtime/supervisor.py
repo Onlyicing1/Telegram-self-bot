@@ -961,6 +961,12 @@ class RuntimeSupervisor:
         await stop_diagnostics()
         await stop_memory_cleanup()
 
+        # Release the bounded Supabase pool that every DB, task and audit
+        # dispatch runs on. A later caller re-creates it lazily, so no
+        # in-flight persistence path can observe a shut-down executor.
+        from backend.db.client import shutdown_db_executor
+        shutdown_db_executor()
+
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
             try:

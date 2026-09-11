@@ -12,187 +12,299 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `1edb0e989a45f67aef1e86f01a0016777e82b8db` (`== origin/main` at phase start) |
-| Phase | **NaraRouter probe diagnostic instrumentation** — the discovery fix shipped in `1edb0e9` is preserved unchanged; this phase adds a sanitized probe/classification trace so a live "Invalid Key" report can be explained |
-| Status | **IMPLEMENTED — full suite green (2174 passed, 24 skipped, 0 failed)** |
-| Database impact | **NONE** (no schema, migration, RLS, table, or configuration change) |
-| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §7 |
-| Delivery record | see §8 |
+| Starting HEAD | `ec933458546d21b2eca7d9ce6aa15016ac435a3d` (`== origin/main` at phase start) |
+| Phase | **Bounded synchronous-Supabase resource lifecycle** — the previous phase's truthful classification is preserved unchanged; this phase bounds the resource that produced the local `EAGAIN` |
+| Status | **IMPLEMENTED — full suite green (2186 passed, 24 skipped, 0 failed)** |
+| Database impact | **NONE** (no schema, migration, RLS, table, index, or migration change; no SQL file touched) |
+| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §14 |
+| Delivery record | see §16 |
 
 ---
 
-## 2. Reported behavior
+## 2. Production symptoms (as reported)
 
-Original report (previous phase): after setting `AI_NARAROUTER_API_KEY` in the
-Render environment, the NaraRouter provider — and therefore its models — did
-not appear in the Telegram AI provider/model list, even though the key was
-configured.
+1. `TASK_FALLBACK_CLASSIFIED reason=local_resource exception=ReadError message=[Errno 11] Resource temporarily unavailable` on Supabase task/occurrence reads.
+2. `AI record_tool_call failed: [Errno 11] Resource temporarily unavailable`.
+3. `Supabase occurrence read failed; using fallback: [Errno 11] Resource temporarily unavailable`.
+4. In the **same** process, ~0.5s earlier: `TASK_OCCURRENCE_PERSIST_CREATE_SUCCESS repository=SupabaseTaskRepository occurrence_id=27`.
 
-Current report (this phase): NaraRouter now appears in the provider panel but
-**under "Invalid Key"** in the running Render instance. The HTTP status (or
-transport exception) that production actually produced is **not yet known**;
-this phase adds the trace that will reveal it.
-
----
-
-## 3. Root cause (source-traced, previous phase)
-
-NaraRouter is wired end-to-end and was never the missing piece. The first and
-only point where it disappeared was **provider discovery classification**.
-
-1. `backend/ai/discovery.py::_PROVIDERS` declares `nararouter` with
-   `env_vars = ["AI_NARAROUTER_API_KEY", "NARAROUTER_API_KEY"]`, default base URL
-   `https://router.bynara.id/v1`, and default model `deepseek-v4-flash`.
-2. `_scan_provider` detects the key and returns status `"detected"`.
-3. `_validate_provider` probes `GET {base_url}/models` with `Bearer` auth. The
-   client is created **without** `follow_redirects`, and httpx defaults
-   `follow_redirects=False` (verified in this workspace).
-4. **Old** classification: any status other than `200` → `_make_invalid`; any
-   exception (timeout, connection error, ...) → `_make_invalid`. Nothing
-   distinguished a genuine auth rejection from a redirect, rate limit, server
-   error, or transport failure.
-5. `backend/bot/handlers/ai.py::_ai_provider_panel_handler` renders selectable
-   rows **only** for `status == "available"`; `invalid` providers are listed
-   separately under "Invalid Key" with no selection row.
-
-So a configured key whose `/models` probe could not complete cleanly was
-reported as a bad key and removed from the selectable provider list — the exact
-reported symptom. Everything downstream (factory `_ENV_KEY_MAP` /
-`_ENV_MODEL_MAP` / `_ENV_BASE_URL_MAP`, `_PROVIDER_DEFAULTS`, the model
-fallback catalog, the display-name map) already registered NaraRouter.
-
-Supporting source facts:
-
-- `GET https://router.bynara.id/v1/models` returns **401** unauthenticated —
-  the endpoint exists and requires auth; a 200 is expected only for a valid key.
-- httpx `AsyncClient` default `follow_redirects=False` — a 3xx from the gateway
-  was therefore surfaced as `status_code=3xx` and misread as an invalid key.
+The same runtime sample simultaneously showed a **healthy** Telegram side
+(`Last update: 0.3s ago`, `Last Telethon event: 0.1s ago`,
+`KEEPALIVE_OK latency_ms=171.2`). Supabase was therefore **not** down, and the
+event loop was **not** stalled. The failures were local to the process's own
+synchronous HTTP sockets.
 
 ---
 
-## 4. Exact fix (previous phase, preserved unchanged)
+## 3. Exact root cause
 
-`backend/ai/discovery.py` only — no key, base URL, or model value was changed.
+Two provable resource-lifecycle defects existed on the **one** shared
+synchronous Supabase client. Neither is a Supabase problem, and together they
+turned an occasional slow call into recurring local socket failures.
 
-- Added `_AUTH_REJECT_STATUSES = frozenset({401, 403})` — the only probe
-  outcomes that genuinely mean "this key is rejected".
-- Added `_classify_probe(status, http_status)`:
-  - `200` → `available`, `validated=True`;
-  - `401`/`403` → `invalid` (the owner must fix the key);
-  - every other status → `available`, `validated=False`.
-- `_validate_provider`'s `except Exception` path now keeps the provider
-  `available` with `validated=False` instead of marking it `invalid`.
-- `_make_available(status, verified: bool = True)` propagates the honest
-  "probe could not confirm" signal through `ProviderStatus.validated`, so the
-  provider stays visible and selectable without claiming verification.
+**(a) The transport deadline was ~15× the application's own dispatch budget.**
+The single shared client was created with `create_client(url, key)` and no
+options, so it inherited **supabase-py's postgrest default of 120s**
+(`postgrest/constants.py: DEFAULT_POSTGREST_CLIENT_TIMEOUT = 120`). Every
+caller, however, abandons and degrades at **10s** (`backend/db/client._DB_TIMEOUT`,
+`task_repository.DB_TIMEOUT`, `persistence._DB_TIMEOUT`).
 
-The fallback/degradation semantics are unchanged: only a real authentication
-rejection is reported as invalid.
+A worker thread blocked inside a synchronous `recv()` **cannot be cancelled** —
+`asyncio.wait_for` only abandons the awaiting coroutine. So on every slow store
+the thread stayed inside the socket call for up to **120s**, holding its pooled
+connection, long after the application had given up. Each new dispatch was then
+pushed onto a fresh worker and a fresh connection, so a slow store increased
+live socket/thread usage instead of shedding it.
+
+**(b) Nothing bounded concurrent synchronous Supabase dispatch, and the audit
+path fanned out without limit.** `backend/db/client._run_sync`,
+`SupabaseTaskRepository._run`/`_run_checked` and `persistence._run_sync` each
+called `asyncio.to_thread`, drawing from the event loop's **shared default
+executor** (`max_workers = min(32, cpu_count + 4)` — measured as **32** in this
+workspace) which every other subsystem also uses, with no cap of its own.
+`ToolExecutor`, the dispatcher and the conversation manager additionally created
+**one unmanaged background task per tool call / AI request / message**, and
+nothing counted how many audit writes were in flight.
+
+**Proven error shape.** `httpcore`'s sync socket layer maps *any* `OSError` from
+`recv()` to `ReadError` (`httpcore/_backends/sync.py:` `exc_map = {socket.timeout: ReadTimeout, OSError: ReadError}`).
+A `BlockingIOError` with `errno == EAGAIN` renders as exactly
+`[Errno 11] Resource temporarily unavailable`. Reproduced in-process:
+
+```
+A) recv on a non-blocking socket -> ('BlockingIOError', 11, '[Errno 11] Resource temporarily unavailable')
+```
+
+That matches the production `exception=ReadError message=[Errno 11] Resource
+temporarily unavailable` byte for byte, and confirms the previous phase's
+classification: a **local OS socket-layer condition**, not a store outage.
+
+**What is NOT proven here.** The exact upstream trigger that leaves a socket in
+that state at that instant (a socket-timeout race on a shared connection, an
+fd reused after a leaked client closed it, or plain kernel/conntrack pressure on
+the Render instance) is not determinable from source alone. This phase therefore
+fixes the defect that is **proven** — unbounded retention and amplification of
+socket/thread resources on the one shared client — rather than guessing at the
+trigger. See §14 for the exact live evidence still required.
 
 ---
 
-## 5. Diagnostic instrumentation (this phase)
+## 4. Evidence from source
 
-**Where "invalid" can come from (re-verified at HEAD).** For chat providers,
-`ProviderStatus.status == "invalid"` is produced in exactly one place:
-`discovery._make_invalid`, and that is reachable only from
-`discovery._classify_probe` when the probe returns 401/403. The "Invalid Key"
-section in `backend/bot/handlers/ai.py` renders exclusively from that status.
-Therefore a live "Invalid Key: NaraRouter" line means either the probe really
-returned 401/403 from the gateway, or the running instance predates `1edb0e9`.
-The trace below distinguishes the two cases without guessing.
-
-**Added to `backend/ai/discovery.py` (logging only — classification semantics,
-timeouts, clients, retries, env names, and provider configuration are all
-unchanged).** Each chat-provider probe now emits exactly one INFO line tagged
-`PROVIDER_DISCOVERY_PROBE` (`LOG_LEVEL` default is `INFO`, so it reaches the
-Render logs on every discovery refresh):
-
-| Field | Meaning |
+| Fact | Source |
 |---|---|
-| `provider` | provider name (e.g. `nararouter`) |
-| `probe_url` | **sanitized** probe URL: scheme, host, port, path only — query string and credentials dropped |
-| `http_status` | the received status code, or `none` when no response arrived |
-| `classification` | `available` / `available_unverified` / `invalid` |
-| `validated` | `True` only for HTTP 200 |
-| `detail` | `probe_ok` · `auth_rejected` · `non_auth_http_status` · `transport_error …` |
-
-For a transport failure the detail additionally carries
-`exc_type=<ExceptionClass>` (the actual failure class, e.g. `ConnectTimeout`,
-`ConnectError`, `OSError`), `cause=<Class>[>Class]…` — the type-only chain of
-`__cause__`/`__context__` (bounded to 4, so the underlying cause that
-determines the failure is visible) — and a bounded, sanitized
-`message='…'`.
-
-**Sanitization guarantees (never logged):** API keys (the exact configured key
-is replaced with `***`; `?…` query strings are replaced with `?<redacted>`,
-covering the Gemini `key=` parameter), Authorization headers, request headers,
-cookies, response bodies, and arbitrary user content. Messages are
-whitespace-collapsed and truncated to 200 characters. Only exception class
-names — never nested exception messages — are traced for the cause chain.
-
-**Reading the trace after deploy:**
-
-| Observed trace | Conclusion |
-|---|---|
-| `http_status=401` / `403`, `classification=invalid`, `detail=auth_rejected` | The gateway genuinely rejected the key; the key/env value is wrong or expired (and the provider panel is behaving correctly). |
-| `http_status=200`, `validated=True` | The probe succeeds; any remaining display issue is elsewhere. |
-| `http_status=<other>`, `classification=available_unverified` | Non-auth outcome; the provider stays listed (post-`1edb0e9` behavior). |
-| `http_status=none`, `detail=transport_error …` | No response arrived; `exc_type`/`cause` identify timeout vs connection/redirect/transport failure. |
-| **No `provider=nararouter` line at all** | The probe never ran — no key was detected in that process (stale env/deploy) or the instance predates `1edb0e9`. |
-
-No claim is made here about the production cause until that trace exists.
+| One shared Supabase client, created once | `backend/db/client.py::get_db()` (`_initialised` singleton) |
+| postgrest transport deadline defaults to 120s | `.venv/…/postgrest/constants.py` → `DEFAULT_POSTGREST_CLIENT_TIMEOUT = 120`, consumed by `supabase/lib/client_options.py` |
+| App-level budget is 10s | `db/client._DB_TIMEOUT`, `task_repository.DB_TIMEOUT`, `persistence._DB_TIMEOUT` |
+| Any socket `OSError` on read becomes `ReadError` | `.venv/…/httpcore/_backends/sync.py` (`SyncStream.read`) |
+| `EAGAIN` renders exactly as the production text | in-process reproduction of `BlockingIOError(11, …)` |
+| Unbounded dispatch, three independent sites | `db/client._run_sync`, `task_repository._run`/`_run_checked`, `persistence._run_sync` (all `asyncio.to_thread`) |
+| Unbounded audit fan-out | `tools/executor.py` (per tool call), `engine/dispatcher.py` (per request), `runtime/manager.py` (per message) |
+| Default executor size 32 here | measured: `cpu_count 48 → min(32, 52) = 32` |
+| Dependency not present | `h2` is not in `backend/requirements.txt`, so production is HTTP/1.1 (no shared multiplexed socket assumption is made anywhere in the fix) |
 
 ---
 
-## 6. Tests
+## 5. Why the previous classification fix was insufficient
 
-`tests/test_nararouter_provider.py` — the 8 discovery tests from the previous
-phase are preserved, plus 10 new instrumentation tests (all in-process, HTTP
-mocked, no live credentials):
-
-| Behavior | Test |
-|---|---|
-| Probe URL/text sanitizers strip credentials and query strings | `test_probe_url_and_text_sanitizers_strip_credentials` |
-| `200` trace: `http_status=200`, `classification=available`, `validated=True`, `detail=probe_ok` | `test_probe_trace_reports_verified_classification` |
-| `401`/`403` trace: `classification=invalid`, `validated=False`, `detail=auth_rejected` | `test_probe_trace_shows_auth_rejection_caused_invalid` |
-| `302`/`429`/`500`/`503` trace: `classification=available_unverified`, `detail=non_auth_http_status` | `test_probe_trace_shows_non_auth_status_available_unverified` |
-| Transport failure trace: `http_status=none`, `exc_type` and nested `cause` classes | `test_probe_trace_shows_transport_exception_type_and_cause` |
-| The API key never appears in the trace (including when an exception message echoes it) | `test_probe_trace_never_contains_credentials` |
+The previous phase (`2551970`) made the *reporting* truthful: a local `EAGAIN`
+is now labelled `local_resource` and is no longer rendered as
+"Supabase unavailable". That is correct and is preserved (a regression test
+pins it), but it is attribution only — it left the process still able to pin
+worker threads and pooled sockets for twelve times longer than the application
+was willing to wait, and still able to create unbounded concurrent dispatches
+and audit tasks. The symptom stayed truthful **and** recurring.
 
 ---
 
-## 7. Verification and limitations
+## 6. Exact files changed
 
-- `python -m py_compile backend/ai/discovery.py tests/test_nararouter_provider.py` — OK.
-- `git diff --check` — clean.
-- Focused NaraRouter suite — **42 passed** (32 before; +10 instrumentation tests).
-- **Full suite (`pytest tests`): `2174 passed, 24 skipped, 0 failed`**
-  (previous tip: 2164 passed / 24 skipped).
-- Diff scope: `backend/ai/discovery.py` + `tests/test_nararouter_provider.py` +
-  this report only.
+| File | Change |
+|---|---|
+| `backend/db/client.py` | Pinned the shared client's transport deadline; added the one bounded reusable dispatch (`run_sync_db`) + deterministic pool shutdown |
+| `backend/ai/database/task_repository.py` | `_run` / `_run_checked` dispatch through `run_sync_db` |
+| `backend/ai/persistence.py` | `_run_sync` dispatches through `run_sync_db`; added bounded, counted `schedule_audit` |
+| `backend/ai/tools/executor.py` | Audit write goes through `schedule_audit` (removed now-unused import) |
+| `backend/ai/engine/dispatcher.py` | Usage persistence goes through `schedule_audit`; docstring corrected |
+| `backend/ai/runtime/manager.py` | Message persistence goes through `schedule_audit` |
+| `backend/runtime/supervisor.py` | Deterministic DB-pool shutdown in `stop()` |
+| `tests/test_local_resource_bounds.py` | **New** — 12 focused regression tests |
 
-**Live Render verification: NOT performed.** What remains unverified in
-production:
-
-1. The exact HTTP status or exception the Render egress produces for
-   `https://router.bynara.id/v1/models`, and therefore which classification the
-   live instance reaches.
-2. That the deployed revision contains `1edb0e9` (the previous phase) and this
-   instrumentation commit.
-
-This phase deliberately does not change classification behavior, so it cannot
-alter the production outcome — it only makes the production outcome observable.
+No file outside this list was modified. No provider, NaraRouter, model
+discovery, Test Modules, Telegram UI, Save, Bio/Username, task-parsing,
+scheduler or schema file was touched.
 
 ---
 
-## 8. Delivery record
+## 7. Exact behavioral changes
 
-| Item | Value |
-|---|---|
-| Starting HEAD | `1edb0e989a45f67aef1e86f01a0016777e82b8db` (`== origin/main` at start) |
-| Change set | `backend/ai/discovery.py` + `tests/test_nararouter_provider.py` + this report |
-| Commit | `feat: trace NaraRouter discovery probe classification` — pushed to `origin/main`, remote SHA verified after push |
-| Database impact | NONE |
-| Previous phase (record) | `1edb0e9` — `fix: expose configured NaraRouter providers` |
-| Live Render / Telegram verification | **NOT performed** — the owner reads the `PROVIDER_DISCOVERY_PROBE` line for `nararouter` after the next deploy |
+1. **One bounded, owned, reusable pool for synchronous Supabase work.**
+   `db/client.run_sync_db(fn, *args, timeout=…)` runs the call on a dedicated
+   `ThreadPoolExecutor(max_workers=4, thread_name_prefix="lifeos-supabase")`.
+   Threads are **reused across calls** and the pool is created lazily under a
+   lock. `shutdown_db_executor()` releases it deterministically; a later caller
+   transparently re-creates it, so no in-flight persistence path can observe
+   "cannot schedule new futures after shutdown".
+2. **The transport deadline is pinned below the application's dispatch budget.**
+   The shared client is now built with
+   `ClientOptions(postgrest_client_timeout=_DB_HTTP_TIMEOUT)` where
+   `_DB_HTTP_TIMEOUT = 8.0 < _DB_TIMEOUT = 10.0`. A synchronous call can
+   therefore no longer hold its thread and connection for 120s after the
+   operation that owns it has already degraded.
+3. **Task and AI persistence use that one pool.**
+   `SupabaseTaskRepository._run`/`_run_checked` and `persistence._run_sync` no
+   longer draw from the loop's shared default executor.
+4. **Audit persistence is bounded and counted.**
+   `persistence.schedule_audit(factory, name=…)` schedules best-effort audit
+   work only while fewer than `_AUDIT_MAX_INFLIGHT = 8` records are in flight;
+   on saturation it **drops** the record, increments `audit_dropped()`, logs
+   `AI audit persistence saturated — dropped record name=… inflight=… dropped_total=…`,
+   and returns `False`. `factory` is only invoked when the record is actually
+   scheduled, so a drop never leaves an unawaited coroutine behind.
+
+Nothing else changed: fallback honesty, `durable` flags, owner isolation, task
+ids, occurrence uniqueness, version/CAS semantics, deletion semantics, bounded
+attempts and transition rules are untouched and their suites stay green.
+
+---
+
+## 8. Task persistence impact
+
+Every task/occurrence read, write, transition and delete now runs on the single
+bounded pool with the same `DB_TIMEOUT` budget and the same error handling,
+including the `_run_checked` variant that distinguishes a real row removal from
+a swallowed transport failure. Concurrency is capped at 4 instead of being
+drawn unboundedly from a 32-worker shared pool, and a slow store can no longer
+retain a thread for 120s.
+
+Fallback semantics are unchanged: a local resource errno still classifies as
+`FALLBACK_REASON_LOCAL_RESOURCE`, a genuine transport failure still classifies
+as `FALLBACK_REASON_UNAVAILABLE`, and both still degrade to the in-memory
+fallback as non-durable.
+
+---
+
+## 9. `record_tool_call` impact
+
+`record_tool_call` remains fire-and-forget and **decoupled**: the primary
+execution path never awaits it, never reads its result, and cannot fail because
+of it. What changed is that the dispatch is now bounded and counted instead of
+being an unbounded `guarded_create_task(...)` per tool call, and the write
+itself runs on the same bounded Supabase pool. Under saturation the record is
+dropped (counted + logged) rather than queued without limit.
+
+---
+
+## 10. Resource lifecycle impact
+
+| Resource | Before | After |
+|---|---|---|
+| Worker threads for Supabase HTTP | drawn per call from the loop's shared default executor (32 here), also used by every other subsystem | one named pool of 4, reused across calls |
+| Thread/connection retention on a slow store | up to 120s (transport default) after a 10s application deadline | ≤ 8s transport deadline, below the 10s dispatch budget |
+| Sockets kept alive by concurrent Supabase calls | unbounded with dispatch rate | ≤ 4 concurrent calls on the one shared client |
+| Background audit/persistence tasks | one unmanaged task per tool call / request / message | hard in-flight bound of 8, with counted drops |
+| Pool shutdown | none (default executor, implicit) | deterministic `shutdown_db_executor()` in `Supervisor.stop()` |
+
+---
+
+## 11. Tests and results
+
+New file `tests/test_local_resource_bounds.py` — **12 tests, all passing**:
+
+- transport deadline is strictly below every dispatch budget (`db`, task, persistence);
+- the shared client is created with an explicit `postgrest_client_timeout == _DB_HTTP_TIMEOUT` (**would fail on the old code**, which inherited 120s), plus an explicit `< 120` assertion;
+- 24 sequential dispatches are served by ≤ `_DB_MAX_WORKERS` reused threads;
+- **concurrency regression**: 3 × `_DB_MAX_WORKERS` concurrent dispatches whose real peak is asserted `== _DB_MAX_WORKERS` — verified to **fail on the old implementation** (measured peak **12** of 12 with `asyncio.to_thread`, i.e. unbounded relative to the pool bound);
+- deterministic shutdown, and re-creation afterwards (no "cannot schedule new futures after shutdown");
+- the task repository and the AI persistence layer each dispatch through `run_sync_db` with their own timeout;
+- audit scheduling: bounded, counted drop, factory never invoked for a dropped record, in-flight returns to 0, failures never reach the caller;
+- a **real `ToolExecutor` run** still returns `success=True` while the audit path is saturated;
+- a failed `record_tool_call` leaves task persistence durable and `fallback_reason == ""`;
+- `OSError(EAGAIN)` still classifies as `FALLBACK_REASON_LOCAL_RESOURCE` (previous phase preserved).
+
+Results:
+
+```
+focused (tests/test_local_resource_bounds.py):  12 passed
+full suite (pytest tests -q):                   2186 passed, 24 skipped, 0 failed
+```
+
+The EAGAIN *shape* is simulated (this workspace never actually exhausts the
+kernel); the **dispatch, retention and lifecycle logic under test is the real
+production code**.
+
+---
+
+## 12. `py_compile` result
+
+`python -m py_compile` on every changed file (plus the new test) — **OK**.
+
+---
+
+## 13. `git diff --check` result
+
+**Clean** (no whitespace errors). Diff scope verified: 7 modified files + 1 new
+test file; `git status --porcelain` contains no SQL, migration or schema path.
+
+---
+
+## 14. Live verification status
+
+**Live Render verification: NOT performed.** No production credentials or
+telemetry access exist in this workspace, and no claim of production behaviour
+is made.
+
+What would confirm the fix in production, in order of value:
+
+1. **No recurrence of the classification line.** The
+   `TASK_FALLBACK_CLASSIFIED reason=local_resource …` / `Supabase occurrence
+   read failed; using fallback: [Errno 11] …` pair should stop appearing while
+   the task system keeps creating and running tasks durably.
+2. **Transport deadline observed.** A slow store should now log postgrest
+   timeouts (`ReadTimeout`) at roughly the new ~8s transport deadline, followed
+   by a truthful degradation — no 120s thread retention.
+3. **Audit saturation, if it happens at all**, is now visible as
+   `AI audit persistence saturated — dropped record name=… inflight=8 dropped_total=…`
+   instead of silent growth.
+4. If `[Errno 11]` **still** appears after this deploy, the trigger is outside
+   this fix's scope and is then provable from the log context: the new bounded
+   pool + 8s transport deadline means the remaining candidates are a
+   socket-timeout race or a leaked non-Supabase client reusing the fd (see §15,
+   item 3).
+
+---
+
+## 15. Remaining limitations
+
+1. **The trigger is still unproven.** The fix removes the *retention and
+   amplification* defect that made the condition recurring and self-worsening.
+   It does not name the single line that puts a socket in the non-blocking state
+   that yields `EAGAIN`. That requires the live evidence above.
+2. **Other `asyncio.to_thread` call sites remain** (`usage_reader`,
+   `usage_recorder`, `config_store`, `ghost_seen_v2`, `database_service`,
+   `tools/memory`, `runtime/memory_cleanup`). They were converted in an earlier
+   draft of this phase and **deliberately reverted**: `tests/test_40_usage_read_side.py::test_no_direct_supabase_access_outside_repository_layer`
+   enforces that those layers reach data only through the repository layer and
+   must not import `backend.db.client`, and routing them through `run_sync_db`
+   would violate that documented separation. They are rate-bounded per request
+   rather than unbounded multipliers, so they are not the fan-out the fix
+   targets; converting them is a separate architectural decision for the
+   repository layer, not this phase.
+3. **Proven socket/FD leak, out of this phase's scope.** The AI providers'
+   `shutdown()` (`openai_compat.py`, `gemini.py`, `you_search.py`) sets
+   `self._http_client = None` **without closing** the `httpx.AsyncClient`, and
+   `model_tester.test_single_model` calls it in a `finally` for every
+   provider × model test — one abandoned connection pool per test. Closing it
+   requires an `await` (`aclose()`), i.e. a contract change to
+   `BaseProvider.shutdown()`, and provider architecture / Test Modules are
+   explicitly excluded from this phase. **Recommended as the next phase.**
+4. **`_DB_MAX_WORKERS = 4`** is a deliberate bound, not a tuned value. If
+   Supabase round-trip latency ever exceeds the dispatch budget often enough to
+   queue work visibly, the correct response is to re-tune this single constant
+   together with `_DB_HTTP_TIMEOUT`, not to raise thread counts ad hoc.
+
+---
+
+## 16. Delivery record
+
+*(commit + remote verification appended after the push.)*

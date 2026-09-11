@@ -209,9 +209,8 @@ class ConversationManager:
         item = session.add_message(role=role, content=content)
         self._trim_if_needed(session)
         from backend.ai import persistence
-        from backend.runtime.task_guard import guarded_create_task
-        guarded_create_task(
-            persistence.add_message(
+        persistence.schedule_audit(
+            lambda: persistence.add_message(
                 session.session_id, owner_id, role, content,
                 token_count=item.estimated_tokens,
             ),

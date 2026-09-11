@@ -354,7 +354,13 @@ class SupabaseTaskRepository(TaskRepository):
         except Exception:
             return
     async def _run(self, fn):
-        try:return await asyncio.wait_for(asyncio.to_thread(fn),timeout=self._timeout)
+        # Synchronous Supabase work goes through the DB layer's single bounded
+        # pool: a fresh worker per call let task persistence and the audit paths
+        # together occupy an unbounded share of the loop's shared default
+        # executor and hold one socket per concurrent call on the one shared
+        # client.
+        from backend.db.client import run_sync_db
+        try:return await run_sync_db(fn,timeout=self._timeout)
         except asyncio.CancelledError:raise
     async def _run_checked(self, fn, timeout=None):
         """Like ``_run`` but propagates failures.
@@ -363,7 +369,8 @@ class SupabaseTaskRepository(TaskRepository):
         must be able to tell a real row removal from a swallowed transport
         failure before it reports durability, so it uses this variant.
         """
-        return await asyncio.wait_for(asyncio.to_thread(fn),timeout=timeout or self._timeout)
+        from backend.db.client import run_sync_db
+        return await run_sync_db(fn,timeout=timeout or self._timeout)
     def _task_payload(self, owner_id, data):
         payload={**data,"owner_id":owner_id};_validate_task_input(payload);return {k:_serialize(v) for k,v in payload.items() if k not in {"id","created_at","updated_at","terminal_at","version"}}
     def _occurrence_payload(self, owner_id, data):
