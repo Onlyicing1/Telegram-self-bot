@@ -57,10 +57,15 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 3
 
-# Deterministic READ tools whose successful results are authoritative and
-# must be delivered to the user EXACTLY as the tool produced them — never
-# re-interpreted, stylized, or replaced by a continuation provider round.
-_VERBATIM_READ_TOOLS = frozenset({"get_bio"})
+# Deterministic READ tools whose successful results are authoritative: they
+# are delivered EXACTLY as the tool produced them, never re-interpreted or
+# replaced by a continuation provider round, which would let the model
+# paraphrase or contradict real data.
+#   get_bio   — production: a real bio was regenerated as unrelated text.
+#   task_list — production: the tool returned the owner's tasks and the model
+#               answered from stale context instead ("...it may have completed
+#               or been removed"), which the fresh tool result contradicted.
+_VERBATIM_READ_TOOLS = frozenset({"get_bio", "task_list"})
 
 
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")

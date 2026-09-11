@@ -540,6 +540,32 @@ class CreateTaskTool(Tool):
             len(task.label), self._label_hash(task.label), owner_id,
         )
 
+        # A degraded write is NOT a durable write. The create still succeeds
+        # through the shared in-memory fallback (the fallback architecture is
+        # preserved), but the owner must never be told a task is persisted
+        # when it only exists in process memory: a later healthy read of the
+        # durable store cannot see it, and a restart loses it. (Live: a
+        # creation reported as persisted was missing from the next task list.)
+        if fallback_backend:
+            from backend.ai.task_management_interface import FALLBACK_NOTE
+
+            return ToolResult(
+                success=True,
+                message=(
+                    f"✅ Task #{task.id} created — {task.label}\n\n{FALLBACK_NOTE}"
+                ),
+                data={
+                    "task_id": int(task.id),
+                    "label": str(task.label),
+                    "schedule_type": str(task.schedule_type),
+                    "timezone": str(task.timezone),
+                    "owner_id": int(task.owner_id),
+                    "status": str(task.status),
+                    "durable": False,
+                    "fallback_backend": str(fallback_backend),
+                },
+            )
+
         return ToolResult(
             success=True,
             message=f"✅ Task #{task.id} created — {task.label}",
@@ -550,5 +576,6 @@ class CreateTaskTool(Tool):
                 "timezone": str(task.timezone),
                 "owner_id": int(task.owner_id),
                 "status": str(task.status),
+                "durable": True,
             },
         )

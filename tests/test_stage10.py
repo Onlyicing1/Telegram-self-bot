@@ -5,7 +5,7 @@ import pytest
 
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.task_creation import TaskCreationService
-from backend.ai.task_management import TaskManagementService, TaskView
+from backend.ai.task_management import TaskListSnapshot, TaskManagementService, TaskView
 from backend.ai.task_management_interface import inspect_text, list_text
 
 
@@ -22,6 +22,13 @@ class PresentationService:
         if status is None:
             return list(self.tasks)
         return [task for task in self.tasks if task.status == status]
+
+    async def snapshot(self, status=None):
+        # Mirrors TaskManagementService.snapshot: one read that binds the
+        # tasks and the (always false here) degraded-store marker.
+        return TaskListSnapshot(
+            tasks=await self.list_tasks(status=status), fallback_active=False,
+        )
 
     async def inspect(self, task_id, occurrence_limit=100):
         task = next((task for task in self.tasks if task.id == task_id), None)

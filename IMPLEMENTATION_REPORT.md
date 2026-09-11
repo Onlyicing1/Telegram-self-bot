@@ -12,160 +12,184 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `dfeebf4643ef4b1724d82b58bf34c7bc7d7e1ba9` (== `origin/main` at phase start) |
-| Phase | (1) Scheduled **bio update persisted as `send_message`** — deterministic bio-action fidelity fix; (2) **Test Modules UI** converted from colorful emoji to plain Unicode symbols |
-| Status | **IMPLEMENTED — full suite green (2090 passed, 24 skipped, 0 failed)** |
+| Starting HEAD | `bf1eee543f32bbca0d1985d3bf91d777ac93ea60` (== `origin/main` at phase start) |
+| Phase | **"Task #N created" but absent from the very next task list** — degraded-store (in-memory fallback) creation reported as a durable success, a double read in `task_list`, and a non-authoritative `task_list` response |
+| Status | **IMPLEMENTED — full suite green (2101 passed, 24 skipped, 0 failed)** |
 | Database impact | **NO DATABASE / SCHEMA CHANGE** |
-| Delivery record | see §7 |
+| Live verification | **NOT performed** (no credentials in this workspace) — see §7 |
+| Delivery record | see §8 |
 
 ---
 
-## 2. ISSUE 1 — a scheduled Bio update persisted as `send_message`
+## 2. Exact root cause (source-verified)
 
-### 2.1 Canonical tool name (source of truth)
+### 2.1 The decisive evidence in the live symptom
 
-The registered production bio-write tool is **`bio_set_text`**
-(`backend/ai/tools/registry.py` → `BioSetTextTool`, name `bio_set_text`,
-delegating to `bio_service.do_text` → the shared `_apply_profile` real
-mutation via `UpdateProfileRequest(about=...)`). There is **no** registered
-`set_bio` tool in production: `set_bio` appears only as a *fake* tool name in
-test fixtures (`tests/test_task_source_fidelity.py`,
-`tests/test_task_prepare_ahead.py`). This phase therefore uses the real
-registered name — `bio_set_text` — and does not invent a new tool.
+The creation was reported as **`Task #3`**, while the task list — two minutes
+later — contained **`Task #27`**. Those two ids cannot both come from the
+durable store: `ai_tasks.id` is `bigserial` (monotonic), so a table that
+already holds `#27` can never hand out `#3`. A fresh low id is the signature of
+the **process-local in-memory fallback**, whose counter starts at 1.
 
-### 2.2 Exact root cause (source-verified)
+So the created task was written to the in-memory fallback, and the list was
+served from the durable store — the two stores diverge by design, and the
+divergence was never reported.
 
-The task-creation pipeline had **no deterministic guard** tying an explicit
-bio-update request to a bio tool:
+### 2.2 The failing layer: `SupabaseTaskRepository` write degradation
 
-1. `TaskInterpreter` (`backend/ai/task_interpreter.py`) *asks* the model for
-   `bio_set_text` on bio requests, but the candidate schema leaves
-   `actions[].name` a free-form string. A model that answers with the generic
-   message action therefore passes validation.
-2. `TaskCandidate._canonicalize_action` (`backend/ai/task_candidate.py`)
-   normalizes only message-write aliases (`send`, `send_message`,
-   `write_message`, `send_text`) → `send_message`; every other action name is
-   trusted verbatim. Nothing repaired the misclassification.
-3. The deterministic high-confidence scheduler shortcut
-   `Dispatcher._build_deterministic_task_candidate` only ever builds
-   `{"name": "send_message", ...}` for an interval + write-verb request, and its
-   result **bypasses the semantic interpreter entirely**
-   (`extra["deterministic_task_candidate"]` → `CreateTaskTool` uses it as-is).
+`backend/ai/database/task_repository.py::SupabaseTaskRepository.create_task`
+catches **any** Supabase insert failure and re-creates the task in the shared
+in-memory fallback:
 
-Result: a clear bio update could be persisted with
-`actions: [{"name": "send_message", "arguments": {"text": ...}}]`. The
-occurrence path then executes the task's own tool names, so every run sent a
-chat message instead of updating the bio.
+```python
+except Exception as exc:
+    self._mark_fallback()
+    record = await self._fallback.create_task(owner_id, data)   # process-local id
+    record.fallback_backend = type(self._fallback).__name__
+    return record
+```
 
-### 2.3 Exact fix (minimal, one boundary)
+`CreateTaskTool` (`backend/ai/tools/task.py`) then returned a plain, durable
+looking result:
 
-A deterministic **profile-fidelity gate** was added at the single authoritative
-creation boundary — `CreateTaskTool._execute`
-(`backend/ai/tools/task.py`), beside the existing `ai_instruction`
-source-fidelity gate:
+```
+✅ Task #3 created — Bio update        data={task_id, label, schedule_type, timezone, owner_id, status}
+```
 
-- It runs only when the **ORIGINAL request** both names the bio and asks to
-  change it. Detection reuses the existing deterministic bio vocabulary in
-  `backend/ai/actions.py` (`_tokenize`, `_has_bio_mention`,
-  `_has_bio_change_intent`, `_write_text_present`) — it is a narrow repair, not
-  a keyword-only replacement of the semantic interpreter.
-- When it matches, an action whose name is `send_message` (the only name the
-  message vocabulary can produce) is renamed to the canonical registered
-  `bio_set_text`, keeping its bounded `text` argument untouched.
-- One correlated `AI_TASK_TRACE stage=create_task_bio_action_gate` record is
-  emitted when a repair happens.
-- A request that genuinely sends a message is completely untouched, and every
-  other action name is untouched.
+`fallback_backend` was only logged/traced — never surfaced in the result. The
+owner was therefore told a **durable** task had been created while the task
+existed only in process memory. The next list (a *healthy* durable read)
+cannot see it: the created active task "disappeared" exactly as reported.
 
-The gate covers **both** creation paths (semantic and deterministic) because
-both flow through `CreateTaskTool._execute`. The deterministic shortcut itself
-was deliberately left alone — no change to scheduler/dispatcher semantics is
-required, and the gate repairs its only possible bio misclassification.
+### 2.3 Two further defects on the same request path
 
-### 2.4 Preserved behavior (unchanged)
+**(a) Double read in `TaskListTool`** — the tool read the list twice:
 
-- `set_bio`/`bio_set_text` remains the **existing execution authority**
-  (`BioSetTextTool` → `bio_service`); no new Bio executor.
-- No second scheduler, no ToolExecutor bypass, no Telegram execution moved into
-  the AI layer.
-- The existing **AI-generated-content contract**: the verbatim request still
-  becomes `ai_instruction` for content-constrained bio tasks
-  (`create_task_ai_instruction_gate`), and preparation/validation still happens
-  in `TaskExecutionCoordinator`.
-- The **Bio Guardian / rolling 60-second** protection is untouched.
-- `send_message` semantics are untouched for message tasks.
-- Ambiguous requests still fail closed (no guessing).
-- `bio_set_text` (with `text`) renders through the existing bio template
-  (`{text}` token) and applies through `_apply_profile`.
+```python
+tasks  = await service.list_tasks(status=...)   # read 1 → used for task_count
+result = await list_text(service, status=...)   # read 2 → used for the rendered text
+```
 
-### 2.5 Tests added (`tests/test_task_source_fidelity.py`, Part C)
+The two reads can hit different stores and the later one can **clear** the
+`fallback_active` marker. Pre-fix reproduction (now a regression test): read 1
+fails (marker `True`, `task_count == 0`) → read 2 succeeds (durable content
+rendered) → the owner sees a real task beside an empty count and **no**
+degraded marker at all. That is precisely "a transient read failure
+masquerading as an authoritative list".
 
-| Test | Reproduces |
+**(b) `task_list` was not response-authoritative** — `_VERBATIM_READ_TOOLS`
+contained only `get_bio`, so a native `task_list` round still got a
+continuation provider round, where the model could answer from stale
+conversation context. Task-management requests are deliberately absent from
+the deterministic command vocabulary (`backend/ai/actions.py` documents this),
+so the **native provider round is the live path** for "list my active tasks" —
+and the model could (and live, did) produce "*…it may have completed or been
+removed*" over a fresh tool result that said otherwise.
+
+### 2.4 Ruled out (checked in source, not assumed)
+
+| Hypothesis | Verdict |
 |---|---|
-| `test_persian_bio_update_misclassified_as_message_persists_bio_tool` | Clear Persian bio request + a `send_message` candidate → persisted action is `bio_set_text` |
-| `test_english_bio_update_misclassified_as_message_persists_bio_tool` | Same for a clear English bio request |
-| `test_plain_message_task_still_persists_send_message` | A real message task still persists `send_message` |
-| `test_bio_request_keeps_verbatim_ai_instruction_when_action_repaired` | Repairing the tool name preserves the verbatim `ai_instruction` (source/length constraints intact) |
-| `test_deterministic_message_write_candidate_for_bio_request_is_repaired` | The deterministic shortcut's `send_message` candidate for a bio request is repaired, with **zero provider calls** |
-| `test_bio_occurrence_executes_bio_tool_not_message_tool` | The resulting occurrence reaches `bio_set_text` through the real `TaskExecutionCoordinator` → `ToolExecutor` path, and never `send_message` |
+| Owner scope mismatch | **No.** Creation (`CreateTaskTool`) and listing (`TaskListTool`) both use `context.owner_id`; `TaskManagementService` filters by owner on every call. |
+| Different repository instance | **No.** Both use the process-wide singleton `get_repository_manager().task`. |
+| Unexpected status transition | **No.** The unfiltered list excludes only `deleted`; a created task is `active` (DB default and in-memory default agree). |
+| Supabase schema/payload mismatch | **Not the cause.** `ai_instruction` and every payload field, bound, and CHECK constraint exist in `supabase/migrations/20260829000001_create_ai_tasks.sql` and match `_validate_task_input`. The insert failure is transient (read succeeded moments later). |
+| Parser / structured output | **Unrelated** to this path. |
 
 ---
 
-## 3. ISSUE 2 — Test Modules UI uses plain Unicode symbols
+## 3. Exact fix (four minimal, source-consistent changes)
 
-The AI / Test Modules panel family was converted from colorful emoji to plain
-Unicode marks. The compact Taskloom-like layout, the five-segment progress bar,
-the `_PanelEditGuardian` coalescing, pagination, concurrency protection, the
-diagnostic budget, and the production candidate-feed logic are **unchanged**.
+### 3.1 One authoritative snapshot (`backend/ai/task_management.py`, `..._interface.py`, `tools/task_management_tools.py`)
 
-| Mark | Meaning | Mark | Meaning |
-|---|---|---|---|
-| `◉` | AI / intelligence | `↻` | refresh / retry / re-run |
-| `◈` | provider | `»` | start chat / enter |
-| `◇` | model | `▸` | test / execute (verb) |
-| `●` / `○` | connected / offline | `▰` / `▱` | filled / empty progress (exactly five segments) |
-| `✓` | success / available | `←` | back |
-| `×` | failure / error | `⌂` | home |
-| `!` | warning / problem | `⋯` / `…` | running / testing |
+- New `TaskListSnapshot(tasks, fallback_active)` and
+  `TaskManagementService.snapshot(status)`: the tasks and the degraded marker
+  come from the **same** repository read with no `await` between them.
+- `list_text(..., snapshot=None)` renders the supplied snapshot when given
+  (otherwise it takes exactly one itself).
+- `TaskListTool.execute` now performs **one** read and reports
+  `task_count`, `task_ids`, and `fallback_active` from that same snapshot —
+  identical content, count, and marker by construction.
 
-Exact changes:
+### 3.2 A non-durable creation can no longer look durable (`backend/ai/tools/task.py`)
 
-- **`backend/bot/handlers/ai.py`** — every emoji in the AI panel module:
-  `🧠→◉`, `🤖→◇`, `🔄`/`🔁→↻` (refresh/retry) and `→◈` (provider),
-  `⬅→←`, `🏠→⌂`, `⚠️→!`, `✅→✓`, `❌→×`, `💬→»`, `🎫/🧵→⌗`,
-  `📈→▤`, `🩺`/`❤️→✚`, `🔍`/`🔎→⌕`, `⚙️→⚙`, `📖→☰`, `🔧→⊞`, and
-  `p.icon` is no longer rendered (the plain provider mark `◈` is used instead).
-  Panel-registration titles were converted with the same vocabulary.
-- **`backend/ai/model_tester.py`** — the unknown-provider fallback icon `❓`
-  → `◈` (two sites).
-- **`backend/bot/handlers/ai_test_progress.py`** — already Unicode-only
-  (five-segment `▰▱` bar, `✓/×/…`, `◇`); unchanged.
-- The Test Modules launch/results/details views already used
-  `✓ × … ◇ ↻ ⌕ ≡ ⌂` and were left as-is apart from the shared provider mark.
+When the created record came from the in-memory fallback
+(`fallback_backend` set), the tool result now says so:
 
-Not touched (out of scope, shared/unrelated UI): the shared nav helpers in
-`backend/helper/panels.py` used by non-AI panels, and the provider
-**catalog metadata** icons in `backend/ai/discovery.py` (still consumed by the
-web dashboard's `/api/ai/*` payload). The AI panels no longer render those
-catalog emoji.
+```
+✅ Task #N created — <label>
 
-### 3.1 Tests added / changed for the Unicode UI
+⚠️ Memory fallback — Supabase unavailable (tasks may be missing, and
+   anything created now is not durable).
+```
 
-- **Changed** `tests/test_13_model_selection.py` (AI panel title `🧠 AI` →
-  `◉ AI`) and `tests/test_34_ai_model_ui.py` (model panel title `🤖 Model` →
-  `◇ Model`, two sites).
-- **Added** `tests/test_23_provider_mesh.py::test_ai_and_test_modules_panels_use_no_colorful_emoji`
-  — renders the AI main panel, the provider panel (with an emoji carrying
-  catalog icon) and the pick-model panel, then sweeps title + body + every
-  button label for the forbidden emoji set. It also proves the provider panel
-  no longer renders the catalog emoji icon.
-- Existing Unicode regression kept green:
-  `test_unicode_progress_and_status_marks_only` (five-segment bar, status
-  marks, `_render_test_results` sweep).
+plus `data = {..., "durable": false, "fallback_backend": "InMemoryTaskRepository"}`.
+A durable creation carries `"durable": true` and no note. The graceful
+fallback architecture is preserved — creation still succeeds — but the owner
+is never told a memory-only task is persisted.
+
+### 3.3 `task_list` is now response-authoritative (`backend/ai/engine/dispatcher.py`)
+
+`_VERBATIM_READ_TOOLS = frozenset({"get_bio", "task_list"})`. A successful
+`task_list`-only round skips the continuation provider round and returns the
+real tool result to the owner, so the model can no longer replace or
+contradict the authoritative list. Mixed rounds and failures keep the normal
+continuation behavior (unchanged).
+
+### 3.4 One truthful degraded-store marker (`backend/ai/task_management_interface.py`)
+
+`_FALLBACK_NOTE` → public `FALLBACK_NOTE`, reworded to be accurate for both
+directions: *"Memory fallback — Supabase unavailable (tasks may be missing,
+and anything created now is not durable)."* The list view and the creation
+result share the exact same wording.
 
 ---
 
-## 4. Preserved architecture from the previous phases (still current)
+## 4. Why a created task can no longer vanish from the next list
+
+- **If the creation degraded**, the task is genuinely not in the durable store
+  — and the owner is told so at creation time (`durable: false` + note)
+  instead of being handed a durable-looking success. No durable success is
+  ever claimed for a task the durable store never received.
+- **If the creation was durable**, the list is now a single snapshot and, for
+  the provider path, a verbatim-authoritative result: the count, the rendered
+  tasks, and the degraded marker can no longer disagree, and no model prose can
+  replace the list.
+- **If the read degraded**, the empty/partial view is explicitly marked as a
+  memory-fallback view rather than presented as the durable list, and the
+  marker can no longer be cleared out from under the content it describes.
+
+**Honest limitation:** the fix does not (and cannot, without a schema or a
+second store — both forbidden) make a task that was written only to memory
+reappear in the durable store. What it removes is the *silent* part of that
+divergence. The live id evidence (`#3` beside a durable `#27`) is the reason
+this is the diagnosed cause; a live reproduction is still required to confirm
+it end-to-end (§7).
+
+---
+
+## 5. Tests added — `tests/test_task_list_consistency.py` (11 tests)
+
+| Requirement | Test |
+|---|---|
+| A — create then list (same owner) shows the task | `test_created_task_appears_in_the_next_list` |
+| B — multiple active tasks all appear | `test_multiple_active_tasks_all_appear` |
+| C — deleted tasks stay excluded | `test_deleted_task_stays_out_of_the_next_list` |
+| D — owner isolation | `test_owner_isolation_holds_for_created_tasks` |
+| E — a failed durable read is flagged, never authoritative | `test_failed_durable_read_is_flagged_not_authoritative` |
+| E/I — one snapshot; degraded→healthy cannot split it | `test_degraded_then_healthy_reads_cannot_split_the_snapshot`, `test_task_list_reads_the_repository_once` |
+| F — `task_list` result cannot be replaced by model prose | `test_task_list_result_is_verbatim_authoritative` (contract + real Dispatcher end-to-end; the narrating continuation provider is never consulted) |
+| G — `task_count` matches the returned/rendered ids | `test_task_count_matches_returned_ids_in_one_snapshot` |
+| Live root cause — a memory-only creation is reported honestly | `test_non_durable_creation_is_reported_honestly` (drives the REAL `CreateTaskTool` with a degrading repo: `durable=False`, note present, fresh local id ≠ durable `#27`, and the durable read cannot see the task) |
+| Healthy path — a durable creation is reported and listed as durable | `test_durable_creation_is_reported_and_listed_as_durable` |
+
+Test-double update: `tests/test_stage10.py::PresentationService` gained
+`snapshot()` to mirror the real service contract (presentation assertions
+unchanged).
+
+---
+
+## 6. Preserved architecture from the previous phases (still current)
 
 - **Production fallback** — model-level, bounded, deterministic: active
   provider/model first, then the complete discovery-fed eligible real/free
@@ -180,42 +204,42 @@ catalog emoji.
   `_PanelEditGuardian` coalescing (12 s window, newest state, dedupe,
   serialized, terminal retry), exact five-segment progress, pagination,
   diagnostics budget, canonical `_render_test_results`.
+- **Bio fidelity** — an explicit bio change persists the registered
+  `bio_set_text` action, never `send_message`.
 
 ---
 
-## 5. Database impact
+## 7. Database impact and live verification
 
-**None.** No schema, table, migration, RLS, or config change. The bio fix is a
-pure action-name fidelity correction at the existing creation boundary; the
-persisted task payload shape is unchanged.
+**Database impact: none.** No schema, table, migration, RLS, or configuration
+change. The only code touching persistence semantics reports the *existing*
+degradation truthfully; the payload shape is unchanged.
+
+**Live Telegram verification: NOT performed** (no credentials in this
+workspace). The end-to-end probe remains: send a bio-task creation request,
+then immediately ask for the active task list, and confirm that (a) the
+creation either reports `durable` or carries the memory-fallback note, and
+(b) the list contains the created task — or is explicitly marked as a
+memory-fallback view.
 
 ---
 
-## 6. Tests and verification
+## 8. Verification and delivery record
 
-- Focused suites: task source fidelity, NL creation, prepare-ahead, candidate
-  contract, provider mesh, model tester, model selection, model UI, AI settings
-  UX, runtime wiring, tool honesty glass — **all green**.
-- **Full suite: `2090 passed, 24 skipped, 0 failed`** (previous tip: 2083
-  passed; +6 new Issue 1 tests; two existing UI tests updated, one new Unicode
-  sweep test added).
+- Focused suites: task-list consistency, stage10 presentation, task hardening,
+  task management, task repository, taskloom UI/milestone, tool health audit,
+  current-bio determinism — **all green**.
+- **Full suite: `2101 passed, 24 skipped, 0 failed`** (previous tip: 2090
+  passed, +11 new tests; one presentation test double updated).
 - `python -m py_compile` on every changed Python file — OK.
 - `git diff --check` — clean.
-- **Live Telegram verification: NOT performed** (no credentials in this
-  workspace). The bio fix is source- and test-verified only; the end-to-end
-  probe remains a live scheduled bio task followed by a `Taskloom → Task #N`
-  inspection showing `bio_set_text` and an actual Telegram bio change.
-
----
-
-## 7. Delivery record
 
 | Item | Value |
 |---|---|
-| Starting HEAD | `dfeebf4643ef4b1724d82b58bf34c7bc7d7e1ba9` (== origin/main at start) |
-| Change commit | `772390709061a84d8b8a585ff4fe488dd6039a16` — `fix: persist scheduled bio updates as the bio tool and de-emoji the AI panel` (8 files) |
-| Push result | `dfeebf4..7723907  main -> main` (exit 0) |
-| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `772390709061a84d8b8a585ff4fe488dd6039a16` == local HEAD; `git show --stat origin/main` lists exactly the 8 phase files |
+| Starting HEAD | `bf1eee543f32bbca0d1985d3bf91d777ac93ea60` (== origin/main at start) |
+| Change commit | _pending_ |
+| Push result | _pending_ |
+| Remote HEAD verification | _pending_ |
 | Report commit | _pending_ |
 | Working tree | pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched |
 | Live Telegram verification | **NOT performed** (no credentials in this workspace) |

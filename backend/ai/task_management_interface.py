@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timezone
 from zoneinfo import ZoneInfo
 
-from backend.ai.task_management import TaskManagementService, TaskView
+from backend.ai.task_management import TaskListSnapshot, TaskManagementService, TaskView
 
 MAX_LINES = 20
 
@@ -12,7 +12,14 @@ MAX_LINES = 20
 # IANA zone (never a fixed numeric offset) keeps DST transitions correct;
 # persisted instants stay timestamptz/UTC internally.
 DISPLAY_TIMEZONE = "Asia/Tehran"
-_FALLBACK_NOTE = "⚠️ Memory fallback — Supabase unavailable (state is not durable)."
+# ONE truthful degraded-store marker, shared by every surface that can read or
+# write through the in-memory fallback: a fallback READ returns a partial view
+# of the durable tasks, and a fallback WRITE is not durable at all. Either way
+# the owner must never be told this state is authoritative.
+FALLBACK_NOTE = (
+    "⚠️ Memory fallback — Supabase unavailable "
+    "(tasks may be missing, and anything created now is not durable)."
+)
 
 _STATUS_LABELS = {
     "active": ("▶️", "Active"),
@@ -60,7 +67,12 @@ def _format_datetime(value: object, *, empty: str) -> str:
 
 
 def _fallback_active(service: TaskManagementService) -> bool:
-    """True when the repository degraded to its in-memory fallback."""
+    """True when the repository degraded to its in-memory fallback.
+
+    Only used by the single-task view; the list path reads the marker from its
+    own snapshot so the marker and the rendered tasks always describe the same
+    read.
+    """
     repository = getattr(service, "repository", None)
     return bool(getattr(repository, "fallback_active", False))
 
@@ -90,22 +102,33 @@ def _list_header(status: str | None) -> list[str]:
     return lines
 
 
-async def list_text(service: TaskManagementService, *, status: str | None = None) -> str:
-    """Render the owner's bounded task list as separated mobile-first blocks."""
-    tasks = await service.list_tasks(status=status)
+async def list_text(
+    service: TaskManagementService,
+    *,
+    status: str | None = None,
+    snapshot: TaskListSnapshot | None = None,
+) -> str:
+    """Render the owner's bounded task list as separated mobile-first blocks.
+
+    Pass ``snapshot`` when the caller already read the list (a tool that also
+    reports a count): the rendered tasks and the degraded marker then come
+    from ONE repository read instead of two potentially inconsistent ones.
+    """
+    snapshot = snapshot or await service.snapshot(status=status)
+    tasks = snapshot.tasks
     header = _list_header(status)
     if not tasks:
         lines = header + ["", "No tasks found."]
-        if _fallback_active(service):
-            lines.append(_FALLBACK_NOTE)
+        if snapshot.fallback_active:
+            lines.append(FALLBACK_NOTE)
         return "\n".join(lines)
 
     blocks = [_task_block(task, include_version=False) for task in tasks[:MAX_LINES]]
     if len(tasks) > MAX_LINES:
         blocks.append(f"…and {len(tasks) - MAX_LINES} more")
     rendered = "\n".join(header + ["", "\n\n".join(blocks)])
-    if _fallback_active(service):
-        rendered += "\n\n" + _FALLBACK_NOTE
+    if snapshot.fallback_active:
+        rendered += "\n\n" + FALLBACK_NOTE
     return rendered
 
 
@@ -129,7 +152,7 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
         except Exception:
             lines.append("Trigger: Telegram message")
     if _fallback_active(service):
-        lines.append(_FALLBACK_NOTE)
+        lines.append(FALLBACK_NOTE)
     if view.occurrences:
         occurrence_blocks = []
         for item in view.occurrences[:10]:

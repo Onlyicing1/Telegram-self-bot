@@ -84,16 +84,21 @@ class TaskListTool(Tool):
             )
         try:
             service = TaskManagementService(get_repository_manager().task, context.owner_id)
-            tasks = await service.list_tasks(status=status or None)
-            result = await list_text(service, status=status or None)
+            # ONE authoritative read: the count, the rendered list, and the
+            # degraded marker must all describe the same snapshot. Two reads
+            # could pair a count from one store with content from the other
+            # (and a fallback read could be masked by a later healthy read).
+            snapshot = await service.snapshot(status=status or None)
+            result = await list_text(service, status=status or None, snapshot=snapshot)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task list failed: {exc}")
         return ToolResult(
             success=True,
             message=result,
             data={
-                "task_count": len(tasks),
-                "fallback_active": bool(getattr(service.repository, "fallback_active", False)),
+                "task_count": len(snapshot.tasks),
+                "task_ids": [int(t.id) for t in snapshot.tasks],
+                "fallback_active": snapshot.fallback_active,
             },
         )
 

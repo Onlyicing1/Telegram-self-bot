@@ -24,6 +24,21 @@ class TaskView:
     occurrences: list[Any]
 
 
+@dataclass(frozen=True)
+class TaskListSnapshot:
+    """One authoritative read of the owner's task list.
+
+    ``tasks`` and ``fallback_active`` come from the SAME repository call with
+    no await in between, so a concurrent operation can never clear the
+    degraded marker while the content it describes is still rendered. Callers
+    that both render and count the list must use one snapshot instead of two
+    independent reads.
+    """
+
+    tasks: list[TaskRecord]
+    fallback_active: bool
+
+
 class TaskManagementService:
     def __init__(self, repository: TaskRepository, owner_id: int) -> None:
         self.repository = repository
@@ -48,6 +63,14 @@ class TaskManagementService:
                 t for t in tasks if str(getattr(t, "status", "") or "") != "deleted"
             ]
         return [t for t in tasks if str(getattr(t, "status", "") or "") == status]
+
+    async def snapshot(self, status: str | None = None) -> TaskListSnapshot:
+        """Read the owner's task list once, with the fallback marker bound to it."""
+        tasks = await self.list_tasks(status=status)
+        return TaskListSnapshot(
+            tasks=tasks,
+            fallback_active=bool(getattr(self.repository, "fallback_active", False)),
+        )
 
     async def counts(self) -> dict[str, int]:
         """Per-status counts of the owner's durable tasks.
