@@ -17,9 +17,11 @@ from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
 from backend.ai.preparation_policy import (
+    CONTENT_FIELDS,
     PreparationPolicy,
     PreparationPolicyError,
     derive_policy,
+    strip_attribution_prefix,
     validate_prepared_arguments,
 )
 from backend.ai.retry import FailureClass, classify_failure, retry_delay, can_retry
@@ -37,6 +39,48 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 class TaskPreparationError(ValueError):
     """Occurrence-time AI argument preparation failed; the action must not run."""
+
+
+def present_calls(calls: list[dict[str, Any]], instruction: str) -> list[dict[str, Any]]:
+    """Apply the task's PRESENTATION contract to validated calls.
+
+    Separation of the two concepts a named-source task carries: source
+    IDENTITY is validated on the generated line (preparation, persisted
+    metadata, boundary) and the owner-visible FORMATTING is applied here —
+    after the last validation and immediately before the ToolExecutor — so a
+    task that asked for a label-free bio executes "Don't be afraid…" while
+    still having proven the line was attributed to the requested source.
+
+    The validated calls are never mutated: they remain what is persisted as
+    the occurrence's prepared action, so every later re-validation sees the
+    same deterministic attributed text. Returns the input unchanged when the
+    task requested the default (label visible) presentation.
+    """
+    policy = derive_policy(instruction)
+    if policy.speaker_label or not policy.source:
+        return calls
+    presented: list[dict[str, Any]] = []
+    for call in calls:
+        arguments = call.get("arguments")
+        if not isinstance(arguments, dict):
+            presented.append(call)
+            continue
+        rewritten: dict[str, Any] | None = None
+        for field in CONTENT_FIELDS:
+            value = arguments.get(field)
+            if not isinstance(value, str):
+                continue
+            visible = strip_attribution_prefix(value, policy.source)
+            if visible is None or not visible.strip():
+                continue
+            if rewritten is None:
+                rewritten = dict(arguments)
+            rewritten[field] = visible
+        presented.append(
+            {"name": call.get("name"), "arguments": rewritten}
+            if rewritten is not None else call
+        )
+    return presented
 
 
 def _load_preparation_json(raw: str) -> Any:
@@ -302,6 +346,7 @@ class TaskExecutionCoordinator:
         if not isinstance(actions, list) or not actions or len(actions) > 5:
             return await self._fail(occurrence, "invalid_action_snapshot", 0, 0)
         calls: list[dict[str, Any]] = []
+        execution_calls: list[dict[str, Any]] = []
         for action in actions:
             if not isinstance(action, dict):
                 return await self._fail(occurrence, "invalid_action", 0, 0)
@@ -312,6 +357,7 @@ class TaskExecutionCoordinator:
             if self.executor._registry.get(name) is None:
                 return await self._fail(occurrence, "unregistered_action", 0, 0)
             calls.append({"name": name, "arguments": arguments})
+        execution_calls = calls
 
         # AI-assisted occurrences: only tasks that persist an ai_instruction
         # pay for a provider round. Static tasks keep the exact deterministic
@@ -332,6 +378,9 @@ class TaskExecutionCoordinator:
                 # every AI-assisted occurrence: the metadata path validated in
                 # _prepared_from_metadata, this closes the occurrence-time path.
                 self._enforce_content_policy(calls, instruction)
+                # Presentation only: the validated calls stay intact for the
+                # audit metadata below; the executor receives the visible form.
+                execution_calls = present_calls(calls, instruction)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -341,7 +390,7 @@ class TaskExecutionCoordinator:
         try:
             result = await asyncio.wait_for(
                 self.executor.execute_calls(
-                    calls,
+                    execution_calls,
                     owner_id=self.owner_id,
                     session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
                     context_override=execution_context,

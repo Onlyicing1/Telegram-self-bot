@@ -2,9 +2,216 @@
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
 > exists at the tip of this phase. If code changes invalidate any section,
-> update this document in the same commit.
+> update this document in the same commit. Previous phase reports are kept
+> verbatim below under `ARCHIVE - PREVIOUS PHASE REPORTS`.
 
 ---
+
+## Phase - Structured Taskloom task-creation wizard
+
+### Metadata
+
+| Item | Value |
+|---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` |
+| Branch | `main` |
+| Starting HEAD | `5325a4065bf29ac1f3379de9d744917f82e0b460` (`main` == `origin/main` at phase start) |
+| Phase | **Taskloom creation UX + content-constraint contract** - structured wizard converging on the existing TaskCandidate/TaskCreationService path, plus English language support and label-free speaker presentation in the deterministic preparation policy |
+| Status | **IMPLEMENTED** - full suite green (2220 passed, 24 skipped, 0 failed); focused wizard suite 34 passed |
+| Database impact | **NONE** (no schema, migration, RLS, table, index, or SQL file touched; the wizard writes through the existing `ai_tasks` columns only) |
+| Live Telegram verification | **NOT performed** (no live Telegram session/telemetry access in this workspace) |
+| Delivery record | see "Delivery record" |
+
+### Exact problem
+
+A recurring Bio task created from natural language executed successfully, but
+the generated bio was not in the requested language and the visible bio was
+forced to carry a literal speaker label (`Ayanami Rei: ...`):
+
+    هر ۲ دقیقه بیو رو آپدیت کن به یه دیالوگ رندوم از آیانامی ری که زیر 60 کاراکتر باشه
+
+Two distinct causes, both traced in source:
+
+1. **No language was named, so no language was enforced - and English was not
+   representable at all.** `backend/ai/preparation_policy.py` derives the content
+   policy from the instruction only. It recognized `persian`, `chinese`, and
+   `arabic` word lists; there was **no English vocabulary**, so a request for
+   English content could not produce `derive_policy(...).language == "english"`,
+   and the only way to obtain English was to leave the language unconstrained
+   (the model then answered in Persian).
+2. **Source identity validation and user-visible formatting were the same
+   thing.** `_check_attribution` requires the generated line to OPEN with the
+   requested source name and a separator, and the validated text is exactly what
+   executes - so the owner's bio was forced to display a speaker label.
+3. **Task creation had no structured path.** The only entry points were the
+   natural-language interpreter (`.task` / `create_task` tool) and the Taskloom
+   panels, which could list/inspect/pause/resume/complete/delete but not create,
+   so every task parameter had to survive one natural-language sentence.
+
+### Source-traced root cause
+
+- `backend/ai/preparation_policy.py::derive_policy` - language detection had no
+  English branch, `PreparationPolicy.language` had no `english` state, and
+  `_check_language` had no English script rule.
+- `backend/ai/preparation_policy.py::_check_attribution` - the attribution parse
+  both validated and defined the executed content; no presentation concept
+  existed anywhere in the contract (task -> `ai_instruction` -> occurrence
+  preparation -> `ToolExecutor`), so "verify the speaker" inevitably meant "print
+  the speaker".
+- The Taskloom handler exposed no creation entry point at all.
+
+### Exact implementation
+
+**a) Structured creation wizard (`backend/ai/task_wizard.py`, new).**
+Stateless deterministic contract: `TaskDraft` -> `build_candidate()` produces the
+**same** candidate dict the natural-language path produces, validated by the same
+`TaskCandidate.from_untrusted` and persisted by the same
+`TaskCreationService` -> `TaskRepository`. Actions come from their registered
+execution contract (`bio_set_text`, `username_set_text`, `send_message`);
+generated content is offered only where the tool contract allows it
+(`send_message` requires bounded non-blank text, so it stays static).
+`build_instruction()` composes the durable `ai_instruction`, and
+`_instruction_problem()` **round-trips it through `derive_policy`** before any
+candidate is returned, so a constraint the policy cannot represent is a hard
+error instead of a silently unenforced review line.
+
+**b) Wizard UI (`backend/bot/handlers/taskloom.py`).** Four steps over the
+existing Glass UI inline-panel/callback/input infrastructure:
+`Action -> Content -> Content details -> Schedule -> Review -> Create`, plus a
+`+ New task` row on the Taskloom list. Inputs (`source`, `maxlen`, `text`,
+`interval`, `daily`, `weekly`, `once`, `tz`) use the existing
+`register_input`/pending-input flow; drafts are per-owner in-process UI state.
+
+**c) English language policy.** `_ENGLISH_WORDS = ("انگلیسی", "english")`,
+`language = "english"`, and a `_check_language` English branch: at least one
+Latin letter and no Persian/Arabic/Han letters. No silent default - an
+unspecified language still imposes nothing.
+
+**d) Label-free speaker presentation.** `PreparationPolicy.speaker_label`
+(default `True`) is derived from explicit markers (`without a speaker label`,
+`بدون نام گوینده`, ...). Attribution is still validated on the generated line at
+every point; `validate_content` keeps its "never rewrites content" contract and
+applies the language/length checks to the VISIBLE text;
+`backend/ai/task_execution.py::present_calls` - called once, after the final
+boundary validation and immediately before `ToolExecutor` - removes the verified
+opening label from the copies handed to the executor, while the validated calls
+(the ones persisted as occurrence metadata and re-validated later) stay intact.
+The model is therefore still forced to attribute the line (identity proof kept)
+and the owner sees only the dialogue.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/task_wizard.py` | **new** - draft -> `ai_instruction` -> candidate contract, parsing/validation, review rendering |
+| `backend/bot/handlers/taskloom.py` | wizard panels/actions/inputs + `+ New task` entry |
+| `backend/ai/preparation_policy.py` | English language support; `speaker_label`; label-free length/language checks on the visible text; `strip_attribution_prefix` |
+| `backend/ai/task_execution.py` | `present_calls` presentation step at the execution boundary |
+| `tests/test_task_wizard.py` | **new** - 34 focused tests |
+| `IMPLEMENTATION_REPORT.md` | this report |
+
+No other file was touched. No Supabase schema/migration/SQL change. No new
+scheduler, executor, repository, or persistence path.
+
+### Wizard flow
+
+    Taskloom -> + New task
+      Step 1 Action            Bio update | Username update | Write a message
+      Step 2 Content           AI-generated (fresh each run) | Static text (same every run)
+      Step 3 Content details    Character/source . Language . Maximum length . Speaker label
+                               (static mode: the exact text)
+      Step 4 Schedule           Once | Every N minutes | Daily | Weekly  + Timezone
+      Review                    every row derived from the built candidate
+      [Create task]             TaskCreationService -> TaskRepository (durable)
+
+The review screen is rendered from `build_candidate()`, never from the draft, so
+it cannot display a value the persisted candidate does not contain.
+
+### Required vs optional fields
+
+- **Required:** action; content mode; static text (static mode only); schedule
+  type AND its parameter (interval minutes / `HH:MM` / weekday+`HH:MM` /
+  `YYYY-MM-DD HH:MM`); timezone (defaults to the owner's configured timezone -
+  no second timezone source of truth). Creation without a valid schedule is
+  impossible; a `once` start must be in the future.
+- **Optional (AI-generated mode):** source/character, language, maximum length,
+  speaker-label presentation. An unset field imposes nothing; no fabricated
+  default is inserted.
+
+### Language-contract behaviour
+
+| Selection | Durable `ai_instruction` fragment | `derive_policy` result |
+|---|---|---|
+| English | `in English` | `language == "english"` |
+| Persian | `in Persian` | `language == "persian"` |
+| Arabic | `in Arabic` | `language == "arabic"` |
+| Chinese | `in Chinese` | `language == "chinese"` |
+| not set | *(absent)* | `language is None` (unchanged semantics) |
+
+Example composed instruction for the reported request:
+`update my bio, with a randomly generated dialogue, in English, at most 59 characters, without a speaker label, from Ayanami Rei`.
+The deterministic validator remains the final authority; the model's self-report
+is never trusted.
+
+### Bio source/format behaviour
+
+- Source identity is still proven deterministically (opening attribution with
+  the full requested name + separator); drifting speakers, short forms, in-text
+  mentions, and generic text are still rejected and regenerated.
+- With label-free presentation selected, the executed bio is
+  `Don't be afraid. You are not alone.` while the validated line was
+  `Ayanami Rei: Don't be afraid. You are not alone.` - validation and visible
+  formatting are separated, neither weakened.
+- Maximum length remains an INCLUSIVE maximum (`at most N characters`, matching
+  the policy's existing `max` branch). The pre-existing "under N"/"below N"
+  semantics (maximum of N-1) are untouched, and the label is excluded from the
+  counted length only when it will not be displayed.
+
+### Test results
+
+- Focused: `tests/test_task_wizard.py` - **34 passed**.
+- Content-policy/execution regression files unchanged and green:
+  `tests/test_preparation_policy_source.py`, `tests/test_task_ai_preparation.py`,
+  `tests/test_task_source_fidelity.py`, `tests/test_task_prepare_ahead.py`,
+  `tests/test_taskloom_ui.py`.
+- Full suite: `.venv/bin/python -m pytest tests -q` - **2220 passed, 24 skipped, 0 failed**.
+- `py_compile` - OK for every changed/added Python file.
+- `git diff --check` - clean.
+
+### Live verification status
+
+**Live Telegram verification was NOT performed** (no live session/credentials in
+this workspace). In-process verification covered the whole wizard -> candidate ->
+`TaskCreationService` -> repository path against the real code with an
+`InMemoryTaskRepository`.
+
+### Remaining limitations (honest)
+
+1. **Event-triggered schedules are not offered by the wizard.** `once`,
+   `interval`, `daily`, and `weekly` are supported; a Telegram-event trigger
+   needs dialog-name resolution at creation time and remains on the
+   natural-language path (documented, not faked).
+2. **The composed instruction is English-phrased.** `derive_policy` also accepts
+   the Persian markers, but the wizard's wording is not localized; the generated
+   CONTENT language is fully controlled by the language field.
+3. **Wizard drafts are in-process UI state** (like every other pending panel
+   input): a process restart discards an unconfirmed draft. Nothing durable is
+   created until the owner presses Create.
+4. **Source names that themselves contain a language word** (e.g. "English
+   Rose") are rejected by the round-trip guard rather than silently imposing an
+   unintended language constraint.
+
+### Delivery record
+
+| Item | Value |
+|---|---|
+| Commit | `feat: add structured task creation wizard` (SHA recorded below by the delivery step) |
+| Push | `origin main` (no force), verified with `git ls-remote origin refs/heads/main` |
+
+---
+
+# ARCHIVE - PREVIOUS PHASE REPORTS (verbatim)
+
 
 ## 1. Implementation metadata
 

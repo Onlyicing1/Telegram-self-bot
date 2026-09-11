@@ -19,7 +19,17 @@ generated line — never presented as an authenticated quotation.
 Language policy is DERIVED FROM THE INSTRUCTION ONLY. If the instruction
 does not name a language, no language constraint is imposed. Detection is
 script-based, not ASCII-based: digits, punctuation, whitespace, emoji and
-language-appropriate marks never count as violations.
+language-appropriate marks never count as violations. English is a named
+language like the others: it is imposed only when the instruction names it.
+
+A named-source task may additionally request a LABEL-FREE presentation
+("without a speaker label"): attribution is still validated on the generated
+line (it must open with the requested source), while the language/length
+checks apply to the VISIBLE content and the validated opening label is
+removed from the executed text by the coordinator's presentation step. The
+validator itself never rewrites content, so every validation pass —
+preparation, persisted metadata, execution boundary — sees the same
+deterministic result.
 """
 from __future__ import annotations
 
@@ -38,6 +48,18 @@ MAX_PREPARATION_ATTEMPTS = 3
 _PERSIAN_WORDS = ("فارسی", "پارسی", "persian", "farsi")
 _CHINESE_WORDS = ("چینی", "chinese", "中文", "汉语", "mandarin")
 _ARABIC_WORDS = ("عربی", "arabic")
+_ENGLISH_WORDS = ("انگلیسی", "english")
+
+# Label-free presentation markers: the owner explicitly asked for the
+# validated speaker label to be dropped from the VISIBLE content (a bio that
+# reads like the line itself). Only meaningful together with a named source;
+# without a source there is nothing to hide and the flag is inert.
+_LABEL_FREE_MARKERS = (
+    "بدون نام گوینده", "بدون برچسب گوینده", "بدون برچسب", "بدون نام",
+    "بی برچسب", "بی نام",
+    "without a speaker label", "without the speaker label",
+    "without speaker label", "no speaker label",
+)
 
 # "dialogue from <X>" — the source/person/character constraint. Marker
 # TOKENS in the languages the owner actually uses; matching is token-based
@@ -133,13 +155,14 @@ class PreparationPolicyError(ValueError):
 class PreparationPolicy:
     """Validated content constraints derived from one task instruction."""
 
-    language: str | None = None  # None | "persian" | "chinese" | "arabic"
+    language: str | None = None  # None | "persian" | "chinese" | "arabic" | "english"
     exact_length: int | None = None
     max_length: int | None = None
     length_text: str = ""
     source: str = ""       # required source/person/character, "" = unconstrained
     source_text: str = ""  # the raw spoken source phrase (diagnostics)
     quote_exact: bool = False  # explicit exact-canonical-quote request: fails closed
+    speaker_label: bool = True  # False = validated label hidden from the visible content
 
     @property
     def active(self) -> bool:
@@ -171,6 +194,12 @@ class PreparationPolicy:
                     f"a GENERATED dialogue from that source: open with "
                     f"'{self.source}:' followed by the line — never another speaker, "
                     f"never a short form, never generic text"
+                    + (
+                        ""
+                        if self.speaker_label
+                        else "; the validated opening speaker label is removed "
+                        "from the visible result"
+                    )
                 )
         return ", ".join(parts) if parts else "no content constraints"
 
@@ -254,6 +283,8 @@ def derive_policy(instruction: str) -> PreparationPolicy:
         language = "chinese"
     elif _contains_any(instruction, _ARABIC_WORDS):
         language = "arabic"
+    elif _contains_any(instruction, _ENGLISH_WORDS):
+        language = "english"
 
     exact_length: int | None = None
     max_length: int | None = None
@@ -309,6 +340,7 @@ def derive_policy(instruction: str) -> PreparationPolicy:
         source=source,
         source_text=source_phrase,
         quote_exact=quote_exact,
+        speaker_label=not _contains_any(instruction, _LABEL_FREE_MARKERS),
     )
 
 
@@ -337,6 +369,11 @@ def _check_language(text: str, language: str) -> None:
             raise PreparationPolicyError("content must be Chinese-only but contains Persian/Arabic or Latin letters")
         if not _HanLetter.search(letters):
             raise PreparationPolicyError("content must be Chinese but contains no Han characters")
+    elif language == "english":
+        if _ArabicLetter.search(letters) or _HanLetter.search(letters):
+            raise PreparationPolicyError("content must be English but contains Persian/Arabic or Han letters")
+        if not _LatinLetter.search(letters):
+            raise PreparationPolicyError("content must be English but contains no Latin letters")
 
 
 def _check_length(text: str, policy: PreparationPolicy) -> None:
@@ -368,18 +405,16 @@ def _check_garbage(text: str) -> None:
         raise PreparationPolicyError("content looks like a provider failure payload, not the requested content")
 
 
-def _check_attribution(text: str, source: str) -> None:
-    """Deterministic self-attribution: the line must OPEN with the requested
-    source's name (all tokens, spoken order, case-insensitive) followed by a
-    dialogue separator and the line itself.
+def _attributed_line(text: str, source: str) -> str:
+    """Return the dialogue line with the verified opening attribution removed.
 
-    Token-based — no regex, no corpus, no model trust beyond the exact name
-    match. A different speaker, a short form, an in-text mention, and
-    unattributed generic text are all rejected.
+    Runs the same deterministic attribution parse as ``_check_attribution``
+    and may therefore only be called on text that already passed it (the
+    execution-boundary presentation step). Raises on any mismatch.
     """
     source_tokens = source.split()
     if not source_tokens:
-        return
+        return text
     stripped = text.lstrip()
     while stripped and stripped[0] in _ATTRIBUTION_OPENERS:
         stripped = stripped[1:].lstrip()
@@ -421,6 +456,32 @@ def _check_attribution(text: str, source: str) -> None:
         raise PreparationPolicyError(
             f"content must include the dialogue line after the {source!r} attribution"
         )
+    return line
+
+
+def _check_attribution(text: str, source: str) -> None:
+    """Deterministic self-attribution: the line must OPEN with the requested
+    source's name (all tokens, spoken order, case-insensitive) followed by a
+    dialogue separator and the line itself.
+
+    Token-based — no regex, no corpus, no model trust beyond the exact name
+    match. A different speaker, a short form, an in-text mention, and
+    unattributed generic text are all rejected.
+    """
+    _attributed_line(text, source)
+
+
+def strip_attribution_prefix(text: str, source: str) -> str | None:
+    """The visible line for a LABEL-FREE source task: the verified opening
+    attribution removed, or ``None`` when the text does not carry it.
+
+    Presentation only — never used as validation, never applied to text that
+    did not already pass the deterministic attribution check.
+    """
+    try:
+        return _attributed_line(text, source)
+    except PreparationPolicyError:
+        return None
 
 
 def validate_content(text: Any, policy: PreparationPolicy) -> str:
@@ -432,6 +493,7 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
     if not isinstance(text, str):
         raise PreparationPolicyError("content must be a string")
     _check_garbage(text)
+    visible = text
     if policy.source:
         if policy.quote_exact:
             # An explicit exact-canonical-quote request cannot be honored
@@ -446,9 +508,14 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
         # enforced (a provider label is never treated as canon, only as the
         # line's own opening attribution).
         _check_attribution(text, policy.source)
+        if not policy.speaker_label:
+            # The owner asked for a LABEL-FREE presentation: the label is
+            # validated above, so the language/length contract applies to the
+            # VISIBLE content the owner will actually see.
+            visible = strip_attribution_prefix(text, policy.source) or text
     if policy.language is not None:
-        _check_language(text, policy.language)
-    _check_length(text, policy)
+        _check_language(visible, policy.language)
+    _check_length(visible, policy)
     return text
 
 
