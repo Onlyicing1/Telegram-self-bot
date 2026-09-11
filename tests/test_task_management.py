@@ -34,7 +34,7 @@ async def test_management_is_owner_scoped_and_uses_cas():
 
 
 @pytest.mark.asyncio
-async def test_delete_is_terminal_persisted_and_excluded_from_list():
+async def test_delete_removes_the_row_and_its_occurrences():
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, data())
     await repo.create_occurrence(
@@ -49,43 +49,39 @@ async def test_delete_is_terminal_persisted_and_excluded_from_list():
     )
     service = TaskManagementService(repo, 1)
 
-    deleted = await service.delete(task.id, expected_version=task.version)
-    assert deleted is not None
-    assert deleted.status == "deleted"
-    # Successful mutation increments the version exactly once.
-    assert deleted.version == task.version + 1
-    assert deleted.terminal_at is not None
+    result = await service.delete(task.id, expected_version=task.version)
+    assert result.deleted is True
+    assert result.task_id == task.id
 
-    # The authoritative row keeps the deletion; the normal list excludes it;
-    # inspection by id still works; occurrence history is intact.
-    stored = await repo.get_task(1, task.id)
-    assert stored.status == "deleted"
+    # The row is really gone — not a hidden "deleted" status — so the normal
+    # list and inspection both lose it, and its occurrences went with it.
+    assert await repo.get_task(1, task.id) is None
+    assert await service.inspect(task.id) is None
     assert [t.id for t in await service.list_tasks()] == []
-    assert await service.inspect(task.id) is not None
-    occurrences = await repo.list_occurrences(1, task.id)
-    assert len(occurrences) == 1 and occurrences[0].status == "claimed"
+    assert await repo.list_occurrences(1, task.id) == []
 
 
 @pytest.mark.asyncio
-async def test_delete_respects_cas_owner_and_terminality():
+async def test_delete_respects_cas_owner_and_leaves_the_row_on_failure():
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, data())
     service = TaskManagementService(repo, 1)
 
-    # Stale version fails safely; nothing changes.
-    assert await service.delete(task.id, expected_version=999) is None
+    # Stale version fails safely; the row is untouched.
+    stale = await service.delete(task.id, expected_version=999)
+    assert stale.outcome == "stale" and stale.deleted is False
     assert (await repo.get_task(1, task.id)).status == "active"
 
     # Foreign owner can neither read nor delete.
     foreign = TaskManagementService(repo, 2)
-    assert await foreign.delete(task.id, expected_version=task.version) is None
+    missing = await foreign.delete(task.id, expected_version=task.version)
+    assert missing.outcome == "not_found" and missing.deleted is False
+    assert (await repo.get_task(1, task.id)) is not None
 
-    # A deleted task can never be reactivated — the repository rejects the
-    # impossible transition before any mutation.
-    await service.delete(task.id, expected_version=task.version)
-    with pytest.raises(ValueError):
-        await service.resume(task.id, expected_version=task.version + 1)
-    assert (await repo.get_task(1, task.id)).status == "deleted"
+    # A real delete removes the task, so nothing can reactivate or inspect it.
+    assert (await service.delete(task.id, expected_version=task.version)).deleted is True
+    assert await repo.get_task(1, task.id) is None
+    assert await service.resume(task.id, expected_version=task.version + 1) is None
 
 
 @pytest.mark.asyncio

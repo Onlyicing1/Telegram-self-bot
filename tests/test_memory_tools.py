@@ -69,7 +69,7 @@ def test_memory_tools_are_registered():
     assert registry.has("memory_store")
     assert registry.has("memory_list")
     names = registry.list_names()
-    assert len(names) == len(set(names)) == 38
+    assert len(names) == len(set(names)) == 39
 
 
 def test_tool_contract():

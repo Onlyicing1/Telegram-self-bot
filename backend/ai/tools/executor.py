@@ -76,6 +76,7 @@ _STATUS_LABELS: dict[str, str] = {
     "task_list": "🗓 Reading tasks...",
     "task_inspect": "🗓 Reading task...",
     "task_transition": "🗓 Updating task...",
+    "task_delete": "🗓 Deleting task...",
     "send_message": "📨 Sending message...",
     "memory_store": "🧠 Remembering...",
     "memory_list": "🧠 Reading memories...",

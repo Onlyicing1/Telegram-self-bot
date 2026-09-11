@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.ai.database.task_repository import TASK_STATUSES, TaskRecord, TaskRepository
+from backend.ai.database.task_repository import (
+    TASK_STATUSES,
+    TaskDeletionResult,
+    TaskRecord,
+    TaskRepository,
+)
 from backend.ai.scheduling import ScheduleError, advance_interval, next_occurrence, parse_schedule
 
 logger = logging.getLogger(__name__)
@@ -51,11 +56,12 @@ class TaskManagementService:
         unchanged; task volumes are small. Status values are the record's
         canonical strings (active / paused / completed / ...).
 
-        The normal (unfiltered) list excludes ``deleted`` tasks: ``deleted``
-        is the terminal lifecycle state, so a deleted task leaves the list
-        while its row and occurrence history stay durable and it remains
-        inspectable by id. An explicit ``status`` filter matches the record's
-        exact status and is never widened.
+        Deletion is a real row removal, so a deleted task is simply absent
+        from the repository. The unfiltered list still excludes a
+        ``deleted`` status defensively: that status is no longer produced,
+        but a pre-existing legacy row that carries it must not reappear in
+        the normal collection. An explicit ``status`` filter matches the
+        record's exact status and is never widened.
         """
         tasks = await self.repository.list_tasks(self.owner_id)
         if status is None:
@@ -153,5 +159,16 @@ class TaskManagementService:
     async def expire(self, task_id: int, expected_version: int) -> TaskRecord | None:
         return await self.set_status(task_id, "expired", expected_version)
 
-    async def delete(self, task_id: int, expected_version: int) -> TaskRecord | None:
-        return await self.set_status(task_id, "deleted", expected_version)
+    async def delete(self, task_id: int, expected_version: int) -> TaskDeletionResult:
+        """Physically delete the owner's task row (never a status write).
+
+        Deletion is a real repository removal (``delete_task``): the durable
+        row and its occurrences are gone, so the task leaves every list
+        because it no longer exists. The CAS ``expected_version`` still
+        guards stale writers, and the result distinguishes a durable removal
+        from a missing task, a stale version, and a degraded (in-memory)
+        deletion that must never be reported as durable.
+        """
+        return await self.repository.delete_task(
+            self.owner_id, task_id, expected_version
+        )

@@ -8,6 +8,8 @@ Semantics preserved from the existing boundary:
   - owner-scoped: the service filters every operation by ``owner_id``;
   - CAS transitions: mutations require the current ``expected_version``, a
     stale version fails honestly instead of overwriting;
+  - deletion is a REAL row removal (``task_delete`` -> ``delete_task``),
+    never a ``status="deleted"`` lifecycle write;
   - the tool layer adds NO new persistence or status logic.
 """
 from __future__ import annotations
@@ -17,13 +19,12 @@ from typing import Any
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 
-# Statuses the owner can filter the task list by (deleted tasks are
-# terminal and excluded from the normal list — they stay inspectable by id).
+# Statuses the owner can filter the task list by.
 _LIST_STATUSES = ("active", "paused", "completed")
-# Statuses task_transition may move a task to. ``deleted`` is the existing
-# terminal lifecycle state: active/paused tasks may be deleted, and a deleted
-# task can never return to an active lifecycle.
-_TRANSITION_STATUSES = ("active", "paused", "completed", "deleted")
+# Statuses task_transition may move a task to. ``deleted`` is deliberately
+# absent: deletion is the dedicated ``task_delete`` operation (a real row
+# removal), never a status transition.
+_TRANSITION_STATUSES = ("active", "paused", "completed")
 
 
 class TaskListTool(Tool):
@@ -174,10 +175,9 @@ class TaskTransitionTool(Tool):
     def description(self) -> str:
         return (
             "Change a scheduled task's status: pause, resume (set active), "
-            "complete, or delete (terminal). Requires the task's CURRENT "
-            "version (from task_list or task_inspect) — a stale version fails "
-            "and nothing changes. A deleted task leaves the normal task list "
-            "but keeps its occurrence history and stays inspectable by id."
+            "or complete. Requires the task's CURRENT version (from "
+            "task_list or task_inspect) — a stale version fails and nothing "
+            "changes. Use task_delete to remove a task permanently."
         )
 
     @property
@@ -191,7 +191,7 @@ class TaskTransitionTool(Tool):
             "action": {
                 "type": "string",
                 "enum": list(_TRANSITION_STATUSES),
-                "description": "Target status: paused, active (resume), completed, or deleted.",
+                "description": "Target status: paused, active (resume), or completed.",
             },
             "expected_version": {
                 "type": "integer",
@@ -237,7 +237,8 @@ class TaskTransitionTool(Tool):
                 success=False,
                 message=(
                     f"Unsupported status '{status}'. "
-                    "Allowed: paused, active, completed, deleted."
+                    "Allowed: paused, active, completed. Use task_delete to "
+                    "remove a task."
                 ),
             )
 
@@ -258,11 +259,9 @@ class TaskTransitionTool(Tool):
             "paused": "paused",
             "active": "resumed",
             "completed": "completed",
-            "deleted": "deleted",
         }
-        prefix = "🗑" if str(task.status) == "deleted" else "✅"
         message = (
-            f"{prefix} Task #{task.id} "
+            f"✅ Task #{task.id} "
             f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
             f"· version {task.version}."
         )
@@ -286,6 +285,133 @@ class TaskTransitionTool(Tool):
             data["fallback_backend"] = fallback_backend
         else:
             data["durable"] = True
+        return ToolResult(success=True, message=message, data=data)
+
+
+class TaskDeleteTool(Tool):
+    """Permanently delete one task (owner-scoped, CAS version check).
+
+    Deletion is a real repository removal — never a ``status="deleted"``
+    lifecycle write — so the task leaves every list because its ``ai_tasks``
+    row (with its occurrences) is gone. A stale ``expected_version`` fails and
+    nothing changes. A deletion that degraded into the in-memory fallback is
+    still reported honestly as non-durable.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "task_delete"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Permanently delete a scheduled task by id. Requires the task's "
+            "CURRENT version (from task_list or task_inspect) — a stale "
+            "version fails and nothing changes. The task is really removed "
+            "and disappears from the task list."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "task_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task id to delete.",
+            },
+            "expected_version": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task's current version (optimistic concurrency).",
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        # Deleting the owner's own task is an owner-authorized lifecycle
+        # operation; the CAS version check keeps it deterministic and
+        # stale-safe.
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the deleted task id and its durability in data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.database.manager import get_repository_manager
+        from backend.ai.database.task_repository import DELETION_STALE
+        from backend.ai.task_management import TaskManagementService
+
+        task_id = _coerce_positive_int(arguments.get("task_id"))
+        version = _coerce_positive_int(arguments.get("expected_version"))
+        if task_id is None:
+            return ToolResult(success=False, message="A positive task_id is required.")
+        if version is None:
+            return ToolResult(
+                success=False,
+                message=(
+                    "The task's current version is required (from task_list or "
+                    "task_inspect). Nothing was changed."
+                ),
+            )
+
+        try:
+            service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            result = await service.delete(task_id, expected_version=version)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Task delete failed: {exc}")
+
+        if not result.deleted:
+            if result.fallback_backend:
+                # The durable store could not be reached: nothing durable was
+                # verified, so a deletion success must never be claimed.
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"⚠️ Task #{task_id} was not deleted: the durable store "
+                        "was unreachable and the in-memory fallback holds no "
+                        "matching task. Nothing durable was changed."
+                    ),
+                )
+            if result.outcome == DELETION_STALE:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"Task #{task_id} was not deleted: version {version} is "
+                        "stale (the task changed after you read it). Read it "
+                        "again and retry."
+                    ),
+                )
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Task #{task_id} not found, ownership check failed, or it "
+                    "no longer exists. Nothing was changed."
+                ),
+            )
+
+        data: dict[str, Any] = {
+            "task_id": int(task_id),
+            "deleted": True,
+            "durable": bool(result.durable),
+        }
+        message = f"🗑 Task #{task_id} deleted."
+        if not result.durable:
+            # A degraded deletion is NOT durable: the shared in-memory
+            # fallback lost the row, but the durable store still holds it (a
+            # restart or a healthy read would bring it back). Never report it
+            # as a plain deletion success.
+            from backend.ai.task_management_interface import FALLBACK_NOTE
+
+            message = f"{message}\n\n{FALLBACK_NOTE}"
+            data["fallback_backend"] = str(result.fallback_backend)
         return ToolResult(success=True, message=message, data=data)
 
 

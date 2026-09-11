@@ -1,8 +1,9 @@
 """Regression tests for the six production task-system problems.
 
-1. Deleted tasks must never be counted in normal task totals.
-2. Delete must persist to Supabase through the CAS update (status, version,
-   terminal_at) — and fallback-to-memory must be visible, never silent.
+1. A deleted task must never be counted in normal task totals.
+2. Delete must physically remove the ownership-scoped row (and its
+   occurrences) from Supabase through the CAS-guarded delete — and
+   fallback-to-memory must be visible, never silent.
 3. \"No tasks\" may only be reported when no eligible tasks exist; a Supabase
    read failure degrades to the shared in-memory fallback and is flagged.
 4. The scheduler must reconstruct stored registered actions (task_list, ...)
@@ -59,7 +60,7 @@ def task_data(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_counts_exclude_deleted_and_normal_list_is_authoritative():
+async def test_removed_tasks_are_excluded_from_counts_and_the_normal_list():
     repo = InMemoryTaskRepository()
     service = TaskManagementService(repo, 1)
     await repo.create_task(1, task_data(label="active one"))
@@ -73,12 +74,12 @@ async def test_counts_exclude_deleted_and_normal_list_is_authoritative():
     counts = await service.counts()
     assert counts == {
         "active": 1, "paused": 1, "completed": 1,
-        "failed": 0, "expired": 0, "deleted": 1,
+        "failed": 0, "expired": 0, "deleted": 0,
     }
 
     listed = await service.list_tasks()
     assert len(listed) == 3
-    assert all(t.status != "deleted" for t in listed)
+    assert all(t.id != doomed.id for t in listed)
     assert sum(1 for t in listed if t.status == "active") == 1
     assert sum(1 for t in listed if t.status == "paused") == 1
     assert sum(1 for t in listed if t.status == "completed") == 1
@@ -129,6 +130,10 @@ class _FakeQuery:
         self.payload, self.operation = payload, "update"
         return self
 
+    def delete(self):
+        self.operation = "delete"
+        return self
+
     def eq(self, key, value):
         self.filters.append((key, value))
         return self
@@ -168,6 +173,12 @@ class _FakeQuery:
         elif self.operation == "update":
             for row in matches:
                 row.update(self.payload)
+        elif self.operation == "delete":
+            removed = list(matches)
+            for row in removed:
+                if row in rows:
+                    rows.remove(row)
+            matches = removed
         data = matches[0] if self.single else (matches[:1] if self.operation in ("insert", "update") else matches)
         return SimpleNamespace(data=data)
 
@@ -202,41 +213,40 @@ def row_task(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_supabase_delete_persists_cas_update_and_terminal_at():
-    client = _FakeClient([row_task()])
+async def test_supabase_delete_physically_removes_the_row_and_its_occurrences():
+    occurrence = {
+        "id": 9, "task_id": 7, "owner_id": 10, "occurrence_key": "k1",
+        "definition_version": 1, "action_snapshot": [{"name": "list_saves", "arguments": {}}],
+        "scheduled_for": "2026-08-29T08:30:00+00:00", "attempt": 1, "status": "claimed",
+        "claimed_at": None, "started_at": None, "finished_at": None, "retry_at": None,
+        "error_metadata": {}, "result_metadata": {},
+        "created_at": "2026-08-29T08:00:00+00:00", "updated_at": "2026-08-29T08:00:00+00:00",
+    }
+    client = _FakeClient([row_task()], [occurrence])
     repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
 
-    deleted = await repo.transition_task(10, 7, "deleted", expected_version=1)
-    assert deleted is not None and deleted.status == "deleted"
-    assert deleted.version == 2 and deleted.terminal_at is not None
+    result = await repo.delete_task(10, 7, 1)
+    assert result.outcome == "deleted" and result.deleted and result.durable
 
     query = client.last_query
-    assert query.table_name == "ai_tasks" and query.operation == "update"
+    assert query.table_name == "ai_tasks" and query.operation == "delete"
     assert ("id", 7) in query.filters
     assert ("owner_id", 10) in query.filters
     assert ("version", 1) in query.filters  # atomic CAS on the row version
-    assert query.payload["status"] == "deleted"
-    assert query.payload["version"] == 2
-    assert "terminal_at" in query.payload
 
-    # The row in the "database" actually changed — persistence, not UI-only.
-    stored = await repo.get_task(10, 7)
-    assert stored.status == "deleted" and stored.version == 2
-
-    # Idempotent deleted -> deleted never overwrites the original terminal_at.
-    again = await repo.transition_task(10, 7, "deleted", expected_version=2)
-    assert again is not None and again.status == "deleted"
-    assert "terminal_at" not in client.last_query.payload
-    assert again.terminal_at == deleted.terminal_at
+    # Both rows are really gone from the "database" — a physical removal, not
+    # a status write the UI merely hides.
+    assert client.rows["ai_tasks"] == [] and client.rows["ai_task_occurrences"] == []
 
 
 @pytest.mark.asyncio
 async def test_supabase_stale_version_delete_does_not_persist():
     client = _FakeClient([row_task()])
     repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
-    assert await repo.transition_task(10, 7, "deleted", expected_version=99) is None
+    result = await repo.delete_task(10, 7, 99)
+    assert result.outcome == "stale" and result.deleted is False
     assert (await repo.get_task(10, 7)).status == "active"
-    assert client.last_query.operation == "select"  # no update was issued
+    assert client.last_query.operation == "select"  # no delete was issued
 
 
 # ── Problems 2/3: fallback is visible and never silently durable ────────────
@@ -299,7 +309,7 @@ async def test_no_tasks_only_when_no_eligible_tasks_exist():
     doomed = await repo.create_task(1, task_data())
     await service.delete(doomed.id, doomed.version)
 
-    # Only terminal deleted rows exist -> "no tasks" is the correct answer.
+    # The only task was removed for real -> "no tasks" is the correct answer.
     assert await service.list_tasks() == []
     assert "No tasks found." in await list_text(service)
 
@@ -433,13 +443,14 @@ async def test_outcome_notification_requires_explicit_opt_in():
     assert await notifier.notify_persisted(quiet.id, "k2", "succeeded") is False
     assert len(sent) == 1
 
-    # Deleted task never notifies, even with the flag.
+    # A physically removed task never notifies, even with the flag: the task
+    # row (and its occurrences) are gone, so there is nothing to report on.
     doomed = await repo.create_task(
         1, task_data(label="doomed", notification_destination={"notify_on_outcome": True})
     )
     await _occurrence(doomed, "k3")
-    await repo.transition_task(1, doomed.id, "deleted", expected_version=doomed.version)
     await _claim_and_succeed(doomed, "k3")
+    assert (await repo.delete_task(1, doomed.id, doomed.version)).deleted is True
     assert await notifier.notify_persisted(doomed.id, "k3", "succeeded") is False
     assert len(sent) == 1
 
@@ -531,7 +542,7 @@ async def test_terminal_transitions_clear_next_run():
     repo = InMemoryTaskRepository()
     future = datetime.now(timezone.utc) + timedelta(hours=1)
     service = TaskManagementService(repo, 1)
-    for status in ("completed", "deleted"):
+    for status in ("completed", "failed", "expired"):
         task = await repo.create_task(1, task_data(label=status, next_run_at=future))
         changed = await service.set_status(task.id, status, task.version)
         assert changed.status == status

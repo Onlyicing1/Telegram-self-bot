@@ -120,7 +120,6 @@ def test_task_inspect_rejects_unexpected_fields():
     ("paused", "paused"),
     ("active", "active"),
     ("completed", "completed"),
-    ("deleted", "deleted"),
 ])
 def test_task_transition_resolves_full_cas_arguments(status, verb):
     result = parse_action_text(
@@ -147,21 +146,52 @@ def test_task_transition_normalizes_status_case():
     assert result.tool_calls[0]["arguments"]["action"] == "paused"
 
 
-def test_task_transition_rejects_nonlifecycle_status():
-    # "delete" is not a lifecycle status; the registered terminal state is
-    # "deleted" (the existing ai_tasks lifecycle value).
+def test_task_transition_rejects_deletion_statuses():
+    # Deletion is a dedicated operation, never a task_transition status.
+    for status in ("delete", "deleted", "removed"):
+        result = parse_action_text(
+            '{"action":"task_transition","task_id":7,'
+            f'"action_status":"{status}","expected_version":1}}'
+        )
+        assert result.kind == "invalid"
+        assert "action_status" in result.error
+
+
+# ── task_delete ─────────────────────────────────────────────────────────────
+
+
+def test_task_delete_resolves_full_cas_arguments():
     result = parse_action_text(
-        '{"action":"task_transition","task_id":7,'
-        '"action_status":"delete","expected_version":1}'
+        '{"action":"task_delete","task_id":7,"expected_version":2}'
+    )
+    assert result.kind == "executable"
+    assert result.tool_calls == [{
+        "name": "task_delete",
+        "arguments": {"task_id": 7, "expected_version": 2},
+    }]
+
+
+def test_task_delete_requires_id_and_version():
+    for payload in (
+        '{"action":"task_delete","expected_version":1}',
+        '{"action":"task_delete","task_id":7}',
+        '{"action":"task_delete","task_id":7,"expected_version":0}',
+    ):
+        result = parse_action_text(payload)
+        assert result.kind == "invalid"
+
+
+def test_task_delete_rejects_a_status_field():
+    result = parse_action_text(
+        '{"action":"task_delete","task_id":7,"expected_version":1,"action_status":"paused"}'
     )
     assert result.kind == "invalid"
     assert "action_status" in result.error
 
 
 def test_task_list_status_filter_rejects_terminal_deleted():
-    # The list filter vocabulary stays narrower than the transition
-    # vocabulary: deleted tasks are excluded from the normal list and can
-    # never be listed through a status filter (matches the registered tool).
+    # The list filter vocabulary mirrors the registered tool: a task is removed
+    # for real, so a legacy "deleted" row is never listed through a filter.
     result = parse_action_text('{"action":"task_list","status":"deleted"}')
     assert result.kind == "invalid"
 

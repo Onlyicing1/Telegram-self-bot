@@ -10,8 +10,9 @@ A dedicated visual surface over the EXISTING durable task system:
 
 The UI never touches the database or Telegram directly: every read goes
 through TaskManagementService (list/inspect), every mutation goes through
-the service's CAS-guarded transitions (pause/resume/complete/delete).
-No second scheduler, no second executor, no persistence layer.
+the service's CAS-guarded operations (pause/resume/complete) and its real
+deletion (delete removes the durable task row). No second scheduler, no
+second executor, no persistence layer.
 
 Entry point: the AI panel button "Taskloom" -> panel:taskloom.
 """
@@ -253,7 +254,42 @@ async def _complete_action(event, extra: str, chat_id: int):
 
 
 async def _delete_action(event, extra: str, chat_id: int):
-    return await _mutate(event, extra, "delete")
+    """Delete a task for real (durable row removal), then show the list.
+
+    Deletion is not a status transition, so it cannot reuse the shared
+    ``_mutate`` verb helper: the service returns a deletion outcome that
+    distinguishes a real removal from a missing task, a stale version, and a
+    degraded (non-durable) deletion.
+    """
+    from backend.helper.inline_engine import _owner_id
+    from backend.ai.database.task_repository import DELETION_STALE
+
+    parsed = _parse_action_extra(extra)
+    if parsed is None:
+        return "Taskloom", "× Invalid action arguments.", []
+    task_id, version = parsed
+    service = _service(_owner_id)
+    try:
+        result = await service.delete(task_id, version)
+    except Exception:
+        logger.exception("Taskloom delete failed for task %s", task_id)
+        return f"Task #{task_id}", "× Operation failed; no change was confirmed.", []
+    if not result.deleted:
+        if result.fallback_backend:
+            return f"Task #{task_id}", "× Supabase unavailable; nothing durable was deleted.", []
+        if result.outcome == DELETION_STALE:
+            return f"Task #{task_id}", "× Version is stale; nothing was deleted.", []
+        return f"Task #{task_id}", "× Task not found or ownership check failed.", []
+    notice = (
+        f"✓ Deleted task #{task_id}\n\n"
+        if result.durable
+        else f"✓ Deleted task #{task_id} (memory only — not durable)\n\n"
+    )
+    refreshed = await _taskloom_panel(event, "")
+    if refreshed is None:
+        return "Taskloom", notice.rstrip(), []
+    title, body, buttons = refreshed
+    return title, notice + body, buttons
 
 
 def register(client, owner_id: int, tz_str: str) -> None:

@@ -49,7 +49,7 @@ async def test_terminal_transitions_and_retry_timing_are_rejected():
     with pytest.raises(ValueError): await repo.transition_occurrence(10, task.id, record.occurrence_key, "retry_pending")
     await repo.claim_occurrence(10, task.id, record.occurrence_key); await repo.transition_occurrence(10, task.id, record.occurrence_key, "succeeded")
     with pytest.raises(ValueError): await repo.transition_occurrence(10, task.id, record.occurrence_key, "running")
-    await repo.transition_task(10, task.id, "deleted"); assert (await repo.get_occurrence(10, task.id, record.occurrence_key)).status == "succeeded"
+    await repo.transition_task(10, task.id, "completed"); assert (await repo.get_occurrence(10, task.id, record.occurrence_key)).status == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -76,27 +76,39 @@ class FakeQuery:
     def select(self, *_args, **_kwargs): self.operation = "select"; return self
     def insert(self, payload): self.payload = payload; self.operation = "insert"; return self
     def update(self, payload): self.payload = payload; self.operation = "update"; return self
+    def delete(self): self.operation = "delete"; return self
     def eq(self, key, value): self.filters.append((key, value)); return self
     def in_(self, key, values): self.filters.append((key, set(values))); return self
     def order(self, *_args, **_kwargs): return self
     def limit(self, value): self.limit_value = value; return self
     def maybe_single(self): self.single = True; return self
     def execute(self):
+        self.client.queries.append(self)
         if self.client.error: raise self.client.error
+        if self.client.insert_error and getattr(self, "operation", None) == "insert": raise self.client.insert_error
         rows = self.client.rows[self.table_name]
         matches = [r for r in rows if all(r.get(k) in v if isinstance(v, set) else r.get(k) == v for k, v in self.filters)]
         if getattr(self, "limit_value", None) is not None:
             matches = matches[:self.limit_value]
         if getattr(self, "operation", None) == "insert":
-            row = dict(self.payload); row.setdefault("id", self.client.next_id[self.table_name]); self.client.next_id[self.table_name] += 1; rows.append(row); matches = [row]
+            row = dict(self.payload); row.setdefault("id", self.client.next_id[self.table_name]); self.client.next_id[self.table_name] += 1
+            # Mirror the database defaults the app never sends explicitly.
+            if self.table_name == "ai_tasks": row.setdefault("status", "active"); row.setdefault("version", 1)
+            row.setdefault("created_at", "2026-08-29T08:00:00+00:00"); row.setdefault("updated_at", "2026-08-29T08:00:00+00:00")
+            rows.append(row); matches = [row]
         elif getattr(self, "operation", None) == "update":
             for row in matches: row.update(self.payload)
+        elif getattr(self, "operation", None) == "delete":
+            removed = list(matches)
+            for row in removed:
+                if row in rows: rows.remove(row)
+            matches = removed
         return SimpleNamespace(data=(matches[0] if self.single else (matches[:1] if getattr(self, "operation", None) in {"insert", "update"} else matches)))
 
 
 class FakeClient:
-    def __init__(self, task_rows=None, occurrence_rows=None, error=None):
-        self.rows = {"ai_tasks": [dict(r) for r in (task_rows or [])], "ai_task_occurrences": [dict(r) for r in (occurrence_rows or [])]}; self.next_id = {"ai_tasks": 100, "ai_task_occurrences": 200}; self.error = error
+    def __init__(self, task_rows=None, occurrence_rows=None, error=None, insert_error=None):
+        self.rows = {"ai_tasks": [dict(r) for r in (task_rows or [])], "ai_task_occurrences": [dict(r) for r in (occurrence_rows or [])]}; self.next_id = {"ai_tasks": 100, "ai_task_occurrences": 200}; self.error = error; self.insert_error = insert_error; self.queries = []
     def table(self, name): return FakeQuery(self, name)
 
 
@@ -142,3 +154,80 @@ async def test_supabase_failure_uses_fallback_without_swallowing_validation():
     fallback = InMemoryTaskRepository(); repo = SupabaseTaskRepository(FakeClient(error=RuntimeError("database unavailable")), fallback)
     created = await repo.create_task(10, task_data()); assert created.owner_id == 10; assert await repo.get_task(11, created.id) is None
     with pytest.raises(ValueError): await repo.create_task(10, task_data(actions=[]))
+
+
+# ── real (row-removing) deletion and durable id ownership ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_in_memory_delete_removes_the_row_occurrences_and_respects_cas():
+    repo = InMemoryTaskRepository(); task = await repo.create_task(10, task_data())
+    await repo.create_occurrence(10, occurrence_data(task.id))
+    stale = await repo.delete_task(10, task.id, 99)
+    assert stale.outcome == "stale" and stale.deleted is False
+    assert await repo.get_task(10, task.id) is not None
+    missing = await repo.delete_task(11, task.id, task.version)
+    assert missing.outcome == "not_found" and missing.deleted is False
+    assert await repo.get_task(10, task.id) is not None
+    deleted = await repo.delete_task(10, task.id, task.version)
+    assert deleted.deleted is True and deleted.durable is True and deleted.task.id == task.id
+    assert await repo.get_task(10, task.id) is None
+    assert await repo.list_tasks(10) == [] and await repo.list_occurrences(10, task.id) == []
+
+
+@pytest.mark.asyncio
+async def test_supabase_delete_physically_removes_the_row_and_its_children_first():
+    client = FakeClient([row_task()], [row_occurrence()]); repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    result = await repo.delete_task(10, 7, 1)
+    assert result.outcome == "deleted" and result.deleted is True and result.durable is True
+    assert client.rows["ai_tasks"] == [] and client.rows["ai_task_occurrences"] == []
+    # Occurrences go first (ON DELETE RESTRICT), then the task row is deleted
+    # with an owner+id+version CAS filter.
+    assert [q.table_name for q in client.queries][-2:] == ["ai_task_occurrences", "ai_tasks"]
+    final = client.queries[-1]
+    assert final.operation == "delete"
+    assert ("id", 7) in final.filters and ("owner_id", 10) in final.filters and ("version", 1) in final.filters
+
+
+@pytest.mark.asyncio
+async def test_supabase_delete_not_found_and_stale_never_issue_a_delete():
+    client = FakeClient([row_task()]); repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    stale = await repo.delete_task(10, 7, 99)
+    assert stale.outcome == "stale" and stale.deleted is False
+    missing = await repo.delete_task(10, 404, 1)
+    assert missing.outcome == "not_found" and missing.deleted is False
+    assert client.rows["ai_tasks"] == [row_task()]
+    assert all(q.operation != "delete" for q in client.queries)
+
+
+@pytest.mark.asyncio
+async def test_durable_creation_lets_postgres_assign_the_task_id():
+    client = FakeClient([row_task(id=27)]); repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    created = await repo.create_task(10, task_data())
+    resent = await repo.create_task(10, task_data())
+    # The app never sends an id: the database-generated row id is returned.
+    assert created.id == 100 and resent.id == 101
+    assert all("id" not in q.payload for q in client.queries if q.operation == "insert")
+
+
+@pytest.mark.asyncio
+async def test_degraded_creation_never_reuses_a_durable_id():
+    client = FakeClient([row_task(id=27)], insert_error=RuntimeError("write unavailable"))
+    repo = SupabaseTaskRepository(client, InMemoryTaskRepository())
+    created = await repo.create_task(10, task_data())
+    assert created.fallback_backend == "InMemoryTaskRepository"
+    # The durable sequence already issued #27: the degraded store must never
+    # restart at 1 and hand out an id the durable store owns.
+    assert created.id == 28
+    assert (await repo.create_task(10, task_data())).id == 29
+    assert await repo.get_task(10, 27) is not None
+
+
+@pytest.mark.asyncio
+async def test_degraded_delete_is_reported_as_non_durable():
+    fallback = InMemoryTaskRepository(); local = await fallback.create_task(10, task_data())
+    repo = SupabaseTaskRepository(FakeClient([row_task(id=7)], error=RuntimeError("unreachable")), fallback)
+    result = await repo.delete_task(10, local.id, local.version)
+    assert result.deleted is True and result.durable is False
+    assert result.fallback_backend == "InMemoryTaskRepository"
+    assert await fallback.get_task(10, local.id) is None

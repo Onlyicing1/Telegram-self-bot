@@ -46,6 +46,7 @@ ACTION_NAMES = frozenset({
     "task_list",
     "task_inspect",
     "task_transition",
+    "task_delete",
     "retrieve_save",
     "send",
     "clean_chat",
@@ -71,6 +72,7 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "task_list",
     "task_inspect",
     "task_transition",
+    "task_delete",
     "retrieve_save",
 })
 
@@ -275,7 +277,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     # ``task_id``/``expected_version``/``action`` status fields are only
     # meaningful for the task lifecycle actions.
     _TASK_ONLY_FIELDS = ("task_id", "expected_version")
-    if action not in ("task_inspect", "task_transition"):
+    if action not in ("task_inspect", "task_transition", "task_delete"):
         for field_name in _TASK_ONLY_FIELDS:
             if field_name in raw:
                 return ActionParseResult(
@@ -295,7 +297,7 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             error="'status' is only valid for the task_list action.",
         )
 
-    if action in ("task_inspect", "task_transition"):
+    if action in ("task_inspect", "task_transition", "task_delete"):
         return _validate_task_lifecycle_action(action, raw)
 
     if action == "retrieve_save":
@@ -540,12 +542,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
 _TASK_INSPECT_FIELDS = frozenset({"action", "task_id"})
 _TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version"})
-# task_list's optional status filter: terminal deleted tasks never match a
-# list filter (the normal list excludes them, see TaskManagementService).
+_TASK_DELETE_FIELDS = frozenset({"action", "task_id", "expected_version"})
+# task_list's optional status filter (the normal list excludes a legacy
+# ``deleted`` row, see TaskManagementService).
 _TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
-# task_transition targets, mirroring the registered tool's action enum:
-# ``deleted`` is the existing terminal lifecycle state.
-_TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed", "deleted"})
+# task_transition targets, mirroring the registered tool's action enum.
+# ``deleted`` is NOT one of them: deleting a task is the dedicated
+# ``task_delete`` action, which removes the durable row (never a status write).
+_TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 _SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
 
 
@@ -558,7 +562,12 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
     — ownership, persistence, and transition legality stay in the existing
     TaskManagementService/TaskRepository boundary.
     """
-    allowed = _TASK_INSPECT_FIELDS if action == "task_inspect" else _TASK_TRANSITION_FIELDS
+    if action == "task_inspect":
+        allowed = _TASK_INSPECT_FIELDS
+    elif action == "task_delete":
+        allowed = _TASK_DELETE_FIELDS
+    else:
+        allowed = _TASK_TRANSITION_FIELDS
     unknown = sorted(set(raw) - allowed)
     if unknown:
         return ActionParseResult(
@@ -581,13 +590,28 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
             task_id=task_id,
         )
 
+    if action == "task_delete":
+        version = coerce_int(raw.get("expected_version"))
+        if version is None or version <= 0:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Missing or invalid 'expected_version' for task_delete.",
+            )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="schedule",
+            task_id=task_id,
+            expected_version=version,
+        )
+
     status = raw.get("action_status")
     if not isinstance(status, str) or status.strip().lower() not in _TASK_TRANSITION_STATUS_VOCABULARY:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=(
                 "Invalid 'action_status' for task_transition "
-                "(allowed: paused, active, completed, deleted)."
+                "(allowed: paused, active, completed)."
             ),
         )
     version = coerce_int(raw.get("expected_version"))
@@ -642,7 +666,7 @@ def _default_target(action: str) -> str:
         return "replied_message"
     if action == "retrieve_save":
         return "current_chat"
-    if action in ("task_list", "task_inspect", "task_transition"):
+    if action in ("task_list", "task_inspect", "task_transition", "task_delete"):
         return "schedule"
     return "recent_messages"
 
@@ -723,6 +747,17 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
             "arguments": {
                 "task_id": result.task_id,
                 "action": result.action_status,
+                "expected_version": result.expected_version,
+            },
+        }]
+
+    if action == "task_delete":
+        # Deletion is a REAL row removal through the dedicated tool/service
+        # operation — never a task_transition status write.
+        return [{
+            "name": "task_delete",
+            "arguments": {
+                "task_id": result.task_id,
                 "expected_version": result.expected_version,
             },
         }]

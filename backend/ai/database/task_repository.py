@@ -21,7 +21,17 @@ MAX_ATTEMPTS = 3
 DB_TIMEOUT = 10.0
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "expired", "deleted"})
 _TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired"})
-_ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired", "deleted"}, "paused": {"paused", "active", "deleted"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
+# Outcomes of a real (row-removing) task deletion. ``DELETION_DELETED`` is the
+# only success; the caller must distinguish a missing task, a
+# stale CAS version, and a degraded in-memory deletion from it.
+DELETION_DELETED = "deleted"
+DELETION_NOT_FOUND = "not_found"
+DELETION_STALE = "stale"
+# ``deleted`` is NOT a transition TARGET: deletion is a real row removal the
+# repository performs (``delete_task``), never a lifecycle status write. The
+# status stays in TASK_STATUSES so a pre-existing row that already carries it
+# remains readable, and such a legacy row can only ever be updated to itself.
+_ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired"}, "paused": {"paused", "active"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
 _ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
 
 
@@ -74,6 +84,21 @@ def _parse_dt(value):
 def _serialize(value): return value.isoformat() if isinstance(value, datetime) else value
 
 @dataclass
+class TaskDeletionResult:
+    """Outcome of a real (row-removing) task deletion.
+
+    ``outcome`` distinguishes a durable removal from a missing task, a stale
+    CAS version, and a degraded deletion. ``fallback_backend`` is set exactly
+    when the mutation happened in the shared in-memory fallback — mirroring
+    ``create_task``/``update_task``: such a deletion is never durable.
+    """
+    outcome: str; task_id: int; task: TaskRecord | None = None; fallback_backend: str = ""
+    @property
+    def deleted(self) -> bool: return self.outcome == DELETION_DELETED
+    @property
+    def durable(self) -> bool: return self.deleted and not self.fallback_backend
+
+@dataclass
 class TaskRecord:
     id: int; owner_id: int; label: str; schedule_type: str; schedule: dict[str, Any]; timezone: str; actions: list[dict[str, Any]]; notification_destination: dict[str, Any]; status: str = "active"; version: int = 1; next_run_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); terminal_at: datetime | None = None; ai_instruction: str | None = None
     def as_dict(self): return _copy(self.__dict__)
@@ -103,6 +128,7 @@ class TaskRepository:
     async def update_task(self, owner_id, task_id, expected_version, updates): raise NotImplementedError
     async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): raise NotImplementedError
     async def transition_task(self, owner_id, task_id, status, expected_version=None): raise NotImplementedError
+    async def delete_task(self, owner_id, task_id, expected_version): raise NotImplementedError
     async def create_occurrence(self, owner_id, data): raise NotImplementedError
     async def get_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def list_occurrences(self, owner_id, task_id=None, limit=100): raise NotImplementedError
@@ -112,7 +138,23 @@ class TaskRepository:
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
 
 class InMemoryTaskRepository(TaskRepository):
-    def __init__(self): self._tasks={}; self._occurrences={}; self._next_task_id=1; self._next_occurrence_id=1
+    def __init__(self, id_floor: int = 0):
+        self._tasks={}; self._occurrences={}; self._next_occurrence_id=1
+        # Provisional task ids start above ``id_floor``: when this repository
+        # acts as the degraded store beside Supabase it must never reuse an id
+        # the durable PostgreSQL sequence already issued, nor restart its
+        # numbering at 1 while durable tasks exist.
+        self._id_floor=max(0, int(id_floor)); self._next_task_id=self._id_floor+1
+    def never_issue_ids_below(self, highest_durable_id: int) -> None:
+        """Raise the provisional id floor above a durable id.
+
+        PostgreSQL ``bigserial`` stays the only durable id allocator: this
+        floor is applied to the degraded in-memory store only, so a memory
+        task can never be handed an id the durable sequence already used.
+        """
+        floor=max(0, int(highest_durable_id))
+        if floor>self._id_floor: self._id_floor=floor
+        if self._next_task_id<=self._id_floor: self._next_task_id=self._id_floor+1
     async def create_task(self, owner_id, data):
         payload={**data,"owner_id":owner_id}; _validate_task_input(payload); r=TaskRecord(self._next_task_id,owner_id,payload["label"].strip(),payload["schedule_type"],_copy(payload["schedule"]),payload["timezone"].strip(),_copy(payload["actions"]),_copy(payload["notification_destination"]),payload.get("status","active"),1,payload.get("next_run_at"),ai_instruction=payload.get("ai_instruction")); self._tasks[r.id]=r; self._next_task_id+=1; return _copy(r)
     async def get_task(self, owner_id, task_id):
@@ -137,6 +179,16 @@ class InMemoryTaskRepository(TaskRepository):
         if not r:return None
         if status not in TASK_STATUSES or status not in _ALLOWED_TASK_TRANSITIONS[r.status]:raise ValueError("invalid task status transition")
         return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else r.version,{"status":status})
+    async def delete_task(self, owner_id, task_id, expected_version):
+        r=self._tasks.get(task_id)
+        if not r or r.owner_id!=owner_id:return TaskDeletionResult(DELETION_NOT_FOUND,task_id)
+        if r.version!=expected_version:return TaskDeletionResult(DELETION_STALE,task_id,task=_copy(r))
+        del self._tasks[task_id]
+        # Occurrences are the task's children (ai_task_occurrences.task_id is
+        # ON DELETE RESTRICT): they go with the row they belong to, exactly as
+        # the durable store must delete them before it can remove the task.
+        for key in [k for k,occ in self._occurrences.items() if occ.task_id==task_id and occ.owner_id==owner_id]: del self._occurrences[key]
+        return TaskDeletionResult(DELETION_DELETED,task_id,task=_copy(r))
     async def create_occurrence(self, owner_id, data):
         payload={**data,"owner_id":owner_id};task=self._tasks.get(payload.get("task_id"))
         if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
@@ -166,7 +218,14 @@ class InMemoryTaskRepository(TaskRepository):
         return _copy(r)
 
 class SupabaseTaskRepository(TaskRepository):
-    def __init__(self, client, fallback=None, timeout=DB_TIMEOUT): self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False
+    def __init__(self, client, fallback=None, timeout=DB_TIMEOUT):
+        self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False
+        # Highest durable task id this process has observed. PostgreSQL's
+        # bigserial sequence stays the ONLY allocator of durable ids; this is
+        # never written to the database — it is only a floor handed to the
+        # degraded in-memory store so a memory task can never reuse a durable
+        # id (nor restart its numbering at 1 while durable tasks exist).
+        self._max_durable_task_id=0
     @property
     def fallback_active(self) -> bool:
         """True when the most recent Supabase operation degraded to memory.
@@ -184,9 +243,47 @@ class SupabaseTaskRepository(TaskRepository):
         if record is not None:
             record.fallback_backend = type(self._fallback).__name__
         return record
+    def _annotate_deletion(self, result):
+        result.fallback_backend = type(self._fallback).__name__
+        return result
+    def _observe_durable_task(self, record) -> None:
+        task_id = record.get("id") if isinstance(record, dict) else getattr(record, "id", None)
+        if isinstance(task_id, int) and task_id > self._max_durable_task_id:
+            self._max_durable_task_id = task_id
+    def _degrade_to_fallback(self) -> None:
+        """Enter the degraded state and align the fallback's provisional ids."""
+        self._mark_fallback()
+        advance = getattr(self._fallback, "never_issue_ids_below", None)
+        if callable(advance):
+            advance(self._max_durable_task_id)
+    async def _observe_durable_ceiling(self, owner_id: int) -> None:
+        """Best-effort durable id ceiling before degrading to memory.
+
+        A failed write does not prove the reads are down: learn the highest
+        durable id first so the fallback cannot restart its numbering at 1
+        while durable tasks exist. Any failure here is irrelevant — the
+        fallback is already non-durable.
+        """
+        try:
+            result = await self._run_checked(lambda: self._client.table("ai_tasks").select("id").eq("owner_id", owner_id).order("id", desc=True).limit(1).execute(), timeout=min(self._timeout, 3.0))
+            rows = getattr(result, "data", None) or []
+            if rows:
+                self._observe_durable_task(rows[0])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
     async def _run(self, fn):
         try:return await asyncio.wait_for(asyncio.to_thread(fn),timeout=self._timeout)
         except asyncio.CancelledError:raise
+    async def _run_checked(self, fn, timeout=None):
+        """Like ``_run`` but propagates failures.
+
+        ``_run`` swallows every failure (returning None); a durable delete
+        must be able to tell a real row removal from a swallowed transport
+        failure before it reports durability, so it uses this variant.
+        """
+        return await asyncio.wait_for(asyncio.to_thread(fn),timeout=timeout or self._timeout)
     def _task_payload(self, owner_id, data):
         payload={**data,"owner_id":owner_id};_validate_task_input(payload);return {k:_serialize(v) for k,v in payload.items() if k not in {"id","created_at","updated_at","terminal_at","version"}}
     def _occurrence_payload(self, owner_id, data):
@@ -199,11 +296,13 @@ class SupabaseTaskRepository(TaskRepository):
             if not row:raise RuntimeError("Supabase task insert returned no row")
             self._mark_supabase_ok()
             record = _task_from_row(row[0] if isinstance(row,list) else row)
+            self._observe_durable_task(record)
             logger.info("TASK_PERSIST_CREATE_SUCCESS repository=%s task_id=%s", type(self).__name__, record.id)
             return record
         except (ValueError,TypeError):raise
         except Exception as exc:
-            self._mark_fallback()
+            await self._observe_durable_ceiling(owner_id)
+            self._degrade_to_fallback()
             logger.warning("TASK_PERSIST_FALLBACK repository=%s operation=create_task exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
             logger.warning("AI_TASK_TRACE stage=create_task_fallback_start backend=InMemoryTaskRepository reason=%s detail=%s", type(exc).__name__, str(exc)[:160])
             try:
@@ -220,11 +319,16 @@ class SupabaseTaskRepository(TaskRepository):
             return record
     async def get_task(self, owner_id, task_id):
         try:
-            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            if not row:return None
+            record=_task_from_row(row[0] if isinstance(row,list) else row);self._observe_durable_task(record);return record
         except Exception as exc:logger.warning("Supabase task read failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.get_task(owner_id,task_id)
     async def list_tasks(self, owner_id):
         try:
-            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).order("updated_at",desc=True).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).order("updated_at",desc=True).execute());self._mark_supabase_ok()
+            records=[_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+            for record in records:self._observe_durable_task(record)
+            return records
         except Exception as exc:logger.warning("Supabase task list failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_tasks(owner_id)
     async def list_due_tasks(self, owner_id, now, limit=10):
         try:
@@ -250,6 +354,45 @@ class SupabaseTaskRepository(TaskRepository):
         if not current:return None
         if status not in TASK_STATUSES or status not in _ALLOWED_TASK_TRANSITIONS[current.status]:raise ValueError("invalid task status transition")
         return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else current.version,{"status":status})
+    async def delete_task(self, owner_id, task_id, expected_version):
+        """Physically DELETE the owner's task row (never a status write).
+
+        Occurrences are deleted first: ``ai_task_occurrences.task_id`` is
+        ``ON DELETE RESTRICT``, so PostgreSQL refuses to remove a task that
+        still has children. The task delete is CAS-guarded on the version and
+        its affected rows are what decides the reported outcome — a swallowed
+        failure is never reported as a durable deletion.
+        """
+        try:
+            result=await self._run_checked(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute())
+            row=getattr(result,"data",None)
+            record=_task_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            logger.warning("Supabase task delete read failed; using fallback: %s",exc)
+            self._degrade_to_fallback()
+            return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
+        if record is None:
+            self._mark_supabase_ok()
+            return TaskDeletionResult(DELETION_NOT_FOUND,task_id)
+        if record.version!=expected_version:
+            self._mark_supabase_ok()
+            return TaskDeletionResult(DELETION_STALE,task_id,task=record)
+        try:
+            await self._run_checked(lambda:self._client.table("ai_task_occurrences").delete().eq("task_id",task_id).eq("owner_id",owner_id).execute())
+            deleted=await self._run_checked(lambda:self._client.table("ai_tasks").delete().eq("id",task_id).eq("owner_id",owner_id).eq("version",expected_version).execute())
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            logger.warning("Supabase task delete failed; using fallback: %s",exc)
+            self._degrade_to_fallback()
+            return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
+        rows=getattr(deleted,"data",None)
+        self._mark_supabase_ok()
+        if not rows:
+            # The row changed or disappeared between the CAS read and the
+            # delete: no durable row removal can be claimed.
+            return TaskDeletionResult(DELETION_STALE,task_id,task=record)
+        return TaskDeletionResult(DELETION_DELETED,task_id,task=record)
     async def create_occurrence(self, owner_id, data):
         task=await self.get_task(owner_id,int(data.get("task_id",0)))
         if not task:raise ValueError("task not found for owner")

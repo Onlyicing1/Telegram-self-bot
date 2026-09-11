@@ -5,8 +5,9 @@ Verifies:
 - List panel reads through TaskManagementService (no direct DB access).
 - Detail panel shows metadata, actions, occurrences, and status-conditional
   CAS buttons carrying (task_id, version).
-- Mutations route through the service's CAS transitions and render the
-  refreshed detail panel; stale versions fail closed with no change.
+- Mutations route through the service's CAS operations and render the
+  refreshed panel; deletion removes the durable row; stale versions fail
+  closed with no change.
 - Cross-owner isolation: another owner's task is invisible.
 """
 from __future__ import annotations
@@ -244,10 +245,16 @@ def test_complete_action_transitions(registered, repo):
     assert _run(repo.get_task(OWNER, task.id)).status == "completed"
 
 
-def test_delete_action_transitions(registered, repo):
+def test_delete_action_removes_the_task(registered, repo):
     task = _make_task(repo, OWNER)
-    _run(registered._delete_action(_FakeEvent(), f"{task.id}:{task.version}", 1))
-    assert _run(repo.get_task(OWNER, task.id)).status == "deleted"
+    title, body, buttons = _run(
+        registered._delete_action(_FakeEvent(), f"{task.id}:{task.version}", 1)
+    )
+    assert "✓ Deleted task" in body
+    # The durable row is gone (not hidden behind a "deleted" status) and the
+    # refreshed list no longer offers the removed task.
+    assert _run(repo.get_task(OWNER, task.id)) is None
+    assert "write hello" not in " ".join(_button_texts(buttons))
 
 
 def test_stale_version_fails_closed(registered, repo):
