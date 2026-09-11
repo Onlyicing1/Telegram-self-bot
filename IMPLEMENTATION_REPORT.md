@@ -237,9 +237,9 @@ memory-fallback view.
 | Item | Value |
 |---|---|
 | Starting HEAD | `bf1eee543f32bbca0d1985d3bf91d777ac93ea60` (== origin/main at start) |
-| Change commit | _pending_ |
-| Push result | _pending_ |
-| Remote HEAD verification | _pending_ |
-| Report commit | _pending_ |
+| Change commit | `56b5e2c36c7c98ba33a8078640fa000519c6643f` — `fix: keep the task list authoritative and never report a memory-only creation as durable` (8 files) |
+| Push result | `bf1eee5..56b5e2c  main -> main` (exit 0) |
+| Remote HEAD verification | `git fetch origin` + `git rev-parse origin/main` == `56b5e2c36c7c98ba33a8078640fa000519c6643f` == local HEAD; `git show --stat origin/main` lists exactly the 8 phase files |
+| Report commit | _this commit_ (delivery record update) |
 | Working tree | pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched |
 | Live Telegram verification | **NOT performed** (no credentials in this workspace) |
