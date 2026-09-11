@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import json
 import logging
 from dataclasses import dataclass, field
@@ -33,6 +34,52 @@ DELETION_STALE = "stale"
 # remains readable, and such a legacy row can only ever be updated to itself.
 _ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired"}, "paused": {"paused", "active"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
 _ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
+
+
+# Degraded-store reasons. ``unavailable`` is claimed ONLY when the failure is
+# evidence the durable store could not be reached; a local OS resource
+# shortage is recorded separately so no surface falsely reports a Supabase
+# outage. Both remain degraded (non-durable): the read/write still happened
+# through the shared in-memory fallback.
+FALLBACK_REASON_UNAVAILABLE = "unavailable"
+FALLBACK_REASON_LOCAL_RESOURCE = "local_resource"
+# errnos that mean THIS process/host could not acquire a resource (a blocking
+# ``connect()`` auto-binding an ephemeral port, an exhausted fd table, an
+# exhausted memory/route cache). They are transient local conditions and say
+# nothing about the durable store's availability.
+_LOCAL_RESOURCE_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EMFILE", None),
+        getattr(errno, "ENFILE", None),
+        getattr(errno, "ENOMEM", None),
+        getattr(errno, "ENOBUFS", None),
+    )
+    if code
+)
+
+
+def _is_local_resource_failure(exc) -> bool:
+    """True when a failure is a LOCAL resource shortage, not a store outage.
+
+    ``httpx``/``httpcore`` wrap the raw ``OSError`` from the local socket
+    layer in a transport error, so the whole ``__cause__``/``__context__``
+    chain is walked. CPython raises ``RuntimeError`` (never an ``OSError``)
+    when a thread cannot start, and this codebase spawns no subprocess, so an
+    ``OSError`` carrying one of ``_LOCAL_RESOURCE_ERRNOS`` comes from the OS
+    socket layer under the synchronous Supabase HTTP call — e.g. a blocking
+    ``connect()`` with no free ephemeral port (EAGAIN).
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "errno", None)
+        if isinstance(code, int) and code in _LOCAL_RESOURCE_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _now(): return datetime.now(timezone.utc)
@@ -92,7 +139,7 @@ class TaskDeletionResult:
     when the mutation happened in the shared in-memory fallback — mirroring
     ``create_task``/``update_task``: such a deletion is never durable.
     """
-    outcome: str; task_id: int; task: TaskRecord | None = None; fallback_backend: str = ""
+    outcome: str; task_id: int; task: TaskRecord | None = None; fallback_backend: str = ""; fallback_reason: str = ""
     @property
     def deleted(self) -> bool: return self.outcome == DELETION_DELETED
     @property
@@ -219,7 +266,7 @@ class InMemoryTaskRepository(TaskRepository):
 
 class SupabaseTaskRepository(TaskRepository):
     def __init__(self, client, fallback=None, timeout=DB_TIMEOUT):
-        self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False
+        self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False;self._fallback_reason=""
         # Highest durable task id this process has observed. PostgreSQL's
         # bigserial sequence stays the ONLY allocator of durable ids; this is
         # never written to the database — it is only a floor handed to the
@@ -235,24 +282,57 @@ class SupabaseTaskRepository(TaskRepository):
         flag is cleared again after the next successful Supabase operation.
         """
         return self._fallback_active
+    @property
+    def fallback_reason(self) -> str:
+        """Why the last operation degraded ("" while healthy).
+
+        ``FALLBACK_REASON_UNAVAILABLE`` is set only when the failure is
+        evidence the durable store could not be reached;
+        ``FALLBACK_REASON_LOCAL_RESOURCE`` marks a local OS resource error,
+        which must never be rendered as "Supabase unavailable".
+        """
+        return self._fallback_reason
     def _mark_supabase_ok(self) -> None:
         self._fallback_active = False
-    def _mark_fallback(self) -> None:
+        self._fallback_reason = ""
+    def _mark_fallback(self, exc=None) -> None:
+        """Enter the degraded state with a TRUTHFUL reason.
+
+        Every exception still degrades (resilience is unchanged); only the
+        REASON is classified, so a local resource error never becomes a
+        "Supabase unavailable" claim while a real store failure still does.
+        """
         self._fallback_active = True
+        self._fallback_reason = (
+            FALLBACK_REASON_LOCAL_RESOURCE if _is_local_resource_failure(exc)
+            else FALLBACK_REASON_UNAVAILABLE
+        )
+        if self._fallback_reason == FALLBACK_REASON_LOCAL_RESOURCE:
+            # Structured diagnostic: the per-operation warning logs the
+            # exception string, which is the OS text for the local errno and
+            # by itself cannot distinguish a local resource shortage from a
+            # store outage (that is the exact gap that made the live
+            # misclassification possible).
+            logger.warning(
+                "TASK_FALLBACK_CLASSIFIED reason=%s exception=%s message=%s",
+                self._fallback_reason, type(exc).__name__, str(exc)[:200],
+            )
     def _annotate_fallback(self, record):
         if record is not None:
             record.fallback_backend = type(self._fallback).__name__
+            record.fallback_reason = self._fallback_reason
         return record
     def _annotate_deletion(self, result):
         result.fallback_backend = type(self._fallback).__name__
+        result.fallback_reason = self._fallback_reason
         return result
     def _observe_durable_task(self, record) -> None:
         task_id = record.get("id") if isinstance(record, dict) else getattr(record, "id", None)
         if isinstance(task_id, int) and task_id > self._max_durable_task_id:
             self._max_durable_task_id = task_id
-    def _degrade_to_fallback(self) -> None:
+    def _degrade_to_fallback(self, exc=None) -> None:
         """Enter the degraded state and align the fallback's provisional ids."""
-        self._mark_fallback()
+        self._mark_fallback(exc)
         advance = getattr(self._fallback, "never_issue_ids_below", None)
         if callable(advance):
             advance(self._max_durable_task_id)
@@ -302,7 +382,7 @@ class SupabaseTaskRepository(TaskRepository):
         except (ValueError,TypeError):raise
         except Exception as exc:
             await self._observe_durable_ceiling(owner_id)
-            self._degrade_to_fallback()
+            self._degrade_to_fallback(exc)
             logger.warning("TASK_PERSIST_FALLBACK repository=%s operation=create_task exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
             logger.warning("AI_TASK_TRACE stage=create_task_fallback_start backend=InMemoryTaskRepository reason=%s detail=%s", type(exc).__name__, str(exc)[:160])
             try:
@@ -316,28 +396,29 @@ class SupabaseTaskRepository(TaskRepository):
             # Observability annotation (not a schema field): lets the caller's
             # terminal trace report the true final backend and fallback usage.
             record.fallback_backend = type(self._fallback).__name__
+            record.fallback_reason = self._fallback_reason
             return record
     async def get_task(self, owner_id, task_id):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
             if not row:return None
             record=_task_from_row(row[0] if isinstance(row,list) else row);self._observe_durable_task(record);return record
-        except Exception as exc:logger.warning("Supabase task read failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.get_task(owner_id,task_id)
+        except Exception as exc:logger.warning("Supabase task read failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.get_task(owner_id,task_id)
     async def list_tasks(self, owner_id):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).order("updated_at",desc=True).execute());self._mark_supabase_ok()
             records=[_task_from_row(row) for row in (getattr(result,"data",None) or [])]
             for record in records:self._observe_durable_task(record)
             return records
-        except Exception as exc:logger.warning("Supabase task list failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_tasks(owner_id)
+        except Exception as exc:logger.warning("Supabase task list failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_tasks(owner_id)
     async def list_due_tasks(self, owner_id, now, limit=10):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").lte("next_run_at",_serialize(now)).order("next_run_at").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:logger.warning("Supabase due task query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_due_tasks(owner_id,now,limit)
+        except Exception as exc:logger.warning("Supabase due task query failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_due_tasks(owner_id,now,limit)
     async def list_event_tasks(self, owner_id, limit=10):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").eq("schedule_type","event").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:logger.warning("Supabase event task query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_event_tasks(owner_id,limit)
+        except Exception as exc:logger.warning("Supabase event task query failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_event_tasks(owner_id,limit)
     async def update_task(self, owner_id, task_id, expected_version, updates):
         current=await self.get_task(owner_id,task_id)
         if current is None or current.version!=expected_version:return None
@@ -347,7 +428,7 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").update(outgoing).eq("id",task_id).eq("owner_id",owner_id).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
         except (ValueError,TypeError):raise
-        except Exception as exc:logger.warning("Supabase task update failed; using fallback: %s",exc);self._mark_fallback();return self._annotate_fallback(await self._fallback.update_task(owner_id,task_id,expected_version,updates))
+        except Exception as exc:logger.warning("Supabase task update failed; using fallback: %s",exc);self._mark_fallback(exc);return self._annotate_fallback(await self._fallback.update_task(owner_id,task_id,expected_version,updates))
     async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): return await self.update_task(owner_id,task_id,expected_version,{"next_run_at":next_run_at})
     async def transition_task(self, owner_id, task_id, status, expected_version=None):
         current=await self.get_task(owner_id,task_id)
@@ -370,7 +451,7 @@ class SupabaseTaskRepository(TaskRepository):
         except asyncio.CancelledError:raise
         except Exception as exc:
             logger.warning("Supabase task delete read failed; using fallback: %s",exc)
-            self._degrade_to_fallback()
+            self._degrade_to_fallback(exc)
             return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
         if record is None:
             self._mark_supabase_ok()
@@ -384,7 +465,7 @@ class SupabaseTaskRepository(TaskRepository):
         except asyncio.CancelledError:raise
         except Exception as exc:
             logger.warning("Supabase task delete failed; using fallback: %s",exc)
-            self._degrade_to_fallback()
+            self._degrade_to_fallback(exc)
             return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
         rows=getattr(deleted,"data",None)
         self._mark_supabase_ok()
@@ -409,34 +490,34 @@ class SupabaseTaskRepository(TaskRepository):
             return record
         except (ValueError,TypeError):raise
         except Exception as exc:
-            self._mark_fallback()
+            self._mark_fallback(exc)
             logger.warning("TASK_OCCURRENCE_PERSIST_FALLBACK repository=%s operation=create_occurrence exception=%s message=%s", type(self).__name__, type(exc).__name__, str(exc)[:256])
             return await self._fallback.create_occurrence(owner_id,data)
     async def get_occurrence(self, owner_id, task_id, occurrence_key):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
-        except Exception as exc:logger.warning("Supabase occurrence read failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.get_occurrence(owner_id,task_id,occurrence_key)
+        except Exception as exc:logger.warning("Supabase occurrence read failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.get_occurrence(owner_id,task_id,occurrence_key)
     async def list_occurrences(self, owner_id, task_id=None, limit=100):
         try:
             query=self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id)
             if task_id is not None:query=query.eq("task_id",task_id)
             result=await self._run(lambda:query.order("scheduled_for",desc=True).limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:logger.warning("Supabase occurrence list failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_occurrences(owner_id,task_id,limit)
+        except Exception as exc:logger.warning("Supabase occurrence list failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_occurrences(owner_id,task_id,limit)
     async def list_recoverable_occurrences(self, owner_id, limit=100):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running","interrupted"]).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:logger.warning("Supabase recovery query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_recoverable_occurrences(owner_id,limit)
+        except Exception as exc:logger.warning("Supabase recovery query failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_recoverable_occurrences(owner_id,limit)
     async def list_due_retry_occurrences(self, owner_id, now, limit=10):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status","retry_pending").lte("retry_at",_serialize(now)).order("retry_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
-        except Exception as exc:logger.warning("Supabase retry query failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
+        except Exception as exc:logger.warning("Supabase retry query failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current or current.status not in {"claimed","retry_pending","interrupted"}:return None
         now=_now().isoformat()
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").update({"status":"running","claimed_at":current.claimed_at.isoformat() if current.claimed_at else now,"started_at":now,"updated_at":now}).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
-        except Exception as exc:logger.warning("Supabase occurrence claim failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.claim_occurrence(owner_id,task_id,occurrence_key)
+        except Exception as exc:logger.warning("Supabase occurrence claim failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.claim_occurrence(owner_id,task_id,occurrence_key)
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current:return None
@@ -448,7 +529,7 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
         except (ValueError,TypeError):raise
-        except Exception as exc:logger.warning("Supabase occurrence transition failed; using fallback: %s",exc);self._mark_fallback();return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
+        except Exception as exc:logger.warning("Supabase occurrence transition failed; using fallback: %s",exc);self._mark_fallback(exc);return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
 
 def get_task_repository():
     """Return the process-wide task repository (single authority).

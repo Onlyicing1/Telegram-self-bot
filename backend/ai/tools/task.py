@@ -510,12 +510,13 @@ class CreateTaskTool(Tool):
             return _fail("create_task_persistence", "repository_failure", exc)
 
         fallback_backend = getattr(task, "fallback_backend", None)
+        fallback_reason = str(getattr(task, "fallback_reason", "") or "")
         if fallback_backend:
             fallback_used = True
         _trace(
             "create_task_repository_create_result", success=True,
             repository=repository, task_id=task.id, version=task.version,
-            fallback_backend=fallback_backend,
+            fallback_backend=fallback_backend, fallback_reason=fallback_reason,
         )
         _trace(
             "create_task_definition_validation_end", success=True,
@@ -547,12 +548,15 @@ class CreateTaskTool(Tool):
         # durable store cannot see it, and a restart loses it. (Live: a
         # creation reported as persisted was missing from the next task list.)
         if fallback_backend:
-            from backend.ai.task_management_interface import FALLBACK_NOTE
+            from backend.ai.task_management_interface import fallback_note
 
+            # Truthful attribution: a local resource error must not be
+            # reported as a Supabase outage. The task is still non-durable.
             return ToolResult(
                 success=True,
                 message=(
-                    f"✅ Task #{task.id} created — {task.label}\n\n{FALLBACK_NOTE}"
+                    f"✅ Task #{task.id} created — {task.label}\n\n"
+                    f"{fallback_note(fallback_reason)}"
                 ),
                 data={
                     "task_id": int(task.id),
@@ -563,6 +567,7 @@ class CreateTaskTool(Tool):
                     "status": str(task.status),
                     "durable": False,
                     "fallback_backend": str(fallback_backend),
+                    "fallback_reason": fallback_reason,
                 },
             )
 

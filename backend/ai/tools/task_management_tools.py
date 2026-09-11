@@ -278,11 +278,13 @@ class TaskTransitionTool(Tool):
         # _annotate_fallback exactly when its Supabase update degraded.
         fallback_backend = str(getattr(task, "fallback_backend", "") or "")
         if fallback_backend:
-            from backend.ai.task_management_interface import FALLBACK_NOTE
+            from backend.ai.task_management_interface import fallback_note
 
-            message = f"{message}\n\n{FALLBACK_NOTE}"
+            fallback_reason = str(getattr(task, "fallback_reason", "") or "")
+            message = f"{message}\n\n{fallback_note(fallback_reason)}"
             data["durable"] = False
             data["fallback_backend"] = fallback_backend
+            data["fallback_reason"] = fallback_reason
         else:
             data["durable"] = True
         return ToolResult(success=True, message=message, data=data)
@@ -371,13 +373,22 @@ class TaskDeleteTool(Tool):
         if not result.deleted:
             if result.fallback_backend:
                 # The durable store could not be reached: nothing durable was
-                # verified, so a deletion success must never be claimed.
+                # verified, so a deletion success must never be claimed. The
+                # attribution stays truthful — a local resource error is not
+                # a Supabase outage.
+                from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
+
+                cause = (
+                    "a local resource error prevented reaching the durable store"
+                    if getattr(result, "fallback_reason", "") == FALLBACK_REASON_LOCAL_RESOURCE
+                    else "the durable store was unreachable"
+                )
                 return ToolResult(
                     success=False,
                     message=(
-                        f"⚠️ Task #{task_id} was not deleted: the durable store "
-                        "was unreachable and the in-memory fallback holds no "
-                        "matching task. Nothing durable was changed."
+                        f"⚠️ Task #{task_id} was not deleted: {cause} and the "
+                        "in-memory fallback holds no matching task. Nothing "
+                        "durable was changed."
                     ),
                 )
             if result.outcome == DELETION_STALE:
@@ -408,10 +419,12 @@ class TaskDeleteTool(Tool):
             # fallback lost the row, but the durable store still holds it (a
             # restart or a healthy read would bring it back). Never report it
             # as a plain deletion success.
-            from backend.ai.task_management_interface import FALLBACK_NOTE
+            from backend.ai.task_management_interface import fallback_note
 
-            message = f"{message}\n\n{FALLBACK_NOTE}"
+            fallback_reason = str(getattr(result, "fallback_reason", "") or "")
+            message = f"{message}\n\n{fallback_note(fallback_reason)}"
             data["fallback_backend"] = str(result.fallback_backend)
+            data["fallback_reason"] = fallback_reason
         return ToolResult(success=True, message=message, data=data)
 
 

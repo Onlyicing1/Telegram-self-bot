@@ -276,6 +276,15 @@ async def _delete_action(event, extra: str, chat_id: int):
         return f"Task #{task_id}", "× Operation failed; no change was confirmed.", []
     if not result.deleted:
         if result.fallback_backend:
+            from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
+
+            if getattr(result, "fallback_reason", "") == FALLBACK_REASON_LOCAL_RESOURCE:
+                return (
+                    f"Task #{task_id}",
+                    "× Local resource error; the durable store was not reached, "
+                    "so nothing durable was deleted.",
+                    [],
+                )
             return f"Task #{task_id}", "× Supabase unavailable; nothing durable was deleted.", []
         if result.outcome == DELETION_STALE:
             return f"Task #{task_id}", "× Version is stale; nothing was deleted.", []

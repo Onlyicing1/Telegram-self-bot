@@ -42,6 +42,7 @@ class TaskListSnapshot:
 
     tasks: list[TaskRecord]
     fallback_active: bool
+    fallback_reason: str = ""
 
 
 class TaskManagementService:
@@ -76,6 +77,7 @@ class TaskManagementService:
         return TaskListSnapshot(
             tasks=tasks,
             fallback_active=bool(getattr(self.repository, "fallback_active", False)),
+            fallback_reason=str(getattr(self.repository, "fallback_reason", "") or ""),
         )
 
     async def counts(self) -> dict[str, int]:

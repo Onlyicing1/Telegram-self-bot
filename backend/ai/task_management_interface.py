@@ -20,6 +20,29 @@ FALLBACK_NOTE = (
     "⚠️ Memory fallback — Supabase unavailable "
     "(tasks may be missing, and anything created now is not durable)."
 )
+# Truthful counterpart for a LOCAL resource failure: the durable store may be
+# perfectly healthy (a Supabase write succeeded moments earlier), so the
+# surface must never claim a Supabase outage. The non-durable semantics are
+# identical — only the attribution changes.
+FALLBACK_RESOURCE_NOTE = (
+    "⚠️ Memory fallback — a local resource error prevented the durable store "
+    "from being reached (tasks may be missing, and anything created now is "
+    "not durable)."
+)
+
+
+def fallback_note(reason: str) -> str:
+    """The truthful degraded-store note for a repository fallback reason.
+
+    Only a real durable-store failure may claim "Supabase unavailable"; any
+    other recorded reason (a local OS resource error) keeps the same
+    non-durable warning without the false attribution.
+    """
+    from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
+
+    if reason == FALLBACK_REASON_LOCAL_RESOURCE:
+        return FALLBACK_RESOURCE_NOTE
+    return FALLBACK_NOTE
 
 _STATUS_LABELS = {
     "active": ("▶️", "Active"),
@@ -77,6 +100,12 @@ def _fallback_active(service: TaskManagementService) -> bool:
     return bool(getattr(repository, "fallback_active", False))
 
 
+def _repository_fallback_reason(service: TaskManagementService) -> str:
+    """The repository's recorded degradation reason ("" while healthy)."""
+    repository = getattr(service, "repository", None)
+    return str(getattr(repository, "fallback_reason", "") or "")
+
+
 def _task_block(task: object, *, include_version: bool) -> str:
     is_event = str(getattr(task, "schedule_type", "") or "") == "event"
     next_line = (
@@ -120,7 +149,7 @@ async def list_text(
     if not tasks:
         lines = header + ["", "No tasks found."]
         if snapshot.fallback_active:
-            lines.append(FALLBACK_NOTE)
+            lines.append(fallback_note(snapshot.fallback_reason))
         return "\n".join(lines)
 
     blocks = [_task_block(task, include_version=False) for task in tasks[:MAX_LINES]]
@@ -128,7 +157,7 @@ async def list_text(
         blocks.append(f"…and {len(tasks) - MAX_LINES} more")
     rendered = "\n".join(header + ["", "\n\n".join(blocks)])
     if snapshot.fallback_active:
-        rendered += "\n\n" + FALLBACK_NOTE
+        rendered += "\n\n" + fallback_note(snapshot.fallback_reason)
     return rendered
 
 
@@ -152,7 +181,7 @@ async def inspect_text(service: TaskManagementService, task_id: int) -> str:
         except Exception:
             lines.append("Trigger: Telegram message")
     if _fallback_active(service):
-        lines.append(FALLBACK_NOTE)
+        lines.append(fallback_note(_repository_fallback_reason(service)))
     if view.occurrences:
         occurrence_blocks = []
         for item in view.occurrences[:10]:
