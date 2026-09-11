@@ -401,3 +401,78 @@ async def test_model_discovery_nararouter_fallback_catalog():
     ids = [m.id for m in models]
     assert "deepseek-v4-flash" in ids
     assert get_last_fetch_source("nararouter") == "fallback"
+
+
+# ── Discovery visibility (the provider/model list) ──
+
+
+def _clear_discovery_cache() -> None:
+    from backend.ai import discovery
+
+    discovery._cache["timestamp"] = 0.0
+    discovery._cache["results"] = []
+
+
+def _probe_client(status_code: int) -> AsyncMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = {}
+    resp.headers = {}
+    resp.text = "probe"
+    client = AsyncMock()
+    client.get.return_value = resp
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    return client
+
+
+async def _nararouter_status(monkeypatch, client) -> Any:
+    from backend.ai import discovery
+
+    monkeypatch.setenv("AI_NARAROUTER_API_KEY", "sk-nry-test-key")
+    _clear_discovery_cache()
+    with patch("backend.ai.discovery.httpx.AsyncClient", return_value=client):
+        results = await discovery.discover_providers(force_refresh=True)
+    _clear_discovery_cache()
+    return next(r for r in results if r.name == "nararouter")
+
+
+@pytest.mark.asyncio
+async def test_discovery_verifies_nararouter_on_200(monkeypatch):
+    status = await _nararouter_status(monkeypatch, _probe_client(200))
+    assert status.status == "available"
+    assert status.has_key is True
+    assert status.validated is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [307, 429, 500, 503])
+async def test_non_auth_probe_failure_keeps_nararouter_in_the_provider_list(monkeypatch, code):
+    """A redirect / rate limit / server error is NOT a bad key.
+
+    The configured provider must stay visible and selectable instead of being
+    rejected by the provider/model list.
+    """
+    status = await _nararouter_status(monkeypatch, _probe_client(code))
+    assert status.status == "available"
+    assert status.has_key is True
+    assert status.validated is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [401, 403])
+async def test_auth_rejection_marks_nararouter_invalid(monkeypatch, code):
+    status = await _nararouter_status(monkeypatch, _probe_client(code))
+    assert status.status == "invalid"
+    assert status.has_key is True
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_keeps_nararouter_in_the_provider_list(monkeypatch):
+    client = AsyncMock()
+    client.get.side_effect = TimeoutError("probe timed out")
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    status = await _nararouter_status(monkeypatch, client)
+    assert status.status == "available"
+    assert status.validated is False

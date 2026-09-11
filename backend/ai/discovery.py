@@ -7,13 +7,20 @@ API keys by making a lightweight API call, and reports the status of
 every supported provider.
 
 Status values:
-  - "available"    — API key detected AND validated successfully
+  - "available"    — API key detected; `validated` says whether the
+                     lightweight probe confirmed it. A probe that cannot
+                     complete (timeout, connection error, redirect, rate
+                     limit, 5xx) is NOT proof of a bad key, so the
+                     provider stays configured and selectable.
   - "detected"     — API key found in ENV but not yet validated
-  - "invalid"      — API key found but validation failed (bad key)
+  - "invalid"      — the provider REJECTED the key (HTTP 401/403)
   - "not_configured" — no API key found in ENV
 
-The discovery layer NEVER silently falls back. If a key is invalid,
-it reports "invalid" so the user can fix it.
+The discovery layer NEVER silently falls back, and it never hides a
+provider merely because a probe failed: a misleading "invalid key"
+classification would remove a configured provider from the provider/model
+list. Only a genuine authentication rejection reports "invalid" so the
+user can fix it.
 
 Usage:
     from backend.ai.discovery import discover_providers, get_available_providers
@@ -36,6 +43,12 @@ logger = logging.getLogger(__name__)
 _CACHE_TTL = 300  # 5 minutes
 _cache: dict[str, Any] = {"timestamp": 0.0, "results": []}
 _validate_lock = asyncio.Lock()
+
+#: HTTP statuses that genuinely mean "this key is rejected". Every other
+#: probe outcome (redirect, rate limit, server error, timeout, connection
+#: error) is an availability/transport failure — never an invalid key — and
+#: must not remove a configured provider from the provider/model list.
+_AUTH_REJECT_STATUSES = frozenset({401, 403})
 
 
 @dataclass(frozen=True)
@@ -268,30 +281,44 @@ async def _validate_provider(status: ProviderStatus) -> ProviderStatus:
             url = f"{status.base_url}/models?key={api_key}&pageSize=1"
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url)
-                if resp.status_code == 200:
-                    return _make_available(status)
-                return _make_invalid(status, f"HTTP {resp.status_code}")
+                return _classify_probe(status, resp.status_code)
         else:
             url = f"{status.base_url}/models"
             headers = {"Authorization": f"Bearer {api_key}"}
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    return _make_available(status)
-                return _make_invalid(status, f"HTTP {resp.status_code}")
+                return _classify_probe(status, resp.status_code)
     except Exception as exc:
-        logger.warning("Provider discovery: validation failed for '%s': %s", status.name, exc)
-        return _make_invalid(status, str(exc)[:50])
+        # A transport failure (timeout, connection error, ...) says nothing
+        # about the key: the provider stays configured and selectable.
+        logger.warning(
+            "Provider discovery: '%s' probe inconclusive (%s) — keeping it configured",
+            status.name, exc,
+        )
+        return _make_available(status, verified=False)
 
 
-def _make_available(status: ProviderStatus) -> ProviderStatus:
+def _classify_probe(status: ProviderStatus, http_status: int) -> ProviderStatus:
+    """Map a probe HTTP status to a provider status (never a false rejection)."""
+    if http_status == 200:
+        return _make_available(status)
+    if http_status in _AUTH_REJECT_STATUSES:
+        return _make_invalid(status, f"HTTP {http_status}")
+    logger.warning(
+        "Provider discovery: '%s' probe inconclusive (HTTP %d) — keeping it configured",
+        status.name, http_status,
+    )
+    return _make_available(status, verified=False)
+
+
+def _make_available(status: ProviderStatus, verified: bool = True) -> ProviderStatus:
     return ProviderStatus(
         name=status.name,
         display_name=status.display_name,
         env_var=status.env_var,
         status="available",
         has_key=True,
-        validated=True,
+        validated=verified,
         default_model=status.default_model,
         base_url=status.base_url,
         icon=status.icon,

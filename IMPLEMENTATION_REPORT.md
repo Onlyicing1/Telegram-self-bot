@@ -12,234 +12,120 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Starting HEAD | `011863e9ce779d57c7de0423b40156a98d034cd2` (== `origin/main` at phase start) |
-| Phase | **Truthful degraded-store classification** — a transient LOCAL resource error (`[Errno 11]`) was reported to the owner as "Supabase unavailable" |
-| Status | **IMPLEMENTED — full suite green (2156 passed, 24 skipped, 0 failed)** |
+| Starting HEAD | `2551970701900116e56c6dff67aec51600696e48` (`== origin/main` at phase start) |
+| Phase | **NaraRouter discovery visibility** — a configured `AI_NARAROUTER_API_KEY` provider was hidden from the provider/model list |
+| Status | **IMPLEMENTED — full suite green (2164 passed, 24 skipped, 0 failed)** |
 | Database impact | **NONE** (no schema, migration, RLS, table, or configuration change) |
-| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §7 |
-| Delivery record | see §8 |
+| Live Render verification | **NOT performed** (no production credentials/telemetry access in this workspace) — see §6 |
+| Delivery record | see §7 |
 
 ---
 
-## 2. Production evidence (as reported, not re-derived)
+## 2. Reported behavior
 
-```
-14:30:54.316  TASK_OCCURRENCE_PERSIST_CREATE_ATTEMPT repository=SupabaseTaskRepository owner_id=7283627550 task_id=2
-14:30:54.417  TASK_OCCURRENCE_PERSIST_CREATE_SUCCESS repository=SupabaseTaskRepository occurrence_id=27
-14:30:54.986  AI record_tool_call failed: [Errno 11] Resource temporarily unavailable
-14:30:54.986  Supabase occurrence read failed; using fallback: [Errno 11] Resource temporarily unavailable
-```
-
-Same health sample: `Last RPC: 59.6s ago`, `RPC latency: 169.5ms`, `Last Telethon event: 0.1s ago`,
-`KEEPALIVE_OK latency_ms=171.2 gen=1`.
-
-Facts these lines prove:
-
-1. **Supabase was not disconnected.** A Supabase write on the same client
-   succeeded 0.57 s before the failures.
-2. The two failures are **concurrent and unrelated** operations (an audit
-   write and an occurrence read) that failed in the **same millisecond** with
-   the **same** error — a shared, local cause, not two independent store
-   problems.
-3. The runtime was otherwise healthy (Telethon events, RPC, keepalive).
+After setting `AI_NARAROUTER_API_KEY` in the Render environment, the NaraRouter
+provider — and therefore its models — did not appear in the Telegram AI
+provider/model list, even though the key was configured.
 
 ---
 
-## 3. Root cause
+## 3. Root cause (source-traced)
 
-### 3.1 Where the error is raised
+NaraRouter is wired end-to-end and was never the missing piece. The first and
+only point where it disappeared was **provider discovery classification**.
 
-Both failing operations execute the **synchronous Supabase HTTP call in a
-worker thread** through `asyncio.to_thread`:
+1. `backend/ai/discovery.py::_PROVIDERS` declares `nararouter` with
+   `env_vars = ["AI_NARAROUTER_API_KEY", "NARAROUTER_API_KEY"]`, default base URL
+   `https://router.bynara.id/v1`, and default model `deepseek-v4-flash`.
+2. `_scan_provider` detects the key and returns status `"detected"`.
+3. `_validate_provider` probes `GET {base_url}/models` with `Bearer` auth. The
+   client is created **without** `follow_redirects`, and httpx defaults
+   `follow_redirects=False` (verified in this workspace).
+4. **Old** classification: any status other than `200` → `_make_invalid`; any
+   exception (timeout, connection error, ...) → `_make_invalid`. Nothing
+   distinguished a genuine auth rejection from a redirect, rate limit, server
+   error, or transport failure.
+5. `backend/bot/handlers/ai.py::_ai_provider_panel_handler` renders selectable
+   rows **only** for `status == "available"`; `invalid` providers are listed
+   separately under "Invalid Key" with no selection row.
 
-| Failing operation | Await path |
-|---|---|
-| `AI record_tool_call` | `ToolExecutor._execute_single` → `guarded_create_task(persistence.record_tool_call(...))` → `persistence._run_sync` → `asyncio.wait_for(asyncio.to_thread(_record_tool_call_sync))` |
-| occurrence read | `SupabaseTaskRepository.get_occurrence` → `_run` → `asyncio.wait_for(asyncio.to_thread(fn))` → `postgrest` sync client → `httpx.Client` |
+So a configured key whose `/models` probe could not complete cleanly was
+reported as a bad key and removed from the selectable provider list — the exact
+reported symptom. Everything downstream (factory `_ENV_KEY_MAP` /
+`_ENV_MODEL_MAP` / `_ENV_BASE_URL_MAP`, `_PROVIDER_DEFAULTS`, the model
+fallback catalog, the display-name map) already registered NaraRouter.
 
-`[Errno 11] Resource temporarily unavailable` is `os.strerror(11)` (`EAGAIN`).
-The classification was proven from source, not assumed:
+Supporting source facts:
 
-| Candidate | Verdict | Proof |
-|---|---|---|
-| Thread-pool / thread-creation exhaustion | **No** | CPython raises `RuntimeError("can't start new thread")` when a thread cannot start, with **no errno** attached (verified in this workspace's CPython 3.10: the binary contains `can't start new thread` and contains no errno path for it). `asyncio.to_thread` → `run_in_executor` → `ThreadPoolExecutor` cannot surface `EAGAIN`. |
-| `subprocess` / `fork` (`BlockingIOError` EAGAIN is the classic fork failure) | **No** | The whole backend contains no `subprocess` / `Popen` / `os.fork` / `posix_spawn` usage. |
-| PostgREST / SQL / database error | **No** | `postgrest`/`supabase` surface those as `APIError`/`HTTPStatusError`; and `httpcore/_backends/sync.py::SyncNetworkBackend.connect_tcp` maps only `socket.timeout → ConnectTimeout` and **`OSError → ConnectError`** — so a raw `OSError(errno=11)` from the socket layer is surfaced as a transport error whose message is the OS string. |
-| **Local OS socket-layer resource failure** | **Yes** | `socket.create_connection()` (socket acquisition / `connect()`, including auto-binding an ephemeral port — a documented `EAGAIN` cause) inside the worker thread's Supabase HTTPS request. |
-
-So the originating function is the **local socket layer under the synchronous
-Supabase HTTP call** (reached through `backend/ai/persistence.py::_run_sync`
-and `backend/ai/database/task_repository.py::_run`); it is **not** evidence
-that the durable store is unavailable. The exact syscall (`socket()` vs
-`connect()`) cannot be distinguished from the log line alone — the honest
-statement is "local socket-layer resource error".
-
-### 3.2 Why `record_tool_call` failed in the same way
-
-`record_tool_call` is already **fire-and-forget and decoupled**: the executor
-spawns it with `guarded_create_task(..., name="ai:record-tool-call")` and
-returns the tool result regardless. Its failure therefore never blocked or
-changed task execution. It failed only because it independently opened its own
-HTTP connection in the same instant and hit the same local shortage. **No
-coupling needed fixing**; §5 adds a regression test that pins the decoupling.
-
-### 3.3 The actual defect (what was wrong in the code)
-
-`SupabaseTaskRepository` converted **every** exception from a Supabase
-operation into the degraded state (`_mark_fallback()`), and every user-facing
-surface then printed:
-
-```
-⚠️ Memory fallback — Supabase unavailable
-(tasks may be missing, and anything created now is not durable).
-```
-
-The degradation itself is correct (the write really did fall back to memory, so
-it really is non-durable). The **claim** was wrong: a transient local resource
-error is not a Supabase outage, and the loud "Supabase unavailable" note made a
-healthy store look dead.
-
-### 3.4 Answering the remaining investigation questions
-
-- **Was task #3 durable when the owner received "Task #3 created"?** No — the
-  durable insert failed with the same transport error, the create degraded to
-  the shared in-memory store, and the non-durable warning was therefore
-  correct. Only its attribution was wrong.
-- **`Task #3` vs `task_id=2`?** Not a separate defect. `2` is the durable task
-  the occurrence (id 27) belongs to; `3` is the degraded store's provisional id
-  (the fallback is floored above the highest durable id observed, so it cannot
-  reuse `2`).
-- **Why did the UI say "Supabase unavailable"?** Because the create returned
-  `fallback_backend` and the surface rendered the single, unconditional
-  `FALLBACK_NOTE`.
+- `GET https://router.bynara.id/v1/models` returns **401** unauthenticated —
+  the endpoint exists and requires auth; a 200 is expected only for a valid key.
+- httpx `AsyncClient` default `follow_redirects=False` — a 3xx from the gateway
+  was therefore surfaced as `status_code=3xx` and misread as an invalid key.
 
 ---
 
-## 4. Exact fix (smallest production-safe change)
+## 4. Exact fix
 
-The fallback boundary is unchanged — **every** failure still degrades
-(resilience preserved). Only the **reason** is now classified, from evidence,
-and only the **attribution** in user-facing text changes.
+`backend/ai/discovery.py` only — no key, base URL, or model value was changed.
 
-### 4.1 `backend/ai/database/task_repository.py`
+- Added `_AUTH_REJECT_STATUSES = frozenset({401, 403})` — the only probe
+  outcomes that genuinely mean "this key is rejected".
+- Added `_classify_probe(status, http_status)`:
+  - `200` → `available`, `validated=True`;
+  - `401`/`403` → `invalid` (the owner must fix the key);
+  - every other status → `available`, `validated=False`.
+- `_validate_provider`'s `except Exception` path now keeps the provider
+  `available` with `validated=False` instead of marking it `invalid`.
+- `_make_available(status, verified: bool = True)` propagates the honest
+  "probe could not confirm" signal through `ProviderStatus.validated`, so the
+  provider stays visible and selectable without claiming verification.
 
-- `_LOCAL_RESOURCE_ERRNOS` = `{EAGAIN/EWOULDBLOCK, EMFILE, ENFILE, ENOMEM, ENOBUFS}`.
-- `_is_local_resource_failure(exc)` walks the whole `__cause__`/`__context__`
-  chain (because `httpx` wraps the raw `OSError`) and reports whether the
-  failure is a local resource shortage.
-- `FALLBACK_REASON_UNAVAILABLE` / `FALLBACK_REASON_LOCAL_RESOURCE`, plus a
-  `fallback_reason` property and `_mark_fallback(exc)` /
-  `_degrade_to_fallback(exc)`. Every call site now passes the exception.
-  `_mark_supabase_ok()` clears the reason again.
-- `_annotate_fallback` / `_annotate_deletion` / the degraded `create_task`
-  annotate `fallback_reason` next to the existing `fallback_backend`
-  (observability annotations only — never written to the database).
-- `TaskDeletionResult` carries `fallback_reason`.
-- New structured diagnostic `TASK_FALLBACK_CLASSIFIED reason=… exception=…
-  message=…` whenever the reason is `local_resource`, because the existing
-  per-operation warning prints only the OS string — the exact gap that made the
-  live misclassification undecidable from logs.
-
-### 4.2 Truthful notes
-
-- `backend/ai/task_management_interface.py`: added `FALLBACK_RESOURCE_NOTE`
-  ("… a local resource error prevented the durable store from being reached
-  …") and `fallback_note(reason)`, which returns the original
-  `FALLBACK_NOTE` only for a real durable-store failure. `list_text` and
-  `inspect_text` use it.
-- `backend/ai/task_management.py`: `TaskListSnapshot.fallback_reason` (default
-  `""`), populated from the repository in the same single snapshot read.
-- `backend/ai/tools/task.py` (create), `backend/ai/tools/task_management_tools.py`
-  (transition + delete), `backend/bot/handlers/taskloom.py` (delete): render the
-  truthful note and expose `fallback_reason` in the result data. A local
-  resource error no longer produces "Supabase unavailable".
-
-### 4.3 Preserved semantics (unchanged)
-
-- a genuine Supabase failure still enters the same fallback path and still
-  shows the original "Supabase unavailable" note;
-- in-memory results are still explicitly **non-durable** (`fallback_active`,
-  `fallback_backend`, `durable=False`) — a local resource error still degrades
-  the same way, it is only attributed truthfully;
-- durable success is still durable and clears the degraded state;
-- owner isolation, CAS/version rules, task-id policy, delete semantics, audit
-  logging and diagnostics are untouched.
-- No new scheduler, worker, database authority, Supabase client, fallback
-  system, retry, or timeout was added.
+The fallback/degradation semantics are unchanged: only a real authentication
+rejection is reported as invalid.
 
 ---
 
 ## 5. Tests
 
-New focused regression file — `tests/test_task_fallback_classification.py`
-(10 tests, in-process only):
+`tests/test_nararouter_provider.py` — 8 new tests (all in-process, HTTP mocked):
 
-| Requirement | Test |
+| Behavior | Test |
 |---|---|
-| A local resource errno is not a store outage | `test_local_resource_errno_is_not_evidence_of_a_store_outage` |
-| The wrapped `__cause__` chain is walked | `test_the_wrapped_cause_chain_is_walked` |
-| A real transport failure keeps the Supabase note | `test_genuine_store_failure_keeps_the_supabase_note` |
-| A local resource error never claims Supabase is unavailable | `test_local_resource_failure_never_claims_supabase_is_unavailable` |
-| The exact production read path (occurrence read) | `test_occurrence_read_classification_matches_the_production_failure` |
-| Degraded create stays non-durable, attributed truthfully | `test_local_resource_create_is_non_durable_with_truthful_attribution` |
-| A genuine create failure keeps the Supabase note | `test_genuine_create_failure_keeps_the_non_durable_supabase_note` |
-| The real `CreateTaskTool` message path | `test_create_message_attributes_a_local_resource_error_truthfully` |
-| Durable success stays durable and clears the reason | `test_a_successful_durable_read_is_durable_and_clears_the_reason` |
-| `record_tool_call` failure cannot mark task persistence unavailable | `test_audit_persistence_failure_cannot_mark_task_persistence_unavailable` |
-
-Existing task tests were not weakened; their degraded fixtures raise
-non-resource errors (`RuntimeError`), so they keep the original
-`FALLBACK_NOTE` behaviour and remain green.
+| A 200 probe is verified | `test_discovery_verifies_nararouter_on_200` |
+| Redirect / rate limit / 5xx keep the provider listed | `test_non_auth_probe_failure_keeps_nararouter_in_the_provider_list` (`307, 429, 500, 503`) |
+| A real auth rejection is still reported invalid | `test_auth_rejection_marks_nararouter_invalid` (`401, 403`) |
+| A transport failure keeps the provider listed | `test_transport_failure_keeps_nararouter_in_the_provider_list` |
 
 ---
 
-## 6. What was NOT changed
+## 6. Verification and limitations
 
-No change to: Supabase schema/migrations/RLS/tables, ProviderManager, provider
-routing, Test Modules, model discovery, TaskScheduler architecture,
-RuntimeSupervisor, Telethon client architecture, Bio Guardian, preparation
-semantics, task creation/scheduling semantics, audit logging, or delete
-semantics.
-
----
-
-## 7. Verification and limitations
-
-- `python -m py_compile` on every changed Python file — OK.
+- `python -m py_compile backend/ai/discovery.py tests/test_nararouter_provider.py` — OK.
 - `git diff --check` — clean.
-- Focused suites (`task_fallback_classification`, `task_repository`,
-  `task_hardening`, `task_list_consistency`, `task_durable_delete`,
-  `task_management`, `taskloom_ui`): **91 passed**.
-- **Full suite (`pytest tests`): `2156 passed, 24 skipped, 0 failed`**
-  (previous tip: 2146 passed / 24 skipped).
+- Focused NaraRouter suite — **32 passed**.
+- **Full suite (`pytest tests`): `2164 passed, 24 skipped, 0 failed`**
+  (previous tip: 2156 passed / 24 skipped).
 
 **Live Render verification: NOT performed.** What remains unverified in
 production:
 
-1. That the observed `[Errno 11]` is in fact the socket-layer `EAGAIN`
-   (the new `TASK_FALLBACK_CLASSIFIED` line will name the exception type on the
-   next occurrence).
-2. The owner's manual probe: create the task again while the store is healthy
-   → the create must be reported **durable with no fallback note**; on a
-   transient local error the note must read "a local resource error prevented
-   the durable store from being reached", never "Supabase unavailable".
-
-**Remaining limitation:** the fix corrects classification and attribution; it
-does **not** remove the local resource shortage itself (e.g. ephemeral-port or
-fd/thread contention in the container). If `TASK_FALLBACK_CLASSIFIED
-reason=local_resource` recurs, the next step would be host-level socket
-accounting — deliberately out of scope here, since the architecture forbids a
-second Supabase client/pool or blanket retries.
+1. That the NaraRouter provider now appears in the Telegram provider list after
+   a refresh, and its models appear in the model picker.
+2. The exact non-200/exception the Render egress produced for
+   `https://router.bynara.id/v1/models`; the fix is correct for every
+   non-auth outcome (redirect, rate limit, 5xx, timeout, connection error), so
+   this does not affect behavior — it only changes whether `validated` is
+   `True` or `False`.
 
 ---
 
-## 8. Delivery record
+## 7. Delivery record
 
 | Item | Value |
 |---|---|
-| Starting HEAD | `011863e9ce779d57c7de0423b40156a98d034cd2` (== `origin/main` at start) |
-| Change set | `backend/ai/database/task_repository.py`, `backend/ai/task_management.py`, `backend/ai/task_management_interface.py`, `backend/ai/tools/task.py`, `backend/ai/tools/task_management_tools.py`, `backend/bot/handlers/taskloom.py` + new `tests/test_task_fallback_classification.py` + this report |
-| Commit | `fix: stop reporting local resource errors as Supabase unavailability` — pushed to `origin/main`, remote SHA verified after push |
-| Previous phase (record) | `011863e` — `feat: improve model testing visibility and proven fallback pool` |
-| Working tree | pre-existing untracked stray clone `telegram-self-bot/` deliberately left untouched; no schema/migration files changed |
-| Live Render / Telegram verification | **NOT performed** — the owner runs the §7 probes manually |
+| Starting HEAD | `2551970701900116e56c6dff67aec51600696e48` (`== origin/main` at start) |
+| Change set | `backend/ai/discovery.py` + `tests/test_nararouter_provider.py` + this report |
+| Commit | `fix: expose configured NaraRouter providers` — pushed to `origin/main`, remote SHA verified after push |
+| Database impact | NONE |
+| Previous phase (record) | `2551970` — `fix: stop reporting local resource errors as Supabase unavailability` |
+| Live Render / Telegram verification | **NOT performed** — the owner verifies the provider list after refresh |
