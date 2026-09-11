@@ -15,6 +15,10 @@ Flow:
      timeouts; a slow/failed provider never blocks the others.
   4. Classify every result deterministically and return a structured
      payload with a rich summary.
+  5. Publish the AVAILABLE results as the runtime model-level fallback
+     pool (free-first, configured model excluded). Discovery alone never
+     qualifies a model, and neither the response/display cap nor the
+     diagnostic budget bounds the pool.
 
 Classification statuses:
   AVAILABLE, NOT_CONFIGURED, AUTH_ERROR, RATE_LIMITED,
@@ -33,7 +37,11 @@ from typing import Any, Callable
 
 from backend.ai.config_store import get_config
 from backend.ai.discovery import discover_providers, _get_env, get_provider_info, _PROVIDERS
-from backend.ai.model_discovery import fetch_models, is_chat_capable
+from backend.ai.model_discovery import (
+    fetch_models,
+    is_chat_capable,
+    order_models_for_selector,
+)
 from backend.ai.providers.base.config import ProviderConfig
 from backend.ai.providers.factory import ProviderFactory
 
@@ -318,7 +326,7 @@ async def _build_targets(
     providers in discovery order. Priority per provider:
       1. the user's currently selected model (when this provider is active)
       2. the provider's default model
-      3. discovered chat-capable models (deduped)
+      3. discovered chat-capable models, FREE-FIRST ordered (deduped)
     ``max_per_provider`` is accepted and ignored for backward compatibility
     with the existing batch runner signature.
     """
@@ -359,10 +367,19 @@ async def _build_targets(
             full.append(m)
         complete_models[p.name] = full
 
-        for m in models[: _MODELS_IN_RESPONSE]:
+        # FREE-FIRST ordering, using the SAME deterministic selector order
+        # the model picker already applies. A provider's raw ``/models``
+        # order is arbitrary with respect to cost, and the diagnostic budget
+        # truncates the flat target list — so without this the budget could
+        # be spent on paid models before a single genuinely-free candidate
+        # was ever reached (e.g. OpenRouter's ``:free`` catalog, which sorts
+        # late in a raw alphabetical list). Ordering here makes free models
+        # testable AND visible within the same explicit budget.
+        ordered = order_models_for_selector(full)
+
+        for m in ordered[: _MODELS_IN_RESPONSE]:
             # Response payload list must contain only chat-capable models.
-            if is_chat_capable(m.id):
-                discovered_models.append(m.__dict__)
+            discovered_models.append(m.__dict__)
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -377,11 +394,9 @@ async def _build_targets(
         if p.default_model and p.default_model not in seen:
             seen.add(p.default_model)
             candidates.append(p.default_model)
-        # 3. discovered chat-capable models
-        for m in models:
+        # 3. discovered chat-capable models (free-first, deduped)
+        for m in ordered:
             if m.id in seen:
-                continue
-            if not is_chat_capable(m.id):
                 continue
             seen.add(m.id)
             candidates.append(m.id)
@@ -433,6 +448,99 @@ async def _run_test_with_semaphore(
         )
 
 
+def annotate_is_free(
+    results: list[dict[str, Any]],
+    complete_models: dict[str, list[Any]],
+    providers_status: list[Any],
+) -> None:
+    """Tag every result with authoritative free/paid metadata (in place).
+
+    ``is_free`` comes ONLY from discovery pricing metadata (the provider
+    reports $0 prompt AND $0 completion) — a model name containing "free"
+    never sets it. A model with no metadata is reported as not-free rather
+    than guessed.
+    """
+    free_pairs = {
+        (p.name, m.id)
+        for p in providers_status
+        for m in complete_models.get(p.name, [])
+        if getattr(m, "is_free", False)
+    }
+    for item in results:
+        item["is_free"] = (item.get("provider"), item.get("model")) in free_pairs
+
+
+def proven_usable_candidates(
+    results: list[dict[str, Any]],
+    complete_models: dict[str, list[Any]],
+    providers_status: list[Any],
+) -> dict[str, list[str]]:
+    """Map provider -> model ids PROVEN AVAILABLE by this diagnostic run.
+
+    Production eligibility is a Test Modules RESULT, never a discovery
+    side effect: only ``status == "AVAILABLE"`` qualifies. An untested
+    model (e.g. cut by the diagnostic budget) or a failed one is never
+    silently equivalent to a usable model. Ordering reuses the same
+    deterministic free-first selector order; ids without discovery
+    metadata keep a stable trailing alphabetical order. Each provider's
+    configured/default model is dropped because the router already tries
+    it first. Dummy is never a candidate.
+    """
+    usable: dict[str, list[str]] = {}
+    for item in results:
+        if item.get("status") != "AVAILABLE":
+            continue
+        provider = str(item.get("provider") or "")
+        model = str(item.get("model") or "")
+        if not provider or not model or provider == "dummy":
+            continue
+        bucket = usable.setdefault(provider, [])
+        if model not in bucket:
+            bucket.append(model)
+
+    configured = {p.name: (p.default_model or "") for p in providers_status}
+    feed: dict[str, list[str]] = {}
+    for provider, ids in usable.items():
+        infos = complete_models.get(provider, [])
+        known = {m.id for m in infos}
+        ordered = [
+            m.id for m in order_models_for_selector(infos) if m.id in ids
+        ]
+        leftover = sorted(i for i in ids if i not in known)
+        default_model = configured.get(provider, "")
+        feed[provider] = [
+            mid for mid in (ordered + leftover) if mid and mid != default_model
+        ]
+    return feed
+
+
+def _feed_production_candidates(
+    results: list[dict[str, Any]],
+    complete_models: dict[str, list[Any]],
+    providers_status: list[Any],
+) -> None:
+    """Publish the AVAILABLE test results to the runtime model-level pool.
+
+    The pool is the EXISTING ProviderManager contract
+    (``set_model_candidates``) — runtime-owned, never scraped from rendered
+    text — so a proven model is eligible whether or not the Test Modules
+    panel is open, and the manager's own health/cooldown/quarantine rules
+    still decide runtime use. A provider with no AVAILABLE model gets an
+    empty candidate list (never the raw discovery set). Dummy is skipped.
+    """
+    try:
+        from backend.ai.engine.engine import get_engine
+
+        feed = proven_usable_candidates(results, complete_models, providers_status)
+        pm = get_engine().provider_manager
+        for p in providers_status:
+            if p.capability_kind != "chat" or not p.has_key or p.name == "dummy":
+                continue
+            pm.set_model_candidates(p.name, feed.get(p.name, []))
+    except Exception as exc:
+        logger.warning("Candidate-pool feed skipped: %s", exc)
+
+
 async def test_all_models(
     owner_id: int = 0,
     per_model_timeout: float = 8.0,
@@ -449,7 +557,7 @@ async def test_all_models(
     providers_status = await discover_providers(force_refresh=True)
     active_config = await get_config(owner_id)
 
-    targets, discovered_models, _complete = await _build_targets(
+    targets, discovered_models, complete_models = await _build_targets(
         providers_status, active_config, global_budget=global_budget,
     )
 
@@ -508,6 +616,9 @@ async def test_all_models(
         if isinstance(item, dict):
             item.setdefault("tested_at", tested_at)
             results.append(item)
+
+    annotate_is_free(results, complete_models, providers_status)
+    _feed_production_candidates(results, complete_models, providers_status)
 
     summary = _build_summary(results, len(discovered_models))
 
@@ -605,31 +716,6 @@ async def test_all_models_streaming(
     targets, discovered_models, complete_models = await _build_targets(
         providers_status, active_config, global_budget=global_budget,
     )
-
-    # Feed the provider mesh's model-level fallback pool: the chat-capable
-    # discovery list per provider (free-first order, minus the configured
-    # default) becomes the candidate set the router tries after each
-    # provider's configured model. One discovery pass serves both the
-    # diagnostics UI and the production router — no second discovery system.
-    try:
-        from backend.ai.engine.engine import get_engine
-        from backend.ai.model_discovery import order_models_for_selector
-
-        pm = get_engine().provider_manager
-        for p in providers_status:
-            if p.capability_kind != "chat" or not p.has_key:
-                continue
-            # COMPLETE discovery feed for the production pool — the display
-            # cap (_MODELS_IN_RESPONSE) lives only in the response payload
-            # and can never bound what production fallback may see.
-            infos = complete_models.get(p.name, [])
-            mids = [
-                m.id for m in order_models_for_selector(infos)
-                if m.id != p.default_model
-            ]
-            pm.set_model_candidates(p.name, mids)
-    except Exception as exc:
-        logger.warning("Candidate-pool feed skipped: %s", exc)
 
     total = len(targets)
     completed = 0
@@ -733,6 +819,15 @@ async def test_all_models_streaming(
             }))
             continue
         results.append(item)
+
+    # Only AFTER the run do we know which (provider, model) pairs are usable.
+    # Discovery alone never arms the production pool: the candidate set is
+    # the AVAILABLE test result (free-first, configured model excluded),
+    # published through the existing ProviderManager contract. The response
+    # payload cap and the diagnostic budget bound TEST EXECUTION and DISPLAY
+    # only — never this feed.
+    annotate_is_free(results, complete_models, providers_status)
+    _feed_production_candidates(results, complete_models, providers_status)
 
     return {
         "success": True,

@@ -15,6 +15,12 @@ Behavior:
     nothing, a centralized per-provider fallback catalog
     (``_FALLBACK_CATALOG`` — the ONE place to update offline model
     lists) is used so the UI still has models to show.
+  - Pagination: a provider whose ``/models`` contract paginates is
+    followed to its last page (currently Gemini's ``nextPageToken``).
+    Providers that return the complete catalog in one response
+    (OpenRouter, OpenAI, Groq, Mistral, Cerebras, ...) need no paging —
+    for those the single response IS the complete list, so a "missing
+    free model" there is an ordering/filtering problem, never a page.
   - Per-provider fetch locks: a slow provider never blocks another.
 
 Usage:
@@ -36,6 +42,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL = int(os.getenv("MODEL_DISCOVERY_CACHE_TTL", "600"))  # seconds
+# Hard bound on followed pagination links so a misbehaving provider can never
+# turn discovery into an unbounded request loop. The Gemini /models contract
+# is the only registered one that paginates (``nextPageToken``).
+_MAX_DISCOVERY_PAGES = 10
 _model_cache: dict[str, dict[str, Any]] = {}  # provider_name -> {"models": [...], "timestamp": float}
 _locks: dict[str, asyncio.Lock] = {}
 _last_source: dict[str, str] = {}  # provider_name -> "api" | "fallback"
@@ -336,47 +346,62 @@ async def _fetch_openai_compat_models(
 
 
 async def _fetch_gemini_models(api_key: str, base_url: str) -> list[ModelInfo]:
-    """Fetch models from the Gemini API."""
-    url = f"{base_url}/models?key={api_key}&pageSize=100"
+    """Fetch models from the Gemini API, following ``nextPageToken``.
+
+    The Gemini ``/models`` contract paginates: a response may carry a
+    ``nextPageToken`` that must be sent back as ``pageToken`` to reach the
+    remaining models. Reading only the first page silently hides every
+    model beyond it, so the full chain is followed (bounded by
+    ``_MAX_DISCOVERY_PAGES``).
+    """
+    models: list[ModelInfo] = []
+    seen: set[str] = set()
+    page_token = ""
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                logger.warning("Model discovery: gemini returned %d", resp.status_code)
-                return []
+            for _ in range(_MAX_DISCOVERY_PAGES):
+                url = f"{base_url}/models?key={api_key}&pageSize=100"
+                if page_token:
+                    url += f"&pageToken={page_token}"
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    logger.warning("Model discovery: gemini returned %d", resp.status_code)
+                    break
 
-            data = resp.json()
-            raw_models = data.get("models", [])
+                data = resp.json()
+                for m in data.get("models", []):
+                    model_name = m.get("name", "").replace("models/", "")
+                    if not model_name or model_name in seen:
+                        continue
+                    if not is_chat_capable(model_name):
+                        continue
 
-            models: list[ModelInfo] = []
-            for m in raw_models:
-                model_name = m.get("name", "").replace("models/", "")
-                if not model_name:
-                    continue
-                if not is_chat_capable(model_name):
-                    continue
+                    supports_generation = "generateContent" in m.get("supportedGenerationMethods", [])
+                    if not supports_generation:
+                        continue
 
-                supports_generation = "generateContent" in m.get("supportedGenerationMethods", [])
-                if not supports_generation:
-                    continue
+                    seen.add(model_name)
+                    context_length = 0
+                    input_limit = m.get("inputTokenLimit", 0)
+                    if isinstance(input_limit, (int, float)):
+                        context_length = int(input_limit)
 
-                context_length = 0
-                input_limit = m.get("inputTokenLimit", 0)
-                if isinstance(input_limit, (int, float)):
-                    context_length = int(input_limit)
+                    models.append(ModelInfo(
+                        id=model_name,
+                        name=model_name,
+                        provider="gemini",
+                        context_length=context_length,
+                        description=m.get("description", ""),
+                        capabilities=list(m.get("supportedGenerationMethods", [])),
+                    ))
 
-                models.append(ModelInfo(
-                    id=model_name,
-                    name=model_name,
-                    provider="gemini",
-                    context_length=context_length,
-                    description=m.get("description", ""),
-                    capabilities=list(m.get("supportedGenerationMethods", [])),
-                ))
+                page_token = str(data.get("nextPageToken") or "")
+                if not page_token:
+                    break
 
-            models.sort(key=lambda m: m.name.lower())
-            return models
+        models.sort(key=lambda m: m.name.lower())
+        return models
 
     except Exception as exc:
         logger.warning("Model discovery: gemini fetch failed: %s", exc)

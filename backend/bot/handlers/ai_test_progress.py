@@ -43,10 +43,22 @@ def render_progress_bar(fraction: float) -> str:
     return "".join("▰" if i < filled else "▱" for i in range(_SEGMENTS))
 
 
-def render_progress_view(done: int, total: int, last_item: dict | None) -> str:
-    """Compact primary message: bar + counts + latest completed candidate."""
+def render_progress_view(
+    done: int,
+    total: int,
+    last_item: dict | None,
+    current_line: str = "",
+) -> str:
+    """Compact primary message: current runtime pair, bar, counts, latest.
+
+    ``current_line`` is the authoritative runtime provider/model the AI
+    request path would use right now (resolved by the caller from the
+    ProviderManager, never from rendered text), so a run always shows what
+    it is testing AGAINST.
+    """
     fraction = (done / total) if total > 0 else 0.0
-    lines = [f"{render_progress_bar(fraction)}  {done}/{total}"]
+    lines: list[str] = [current_line] if current_line else []
+    lines.append(f"{render_progress_bar(fraction)}  {done}/{total}")
     if last_item:
         mark = "✓" if last_item.get("status") == "AVAILABLE" else "×"
         lines.append(
@@ -174,12 +186,16 @@ async def run_streaming_test(owner_id: int, event) -> None:
 
         guardian = _PanelEditGuardian(_edit)
         state: dict = {"last": None}
+        try:
+            current_line = _ai_mod._runtime_pair_line()
+        except Exception:
+            current_line = "Current: unavailable"
 
         def on_result(item: dict) -> None:
             state["last"] = item
 
         def on_progress(done: int, total: int) -> None:
-            text = render_progress_view(done, total, state["last"])
+            text = render_progress_view(done, total, state["last"], current_line)
             title, built = render_edit("Test Modules", text, _progress_buttons())
             guardian.submit(title, built)
 

@@ -172,3 +172,130 @@ async def test_provider_without_listing_support_falls_back():
     with patch("backend.ai.model_discovery.httpx.AsyncClient", return_value=mock_client):
         models = await fetch_models("mistral", "fake_key", "https://api.mistral.ai/v1")
     assert any(m.id == "mistral-large-latest" for m in models)
+
+
+# ── OpenRouter: free models must survive discovery, metadata decides free ──
+
+
+@pytest.mark.asyncio
+async def test_openrouter_free_models_are_retained_and_free_is_metadata_driven():
+    """An OpenRouter-shaped /models response keeps every chat-capable model
+    (including ``:free`` ids) and marks a model free ONLY when authoritative
+    pricing reports $0 prompt AND $0 completion."""
+    clear_cache()
+    payload = {
+        "data": [
+            {"id": "google/gemini-2.0-flash-exp:free", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "openai/gpt-4o", "pricing": {"prompt": "0.0000025", "completion": "0.00001"}},
+            {"id": "vendor/paid-model:free", "pricing": {"prompt": "0.1", "completion": "0.2"}},
+            {"id": "vendor/half-free", "pricing": {"prompt": "0", "completion": "0.5"}},
+            {"id": "vendor/zero-numeric", "pricing": {"prompt": "0", "completion": 0.0}},
+            {"id": "vendor/text-embedding-3", "pricing": {"prompt": "0", "completion": "0"}},
+        ]
+    }
+    mock_client = _mock_async_client(_mock_response(200, payload))
+
+    with patch("backend.ai.model_discovery.httpx.AsyncClient", return_value=mock_client):
+        models = await fetch_models(
+            "openrouter", "fake_key", "https://openrouter.ai/api/v1"
+        )
+
+    ids = [m.id for m in models]
+    # Nothing chat-capable was dropped on the way in...
+    assert "google/gemini-2.0-flash-exp:free" in ids
+    assert "meta-llama/llama-3.3-70b-instruct:free" in ids
+    assert "vendor/half-free" in ids
+    # ...and the non-chat embedding family is still filtered out.
+    assert "vendor/text-embedding-3" not in ids
+
+    free = {m.id for m in models if m.is_free}
+    assert free == {
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "vendor/zero-numeric",
+    }
+    # A name containing "free" is never proof of free status.
+    assert "vendor/paid-model:free" not in free
+    # Pricing that is free on only ONE side is not free.
+    assert "vendor/half-free" not in free
+    assert "openai/gpt-4o" not in free
+
+
+def test_free_first_order_is_deterministic_lossless_and_metadata_only():
+    from backend.ai.model_discovery import ModelInfo, order_models_for_selector
+
+    models = [
+        ModelInfo(id="z/paid", name="paid", provider="p"),
+        ModelInfo(id="a/free", name="free-a", provider="p", is_free=True),
+        ModelInfo(id="b/mid", name="mid", provider="p"),
+        ModelInfo(id="c/free", name="free-c", provider="p", is_free=True),
+    ]
+    ordered = order_models_for_selector(models)
+
+    assert [m.id for m in ordered] == ["a/free", "c/free", "b/mid", "z/paid"]
+    assert len(ordered) == len(models)
+    assert sorted(m.id for m in ordered) == sorted(m.id for m in models)
+    # The input list is never mutated.
+    assert [m.id for m in models] == ["z/paid", "a/free", "b/mid", "c/free"]
+
+
+# ── Gemini: the /models contract paginates via nextPageToken ──
+
+
+@pytest.mark.asyncio
+async def test_gemini_discovery_follows_every_page():
+    """Only reading the first page hides every model beyond it; the full
+    ``nextPageToken`` chain is followed (and de-duplicated)."""
+    clear_cache()
+    pages = [
+        {
+            "models": [
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            ],
+            "nextPageToken": "tok-2",
+        },
+        {
+            "models": [
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+            ],
+            "nextPageToken": "tok-3",
+        },
+        {
+            "models": [
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            ],
+        },
+    ]
+
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = [_mock_response(200, p) for p in pages]
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = False
+
+    with patch("backend.ai.model_discovery.httpx.AsyncClient", return_value=mock_client):
+        models = await fetch_models(
+            "gemini", "fake_key", "https://generativelanguage.googleapis.com/v1beta"
+        )
+
+    assert [m.id for m in models] == ["gemini-2.5-flash", "gemini-2.5-pro"]
+    assert mock_client.get.call_count == 3
+    urls = [call.args[0] for call in mock_client.get.call_args_list]
+    assert "pageToken=tok-2" in urls[1]
+    assert "pageToken=tok-3" in urls[2]
+
+
+@pytest.mark.asyncio
+async def test_single_page_openai_compatible_provider_is_not_paged():
+    """A provider that returns its whole catalog in one response (the
+    OpenRouter/OpenAI/Groq contract) is fetched exactly once."""
+    clear_cache()
+    payload = {"data": [{"id": "vendor/a"}, {"id": "vendor/b"}]}
+    mock_client = _mock_async_client(_mock_response(200, payload))
+
+    with patch("backend.ai.model_discovery.httpx.AsyncClient", return_value=mock_client):
+        models = await fetch_models("openrouter", "fake_key", "https://openrouter.ai/api/v1")
+
+    assert [m.id for m in models] == ["vendor/a", "vendor/b"]
+    assert mock_client.get.call_count == 1

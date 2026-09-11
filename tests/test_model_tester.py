@@ -477,8 +477,9 @@ async def test_production_feed_exceeds_display_cap_and_payload_stays_bounded():
 
 @pytest.mark.asyncio
 async def test_global_budget_limits_test_execution_not_production_feed():
-    """The explicit diagnostic budget bounds TEST EXECUTION only; the
-    production candidate feed still receives the complete discovery set."""
+    """The explicit diagnostic budget bounds TEST EXECUTION only. The
+    production pool receives exactly the AVAILABLE tested models — never the
+    raw discovery set, and never a model the budget never tested."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
     from backend.ai.model_tester import _MODELS_IN_RESPONSE
@@ -528,17 +529,25 @@ async def test_global_budget_limits_test_execution_not_production_feed():
     # Diagnostic execution bounded by the explicit budget (fair round-robin
     # keeps the configured/default model first).
     assert len(data["results"]) == 5
-    assert "gpt-4o" in [r["model"] for r in data["results"]]
-    # Production feed NOT truncated by the diagnostic budget — the complete
-    # discovery set is fed regardless.
+    proven = {r["model"] for r in data["results"] if r["status"] == "AVAILABLE"}
+    assert "gpt-4o" in proven
+    # Production pool = the AVAILABLE test result minus the configured model
+    # (the router already tries it first) — never the raw discovery set, and
+    # never a model the diagnostic budget skipped.
     fed = fake_pm.candidates.get("openai", [])
-    assert len(fed) == total_models
+    assert set(fed) == proven - {"gpt-4o"}
+    assert len(fed) == 4
+    assert f"m{total_models - 1:03d}" not in fed
+    # The display payload stays bounded by the display cap while the pool is
+    # bounded only by what was proven usable.
+    assert len(data["models"]) <= _MODELS_IN_RESPONSE
 
 
 @pytest.mark.asyncio
 async def test_multiple_providers_each_feed_complete_sets():
-    """Every real provider contributes its COMPLETE discovered eligible set
-    to the production pool — the display cap never binds any provider."""
+    """Every real provider contributes its COMPLETE proven-AVAILABLE set to
+    the production pool — proven by an uncapped diagnostic run, so neither
+    the display cap nor the budget binds any provider."""
     from backend.ai.discovery import ProviderStatus
     from backend.ai.model_discovery import ModelInfo
     from backend.ai.model_tester import _MODELS_IN_RESPONSE
@@ -584,8 +593,14 @@ async def test_multiple_providers_each_feed_complete_sets():
         mock_disc.return_value = fake_providers
         from backend.ai.model_tester import test_all_models_streaming
 
-        data = await test_all_models_streaming(owner_id=0)
+        # Uncapped run so every discovered candidate is actually tested;
+        # the pool is then the proven AVAILABLE set.
+        data = await test_all_models_streaming(owner_id=0, global_budget=0)
 
+    assert sum(
+        1 for r in data["results"]
+        if r["provider"] == "openai" and r["status"] == "AVAILABLE"
+    ) == per_provider + 1
     assert len(fake_pm.candidates.get("openai", [])) == per_provider
     assert len(fake_pm.candidates.get("groq", [])) == per_provider
     assert fake_pm.candidates["openai"][-1] == f"openai-m{per_provider - 1:03d}"
@@ -672,3 +687,194 @@ def test_api_ai_models_all_endpoint():
     assert "providers" in data
     assert data["providers"][0]["provider"] == "openai"
     assert data["providers"][0]["models"][0]["id"] == "gpt-4o"
+
+
+# ── Production eligibility = a Test Modules AVAILABLE result ──
+
+
+def _pm_engine():
+    class _FakePM:
+        def __init__(self):
+            self.candidates: dict[str, list[str]] = {}
+
+        def set_model_candidates(self, name, models):
+            self.candidates[name] = models
+
+    class _FakeEngine:
+        provider_manager = _FakePM()
+
+    return _FakeEngine.provider_manager, _FakeEngine
+
+
+def _provider_status(name, default_model):
+    from backend.ai.discovery import ProviderStatus
+
+    return ProviderStatus(
+        name=name, display_name=name.title(), env_var=f"AI_{name.upper()}_API_KEY",
+        status="available", has_key=True, validated=True, default_model=default_model,
+        base_url=f"https://{name}.example/v1", icon="◇",
+    )
+
+
+def _result(provider, model, status):
+    return {
+        "provider": provider, "display_name": provider.title(), "icon": "◇",
+        "model": model, "status": status,
+        "error": None if status == "AVAILABLE" else "boom",
+        "latency_s": 0.1, "http_status": 200, "retry_after": None,
+        "error_type": None, "provider_code": None, "finish_reason": "stop",
+        "capabilities": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_only_available_models_from_any_provider_enter_the_pool():
+    """A failed test result never becomes a production candidate, while a
+    usable model from ANY provider (and several from one provider) is
+    eligible."""
+    from backend.ai.model_discovery import ModelInfo
+
+    providers = [_provider_status("groq", "llama"), _provider_status("openai", "gpt-4o")]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [
+            ModelInfo(id=f"{provider_name}-ok1", name="ok1", provider=provider_name),
+            ModelInfo(id=f"{provider_name}-ok2", name="ok2", provider=provider_name),
+            ModelInfo(id=f"{provider_name}-bad", name="bad", provider=provider_name),
+        ]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return _result(provider, model, "AVAILABLE" if "-ok" in model else "PROVIDER_ERROR")
+
+    pm, engine = _pm_engine()
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=engine):
+        disc.return_value = providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0, global_budget=0)
+
+    # Multiple AVAILABLE models per provider, configured model excluded.
+    assert pm.candidates["groq"] == ["groq-ok1", "groq-ok2"]
+    assert pm.candidates["openai"] == ["openai-ok1", "openai-ok2"]
+    # Failed models are never candidates anywhere.
+    failed = [r["model"] for r in data["results"] if r["status"] != "AVAILABLE"]
+    assert "groq-bad" in failed and "openai-bad" in failed
+    for models in pm.candidates.values():
+        assert not any("-bad" in m for m in models)
+    # Results carry free/paid metadata honestly (no metadata -> not free).
+    assert all(r["is_free"] is False for r in data["results"])
+
+
+@pytest.mark.asyncio
+async def test_a_provider_with_no_available_model_gets_no_candidates():
+    from backend.ai.model_discovery import ModelInfo
+
+    providers = [_provider_status("groq", "llama")]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        return [ModelInfo(id="groq-bad1", name="bad1", provider=provider_name),
+                ModelInfo(id="groq-bad2", name="bad2", provider=provider_name)]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return _result(provider, model, "RATE_LIMITED")
+
+    pm, engine = _pm_engine()
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=engine):
+        disc.return_value = providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        await test_all_models_streaming(owner_id=0, global_budget=0)
+
+    # Discovery found two chat-capable models; neither was proven usable, so
+    # the pool is empty rather than discovery-fed.
+    assert pm.candidates.get("groq") == []
+
+
+@pytest.mark.asyncio
+async def test_dummy_is_never_a_production_candidate():
+    pm, engine = _pm_engine()
+    providers = [_provider_status("dummy", "dummy-model")]
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return _result(provider, model, "AVAILABLE")
+
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=engine):
+        disc.return_value = providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0, global_budget=0)
+
+    assert any(r["provider"] == "dummy" for r in data["results"])
+    assert "dummy" not in pm.candidates
+
+
+@pytest.mark.asyncio
+async def test_free_models_are_tested_before_paid_ones_under_the_budget():
+    """The diagnostic budget is applied to a FREE-FIRST target list, so a
+    genuinely-free catalog is reachable (and visible) instead of being cut
+    off behind an alphabetically earlier paid catalog."""
+    from backend.ai.model_discovery import ModelInfo
+
+    providers = [_provider_status("openrouter", "openrouter/auto")]
+
+    async def fake_fetch(provider_name, api_key, base_url, force_refresh=False):
+        paid = [ModelInfo(id=f"paid-{i:02d}", name=f"paid-{i:02d}", provider=provider_name)
+                for i in range(20)]
+        free = [ModelInfo(id=f"free-{i:02d}", name=f"free-{i:02d}", provider=provider_name,
+                          is_free=True)
+                for i in range(3)]
+        return paid + free
+
+    async def fake_test(provider, display, icon, model, timeout=8.0):
+        return _result(provider, model, "AVAILABLE")
+
+    pm, engine = _pm_engine()
+    with patch("backend.ai.model_tester.discover_providers", new_callable=AsyncMock) as disc, \
+         patch("backend.ai.model_tester._get_env", return_value="fake_key"), \
+         patch("backend.ai.model_tester.fetch_models", side_effect=fake_fetch), \
+         patch("backend.ai.model_tester.test_single_model", side_effect=fake_test), \
+         patch("backend.ai.engine.engine.get_engine", return_value=engine):
+        disc.return_value = providers
+        from backend.ai.model_tester import test_all_models_streaming
+
+        data = await test_all_models_streaming(owner_id=0, global_budget=4)
+
+    tested = [r["model"] for r in data["results"]]
+    assert tested[0] == "openrouter/auto"
+    assert {"free-00", "free-01", "free-02"} <= set(tested)
+    assert "paid-00" not in tested
+    # The display payload follows the same free-first order.
+    assert [m["id"] for m in data["models"]][:3] == ["free-00", "free-01", "free-02"]
+    # Free metadata is carried into the results for the UI.
+    free_models = {r["model"] for r in data["results"] if r.get("is_free")}
+    assert free_models == {"free-00", "free-01", "free-02"}
+
+
+def test_is_free_annotation_uses_discovery_metadata_only():
+    from backend.ai.model_discovery import ModelInfo
+    from backend.ai.model_tester import annotate_is_free
+
+    results = [{"provider": "openrouter", "model": "a"},
+               {"provider": "openrouter", "model": "b"},
+               {"provider": "openrouter", "model": "c"}]
+    complete = {"openrouter": [
+        ModelInfo(id="a", name="a", provider="openrouter", is_free=True),
+        ModelInfo(id="b", name="b", provider="openrouter"),
+    ]}
+    annotate_is_free(results, complete, [_provider_status("openrouter", "auto")])
+
+    assert results[0]["is_free"] is True
+    assert results[1]["is_free"] is False
+    # No discovery metadata -> not claimed free.
+    assert results[2]["is_free"] is False

@@ -30,6 +30,7 @@ import logging
 
 from backend.helper import (
     InlinePanelBuilder,
+    get_action,
     register_panel,
     register_inline_builder,
     register_action,
@@ -1239,11 +1240,90 @@ def _short_model_name(model_id: str) -> str:
     return model_id.split("/")[-1]
 
 
-def _render_test_results(results_payload: dict) -> tuple[str, list]:
-    """Canonical Test Models results view (body + buttons).
+# Test Modules grid geometry. The previous results view showed at most 12
+# usable-model buttons in one view (a hard ``[:12]`` slice, no paging), so
+# 12 is the normal single-view capacity. Keeping the panel at 6 rows and
+# widening — 2 columns × 6 rows = 12 normally, 3 columns × 6 rows = 18 once
+# the usable set no longer fits — means a larger result set earns a third
+# column instead of a taller panel, and pagination only appears when even
+# that does not fit.
+_TEST_GRID_2COL_MAX = 12
+_TEST_GRID_ROWS_PER_PAGE = 6
+
+
+def _test_grid_columns(usable_count: int) -> int:
+    """2 columns for a normal usable set, 3 once it exceeds a 2-column page."""
+    return 3 if usable_count > _TEST_GRID_2COL_MAX else 2
+
+
+def _test_grid_page_size(columns: int) -> int:
+    """Buttons per page: a constant 6 rows, widening with the columns."""
+    return columns * _TEST_GRID_ROWS_PER_PAGE
+
+
+def _runtime_pair() -> tuple[str, str]:
+    """Authoritative runtime (provider, model) — the ProviderManager pair.
+
+    This is the same state the AI request path uses. It never falls back to
+    the persisted config: a "current" display must show the pair the
+    runtime would actually use, or nothing. Returns ``("", "")`` when the
+    runtime reports no pair (so callers can render an honest unavailable
+    state instead of inventing one).
+    """
+    info = _get_engine_info()
+    provider = str(info.get("provider") or "").strip()
+    model = str(info.get("model") or "").strip()
+    if provider in ("", "—"):
+        provider = ""
+    if model in ("", "—"):
+        model = ""
+    return provider, model
+
+
+def _current_model_line(provider: str, model: str) -> str:
+    """Compact 'Current: <provider> · <model>' line (Unicode only)."""
+    if not provider:
+        return "Current: unavailable"
+    return f"Current: {_provider_display(provider)} · {model or 'unavailable'}"
+
+
+def _runtime_pair_line() -> str:
+    """'Current: …' line resolved from the authoritative runtime state."""
+    provider, model = _runtime_pair()
+    return _current_model_line(provider, model)
+
+
+def _usable_results(results: list[dict]) -> list[dict]:
+    """AVAILABLE results in the deterministic Test Modules display order.
+
+    Provider grouping first, then fastest first. Shared by the renderer and
+    the pager so both always agree on the exact same ordered list.
+    """
+    usable = [r for r in results if r.get("status") == "AVAILABLE"]
+    return sorted(
+        usable,
+        key=lambda x: (
+            x.get("provider", ""),
+            x.get("latency_s") if x.get("latency_s") is not None else 999,
+        ),
+    )
+
+
+def _render_test_results(
+    results_payload: dict,
+    page: int = 0,
+    current: tuple[str, str] | None = None,
+) -> tuple[str, list]:
+    """Canonical Test Modules results view (body + buttons).
 
     Single render path shared by the batch action result and the streaming
     completion view — the two entry points can never drift apart.
+
+    Shows the CURRENT runtime pair first (from the authoritative
+    ProviderManager state, never the persisted config), then an ADAPTIVE
+    usable-model grid: two columns for a normal usable set, three once it
+    exceeds one full two-column page. The active runtime model keeps its
+    normal position and is marked in place (``◉``) rather than duplicated.
     """
     results = results_payload.get("results", [])
     summary = results_payload.get("summary", {})
@@ -1251,21 +1331,21 @@ def _render_test_results(results_payload: dict) -> tuple[str, list]:
     def s(key: str, default: int = 0) -> int:
         return summary.get(key, default)
 
+    active_provider, active_model = current if current is not None else _runtime_pair()
+
     lines = ["**Model Tests**\n"]
     lines.append(
         f"_✓ {s('available')} · × {s('failed')} · × rate {s('rate_limited')} · · not configured {s('not_configured')} · "
         f"× invalid {s('invalid')} · × no credits {s('insufficient_credits')}_"
     )
     lines.append("")
+    lines.append(_current_model_line(active_provider, active_model))
+    lines.append("")
 
     # Compact layout: usable models are the focus (provider-grouped, model
     # name dominant, one line each). Failure details stay out of the main
     # message — one compact line per model, capped, full detail one tap away.
-    usable = [r for r in results if r.get("status") == "AVAILABLE"]
-    usable_sorted = sorted(
-        usable,
-        key=lambda x: (x.get("provider", ""), x.get("latency_s") if x.get("latency_s") is not None else 999),
-    )
+    usable_sorted = _usable_results(results)
 
     if usable_sorted:
         lines.append("**✓ Usable Models**")
@@ -1275,7 +1355,10 @@ def _render_test_results(results_payload: dict) -> tuple[str, list]:
             if provider != current_provider:
                 current_provider = provider
                 lines.append(f"◇ **{r.get('display_name', provider)}**")
-            lines.append(f"• `{_short_model_name(r.get('model', '?'))}`")
+            is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
+            mark = "◉" if is_active else "•"
+            free_tag = " ·free" if r.get("is_free") else ""
+            lines.append(f"{mark} `{_short_model_name(r.get('model', '?'))}`{free_tag}")
         lines.append("")
     else:
         lines.append("_No usable chat models right now._")
@@ -1292,16 +1375,44 @@ def _render_test_results(results_payload: dict) -> tuple[str, list]:
             lines.append(f"_…and {len(failed) - 8} more_")
         lines.append("")
 
-    # Buttons: usable models select provider+model together; everything else
-    # is navigation/diagnostics. All existing actions preserved.
+    # Buttons: usable models select provider+model together in a grid whose
+    # column count follows the usable set size; everything else is
+    # navigation/diagnostics. All existing actions preserved. Pagination
+    # only appears when the usable set spans more than one page, and every
+    # usable model is reachable exactly once across the pages.
+    columns = _test_grid_columns(len(usable_sorted))
+    page_size = _test_grid_page_size(columns)
+    total_pages = max(1, (len(usable_sorted) + page_size - 1) // page_size)
+    try:
+        page = max(0, min(int(page or 0), total_pages - 1))
+    except (TypeError, ValueError):
+        page = 0
+    start = page * page_size
+    page_models = usable_sorted[start:start + page_size]
+
     builder = InlinePanelBuilder()
-    if usable_sorted:
-        for r in usable_sorted[:12]:
-            label = f"✓ {r.get('display_name', r.get('provider', '?'))} — {_short_model_name(r.get('model', '?'))}"
+    for i in range(0, len(page_models), columns):
+        row: list[tuple[str, str]] = []
+        for r in page_models[i:i + columns]:
+            provider = r.get("provider", "?")
+            is_active = bool(active_model) and provider == active_provider and r.get("model") == active_model
+            mark = "◉" if is_active else "✓"
+            label = f"{mark} {r.get('display_name', provider)} — {_short_model_name(r.get('model', '?'))}"
+            if r.get("is_free"):
+                label += " ·free"
             latency = r.get("latency_s")
             if latency is not None:
                 label += f" ({latency}s)"
-            builder.add_row(label[:64], f"action:ai_pick_model:{r['provider']}:{r['model']}")
+            row.append((label[:64], f"action:ai_pick_model:{provider}:{r['model']}"))
+        builder.add_buttons(*row)
+    if total_pages > 1:
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("‹ Prev", f"action:ai_test_page:{page - 1}"))
+        nav.append((f"{page + 1}/{total_pages}", "panel:_nav:noop"))
+        if page < total_pages - 1:
+            nav.append(("Next ›", f"action:ai_test_page:{page + 1}"))
+        builder.add_buttons(*nav)
     builder.add_row("↻ Re-run Tests", "action:ai_test_models")
     if results:
         builder.add_row("⌕ All Results", "action:ai_test_details")
@@ -1334,7 +1445,11 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     if _test_running:
         builder = InlinePanelBuilder()
         builder.add_row("⌂ Home", "panel:_nav:home")
-        return "Test Modules", "◌ Already running — this panel will update when done.", builder.build()
+        return (
+            "Test Modules",
+            f"◌ Already running — this panel will update when done.\n\n{_runtime_pair_line()}",
+            builder.build(),
+        )
 
     _test_running = True
     guarded_create_task(
@@ -1346,9 +1461,26 @@ async def _ai_test_models_action(event, extra: str, chat_id: int) -> tuple[str, 
     builder.add_row("Overview", "panel:ai")
     return (
         "Test Modules",
-        "… Starting the model test run\n\n_This panel will update with progress and results — no spam._",
+        f"… Starting the model test run\n\n{_runtime_pair_line()}\n\n"
+        f"_This panel will update with progress and results — no spam._",
         builder.build(),
     )
+
+
+async def _test_modules_page_dispatch(event, extra: str, chat_id: int):
+    """Forward to the Test Modules grid pager handler defined below.
+
+    The name lookup is deferred to call time so the pager implementation
+    keeps its place beside the results renderer it pages.
+    """
+    return await _ai_test_page_action(event, extra, chat_id)
+
+
+# Wired at import: the helper registry keys actions by id, so this is
+# idempotent and the pager can never be missing while the Test Modules
+# results grid that renders its page buttons is on screen.
+if get_action("ai_test_page") is None:
+    register_action("ai_test_page", _test_modules_page_dispatch)
 
 
 async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -1393,6 +1525,30 @@ async def _ai_test_details_action(event, extra: str, chat_id: int) -> tuple[str,
     builder.add_row("≡ Pick Model", "panel:ai_model")
     _nav_buttons(builder)
     return "Test Modules", "\n".join(lines).rstrip(), builder.build()
+
+
+async def _ai_test_page_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Render a different page of the cached Test Modules usable-model grid.
+
+    Pure presentation over the LAST run's payload — it never re-runs the
+    tests and never mutates the cached results, so paging cannot change
+    which models are displayed as usable or which pairs are eligible for
+    production fallback.
+    """
+    try:
+        page = max(0, int((extra or "0").strip()))
+    except ValueError:
+        page = 0
+
+    payload = _last_test_payload or {}
+    if not payload.get("results"):
+        builder = InlinePanelBuilder()
+        builder.add_row("Run Tests", "action:ai_test_models")
+        _nav_buttons(builder)
+        return "Test Modules", "**All Results**\n\n_◌ No results yet. Tap **Run Tests** first._", builder.build()
+
+    body, buttons = _render_test_results(payload, page=page)
+    return "Test Modules", body, buttons
 
 
 async def _finish_input(
