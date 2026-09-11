@@ -205,8 +205,10 @@ this workspace). In-process verification covered the whole wizard -> candidate -
 
 | Item | Value |
 |---|---|
-| Commit | `feat: add structured task creation wizard` (SHA recorded below by the delivery step) |
-| Push | `origin main` (no force), verified with `git ls-remote origin refs/heads/main` |
+| Starting HEAD | `5325a4065bf29ac1f3379de9d744917f82e0b460` |
+| Final implementation commit | `feat: add structured task creation wizard` — `be45990e5e0eadceb1c6932e69e2816231c76dcf` |
+| Push | `5325a40..be45990  main -> main` (no force) |
+| Remote verification | `HEAD` == `origin/main` == `git ls-remote origin refs/heads/main` == `be45990e5e0eadceb1c6932e69e2816231c76dcf`; `git rev-list --left-right --count HEAD...origin/main` = `0 0`; working tree clean |
 
 ---
 
