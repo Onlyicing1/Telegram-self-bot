@@ -41,17 +41,34 @@ _SLOW_HANDLER_PATTERNS = (
     "_input_listener", "panel_cmd", "save_cmd", "del_cmd",
     "health_cmd", "kill_cmd", "logs_cmd", "help_cmd",
 )
+# The runtime's own forever-loops, keyed by the task NAME the supervisor /
+# scheduler actually assigns (verified against backend/runtime/*.py,
+# backend/ai/task_scheduler.py and backend/profile/scheduler.py). A task that
+# deliberately parks on its own timer or event has an unchanged stack BY
+# DESIGN, so it is never a stall and never starvation.
 _PERMANENT_TASK_NAMES = frozenset({
     "lifeos-heartbeat", "lifeos-keepalive", "lifeos-failsafe",
     "lifeos-diagnostics", "lifeos-memory-cleanup", "lifeos-run",
-    "lifeos-web",
+    "lifeos-web", "lifeos-web-server", "lifeos-helper",
+    "lifeos-task-scheduler", "lifeos-profile-scheduler",
 })
 _PERMANENT_CORO_PATTERNS = (
     "run_until_disconnected", "run_until_connected",
     "_heartbeat_loop", "_keepalive_loop", "_failsafe_loop",
     "_diagnostics_loop", "_cleanup_loop", "_run_loop",
     "uvicorn", "serve",
+    # Long-lived Telethon transport/update loops. The library creates them with
+    # auto-generated task names ("Task-N"), so only the coroutine name can
+    # identify them: _update_loop / _recv_loop / _send_loop / _keepalive_loop
+    # never complete while the client is connected — their stack IS the await.
+    "_update_loop", "_recv_loop", "_send_loop",
 )
+# A task whose OWN coroutine is suspended inside the telethon package is
+# library machinery that is long-lived by construction (Telethon owns the
+# connection loops), whatever name it was given. ``_get_await_location`` reads
+# the coroutine's own frame, so an application coroutine awaiting a Telethon
+# RPC still reports an application file and stays correctly bounded.
+_PERMANENT_SOURCE_MARKERS = ("telethon/",)
 
 _task: asyncio.Task | None = None
 _prev_stacks: dict[str, str] = {}
@@ -108,18 +125,24 @@ def _is_blocked_on_sync_primitive(awaited: str) -> bool:
     )
 
 
-def _is_permanent_task(name: str, coro_name: str = "") -> bool:
+def _is_permanent_task(name: str, coro_name: str = "", await_loc: str = "") -> bool:
     """Classify a task as permanent (long-lived) or bounded (should complete).
 
     Permanent tasks are expected to wait indefinitely — an unchanged
     stack trace across dumps is NORMAL for them.  Bounded tasks should
     complete within a reasonable period; an unchanged stack is a stall.
+
+    Three independent signals, in order: the runtime's own assigned task
+    names, the coroutine name (covers Telethon's auto-named loops), and the
+    file the suspended frame lives in (any Telethon machinery is long-lived
+    by construction).
     """
     if name in _PERMANENT_TASK_NAMES:
         return True
     if any(pat in coro_name for pat in _PERMANENT_CORO_PATTERNS):
         return True
-    return False
+    normalized = (await_loc or "").replace("\\", "/").lower()
+    return any(marker in normalized for marker in _PERMANENT_SOURCE_MARKERS)
 
 
 def _detect_deadlocks(pending_tasks: list, task_info: dict, elapsed: dict) -> list[str]:
@@ -137,11 +160,21 @@ def _detect_deadlocks(pending_tasks: list, task_info: dict, elapsed: dict) -> li
     return deadlocks
 
 
-def _detect_starvation(permanent_names: frozenset[str] = frozenset()) -> list[str]:
-    """Detect bounded tasks whose stack hasn't changed across multiple dumps."""
+def _detect_starvation(
+    current_names: frozenset[str] = frozenset(),
+    permanent_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Detect bounded tasks that are STILL PENDING and unchanged across dumps.
+
+    A name qualifies only while a task with that name is present right now: a
+    counter left behind by an already-finished task would otherwise be
+    reported as starvation forever, which is exactly the false positive that
+    made the dump claim starvation for ordinary long-lived runtime work
+    (and for recovery tasks that had already completed).
+    """
     starved = []
     for name, count in _stack_unchanged_count.items():
-        if name in permanent_names:
+        if name not in current_names or name in permanent_names:
             continue
         if count >= _STARVATION_THRESHOLD:
             elapsed = time.time() - _task_first_seen.get(name, time.time())
@@ -256,7 +289,7 @@ async def _dump_tasks() -> None:
             coro_name = _get_coro_name(coro)
             await_loc = _get_await_location(coro)
             awaited_obj = _get_awaited_object(coro)
-            is_permanent = _is_permanent_task(name, coro_name)
+            is_permanent = _is_permanent_task(name, coro_name, await_loc)
 
             if name not in _task_first_seen:
                 _task_first_seen[name] = now
@@ -282,6 +315,15 @@ async def _dump_tasks() -> None:
             pass
 
     _prev_stacks = stacks
+
+    # Drop per-task state for tasks that no longer exist, so a completed
+    # bounded task can never be reported as starved on a later dump.
+    current_names = frozenset(task_info)
+    for stale in [n for n in _stack_unchanged_count if n not in current_names] + [
+        n for n in _task_first_seen if n not in current_names
+    ]:
+        _stack_unchanged_count.pop(stale, None)
+        _task_first_seen.pop(stale, None)
 
     permanent_names = frozenset(
         name for name, info in task_info.items() if info.get("permanent", False)
@@ -309,7 +351,7 @@ async def _dump_tasks() -> None:
         )
 
     deadlocks = _detect_deadlocks(bounded_tasks, task_info, elapsed)
-    starved = _detect_starvation(permanent_names)
+    starved = _detect_starvation(current_names, permanent_names)
     slow_handlers = _detect_slow_handlers(bounded_tasks, task_info, elapsed)
 
     if stalled:

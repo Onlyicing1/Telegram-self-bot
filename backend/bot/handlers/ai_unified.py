@@ -55,6 +55,14 @@ _trigger_cache: dict[str, str] = {"en": "", "fa": "", "ts": 0.0}
 _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
 _AI_MAX_CONCURRENCY = 4
+_RPC_T = 30.0
+
+# Appended to the text reply ONLY when the Taskloom wizard panel could not be
+# sent (helper bot unavailable): the owner still needs an actionable path to
+# the SAME structured creation flow.
+_WIZARD_UNAVAILABLE_HINT = (
+    "Open **Menu → Taskloom → ＋ New task** to set this up with structured options."
+)
 _ai_semaphore: asyncio.Semaphore | None = None
 
 # Tools whose successful execution must end silently: the Telegram deletion
@@ -84,6 +92,74 @@ def _is_silent_delete(result) -> bool:
         if item.get("tool_name") not in _DELETE_TOOL_NAMES:
             return False
     return all(bool(item.get("success")) for item in tool_results)
+
+
+def _wizard_signal(result) -> dict | None:
+    """The Taskloom-wizard signal a tool result asked the delivery layer to surface.
+
+    Only a ``create_task`` result that could not produce a COMPLETE task
+    definition carries it (an unsupported capability, or a candidate-level
+    interpretation failure). Provider, timeout, and persistence failures
+    carry nothing: retrying is the right answer there, not filling in a form.
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    for item in metadata.get("tool_results") or []:
+        if not isinstance(item, dict) or item.get("tool_name") != "create_task":
+            continue
+        data = item.get("data")
+        if isinstance(data, dict) and data.get("open_taskloom_wizard"):
+            return data
+    return None
+
+
+def _wizard_notice(signal: dict) -> str:
+    """One honest, bounded line explaining why the structured wizard opened."""
+    reason = str(signal.get("wizard_reason") or "").strip()
+    capability = " ".join(str(signal.get("capability") or "").split())[:80]
+    if reason == "unsupported_capability" and capability:
+        return f"⚠ `{capability}` cannot be scheduled as one sentence — choose the options below."
+    return "⚠ I need a few structured choices for this task — fill them in below."
+
+
+async def _open_task_wizard(event, client, owner_id: int, signal: dict) -> bool:
+    """Open the EXISTING Taskloom creation wizard for a task request the
+    natural-language path could not complete.
+
+    Returns True only when the Glass UI panel was actually sent. The wizard
+    draft is reset with an explanatory notice; nothing is prefilled from the
+    request and nothing is persisted — the owner's own choices still build the
+    candidate that the same ``TaskCreationService`` / ``TaskRepository`` store.
+    """
+    from backend.bot.handlers import taskloom
+    from backend.helper import send_inline_panel
+    from backend.helper.rpc_timeout import rpc_await
+
+    chat_id = getattr(event, "chat_id", None)
+    if not isinstance(chat_id, int):
+        return False
+    taskloom.reset_wizard_draft(owner_id, notice=_wizard_notice(signal))
+    try:
+        opened = await rpc_await(
+            send_inline_panel(client, chat_id, taskloom.WIZARD_PANEL_QUERY),
+            timeout=_RPC_T,
+            label="taskloom.wizard_bridge",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("AI handler: task wizard panel send failed: %s", exc)
+        return False
+    if not opened:
+        return False
+    try:
+        await rpc_await(
+            event.delete(), timeout=_RPC_T, label="taskloom.wizard_bridge_delete"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("AI handler: wizard bridge placeholder delete skipped: %s", exc)
+    return True
 
 
 def _get_concurrency_semaphore() -> asyncio.Semaphore:
@@ -394,7 +470,7 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
 
 
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
-                      tz_str: str, reply_context=None) -> None:
+                      tz_str: str, reply_context=None, client=None) -> None:
     """Execute the AI pipeline and deliver the result via centralized delivery.
 
     A single request id tracks the whole lifecycle, and ``register_end`` runs
@@ -515,6 +591,29 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 logger.warning("AI handler: scheduling record_request failed: %s", exc)
 
         if result.success and result.response:
+            # ── Natural-language → Taskloom wizard bridge ──
+            # A create_task result that could not produce a complete task
+            # definition surfaces the EXISTING structured creation wizard
+            # instead of only a refusal. The wizard is the same one the direct
+            # Taskloom button opens and converges on the same candidate /
+            # persistence path; if the panel cannot be sent (helper bot
+            # unavailable) the text reply is delivered with an actionable hint.
+            wizard_unavailable = False
+            wizard = _wizard_signal(result)
+            if wizard is not None:
+                ai_diag.set_stage(rid, "TASK_WIZARD")
+                if await _open_task_wizard(event, client, owner_id, wizard):
+                    ai_diag.mark_success("TASK_WIZARD")
+                    logger.info(
+                        "AI_EXEC_TRACE request_id=%s stage=task_wizard_opened reason=%s",
+                        rid, wizard.get("wizard_reason") or "-",
+                    )
+                    return
+                wizard_unavailable = True
+                logger.info(
+                    "AI_EXEC_TRACE request_id=%s stage=task_wizard_unavailable "
+                    "reason=%s", rid, wizard.get("wizard_reason") or "-",
+                )
             # ── Silent delete ──
             # A successful pure-delete execution must not produce any
             # Telegram confirmation: the deletion is the only visible effect.
@@ -549,6 +648,8 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             logger.info("AI_RESPONSE_SEND_START id=%s", rid)
             from backend.ai.tools.delivery import deliver_response
             response_text = result.response
+            if wizard_unavailable:
+                response_text = f"{response_text}\n\n_{_WIZARD_UNAVAILABLE_HINT}_"
             if result.metadata.get("tool_rounds_exhausted"):
                 pending = len(result.metadata.get("pending_tool_calls", []))
                 response_text = (
@@ -760,7 +861,7 @@ def register(client, owner_id: int, tz_str: str):
 
             await _execute_ai(
                 event, owner_id, user_message, trigger_label, tz_str,
-                reply_context=reply_ctx,
+                reply_context=reply_ctx, client=client,
             )
             return
 
@@ -769,4 +870,4 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")
-        await _execute_ai(event, owner_id, user_text, trigger_label, tz_str)
+        await _execute_ai(event, owner_id, user_text, trigger_label, tz_str, client=client)

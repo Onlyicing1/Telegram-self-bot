@@ -7,6 +7,133 @@
 
 ---
 
+## Phase - Taskloom creation bridge, local-resource cooldown, and runtime diagnostics correctness
+
+### Metadata
+
+| Item | Value |
+|---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` |
+| Branch | `main` |
+| Starting HEAD | `bf192d887e9121b7dc4b5cd0be00ddc1fd2c3908` |
+| Phase | **Taskloom UX bridge + EAGAIN pressure protection + false-positive diagnostics fix** |
+| Status | **IMPLEMENTED** - focused and full in-process suites green |
+| Database impact | **NONE** (no schema, migration, RLS, table, index, or SQL file touched) |
+| Live Render/Telegram verification | **NOT performed** (no production session or telemetry access in this workspace) |
+| Delivery record | pending final commit/push verification |
+
+### Exact production problems and source-traced causes
+
+1. **Natural-language Taskloom requests stopped before the existing wizard.**
+   `CreateTaskTool` caught `TaskUnsupportedError` and returned only a refusal, while
+   candidate-level interpretation failures returned the generic rejection. Neither
+   result carried a signal to the Telegram delivery layer, so the already-implemented
+   `taskloom_new` panel was unreachable from the natural-language path.
+2. **Persistent local EAGAIN caused an event-query storm.**
+   `TaskEventDispatcher.handle_event()` calls `SupabaseTaskRepository.list_event_tasks()`
+   for every incoming Telegram event. The repository correctly classified the local
+   transport error, but each event immediately retried the same failing Supabase
+   operation and emitted another warning pair. There was no repository-level local
+   resource protection state.
+3. **Runtime diagnostics classified deliberately long-lived work as bounded.**
+   The classifier knew only a partial set of LifeOS names/coroutine patterns. Telethon's
+   auto-named `_update_loop`, `_recv_loop`, and `_send_loop`, the named Taskloom/profile
+   schedulers, helper/web wrappers, and stale state for completed tasks were therefore
+   eligible for `TASK_NO_PROGRESS` / `TASK_STARVATION` despite fresh event/RPC and loop
+   telemetry.
+4. **The health heartbeat timestamp was write-once.**
+   `backend.health.mark_started()` initialized `_last_heartbeat`, but no runtime loop
+   refreshed it. The heartbeat loop reported progress through `tick_loop()` without
+   updating the canonical health timestamp, so `heartbeat_age_s`, `process_alive`, and
+   the failsafe signal could remain stale during healthy runtime. The 15-second stale
+   threshold was also shorter than the 30-second heartbeat interval.
+
+### Exact implementation
+
+**Natural-language -> existing Taskloom wizard.** `CreateTaskTool` now marks only
+unsupported-capability and candidate-level interpretation failures with
+`data.open_taskloom_wizard=true`; provider, timeout, and persistence failures remain
+ordinary failures. `ai_unified` consumes that structured result, resets the existing
+per-owner `taskloom_new` draft, and opens it through the existing
+`send_inline_panel`/panel lifecycle. Opening the wizard creates no task and does not
+prefill untrusted values. If the helper panel cannot be sent, the normal response
+includes an actionable `Menu -> Taskloom -> + New task` hint. Fully representable NL
+requests continue through the existing `TaskInterpreter -> TaskCandidate ->
+TaskCreationService -> TaskRepository` path.
+
+**Bounded local-resource cooldown.** `SupabaseTaskRepository` now owns a monotonic,
+5-second cooldown after a confirmed local-resource failure. During the window its
+existing in-memory fallback is served without dispatching another Supabase request.
+The deadline is not extended by skipped calls, expires automatically, and is cleared
+immediately by any successful durable operation. Genuine Supabase/store failures do
+not enter the cooldown and remain observable on every attempted operation. The
+existing `local_resource`/`unavailable` classification and non-durable fallback
+honesty are unchanged. Warning output is deduplicated to one classification/request
+pair per continuous local-resource episode; no retry loop, client, pool, scheduler,
+or persistence path was added.
+
+**Diagnostics and health.** Permanent classification now covers the actual runtime
+names, Taskloom/profile schedulers, helper/web wrappers, and Telethon transport/update
+coroutines and source frames. Starvation now considers only tasks still pending in
+the current dump, pruning completed-task state. Genuine bounded unchanged-task and
+event-loop-latency detection remain active. `health.set_heartbeat()` is the single
+canonical timestamp writer after startup and is called by the existing heartbeat
+loop; the stale threshold is 90 seconds, longer than the 30-second beat interval but
+still bounded for real failure detection.
+
+### Exact files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/tools/task.py` | structured wizard signal for unsupported/incomplete task interpretation |
+| `backend/bot/handlers/ai_unified.py` | opens the existing owner-scoped Taskloom wizard, with text fallback |
+| `backend/bot/handlers/taskloom.py` | exposes the existing wizard query/reset entry for the bridge |
+| `backend/ai/database/task_repository.py` | bounded local-resource cooldown and episode-scoped warning deduplication |
+| `backend/runtime/diagnostics.py` | correct permanent-loop classification and live-task starvation filtering |
+| `backend/health.py` | canonical heartbeat writer and interval-aligned stale threshold |
+| `backend/runtime/heartbeat.py` | refreshes the canonical heartbeat timestamp through the existing loop |
+| `tests/test_task_wizard_nl_bridge.py` | 9 focused NL bridge/owner/no-persistence tests |
+| `tests/test_task_fallback_cooldown.py` | 8 cooldown, recovery, classification, and event-pressure tests |
+| `tests/test_runtime_diagnostics_classification.py` | 11 diagnostics and heartbeat tests |
+| `tests/test_task_fallback_classification.py` | updates existing recovery assertion for the bounded window |
+| `IMPLEMENTATION_REPORT.md` | this current-state phase report |
+
+No provider, NaraRouter, model-testing, scheduler architecture, ToolExecutor,
+Supabase schema/migration, or unrelated UI file was changed.
+
+### Test results
+
+- Focused Taskloom bridge: `tests/test_task_wizard_nl_bridge.py` - **9 passed**.
+- Focused local-resource protection: `tests/test_task_fallback_cooldown.py` - **8 passed**; existing `tests/test_task_fallback_classification.py` - **10 passed**.
+- Focused diagnostics/health: `tests/test_runtime_diagnostics_classification.py` - **11 passed**.
+- Combined relevant regression selection: **141 passed**.
+- Full suite: `.venv/bin/python -m pytest tests -q` - **2248 passed, 24 skipped, 0 failed** (3 dependency deprecation warnings only).
+- `py_compile` - **OK** for every changed/added Python file.
+- `git diff --check` - **clean**.
+
+### Remaining limitations
+
+1. Live Render/Telegram verification was not performed in this coding workspace. The
+   next deployed runtime must confirm that the new `TASK_FALLBACK_CLASSIFIED` episode
+   behavior and `TASK_EVENT_TRACE` volume match the in-process contract.
+2. The cooldown intentionally serves the existing non-durable fallback while the
+   local condition persists. It prevents request amplification; it does not make
+   fallback data durable or claim that a failed durable read succeeded.
+3. The NL bridge opens a blank structured wizard rather than guessing values from an
+   unsupported request. This is deliberate: only explicit owner selections become
+   the durable candidate.
+
+### Delivery record
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `bf192d887e9121b7dc4b5cd0be00ddc1fd2c3908` |
+| Final implementation commit | pending |
+| Push | pending |
+| Remote verification | pending |
+
+---
+
 ## Phase - Structured Taskloom task-creation wizard
 
 ### Metadata

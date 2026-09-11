@@ -206,7 +206,16 @@ async def test_a_successful_durable_read_is_durable_and_clears_the_reason():
     assert await repo.list_tasks(10) == []
     assert repo.fallback_reason == FALLBACK_REASON_LOCAL_RESOURCE
 
-    # ...and the next healthy durable read restores the healthy state.
+    # ...and the bounded local-resource cooldown serves the fallback for one
+    # short window instead of re-issuing the doomed durable call. This is the
+    # change that stops a persistent EAGAIN from hammering Supabase on every
+    # incoming Telegram event.
+    assert repo._in_local_resource_cooldown() is True
+    assert await repo.list_tasks(10) == []
+
+    # Once the bounded window expires, the next healthy durable read is
+    # attempted again, succeeds, and clears the degraded state immediately.
+    repo._local_resource_until = 0.0
     client.error = None
     assert len(await repo.list_tasks(10)) == 1
     assert repo.fallback_active is False

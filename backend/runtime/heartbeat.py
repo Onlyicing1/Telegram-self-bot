@@ -25,7 +25,7 @@ import time
 
 from backend.runtime.tracer import trace
 from backend.runtime.task_guard import immortal_create_task, guarded_create_task
-from backend.health import tick_loop
+from backend.health import set_heartbeat, tick_loop
 
 logger = logging.getLogger("backend.heartbeat")
 
@@ -91,6 +91,11 @@ async def _heartbeat_loop() -> None:
         await asyncio.sleep(_INTERVAL)
         loop_latency = (time.monotonic() - t0 - _INTERVAL) * 1000
 
+        # This loop IS the canonical heartbeat: refresh the health layer's
+        # heartbeat timestamp so ``process_alive`` / the staleness warning /
+        # the failsafe's heartbeat signal describe the live runtime rather
+        # than a value frozen at startup.
+        set_heartbeat()
         tick_loop("lifeos-heartbeat", state="RUNNING", success=True)
 
         if loop_latency > _LOOP_STARVATION_MS:

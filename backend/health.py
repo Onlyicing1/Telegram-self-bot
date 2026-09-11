@@ -25,7 +25,13 @@ import time
 
 logger = logging.getLogger(__name__)
 
-_STALE_THRESHOLD = 15.0
+# The canonical heartbeat writer is the runtime heartbeat loop
+# (``backend/runtime/heartbeat.py``, interval 30s) through ``set_heartbeat``.
+# The staleness window must EXCEED one beat interval: a 15s window measured
+# against a 30s loop reported a perfectly healthy runtime as "stale" /
+# "degraded" for half of every cycle. 90s matches the runtime's existing
+# loop-staleness convention, so a heartbeat that really stops is still caught.
+_STALE_THRESHOLD = 90.0
 
 _started_at: float = 0.0
 _last_heartbeat: float = 0.0
@@ -94,6 +100,20 @@ def mark_started() -> None:
     _started_at = now
     _last_heartbeat = now
     logger.info("health: process started at %.0f", now)
+
+
+def set_heartbeat() -> None:
+    """Refresh the canonical heartbeat timestamp (the heartbeat loop's writer).
+
+    The ONLY writer of ``_last_heartbeat`` after startup. Without it the field
+    kept its ``mark_started()`` value for the whole process lifetime, so
+    ``heartbeat_age_s`` / ``process_alive`` / ``check_stale`` (and the
+    failsafe's heartbeat signal) reported a number frozen at boot instead of
+    the live runtime — an inconsistency against the fresh Telethon/RPC
+    timestamps in the same log sample.
+    """
+    global _last_heartbeat
+    _last_heartbeat = time.time()
 
 
 def set_runtime_state(state: str) -> None:

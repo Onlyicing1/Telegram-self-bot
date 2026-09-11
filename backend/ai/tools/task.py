@@ -182,6 +182,16 @@ class CreateTaskTool(Tool):
             into one indistinguishable rejection text. The token is
             sanitized to one line, bounded, and content-free (no raw provider
             output, no secrets).
+
+            A candidate-level failure (``candidate_invalid*``) means the
+            interpreter could not derive a COMPLETE task definition from the
+            request — ambiguous schedule/action, or a candidate that failed
+            the contract. That is precisely the case the existing Taskloom
+            creation wizard resolves with structured choices, so the result
+            carries a signal the delivery layer turns into the wizard entry
+            (see ``backend.bot.handlers.ai_unified``). Provider/timeout/
+            persistence failures carry no such signal: retrying is the right
+            response there, not filling in a form.
             """
             logger.warning(
                 "AI_TASK_TRACE request_id=%s stage=create_task_failed failed_stage=%s "
@@ -192,12 +202,18 @@ class CreateTaskTool(Tool):
                 int((time.perf_counter() - started) * 1000),
             )
             safe_category = " ".join(str(category).split())[:80]
+            data: dict[str, Any] = {}
+            if safe_category.startswith("candidate_invalid"):
+                data = {
+                    "open_taskloom_wizard": True,
+                    "wizard_reason": safe_category,
+                }
             return ToolResult(success=False, message=(
                 "I could not turn that into a safe, unambiguous schedule, so I "
                 "did not create any task. Restate it as an interval (e.g. 'every "
                 "X minutes'), a time, or a daily/weekly cadence with a clear action."
                 + (f" [failure category: {safe_category}]" if safe_category else "")
-            ))
+            ), data=data)
 
         _trace(
             "create_task_received", owner_scope=owner_id,
@@ -247,8 +263,14 @@ class CreateTaskTool(Tool):
                 )
                 return _fail("create_task_interpretation", "timeout", exc)
             except TaskUnsupportedError as exc:
-                # Semantically clear but unrepresentable capability: answer
-                # honestly instead of with the generic ambiguity rejection.
+                # Semantically clear but unrepresentable capability. The
+                # owner's intent is unambiguously a TASK, so the natural-
+                # language path refuses honestly AND asks the delivery layer
+                # to open the EXISTING Taskloom creation wizard: the same
+                # structured choices converge on the same TaskCandidate and
+                # the same TaskCreationService, so no capability that the
+                # scheduler/tool layer truly cannot run is ever fabricated
+                # here, and no second creation path is introduced.
                 logger.warning(
                     "AI_TASK_TRACE request_id=%s stage=create_task_failed "
                     "failed_stage=create_task_interpretation category=unsupported_capability "
@@ -256,12 +278,18 @@ class CreateTaskTool(Tool):
                     request_id, exc.capability,
                     int((time.perf_counter() - started) * 1000),
                 )
+                capability = " ".join(str(exc.capability).split())[:120]
                 return ToolResult(
                     success=False,
                     message=(
                         f"I understood your request, but {exc.capability} is not "
                         "supported yet, so I did not create the task."
                     ),
+                    data={
+                        "open_taskloom_wizard": True,
+                        "wizard_reason": "unsupported_capability",
+                        "capability": capability,
+                    },
                 )
             except Exception as exc:  # noqa: BLE001
                 category = _classify_interpretation_failure(exc)

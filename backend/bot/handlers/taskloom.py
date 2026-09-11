@@ -358,6 +358,25 @@ def _store(draft: TaskDraft, owner_id: int | None = None) -> None:
     _drafts[_owner(owner_id)] = draft
 
 
+# The panel QUERY the natural-language bridge sends to surface this wizard
+# (``send_inline_panel(client, chat_id, taskloom.WIZARD_PANEL_QUERY)``).
+WIZARD_PANEL_QUERY = _WIZARD_PANEL
+
+
+def reset_wizard_draft(owner_id: int | None = None, notice: str = "") -> TaskDraft:
+    """Start a FRESH wizard draft for this owner — pure UI state, nothing durable.
+
+    The one shared entry into the wizard (the direct "＋ New task" button and
+    the natural-language bridge both render the same draft). Nothing is
+    prefilled from the request and no task is created here: the owner's own
+    choices build the candidate that the SAME ``TaskCreationService`` -> the
+    SAME ``TaskRepository`` later persists.
+    """
+    draft = TaskDraft(timezone=_DEFAULT_TZ, step=STEP_ACTION, notice=notice)
+    _drafts[_owner(owner_id)] = draft
+    return draft
+
+
 def _step_position(step: str) -> tuple[int, str]:
     order = {
         STEP_ACTION: (1, "Action"),
