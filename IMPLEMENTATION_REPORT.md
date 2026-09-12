@@ -285,11 +285,20 @@ the reply resolver, and every other handler.
 
 ## 11. Delivery
 
-- Commit SHA: _filled in below after push_
+- Starting HEAD: `697c202393fb1e9f0dcb616f8f44b8c89070c126`
+- Implementation commit: `c71d0acfa1c84fe539f28593bc861f07f40e40c0`
+  (`fix: deliver memory and output instructions in the prompt payload`)
 - Branch: `main`
-- Push result: _filled in below_
-- Remote HEAD: _filled in below_
-- Final working-tree state: _filled in below_
+- Push result: `697c202..c71d0ac  main -> main` (fast-forward, no force, no rebase)
+- `git rev-parse HEAD`:
+  `c71d0acfa1c84fe539f28593bc861f07f40e40c0`
+- `git rev-parse origin/main`:
+  `c71d0acfa1c84fe539f28593bc861f07f40e40c0`
+- `git ls-remote origin refs/heads/main`:
+  `c71d0acfa1c84fe539f28593bc861f07f40e40c0`
+- Ahead/behind: `0 0`
+- Final working-tree state: clean (`## main...origin/main`, no modified or
+  untracked files). No pre-existing unrelated changes were present or discarded.
 
 ---
 
