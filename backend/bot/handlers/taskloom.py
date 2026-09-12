@@ -634,10 +634,30 @@ async def _wizard_panel(event, extra: str) -> tuple[str, str, list] | None:
     ``new`` starts a FRESH draft (the explicit "＋ New task" entry). A bare
     entry RESUMES the current draft, which is what the shared input prompt's
     Cancel returns to — so abandoning one field never loses the draft.
+
+    ``edit:<task_id>`` RESUMES an in-progress edit of the SAME task. The panel
+    is reachable again from any re-dispatch — a navigation Back landing on it,
+    a repaint, the inline builder — and re-prefilling on every re-entry would
+    rebuild the draft from the STORED definition, discarding every value the
+    owner has already changed. Live symptom: flipping "Show source" to No
+    reverted to the stored Yes by the time Review (and Save) ran, so the Bio
+    kept rendering the speaker label. The stored definition is read only when
+    an edit actually STARTS (no draft, or a different task) and on the explicit
+    "⟳ Reload from task" — never on a re-entry.
     """
     extra = (extra or "").strip()
     if extra.startswith("edit:"):
-        return await _start_edit(extra[len("edit:"):])
+        raw = extra[len("edit:"):]
+        try:
+            task_id = int(raw)
+        except (TypeError, ValueError):
+            task_id = 0
+        existing = _drafts.get(_owner())
+        if task_id and existing is not None and existing.editing_task_id == task_id:
+            # RESUMING the same edit: the in-progress draft is the source of
+            # truth until Save or Cancel, never the stored definition.
+            return _wizard_render(existing)
+        return await _start_edit(raw)
     if extra == "new":
         # The explicit New-task entry always starts fresh: an abandoned edit
         # draft (or a stale one) must never resurface here as a new-task form.

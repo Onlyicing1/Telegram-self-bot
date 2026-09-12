@@ -590,3 +590,195 @@ async def test_label_free_bio_still_shares_the_one_guardian_window(_guardian_env
     )
     assert results[0].success is False
     assert "NOT updated" in results[0].message
+
+
+# ── Taskloom EDIT: the display choice must survive the whole edit session ────
+# Live bug: with a stored "Show source: Yes", flipping the toggle to No showed
+# No on the Content-details step, but Review (and the save) reverted to Yes.
+# Root cause: ``panel:taskloom_new:edit:<id>`` re-prefilled the draft from the
+# STORED task on EVERY re-dispatch of that panel (a navigation Back landing on
+# the wizard, a repaint, the inline builder), so any pending edit was rebuilt
+# from the old definition the moment the panel was re-entered. The editor now
+# RESUMES an in-progress draft for the same task and only reads the stored
+# definition when an edit actually starts (or on the explicit ⟳ Reload).
+
+
+def _reenter_edit(wizard, task_id):
+    """Re-dispatch the wizard with the STORED panel query (nav-Back / repaint)."""
+    return _run(wizard._wizard_panel(_Event(), f"edit:{task_id}"))
+
+
+def _review_body(wizard):
+    _title, body, _rows = _run(wizard._wizard_action(_Event(), "step:review", 111))
+    return body
+
+
+def test_edit_toggle_off_survives_a_panel_re_entry(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+    assert derive_policy(task.ai_instruction).show_source is True
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "step:details", 111))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    assert wizard._draft(OWNER).show_source is False
+
+    _reenter_edit(wizard, task.id)
+    assert wizard._draft(OWNER).show_source is False
+    assert wizard._draft(OWNER).editing_task_id == task.id
+    assert "**Show source:** No" in _review_body(wizard)
+
+
+def test_edit_toggle_on_survives_a_panel_re_entry(wizard, repo):
+    _create_bio_task(wizard)  # default No
+    task = _run(repo.list_tasks(OWNER))[0]
+    assert derive_policy(task.ai_instruction).show_source is False
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "step:details", 111))
+    _run(wizard._wizard_action(_Event(), "set:show_source:1", 111))
+    _reenter_edit(wizard, task.id)
+
+    assert wizard._draft(OWNER).show_source is True
+    assert "**Show source:** Yes" in _review_body(wizard)
+
+
+def test_panel_re_entry_keeps_the_current_editor_step(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "step:details", 111))
+    _reenter_edit(wizard, task.id)
+
+    draft = wizard._draft(OWNER)
+    assert draft.step == wizard.STEP_DETAILS  # never bounced back to the hub
+    assert draft.action == "bio" and draft.source == EN_SOURCE
+    assert draft.content_mode == "ai" and draft.interval_minutes == 2
+
+
+def test_other_edited_fields_survive_a_panel_re_entry(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_input_handler("maxlen")("20", 111, 9, 0, 0))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    _reenter_edit(wizard, task.id)
+
+    draft = wizard._draft(OWNER)
+    assert draft.max_length == 20 and draft.show_source is False
+
+
+def test_stored_edit_extra_through_the_panel_router_preserves_the_draft(wizard, repo):
+    """The REAL dispatcher path (``panel:taskloom_new:edit:<id>``)."""
+    from backend.helper import panels
+
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "step:details", 111))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+
+    class _Ev:
+        def __init__(self):
+            self.edits = []
+
+        async def edit(self, text=None, buttons=None, **kwargs):
+            self.edits.append(text)
+
+        async def answer(self, *args, **kwargs):
+            pass
+
+    event = _Ev()
+    _run(panels._handle_panel(event, f"taskloom_new:edit:{task.id}", 111, 222, OWNER))
+
+    assert wizard._draft(OWNER).show_source is False
+    assert wizard._draft(OWNER).step == wizard.STEP_DETAILS
+    assert event.edits and "Show source: No" in event.edits[-1]
+
+
+def test_edited_display_choice_reaches_persistence_and_execution(wizard, repo):
+    """Edit → toggle → navigate → Review → save → definition → policy → call."""
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "step:details", 111))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    _reenter_edit(wizard, task.id)
+    assert "**Show source:** No" in _review_body(wizard)
+
+    _run(wizard._wizard_action(_Event(), "create", 111))
+    updated = _run(repo.list_tasks(OWNER))[0]
+    assert updated.id == task.id and updated.version == task.version + 1
+
+    policy = derive_policy(updated.ai_instruction)
+    assert policy.source == EN_SOURCE and policy.show_source is False
+
+    presented = present_calls(
+        [{"name": "bio_set_text", "arguments": {"text": EN_ATTRIBUTED}}],
+        updated.ai_instruction,
+    )
+    assert presented[0]["arguments"]["text"] == EN_LINE
+
+
+def test_explicit_reload_still_prefills_from_the_stored_task(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    assert wizard._draft(OWNER).show_source is False
+
+    # ⟳ Reload from task is the ONE explicit, owner-chosen re-prefill.
+    _run(wizard._wizard_action(_Event(), "reload", 111))
+    assert wizard._draft(OWNER).show_source is True
+    assert wizard._draft(OWNER).editing_task_id == task.id
+
+
+def test_cancel_then_reopen_prefills_from_the_stored_task(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    _run(wizard._wizard_action(_Event(), "cancel", 111))
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    assert wizard._draft(OWNER).show_source is True
+
+
+def test_after_save_reopening_prefills_the_persisted_value(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    task = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+    _run(wizard._wizard_action(_Event(), "create", 111))
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{task.id}"))
+    assert wizard._draft(OWNER).show_source is False
+
+
+def test_switching_to_another_task_prefills_that_task(wizard, repo):
+    _create_bio_task(wizard, before_create=("set:show_source:1",))
+    first = _run(repo.list_tasks(OWNER))[0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{first.id}"))
+    _run(wizard._wizard_action(_Event(), "set:show_source:0", 111))
+
+    # The explicit "＋ New task" entry starts a FRESH draft (an edit draft in
+    # progress can never turn a new task into an update of the old one).
+    _run(wizard._wizard_panel(_Event(), "new"))
+    assert wizard._draft(OWNER).editing_task_id == 0
+    _to_details(wizard, source="Rei Ayanami")  # a second Bio task, default No
+    _run(wizard._wizard_input_handler("interval")("2", 111, 9, 0, 0))
+    _run(wizard._wizard_action(_Event(), "create", 111))
+    second = [t for t in _run(repo.list_tasks(OWNER)) if t.id != first.id][0]
+
+    _run(wizard._wizard_panel(_Event(), f"edit:{second.id}"))
+    draft = wizard._draft(OWNER)
+    assert draft.editing_task_id == second.id
+    assert draft.show_source is False and draft.source == "Rei Ayanami"

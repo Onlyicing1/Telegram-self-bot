@@ -584,3 +584,79 @@ def test_an_unrepresentable_definition_is_refused_instead_of_rewritten(editor):
     assert "cannot be edited here" in body
     assert OWNER not in taskloom._drafts
     assert _run(repo.get_task(OWNER, task.id)).version == task.version
+
+
+# ── Re-entering the editor panel must RESUME the draft ─────────────────────
+# The panel is reachable again through its STORED query
+# (``panel:taskloom_new:edit:<id>``) — a navigation Back landing on it, a
+# repaint, the inline builder. Re-reading the stored definition there silently
+# rebuilt the draft and discarded every pending change, so the Review (and the
+# Save) showed the OLD values. The stored definition is read only when an edit
+# actually starts, or on the explicit "⟳ Reload from task".
+
+def test_reopening_the_same_editor_resumes_the_in_progress_draft(editor):
+    taskloom, repo = editor
+    task = _run(repo.create_task(OWNER, _message_task_data()))
+    _open_edit(taskloom, task.id)
+    _run(taskloom._wizard_input_handler("interval")("9", 1, 2, 0, 0))
+    _run(taskloom._wizard_input_handler("text")("edited text", 1, 2, 0, 0))
+    _run(taskloom._wizard_action(None, f"step:{taskloom.STEP_SCHEDULE}", 1))
+
+    # The same panel query the nav stack / a repaint dispatches.
+    _run(taskloom._wizard_panel(None, f"edit:{task.id}"))
+
+    draft = taskloom._draft(OWNER)
+    assert draft.editing_task_id == task.id
+    assert draft.interval_minutes == 9            # not the stored 5
+    assert draft.text == "edited text"            # not the stored "hello"
+    assert draft.step == taskloom.STEP_SCHEDULE   # the step is preserved too
+
+
+def test_stored_edit_extra_through_the_panel_router_resumes_the_draft(editor, monkeypatch):
+    from backend.helper import panels
+
+    taskloom, repo = editor
+    task = _run(repo.create_task(OWNER, _message_task_data()))
+    _open_edit(taskloom, task.id)
+    _run(taskloom._wizard_input_handler("interval")("11", 1, 2, 0, 0))
+
+    calls: list = []
+
+    async def _capture(event, text, buttons, chat_id, msg_id):
+        calls.append(text)
+        return True
+
+    monkeypatch.setattr(panels, "_safe_edit", _capture)
+    _run(panels._handle_panel(
+        object(), f"taskloom_new:edit:{task.id}", 111, 222, OWNER
+    ))
+
+    assert taskloom._draft(OWNER).interval_minutes == 11
+    assert calls and "What do you want to edit?" in calls[-1]
+
+
+def test_a_fresh_edit_session_still_prefills_from_the_stored_task(editor):
+    taskloom, repo = editor
+    task = _run(repo.create_task(OWNER, _message_task_data()))
+    _open_edit(taskloom, task.id)
+    _run(taskloom._wizard_input_handler("interval")("11", 1, 2, 0, 0))
+
+    # Cancel discards the draft, so the next edit starts from the stored task.
+    _run(taskloom._wizard_action(None, "cancel", 1))
+
+    _open_edit(taskloom, task.id)
+    assert taskloom._draft(OWNER).interval_minutes == 5
+
+
+def test_new_task_entry_starts_fresh_while_an_edit_draft_is_open(editor):
+    taskloom, repo = editor
+    task = _run(repo.create_task(OWNER, _message_task_data()))
+    _open_edit(taskloom, task.id)
+    _run(taskloom._wizard_input_handler("interval")("11", 1, 2, 0, 0))
+
+    _run(taskloom._wizard_panel(None, "new"))
+    draft = taskloom._draft(OWNER)
+
+    assert draft.editing_task_id == 0
+    assert draft.step == taskloom.STEP_ACTION
+    assert draft.interval_minutes is None
