@@ -47,6 +47,7 @@ from backend.ai.task_wizard import (
     STEP_ACTION,
     STEP_CONTENT,
     STEP_DETAILS,
+    STEP_EDIT,
     STEP_REVIEW,
     STEP_SCHEDULE,
     WEEKDAYS,
@@ -118,34 +119,46 @@ def _wizard_footer(builder: InlinePanelBuilder, *, editing: bool = False) -> Non
 
     The wizard owns its navigation: "← Back" is always the wizard's own
     PREVIOUS STEP (a deterministic draft step rendered by the step branches),
-    "Cancel" exits to Taskloom, and "Close" closes the panel. No
-    ``panel:_nav:back`` is emitted anywhere in the wizard, so the shared panel
-    finalizer can never inject a stack-popping Back that jumps to Taskloom
-    home — the live regression where Back after an input submission returned
-    to the Taskloom list instead of the previous step. Back never cancels; it
-    never discards the draft.
+    and "Close" closes the panel. No ``panel:_nav:back`` is emitted anywhere in
+    the wizard, so the shared panel finalizer can never inject a stack-popping
+    Back that jumps out of the editor.
+
+    Cancel differs by mode: while EDITING it DISCARDS the draft and returns to
+    the edited task's detail view (an action, so the draft is really cleared and
+    can never resurface as a later "＋ New task" form); while creating it returns
+    to the Taskloom list. Back never cancels and never discards the draft.
     """
-    builder.add_row("✕ Cancel", "panel:taskloom")
+    if editing:
+        builder.add_row("✕ Cancel edit", "action:taskloom_wizard:cancel")
+    else:
+        builder.add_row("✕ Cancel", "panel:taskloom")
     builder.add_row("❌ Close", "panel:_nav:close")
 
 
 async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
     """LEVEL 1 — compact paginated task list."""
+    from backend.ai.task_management_interface import fallback_note
     from backend.helper.inline_engine import _owner_id
+
     service = _service(_owner_id)
-    tasks = await service.list_tasks()
+    # ONE authoritative read. The rows, the status counters and the degraded
+    # marker below all describe the same repository call: two independent reads
+    # could observe different states (the bounded local-resource cooldown
+    # expiring, a recovery, a concurrent write) and render a list whose
+    # counters contradict it.
+    snapshot = await service.snapshot()
+    tasks = snapshot.tasks
+    counts = snapshot.counts()
     try:
         page = max(0, int(extra or 0))
     except (TypeError, ValueError):
         page = 0
     page_count = max(1, (len(tasks) + _MAX_LIST_ROWS - 1) // _MAX_LIST_ROWS)
+    # A page can become invalid after an edit/delete shrinks the list; clamp
+    # deterministically onto the nearest valid page instead of rendering empty.
     page = min(page, page_count - 1)
     visible = tasks[page * _MAX_LIST_ROWS:(page + 1) * _MAX_LIST_ROWS]
 
-    # Authoritative per-status counts from the service: the normal task
-    # collection excludes terminal deleted tasks, so deleted tasks can never
-    # inflate the active/paused/closed totals.
-    counts = await service.counts()
     active = counts.get("active", 0)
     paused = counts.get("paused", 0)
     done = counts.get("completed", 0) + counts.get("failed", 0) + counts.get("expired", 0)
@@ -156,11 +169,19 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
         "",
     ]
     builder = InlinePanelBuilder()
-    builder.add_row("＋ New task", f"panel:{_WIZARD_PANEL}")
+    builder.add_row("＋ New task", f"panel:{_WIZARD_PANEL}:new")
 
     if not tasks:
-        lines.append("_No tasks yet._")
-        lines.append("_Say e.g. **every minute write hello**_")
+        if snapshot.fallback_active:
+            # A degraded read is NOT an authoritative empty list: the owner's
+            # durable tasks may exist and simply could not be read. Never
+            # render the genuine empty state for it.
+            lines.append("_Task list unavailable — the durable store could not be read._")
+            lines.append("")
+            lines.append(fallback_note(snapshot.fallback_reason))
+        else:
+            lines.append("_No tasks yet._")
+            lines.append("_Say e.g. **every minute write hello**_")
     else:
         for task in visible:
             text, cb = _task_row(task)
@@ -176,6 +197,11 @@ async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
             )
             if page + 1 < page_count:
                 builder.add_row("❯", f"panel:taskloom:{page + 1}")
+        if snapshot.fallback_active:
+            # The rows above are a NON-DURABLE view: say so instead of letting
+            # a memory-only list look authoritative.
+            lines.append("")
+            lines.append(fallback_note(snapshot.fallback_reason))
 
     _nav(builder)
     return "Taskloom", "\n".join(lines), builder.build()
@@ -402,9 +428,21 @@ def _step_position(step: str) -> tuple[int, str]:
         STEP_DETAILS: (3, "Content details"),
         STEP_SCHEDULE: (4, "Schedule"),
         STEP_REVIEW: (4, "Review"),
+        STEP_EDIT: (1, "Choose"),
     }
     index, label = order.get(step, (1, "Action"))
     return index, label
+
+
+def _wizard_back_step(draft: TaskDraft, create_mode_target: str) -> str:
+    """The wizard's own PREVIOUS step — never a panel-stack pop.
+
+    While EDITING every field step returns to the edit hub, so the editor is a
+    deterministic hub-and-spoke form (Content / Schedule / Review) instead of
+    the linear creation wizard. Outside edit mode the creation order is
+    unchanged.
+    """
+    return STEP_EDIT if draft.editing_task_id else create_mode_target
 
 
 def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, str, list]:
@@ -412,13 +450,48 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
     wizard draft / the candidate it produces — never invented here."""
     step = draft.step or STEP_ACTION
     index, label = _step_position(step)
-    lines = [f"**Step {index}/4 · {label}**", ""]
+    if draft.editing_task_id:
+        header = f"**✎ Editing task #{draft.editing_task_id} · {label}**"
+    else:
+        header = f"**Step {index}/4 · {label}**"
+    lines = [header, ""]
     if draft.notice:
         lines.insert(0, draft.notice)
         lines.insert(1, "")
     builder = InlinePanelBuilder()
 
-    if step == STEP_ACTION:
+    if step == STEP_EDIT:
+        # EDIT HUB: the definition is summarised so the owner can see what they
+        # are editing, and each row jumps STRAIGHT to the field it names — no
+        # walking through unrelated creation steps.
+        definition = ACTION_DEFINITIONS.get(draft.action)
+        lines.append("What do you want to edit?")
+        lines.append("")
+        lines.append(f"**Action:** {definition.title if definition else '—'}")
+        lines.append(f"**Schedule:** {_schedule_line(draft)}")
+        if draft.content_mode == AI_MODE:
+            lines.append(
+                "**Content:** ✨ AI-generated · source "
+                f"{draft.source or 'Any'} · language "
+                f"{task_wizard.LANGUAGE_WORDS.get(draft.language) or 'Any'}"
+                + (
+                    f" · show source {'Yes' if draft.show_source else 'No'}"
+                    if draft.action == "bio" and draft.source
+                    else ""
+                )
+            )
+        else:
+            lines.append(f"**Content:** ✍ `{draft.text.strip() or '— not set —'}`")
+            if definition is not None and definition.key == "message":
+                lines.append(f"**Font:** {task_wizard.font_label(draft.font)}")
+        builder.add_row("✎ Content", f"action:taskloom_wizard:step:{STEP_DETAILS}")
+        builder.add_row("⟳ Schedule", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
+        builder.add_row("✔ Review & save", f"action:taskloom_wizard:step:{STEP_REVIEW}")
+        # Explicit, user-chosen discard: re-prefill from the stored task (and
+        # adopt its current version after a stale save) without ever doing it
+        # silently.
+        builder.add_row("⟳ Reload from task", "action:taskloom_wizard:reload")
+    elif step == STEP_ACTION:
         lines.append("What should this task do?")
         for key in ACTION_ORDER:
             definition = ACTION_DEFINITIONS[key]
@@ -427,7 +500,10 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         lines.append("How should the content be produced each run?")
         builder.add_row("✨ AI-generated (fresh each run)", "action:taskloom_wizard:set:mode:ai")
         builder.add_row("✍ Static text (same every run)", "action:taskloom_wizard:set:mode:static")
-        builder.add_row("← Back", "action:taskloom_wizard:step:action")
+        builder.add_row(
+            "← Back",
+            f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_ACTION)}",
+        )
     elif step == STEP_DETAILS:
         definition = ACTION_DEFINITIONS.get(draft.action)
         if definition is not None and draft.content_mode == AI_MODE:
@@ -481,7 +557,10 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             if (definition is not None and definition.supports_ai and draft.content_mode)
             else STEP_ACTION
         )
-        builder.add_row("← Back", f"action:taskloom_wizard:step:{back_step}")
+        builder.add_row(
+            "← Back",
+            f"action:taskloom_wizard:step:{_wizard_back_step(draft, back_step)}",
+        )
     elif step == STEP_SCHEDULE:
         lines.append("Scheduling is required.")
         lines.append("")
@@ -496,9 +575,12 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         else:
             lines.append("")
             lines.append(f"_Cannot continue yet: {problem}_")
-        builder.add_row("← Back", f"action:taskloom_wizard:step:{STEP_DETAILS}")
+        builder.add_row(
+            "← Back",
+            f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_DETAILS)}",
+        )
     elif step == STEP_REVIEW:
-        lines.append("Create this task?")
+        lines.append("Save these changes?" if draft.editing_task_id else "Create this task?")
         lines.append("")
         try:
             rows = task_wizard.review_lines(draft, reference=datetime.now(timezone.utc))
@@ -512,8 +594,11 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
                 "✔ Save changes" if draft.editing_task_id else "✔ Create task",
                 "action:taskloom_wizard:create",
             )
-        builder.add_row("← Back", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
-        builder.add_row("✕ Cancel", "panel:taskloom")
+        builder.add_row(
+            "← Back",
+            f"action:taskloom_wizard:step:{_wizard_back_step(draft, STEP_SCHEDULE)}",
+        )
+        # Cancel lives in the shared footer and is mode-aware there.
 
     _wizard_footer(builder, editing=bool(draft.editing_task_id))
     title = f"✎ Edit task #{draft.editing_task_id}" if draft.editing_task_id else "＋ New task"
@@ -544,10 +629,19 @@ def _schedule_line(draft: TaskDraft) -> str:
 
 
 async def _wizard_panel(event, extra: str) -> tuple[str, str, list] | None:
-    """Render the wizard; ``edit:<task_id>`` opens it prefilled for that task."""
+    """Render the wizard; ``edit:<task_id>`` opens it prefilled for that task.
+
+    ``new`` starts a FRESH draft (the explicit "＋ New task" entry). A bare
+    entry RESUMES the current draft, which is what the shared input prompt's
+    Cancel returns to — so abandoning one field never loses the draft.
+    """
     extra = (extra or "").strip()
     if extra.startswith("edit:"):
         return await _start_edit(extra[len("edit:"):])
+    if extra == "new":
+        # The explicit New-task entry always starts fresh: an abandoned edit
+        # draft (or a stale one) must never resurface here as a new-task form.
+        return _wizard_render(reset_wizard_draft())
     return _wizard_render(_draft())
 
 
@@ -557,7 +651,8 @@ async def _start_edit(raw_task_id: str) -> tuple[str, str, list]:
     The prefill comes from the STORED definition only (trusted values); the
     confirmed result is persisted through the SAME CAS update path
     (``TaskManagementService.update_definition``), never a second task
-    definition or a second persistence path.
+    definition or a second persistence path. The editor opens on the hub, so
+    the owner chooses the field instead of walking the creation steps.
     """
     from backend.helper.inline_engine import _owner_id
 
@@ -570,7 +665,7 @@ async def _start_edit(raw_task_id: str) -> tuple[str, str, list]:
     if view is None:
         return "Taskloom", "× Task not found.", []
     try:
-        draft = task_wizard.draft_from_task(view.task)
+        draft = task_wizard.draft_from_task(view.task, step=STEP_EDIT)
     except TaskWizardError as exc:
         return f"Task #{task_id}", f"× {exc}", []
     draft = draft.updated(
@@ -673,12 +768,16 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
                 now,
             )
             if task is None:
+                # Stale CAS: keep the WHOLE draft and stay in the editor. The
+                # hub's "⟳ Reload from task" adopts the current version
+                # deliberately — never silently.
                 return _wizard_render(
                     draft.updated(
                         step=STEP_REVIEW,
                         notice=(
                             "× The task changed since the form was opened "
-                            "(stale version); nothing was saved."
+                            "(stale version); nothing was saved. "
+                            "← Back → ⟳ Reload from task to adopt the current version."
                         ),
                     )
                 )
@@ -712,8 +811,35 @@ async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list
     return title, f"{note}\n\n{body}", buttons
 
 
+async def _wizard_cancel(draft: TaskDraft) -> tuple[str, str, list]:
+    """Discard the draft and return to the surface that owns it.
+
+    While editing that is the edited task's DETAIL view (never a step in the
+    wizard chain, never a blank panel), so cancelling leaves the owner exactly
+    where they started and the durable task untouched. The draft is really
+    cleared, so a cancelled edit can never be silently resumed later.
+    """
+    _drafts.pop(_owner(), None)
+    if draft.editing_task_id:
+        detail = await _task_detail_panel(None, str(draft.editing_task_id))
+        if detail is not None:
+            return detail
+        return f"Task #{draft.editing_task_id}", "× Edit cancelled; nothing was saved.", []
+    listed = await _taskloom_panel(None, "")
+    if listed is not None:
+        return listed
+    return "Taskloom", "× Cancelled.", []
+
+
+async def _wizard_reload(draft: TaskDraft) -> tuple[str, str, list]:
+    """Re-prefill the editor from the stored task (explicit, user-chosen)."""
+    if not draft.editing_task_id:
+        return _wizard_render(draft)
+    return await _start_edit(str(draft.editing_task_id))
+
+
 async def _wizard_action(event, extra: str, chat_id: int):
-    """One action for every wizard mutation (set/step/create/cancel)."""
+    """One action for every wizard mutation (set/step/create/cancel/reload)."""
     verb, _, value = (extra or "").partition(":")
     draft = _draft()
     if verb == "set":
@@ -727,6 +853,10 @@ async def _wizard_action(event, extra: str, chat_id: int):
         return _wizard_render(draft)
     if verb == "create":
         return await _wizard_create(draft, chat_id)
+    if verb == "cancel":
+        return await _wizard_cancel(draft)
+    if verb == "reload":
+        return await _wizard_reload(draft)
     return _wizard_render(draft)
 
 
@@ -763,6 +893,10 @@ def _wizard_input_handler(field: str):
         try:
             if field == "source":
                 source = task_wizard.clean_source(text)
+                # A source is a NEW generation constraint, so its display choice
+                # returns to the deliberate default (No): the owner opts in for
+                # the source they actually named. Clearing the source clears the
+                # flag with it — the contract forbids a display flag alone.
                 trial = draft.updated(source=source, show_source=False)
                 problem = task_wizard.instruction_problem(trial)
                 if problem:

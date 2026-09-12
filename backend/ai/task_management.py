@@ -40,11 +40,33 @@ class TaskListSnapshot:
     degraded marker while the content it describes is still rendered. Callers
     that both render and count the list must use one snapshot instead of two
     independent reads.
+
+    ``fallback_active`` is the AUTHORITATIVE-READ signal: the repository sets
+    it when the caller could not read the durable store (a real failure, or a
+    bounded local-resource cooldown that skipped the durable call). A surface
+    must therefore never present a degraded snapshot as the owner's task list.
     """
 
     tasks: list[TaskRecord]
     fallback_active: bool
     fallback_reason: str = ""
+
+    def counts(self) -> dict[str, int]:
+        """Per-status counts of THIS snapshot's tasks (one logical read).
+
+        The rows and the counters a surface renders must describe the same
+        read: a second repository call could observe a different state (the
+        local-resource cooldown expiring, a recovery, a concurrent write) and
+        produce a torn list/count view. ``deleted`` is counted here for
+        completeness, but the task collection this snapshot came from already
+        excludes terminal deleted rows.
+        """
+        result = {status: 0 for status in TASK_STATUSES}
+        for task in self.tasks:
+            status = str(getattr(task, "status", "") or "")
+            if status in result:
+                result[status] += 1
+        return result
 
 
 class TaskManagementService:
@@ -200,10 +222,19 @@ class TaskManagementService:
             # The destination is replaced only when the edit explicitly chose
             # one; otherwise the task keeps its trusted stored destination.
             updates["notification_destination"] = destination
-        try:
-            updates["next_run_at"] = initial_next_run(schedule_type, updates["schedule"], reference)
-        except ScheduleError:
-            raise
+        # The boundary is recomputed ONLY when the SCHEDULE really changed: an
+        # edit that corrects the content must not silently push the next run a
+        # whole interval out, and a paused task's cleared boundary stays clear.
+        schedule_changed = (
+            schedule_type != str(getattr(current, "schedule_type", "") or "")
+            or dict(updates["schedule"]) != dict(getattr(current, "schedule", None) or {})
+            or str(updates["timezone"]) != str(getattr(current, "timezone", "") or "")
+        )
+        if schedule_changed:
+            try:
+                updates["next_run_at"] = initial_next_run(schedule_type, updates["schedule"], reference)
+            except ScheduleError:
+                raise
         task = await self.repository.update_task(
             self.owner_id, task_id, expected_version, updates
         )

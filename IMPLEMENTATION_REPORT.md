@@ -1,14 +1,269 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
-> exists at the tip of the LATEST phase (Bio source-display separation).
-> Earlier phase reports are preserved verbatim below the ARCHIVE marker.
-> If code changes invalidate any section, update this document in the same
-> commit.
+> exists at the tip of the LATEST phase (Taskloom editor UX + task-list
+> reliability). Earlier phase reports are preserved verbatim below, in
+> most-recent-first order. If code changes invalidate any section, update this
+> document in the same commit.
 
 ---
 
-# CURRENT PHASE — separate bio source ATTRIBUTION from source DISPLAY
+# CURRENT PHASE — Taskloom EDITOR UX + task-list reliability
+
+## 1. Objective
+
+**Part A — editor UX.** Entering Edit from a task detail must behave like a
+coherent Telegram-native EDITOR: stay clearly in edit mode, prefill the stored
+definition, let the owner jump straight to the one field they want, keep Back
+meaning "previous EDIT step" (never a panel-stack pop and never a jump to a
+menu), let Cancel discard the draft, and return a successful save to the edited
+task's detail view.
+
+**Part B — task-list reliability.** Find and fix the actual cause of the
+intermittent «Taskloom sometimes does not show my existing tasks».
+
+## 2. Implementation phase
+
+`Phase: Taskloom editor UX + task-list reliability`
+(starting HEAD `fd530b88e8e235704b9e424805214fe0c03086d5`).
+
+Source-first: every conclusion below was traced in the current source at that
+HEAD before any edit. The previous phase report was treated as context only.
+
+## 3. Root causes
+
+### 3.1 CONFIRMED — the list was read TWICE per render, and a degraded read was
+published as the authoritative list
+
+`_taskloom_panel()` derived the ROWS from one repository read
+(`service.list_tasks()`) and the STATUS COUNTERS from a second, later read
+(`service.counts()`). `SupabaseTaskRepository.list_tasks()` returns the
+degraded in-memory FALLBACK rows on **any** failure (and inside the bounded
+local-resource cooldown it skips the durable call entirely and returns the
+fallback). Two consequences, both reachable exactly when the runtime is in the
+`[Errno 11]`/EAGAIN state the production logs show:
+
+1. **Torn panel** — if the store degrades between the two reads, the panel
+   renders the durable rows with the degraded read's all-zero counters.
+2. **False empty list** — if the FIRST read degrades, the panel renders the
+   (usually empty) memory fallback as the genuine `_No tasks yet._` state while
+   the owner's durable tasks still exist. **This is the reported symptom.**
+
+The repository already computed the truthful signal (`fallback_active` /
+`fallback_reason`) and the interface layer already had `fallback_note()`. The
+panel simply never consulted the marker, and never bound it to a single read.
+
+### 3.2 CONFIRMED — the entry point could resurrect an abandoned draft
+
+The task list's `＋ New task` button sent the BARE panel query
+(`panel:taskloom_new`). The bare query RESUMES the owner's current draft — which
+is the right behaviour for the shared input prompt's Cancel, but from the task
+list it meant an abandoned edit draft could be re-rendered as a new-task form.
+
+### 3.3 CONFIRMED — the editor reused the LINEAR creation chain and its exit
+was a panel jump
+
+- Edit opened at the creation chain's first step and each step's Back walked
+  the CREATION order, so the owner was forced through unrelated steps to reach
+  one field.
+- `✕ Cancel` while editing was `panel:taskloom` — it jumped to the Taskloom
+  LIST and left the assembled edit draft alive in `_drafts`.
+- `update_definition` recomputed `next_run_at` on **every** edit, so correcting
+  the content of a recurring task silently pushed its next boundary a whole
+  interval out.
+
+### 3.4 Ruled out (investigated, not the cause)
+
+- **The wizard does not contain a stack-popping Back.** `panel:_nav:back` in the
+  current source is emitted only by `taskloom._nav()` — the footer of the task
+  LIST and task DETAIL panels, where "pop to the parent panel" is the correct
+  behaviour — and by the generic `backend/helper/panels.py` nav helper. The
+  wizard/editor renders `_wizard_footer()` and emits **no** `_nav:back` at any
+  step. What was actually wrong is §3.3 (the wrong Back *target* and the wrong
+  Cancel semantics inside the editor), which is what got fixed.
+- Not a UI refresh/rendering defect: every callback re-reads the list.
+- Not lossy or mis-scoped reads: `list_tasks` is owner-scoped and returns every
+  non-deleted row.
+- Not a stale cache: no task-list cache exists.
+- Not stale pagination on deletion: delete already returns to page 0.
+- Not the `preparation_metadata` schema mismatch: that concerns
+  `ai_task_occurrences` transitions and does not affect `ai_tasks` reads (see
+  the previous phase, §6).
+
+## 4. Exact fix
+
+### 4.1 Task list (Part B)
+
+| Change | File |
+|---|---|
+| `TaskListSnapshot.counts()` — per-status counters derived from **this** snapshot's rows | `backend/ai/task_management.py` |
+| `_taskloom_panel` performs ONE `service.snapshot()` read; rows, counters and the degraded marker all describe it | `backend/bot/handlers/taskloom.py` |
+| A degraded snapshot is never the genuine empty state: `_Task list unavailable — the durable store could not be read._` + the truthful `fallback_note(reason)` | `backend/bot/handlers/taskloom.py` |
+| A degraded snapshot that DOES return rows is annotated as non-durable | `backend/bot/handlers/taskloom.py` |
+| An out-of-range page clamps onto the nearest valid page instead of rendering empty | `backend/bot/handlers/taskloom.py` |
+
+The panel's displayed counters now come from the same non-deleted collection as
+the rows, so a legacy `deleted` row can no longer contribute to any displayed
+total. `TaskManagementService.counts()` is unchanged for callers that want its
+own read.
+
+### 4.2 Editor (Part A)
+
+| Change | File |
+|---|---|
+| `TaskDraft.label`; edit keeps the STORED label so an untouched field is never rewritten | `backend/ai/task_wizard.py` |
+| `draft_from_task` REFUSES a definition this editor cannot faithfully reproduce (an exact-length contract) instead of silently rewriting it | `backend/ai/task_wizard.py` |
+| `STEP_EDIT` = the editor HUB: summarises action / schedule / content / source+display / font; each row jumps straight to the field step it names | `backend/bot/handlers/taskloom.py` |
+| `_wizard_back_step()` returns the hub for **every** edit step, so Back is always "previous EDIT step" | `backend/bot/handlers/taskloom.py` |
+| Mode-aware footer: editing → `✕ Cancel edit` (action, pops the draft, returns to the task DETAIL); creating → `✕ Cancel` (`panel:taskloom`); `❌ Close` always `panel:_nav:close` | `backend/bot/handlers/taskloom.py` |
+| New `reload` action ("⟳ Reload from task") re-prefills from the stored task on explicit request; the stale-save notice points at it | `backend/bot/handlers/taskloom.py` |
+| `＋ New task` → `panel:taskloom_new:**new**` so the explicit entry always starts a FRESH draft | `backend/bot/handlers/taskloom.py` |
+| `update_definition` recomputes `next_run_at` ONLY when the schedule really changed | `backend/ai/task_management.py` |
+
+## 5. Taskloom navigation semantics (exact)
+
+| Surface / step | `← Back` | Cancel | Close |
+|---|---|---|---|
+| Task list | `panel:_nav:back` (stack pop — correct here) | — | `panel:_nav:close` |
+| Task detail | `panel:_nav:back` (stack pop) | — | `panel:_nav:close` |
+| Wizard · Action (create) | *none* | `panel:taskloom` | `panel:_nav:close` |
+| Wizard · Content (create) | `step:action` | `panel:taskloom` | `panel:_nav:close` |
+| Wizard · Content details (create) | `step:content` | `panel:taskloom` | `panel:_nav:close` |
+| Wizard · Schedule (create) | `step:details` | `panel:taskloom` | `panel:_nav:close` |
+| Wizard · Review (create) | `step:schedule` | `panel:taskloom` | `panel:_nav:close` |
+| **Editor** · hub | *none* (it is the root of the editor) | `action:cancel` → task **detail** | `panel:_nav:close` |
+| **Editor** · Content details | `step:edit` → hub | `action:cancel` → detail | `panel:_nav:close` |
+| **Editor** · Schedule | `step:edit` → hub | `action:cancel` → detail | `panel:_nav:close` |
+| **Editor** · Review | `step:edit` → hub | `action:cancel` → detail | `panel:_nav:close` |
+| Shared input prompt | *none* (it is a sub-view) | `panel:taskloom_new` (resumes the draft) | `panel:_nav:close` |
+
+Invariants asserted by tests: no wizard/editor step emits `panel:_nav:back`;
+every editor field step has exactly one Back targeting the hub; an input
+submission re-renders the SAME step and keeps the draft; Cancel is not Back and
+Back is not Cancel.
+
+## 6. Edit flow (exact)
+
+```
+Task detail → ✎ Edit  (panel:taskloom_new:edit:<task_id>)
+  → _start_edit: service.inspect(owner, id) → draft_from_task(task, step=STEP_EDIT)
+      prefill comes ONLY from the STORED definition; nothing is inferred
+  → EDIT HUB   Action · Schedule · Content · Show source · Font
+      rows: ✎ Content · ⟳ Schedule · ✔ Review & save · ⟳ Reload from task
+  → field step (input/selection) → back to the hub or straight to Review
+  → Review  → ✔ Save changes
+  → TaskManagementService.update_definition(id, expected_version, candidate, now)
+      CAS: version + 1 exactly once; only when it succeeds
+      future never-started (claimed) occurrences of the old version discarded
+      next_run_at recomputed ONLY when the schedule changed
+  → the edited task's DETAIL view (never a menu, never a second task)
+```
+
+Stale save: the WHOLE draft is kept, the owner stays in the editor at Review,
+the notice names the recovery path, and `⟳ Reload from task` adopts the current
+version on explicit request. Nothing is ever prefilled silently from an
+untrusted source, and no durable write is attempted on Back or Cancel.
+
+## 7. Task-list correctness contract (after the fix)
+
+1. One render = one repository read; the rows and the counters describe it.
+2. A degraded read is never rendered as the genuine empty state, and never as
+   an authoritative list: it carries the truthful note (local resource vs. store
+   outage are attributed differently, never collapsed).
+3. A successful durable read clears the degraded marker and shows the durable
+   rows again (immediate recovery).
+4. Owner isolation, deletion, empty-store and paging behaviour are unchanged;
+   an out-of-range page clamps instead of rendering empty.
+5. Non-durable (memory) rows are marked as such.
+
+## 8. Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/task_management.py` | `TaskListSnapshot.counts()`; `update_definition` recomputes the boundary only when the schedule changed |
+| `backend/ai/task_wizard.py` | `TaskDraft.label`; `STEP_EDIT`; edit prefill keeps the stored label; refuses an unrepresentable definition |
+| `backend/bot/handlers/taskloom.py` | one-snapshot list read; honest degraded rendering; page clamp; `:new` entry; editor hub; `_wizard_back_step`; mode-aware footer; `cancel` + `reload` actions; stale-save recovery notice |
+| `tests/test_taskloom_editor_ux.py` | **new** — 30 editor UX tests |
+| `tests/test_task_list_reliability.py` | **new** — 15 task-list reliability tests |
+| `tests/test_task_wizard.py` | the list entry now asserts the explicit `:new` callback |
+
+No provider, scheduler, executor, guardian, diagnostics, migration or schema file
+was touched.
+
+## 9. Tests
+
+- `pytest tests/test_taskloom_editor_ux.py -q` — **30 passed**
+- `pytest tests/test_task_list_reliability.py -q` — **15 passed**
+- focused Taskloom / wizard / NL-bridge / source-display / repository /
+  cooldown / management / reliability suites — **264 passed** (including the
+  45 new editor + list tests)
+- full suite `pytest tests -q` — **2390 passed, 24 skipped, 0 failed**
+- `py_compile` OK for every changed file; `git diff --check` clean
+
+**The torn-state regression is deterministic and would FAIL under the old
+implementation**: `_FlappingRepository` returns the durable rows on read #1 and
+an empty degraded list on any later read, reproducing a degradation that begins
+between the two reads. The old panel rendered rows with all-zero counters and
+two repository reads; the test asserts `repo.reads == 1`, `● 3 active` **and** 3
+task rows together.
+
+Covered (Part A): editor opens on the hub with `editing_task_id`/version; hub
+rows jump straight to each field and never offer the creation-only steps;
+prefill of action/mode/source/language/max-length/schedule/timezone/label/font;
+Back from every editor step targets the hub; no `panel:_nav:back` at any editor
+step; footer is `Cancel edit` + `Close`; six input paths keep their step, the
+task and the draft and re-render the editor; Cancel discards without touching
+the durable task; Back/Cancel leave version, actions, schedule and `next_run_at`
+untouched; save returns to the DETAIL view, bumps the version exactly once and
+never creates a second task; stale save keeps the whole draft and the recovery
+path; reload adopts the current version and then saves; a one-field edit leaves
+source/language/length/display/label intact; a content edit does not move the
+boundary while a schedule edit does; send-message text edit keeps its canonical
+font; username edit keeps its action; a foreign task is not reachable; an
+unrepresentable definition is refused.
+
+Covered (Part B): one read per render; a degradation between reads cannot hide
+the durable rows; a healthy read lists the durable store; a durable read after a
+store failure restores the list and clears the marker; a degraded read is never
+the genuine empty state; local-resource degradation never claims "Supabase
+unavailable"; a genuine store failure is distinguishable from zero tasks; a
+degraded list with rows is marked non-durable; healthy empty stores (memory and
+Supabase) still show the genuine empty state; owner isolation; deletion; page
+clamp; paging reaches every task exactly once.
+
+## 10. Verification status
+
+- Unit/in-process verification: **performed** (see §9).
+- Live Telegram verification: **NOT performed** — no production session or
+  self-bot client is available in this workspace. The behaviour was proven at
+  the Taskloom handler, wizard, service and repository boundaries, including a
+  deterministic in-process reproduction of the torn/degraded list.
+- Supabase schema impact: **NONE** — no migration, no SQL, no schema file; the
+  `ai_tasks` / `ai_task_occurrences` model is unchanged.
+
+## 11. Remaining limitations
+
+1. The editor exposes the fields the existing task definition can carry
+   (content, source/display, language, maximum length, schedule, timezone,
+   font). Changing the ACTION of an existing task is deliberately not offered
+   (it is not representable without rewriting the whole definition).
+2. A definition requiring an EXACT character length is refused with an explicit
+   message rather than edited, because the editor can only express a maximum —
+   refusing beats silently changing the requirement.
+3. The list still shows the in-memory fallback rows while the store is degraded;
+   they are now truthfully labelled, but a memory-only task is still not durable
+   (unchanged repository semantics).
+4. Live production behaviour of the list under a real EAGAIN episode was not
+   observed from this workspace; the reproduction is in-process.
+
+## 12. Delivery
+
+- Implementation + report committed together; see the delivery block appended at
+  the end of this phase after push and remote verification.
+
+---
+
+# PREVIOUS PHASE — separate bio source ATTRIBUTION from source DISPLAY
 
 ## 1. Objective
 

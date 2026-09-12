@@ -52,6 +52,9 @@ STEP_CONTENT = "content"
 STEP_DETAILS = "details"
 STEP_SCHEDULE = "schedule"
 STEP_REVIEW = "review"
+# EDIT-mode hub: the entry step of the editor, where each row jumps straight to
+# the field it names (never used by the creation flow).
+STEP_EDIT = "edit"
 
 STATIC_MODE = "static"
 AI_MODE = "ai"
@@ -127,6 +130,10 @@ class TaskDraft:
     action: str = ""
     step: str = STEP_ACTION
     content_mode: str = ""
+    # Display label of the task being EDITED. Creation derives the label from
+    # the action; an edit keeps the stored one so an untouched field (and an
+    # untouched label) are never rewritten behind the owner's back.
+    label: str = ""
     text: str = ""
     source: str = ""
     language: str = ""
@@ -347,6 +354,8 @@ def _schedule_payload(
 
 
 def _label(draft: TaskDraft, definition: ActionDefinition) -> str:
+    if draft.editing_task_id and draft.label.strip():
+        return draft.label.strip()[:MAX_LABEL_CHARS]
     if definition.key == "message":
         return (draft.text.strip() or "Message")[:MAX_LABEL_CHARS]
     return definition.title
@@ -449,6 +458,20 @@ def draft_from_task(task: Any, *, step: str = STEP_SCHEDULE) -> TaskDraft:
         if not definition.supports_ai:
             raise TaskWizardError("this task's action requires static text")
         policy = derive_policy(instruction)
+        # A definition this editor cannot FAITHFULLY reproduce is refused
+        # instead of silently rewritten: recomposing the instruction would drop
+        # a constraint the editor has no field for, changing a value the owner
+        # never touched.
+        if policy.quote_exact:
+            raise TaskWizardError(
+                "this task asks for an exact canonical quote, a contract that fails "
+                "closed and cannot be represented by this editor"
+            )
+        if policy.exact_length is not None:
+            raise TaskWizardError(
+                "this task requires an EXACT character length; this editor can only "
+                "express a maximum, so editing it would change the requirement"
+            )
         mode = AI_MODE
         language = next(
             (code for code, word in LANGUAGE_POLICY.items() if word == policy.language), ""
@@ -485,6 +508,7 @@ def draft_from_task(task: Any, *, step: str = STEP_SCHEDULE) -> TaskDraft:
         action=key,
         step=step,
         content_mode=mode,
+        label=str(getattr(task, "label", "") or ""),
         text=str(arguments.get("text") or ""),
         font=normalize_font_key(arguments.get("font")) if arguments.get("font") else DEFAULT_FONT_KEY,
         source=source,

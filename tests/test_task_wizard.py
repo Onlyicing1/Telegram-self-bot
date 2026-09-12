@@ -364,7 +364,9 @@ def test_wizard_is_registered_and_reachable_from_the_task_list(wizard, repo):
 
     assert get_registry().get_handler("taskloom_new") is not None
     _title, _body, rows = _run(wizard._taskloom_panel(_Event(), ""))
-    assert "panel:taskloom_new" in _buttons(rows)
+    # The New-task entry is explicit (`:new`), so it always starts a FRESH
+    # draft and an abandoned editor draft can never resurface there.
+    assert "panel:taskloom_new:new" in _buttons(rows)
 
 
 def test_wizard_walks_action_to_review_and_creates_through_the_shared_service(wizard, repo):
