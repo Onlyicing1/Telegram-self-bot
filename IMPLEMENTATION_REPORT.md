@@ -252,11 +252,18 @@ reuses an already-fetched value inside one request.
 ## 10. Delivery
 
 - Implementation commit (source + tests):
-  `fix: commit Taskloom field inputs and dedupe per-request external calls`.
+  `fix: commit Taskloom field inputs and dedupe per-request external calls` —
+  `2967c18` (`git log` holds the full SHA).
 - Report/docs commit: `docs: record the Taskloom input UX and call-efficiency
-  phase`.
-- Pushed to `origin/main` (no force, no rebase, no unrelated files); remote
-  verification recorded in the commit-message follow-up below.
+  phase` — `60770c0`.
+- Both were pushed to `origin/main` (no force, no rebase, no unrelated files).
+- Remote verification after the push:
+  `git rev-parse HEAD` == `git rev-parse origin/main` ==
+  `git ls-remote origin refs/heads/main` ==
+  `60770c0eb494ad630c3e29eb0310a2d1a75a32f5`;
+  `git rev-list --left-right --count HEAD...origin/main` = `0 0`; working tree
+  clean. The only files touched by this phase are the four source files and the
+  four test files listed in §5 plus this report.
 
 ---
 
