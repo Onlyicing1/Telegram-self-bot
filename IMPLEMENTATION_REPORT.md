@@ -151,8 +151,16 @@ the five layers now agree:
 
 - Implementation commit (source + tests):
   `fix: keep the Taskloom edit draft across panel re-entry` — `f2e8e19`
-- Report/docs commit and remote verification: see the header of the delivery
-  section appended after the push.
+  (`git log` holds the full SHA).
+- Report/docs commit: `docs: record the Bio Taskloom show-source edit
+  propagation fix`.
+- Both were pushed to `origin/main` (no force, no rebase, no unrelated files).
+- Remote verification after the push:
+  `git rev-parse HEAD` == `git rev-parse origin/main` ==
+  `git ls-remote origin refs/heads/main`;
+  `git rev-list --left-right --count HEAD...origin/main` = `0 0`; working tree
+  clean. The only files touched by this phase are the three listed in §5 plus
+  this report.
 
 ---
 
