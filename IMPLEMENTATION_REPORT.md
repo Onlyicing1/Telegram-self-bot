@@ -47,7 +47,10 @@ No schema or RLS change was required, and no SQL was executed. Owner identity re
 
 ### Delivery
 
-Branch: `main`. Commit and remote verification will be recorded after delivery.
+- Implementation commit: `3763138d774d7df9aa0567f5d56118b5d0ad7888` (`feat: enforce semantic completeness for task creation`).
+- Branch: `main`.
+- Implementation was pushed to `origin/main`; the report verification commit follows this implementation commit.
+- Live Telegram/Supabase/Render verification was not performed.
 
 ---
 
