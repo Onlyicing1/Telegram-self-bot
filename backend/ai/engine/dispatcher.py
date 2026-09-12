@@ -418,13 +418,17 @@ class Dispatcher:
         try:
             _stage("PROMPT_BUILD")
             logger.info("AI_PROMPT_BUILD id=%s", rid or "-")
-            prompt_package = self._prompt_builder.build(await self._build_context(request, session))
-            # Inject tool schemas into the prompt if a registry is available
+            # Tool schemas belong to the prompt's tool section, so they are
+            # rendered before the build and handed to the Prompt Builder. The
+            # full registry renders ~1.9k tokens; adding them after the build
+            # would leave that much of the prompt outside the token budget.
+            tool_block = ""
             if tools_allowed and self._tool_registry and not self._tool_registry.is_empty():
-                tool_schemas = self._tool_registry.list_schemas()
-                tool_block = self._render_tool_schemas(tool_schemas)
-                if tool_block:
-                    prompt_package = self._inject_tool_schemas(prompt_package, tool_block)
+                tool_block = self._render_tool_schemas(self._tool_registry.list_schemas())
+            prompt_package = self._prompt_builder.build(
+                await self._build_context(request, session),
+                tool_block=tool_block,
+            )
             safe_call(self._hooks, "after_prompt", prompt_package)
             metadata["stages"].append("prompt_builder")
         except Exception as exc:  # noqa: BLE001
@@ -1898,13 +1902,6 @@ class Dispatcher:
             )
         return "\n".join(lines)
 
-    def _inject_tool_schemas(self, package: Any, tool_block: str) -> Any:
-        """Return a new PromptPackage with the tool context enriched."""
-        from dataclasses import replace
-        existing = package.tool_context or ""
-        merged = f"{existing}\n\n{tool_block}" if existing else tool_block
-        return replace(package, tool_context=merged)
-
     def _build_messages(self, prompt_package: Any) -> list[dict[str, Any]]:
         """Convert a PromptPackage into a messages list for ProviderManager.chat()."""
         messages: list[dict[str, Any]] = []
@@ -1978,7 +1975,6 @@ class Dispatcher:
         from backend.ai.conversation.context_builder import (
             ContextBuilder,
             RuntimeContext,
-            ToolContext,
         )
 
         runtime_provider = ""
@@ -2004,13 +2000,23 @@ class Dispatcher:
         history_items = self._conversation.get_history(
             owner_id=request.owner_id, n=20
         )
+        # Stage 1 already appended THIS turn's message to the session history
+        # (it is persisted there), and the same text travels as the
+        # USER_MESSAGE section. Rendering it inside [History] as well put the
+        # owner's request into the payload twice.
+        if (
+            request.user_message
+            and history_items
+            and history_items[-1].role == "user"
+            and history_items[-1].content == request.user_message
+        ):
+            history_items = history_items[:-1]
         from backend.ai.conversation.history import HistoryEntry
         history_entries: list[HistoryEntry] = []
         for item in history_items:
             history_entries.append(HistoryEntry(
                 role=item.role,
                 content=item.content,
-                tool_name=item.role if item.role == "tool" else "",
             ))
         memory_data: dict[str, str] = {}
         if self._memory_manager is not None:
@@ -2038,7 +2044,6 @@ class Dispatcher:
             message_id=request.message_id,
             current_menu="main",
             reply=request.reply_context,
-            tool=ToolContext(),
             runtime=RuntimeContext(
                 ai_enabled=True,
                 active_provider=runtime_provider,
@@ -2103,8 +2108,21 @@ class Dispatcher:
                 self.pending_action = ""
                 self.language = req.language if req else "English"
                 self.timezone = req.timezone if req else "UTC"
-                self.current_tool = ""
-                self.last_tool = ""
+                # The runtime session records every completed tool call
+                # (ConversationManager.add_tool_result -> add_tool_call), so
+                # [Tool Context] reports the real last tool instead of a
+                # hardcoded None. current_tool stays empty unless a call is
+                # actually pending: no tool runs while the prompt is built.
+                recorded = getattr(s, "tool_history", None) or []
+                last_call = recorded[-1] if recorded else None
+                self.last_tool = (
+                    str(last_call.get("name", "")) if isinstance(last_call, dict) else ""
+                )
+                pending_call = getattr(s, "pending_tool", None)
+                self.current_tool = (
+                    str(pending_call.get("name", ""))
+                    if isinstance(pending_call, dict) else ""
+                )
 
         return _SessionView(session, request)
 

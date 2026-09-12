@@ -186,8 +186,9 @@ class _CapturePromptBuilder:
     def __init__(self) -> None:
         self.context = None
 
-    def build(self, context: Any) -> Any:
+    def build(self, context: Any, tool_block: str = "") -> Any:
         self.context = context
+        self.tool_block = tool_block
         pp = MagicMock()
         pp.system_prompt = "sys"
         pp.runtime_context = ""

@@ -93,7 +93,9 @@ class PromptBuilder:
 
     __slots__ = ()
 
-    def build(self, context: ConversationContext) -> PromptPackage:
+    def build(
+        self, context: ConversationContext, tool_block: str = ""
+    ) -> PromptPackage:
         """Assemble an immutable ``PromptPackage`` from a conversation context.
 
         Enforces the token budget: if the estimated total exceeds the
@@ -103,11 +105,16 @@ class PromptBuilder:
 
         Args:
             context: The ``ConversationContext`` produced by the Conversation Layer.
+            tool_block: Already-rendered available-tool schema text for this
+                request (empty when tools are disabled or the registry is
+                empty). It is rendered INTO the tool section BEFORE the budget
+                is computed, so the schemas are counted and can push history
+                out through the normal trimming path.
 
         Returns:
             A frozen ``PromptPackage`` with all sections in fixed order.
         """
-        sections = self._render_sections(context)
+        sections = self._render_sections(context, tool_block)
         budget = compute_budget(sections, language=context.language)
 
         if not budget.within_budget:
@@ -137,7 +144,7 @@ class PromptBuilder:
         return package
 
     def _render_sections(
-        self, ctx: ConversationContext
+        self, ctx: ConversationContext, tool_block: str = ""
     ) -> dict[PromptSection, str]:
         """Render all 9 sections from the context, in fixed order."""
         sections: dict[PromptSection, str] = {}
@@ -149,7 +156,7 @@ class PromptBuilder:
         sections[PromptSection.PREFERENCES] = self._render_preferences(ctx)
         sections[PromptSection.CURRENT_CONTEXT] = self._render_current_context(ctx)
         sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(ctx)
-        sections[PromptSection.TOOL_METADATA] = self._render_tool_metadata(ctx)
+        sections[PromptSection.TOOL_METADATA] = self._render_tool_metadata(ctx, tool_block)
         sections[PromptSection.TOOL_RESULTS] = self._render_tool_results(ctx)
         sections[PromptSection.USER_MESSAGE] = ctx.user_text
         sections[PromptSection.OUTPUT_INSTRUCTIONS] = OUTPUT_INSTRUCTIONS_TEMPLATE
@@ -159,15 +166,24 @@ class PromptBuilder:
     def _merge_system(self, sections: dict[PromptSection, str]) -> str:
         """Merge system-level sections into one string.
 
-        Includes system rules, platform constraints, runtime rules,
-        and preferences — all are system-level instructions that shape
-        the assistant's behavior.
+        Includes EVERY section that shapes the assistant's behavior — system
+        rules, platform constraints, runtime rules, memory, preferences, and
+        output instructions — in ``SECTION_ORDER`` order. The remaining
+        sections (current context, conversation state, tool metadata, user
+        message) travel as their own messages; see the dispatcher's message
+        assembly.
+
+        Memory and the output instructions used to be rendered into
+        ``sections`` and then dropped here, so the retrieved memory never
+        reached the model and the JSON action contract was never sent.
         """
         parts = [
             sections.get(PromptSection.SYSTEM_RULES, ""),
             sections.get(PromptSection.PLATFORM_CONSTRAINTS, ""),
             sections.get(PromptSection.RUNTIME_RULES, ""),
+            sections.get(PromptSection.MEMORY, ""),
             sections.get(PromptSection.PREFERENCES, ""),
+            sections.get(PromptSection.OUTPUT_INSTRUCTIONS, ""),
         ]
         return "\n\n".join(p for p in parts if p)
 
@@ -300,8 +316,13 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
-    def _render_tool_metadata(self, ctx: ConversationContext) -> str:
-        """Render the current tool metadata block."""
+    def _render_tool_metadata(self, ctx: ConversationContext, tool_block: str = "") -> str:
+        """Render the current tool metadata block.
+
+        ``tool_block`` (the available-tool schemas) is part of this section
+        and is always preserved by trimming: it is the tool contract the
+        provider relies on.
+        """
         lines: list[str] = ["[Tool Context]"]
         if ctx.tool.current_tool:
             lines.append(f"Current Tool: {ctx.tool.current_tool}")
@@ -311,6 +332,9 @@ class PromptBuilder:
             lines.append(f"Last Tool: {ctx.tool.last_tool}")
         else:
             lines.append("Last Tool: None")
+        if tool_block:
+            lines.append("")
+            lines.append(tool_block)
         return "\n".join(lines)
 
     def _render_tool_results(self, ctx: ConversationContext) -> str:

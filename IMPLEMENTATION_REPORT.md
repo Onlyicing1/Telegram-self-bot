@@ -1,14 +1,299 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
-> exists at the tip of the LATEST phase (Taskloom input/commit UX + external
-> call efficiency). Earlier phase reports are preserved verbatim below, in
+> exists at the tip of the LATEST phase (Context architecture — source-first
+> audit and completion). Earlier phase reports are preserved verbatim below, in
 > most-recent-first order. If code changes invalidate any section, update this
 > document in the same commit.
 
 ---
 
-# CURRENT PHASE — Taskloom input/commit UX + external-call efficiency
+# CURRENT PHASE — Context architecture: source-first audit and completion
+
+## 1. Objective
+
+Make the existing Conversation Context layer (`ContextBuilder` →
+`ConversationContext` → `PromptBuilder` → `PromptPackage`) complete, correct,
+deterministic and source-backed: the model must receive every context item the
+system already fetches and renders, nothing it renders may be silently dropped,
+and the token budget must describe what is actually sent.
+
+No architecture change: `ContextBuilder`/`ConversationContext`/`PromptBuilder`
+are preserved and remain the only context pipeline. `ProviderManager`,
+`ToolExecutor`, the scheduler, the repositories, Taskloom and every service were
+left untouched.
+
+## 2. Implementation phase
+
+- Starting HEAD: `697c202393fb1e9f0dcb616f8f44b8c89070c126`
+  (`docs: record this phase's commit SHAs and remote verification`)
+- Branch: `main`
+- Working tree at start: clean
+
+## 3. Audit — the real call graph for one AI message
+
+Traced from source (not from prior reports), then reproduced in-process with the
+real `Engine` and a scripted provider that records the exact provider payload:
+
+```
+Telegram text
+  → ai_unified._execute_ai            (reply resolution: ONE Telegram fetch,
+                                       reusing the message the activation check
+                                       already read — fixed in the prior phase)
+  → Engine.execute → Dispatcher.dispatch
+      Stage 1  Conversation Runtime   get_session / restore_history (Supabase
+                                      ai_messages, once per fresh session) /
+                                      add_user_message (RAM + scheduled audit)
+      fast path / confirmation        return before any provider round when
+                                      deterministic
+      Stage 2  Prompt Builder         ContextBuilder.build(...)  → ONE context
+                                      memory retrieve_for_prompt (owner-scoped)
+                                      preferences get_or_create (in-memory only)
+                                      PromptBuilder.build       → ONE package
+      Stage 3  ProviderManager        active provider
+      Stage 4  provider + tool loop   N rounds reuse the SAME messages list
+      Stage 5  Conversation Update    history + usage/audit persistence
+```
+
+Measured facts that drove the changes:
+
+- the context is built exactly **once** per dispatch; tool/continuation rounds
+  reuse the same message list (no duplicate context construction, no duplicate
+  provider work attributable to context);
+- memory retrieval is required by design (§7.5) and bounded (`MEMORY_READ_TIMEOUT_S`)
+  and is performed off the event loop;
+- preferences are served by `InMemoryPreferencesRepository` — **no network call**
+  (`ai_preferences` does not exist yet; the default record is used);
+- the available-tool schema block for the real registry is **7,502 characters
+  ≈ 1,876 tokens**;
+- the provider payload for a plain conversational message was 4 system messages
+  + 1 user message.
+
+### 3.1 Findings — CONFIRMED (each reproduced at HEAD before the fix)
+
+| # | Finding | Evidence |
+|---|---|---|
+| C1 | **The current turn was rendered twice.** Stage 1 appends the owner's message to the runtime session history; `_build_context` then rendered that history into `[History]` while the same text also traveled as the `USER_MESSAGE` section. | payload contained `[History] … 4. [user] what is my bio` **and** `role=user: what is my bio` |
+| C2 | **`[Tool Context]` was dead.** `_build_context` passed an empty `ToolContext()`, so the section always rendered `Current Tool: None / Last Tool: None` even though the runtime session records every completed call in `tool_history`. A secondary artifact stamped the history label as `tool (tool)`. | `session.tool_history == [{'name': 'get_bio', …}]` while the prompt read `Last Tool: None` |
+| C3 | **The retrieved `MEMORY` section never reached the model.** `PromptBuilder._merge_system` merged only SYSTEM_RULES + PLATFORM_CONSTRAINTS + RUNTIME_RULES + PREFERENCES; the `[Memory]` block was rendered into `sections` and dropped. The owner-scoped store was therefore read on every request and discarded. | payload had no `[Memory]`/`[Permanent Facts]` while `package.sections[MEMORY]` was populated — and `serialize_to_message_list` (the canonical assembler in the same package) *does* include it |
+| C4 | **The `OUTPUT_INSTRUCTIONS` section never reached the model.** Same mechanism: the JSON action contract, the action vocabulary/examples and the Markdown/500-char rules were rendered and dropped. | payload had no `Output Rules:` while `sections[OUTPUT_INSTRUCTIONS]` was populated; it is also a `MANDATORY_SECTION` |
+| C5 | **The tool-schema block was outside the token budget.** `_render_tool_schemas` output was appended to the package *after* `PromptBuilder.build` had computed `TokenBudget`, so `within_budget`/`estimated_input_tokens` described a prompt ~1.9k tokens smaller than the one actually sent. | 7,502-char block injected post-budget |
+
+### 3.2 Findings — not defects (verified, deliberately unchanged)
+
+- **Reply text preview.** A replied **AI** message is injected in full
+  (`ai_content`, untruncated). A replied **non-AI** message is injected as the
+  designed 200-character preview: `AI_MASTER_DESIGN.md` §25.4 specifies
+  “The message's text (truncated to 200 characters)” and the source encodes
+  exactly that. Not changed — see §8 limitations (long non-AI replies are the
+  affected class).
+- **`Menu/Panel/Category/Pending Action`.** Rendered from
+  `ConversationSession`, but the only producer of panel state is the helper
+  panel subsystem (`helper/session_manager.py` keys navigation by
+  `chat_id`+`msg_id`); `AI_MASTER_DESIGN.md` §25.1 names an
+  `inline_engine.current_menu/current_panel/pending_action` API that does not
+  exist in the current helper implementation, and the AI runtime session has no
+  panel fields. Wiring it would require a new cross-subsystem bridge → not
+  invented here (documented in §8).
+- **Task context / saved-item context.** Both are already reachable through the
+  registered tool path (`task_list`, `task_inspect`, `list_saves`, `search`) and
+  are read on demand. They are deliberately **not** injected into every prompt.
+- **Tool-result duplication.** Tool results travel exactly once: as `tool`-role
+  messages in the tool round, and (for later turns) inside `[History]`. The
+  `TOOL_RESULTS` section is never populated (`last_tool_result` stays empty), so
+  nothing is duplicated into a second carrier — asserted by test.
+- **Duplicate external calls.** No new duplicate reads were found on this path;
+  the `ai_config` double read and the duplicate replied-message fetch were
+  already removed in the previous phase and remain gone.
+- **Sensitive data.** The payload contains no session string, API key, bot
+  token or raw environment value; the runtime session object is never
+  serialized (asserted by test).
+
+## 4. Root cause (one sentence per symptom)
+
+1. **Retrieved-but-undelivered context (C3, C4):** the dispatcher's hand-rolled
+   prompt assembly diverged from the canonical
+   `prompt/serializer.serialize_to_message_list`, and `_merge_system` merged
+   only four of the eleven rendered sections — memory and output instructions
+   were computed, budgeted, and then dropped.
+2. **Duplicated current turn (C1):** context was assembled *after* Stage 1 had
+   appended the current message to the session history, and the history block
+   did not exclude it.
+3. **Dead tool context (C2):** `_build_context` constructed `ToolContext()`
+   instead of letting the builder read `current_tool`/`last_tool` from the
+   session view, whose values were hardcoded empty although the runtime session
+   already recorded tool calls.
+4. **Budget dishonesty (C5):** the tool block was appended to the finished
+   package instead of being part of the section set the budget is computed from.
+
+## 5. Implementation changes (exact)
+
+`backend/ai/prompt/builder.py`
+
+- `build(context, tool_block: str = "")` — the rendered available-tool schema
+  text is now an input to the build and is rendered into the `TOOL_METADATA`
+  section **before** `compute_budget`, so the schemas are counted and can push
+  history out through the existing trimming path. Optional parameter → every
+  existing one-argument caller is unchanged.
+- `_render_sections(ctx, tool_block)` / `_render_tool_metadata(ctx, tool_block)`
+  — the block is placed in the tool section (same position as before).
+- `_merge_system` now merges **every behaviour-shaping section in
+  `SECTION_ORDER`** — SYSTEM_RULES, PLATFORM_CONSTRAINTS, RUNTIME_RULES,
+  **MEMORY**, PREFERENCES, **OUTPUT_INSTRUCTIONS** — so no rendered section is
+  silently dropped. This is the C3/C4 fix.
+
+`backend/ai/engine/dispatcher.py`
+
+- Stage 2 renders the tool schemas first and passes them to
+  `PromptBuilder.build(..., tool_block=...)`; the dead `_inject_tool_schemas`
+  helper was removed (its only caller was this call site).
+- `_build_context`: the current turn is excluded from the rendered history when
+  the trailing session entry is the request's own message (it already travels as
+  `USER_MESSAGE`); the meaningless `tool_name=item.role` stamp was removed from
+  history entries; the explicit `ToolContext()` was dropped so the builder reads
+  the session view as designed.
+- `_adapt_session`: `last_tool` comes from the runtime session's recorded tool
+  call (`tool_history[-1]["name"]`), `current_tool` from `pending_tool` (empty
+  while the prompt is built, because no tool is running at that moment).
+
+`tests/test_ai_state_consistency.py`: the local `_CapturePromptBuilder` test
+double mirrors the widened `build` signature (test double only — the contract
+change is backwards compatible).
+
+### Semantic impact (what the model now actually receives)
+
+- the `[Memory]` block (permanent / long-term / short-term) — previously fetched
+  and discarded;
+- the `Output Rules:` section with the JSON action contract and its examples —
+  previously dropped (the `SYSTEM_RULES` template already described tool-first
+  behavior, which is why tool/action routing still worked);
+- the owner's request exactly once, `[History]` containing only prior turns;
+- `Last Tool: <name>` instead of a permanent `None`;
+- a tool section whose ~1.9k tokens are inside the budget and inside the
+  reported estimate.
+
+Message structure is unchanged (4 system messages + the user message, user
+message last), so no provider-compatibility risk was introduced.
+
+## 6. Files changed
+
+- `backend/ai/prompt/builder.py`
+- `backend/ai/engine/dispatcher.py`
+- `tests/test_context_architecture.py` (new)
+- `tests/test_ai_state_consistency.py` (test double signature only)
+- `IMPLEMENTATION_REPORT.md`
+
+No other file was modified.
+
+## 7. Tests
+
+`tests/test_context_architecture.py` — **22 tests**, all behavioural, driving the
+real `Engine` + real `PromptBuilder` and asserting on the exact provider payload:
+
+1. the current turn is rendered exactly once and never inside `[History]`;
+2. previous turns still reach the history block (dedup does not erase continuity);
+3. owner/chat/message/session/timezone/language identity is preserved;
+4. a replied AI message arrives with its full untruncated content;
+5. a replied non-AI message stays distinguishable (`[Reply Context]`, sender,
+   chat, media, text) and never claims to be an AI message;
+6. a request without a reply is valid and renders `Reply: None`;
+7. retrieved memory is delivered **and** stays separate from history;
+8. memory is owner-scoped in the payload (one owner's memory never reaches
+   another owner's payload);
+9. **every rendered section reaches the provider payload** (the invariant that
+   catches this whole class of bug; it fails on the pre-fix code);
+10. output instructions and the JSON action contract reach the model, in
+    canonical order (memory → preferences → output rules);
+11. preferences are propagated into the system prompt and are owner-scoped;
+12. `[Tool Context]` reports the last recorded tool and never a running one;
+13. tool results are not duplicated into a `[Tool Results]` block;
+14. the tool schemas reach the payload exactly once (not twice: once in the text
+    section, once appended);
+15. the schemas are absent when tools are disabled;
+16. the builder counts the tool block against the budget;
+17. a large tool block forces history trimming while remaining within budget and
+    never drops the schemas, the user message or the output rules;
+18. the budget estimate grows by exactly the tool block's token estimate;
+19. internal session state and environment secrets never reach the payload;
+20. the context and the prompt package are built exactly once per dispatch and
+    every provider round reuses them;
+21. the fixed section order is unchanged and complete.
+
+### Test results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_context_architecture.py -q` | **22 passed** |
+| focused AI/context suites (`test_ai_state_consistency`, `test_37_ai_memory_db`, `test_09_reply_to_ai`, `test_10_tool_calls`, `test_25_fast_path`, `test_external_call_efficiency`, `test_settings_model_key_contract`) | **72 passed** |
+| full suite `pytest tests -q` | **2450 passed, 24 skipped, 0 failed** (baseline before this phase: 2428 passed / 24 skipped) |
+| `py_compile` on every changed Python file | OK |
+| `git diff --check` | clean |
+| complete diff review | 3 files + 1 new test file, no unrelated change |
+| stale call-site search (`_inject_tool_schemas`) | none remaining |
+| duplicate-implementation search | one dispatcher assembly (`_build_messages`) + the library formatter/serializer; no competing context builder or prompt builder |
+
+## 8. Database, RLS, security
+
+- **Database / schema impact: NONE.** No migration, no SQL, no table and no
+  column was touched; Supabase was not contacted or modified. The
+  `ai_preferences` table still does not exist — preferences continue to come
+  from the in-memory repository defaults and are not pretended to be persisted.
+- **RLS / ownership: unchanged and re-asserted.** Memory and preferences are
+  read per `request.owner_id`; tests prove one owner's memory/preferences never
+  appear in another owner's payload.
+- **Security boundaries preserved.** The prompt still contains no credentials,
+  session string, API keys, raw environment values or serialized Telethon
+  objects; the model never receives the runtime session object. Tool execution
+  stays behind `ToolExecutor`; no new Telegram, DB or provider call was added by
+  this phase.
+
+## 9. Files intentionally left untouched
+
+`ProviderManager` and every provider, `ToolExecutor`/`ToolRegistry`, the
+scheduler and occurrence state machine, `RuntimeSupervisor`, the repositories
+and the task/`Taskloom` UI, Bio/Username services, the helper panel subsystem,
+the reply resolver, and every other handler.
+
+## 10. Limitations / not verified
+
+1. **Live Telegram / Render verification was NOT performed** (no production
+   self-bot session in this workspace). Every claim above is source-traced and
+   reproduced in-process against the real Engine and a scripted provider.
+2. **Panel/menu context is still not available to the AI.** `AI_MASTER_DESIGN.md`
+   §25.1 sources `Menu/Panel/Category/Pending Action` from an
+   `inline_engine.current_*` API that does not exist in the current helper
+   implementation; the AI runtime session carries no panel state. Supplying it
+   needs a new bridge between the helper panel subsystem and the AI runtime,
+   which this phase deliberately did not invent. Today the block renders
+   `Menu: main` and empty panel/category/flow/pending values.
+3. **Long non-AI replies are previewed, not injected in full** (§3.2, design
+   §25.4). Replying with “summarize this” to a message longer than 200
+   characters gives the model only the first 200 characters. Changing this
+   contradicts the current design document, so it is reported rather than
+   silently changed.
+4. **Two prompt-assembly paths exist**: the dispatcher's `_build_messages` and
+   the library `serialize_to_message_list` (used by `prompt/formatter.py`).
+   Both now deliver every section, but they are not consolidated; the
+   serializer's `tool`-role handling for `TOOL_RESULTS` has no `tool_call_id`,
+   so replacing the dispatcher path is a larger behavioural change than this
+   phase warrants.
+5. **`ai_preferences` is not persisted**, so preference context is the in-memory
+   default record until that table is introduced.
+6. Delivering the output instructions and memory is a real behavioural change:
+   the model now sees the JSON action contract and the memory block. Any change
+   in production response wording (not routing) should be attributed to this.
+
+## 11. Delivery
+
+- Commit SHA: _filled in below after push_
+- Branch: `main`
+- Push result: _filled in below_
+- Remote HEAD: _filled in below_
+- Final working-tree state: _filled in below_
+
+---
+
+# PREVIOUS PHASE — Taskloom input/commit UX + external-call efficiency
 
 ## 1. Objective
 
