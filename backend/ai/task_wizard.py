@@ -18,10 +18,13 @@ action's editable fields follow its registered tool contract:
 For generated content the wizard composes the durable ``ai_instruction``
 from the selected fields in a canonical phrasing that the existing
 ``preparation_policy.derive_policy`` parses deterministically (language,
-inclusive maximum length, named source, optional label-free presentation).
-The composition is verified by round-tripping it through ``derive_policy``
-before a candidate is ever returned, so the review screen can only show
-constraints that are actually enforced at occurrence time.
+inclusive maximum length, named source, source display). Source display is
+an explicitly OPT-IN presentation flag whose default is OFF: a named source
+constrains generation without putting its name on screen, and the instruction
+only carries the show clause when the owner asked for it. The composition is
+verified by round-tripping it through ``derive_policy`` before a candidate is
+ever returned, so the review screen can only show constraints that are
+actually enforced at occurrence time.
 
 The wizard NEVER generates content at creation time: the occurrence path
 generates and validates fresh content per run.
@@ -65,6 +68,11 @@ LANGUAGE_NAMES = (
 )
 LANGUAGE_POLICY = {"en": "english", "fa": "persian", "ar": "arabic", "zh": "chinese"}
 LANGUAGE_WORDS = dict(LANGUAGE_NAMES)
+
+# The durable clause that turns the opt-in source display ON. The
+# deterministic policy recognizes it, so the flag cannot drift from what is
+# actually enforced at occurrence time.
+SHOW_SOURCE_CLAUSE = "show the source name"
 
 
 class TaskWizardError(ValueError):
@@ -123,7 +131,9 @@ class TaskDraft:
     source: str = ""
     language: str = ""
     max_length: int | None = None
-    hide_speaker_label: bool = False
+    # Presentation flag, default OFF: the source constrains generation but is
+    # not displayed unless the owner explicitly asked for it.
+    show_source: bool = False
     schedule_type: str = ""
     interval_minutes: int | None = None
     clock: str = ""
@@ -265,8 +275,8 @@ def build_instruction(draft: TaskDraft) -> str:
         clauses.append(f"in {LANGUAGE_WORDS[draft.language]}")
     if draft.max_length is not None:
         clauses.append(f"at most {draft.max_length} characters")
-    if draft.source and draft.hide_speaker_label:
-        clauses.append("without a speaker label")
+    if draft.source and draft.show_source:
+        clauses.append(SHOW_SOURCE_CLAUSE)
     if draft.source:
         clauses.append(f"from {draft.source}")
     return ", ".join(clause for clause in clauses if clause)
@@ -280,11 +290,11 @@ def _instruction_problem(draft: TaskDraft, instruction: str) -> str | None:
         return "the selected language cannot be represented in the task contract"
     if policy.max_length != draft.max_length:
         return "the selected maximum length cannot be represented in the task contract"
+    if policy.show_source != draft.show_source:
+        return "the source display preference cannot be represented in the task contract"
     if draft.source:
         if policy.source.casefold() != draft.source.casefold():
             return "the selected source cannot be represented in the task contract"
-        if policy.speaker_label == draft.hide_speaker_label:
-            return "the speaker-label preference cannot be represented in the task contract"
     elif policy.source:
         return "the task contract derived an unexpected source"
     return None
@@ -445,11 +455,11 @@ def draft_from_task(task: Any, *, step: str = STEP_SCHEDULE) -> TaskDraft:
         )
         source = policy.source or ""
         max_length = policy.max_length
-        hide_label = bool(policy.source) and not policy.speaker_label
+        show_source = bool(policy.source) and policy.show_source
     else:
         if not definition.supports_ai and not str(arguments.get("text") or "").strip():
             raise TaskWizardError("this task has no editable text")
-        mode, language, source, max_length, hide_label = STATIC_MODE, "", "", None, False
+        mode, language, source, max_length, show_source = STATIC_MODE, "", "", None, False
     schedule_type = str(getattr(task, "schedule_type", "") or "")
     if schedule_type not in SCHEDULE_TYPES:
         raise TaskWizardError("this task's schedule cannot be edited here")
@@ -480,7 +490,7 @@ def draft_from_task(task: Any, *, step: str = STEP_SCHEDULE) -> TaskDraft:
         source=source,
         language=language,
         max_length=max_length,
-        hide_speaker_label=hide_label,
+        show_source=show_source,
         schedule_type=schedule_type,
         interval_minutes=interval_minutes,
         clock=clock,
@@ -546,7 +556,7 @@ def review_lines(
             f"at most {policy.max_length} characters" if policy.max_length else "Any",
         ))
         if policy.source:
-            lines.append(("Speaker label", "Hidden" if not policy.speaker_label else "Shown"))
+            lines.append(("Show source", "Yes" if policy.show_source else "No"))
     else:
         lines.append(("Content", f'Static text: "{candidate["actions"][0]["arguments"]["text"]}"'))
         font = candidate["actions"][0]["arguments"].get("font")

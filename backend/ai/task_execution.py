@@ -48,16 +48,17 @@ def present_calls(calls: list[dict[str, Any]], instruction: str) -> list[dict[st
     IDENTITY is validated on the generated line (preparation, persisted
     metadata, boundary) and the owner-visible FORMATTING is applied here —
     after the last validation and immediately before the ToolExecutor — so a
-    task that asked for a label-free bio executes "Don't be afraid…" while
-    still having proven the line was attributed to the requested source.
+    source task executes "Don't be afraid…" while still having proven the line
+    was attributed to the requested source. Displaying the source is opt-in:
+    the label is kept ONLY when the instruction explicitly asked for it.
 
     The validated calls are never mutated: they remain what is persisted as
     the occurrence's prepared action, so every later re-validation sees the
     same deterministic attributed text. Returns the input unchanged when the
-    task requested the default (label visible) presentation.
+    task requested the visible-source presentation.
     """
     policy = derive_policy(instruction)
-    if policy.speaker_label or not policy.source:
+    if policy.show_source or not policy.source:
         return calls
     presented: list[dict[str, Any]] = []
     for call in calls:

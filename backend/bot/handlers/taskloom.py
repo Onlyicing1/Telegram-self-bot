@@ -440,7 +440,7 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
                 f"Maximum length: {f'at most {draft.max_length}' if draft.max_length else 'Any'}"
             )
             if draft.source:
-                lines.append(f"Speaker label: {'Hidden' if draft.hide_speaker_label else 'Shown'}")
+                lines.append(f"Show source: {'Yes' if draft.show_source else 'No'}")
             builder.add_row("Character / source…", f"input:{_WIZARD_PANEL}:source")
             if draft.source:
                 builder.add_row("Clear source", "action:taskloom_wizard:set:source:none")
@@ -450,11 +450,14 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             builder.add_row("Maximum length…", f"input:{_WIZARD_PANEL}:maxlen")
             if draft.max_length:
                 builder.add_row("Clear maximum length", "action:taskloom_wizard:set:maxlen:none")
-            if draft.source:
+            if draft.source and definition is not None and definition.key == "bio":
+                # Source DISPLAY is opt-in and Bio-specific. The button always
+                # names the value it will set; the default is No, so a named
+                # source constrains generation without being rendered.
                 builder.add_row(
-                    "Speaker label: " + ("Show" if draft.hide_speaker_label else "Hide"),
-                    "action:taskloom_wizard:set:label:"
-                    + ("0" if draft.hide_speaker_label else "1"),
+                    "Show source: " + ("No" if draft.show_source else "Yes"),
+                    "action:taskloom_wizard:set:show_source:"
+                    + ("0" if draft.show_source else "1"),
                 )
         else:
             lines.append("Text to use every run:")
@@ -590,7 +593,7 @@ def _wizard_set_action(draft: TaskDraft, key: str) -> TaskDraft:
         action=key,
         content_mode="" if definition.supports_ai else STATIC_MODE,
         step=STEP_CONTENT if definition.supports_ai else STEP_DETAILS,
-        source="", language="", max_length=None, hide_speaker_label=False,
+        source="", language="", max_length=None, show_source=False,
         text="", notice="",
     )
 
@@ -630,14 +633,14 @@ def _wizard_apply(draft: TaskDraft, field: str, raw: str) -> TaskDraft:
             if not task_wizard.valid_font_key(key):
                 raise TaskWizardError("unknown font key")
             return draft.updated(font=key, notice="")
-        if field == "label":
-            trial = draft.updated(hide_speaker_label=raw == "1")
+        if field == "show_source":
+            trial = draft.updated(show_source=raw == "1")
             problem = task_wizard.instruction_problem(trial)
             if problem:
                 raise TaskWizardError(problem)
             return trial.updated(notice="")
         if field == "source":
-            return draft.updated(source="", hide_speaker_label=False, notice="")
+            return draft.updated(source="", show_source=False, notice="")
         raise TaskWizardError("unknown setting")
     except TaskWizardError as exc:
         return draft.updated(notice=f"× {exc}")
@@ -760,7 +763,7 @@ def _wizard_input_handler(field: str):
         try:
             if field == "source":
                 source = task_wizard.clean_source(text)
-                trial = draft.updated(source=source, hide_speaker_label=False)
+                trial = draft.updated(source=source, show_source=False)
                 problem = task_wizard.instruction_problem(trial)
                 if problem:
                     raise TaskWizardError(problem)

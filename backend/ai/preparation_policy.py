@@ -22,14 +22,16 @@ script-based, not ASCII-based: digits, punctuation, whitespace, emoji and
 language-appropriate marks never count as violations. English is a named
 language like the others: it is imposed only when the instruction names it.
 
-A named-source task may additionally request a LABEL-FREE presentation
-("without a speaker label"): attribution is still validated on the generated
-line (it must open with the requested source), while the language/length
-checks apply to the VISIBLE content and the validated opening label is
-removed from the executed text by the coordinator's presentation step. The
-validator itself never rewrites content, so every validation pass —
-preparation, persisted metadata, execution boundary — sees the same
-deterministic result.
+Source DISPLAY is separate from source IDENTITY and defaults to OFF: naming a
+source never implies its name is rendered. By default attribution is still
+validated on the generated line (it must open with the requested source),
+while the language/length checks apply to the VISIBLE content and the
+validated opening label is removed from the executed text by the
+coordinator's presentation step. The label is displayed only when the
+instruction explicitly asks for it ("show the source name", "اسمش هم اولش
+باشه", "منبع رو نمایش بده"). The validator itself never rewrites content, so
+every validation pass — preparation, persisted metadata, execution boundary
+— sees the same deterministic result.
 """
 from __future__ import annotations
 
@@ -50,15 +52,41 @@ _CHINESE_WORDS = ("چینی", "chinese", "中文", "汉语", "mandarin")
 _ARABIC_WORDS = ("عربی", "arabic")
 _ENGLISH_WORDS = ("انگلیسی", "english")
 
-# Label-free presentation markers: the owner explicitly asked for the
-# validated speaker label to be dropped from the VISIBLE content (a bio that
-# reads like the line itself). Only meaningful together with a named source;
-# without a source there is nothing to hide and the flag is inert.
-_LABEL_FREE_MARKERS = (
+# Explicit "hide the source name" markers: the owner asked for the validated
+# speaker label to be dropped from the VISIBLE content. This is the DEFAULT,
+# so these markers only act as an override of an explicit show request — but
+# they are still honoured so that documented phrasing keeps its meaning.
+# Only meaningful together with a named source.
+_HIDE_SOURCE_MARKERS = (
     "بدون نام گوینده", "بدون برچسب گوینده", "بدون برچسب", "بدون نام",
     "بی برچسب", "بی نام",
     "without a speaker label", "without the speaker label",
     "without speaker label", "no speaker label",
+    # explicit negative requests that the source name NOT be displayed
+    "ننویس", "بدون اسم", "اسم نباشه", "اسمش نباشه", "اسم رو نشون نده",
+    "don't show the source", "do not show the source",
+    "without the source name", "no source name", "hide the source",
+    "don't show its name", "don't show the name",
+)
+
+# Explicit "show the source name" markers: the ONLY thing that makes the
+# source VISIBLE. Naming a source never implies this. Deliberately multi-word
+# so unrelated phrasing (a destination "نمایش بده", a saved-text "منبع") can
+# never flip the presentation of an unrelated task.
+_SHOW_SOURCE_MARKERS = (
+    # Persian — the source/character NAME must appear
+    "اسمش هم اول", "اسمش اول", "اسمش رو اول", "اسمش را اول",
+    "اسمش رو بنویس", "اسمش را بنویس", "اسمش رو بذار", "اسمش را بذار",
+    "نامش رو بنویس", "نامش را بنویس", "نامش رو اول", "نامش را اول",
+    "اسم شخصیت رو بنویس", "اسم کاراکتر رو بنویس",
+    "با اسمش", "با نامش", "با اسم کاراکتر",
+    "منبع رو نمایش", "منبع را نمایش", "منبع رو نشون", "منبع را نشون",
+    "نمایش منبع", "نمایش اسم",
+    # English
+    "show the source", "show source", "show the name", "show its name",
+    "show the speaker", "with the source name", "include the source",
+    "source name first", "name first",
+    "with a speaker label", "with the speaker label",
 )
 
 # "dialogue from <X>" — the source/person/character constraint. Marker
@@ -162,7 +190,7 @@ class PreparationPolicy:
     source: str = ""       # required source/person/character, "" = unconstrained
     source_text: str = ""  # the raw spoken source phrase (diagnostics)
     quote_exact: bool = False  # explicit exact-canonical-quote request: fails closed
-    speaker_label: bool = True  # False = validated label hidden from the visible content
+    show_source: bool = False  # True = validated source label kept in the visible content
 
     @property
     def active(self) -> bool:
@@ -195,10 +223,12 @@ class PreparationPolicy:
                     f"'{self.source}:' followed by the line — never another speaker, "
                     f"never a short form, never generic text"
                     + (
-                        ""
-                        if self.speaker_label
-                        else "; the validated opening speaker label is removed "
-                        "from the visible result"
+                        "; the visible content MUST KEEP that opening source "
+                        "attribution"
+                        if self.show_source
+                        else "; the validated opening source label is REMOVED from the "
+                        "visible content — the source is a generation constraint "
+                        "only and is NOT displayed by default"
                     )
                 )
         return ", ".join(parts) if parts else "no content constraints"
@@ -340,7 +370,14 @@ def derive_policy(instruction: str) -> PreparationPolicy:
         source=source,
         source_text=source_phrase,
         quote_exact=quote_exact,
-        speaker_label=not _contains_any(instruction, _LABEL_FREE_MARKERS),
+        # Source DISPLAY defaults to OFF: only an explicit show request turns
+        # it on, and an explicit hide request always wins. A named source with
+        # no display language is a generation constraint only.
+        show_source=(
+            bool(source)
+            and _contains_any(instruction, _SHOW_SOURCE_MARKERS)
+            and not _contains_any(instruction, _HIDE_SOURCE_MARKERS)
+        ),
     )
 
 
@@ -508,10 +545,10 @@ def validate_content(text: Any, policy: PreparationPolicy) -> str:
         # enforced (a provider label is never treated as canon, only as the
         # line's own opening attribution).
         _check_attribution(text, policy.source)
-        if not policy.speaker_label:
-            # The owner asked for a LABEL-FREE presentation: the label is
-            # validated above, so the language/length contract applies to the
-            # VISIBLE content the owner will actually see.
+        if not policy.show_source:
+            # Default LABEL-FREE presentation: the identity proof above is
+            # required, but the visible content is the dialogue line itself, so
+            # the language/length contract applies to what the owner will see.
             visible = strip_attribution_prefix(text, policy.source) or text
     if policy.language is not None:
         _check_language(visible, policy.language)

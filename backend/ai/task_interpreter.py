@@ -94,7 +94,8 @@ CANDIDATE_SCHEMA = {
             "description": (
                 "For AI-generated per-run content ONLY: the user's request VERBATIM "
                 "(never paraphrased or translated) so source/character/language/length "
-                "requirements are enforced at each occurrence. Omit for static content."
+                "and source-display requirements are enforced at each occurrence. "
+                "Omit for static content."
             ),
         },
     },
@@ -412,6 +413,18 @@ class TaskInterpreter:
             "as \\n inside the JSON string so the JSON stays valid. Only truly static "
             "one-time content (say exactly 'hello') omits "
             "ai_instruction. "
+            "SOURCE DISPLAY (default OFF): naming a source/person/character does NOT "
+            "mean its name must appear in the output — the source is a generation "
+            "constraint only, so by default the generated content shows no speaker "
+            "name. Never add a show/hide request the user did not make, and never "
+            "treat the mere presence of a source as a request to display it. When the "
+            "user EXPLICITLY asks for the source/character NAME to be visible (e.g. "
+            "'اسمش هم اولش باشه', 'با اسمش', 'منبع رو نمایش بده', 'show the source "
+            "name', 'with the source name'), keep those exact words in "
+            "ai_instruction. When the user explicitly asks that the name NOT be "
+            "shown (e.g. 'اسمش رو ننویس', 'بدون اسم', 'don't show the source'), keep "
+            "those exact words too. With no such language, the source is never "
+            "displayed. "
             "SCHEDULE CONTRACT: 'schedule' must match the schedule_type exactly — "
             "interval: {'seconds': <positive number>} (every X minutes = X*60 seconds, "
             "e.g. 'هر سه دقیقه' or 'every 3 minutes' = {'seconds': 180}); "

@@ -378,11 +378,13 @@ async def test_wrong_speaker_labels_are_rejected():
 async def test_matching_attributed_line_executes_exactly_once():
     """A line that opens with the requested source satisfies the generated
     in-character dialogue contract: it executes exactly once through the
-    ToolExecutor — self-attribution, never a canonical-quote claim."""
+    ToolExecutor — self-attribution, never a canonical-quote claim. Source
+    display defaults to OFF, so the verified attribution is not rendered."""
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, ai_task_data())
-    valid = "آیانامی ری: " + "د" * 40  # 51 chars, attributed, Persian script
-    preparator = ScriptedPreparator([valid])
+    attributed = "آیانامی ری: " + "د" * 40  # 51 chars, attributed, Persian script
+    visible = "د" * 40
+    preparator = ScriptedPreparator([attributed])
     calls = []
     coordinator = build_coordinator(repo, preparator, calls=calls)
     occurrence = await make_claimed_occurrence(repo, task)
@@ -393,7 +395,7 @@ async def test_matching_attributed_line_executes_exactly_once():
     )
     assert result.success is True
     assert preparator.rounds == 1
-    assert calls == [("set_bio", {"text": valid}, 1)]
+    assert calls == [("set_bio", {"text": visible}, 1)]
     assert (await repo.get_occurrence(1, task.id, occurrence.occurrence_key)).status == "succeeded"
 
 
@@ -425,8 +427,9 @@ async def test_drift_then_attributed_line_succeeds_once():
     self-attributed line executes exactly once."""
     repo = InMemoryTaskRepository()
     task = await repo.create_task(1, ai_task_data())
-    valid = "آیانامی ری: " + "د" * 40
-    preparator = ScriptedPreparator([LIVE_DRIFT_LINE, valid])
+    attributed = "آیانامی ری: " + "د" * 40
+    visible = "د" * 40
+    preparator = ScriptedPreparator([LIVE_DRIFT_LINE, attributed])
     calls = []
     coordinator = build_coordinator(repo, preparator, calls=calls)
     occurrence = await make_claimed_occurrence(repo, task)
@@ -437,7 +440,7 @@ async def test_drift_then_attributed_line_succeeds_once():
     )
     assert result.success is True
     assert preparator.rounds == 2
-    assert calls == [("set_bio", {"text": valid}, 1)]
+    assert calls == [("set_bio", {"text": visible}, 1)]
 
 
 @pytest.mark.asyncio
@@ -500,15 +503,17 @@ async def test_exact_quote_task_fails_closed_zero_mutation():
 async def test_prepare_ahead_source_task_is_side_effect_free_then_executes_once():
     """Prepare-ahead never runs the tool or guardian; a validated
     self-attributed action is persisted durably, and the boundary later
-    executes it exactly once from the metadata — no new provider round."""
+    executes it exactly once from the metadata — no new provider round. The
+    default source display applies identically to the prepared path."""
     from backend.services import bio_guardian
 
     bio_guardian.reset_window_for_tests()
     try:
         repo = InMemoryTaskRepository()
         task = await repo.create_task(1, ai_task_data())
-        valid = "آیانامی ری: " + "م" * 30
-        preparator = ScriptedPreparator([valid])
+        attributed = "آیانامی ری: " + "م" * 30
+        visible = "م" * 30
+        preparator = ScriptedPreparator([attributed])
         calls = []
         coordinator = build_coordinator(repo, preparator, calls=calls)
         occurrence = await make_claimed_occurrence(repo, task)
@@ -529,7 +534,7 @@ async def test_prepare_ahead_source_task_is_side_effect_free_then_executes_once(
         result = await coordinator.execute(stored)
         assert result.success is True
         assert preparator.rounds == rounds_before  # metadata path, no provider call
-        assert calls == [("set_bio", {"text": valid}, 1)]
+        assert calls == [("set_bio", {"text": visible}, 1)]
     finally:
         bio_guardian.reset_window_for_tests()
 

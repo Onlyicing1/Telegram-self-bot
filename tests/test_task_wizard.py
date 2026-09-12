@@ -13,9 +13,10 @@ Contract under test:
   ``ai_instruction``.
 - Generated content is never produced or stored at creation time; the
   occurrence path generates and validates fresh content per run.
-- Named-source attribution is validated deterministically, and the owner may
-  request a LABEL-FREE presentation: identity validation is unchanged while
-  the visible bio drops the validated speaker label.
+- Named-source attribution is validated deterministically. Source DISPLAY is
+  a separate, opt-in presentation flag (default OFF): identity validation is
+  unchanged while the visible bio drops the validated speaker label unless the
+  owner explicitly asked to show the source.
 """
 from __future__ import annotations
 
@@ -66,9 +67,7 @@ def _run(coro):
 
 
 def test_bio_wizard_happy_path_produces_the_shared_candidate_contract():
-    draft = _draft(
-        source="Ayanami Rei", language="en", max_length=59, hide_speaker_label=True,
-    )
+    draft = _draft(source="Ayanami Rei", language="en", max_length=59)
     candidate = TaskCandidate.from_untrusted(task_wizard_candidate(draft))
 
     assert candidate.schedule_type == "interval"
@@ -80,7 +79,8 @@ def test_bio_wizard_happy_path_produces_the_shared_candidate_contract():
     assert policy.source == "Ayanami Rei"
     assert policy.language == "english"
     assert policy.max_length == 59
-    assert policy.speaker_label is False
+    # Source display is opt-in: the default is NOT to render the source.
+    assert policy.show_source is False
 
 
 def task_wizard_candidate(draft: TaskDraft) -> dict:
@@ -212,7 +212,7 @@ def test_source_input_is_bounded():
 def test_review_reflects_the_candidate_that_will_be_persisted():
     from backend.ai import task_wizard
 
-    draft = _draft(source="Ayanami Rei", language="en", max_length=59, hide_speaker_label=True)
+    draft = _draft(source="Ayanami Rei", language="en", max_length=59)
     rows = dict(task_wizard.review_lines(draft, reference=NOW))
     candidate = task_wizard.build_candidate(draft, 0, NOW)
     policy = derive_policy(candidate["ai_instruction"])
@@ -222,7 +222,7 @@ def test_review_reflects_the_candidate_that_will_be_persisted():
     assert rows["Language"] == "English" and policy.language == "english"
     assert rows["Maximum length"] == f"at most {policy.max_length} characters"
     assert policy.max_length == 59
-    assert rows["Speaker label"] == "Hidden" and policy.speaker_label is False
+    assert rows["Show source"] == "No" and policy.show_source is False
     assert rows["Schedule"] == "Every 2 minutes"
     assert rows["Timezone"] == candidate["timezone"] == "Asia/Tehran"
 
@@ -268,17 +268,18 @@ def test_message_action_cannot_be_ai_generated():
 
 def test_validator_never_rewrites_the_generated_line():
     policy = derive_policy(task_wizard_candidate(_draft(
-        source="Ayanami Rei", hide_speaker_label=True,
+        source="Ayanami Rei",
     ))["ai_instruction"])
-    assert policy.speaker_label is False
+    assert policy.show_source is False
     assert validate_content(LABELED_LINE, policy) == LABELED_LINE
     with pytest.raises(PreparationPolicyError):
         validate_content("Ayumi: Every star begins as a dream!", policy)
 
 
 def test_label_free_presentation_strips_only_the_verified_label():
+    # No display opt-in: label-free presentation is the DEFAULT for a source.
     instruction = task_wizard_candidate(_draft(
-        source="Ayanami Rei", hide_speaker_label=True,
+        source="Ayanami Rei",
     ))["ai_instruction"]
     calls = [{"name": "bio_set_text", "arguments": {"text": LABELED_LINE}}]
     presented = present_calls(calls, instruction)
@@ -288,8 +289,19 @@ def test_label_free_presentation_strips_only_the_verified_label():
     assert calls[0]["arguments"]["text"] == LABELED_LINE
 
 
-def test_default_presentation_keeps_the_speaker_label():
+def test_default_presentation_hides_the_source():
     instruction = task_wizard_candidate(_draft(source="Ayanami Rei"))["ai_instruction"]
+    calls = [{"name": "bio_set_text", "arguments": {"text": LABELED_LINE}}]
+    presented = present_calls(calls, instruction)
+    assert presented is not calls
+    assert presented[0]["arguments"]["text"] == "Don't be afraid. You are not alone."
+
+
+def test_explicit_show_source_keeps_the_attribution():
+    instruction = task_wizard_candidate(_draft(
+        source="Ayanami Rei", show_source=True,
+    ))["ai_instruction"]
+    assert derive_policy(instruction).show_source is True
     calls = [{"name": "bio_set_text", "arguments": {"text": LABELED_LINE}}]
     assert present_calls(calls, instruction) is calls
 
@@ -301,7 +313,7 @@ def test_strip_attribution_prefix_refuses_unattributed_text():
 
 def test_label_free_length_applies_to_the_visible_content():
     policy = derive_policy(task_wizard_candidate(_draft(
-        source="Ayanami Rei", hide_speaker_label=True, max_length=20,
+        source="Ayanami Rei", max_length=20,
     ))["ai_instruction"])
     visible = "x" * 20
     assert validate_content(f"Ayanami Rei: {visible}", policy) == f"Ayanami Rei: {visible}"
@@ -381,6 +393,7 @@ def test_wizard_walks_action_to_review_and_creates_through_the_shared_service(wi
     assert policy.source == "Ayanami Rei"
     assert policy.language == "english"
     assert policy.max_length == 59
+    assert policy.show_source is False  # display is opt-in; default is No
     assert wizard._drafts == {}  # the draft is consumed by the creation
 
 

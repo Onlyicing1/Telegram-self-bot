@@ -1,11 +1,179 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
-> exists at the tip of THIS phase. It replaced the previous phase reports
-> rather than appending to them. If code changes invalidate any section,
-> update this document in the same commit.
+> exists at the tip of the LATEST phase (Bio source-display separation).
+> Earlier phase reports are preserved verbatim below the ARCHIVE marker.
+> If code changes invalidate any section, update this document in the same
+> commit.
 
 ---
+
+# CURRENT PHASE — separate bio source ATTRIBUTION from source DISPLAY
+
+## 1. Objective
+
+Make source DISPLAY an explicit, opt-in property of a Bio task instead of an
+implicit consequence of naming a source:
+
+- a Bio task may carry a semantic source/character (e.g. Rei Ayanami) that
+  constrains generation **without** its name appearing in the bio;
+- source **identity** validation is unchanged (the generated line must still
+  prove attribution to the requested source);
+- the default is **not** to display the source;
+- Taskloom exposes a Bio-only **“Show source?”** option (No / Yes, default No);
+- natural-language creation can set it semantically.
+
+## 2. Implementation phase
+
+`Phase: bio source-display separation`
+(starting HEAD `fc6879cfa7add680ef0190e2d6dfad7187b16adf`).
+
+## 3. Root cause (traced from source)
+
+Source identity and source display already existed as two concepts but with
+the **wrong default polarity**:
+
+- `backend/ai/preparation_policy.py` derived
+  `speaker_label = not _contains_any(instruction, _LABEL_FREE_MARKERS)` —
+  i.e. the label was rendered **unless** the instruction contained a negation
+  (“without a speaker label”). Naming a source therefore implied printing it,
+  and the only vocabulary for the *positive* request did not exist at all, so
+  “show the source name” was not representable.
+- `backend/bot/handlers/taskloom.py` exposed the same double negative as a
+  “Speaker label: Show/Hide” toggle whose default was **Shown**, so the
+  wizard could not express the owner's actual intent.
+- `backend/ai/task_interpreter.py` had no contract for source display, so the
+  model was never told that a source is a generation constraint only.
+
+Rendered result in production: `Ayanami Rei: Don't be afraid…` in the bio.
+
+## 4. Exact semantic change
+
+The presentation flag was renamed to match its real meaning and inverted to
+default **OFF**;
+
+| | before | after |
+|---|---|---|
+| policy field | `speaker_label: bool = True` | `show_source: bool = False` |
+| draft field | `hide_speaker_label: bool = False` | `show_source: bool = False` |
+| vocabulary | “without a speaker label” (hide) | + explicit **show** markers |
+
+The instruction is still the single durable semantic carrier
+(`ai_instruction`), exactly like language and maximum length. The deterministic
+`derive_policy` is the authority:
+
+```
+show_source = bool(source)
+              and any show marker
+              and no hide marker      # explicit hide always wins
+```
+
+Because display is OFF by default, the model can never enable it merely by
+naming a source; only an explicit owner request in the (verbatim) instruction
+can, and a request that asks for hidden output always wins.
+
+## 5. Behaviour changed
+
+- **Default behaviour** — a source-bearing task's executed content is the
+dialogue line alone: `present_calls` removes the validated opening
+attribution before the ToolExecutor. Applies to manual, AI, scheduled,
+prepare-ahead and retry paths (one code path).
+- **Explicit show** — `show the source name` / `اسمش هم اولش باشه` /
+`منبع رو نمایش بده` / `with the source name` keeps the attribution in the
+executed content, and the length bound then covers the rendered text.
+- **Explicit hide** — `اسمش رو ننویس` / `don't show the source` / legacy
+`without a speaker label` keeps it off and overrides an incidental show
+phrase.
+- **Language/length** — still deterministic; when the label is hidden the
+contract is applied to the **visible** text (unchanged rule, new default).
+- **Source fidelity** — unchanged: `_check_attribution` still requires the
+generated line to open with the requested source (full name, spoken order,
+separator). Drift, short forms, in-text mentions and generic text remain
+rejected and regenerated within the existing bounded attempt budget.
+
+## 6. AI / natural-language behaviour
+
+The interpreter prompt now carries a `SOURCE DISPLAY (default OFF)` contract:
+filing a source does not imply rendering it; the model must not invent a
+show/hide request; explicit owner wording is preserved **verbatim** in
+`ai_instruction` (which the existing deterministic creation gate already
+forces when the request derives a content policy). No new candidate field,
+no second source of truth: the display choice travels in the same durable
+`ai_instruction` as source/language/length.
+
+## 7. Taskloom behaviour
+
+The “Content details” step for a Bio task now shows `Show source: Yes/No` and
+one Bio-only toggle button whose label names the value it will set
+(`Show source: Yes` when it is currently No). Entering a new source resets the
+flag to the safe default. **Edit** prefills the stored value, preserves it
+when nothing is changed, and can flip it either way through the existing CAS
+`update_definition` path (version +1, boundary recomputed, unstarted
+occurrences discarded). Review shows `Show source: Yes/No`.
+
+## 8. Persistence behaviour
+
+The flag is part of the durable semantic definition — the text of
+`ai_instruction` — so **no database/schema change was made or is required**.
+`draft_from_task` recovers it from the stored instruction, and the wizard's
+round-trip guard (`instruction_problem`) rejects any selection the policy
+cannot represent, so review can never show an unenforced value.
+
+## 9. Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/preparation_policy.py` | `show_source` (default False); explicit show/hide vocabularies; `describe()` and `validate_content()` use the new default |
+| `backend/ai/task_execution.py` | `present_calls` gates on `policy.show_source` |
+| `backend/ai/task_wizard.py` | `TaskDraft.show_source`; `SHOW_SOURCE_CLAUSE`; round-trip guard; edit prefill; review row |
+| `backend/bot/handlers/taskloom.py` | Bio-only “Show source?” option (default No) |
+| `backend/ai/task_interpreter.py` | `SOURCE DISPLAY (default OFF)` prompt contract + schema description |
+| `tests/test_task_wizard.py` | new default polarity; show-source assertion |
+| `tests/test_task_source_fidelity.py` | execution assertions updated to the label-free default (fidelity/guardian tests unchanged) |
+| `tests/test_bio_source_display.py` | **new** — 41 focused behaviour tests |
+
+## 10. Tests
+
+- `pytest tests/test_bio_source_display.py -q` — **41 passed**
+- related Taskloom / task / source-fidelity / repository suites — **467 passed**
+- full suite `pytest tests -q` — **2345 passed, 24 skipped, 0 failed**
+- `py_compile` OK for every changed file; `git diff --check` clean
+
+Covered: source alone ⇒ `show_source=False`; explicit show ⇒ True (Persian and
+English); explicit hide ⇒ False and overrides show; show marker without a
+source is inert; identity/language/length validation unchanged; boundary,
+prepare-ahead and per-parameter parametrised display; Taskloom default No,
+No→Yes, Yes→No, Bio-only toggle, review value, persistence, edit prefill,
+edit preserve/flip via CAS; Bio Guardian still shared by the label-free path;
+static non-Bio tasks unaffected.
+
+## 11. Verification status
+
+- Unit/in-process verification: **performed** (see §10).
+- Live Telegram verification: **NOT performed** — no production session or
+  self-bot client is available in this workspace. The change was proven at the
+  deterministic policy, presentation, Taskloom UI, repository and execution
+  boundaries.
+- Supabase schema impact: **NONE** (no migration, no SQL, no schema file).
+
+## 12. Remaining limitations
+
+1. The “Show source?” toggle is offered for **Bio** only (as specified). The
+   underlying policy is shared, so a Username AI task with a source is also
+   label-free by default — it has no UI to opt in.
+2. The display flag is even meaningful only with a named source; a standalone
+   “منبع رو نمایش بده” carries no source and is therefore inert by design.
+3. Natural-language *creation* can set the flag; NL **definition editing**
+   does not exist in this architecture (list/inspect/transition/delete only),
+   so changing the flag on an existing task goes through the Taskloom Edit
+   flow.
+4. `_extract_source`'s existing trailing-token behaviour (e.g. a verb not in
+   its stop vocabulary can join the source phrase) is unchanged and out of
+   scope for this phase.
+
+---
+
+# ARCHIVE — superseded phase reports
 
 ## 1. Objective
 
