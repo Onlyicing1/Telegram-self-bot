@@ -1,5 +1,102 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+> **Latest phase — Task execution reliability**
+>
+> This section is the current execution-reliability result. Earlier context and
+> Taskloom phase reports remain below as historical current-state sections.
+
+## Objective
+
+Prove the durable occurrence lifecycle under restart, repeated recovery, retry,
+concurrent scheduler observation, and external-side-effect uncertainty; change
+only a confirmed correctness boundary.
+
+## Confirmed root cause
+
+`TaskScheduler.recover()` previously handled persisted `claimed` and `running`
+occurrences identically: it converted either state to `interrupted`, then
+scheduled `retry_pending`. However, `_execute_claimed()` calls the repository's
+atomic `claim_occurrence()` before entering `TaskExecutionCoordinator.execute()`;
+that transition changes the durable state to `running`. A process can therefore
+stop after the claim and after a Telegram/tool side effect has started (or
+completed) but before terminal occurrence persistence. Retrying every recovered
+`running` row could execute the same external mutation a second time.
+
+This was reproduced from the current source and distinguished from the valid
+unstarted `claimed`/`interrupted` recovery path. The durable claim CAS still
+prevents two observers from obtaining the same execution authority, but it
+cannot provide distributed exactly-once semantics for an external Telegram side
+effect.
+
+## Exact implementation
+
+`backend/ai/task_scheduler.py` now applies separate recovery semantics:
+
+- future `claimed` prepare-ahead occurrences remain untouched until their
+  scheduled boundary;
+- unstarted/persisted `claimed` work is still converted through
+  `interrupted` → bounded `retry_pending`/`failed` recovery;
+- persisted `interrupted` work keeps the existing bounded retry contract;
+- persisted `running` work is terminalized as `failed` with
+  `error_class=restart_side_effect_uncertain`, no `retry_at`, and no retry;
+- terminalized uncertain work cannot re-enter the retry or due-task execution
+  paths, so recovery will not repeat a possibly successful Telegram mutation.
+
+No second scheduler, executor, retry system, lock, cache, schema change, SQL,
+or Telegram execution path was introduced.
+
+## State-machine behavior
+
+Normal execution remains:
+
+`due task → idempotent occurrence creation → atomic claim (running) →
+TaskExecutionCoordinator → terminal transition/retry → scheduled-boundary
+advancement`.
+
+Recovery now treats `running` as the at-most-once external-side-effect boundary.
+The system guarantees at-most one execution attempt after durable claim, not
+true exactly-once delivery across a process crash between an external side
+effect and its terminal audit write. An uncertain post-claim result is reported
+as an explicit terminal failure rather than silently retried. Unstarted
+`claimed`/`interrupted` work remains retryable, with existing `retry_at` and
+attempt limits preserved.
+
+## Files changed
+
+- `backend/ai/task_scheduler.py`
+- `tests/test_task_scheduler.py`
+- `tests/test_task_restart_recovery.py`
+- `IMPLEMENTATION_REPORT.md`
+
+## Tests and validation
+
+- Focused execution/recovery/scheduler suites: **90 passed**.
+- Full suite: **2451 passed, 24 skipped, 0 failed**.
+- `py_compile` for every changed Python file: **OK**.
+- `git diff --check`: **clean**.
+- Live Telegram/Render verification: **not performed**; no production
+  self-bot session is available in this workspace.
+- Supabase schema/database impact: **none**; no SQL was executed.
+
+## Remaining limitation
+
+A crash after the durable `running` claim but before the process knows whether
+Telegram completed leaves the outcome unknowable from this repository's state
+alone. The implementation deliberately chooses no duplicate external mutation
+and records the uncertainty as terminal failure; the affected occurrence may
+need an explicit owner-level recovery action if the product later adds one.
+
+## Delivery
+
+- Implementation commit: `177a31d` (`fix: prevent duplicate task side effects after recovery`).
+- Branch: `main`.
+- The report update is intentionally delivered in the follow-up documentation
+  commit after remote verification of the implementation commit.
+
+---
+
+# IMPLEMENTATION REPORT — CURRENT STATE
+
 > **This is a CURRENT-STATE document.** It describes the repository as it
 > exists at the tip of the LATEST phase (Context architecture — source-first
 > audit and completion). Earlier phase reports are preserved verbatim below, in
