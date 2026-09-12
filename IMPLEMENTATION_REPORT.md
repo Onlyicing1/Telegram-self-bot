@@ -1,5 +1,56 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## Latest phase — AI task semantic-completeness boundary
+
+### Objective
+
+Harden the existing AI task-creation boundary so schema-valid provider output is not trusted as semantically complete when it lacks required user-grounded profile content. The existing interpreter, TaskCandidate, TaskCreationService, repository, Taskloom bridge, scheduler, and ToolExecutor architecture remain authoritative.
+
+### Confirmed root cause
+
+**CONFIRMED:** `TaskCandidate.from_untrusted()` and the existing persistence checks validated candidate shape and schedule, but no independent semantic-completeness check rejected an empty `bio_set_text` or `username_set_text` action with no `ai_instruction`. A provider could therefore return valid JSON and a schema-valid candidate that contained neither user-grounded static content nor a per-occurrence generation contract, and the service would attempt to persist it.
+
+Schema validity is not sufficient for content-bearing profile actions. Static profile content must be nonblank, or generated content must carry a nonblank validated `ai_instruction`.
+
+### Exact implementation
+
+`backend/ai/task_creation.py` now defines `TaskSemanticCompletenessError` and a deterministic structured-candidate check before schedule resolution or repository persistence. It accepts nonblank static profile text or a nonblank AI instruction, and rejects empty profile content without an instruction. The repository is not called for rejected candidates.
+
+`backend/ai/tools/task.py` classifies this rejection as `candidate_semantically_incomplete` and returns the existing `open_taskloom_wizard=true` / `wizard_reason` signal. No second clarification or persistence path was added.
+
+`backend/ai/task_interpreter.py` now explicitly instructs the existing provider path that schema validity is not semantic completeness and that it must not invent schedule, content, source, language, destination, recurrence, or generation requirements. Existing parser tolerance and source-display behavior remain unchanged.
+
+Incomplete requests with no schedule still use the pre-existing deterministic gate and existing Taskloom flow. Fully specified static or generated profile tasks continue through the normal direct creation path.
+
+### Files changed
+
+- `backend/ai/task_creation.py`
+- `backend/ai/task_interpreter.py`
+- `backend/ai/tools/task.py`
+- `tests/test_task_semantic_completeness.py`
+- `IMPLEMENTATION_REPORT.md`
+
+No scheduler, execution/recovery, provider architecture, context, memory, Taskloom UI, database schema, Supabase migration, or SQL was changed.
+
+### Tests and validation
+
+- Focused task-creation, wizard-bridge, candidate-contract, and source-fidelity suites: **134 passed**.
+- Full suite: **2455 passed, 24 skipped, 0 failed**.
+- `py_compile` for all changed Python files: **passed**.
+- `git diff --check`: **clean**.
+- Reference search found only the intended exception and wizard-signal call sites; no obsolete `request=` service argument remains.
+- Live Telegram, Supabase, and Render verification: **not performed**.
+
+### Database and security impact
+
+No schema or RLS change was required, and no SQL was executed. Owner identity remains trusted ToolContext data; providers cannot supply owner identity or directly execute Telegram actions. The change addresses the confirmed empty-profile-content gap only; broader ambiguous requests remain governed by the existing interpreter and structured Taskloom resolution.
+
+### Delivery
+
+Branch: `main`. Commit and remote verification will be recorded after delivery.
+
+---
+
 > **Latest phase — Task execution reliability**
 >
 > This section is the current execution-reliability result. Earlier context and

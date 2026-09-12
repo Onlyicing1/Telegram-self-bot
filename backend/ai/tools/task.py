@@ -164,7 +164,7 @@ class CreateTaskTool(Tool):
             _tokenize,
         )
         from backend.ai.task_interpreter import TaskInterpreter, TaskUnsupportedError
-        from backend.ai.task_creation import TaskCreationService
+        from backend.ai.task_creation import TaskCreationService, TaskSemanticCompletenessError
 
         started = time.perf_counter()
         request = arguments.get("request")
@@ -268,7 +268,10 @@ class CreateTaskTool(Tool):
             )
             safe_category = " ".join(str(category).split())[:80]
             data: dict[str, Any] = {}
-            if safe_category.startswith("candidate_invalid"):
+            if (
+                safe_category.startswith("candidate_invalid")
+                or safe_category == "candidate_semantically_incomplete"
+            ):
                 data = {
                     "open_taskloom_wizard": True,
                     "wizard_reason": safe_category,
@@ -584,6 +587,8 @@ class CreateTaskTool(Tool):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, TaskSemanticCompletenessError):
+                return _fail("create_task_semantics", "candidate_semantically_incomplete", exc)
             _trace(
                 "create_task_repository_create_result", success=False,
                 repository=repository or "unresolved", exception=type(exc).__name__,

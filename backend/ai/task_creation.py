@@ -32,6 +32,38 @@ class TaskCreationError(ValueError):
     """Candidate task data is invalid or cannot be scheduled."""
 
 
+class TaskSemanticCompletenessError(TaskCreationError):
+    """A schema-valid candidate lacks grounded user task semantics."""
+
+
+_PROFILE_CONTENT_ACTIONS = frozenset({"bio_set_text", "username_set_text"})
+
+
+def _semantic_completeness_error(candidate: dict[str, Any]) -> str | None:
+    """Reject empty profile content when no generation contract exists.
+
+    The candidate schema proves shape only. Profile tools deliberately accept
+    empty text for generated-per-occurrence content, but that mode is only
+    complete when an ``ai_instruction`` is present. A nonblank static profile
+    value remains valid through the existing candidate/action contract.
+    """
+    actions = candidate.get("actions")
+    if not isinstance(actions, list):
+        return None
+    instruction = candidate.get("ai_instruction")
+    if instruction is not None and (not isinstance(instruction, str) or not instruction.strip()):
+        return "AI instruction is invalid"
+    for action in actions:
+        if not isinstance(action, dict) or action.get("name") not in _PROFILE_CONTENT_ACTIONS:
+            continue
+        arguments = action.get("arguments")
+        if not isinstance(arguments, dict):
+            return "content action arguments are invalid"
+        if not (isinstance(instruction, str) and instruction.strip()) and not str(arguments.get("text") or "").strip():
+            return "profile content requires explicit content or an AI instruction"
+    return None
+
+
 def initial_next_run(
     schedule_type: str, schedule_payload: dict[str, Any], reference: datetime
 ) -> datetime | None:
@@ -85,6 +117,10 @@ class TaskCreationService:
             raise _invalid(f"unsupported task fields: {sorted(set(candidate) - allowed)}")
         if required - set(candidate):
             raise _invalid(f"missing required task fields: {sorted(required - set(candidate))}")
+        semantic_error = _semantic_completeness_error(candidate)
+        if semantic_error:
+            _creation_trace("semantic_incomplete", reason=semantic_error)
+            raise TaskSemanticCompletenessError(semantic_error)
         if (
             candidate.get("timezone") != candidate["schedule"].get("timezone")
             and candidate["schedule_type"] not in ("interval", "event")
