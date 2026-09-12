@@ -1,14 +1,162 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
-> exists at the tip of the LATEST phase (Taskloom editor UX + task-list
-> reliability). Earlier phase reports are preserved verbatim below, in
+> exists at the tip of the LATEST phase (Bio Taskloom “Show source” EDIT
+> propagation). Earlier phase reports are preserved verbatim below, in
 > most-recent-first order. If code changes invalidate any section, update this
 > document in the same commit.
 
 ---
 
-# CURRENT PHASE — Taskloom EDITOR UX + task-list reliability
+# CURRENT PHASE — Bio Taskloom “Show source” EDIT propagation
+
+## 1. Objective
+
+One reported edit bug: open an existing Bio task in Taskloom → Edit →
+Content details → change **Show source** from Yes to No. The details step shows
+No, but **Review still shows Yes**, the save persists the old value, and the
+next scheduled Bio occurrence still renders the speaker attribution.
+
+## 2. Implementation phase
+
+`Phase: Bio Taskloom “Show source” edit-state propagation`
+(starting HEAD `5aa47f5166ca757386bb830b36b2d51936e44535`).
+
+Source-first: the current GitHub source at that HEAD was traced end to end
+before any edit; the previous phase reports were treated as context only.
+
+## 3. Root cause (CONFIRMED, reproduced in-process)
+
+**Exact propagation point where the value was lost: the panel ENTRY, not the
+toggle, the Review renderer or persistence.**
+
+`backend/bot/handlers/taskloom.py::_wizard_panel()` treated the stored
+`edit:<task_id>` query as “start (or restart) the edit from the stored task”
+and called `task_wizard.draft_from_task()` on **every** dispatch:
+
+```python
+if extra.startswith("edit:"):
+    return await _start_edit(extra[len("edit:"):])   # rebuilds from the STORED task
+```
+
+The wizard panel is re-dispatched with that exact stored extra by the shared
+panel infrastructure — `panels._handle_navigation("back")` re-invokes the
+previous panel with its stored `(panel_id, extra)` from the nav stack, and any
+repaint / inline re-render of `panel:taskloom_new:edit:<id>` does the same. So
+any re-entry mid-edit silently rebuilt the whole draft from the durable
+definition, discarding every pending change — including the `show_source`
+toggle — and resetting the step back to the edit hub. Review (and the save)
+then faithfully reported the **stored** value.
+
+Deterministic pre-fix reproduction (the same sequence the user reported):
+
+```
+after toggle           : False  (step: details)
+after panel re-entry   : True   (step: edit)      <-- draft rebuilt from the stored task
+review shows           : **Show source:** Yes   <-- the reported symptom
+```
+
+Every other layer was verified correct at that HEAD and is unchanged:
+`_wizard_apply("show_source", …)` + the `instruction_problem` round-trip
+guard, `review_lines()` (derived from `build_candidate()`),
+`TaskManagementService.update_definition()` (CAS, version +1),
+`derive_policy()` and `task_execution.present_calls()`. The bug was the draft
+being thrown away before those layers ever saw the new value.
+
+## 4. Exact fix
+
+`_wizard_panel(extra="edit:<task_id>")` now **RESUMES an in-progress edit of the
+SAME task** and only reads the stored definition when an edit genuinely starts
+(no draft, or a draft for a different task):
+
+```python
+if extra.startswith("edit:"):
+    raw = extra[len("edit:"):]
+    try:
+        task_id = int(raw)
+    except (TypeError, ValueError):
+        task_id = 0
+    existing = _drafts.get(_owner())
+    if task_id and existing is not None and existing.editing_task_id == task_id:
+        return _wizard_render(existing)   # the draft is the source of truth
+    return await _start_edit(raw)
+```
+
+Unchanged and still the only explicit re-prefill: the hub's
+`⟳ Reload from task` (`action:taskloom_wizard:reload` → `_start_edit`). Cancel
+still discards the draft, and `＋ New task` (`:new`) still starts fresh — so
+the five layers now agree:
+
+| layer | source of truth |
+|---|---|
+| A — editor state | the in-progress draft |
+| B — Review | `review_lines(build_candidate(draft))` (already correct) |
+| C — durable definition | `update_definition` CAS write of the built `ai_instruction` |
+| D — next occurrence policy | `derive_policy(task.ai_instruction)` |
+| E — Telegram output | `present_calls(calls, task.ai_instruction)` |
+
+## 5. Files changed
+
+| File | Change |
+|---|---|
+| `backend/bot/handlers/taskloom.py` | `_wizard_panel` resumes an in-progress draft for the same task instead of re-prefilling from the stored definition |
+| `tests/test_bio_source_display.py` | **10 new** Bio edit-propagation regression tests (exact reported sequence, reverse direction, step/field preservation, real `panel:` dispatcher path, persistence + policy + `present_calls`, explicit reload, cancel/reopen, save/reopen, switching task) |
+| `tests/test_taskloom_editor_ux.py` | **4 new** generic editor-resume tests (same-query re-entry, real panel router, fresh session still prefills, `:new` still starts fresh) |
+
+## 6. Behaviour changed
+
+- Toggling **Show source** in an edit survives every subsequent editor step and
+  every panel re-entry (`details → schedule → review → save`).
+- Review shows the selected value; the persisted `ai_instruction` omits the
+  `show the source name` clause when OFF; `derive_policy().show_source` is
+  `False`; `present_calls()` strips the verified attribution prefix, so the Bio
+  carries only the dialogue line. Flipping it back ON keeps the attribution.
+- **Back / re-entry never discards the draft** (the reported bug); Cancel still
+  discards it, and Reload still re-prefills from the stored task.
+- No change to: source-fidelity/attribution validation, language or length
+  validation, schedule semantics, CAS/versioning, Bio Guardian, prepare-ahead,
+  `ToolExecutor`, providers, scheduler, or the database schema.
+
+## 7. Tests
+
+- `tests/test_bio_source_display.py` — **51 passed** (41 existing + 10 new)
+- `tests/test_taskloom_editor_ux.py` — **34 passed** (30 existing + 4 new)
+- focused Taskloom / wizard / source-fidelity suites — **143 passed**
+- full suite `pytest tests -q` — **2404 passed, 24 skipped, 0 failed**
+- `py_compile` on every changed file — **OK**; `git diff --check` — **clean**
+- Regression validity: the pre-fix implementation of `_wizard_panel` was
+  replayed verbatim against the new assertions and reproduces the reported
+  symptom (draft `True`, step reset, Review `Yes`), so the new tests fail under
+  the old code.
+
+## 8. Verification status
+
+- In-process verification: **performed** (handler, wizard, panel router,
+  service, repository, preparation policy and execution presentation).
+- **Live Telegram verification: NOT performed** — no production self-bot
+  session or helper bot is available in this workspace.
+- **Supabase schema impact: NONE** — no migration, no SQL, no schema file, no
+  column or table touched. The display flag continues to travel inside the
+  existing durable `ai_instruction`.
+
+## 9. Remaining limitations
+
+1. The fix guarantees the draft survives a re-entry of the SAME editor; the
+   live trigger frequency (how often the nav stack re-dispatches the stored
+   `edit:<id>` extra in production) was not observed from this workspace.
+2. A definition requiring an EXACT character length is still refused by the
+   editor rather than edited (unchanged, deliberate).
+
+## 10. Delivery
+
+- Implementation commit (source + tests):
+  `fix: keep the Taskloom edit draft across panel re-entry` — `f2e8e19`
+- Report/docs commit and remote verification: see the header of the delivery
+  section appended after the push.
+
+---
+
+# PREVIOUS PHASE — Taskloom EDITOR UX + task-list reliability
 
 ## 1. Objective
 
