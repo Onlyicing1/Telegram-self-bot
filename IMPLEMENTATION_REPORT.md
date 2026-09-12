@@ -171,6 +171,18 @@ static non-Bio tasks unaffected.
    its stop vocabulary can join the source phrase) is unchanged and out of
    scope for this phase.
 
+## 13. Delivery
+
+- Implementation commit: `feat: separate bio source attribution from source
+  display` — `28d9f0893db6f84003bf3377f7f80e150c62d5eb`
+- Push: `fc6879c..28d9f08 main -> main` (no force, no rebase)
+- `git rev-parse HEAD` == `git rev-parse origin/main` ==
+  `git ls-remote origin refs/heads/main` == `28d9f08…`
+- `git rev-list --left-right --count HEAD...origin/main` = `0 0`
+- Working tree clean; the only files touched are the nine listed in §9
+  (5 source, 3 test, this report). No schema/migration/provider/scheduler/
+  executor/guardian file was modified.
+
 ---
 
 # ARCHIVE — superseded phase reports
