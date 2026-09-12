@@ -374,7 +374,12 @@ until it is applied.
 | Item | Value |
 |---|---|
 | Starting HEAD | `40b3fb7d3a0e79f44d7cf435d0238777083e168d` |
-| Final HEAD | see the delivery commit recorded below |
-| Push result | recorded below |
-| Remote HEAD | recorded below |
-| Working tree | recorded below |
+| Implementation commit | `c9a08ae9f4f92e0771e20166b05639cb4d79f95d` — *fix: repair task scheduling, first-message task management, taskloom edit and occurrence persistence* |
+| Push result | `40b3fb7..c9a08ae  main -> main` (no force, no rebase) |
+| `origin/main` | `c9a08ae9f4f92e0771e20166b05639cb4d79f95d` |
+| `git ls-remote origin refs/heads/main` | `c9a08ae9f4f92e0771e20166b05639cb4d79f95d` |
+| `HEAD...origin/main` | `0 0` |
+| Working tree | clean (`## main...origin/main`) |
+
+This report section was updated in a follow-up docs commit that records the
+implementation SHA above; no source file changed in it.
