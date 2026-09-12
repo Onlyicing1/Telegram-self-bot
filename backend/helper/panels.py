@@ -568,9 +568,14 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         extra=extra,
     )
 
+    # The prompt is a SUB-VIEW of the panel: "Cancel" returns to the panel
+    # that owns the input. A generic nav Back here popped the panel stack
+    # instead (live: a Taskloom wizard input's Back jumped to the Taskloom
+    # home/list instead of the wizard). Home/Close are still offered.
     builder = InlinePanelBuilder()
     builder.add_row("Cancel", f"panel:{panel_id}")
-    _add_nav_buttons(builder)
+    builder.add_row("🏠 Home", "panel:_nav:home")
+    builder.add_row("❌ Close", "panel:_nav:close")
 
     built = builder.build()
     _sync_timer(chat_id or 0, msg_id or 0, panel_id, prompt, built)

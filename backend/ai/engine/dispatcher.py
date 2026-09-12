@@ -67,6 +67,27 @@ MAX_TOOL_ROUNDS = 3
 #               or been removed"), which the fresh tool result contradicted.
 _VERBATIM_READ_TOOLS = frozenset({"get_bio", "task_list"})
 
+# Read tools whose result is a PREREQUISITE for a CAS-guarded mutation in the
+# same request: task_transition/task_delete need the task's CURRENT version,
+# which only task_list/task_inspect can supply. A round that executed only
+# these tools therefore gets one continuation round before the verbatim
+# short-circuit applies (see Dispatcher._read_round_may_continue).
+_CAS_READ_TOOLS = frozenset({"task_list", "task_inspect"})
+
+
+def _read_round_may_continue(tool_calls: list[dict[str, Any]]) -> bool:
+    """True when a read-only round may be a prerequisite for a mutation.
+
+    ``task_list``/``task_inspect`` feed the CAS-guarded task lifecycle tools,
+    which require the task's CURRENT version -- so a request such as "pause
+    task 11" legitimately reads first and mutates in the next round. Such a
+    round gets one continuation instead of the immediate verbatim
+    short-circuit; when the continuation produces no further tool call, the
+    verbatim tool output is delivered exactly as before.
+    """
+    names = {call.get("name", "") for call in tool_calls}
+    return bool(names) and names <= _CAS_READ_TOOLS
+
 
 _BLOCKED_FINISH_TOKENS = ("SAFETY", "RECITATION", "CONTENT_FILTER", "BLOCKED")
 _TRUNCATED_FINISH_TOKENS = ("MAX_TOKENS", "LENGTH", "TRUNCATED")
@@ -662,6 +683,9 @@ class Dispatcher:
         # continuation just produced fresh calls that have not run yet" so
         # the exhaustion handler never re-executes and never discards.
         last_round_executed = False
+        # Verbatim read result held back for one continuation round so a
+        # read-then-mutate request can finish (see _read_round_may_continue).
+        verbatim_read_pending: str | None = None
         round_execution_failed = False
 
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -763,16 +787,31 @@ class Dispatcher:
                 # (production: a real bio was regenerated as unrelated text).
                 # Same contract as the structured-action path above.
                 if self._read_results_authoritative(response.tool_calls, exec_results):
-                    logger.info(
-                        "AI_EXEC_TRACE id=%s stage=verbatim_tool_result tools=%s",
-                        rid or "-", [er.tool_name for er in exec_results],
-                    )
-                    response = replace(
-                        response,
-                        tool_calls=[],
-                        text=self._summarize_tool_results(all_tool_results),
-                    )
-                    break
+                    if _read_round_may_continue(response.tool_calls):
+                        # Live regression: "pause task 11" resolved to a single
+                        # task_list round, the verbatim short-circuit returned
+                        # the list, and the requested mutation was never
+                        # requested again. The calls already ran, so they are
+                        # never re-executed; the verbatim text is delivered
+                        # below unless the continuation proves the request
+                        # continues with a real tool call.
+                        verbatim_read_pending = self._summarize_tool_results(all_tool_results)
+                        response = replace(response, tool_calls=[], text="")
+                        logger.info(
+                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_deferred tools=%s",
+                            rid or "-", [er.tool_name for er in exec_results],
+                        )
+                    else:
+                        logger.info(
+                            "AI_EXEC_TRACE id=%s stage=verbatim_tool_result tools=%s",
+                            rid or "-", [er.tool_name for er in exec_results],
+                        )
+                        response = replace(
+                            response,
+                            tool_calls=[],
+                            text=self._summarize_tool_results(all_tool_results),
+                        )
+                        break
             except Exception as exc:  # noqa: BLE001
                 round_execution_failed = True
                 warnings.append(f"tool_execution_round_{round_num + 1}: {exc}")
@@ -829,6 +868,25 @@ class Dispatcher:
             response = cont_response
             messages = continuation_messages
             last_round_executed = False
+            if verbatim_read_pending is not None:
+                if cont_response.tool_calls:
+                    # The model continued the request, so the read was a
+                    # PREREQUISITE (e.g. task_list -> task_transition) and its
+                    # result must not replace the final answer.
+                    verbatim_read_pending = None
+                else:
+                    # The continuation did not continue the request: the read
+                    # tool result IS the answer and reaches the owner exactly
+                    # as the tool produced it (anti-paraphrase guarantee).
+                    response = replace(
+                        cont_response, tool_calls=[], text=verbatim_read_pending
+                    )
+                    logger.info(
+                        "AI_EXEC_TRACE id=%s stage=verbatim_tool_result_delivered",
+                        rid or "-",
+                    )
+                    verbatim_read_pending = None
+                    break
 
         # ── Tool-round exhaustion: pending tool calls are NEVER silently dropped ──
         # The round limit bounds PROVIDER continuation rounds, not the current
@@ -956,6 +1014,12 @@ class Dispatcher:
 
         if accumulated_finish_reasons:
             metadata["continuation_finish_reasons"] = accumulated_finish_reasons
+
+        if verbatim_read_pending is not None and not response.text:
+            # Every continuation attempt failed or returned no text: the
+            # authoritative read result still reaches the owner verbatim.
+            response = replace(response, text=verbatim_read_pending)
+            verbatim_read_pending = None
 
         # ── Real-result response: never fabricate success ──
         # If tools executed but no final text was produced (the structured

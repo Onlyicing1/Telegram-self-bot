@@ -225,9 +225,20 @@ def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
     text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_SEND_TEXT_CHARS:
         raise TaskCandidateError("message action requires bounded nonblank text content")
-    # Only the bounded text travels forward — a model can never smuggle a
-    # destination, recipient, chat id, or raw Telegram method into the action.
-    return {"name": "send_message", "arguments": {"text": text.strip()}}
+    # Only the bounded text (plus an optional allow-listed display font) travels
+    # forward — a model can never smuggle a destination, recipient, chat id, or
+    # raw Telegram method into the action. The font key names an entry of the
+    # existing canonical display-font registry; the transform itself is applied
+    # at execution time by that same registry, never re-implemented here.
+    arguments: dict[str, Any] = {"text": text.strip()}
+    font = args.get("font")
+    if font is not None:
+        from backend.helper.font_style import is_valid_font, normalize_font_key
+
+        if not is_valid_font(font):
+            raise TaskCandidateError("message action font is not an allowed style")
+        arguments["font"] = normalize_font_key(font)
+    return {"name": "send_message", "arguments": arguments}
 
 
 class TaskCandidateError(ValueError):

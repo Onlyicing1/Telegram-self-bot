@@ -49,12 +49,23 @@ class SendMessageTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        from backend.helper.font_style import FONT_KEYS
+
         return {
             "text": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": MAX_SEND_TEXT_CHARS,
                 "description": "The exact message text to send.",
+            },
+            "font": {
+                "type": "string",
+                "enum": list(FONT_KEYS),
+                "description": (
+                    "Optional display font from the canonical font registry. "
+                    "The text is stored unchanged and styled by that registry "
+                    "when the message is sent."
+                ),
             },
         }
 
@@ -83,6 +94,19 @@ class SendMessageTool(Tool):
         text = text.strip()
         if len(text) > MAX_SEND_TEXT_CHARS:
             return ToolResult(success=False, message="Message text is too long; nothing was sent.")
+        # Optional display font: resolved against the canonical registry, so
+        # the same stored task definition always renders identically and an
+        # unknown key fails honestly instead of sending transformed-looking
+        # text that was never transformed.
+        from backend.helper.font_style import DEFAULT_FONT_KEY, apply_font, is_valid_font, normalize_font_key
+
+        font_key = arguments.get("font")
+        if font_key is not None:
+            if not is_valid_font(font_key):
+                return ToolResult(success=False, message="Unknown display font; nothing was sent.")
+            font_key = normalize_font_key(font_key)
+            if font_key != DEFAULT_FONT_KEY:
+                text = apply_font(text, font_key)
         # Destination comes from trusted runtime context, never arguments.
         # For immediate sends the chat_id is the current request chat; for
         # scheduled tasks it is the chat where the task was created (stored

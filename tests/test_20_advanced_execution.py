@@ -435,9 +435,10 @@ def test_registry_has_no_arbitrary_telegram_or_exec_tools():
     names = set(registry.list_names())
     # No ARBITRARY Telegram method / RPC / shell / file / secret access is ever
     # exposed. The single deliberate exception is the bounded ``send_message``
-    # tool: it accepts ONLY a ``text`` argument and sends exclusively to the
-    # owner's own Saved Messages chat resolved from trusted runtime context —
-    # no destination, method, or peer is ever supplied by the model.
+    # tool: it accepts ONLY a ``text`` argument (plus an optional display-font
+    # key from the existing canonical font registry — a presentation choice,
+    # never a destination/method/peer) and sends exclusively to the owner's own
+    # Saved Messages chat resolved from trusted runtime context.
     for forbidden in (
         "telegram_method", "call_rpc", "exec", "eval", "shell", "run_python",
         "forward_messages", "read_file", "get_secret", "get_env",
@@ -445,8 +446,13 @@ def test_registry_has_no_arbitrary_telegram_or_exec_tools():
         assert forbidden not in names
     tool = registry.get("send_message")
     assert tool is not None
-    assert set(tool.parameters) == {"text"}
+    assert set(tool.parameters) == {"text", "font"}
     assert tool.parameters["text"]["type"] == "string"
+    # The font is not a free-form string: it is exactly the canonical
+    # display-font allow-list, so no arbitrary value can reach Telegram.
+    from backend.helper.font_style import FONT_KEYS
+
+    assert set(tool.parameters["font"]["enum"]) == set(FONT_KEYS)
     assert tool.permission_level.value in ("read_only", "read_write")
 
 

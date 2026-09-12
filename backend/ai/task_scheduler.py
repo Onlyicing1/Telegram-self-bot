@@ -14,7 +14,21 @@ logger = logging.getLogger(__name__)
 MAX_TASKS_PER_WAKE = 10
 MAX_RECOVERY_PER_START = 100
 MAX_RETRIES_PER_WAKE = 10
+# The wake interval is the UPPER bound of one sleep, not the scheduling
+# granularity: ``run()`` sleeps until the nearest known boundary (bounded by
+# this value) so a boundary that lands just after a wake is served at that
+# boundary instead of up to a full interval late. It stays the poll ceiling
+# that also covers due retries.
 WAKE_INTERVAL_SECONDS = 60.0
+# Floor for the computed sleep — keeps a skewed/equal boundary from spinning.
+MIN_WAKE_SECONDS = 1.0
+# Bounded sweep width: more due tasks than one batch can never wait a whole
+# poll interval (10 tasks per batch x 20 sweeps = 200 due tasks per wake).
+MAX_SWEEPS_PER_WAKE = 20
+# One slow occurrence (AI preparation, provider timeout, large upload) must
+# not serialize the whole sweep behind it; executions are independent and
+# already durably claimed, so they run side by side up to this bound.
+MAX_CONCURRENT_EXECUTIONS = 4
 # Prepare-ahead: AI-assisted occurrences whose boundary is within this
 # horizon are prepared (content generated + validated, NO side effects)
 # during the interval BEFORE the boundary. The wake loop does not wait for
@@ -163,43 +177,73 @@ class TaskScheduler:
         )
         return True
 
-    async def _run_due_retries(self, reference: datetime) -> int:
-        processed = 0
-        for occurrence in await self.repository.list_due_retry_occurrences(
-            self.owner_id, reference, MAX_RETRIES_PER_WAKE
-        ):
-            try:
-                processed += await self._execute_claimed(occurrence)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Retry execution failed for occurrence %s", occurrence.occurrence_key)
-        return processed
+    async def _execute_claimed_batch(self, occurrences: list[OccurrenceRecord]) -> int:
+        """Execute already-claimed occurrences with BOUNDED concurrency.
 
-    async def run_once(self, now: datetime | None = None) -> int:
-        reference = now or datetime.now(timezone.utc)
-        processed = await self._run_due_retries(reference)
-        for task in await self.repository.list_due_tasks(self.owner_id, reference, MAX_TASKS_PER_WAKE):
-            try:
-                schedule = parse_schedule(task.schedule_type, task.schedule)
-                scheduled, following = catch_up_occurrence(schedule, task.next_run_at, reference)
-                key = occurrence_key(task.id, scheduled)
-                occurrence = await self.repository.create_occurrence(self.owner_id, {
-                    "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
-                    "action_snapshot": task.actions, "scheduled_for": scheduled,
-                })
-                claimed = False
+        Each occurrence is independent and durably claimed before it gets
+        here, and the claim CAS remains the duplicate guard, so one slow
+        occurrence (AI preparation, provider timeout, large transfer) can no
+        longer delay every other due task in the same sweep.
+        """
+        if not occurrences:
+            return 0
+        semaphore = asyncio.Semaphore(max(1, min(MAX_CONCURRENT_EXECUTIONS, len(occurrences))))
+
+        async def _one(occurrence: OccurrenceRecord) -> bool:
+            async with semaphore:
+                try:
+                    return await self._execute_claimed(occurrence)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Task execution failed for occurrence %s", occurrence.occurrence_key
+                    )
+                    return False
+
+        results = await asyncio.gather(*(_one(item) for item in occurrences))
+        return sum(1 for item in results if item)
+
+    async def _run_due_retries(self, reference: datetime) -> int:
+        due = await self.repository.list_due_retry_occurrences(
+            self.owner_id, reference, MAX_RETRIES_PER_WAKE
+        )
+        return await self._execute_claimed_batch(list(due or []))
+
+    async def _process_due_task(self, task, reference: datetime) -> tuple[int, bool]:
+        """Create the task's due occurrence, execute it, advance its boundary.
+
+        The order is deliberate and unchanged: the boundary is advanced from
+        the SCHEDULED boundary (``catch_up_occurrence``) — never from the
+        execution finish time — so a delayed wake cannot shift the recurring
+        cadence forward. The advance happens after the execution of THIS
+        task (and before the next occurrence is prepared ahead), which is what
+        keeps a durably prepared action valid at its own boundary: advancing
+        bumps the task's CAS version, and the prepared record is stamped with
+        the version that must still be current when the boundary executes.
+
+        Returns ``(counted, advanced)``.
+        """
+        try:
+            schedule = parse_schedule(task.schedule_type, task.schedule)
+            scheduled, following = catch_up_occurrence(schedule, task.next_run_at, reference)
+            key = occurrence_key(task.id, scheduled)
+            occurrence = await self.repository.create_occurrence(self.owner_id, {
+                "task_id": task.id, "occurrence_key": key, "definition_version": task.version,
+                "action_snapshot": task.actions, "scheduled_for": scheduled,
+            })
+            counted = 0
+            if occurrence is not None and occurrence.status == "claimed":
                 if self.execution_coordinator is not None:
                     # Only an occurrence whose persisted state proves it was
                     # never started may be executed here. retry_pending is
                     # owned by the bounded retry path (which honors retry_at —
                     # critical after a restart, where recovery has just armed
                     # the backoff), and running/interrupted/terminal states
-                    # belong to recovery or are already finished. The claim
-                    # CAS below remains the final duplicate guard.
-                    if occurrence.status == "claimed":
-                        claimed = await self._execute_claimed(occurrence)
-                elif occurrence.status == "claimed":
+                    # belong to recovery or are already finished. The claim CAS
+                    # in _execute_claimed is the final duplicate guard.
+                    counted = 1 if await self._execute_claimed(occurrence) else 0
+                else:
                     # No execution authority: park the occurrence for
                     # deterministic recovery (same contract as the event
                     # dispatcher) instead of leaving it silently claimed.
@@ -209,29 +253,91 @@ class TaskScheduler:
                         )
                     except ValueError:
                         pass
-                    claimed = True
-                if following is None or task.schedule_type == "once":
-                    next_run = None
-                else:
-                    next_run = following
-                await self.repository.advance_next_run(self.owner_id, task.id, task.version, next_run)
-                processed += occurrence is not None and claimed
-                if following is not None and task.schedule_type != "once":
-                    await self._prepare_next_ahead(task, following, reference)
-            except (ScheduleError, ValueError) as exc:
-                logger.warning("Task %s was not scheduled: %s", task.id, exc)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Task %s scheduling failed", task.id)
+                    counted = 1
+            next_run = None if (following is None or task.schedule_type == "once") else following
+            advanced = await self.repository.advance_next_run(
+                self.owner_id, task.id, task.version, next_run
+            )
+            if following is not None and task.schedule_type != "once":
+                await self._prepare_next_ahead(task, following, reference)
+            return counted, advanced is not None
+        except (ScheduleError, ValueError) as exc:
+            logger.warning("Task %s was not scheduled: %s", task.id, exc)
+            return 0, False
+
+    async def _run_due_sweeps(self, reference: datetime) -> int:
+        """Serve EVERY due task in this wake, bounded but not serialized.
+
+        Each sweep takes up to ``MAX_TASKS_PER_WAKE`` due tasks and runs them
+        with bounded concurrency, so one slow task (AI preparation, provider
+        timeout, large transfer) no longer delays the others, and a due task
+        that lands just after a wake is not deferred a whole poll interval.
+        Sweeps repeat until no task is due or nothing advanced (a stale
+        version), bounded by ``MAX_SWEEPS_PER_WAKE``: more due tasks than one
+        batch no longer have to wait for the next wake (starvation).
+        """
+        processed = 0
+        for _sweep in range(MAX_SWEEPS_PER_WAKE):
+            due = await self.repository.list_due_tasks(self.owner_id, reference, MAX_TASKS_PER_WAKE)
+            if not due:
+                break
+            semaphore = asyncio.Semaphore(max(1, min(MAX_CONCURRENT_EXECUTIONS, len(due))))
+
+            async def _one(task):
+                async with semaphore:
+                    try:
+                        return await self._process_due_task(task, reference)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Task %s scheduling failed", task.id)
+                        return 0, False
+
+            outcomes = await asyncio.gather(*(_one(task) for task in due))
+            progressed = False
+            for counted, advanced in outcomes:
+                processed += counted
+                progressed = progressed or advanced
+            if not progressed:
+                break
         return processed
+
+    async def run_once(self, now: datetime | None = None) -> int:
+        reference = now or datetime.now(timezone.utc)
+        processed = await self._run_due_retries(reference)
+        processed += await self._run_due_sweeps(reference)
+        return processed
+
+    async def _sleep_seconds(self) -> float:
+        """Seconds until the nearest boundary, bounded by the poll interval.
+
+        The repository hint is advisory: any failure (or no active task)
+        falls back to the plain poll interval, so this can never make the
+        loop sleep longer than ``WAKE_INTERVAL_SECONDS`` nor starve due
+        retries.
+        """
+        try:
+            hint = await self.repository.next_run_hint(self.owner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            hint = None
+        if hint is None:
+            return WAKE_INTERVAL_SECONDS
+        try:
+            delta = (hint - datetime.now(timezone.utc)).total_seconds()
+        except TypeError:
+            return WAKE_INTERVAL_SECONDS
+        return max(MIN_WAKE_SECONDS, min(WAKE_INTERVAL_SECONDS, delta))
 
     async def run(self) -> None:
         try:
             while not self._stop.is_set():
                 await self.run_once()
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=WAKE_INTERVAL_SECONDS)
+                    await asyncio.wait_for(
+                        self._stop.wait(), timeout=await self._sleep_seconds()
+                    )
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:

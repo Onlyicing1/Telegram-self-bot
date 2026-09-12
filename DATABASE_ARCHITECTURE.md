@@ -851,7 +851,7 @@ RLS is enabled. The migration grants SELECT to `anon` and `authenticated` and ad
 
 ## 16. ai_task_occurrences
 
-Durable occurrence/attempt history for `ai_tasks`. Repository migration state exists in the same migration file; live Supabase deployment is manual and unverified.
+Durable occurrence/attempt history for `ai_tasks`. The base definition lives in `20260829000001_create_ai_tasks.sql`; `preparation_metadata` was added to that file later, and because the table is created with `CREATE TABLE IF NOT EXISTS`, a database whose table predates the column never received it. `20260912000001_add_ai_task_occurrences_preparation_metadata.sql` is the idempotent repair (`ADD COLUMN IF NOT EXISTS` + the object/size CHECK constraints + a PostgREST schema-cache reload). Live Supabase deployment is manual and must be verified by the operator; the application additionally keeps the durable STATE transition working when only this optional column is missing, and reports the dropped diagnostics field explicitly (never as a durable store outage).
 
 | Column | Type | Nullable | Default / constraint |
 |---|---|---:|---|

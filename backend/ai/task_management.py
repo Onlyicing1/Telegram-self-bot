@@ -1,6 +1,7 @@
 """Owner-scoped operational management for durable tasks."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from backend.ai.database.task_repository import (
     TaskRepository,
 )
 from backend.ai.scheduling import ScheduleError, advance_interval, next_occurrence, parse_schedule
+from backend.ai.task_creation import initial_next_run
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +162,68 @@ class TaskManagementService:
 
     async def expire(self, task_id: int, expected_version: int) -> TaskRecord | None:
         return await self.set_status(task_id, "expired", expected_version)
+
+    async def update_definition(
+        self,
+        task_id: int,
+        expected_version: int,
+        candidate: dict[str, Any],
+        reference: datetime,
+    ) -> TaskRecord | None:
+        """Edit an existing task's DEFINITION through the SAME CAS update.
+
+        ``candidate`` is the same shape the wizard and the natural-language
+        path produce, so a definition edit cannot introduce a second task
+        shape or a second persistence path. The boundary is recomputed from the
+        NEW schedule with the SAME helper creation uses, occurrences are never
+        rewritten, and every future occurrence that was created (prepare-ahead)
+        but never started is discarded so the next boundary runs the new
+        definition version instead of a stale snapshot.
+
+        Returns ``None`` for a missing task or a stale ``expected_version`` —
+        nothing is written in either case.
+        """
+        current = await self.repository.get_task(self.owner_id, task_id)
+        if current is None or current.version != expected_version:
+            return None
+        schedule_type = str(candidate["schedule_type"])
+        updates: dict[str, Any] = {
+            "label": candidate["label"],
+            "schedule_type": schedule_type,
+            "schedule": dict(candidate["schedule"]),
+            "timezone": candidate["timezone"],
+            "actions": [dict(action) for action in candidate["actions"]],
+            "ai_instruction": candidate.get("ai_instruction"),
+        }
+        destination = dict(candidate.get("notification_destination") or {})
+        if destination.get("chat_id"):
+            # The destination is replaced only when the edit explicitly chose
+            # one; otherwise the task keeps its trusted stored destination.
+            updates["notification_destination"] = destination
+        try:
+            updates["next_run_at"] = initial_next_run(schedule_type, updates["schedule"], reference)
+        except ScheduleError:
+            raise
+        task = await self.repository.update_task(
+            self.owner_id, task_id, expected_version, updates
+        )
+        if task is None:
+            return None
+        try:
+            await self.repository.discard_unstarted_occurrences(
+                self.owner_id, task_id, reference
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The definition is durably updated either way; a stale unstarted
+            # occurrence is rejected at its boundary by the version check, so
+            # this is best-effort cleanup, not a correctness dependency.
+            logger.warning(
+                "Task %s: future unstarted occurrences could not be discarded after edit",
+                task_id,
+            )
+        return task
 
     async def delete(self, task_id: int, expected_version: int) -> TaskDeletionResult:
         """Physically delete the owner's task row (never a status write).

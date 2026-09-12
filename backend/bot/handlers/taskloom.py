@@ -35,6 +35,7 @@ from backend.helper import (
     register_inline_builder,
     render,
 )
+from backend.helper.font_style import FONT_KEYS
 from backend.ai import task_wizard
 from backend.ai.task_wizard import (
     ACTION_DEFINITIONS,
@@ -110,6 +111,22 @@ def _nav(builder: InlinePanelBuilder) -> None:
         ("← Back", "panel:_nav:back"),
         ("⌂ Home", "panel:_nav:home"),
     )
+
+
+def _wizard_footer(builder: InlinePanelBuilder, *, editing: bool = False) -> None:
+    """Wizard-only navigation footer (never a panel-stack Back).
+
+    The wizard owns its navigation: "← Back" is always the wizard's own
+    PREVIOUS STEP (a deterministic draft step rendered by the step branches),
+    "Cancel" exits to Taskloom, and "Close" closes the panel. No
+    ``panel:_nav:back`` is emitted anywhere in the wizard, so the shared panel
+    finalizer can never inject a stack-popping Back that jumps to Taskloom
+    home — the live regression where Back after an input submission returned
+    to the Taskloom list instead of the previous step. Back never cancels; it
+    never discards the draft.
+    """
+    builder.add_row("✕ Cancel", "panel:taskloom")
+    builder.add_row("❌ Close", "panel:_nav:close")
 
 
 async def _taskloom_panel(event, extra: str) -> tuple[str, str, list] | None:
@@ -224,6 +241,7 @@ async def _task_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         builder.add_row("● Resume", f"action:taskloom_resume:{task.id}:{task.version}")
     if task.status not in ("completed", "deleted", "expired"):
         builder.add_row("✓ Complete", f"action:taskloom_complete:{task.id}:{task.version}")
+    builder.add_row("✎ Edit", f"panel:{_WIZARD_PANEL}:edit:{task.id}")
     if task.status not in ("deleted",):
         builder.add_row("⌫ Delete", f"action:taskloom_delete:{task.id}:{task.version}")
     builder.add_row("⟳ Refresh", f"panel:taskloom_task:{task.id}")
@@ -405,7 +423,6 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         for key in ACTION_ORDER:
             definition = ACTION_DEFINITIONS[key]
             builder.add_row(definition.button, f"action:taskloom_wizard:set:action:{key}")
-        builder.add_row("✕ Cancel", "panel:taskloom")
     elif step == STEP_CONTENT:
         lines.append("How should the content be produced each run?")
         builder.add_row("✨ AI-generated (fresh each run)", "action:taskloom_wizard:set:mode:ai")
@@ -443,6 +460,18 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
             lines.append("Text to use every run:")
             lines.append(f"`{draft.text.strip() or '— not set —'}`")
             builder.add_row("Enter text…", f"input:{_WIZARD_PANEL}:text")
+            if definition is not None and definition.key == "message":
+                # The display font is the EXISTING canonical font registry
+                # (backend.helper.font_style) — exposed here, applied by the
+                # send tool at execution time, never re-implemented.
+                lines.append(f"Font: {task_wizard.font_label(draft.font)}")
+                if draft.font != "default":
+                    lines.append(f"Preview: {task_wizard.font_preview(draft.font)}")
+                builder.add_row("Font…", f"input:{_WIZARD_PANEL}:font")
+                if draft.font != "default":
+                    builder.add_row(
+                        "Clear font", "action:taskloom_wizard:set:font:default"
+                    )
         builder.add_row("Next: schedule →", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
         back_step = (
             STEP_CONTENT
@@ -476,12 +505,16 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         for key, value in rows:
             lines.append(f"**{key}:** {value}")
         if rows:
-            builder.add_row("✔ Create task", "action:taskloom_wizard:create")
+            builder.add_row(
+                "✔ Save changes" if draft.editing_task_id else "✔ Create task",
+                "action:taskloom_wizard:create",
+            )
         builder.add_row("← Back", f"action:taskloom_wizard:step:{STEP_SCHEDULE}")
         builder.add_row("✕ Cancel", "panel:taskloom")
 
-    _nav(builder)
-    return "＋ New task", "\n".join(lines), builder.build()
+    _wizard_footer(builder, editing=bool(draft.editing_task_id))
+    title = f"✎ Edit task #{draft.editing_task_id}" if draft.editing_task_id else "＋ New task"
+    return title, "\n".join(lines), builder.build()
 
 
 def _schedule_line(draft: TaskDraft) -> str:
@@ -508,7 +541,40 @@ def _schedule_line(draft: TaskDraft) -> str:
 
 
 async def _wizard_panel(event, extra: str) -> tuple[str, str, list] | None:
+    """Render the wizard; ``edit:<task_id>`` opens it prefilled for that task."""
+    extra = (extra or "").strip()
+    if extra.startswith("edit:"):
+        return await _start_edit(extra[len("edit:"):])
     return _wizard_render(_draft())
+
+
+async def _start_edit(raw_task_id: str) -> tuple[str, str, list]:
+    """Open the wizard in EDIT mode for one of the owner's own tasks.
+
+    The prefill comes from the STORED definition only (trusted values); the
+    confirmed result is persisted through the SAME CAS update path
+    (``TaskManagementService.update_definition``), never a second task
+    definition or a second persistence path.
+    """
+    from backend.helper.inline_engine import _owner_id
+
+    owner = _owner_id
+    try:
+        task_id = int(raw_task_id)
+    except (TypeError, ValueError):
+        return "Taskloom", "× Invalid task id.", []
+    view = await _service(owner).inspect(task_id, occurrence_limit=1)
+    if view is None:
+        return "Taskloom", "× Task not found.", []
+    try:
+        draft = task_wizard.draft_from_task(view.task)
+    except TaskWizardError as exc:
+        return f"Task #{task_id}", f"× {exc}", []
+    draft = draft.updated(
+        notice=f"Editing task #{task_id} · v{view.task.version}"
+    )
+    _store(draft, owner)
+    return _wizard_render(draft, owner)
 
 
 async def _wizard_inline_builder(event, extra: str) -> list:
@@ -557,6 +623,13 @@ def _wizard_apply(draft: TaskDraft, field: str, raw: str) -> TaskDraft:
             if problem:
                 raise TaskWizardError(problem)
             return trial.updated(notice="")
+        if field == "font":
+            key = " ".join((raw or "").split()).lower()
+            if key in ("", "none", "default", "clear", "off", "-"):
+                return draft.updated(font="default", notice="")
+            if not task_wizard.valid_font_key(key):
+                raise TaskWizardError("unknown font key")
+            return draft.updated(font=key, notice="")
         if field == "label":
             trial = draft.updated(hide_speaker_label=raw == "1")
             problem = task_wizard.instruction_problem(trial)
@@ -573,30 +646,63 @@ def _wizard_apply(draft: TaskDraft, field: str, raw: str) -> TaskDraft:
 async def _wizard_create(draft: TaskDraft, chat_id: int) -> tuple[str, str, list]:
     owner = _owner()
     now = datetime.now(timezone.utc)
-    problem = task_wizard.missing_requirement(draft, chat_id, now)
+    # Edit mode keeps the task's STORED destination: the candidate is built
+    # without inventing one, and the update path only replaces it when the
+    # edit explicitly chose a chat.
+    effective_chat = 0 if draft.editing_task_id else chat_id
+    problem = task_wizard.missing_requirement(draft, effective_chat, now)
     if problem is not None:
         return _wizard_render(draft.updated(step=STEP_REVIEW, notice=f"× {problem}"))
     try:
         from backend.ai.task_candidate import TaskCandidate
-        from backend.ai.task_creation import TaskCreationService
         from backend.ai.database.manager import get_repository_manager
 
-        candidate = task_wizard.build_candidate(draft, chat_id, now)
+        candidate = task_wizard.build_candidate(draft, effective_chat, now)
         validated = TaskCandidate.from_untrusted(candidate)
-        service = TaskCreationService(get_repository_manager().task, owner)
-        task = await service.create(validated, now)
+        repository = get_repository_manager().task
+        if draft.editing_task_id:
+            from backend.ai.task_management import TaskManagementService
+
+            task = await TaskManagementService(repository, owner).update_definition(
+                draft.editing_task_id,
+                draft.editing_version,
+                validated.as_creation_candidate(),
+                now,
+            )
+            if task is None:
+                return _wizard_render(
+                    draft.updated(
+                        step=STEP_REVIEW,
+                        notice=(
+                            "× The task changed since the form was opened "
+                            "(stale version); nothing was saved."
+                        ),
+                    )
+                )
+        else:
+            from backend.ai.task_creation import TaskCreationService
+
+            task = await TaskCreationService(repository, owner).create(validated, now)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Taskloom wizard creation failed")
+        logger.exception("Taskloom wizard persistence failed")
         return _wizard_render(
-            draft.updated(step=STEP_REVIEW, notice=f"× Creation failed ({type(exc).__name__}); nothing durable was created.")
+            draft.updated(step=STEP_REVIEW, notice=f"× Save failed ({type(exc).__name__}); nothing durable was written.")
         )
     _drafts.pop(owner, None)
-    note = f"✓ Task #{task.id} created — {task.label}"
+    note = (
+        f"✓ Task #{task.id} updated · v{task.version}"
+        if draft.editing_task_id
+        else f"✓ Task #{task.id} created — {task.label}"
+    )
     fallback_backend = getattr(task, "fallback_backend", None)
     if fallback_backend:
         from backend.ai.task_management_interface import fallback_note
         note += f" (memory only — not durable)\n\n{fallback_note(str(getattr(task, 'fallback_reason', '') or ''))}"
-    refreshed = await _taskloom_panel(None, "")
+    refreshed = (
+        await _task_detail_panel(None, str(task.id))
+        if draft.editing_task_id
+        else await _taskloom_panel(None, "")
+    )
     if refreshed is None:
         return "Taskloom", note, []
     title, body, buttons = refreshed
@@ -692,6 +798,16 @@ def _wizard_input_handler(field: str):
                 at = task_wizard.parse_once_at(text)
                 draft = draft.updated(schedule_type="once", once_at=at)
                 notice = f"✓ Once at {at.replace('T', ' ')[:16]}"
+            elif field == "font":
+                key = " ".join((text or "").split()).lower()
+                if key in ("", "none", "default", "clear", "off", "-"):
+                    draft = draft.updated(font="default")
+                    notice = "✓ Font: Default"
+                else:
+                    if not task_wizard.valid_font_key(key):
+                        raise TaskWizardError("unknown font key")
+                    draft = draft.updated(font=key)
+                    notice = f"✓ Font: {task_wizard.font_label(key)}"
             elif field == "tz":
                 zone = " ".join((text or "").split())
                 if not task_wizard.valid_timezone(zone):
@@ -736,6 +852,12 @@ _INPUT_PROMPTS = {
     "weekly": "**Weekly time**\n\nSend a weekday and time (e.g. `Monday 09:30`).\n\n_Reply below._",
     "once": "**Start time**\n\nSend the local start as YYYY-MM-DD HH:MM (e.g. `2026-09-20 09:30`).\n\n_Reply below._",
     "tz": "**Timezone**\n\nSend an IANA timezone (e.g. `Asia/Tehran`).\n\n_Reply below._",
+    "font": (
+        "**Display font**\n\n"
+        "Send one of:\n`"
+        + "`\n`".join(FONT_KEYS)
+        + "`\n\nor `none` to use the system font.\n\n_Reply below._"
+    ),
 }
 
 

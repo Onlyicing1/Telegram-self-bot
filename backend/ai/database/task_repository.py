@@ -5,6 +5,7 @@ import copy
 import errno
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,6 +60,60 @@ _LOCAL_RESOURCE_ERRNOS = frozenset(
     )
     if code
 )
+
+# Exactly one occurrence column is pure DIAGNOSTICS: ``preparation_metadata``
+# stores the prepared-action audit record (and, for a single-action AI task, the
+# durably prepared action). It is written on the same update that performs the
+# real state transition, so a schema-cache drift on THIS column (live:
+# PGRST204 "Could not find the 'preparation_metadata' column") would otherwise
+# cost the durable status change itself. The transition is retried without an
+# optional audit field when (and only when) the status really changes, so the
+# durable state is persisted honestly and the dropped field is reported.
+_OPTIONAL_OCCURRENCE_AUDIT_FIELDS = frozenset({"preparation_metadata"})
+_UNKNOWN_COLUMN_RE = re.compile(r"could not find the '([^']+)' column", re.IGNORECASE)
+
+
+def _missing_column(exc) -> str | None:
+    """The column named by a PostgREST "column not found" error, if any."""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for text in (getattr(current, "message", None), str(current)):
+            if isinstance(text, str):
+                match = _UNKNOWN_COLUMN_RE.search(text)
+                if match:
+                    return match.group(1).strip()
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _is_unknown_column_error(exc) -> bool:
+    """True when the failure is PostgREST's unknown-column/PGRST204 error."""
+    if _missing_column(exc) is not None:
+        return True
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if str(getattr(current, "code", "") or "").upper() == "PGRST204":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _drifted_optional_audit_field(exc, outgoing: dict) -> str | None:
+    """The single optional audit field a schema-drift error refers to.
+
+    Returns a key only when the error is a genuine unknown-column/PGRST204
+    failure AND exactly one optional audit field is present in the update, so
+    a drift on a REQUIRED column is never silently stripped.
+    """
+    if not _is_unknown_column_error(exc):
+        return None
+    present = [key for key in outgoing if key in _OPTIONAL_OCCURRENCE_AUDIT_FIELDS]
+    return present[0] if len(present) == 1 else None
+
 
 # A local OS resource failure is a transient condition of THIS process, and
 # every incoming Telegram event would otherwise re-issue the same doomed
@@ -220,6 +275,8 @@ class TaskRepository:
     async def list_due_retry_occurrences(self, owner_id, now, limit=10): raise NotImplementedError
     async def claim_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
+    async def next_run_hint(self, owner_id): raise NotImplementedError
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference): raise NotImplementedError
 
 class InMemoryTaskRepository(TaskRepository):
     def __init__(self, id_floor: int = 0):
@@ -246,6 +303,27 @@ class InMemoryTaskRepository(TaskRepository):
     async def list_tasks(self, owner_id): return [_copy(r) for r in self._tasks.values() if r.owner_id==owner_id]
     async def list_due_tasks(self, owner_id, now, limit=10):
         ref=_parse_dt(now); return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.next_run_at is not None and r.next_run_at<=ref], key=lambda r:(r.next_run_at,r.id))[:max(0,limit)]
+    async def next_run_hint(self, owner_id):
+        """Earliest FUTURE boundary among the owner's active tasks, or None.
+
+        Advisory only (the wake loop bounds its own sleep): it lets the
+        scheduler sleep until the nearest boundary instead of a fixed poll,
+        so a task is neither late nor polled every minute forever.
+        """
+        ref=_now(); upcoming=[r.next_run_at for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.next_run_at is not None and r.next_run_at>ref]
+        return min(upcoming) if upcoming else None
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference):
+        """Remove the task's FUTURE, never-started occurrences.
+
+        Used by the definition-edit path: an unstarted (`claimed`, not yet
+        due) occurrence carries the OLD definition_version/action_snapshot,
+        so it must not execute after the task was edited. Started/terminal
+        occurrences are history and are never touched.
+        """
+        ref=_parse_dt(reference)
+        removed=[k for k,occ in self._occurrences.items() if occ.owner_id==owner_id and occ.task_id==task_id and occ.status=="claimed" and occ.scheduled_for is not None and ref is not None and occ.scheduled_for>ref]
+        for key in removed: del self._occurrences[key]
+        return len(removed)
     async def list_event_tasks(self, owner_id, limit=10):
         return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.schedule_type=="event"], key=lambda r:r.id)[:max(0,limit)]
     async def update_task(self, owner_id, task_id, expected_version, updates):
@@ -306,7 +384,7 @@ class SupabaseTaskRepository(TaskRepository):
         self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False;self._fallback_reason=""
         # Bounded local-resource cooldown (monotonic deadline; 0.0 = inactive)
         # and "this continuous degradation episode was already reported".
-        self._local_resource_until=0.0;self._degraded_announced=False
+        self._local_resource_until=0.0;self._degraded_announced=False;self._audit_drop_announced=False
         # Highest durable task id this process has observed. PostgreSQL's
         # bigserial sequence stays the ONLY allocator of durable ids; this is
         # never written to the database — it is only a floor handed to the
@@ -343,6 +421,7 @@ class SupabaseTaskRepository(TaskRepository):
         self._fallback_reason = ""
         self._local_resource_until = 0.0
         self._degraded_announced = False
+        self._audit_drop_announced = False
     def _in_local_resource_cooldown(self) -> bool:
         """True while the bounded post-local-failure window is still open."""
         return time.monotonic() < self._local_resource_until
@@ -515,6 +594,26 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").lte("next_run_at",_serialize(now)).order("next_run_at").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
         except Exception as exc:self._degrade("Supabase due task query failed; using fallback: %s",exc);return await self._fallback.list_due_tasks(owner_id,now,limit)
+    async def next_run_hint(self, owner_id):
+        """Earliest future boundary (advisory). Never degrades the store."""
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("next_run_at").eq("owner_id",owner_id).eq("status","active").order("next_run_at").limit(1).execute())
+        except asyncio.CancelledError:raise
+        except Exception:return None
+        rows=getattr(result,"data",None) or []
+        if not rows:return None
+        return _parse_dt(rows[0].get("next_run_at"))
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference):
+        """Delete the task's future, never-started occurrences (edit path)."""
+        try:
+            result=await self._run_checked(lambda:self._client.table("ai_task_occurrences").delete().eq("owner_id",owner_id).eq("task_id",task_id).eq("status","claimed").gt("scheduled_for",_serialize(reference)).execute())
+            self._mark_supabase_ok()
+            rows=getattr(result,"data",None)
+            return len(rows) if isinstance(rows,list) else 0
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase unstarted occurrence discard failed; using fallback: %s",exc)
+            return await self._fallback.discard_unstarted_occurrences(owner_id,task_id,reference)
     async def list_event_tasks(self, owner_id, limit=10):
         try:
             result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").eq("schedule_type","event").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
@@ -619,6 +718,9 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").update({"status":"running","claimed_at":current.claimed_at.isoformat() if current.claimed_at else now,"started_at":now,"updated_at":now}).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
         except Exception as exc:self._degrade("Supabase occurrence claim failed; using fallback: %s",exc);return await self._fallback.claim_occurrence(owner_id,task_id,occurrence_key)
+    async def _occurrence_transition_write(self, owner_id, task_id, occurrence_key, current_status, outgoing):
+        """One CAS update: only the row still in ``current_status`` may move."""
+        return await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current_status).execute())
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current:return None
@@ -628,9 +730,35 @@ class SupabaseTaskRepository(TaskRepository):
         candidate={**current.as_dict(),**updates,"status":status};_validate_occurrence_input(candidate);outgoing={k:_serialize(v) for k,v in updates.items()};outgoing["status"]=status;outgoing["updated_at"]=_now().isoformat()
         if status in _TERMINAL_OCCURRENCE_STATUSES:outgoing.setdefault("finished_at",_now().isoformat())
         try:
-            result=await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+            result=await self._occurrence_transition_write(owner_id,task_id,occurrence_key,current.status,outgoing)
         except (ValueError,TypeError):raise
-        except Exception as exc:self._degrade("Supabase occurrence transition failed; using fallback: %s",exc);return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
+        except Exception as exc:
+            # A schema-cache drift on the OPTIONAL diagnostics column must
+            # not cost the durable STATE transition (live: an occurrence whose
+            # actions already ran could not be marked succeeded, so recovery
+            # reported a false failure — and a retry could repeat a completed
+            # Telegram side effect). The status change is retried without the
+            # audit field; if that also fails the store is honestly degraded.
+            result=None
+            drifted=_drifted_optional_audit_field(exc,outgoing) if status!=current.status else None
+            if drifted is not None:
+                trimmed={k:v for k,v in outgoing.items() if k!=drifted}
+                try:
+                    result=await self._occurrence_transition_write(owner_id,task_id,occurrence_key,current.status,trimmed)
+                except asyncio.CancelledError:raise
+                except Exception:result=None
+                if result is not None:
+                    if not self._audit_drop_announced:
+                        self._audit_drop_announced=True
+                        logger.warning(
+                            "TASK_OCCURRENCE_AUDIT_FIELD_DROPPED repository=%s column=%s status=%s "
+                            "exception=%s detail=%s durable_state_transition=persisted",
+                            type(self).__name__,drifted,status,type(exc).__name__,str(exc)[:160],
+                        )
+            if result is None:
+                self._degrade("Supabase occurrence transition failed; using fallback: %s",exc)
+                return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
+        row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
 
 def get_task_repository():
     """Return the process-wide task repository (single authority).

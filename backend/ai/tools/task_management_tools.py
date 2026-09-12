@@ -221,7 +221,10 @@ class TaskTransitionTool(Tool):
 
         task_id = _coerce_positive_int(arguments.get("task_id"))
         version = _coerce_positive_int(arguments.get("expected_version"))
-        status = str(arguments.get("action") or "").strip().lower()
+        # ``action_status`` is the JSON-action field name; native tool calls use
+        # ``action``. Both names resolve here so one request shape is never
+        # silently rejected as "unsupported status" on the fallback path.
+        status = str(arguments.get("action") or arguments.get("action_status") or "").strip().lower()
         if task_id is None:
             return ToolResult(success=False, message="A positive task_id is required.")
         if version is None:
@@ -248,11 +251,26 @@ class TaskTransitionTool(Tool):
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task transition failed: {exc}")
         if task is None:
+            # A stale version is the common first-message failure: the owner
+            # asked to pause a task the model had read in an earlier round.
+            # Report the CURRENT version so the very next round can retry
+            # deterministically instead of guessing or giving up.
+            current = await service.repository.get_task(service.owner_id, task_id)
+            if current is not None:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"Task #{task_id} was not changed: version {version} is "
+                        f"stale (it is now v{current.version}). Retry with "
+                        f"expected_version={current.version}."
+                    ),
+                    data={"task_id": int(task_id), "current_version": int(current.version)},
+                )
             return ToolResult(
                 success=False,
                 message=(
-                    f"Task #{task_id} not found, ownership check failed, or "
-                    f"version {version} is stale. Nothing was changed."
+                    f"Task #{task_id} not found or ownership check failed. "
+                    "Nothing was changed."
                 ),
             )
         _STATUS_VERB = {
@@ -392,13 +410,23 @@ class TaskDeleteTool(Tool):
                     ),
                 )
             if result.outcome == DELETION_STALE:
+                current = await service.repository.get_task(service.owner_id, task_id)
+                current_version = getattr(current, "version", None)
+                detail = (
+                    f"it is now v{current_version}"
+                    if isinstance(current_version, int)
+                    else "the task changed after you read it"
+                )
+                data: dict[str, Any] = {"task_id": int(task_id), "deleted": False}
+                if isinstance(current_version, int):
+                    data["current_version"] = current_version
                 return ToolResult(
                     success=False,
                     message=(
                         f"Task #{task_id} was not deleted: version {version} is "
-                        "stale (the task changed after you read it). Read it "
-                        "again and retry."
+                        f"stale ({detail}). Retry with the current version."
                     ),
+                    data=data,
                 )
             return ToolResult(
                 success=False,

@@ -32,6 +32,26 @@ class TaskCreationError(ValueError):
     """Candidate task data is invalid or cannot be scheduled."""
 
 
+def initial_next_run(
+    schedule_type: str, schedule_payload: dict[str, Any], reference: datetime
+) -> datetime | None:
+    """Resolve the first boundary of a schedule (ONE implementation).
+
+    Shared by task creation and the task-definition edit path so an edit can
+    never compute a different next run than a create for the same schedule.
+    Event schedules have no wall-clock time (``None``); a brand-new interval
+    schedule has no previous occurrence, so its first run is one interval
+    after the reference and the scheduler anchors later occurrences itself.
+    """
+    parsed = parse_schedule(schedule_type, schedule_payload)
+    if schedule_type == "interval":
+        interval = getattr(parsed, "interval", None)
+        if not isinstance(interval, timedelta) or interval <= timedelta(0):
+            raise ScheduleError("interval must be positive")
+        return advance_interval(reference, interval, reference)
+    return next_occurrence(parsed, reference)
+
+
 class TaskCreationService:
     def __init__(self, repository: TaskRepository, owner_id: int) -> None:
         if not isinstance(owner_id, int) or owner_id <= 0:
@@ -74,26 +94,17 @@ class TaskCreationService:
                 f"(task={candidate.get('timezone')} schedule={candidate['schedule'].get('timezone')})"
             )
         try:
-            schedule = parse_schedule(candidate["schedule_type"], candidate["schedule"])
             initial = candidate.get("next_run_at")
             if candidate["schedule_type"] == "event":
                 # Event-triggered tasks have no wall-clock time: next_run_at
                 # stays None (the event handler drives executions) and the
                 # UI reports the trigger, never a fake run time.
+                parse_schedule("event", candidate["schedule"])
                 initial = None
             elif initial is None:
-                if candidate["schedule_type"] == "interval":
-                    # A brand-new recurring interval task has no previous
-                    # occurrence, so `next_occurrence` (which requires one for
-                    # intervals) cannot anchor it. Schedule the first run one
-                    # interval after the reference time; the scheduler advances
-                    # subsequent occurrences through its normal catch-up path.
-                    interval = getattr(schedule, "interval", None)
-                    if not isinstance(interval, timedelta) or interval <= timedelta(0):
-                        raise ScheduleError("interval must be positive")
-                    initial = advance_interval(reference, interval, reference)
-                else:
-                    initial = next_occurrence(schedule, reference)
+                initial = initial_next_run(
+                    candidate["schedule_type"], candidate["schedule"], reference
+                )
         except (ScheduleError, TypeError, ValueError) as exc:
             _creation_trace("schedule_invalid", schedule_type=str(candidate.get("schedule_type")), error=str(exc)[:120])
             raise TaskCreationError(str(exc)) from exc

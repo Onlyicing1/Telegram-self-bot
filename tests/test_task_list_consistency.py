@@ -415,9 +415,13 @@ async def test_task_list_result_is_verbatim_authoritative():
     assert result.success is True
     assert f"Task #{created.id}" in result.response
     assert "bio update" in result.response
-    # The fabrication never reached the owner: no continuation round ran.
+    # A task-list round is given ONE continuation round, because the same read
+    # tools are the prerequisite for a CAS-guarded mutation (task_list ->
+    # task_transition / task_delete). The guarantee under test is unchanged and
+    # is what matters: the continuation's fabricated narration NEVER reaches
+    # the owner — the real tool result is delivered verbatim instead.
+    assert provider.calls == 2
     assert "may have completed or been removed" not in result.response
-    assert provider.calls == 1
 
 
 # ── G: task_count always matches the returned ids ───────────────────────────
