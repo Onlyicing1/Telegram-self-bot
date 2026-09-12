@@ -1,14 +1,266 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
 > **This is a CURRENT-STATE document.** It describes the repository as it
-> exists at the tip of the LATEST phase (Bio Taskloom “Show source” EDIT
-> propagation). Earlier phase reports are preserved verbatim below, in
+> exists at the tip of the LATEST phase (Taskloom input/commit UX + external
+> call efficiency). Earlier phase reports are preserved verbatim below, in
 > most-recent-first order. If code changes invalidate any section, update this
 > document in the same commit.
 
 ---
 
-# CURRENT PHASE — Bio Taskloom “Show source” EDIT propagation
+# CURRENT PHASE — Taskloom input/commit UX + external-call efficiency
+
+## 1. Objective
+
+**Part A — Taskloom input/commit UX.** When a Taskloom step asks for a
+variable (interval, daily time, weekly time, timezone, text, source, maximum
+length, font), the entered value must visibly COMMIT into the current draft and
+the step must re-render with that value, instead of leaving the owner in the
+ambiguous "still being entered" state. Back must always mean "the previous
+logical step in the current wizard/editor", never "Taskloom home"; Back and
+Cancel must stay distinct.
+
+**Part B — external-call efficiency.** Render shows rising service-initiated
+outbound traffic. Before changing anything, trace every external call one AI
+request actually makes; fix only CONFIRMED redundant work and leave required
+work in place. No cache layer, retry loop, second scheduler/executor or
+provider change.
+
+## 2. Implementation phase
+
+`Phase: Taskloom input/commit UX + external-call efficiency`
+(starting HEAD `067897b45c7f56d288949d9c4024ff24f032c1c1`).
+
+Source-first: the current GitHub source at that HEAD was traced before any
+edit; older phase reports were used as context only.
+
+---
+
+## 3. PART A — Taskloom input / commit UX
+
+### 3.1 The traced input lifecycle
+
+`input:<panel>:<field>` callback → `helper.panels._handle_input` renders the
+field PROMPT (`_INPUT_PROMPTS[field]`) with a footer → the owner replies →
+`inline_sender`'s pending-input listener hands the text to the registered
+handler `taskloom._wizard_input_handler(field)` → validate →
+`draft.updated(...)` (or `notice = "× …"` on failure) → `_store(draft)` →
+`taskloom._wizard_finish(notice, …)` re-renders the panel message.
+
+### 3.2 CONFIRMED defects (all three reproduced in-process)
+
+**A1. A committed field never left the prompt when the helper bot was
+disabled.** `_wizard_finish` closed the input ONLY through the helper bot:
+
+```python
+helper = get_client()
+if helper and inline_chat_id and inline_msg_id:      # helper disabled ⇒ NOTHING runs
+    await helper.edit_message(...)
+if _self_client:
+    await _self_client.delete_messages(chat_id, [msg_id])
+```
+
+A disabled helper (`BOT_TOKEN` unset) is a documented VALID runtime state
+(AGENTS §10), and the fallback is the self client's edit-in-place text panel.
+Without it the value WAS committed to the draft and the owner's reply WAS
+deleted, but the panel message kept showing the input prompt — the exact
+"it still looks like I am entering the value" symptom.
+
+**A2. The shared input prompt had no Back and no real discard.** Its first row
+was `("Cancel", "panel:<owner>")`: the label said Cancel but the target merely
+re-opened the owning panel, i.e. a Back that preserves. There was no control
+that actually discarded, and no row the wizard could label "← Back".
+
+**A3. The EDIT hub had no Back at all.** Its only exits were
+`✕ Cancel edit` (discard → task detail) and `❌ Close`, so the required chain
+`edit hub → Back → task detail` was not representable and Back (preserve) and
+Cancel (discard) were conflated into one control.
+
+### 3.3 Exact fix
+
+- `_wizard_finish` now edits the panel message through the helper bot when it
+exists and through `inline_engine._self_client` when it does not (the
+documented text-panel fallback); if the rich panel edit raises it retries with
+the notice-only edit, so a commit is never silent.
+- `helper/panels._handle_input` renders the prompt's first row as
+  `("← Back", input_cfg.get("back") or f"panel:{panel_id}")` — it re-opens the
+owning panel, which renders its CURRENT step from live state with the draft
+  intact — and appends any `extra_rows` the panel declares.
+- Every Taskloom field input declares
+  `extra_rows = (("✕ Cancel", "action:taskloom_wizard:cancel"),)`, which really
+  DISCARDS the draft through the existing mode-aware cancel (edit → the edited
+  task's detail, create → the Taskloom list).
+- The EDIT hub gains `← Back` → `action:taskloom_wizard:leave`, which returns
+to the edited task's DETAIL view and PRESERVES the draft (an in-place action,
+so the nav stack is untouched); `✕ Cancel edit` remains the only discard.
+
+### 3.4 Committed navigation semantics (exact)
+
+| control | target | draft |
+|---|---|---|
+| field input `← Back` | `panel:taskloom_new` → the step that opened the input | preserved |
+| field input `✕ Cancel` | `action:taskloom_wizard:cancel` → detail (edit) / list (create) | discarded |
+| hub `← Back` | `action:taskloom_wizard:leave` → edited task's detail | preserved |
+| hub `✕ Cancel edit` | `action:taskloom_wizard:cancel` → edited task's detail | discarded |
+| step `← Back` (create) | ACTION ← CONTENT ← DETAILS ← SCHEDULE ← REVIEW | preserved |
+| step `← Back` (edit) | always the edit hub | preserved |
+
+No wizard/editor step emits `panel:_nav:back`. An input never navigates the
+wizard: after a successful reply the draft step is unchanged and the step is
+re-rendered with the committed value; after a failed reply the step is
+unchanged too, the rest of the draft survives, and the error is shown.
+
+---
+
+## 4. PART B — external-call audit
+
+### 4.1 Call graph — one ordinary trigger/reply AI message
+
+Before provider selection (`ai_unified.register`):
+
+| step | call | external? |
+|---|---|---|
+| trigger resolve (`_load_triggers`, 60 s TTL) | `ai_config` SELECT via `get_config` | 1 read on a cold cache, 0 warm |
+| reply-to-AI sniff (reply only) | Telegram `get_reply_message()` | 1 **← was 2** |
+| reply-resolver lookup | in-process | 0 |
+| config restore (`_restore_config` → `apply_persisted_config`) | `ai_config` SELECT via `get_config` | 1 **← was a 2nd read** |
+| reply-context extraction (reply only) | Telegram `get_reply_message()` | 1 **← was a 2nd fetch** |
+| media classify | in-process | 0 |
+
+Context construction (`ContextBuilder` / `PromptBuilder`):
+
+| step | call | external? |
+|---|---|---|
+| conversation history (`get_history(n=20)`) | in-process session registry | no |
+| memory (`retrieve_for_prompt`) | in-process memory tiers (`memory/manager.py` only reads its own stores) | no |
+| preferences (`_load_preferences` → `get_or_create`) | in-process — only `InMemoryPreferencesRepository` exists | no |
+| prompt assembly + token budget | pure | no |
+
+Execution and persistence: provider HTTP (1 + the existing fallback contract);
+tool rounds through the single `ToolExecutor` (Supabase/Telegram only as the
+tool requires); `_persist_usage` and `_add_message` → `persistence.schedule_audit`
+(bounded, durable audit writes — REQUIRED, kept); `record_request` (a TARGETED
+`ai_config` UPDATE, not a config rewrite — kept).
+
+Independent of the AI path, every incoming Telegram message reaches
+`TaskEventDispatcher.handle_event` → one `ai_tasks` SELECT (owner + active +
+`schedule_type=event`, `limit=10`).
+
+### 4.2 Findings
+
+| # | finding | class | action |
+|---|---|---|---|
+| 1 | `ai_config` read TWICE per cold-cache request: `get_triggers()` is implemented as `get_config()` (`config_store.py:242`), then `apply_persisted_config` read it again | **CONFIRMED** | FIXED — the trigger resolve returns its snapshot and the restore reuses it |
+| 2 | the replied Telegram message was fetched TWICE per reply-triggered request (reply-to-AI sniff + reply-context extraction) | **CONFIRMED** | FIXED — the object is fetched once and threaded through |
+| 3 | with the helper disabled the panel stayed on the prompt after a commit (A1 above) | **CONFIRMED** | FIXED |
+| 4 | memory retrieval, preferences loading and prompt assembly make NO network call | **CONFIRMED** (verified in source) | kept |
+| 5 | `record_request` does not rewrite the config; `_persist_usage`/`_add_message` go through the bounded `schedule_audit` path | **CONFIRMED** (verified in source) | kept |
+| 6 | the per-message `ai_tasks` event query is one PostgREST round trip per Telegram message | **LIKELY** | kept — REQUIRED for event-triggered tasks, already owner/status/type filtered and `limit`ed; avoiding it would need a cache, which is out of scope |
+| 7 | which caller dominates Render's service-initiated bandwidth | **UNKNOWN** | not claimed; no instrumentation was added (a per-request counter would itself add log traffic) |
+
+### 4.3 Changes (Part B)
+
+Only the two CONFIRMED duplicates were removed:
+
+- `backend/bot/handlers/ai_unified.py` — `_load_triggers` returns the
+  `ai_config` snapshot it read; `_execute_ai`/`_restore_config` thread it into
+  `apply_persisted_config`; the activation handler fetches the replied message
+  ONCE (sentinel `_REPLY_UNFETCHED` distinguishes "not fetched" from "no
+  reply") and passes it to `_extract_reply_context`.
+- `backend/ai/engine/engine.py` — `apply_persisted_config(owner_id, config=None)`
+  accepts the caller's snapshot; omitted ⇒ it reads, so this stays the single
+  restore entry point. Nothing is cached across requests.
+
+---
+
+## 5. Files changed
+
+`backend/bot/handlers/taskloom.py` · `backend/helper/panels.py` ·
+`backend/bot/handlers/ai_unified.py` · `backend/ai/engine/engine.py` ·
+`tests/test_taskloom_input_ux.py` (new, 15) ·
+`tests/test_external_call_efficiency.py` (new, 9) ·
+`tests/test_taskloom_editor_ux.py` · `tests/test_task_wizard_nl_bridge.py` ·
+`tests/test_18_ai_execution_agent.py` · `IMPLEMENTATION_REPORT.md`.
+
+`tests/test_task_wizard_nl_bridge.py` and `tests/test_18_ai_execution_agent.py`
+were adjusted only because their local `_restore_config` stubs still had the
+old one-argument signature — the contract they assert is unchanged.
+
+## 6. Tests
+
+Part A (`tests/test_taskloom_input_ux.py`, 15) — prompt row contract for every
+field; the daily input commits into the draft and the SAME step renders
+`Schedule: Daily at 23:30` / `Timezone: Asia/Tehran`; a valid input never
+leaves the panel on the prompt (helper bot, and the self-client fallback);
+helper failure still ends the input with the notice; invalid input keeps the
+step + the rest of the draft + the error; Back from a field input returns to
+the step with `interval=5`/`tz=Europe/Berlin` intact; Cancel from a field input
+discards (create → list, edit → detail, version unchanged); several inputs in
+sequence lose nothing and Review matches the persisted weekly task; the edit
+hub's Back returns to the task detail with the draft preserved while Cancel
+discards; a field input's Back inside an edit re-opens the editor and never the
+Taskloom home list.
+
+Part B (`tests/test_external_call_efficiency.py`, 9) — every assertion is a
+CALL COUNT on the real path:
+
+| call | before | after |
+|---|---|---|
+| Telegram `get_reply_message` per reply-triggered request | 2 | **1** |
+| `ai_config` read per cold-cache request | 2 | **1** |
+| `ai_config` read on a warm trigger cache | 0 | 0 |
+| `ai_tasks` event query per incoming message | 1 | 1 (required) |
+
+Plus: a snapshot is never cached across requests (the next request re-reads),
+`apply_persisted_config(snapshot)` applies the provider/model without reading
+while `apply_persisted_config()` reads exactly once, and the reply-independent
+path still fetches the reply when the caller has none.
+
+## 7. Verification
+
+- `tests/test_taskloom_input_ux.py` **15 passed** ·
+  `tests/test_external_call_efficiency.py` **9 passed**
+- `test_taskloom_editor_ux.py` 34 · `test_task_wizard.py` 35 ·
+  `test_bio_source_display.py` 51 · `test_task_wizard_nl_bridge.py` 15 — all green
+- focused Taskloom/wizard/source/reliability suites **270 passed**
+- full suite `pytest tests -q` — **2428 passed, 24 skipped, 0 failed**
+- `py_compile` for every changed Python file **OK**; `git diff --check` **clean**
+- the diff is limited to the four source files and the four test files above
+
+## 8. Schema impact
+
+**NONE** — no migration, SQL, schema file, table or column touched. Part A
+stores nothing new (the draft is per-owner in memory, unchanged); Part B only
+reuses an already-fetched value inside one request.
+
+## 9. Not verified / limitations
+
+1. **Render production traffic reduction was NOT verified.** No production
+   session or bandwidth measurement exists in this workspace, so only the
+   source-level call counts above are proven. The two removed calls are the
+   ones the audit could confirm; the graph alone was not used as evidence.
+2. **Live Telegram verification was NOT performed** — there is no production
+   self-bot/helper session here. Every Taskloom contract above was driven
+   in-process through the real `panels` dispatcher, the real wizard handlers
+   and a real in-memory repository.
+3. The per-message `ai_tasks` event query must be kept: suppressing it would
+   require a cache this phase is explicitly forbidden from adding.
+4. An edit draft left via the hub's Back stays pending for that SAME task and
+   is resumed by the next "✎ Edit" — that is the documented Back-preserves
+   semantics; `✕ Cancel edit` is the way to drop it.
+
+## 10. Delivery
+
+- Implementation commit (source + tests):
+  `fix: commit Taskloom field inputs and dedupe per-request external calls`.
+- Report/docs commit: `docs: record the Taskloom input UX and call-efficiency
+  phase`.
+- Pushed to `origin/main` (no force, no rebase, no unrelated files); remote
+  verification recorded in the commit-message follow-up below.
+
+---
+
+# PREVIOUS PHASE — Bio Taskloom “Show source” EDIT propagation
 
 ## 1. Objective
 
