@@ -258,8 +258,15 @@ clamp; paging reaches every task exactly once.
 
 ## 12. Delivery
 
-- Implementation + report committed together; see the delivery block appended at
-  the end of this phase after push and remote verification.
+- Implementation commit: `fix: harden Taskloom edit UX and task list
+  reliability` — `9f97f01dc52028cc63f5bf70a8cf3f3e79a005ec`
+- Push: `fd530b8..9f97f01 main -> main` (no force, no rebase)
+- `git rev-parse HEAD` == `git rev-parse origin/main` ==
+  `git ls-remote origin refs/heads/main` == `9f97f01…`
+- `git rev-list --left-right --count HEAD...origin/main` = `0 0`
+- Working tree clean; the only files touched are the seven listed in §8
+  (3 source, 3 test, this report). No schema/migration/provider/scheduler/
+  executor/guardian/diagnostics file was modified.
 
 ---
 
