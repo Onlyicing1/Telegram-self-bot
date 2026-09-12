@@ -141,7 +141,7 @@ change was needed**; the existing tests (`tests/test_07_diagnostics.py`,
 | `backend/ai/tools/message.py` | bounded `font` parameter; canonical transform at send time |
 | `supabase/migrations/20260912000001_add_ai_task_occurrences_preparation_metadata.sql` | **new** idempotent column repair |
 | `DATABASE_ARCHITECTURE.md` | records the migration and the drift |
-| `tests/test_task_reliability_repair.py` | **new** 57 focused regressions |
+| `tests/test_task_reliability_repair.py` | **new** 49 focused regressions |
 | `tests/test_20_advanced_execution.py`, `tests/test_task_list_consistency.py` | updated to the repaired, still-safety-preserving contract |
 
 ## 5. Behaviour changed
@@ -297,7 +297,7 @@ ALTER TABLE ai_task_occurrences DROP COLUMN IF EXISTS preparation_metadata;
 
 ## 7. Tests
 
-Added `tests/test_task_reliability_repair.py` — **57 focused behavioural
+Added `tests/test_task_reliability_repair.py` — **49 focused behavioural
 tests**:
 
 * scheduler: no early execution, cadence preserved after a late wake, 25 due
@@ -326,7 +326,7 @@ tests**:
 
 Test results actually executed:
 
-* `pytest tests/test_task_reliability_repair.py -q` → **57 passed**
+* `pytest tests/test_task_reliability_repair.py -q` → **49 passed**
 * `pytest tests -q` → **2300 passed, 24 skipped, 0 failed** (67 s)
 * `py_compile` on every changed Python file → **OK**
 * `git diff --check` → **clean**
