@@ -568,12 +568,20 @@ async def _handle_input(event, remainder: str, owner_id: int, chat_id: int, msg_
         extra=extra,
     )
 
-    # The prompt is a SUB-VIEW of the panel: "Cancel" returns to the panel
-    # that owns the input. A generic nav Back here popped the panel stack
-    # instead (live: a Taskloom wizard input's Back jumped to the Taskloom
-    # home/list instead of the wizard). Home/Close are still offered.
+    # The prompt is a SUB-VIEW of the panel. Its first row re-opens the panel
+    # that owns the input, which renders its CURRENT step from the live state
+    # (for the Taskloom wizard: the same field step with the draft intact).
+    # A generic nav Back here popped the panel stack instead (live: a Taskloom
+    # wizard input's Back jumped to the Taskloom home/list), so the row is a
+    # plain panel query and is LABELLED "Back" — it preserves state, which is
+    # what a field input's Back must do. Panels whose input also needs a real
+    # discard declare it as an explicit extra row (see ``extra_rows``).
+    # Home/Close are still offered as explicit navigation.
     builder = InlinePanelBuilder()
-    builder.add_row("Cancel", f"panel:{panel_id}")
+    builder.add_row("← Back", input_cfg.get("back") or f"panel:{panel_id}")
+    for extra_row in input_cfg.get("extra_rows") or ():
+        label, data = extra_row
+        builder.add_row(str(label), str(data))
     builder.add_row("🏠 Home", "panel:_nav:home")
     builder.add_row("❌ Close", "panel:_nav:close")
 

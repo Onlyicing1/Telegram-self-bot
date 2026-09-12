@@ -491,6 +491,12 @@ def _wizard_render(draft: TaskDraft, owner_id: int | None = None) -> tuple[str, 
         # adopt its current version after a stale save) without ever doing it
         # silently.
         builder.add_row("⟳ Reload from task", "action:taskloom_wizard:reload")
+        # The edit hub's parent surface is the edited task's DETAIL view, so its
+        # Back LEAVES the editor there with the pending draft intact. It is an
+        # action (rendered in place), so the nav stack is untouched and the
+        # detail view keeps its own Back. "✕ Cancel edit" below stays the only
+        # control that discards.
+        builder.add_row("← Back", "action:taskloom_wizard:leave")
     elif step == STEP_ACTION:
         lines.append("What should this task do?")
         for key in ACTION_ORDER:
@@ -858,6 +864,23 @@ async def _wizard_reload(draft: TaskDraft) -> tuple[str, str, list]:
     return await _start_edit(str(draft.editing_task_id))
 
 
+async def _wizard_leave(draft: TaskDraft) -> tuple[str, str, list]:
+    """The edit hub's Back: return to the edited task's detail view.
+
+    Unlike ``_wizard_cancel`` this PRESERVES the draft — leaving the editor is
+    not abandoning the edit, so a Back never loses the owner's work, and the
+    next "✎ Edit" on the SAME task resumes exactly what they had. The draft is
+    dropped only by the explicit Cancel, and the durable task is untouched by
+    either. Outside an edit there is no hub to leave, so the step re-renders.
+    """
+    if not draft.editing_task_id:
+        return _wizard_render(draft)
+    detail = await _task_detail_panel(None, str(draft.editing_task_id))
+    if detail is not None:
+        return detail
+    return f"Task #{draft.editing_task_id}", "_Left the editor; nothing was saved._", []
+
+
 async def _wizard_action(event, extra: str, chat_id: int):
     """One action for every wizard mutation (set/step/create/cancel/reload)."""
     verb, _, value = (extra or "").partition(":")
@@ -875,28 +898,40 @@ async def _wizard_action(event, extra: str, chat_id: int):
         return await _wizard_create(draft, chat_id)
     if verb == "cancel":
         return await _wizard_cancel(draft)
+    if verb == "leave":
+        return await _wizard_leave(draft)
     if verb == "reload":
         return await _wizard_reload(draft)
     return _wizard_render(draft)
 
 
 async def _wizard_finish(notice: str, chat_id: int, msg_id: int, inline_chat_id: int, inline_msg_id: int) -> None:
-    """Close one wizard input with a single edit: notice + refreshed wizard."""
+    """Close one wizard input: commit the value and re-render the SAME step.
+
+    The panel message must stop showing the input prompt — otherwise the owner
+    is left in the ambiguous state where the value looks like it is still being
+    entered. The panel is edited through the helper bot when it exists; when
+    the helper is disabled/unavailable the SAME message is edited in place with
+    the self client (the documented text-panel fallback), never left on the
+    prompt.
+    """
     from backend.helper.client import get_client
     from backend.helper.inline_engine import _self_client
     from backend.helper.panel_render import render_edit
 
-    helper = get_client()
-    if helper and inline_chat_id and inline_msg_id:
-        try:
-            title, body, buttons = _wizard_render(_draft())
-            text, built = render_edit(title, f"{notice}\n\n{body}", buttons)
-            await helper.edit_message(inline_chat_id, inline_msg_id, text, buttons=built)
-        except Exception:
+    if inline_chat_id and inline_msg_id:
+        helper = get_client()
+        editor = helper or _self_client
+        if editor is not None:
             try:
-                await helper.edit_message(inline_chat_id, inline_msg_id, notice)
+                title, body, buttons = _wizard_render(_draft())
+                text, built = render_edit(title, f"{notice}\n\n{body}", buttons)
+                await editor.edit_message(inline_chat_id, inline_msg_id, text, buttons=built)
             except Exception:
-                pass
+                try:
+                    await editor.edit_message(inline_chat_id, inline_msg_id, notice)
+                except Exception:
+                    pass
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -1037,6 +1072,13 @@ def register(client, owner_id: int, tz_str: str) -> None:
             register_input(_WIZARD_PANEL, field, {
                 "handler": _wizard_input_handler(field),
                 "prompt": prompt,
+                # A field input's "← Back" re-opens the wizard at the step that
+                # opened it with the draft intact (the shared default). Editing
+                # a field is not the same as abandoning the task, so the
+                # explicit Cancel row really DISCARDS the draft — mode-aware in
+                # the handler (edit → the task's detail view, create → the
+                # Taskloom list).
+                "extra_rows": (("✕ Cancel", "action:taskloom_wizard:cancel"),),
             })
         logger.info("Taskloom panels registered OK")
     except Exception as exc:

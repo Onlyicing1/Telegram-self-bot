@@ -197,7 +197,7 @@ async def test_execute_ai_cleans_up_active_request():
     orig_restore = ai_unified._restore_config
     ai_unified._engine = FakeEngine()
 
-    async def _noop_restore(owner_id):
+    async def _noop_restore(owner_id, config=None):
         return None
 
     ai_unified._restore_config = _noop_restore

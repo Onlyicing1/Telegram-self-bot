@@ -287,7 +287,9 @@ async def _heal_phantom_config(
         return None
 
 
-async def apply_persisted_config(owner_id: int) -> bool:
+async def apply_persisted_config(
+    owner_id: int, config: dict[str, Any] | None = None,
+) -> bool:
     """Apply the persisted AI configuration to the live runtime.
 
     This is the ONE shared restore, used at boot (``RuntimeSupervisor``)
@@ -302,12 +304,18 @@ async def apply_persisted_config(owner_id: int) -> bool:
       - the owner's conversation session is synced (``set_provider``);
       - the system prompt is applied.
 
-    The persisted ``config_store`` remains the source of truth. Failures
-    are logged, never raised.
+    ``config`` may carry the snapshot the caller ALREADY read for this same
+    request (the activation handler reads the identical ``ai_config`` row to
+    resolve the trigger words). Reusing it removes a duplicate read of one row
+    inside one request without introducing any cross-request state; when it is
+    omitted the config is read here, so this stays the single restore entry
+    point and the persisted ``config_store`` remains the source of truth.
+    Failures are logged, never raised.
     """
     try:
-        from backend.ai.config_store import get_config
-        config = await get_config(owner_id)
+        if config is None:
+            from backend.ai.config_store import get_config
+            config = await get_config(owner_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("apply_persisted_config: config load failed for owner=%s: %s", owner_id, exc)
         return False

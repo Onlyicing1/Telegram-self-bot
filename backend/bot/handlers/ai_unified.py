@@ -38,6 +38,7 @@ import asyncio
 import logging
 import os
 import time
+from typing import Any
 
 from telethon import events
 
@@ -64,6 +65,11 @@ _WIZARD_UNAVAILABLE_HINT = (
     "Open **Menu → Taskloom → ＋ New task** to set this up with structured options."
 )
 _ai_semaphore: asyncio.Semaphore | None = None
+
+# Sentinel for "the caller has not fetched the replied message yet". A real
+# fetch can legitimately return None (= no replied message), so None cannot
+# double as "not fetched".
+_REPLY_UNFETCHED = object()
 
 # Tools whose successful execution must end silently: the Telegram deletion
 # is the only visible effect, and a confirmation must never become a message.
@@ -204,31 +210,39 @@ def _get_engine():
         return None
 
 
-async def _load_triggers(owner_id: int) -> tuple[str, str]:
+async def _load_triggers(owner_id: int) -> tuple[str, str, dict | None]:
+    """Resolve the owner's trigger words (TTL-cached) and hand back the row.
+
+    The third value is the ``ai_config`` snapshot this call actually read, or
+    ``None`` when the cache served the triggers. The activation handler passes
+    it to the config restore so one request reads that row at most once.
+    """
     now = time.monotonic()
     if (now - _trigger_cache["ts"]) < _CACHE_TTL and _trigger_cache["en"] is not None:
-        return _trigger_cache["en"], _trigger_cache["fa"]
+        return _trigger_cache["en"], _trigger_cache["fa"], None
     try:
-        from backend.ai.config_store import get_triggers
-        triggers = await get_triggers(owner_id)
-        en = triggers.get("trigger_en", "") or ""
-        fa = triggers.get("trigger_fa", "") or ""
+        from backend.ai.config_store import get_config
+        config = await get_config(owner_id)
+        en = config.get("trigger_en", "") or ""
+        fa = config.get("trigger_fa", "") or ""
         _trigger_cache["en"] = en
         _trigger_cache["fa"] = fa
         _trigger_cache["ts"] = now
-        return en, fa
+        # Same request, same row: the restore reuses THIS snapshot instead of
+        # issuing a second identical read. Nothing is cached across requests.
+        return en, fa, config
     except Exception as exc:
         logger.warning("AI handler: failed to load triggers: %s", exc)
-        return "", ""
+        return "", "", None
 
 
-async def _restore_config(owner_id: int) -> None:
+async def _restore_config(owner_id: int, config: dict | None = None) -> None:
     # Single shared restore: provider/model → apply_runtime_selection,
     # temperature/max_tokens → the active provider's runtime config,
     # conversation session sync, system prompt. Same path as boot.
     try:
         from backend.ai.engine.engine import apply_persisted_config
-        await apply_persisted_config(owner_id)
+        await apply_persisted_config(owner_id, config=config)
     except Exception as exc:
         logger.warning("AI handler: config restore failed: %s", exc)
 
@@ -357,7 +371,9 @@ def _humanize_error(error: str) -> str:
     return error[:200] if error else "Unknown error."
 
 
-async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "ReplyContext", str]:
+async def _extract_reply_context(
+    event, client, user_text: str, reply_msg: Any = _REPLY_UNFETCHED,
+) -> tuple[str, "ReplyContext", str]:
     """Extract reply context from a replied-to message.
 
     The replied-to message is ALWAYS treated as CONTEXT — never as the
@@ -368,18 +384,22 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
     is injected via ``ReplyContext.ai_content`` so the Prompt Builder can
     include it as high-priority context.
 
+    ``reply_msg`` may carry the message the activation handler already
+    fetched for its reply-to-AI check: one request must not issue the same
+    Telegram fetch twice. It is only fetched here when the caller has none.
+
     Returns (user_message, reply_context, error_message).
     On success, error_message is empty. On failure, user_message is empty.
     """
     from backend.ai.conversation.context_builder import ReplyContext
     from backend.ai.media import classify_message
 
-    reply_msg = None
-    try:
-        reply_msg = await event.get_reply_message()
-    except Exception as exc:
-        logger.warning("AI handler: could not fetch reply message: %s", exc)
-        return "", ReplyContext(), f"Could not read the replied message: {exc}"
+    if reply_msg is _REPLY_UNFETCHED:
+        try:
+            reply_msg = await event.get_reply_message()
+        except Exception as exc:
+            logger.warning("AI handler: could not fetch reply message: %s", exc)
+            return "", ReplyContext(), f"Could not read the replied message: {exc}"
 
     if reply_msg is None:
         return "", ReplyContext(), "No replied message found. Reply to a message first."
@@ -475,8 +495,13 @@ async def _extract_reply_context(event, client, user_text: str) -> tuple[str, "R
 
 
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
-                      tz_str: str, reply_context=None, client=None) -> None:
+                      tz_str: str, reply_context=None, client=None,
+                      config: dict | None = None) -> None:
     """Execute the AI pipeline and deliver the result via centralized delivery.
+
+    ``config`` carries the ``ai_config`` snapshot the handler already read for
+    this request (trigger resolution), so the config restore does not read the
+    same row twice. ``None`` means "read it in the restore", never "empty".
 
     A single request id tracks the whole lifecycle, and ``register_end`` runs
     in a ``finally`` block so ``ai_active`` can never leak — whether the
@@ -530,7 +555,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     try:
         ai_diag.set_stage(rid, "CONFIG_LOAD")
         logger.info("AI_CONFIG_LOAD_START id=%s", rid)
-        await _restore_config(owner_id)
+        await _restore_config(owner_id, config=config)
         ai_diag.mark_success("CONFIG_LOAD")
         logger.info("AI_CONFIG_LOAD_END id=%s", rid)
 
@@ -813,7 +838,7 @@ def register(client, owner_id: int, tz_str: str):
         first_word = words[0]
         remaining = words[1].strip() if len(words) > 1 else ""
 
-        trigger_en, trigger_fa = await _load_triggers(owner_id)
+        trigger_en, trigger_fa, config_snapshot = await _load_triggers(owner_id)
         trigger_matched = False
         if trigger_en or trigger_fa:
             from backend.ai.config_store import match_trigger
@@ -827,16 +852,21 @@ def register(client, owner_id: int, tz_str: str):
         # the AI.  The replied AI message becomes context and the user's
         # full text becomes the prompt.
         reply_to_ai = False
+        # Fetched ONCE for the whole request: the reply-to-AI sniff below and
+        # the reply-context extraction use the SAME Telegram object instead of
+        # re-issuing the fetch.
+        reply_message: Any = _REPLY_UNFETCHED
         if is_reply:
             from backend.ai.context.reply_resolver import get_resolver
             try:
-                reply_msg = await event.get_reply_message()
-                if reply_msg is not None:
-                    resolved = get_resolver().resolve(reply_msg.id or 0)
+                reply_message = await event.get_reply_message()
+                if reply_message is not None:
+                    resolved = get_resolver().resolve(reply_message.id or 0)
                     if resolved is not None:
                         reply_to_ai = True
             except Exception as exc:
                 logger.warning("AI handler: reply-to-AI check failed: %s", exc)
+                reply_message = _REPLY_UNFETCHED
 
         if not trigger_matched and not reply_to_ai:
             return
@@ -854,7 +884,7 @@ def register(client, owner_id: int, tz_str: str):
             trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="reply",
                   reply_to_ai=reply_to_ai)
             user_message, reply_ctx, error_msg = await _extract_reply_context(
-                event, client, user_text
+                event, client, user_text, reply_msg=reply_message
             )
 
             if error_msg:
@@ -866,7 +896,7 @@ def register(client, owner_id: int, tz_str: str):
 
             await _execute_ai(
                 event, owner_id, user_message, trigger_label, tz_str,
-                reply_context=reply_ctx, client=client,
+                reply_context=reply_ctx, client=client, config=config_snapshot,
             )
             return
 
@@ -875,4 +905,7 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")
-        await _execute_ai(event, owner_id, user_text, trigger_label, tz_str, client=client)
+        await _execute_ai(
+            event, owner_id, user_text, trigger_label, tz_str,
+            client=client, config=config_snapshot,
+        )

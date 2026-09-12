@@ -303,7 +303,7 @@ async def test_execute_ai_opens_the_wizard_instead_of_only_refusing(monkeypatch)
 
     monkeypatch.setattr("backend.helper.send_inline_panel", _fake_send)
 
-    async def _no_restore(owner_id):
+    async def _no_restore(owner_id, config=None):
         return None
 
     monkeypatch.setattr(ai_unified, "_restore_config", _no_restore)
@@ -342,7 +342,7 @@ async def test_execute_ai_falls_back_to_text_with_a_hint(monkeypatch):
 
     monkeypatch.setattr("backend.helper.send_inline_panel", _no_helper)
 
-    async def _no_restore(owner_id):
+    async def _no_restore(owner_id, config=None):
         return None
 
     monkeypatch.setattr(ai_unified, "_restore_config", _no_restore)
@@ -450,7 +450,7 @@ async def test_incomplete_request_delivery_preference(monkeypatch):
 
     monkeypatch.setattr("backend.helper.send_inline_panel", _no_helper)
 
-    async def _no_restore(owner_id):
+    async def _no_restore(owner_id, config=None):
         return None
 
     monkeypatch.setattr(ai_unified, "_restore_config", _no_restore)
