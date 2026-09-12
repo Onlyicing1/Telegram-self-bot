@@ -311,7 +311,11 @@ async def test_ambiguous_request_still_returns_honest_failure():
             _tool_context(pm), {"request": "یه وقتایی یه یادآوری بفرست"}
         )
     assert result.success is False
-    assert "could not turn that into a safe, unambiguous schedule" in result.message
+    # The completeness gate fires before the provider: an ambiguous phrase
+    # expresses no schedule, so the wizard signal is returned instead of the
+    # (now unreachable) interpretation rejection text.
+    assert result.data.get("open_taskloom_wizard") is True
+    assert result.data.get("wizard_reason") == "incomplete_request"
     tasks = await manager.task.list_tasks(777)
     assert tasks == []
 

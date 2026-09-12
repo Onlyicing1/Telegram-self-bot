@@ -118,6 +118,11 @@ def _wizard_notice(signal: dict) -> str:
     capability = " ".join(str(signal.get("capability") or "").split())[:80]
     if reason == "unsupported_capability" and capability:
         return f"⚠ `{capability}` cannot be scheduled as one sentence — choose the options below."
+    if reason == "incomplete_request":
+        return (
+            "⚠ This task needs a schedule (and content details) the request "
+            "did not fully specify — choose them below."
+        )
     return "⚠ I need a few structured choices for this task — fill them in below."
 
 

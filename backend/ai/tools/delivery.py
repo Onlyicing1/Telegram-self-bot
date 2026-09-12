@@ -346,7 +346,10 @@ def _format_chunks(user_message: str, trigger_label: str, response_text: str) ->
 
 
 async def deliver_response(event: Any, user_message: str, trigger_label: str, response_text: str) -> DeliveryResult:
-    if not response_text:
+    if not isinstance(response_text, str) or not response_text.strip():
+        # A whitespace-only response is NO response (live evidence: response
+        # == " " passed the truthiness check, then normalization raised
+        # ValueError and the header-only shell was delivered anyway).
         try:
             await event.edit(f"{user_message}\n────────────\n🤖 {trigger_label}\n❌ Error\nAI returned no response.")
         except Exception as exc:
@@ -358,7 +361,12 @@ async def deliver_response(event: Any, user_message: str, trigger_label: str, re
         response_text = processed.text
         logger.info("AI_OUTPUT_NORMALIZED scripts=%s direction=%s mixed=%s markdown=%s changed=%s length=%d", ",".join(processed.profile.scripts) or "none", processed.profile.direction, processed.profile.mixed_direction, processed.profile.markdown_detected, processed.changed, len(response_text))
     except Exception as exc:
-        logger.warning("AI_OUTPUT_NORMALIZATION_FALLBACK error_type=%s", type(exc).__name__)
+        # Content-free classification only: the failure is never hidden, but
+        # raw AI output is never echoed to logs either.
+        logger.warning(
+            "AI_OUTPUT_NORMALIZATION_FALLBACK error_type=%s nonempty_after_strip=%s",
+            type(exc).__name__, bool(response_text and response_text.strip()),
+        )
     messages = _format_chunks(user_message, trigger_label, response_text)
     delivered = 0
     try:

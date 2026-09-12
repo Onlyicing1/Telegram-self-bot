@@ -22,6 +22,7 @@ In-process only: no live Telegram, no live Supabase, no provider HTTP.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -126,7 +127,9 @@ async def test_unsupported_capability_requests_the_existing_wizard():
 async def test_incomplete_candidate_requests_the_wizard():
     """The interpreter could not derive a full task (null / invalid candidate)."""
     pm = _provider_manager("null")
-    result, manager = await _create(pm, "something about my bio")
+    # "every 10 minutes" keeps the request past the deterministic
+    # completeness gate so the candidate-level failure itself is what signals.
+    result, manager = await _create(pm, "something about my bio every 10 minutes")
     assert result.success is False
     assert result.data.get("open_taskloom_wizard") is True
     assert str(result.data.get("wizard_reason", "")).startswith("candidate_invalid")
@@ -152,6 +155,43 @@ async def test_fully_representable_request_still_creates_directly():
     tasks = await manager.task.list_tasks(OWNER)
     assert len(tasks) == 1
     assert tasks[0].schedule == {"seconds": 120.0}
+
+
+# ── the deterministic completeness gate (live production regression) ─────
+
+
+@pytest.mark.asyncio
+async def test_live_underspecified_request_never_creates_and_signals_the_wizard():
+    """THE live reproduction: "یه تسک برای بیو بساز" carries no schedule
+    expression, so the provider must never be asked (and never fill one in).
+    The existing Taskloom wizard is surfaced with the structured signal."""
+    pm = _provider_manager(_good_candidate())  # model WOULD fill the schedule
+    result, manager = await _create(pm, "یه تسک برای بیو بساز")
+    assert result.success is False
+    assert result.data.get("open_taskloom_wizard") is True
+    assert result.data.get("wizard_reason") == "incomplete_request"
+    assert await manager.task.list_tasks(OWNER) == []
+
+
+@pytest.mark.asyncio
+async def test_invented_schedule_for_underspecified_request_is_never_persisted():
+    """Even a schema-valid candidate with an invented interval cannot become a
+    task when the owner's request expressed no schedule: the gate runs BEFORE
+    the provider, so the invented schedule is never persisted."""
+    pm = _provider_manager(_good_candidate())
+    result, manager = await _create(pm, "update my bio please")
+    assert result.success is False
+    assert result.data.get("open_taskloom_wizard") is True
+    assert await manager.task.list_tasks(OWNER) == []
+
+
+@pytest.mark.asyncio
+async def test_english_underspecified_request_signals_the_wizard():
+    pm = _provider_manager(_good_candidate())
+    result, manager = await _create(pm, "make a task for my bio")
+    assert result.success is False
+    assert result.data.get("open_taskloom_wizard") is True
+    assert await manager.task.list_tasks(OWNER) == []
 
 
 # ── the delivery-layer bridge ─────────────────────────────────────────────
@@ -320,6 +360,114 @@ async def test_execute_ai_falls_back_to_text_with_a_hint(monkeypatch):
     try:
         event = _FakeEvent()
         await ai_unified._execute_ai(event, OWNER, "sync my bio", "Nova", TZ)
+    finally:
+        ai_unified._engine = None
+
+    delivered = "\n".join(event.edits + event.replies)
+    assert refusal in delivered
+    assert "Taskloom" in delivered and "New task" in delivered
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_ai_response_is_not_delivered_as_a_shell(monkeypatch, caplog):
+    """Live evidence: response == " " passed truthiness, normalization raised
+    ValueError, and the request message was left as the header-only shell.
+    The delivery layer now treats whitespace-only output as NO response."""
+    import logging
+
+    from backend.ai.tools import delivery as delivery_mod
+
+    edits, replies = [], []
+
+    async def edit(text):
+        edits.append(text)
+
+    async def reply(text):
+        replies.append(text)
+
+    event = SimpleNamespace(edit=edit, reply=reply)
+    with caplog.at_level(logging.WARNING, logger=delivery_mod.logger.name):
+        result = await delivery_mod.deliver_response(event, "یه تسک برای بیو بساز", "Nova", "   ")
+
+    assert result.success is True
+    assert len(edits) == 1
+    assert replies == []
+    assert "AI returned no response." in edits[0]
+    # No normalization fallback noise for a response that is simply empty.
+    assert "AI_OUTPUT_NORMALIZATION_FALLBACK" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_normalization_failure_is_logged_and_still_delivered(monkeypatch, caplog):
+    """A non-empty response whose normalization fails is logged with a
+    content-free error classification, then delivered as-is (never hidden)."""
+    import logging
+
+    from backend.ai.tools import delivery as delivery_mod
+
+    edits, replies = [], []
+
+    async def edit(text):
+        edits.append(text)
+
+    async def reply(text):
+        replies.append(text)
+
+    event = SimpleNamespace(edit=edit, reply=reply)
+    # Force the normalization failure deterministically: the output pipeline
+    # raises ValueError on empty/whitespace input, which only happens here
+    # when the pre-checked response renders to whitespace.
+    from backend.ai.tools.delivery import process_output as _po
+
+    calls = {"n": 0}
+
+    def _boom(_text):
+        calls["n"] += 1
+        raise ValueError("AI output became empty after rendering")
+
+    monkeypatch.setattr(delivery_mod, "process_output", _boom)
+    text = "a real response"
+    with caplog.at_level(logging.WARNING, logger=delivery_mod.logger.name):
+        result = await delivery_mod.deliver_response(event, "msg", "Nova", text)
+
+    assert calls["n"] == 1
+    assert result.success is True
+    assert "AI_OUTPUT_NORMALIZATION_FALLBACK" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "nonempty_after_strip=True" in caplog.text
+    # The response still reached the owner (raw fallback), never hidden.
+    assert edits == ["msg\n────────────\n🤖 Nova\n" + text]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_request_delivery_preference(monkeypatch):
+    """The gate's refusal carries the wizard signal the delivery layer needs;
+    the refusal text itself is only shown when the panel cannot be sent."""
+    import backend.bot.handlers.ai_unified as ai_unified
+
+    async def _no_helper(client, chat_id, query):
+        return False
+
+    monkeypatch.setattr("backend.helper.send_inline_panel", _no_helper)
+
+    async def _no_restore(owner_id):
+        return None
+
+    monkeypatch.setattr(ai_unified, "_restore_config", _no_restore)
+    monkeypatch.setattr(
+        "backend.runtime.task_guard.guarded_create_task", MagicMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "backend.ai.config_store.record_request", lambda owner_id, latency_ms: None
+    )
+
+    refusal = "I need a few structured choices for this task — pick them in the creation form below."
+    ai_unified._engine = _FakeEngine(
+        _wizard_result(refusal, {"open_taskloom_wizard": True, "wizard_reason": "incomplete_request"})
+    )
+    try:
+        event = _FakeEvent()
+        await ai_unified._execute_ai(event, OWNER, "یه تسک برای بیو بساز", "Nova", TZ)
     finally:
         ai_unified._engine = None
 

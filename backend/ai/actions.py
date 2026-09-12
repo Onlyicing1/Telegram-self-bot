@@ -1397,7 +1397,7 @@ _FA_RECUR_WORDS = frozenset({
     "مداوم", "همیشه", "دائمی", "مرتب",
 })
 _EN_RECUR_WORDS = frozenset({
-    "daily", "weekly", "monthly", "yearly", "recurring", "repeat",
+    "daily", "weekly", "monthly", "yearly", "annually", "recurring", "repeat",
     "repeated", "always", "continuously", "regularly",
 })
 _INTERVAL_INTRO = frozenset({"هر", "every", "each", "once"})
@@ -1433,6 +1433,13 @@ _EN_ACTION_VERBS = frozenset({
 # "once" ("save this once") are deliberately NOT event markers.
 _FA_EVENT_MARKERS = ("وقتی", "هر وقت", "هر وقت", "هرموقع", "هر موقع", "هرگاه", "موقعی")
 _EN_EVENT_WORDS = frozenset({"when", "whenever"})
+
+# Time-of-day anchors: "ساعت X", "at X", "X:MM". Their PRESENCE (with or
+# without a cadence/plan word) proves a clock-anchored schedule ("today at
+# 5", "tomorrow at 8 AM", "فردا ساعت 15:35") — the completeness gate reads
+# them directly because that request carries no recurring cadence word.
+_FA_CLOCK_WORDS = frozenset({"ساعت"})
+_EN_CLOCK_WORDS = frozenset({"am", "pm"})
 
 
 def _is_event_intent(text: str, words: list[str]) -> bool:
@@ -1479,7 +1486,7 @@ def _has_time_unit(words: list[str], start: int) -> bool:
     return any(w in _TIME_UNITS for w in words[max(0, start):min(len(words), start + 5)])
 
 
-def _is_scheduling_intent(words: list[str]) -> bool:
+def _is_scheduling_intent(words: list[str], *, require_action_verb: bool = True) -> bool:
     """True when the message clearly requests a recurring/planned task.
 
     Detects natural-language interval expressions in Persian and English,
@@ -1492,8 +1499,13 @@ def _is_scheduling_intent(words: list[str]) -> bool:
         "every 5 minutes ...", "each hour ..."
       - "هر یک دقیقه ...", "هر ده دقیقه ...", "every hour ..."
       - "once a minute", "once every hour"
+
+    ``require_action_verb=False`` drops the co-occurring action-verb
+    requirement so a bare interval/cadence expression ("هر 5 دقیقه") still
+    proves a schedule was expressed — used by the task-creation completeness
+    gate, not by command routing.
     """
-    if not words or not _has_action_verb(words):
+    if not words or (require_action_verb and not _has_action_verb(words)):
         return False
     if any(w in _FA_RECUR_WORDS or w in _EN_RECUR_WORDS for w in words):
         return True

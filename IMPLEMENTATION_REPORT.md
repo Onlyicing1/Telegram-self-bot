@@ -7,6 +7,126 @@
 
 ---
 
+## Phase - Underspecified NL task requests route to the Taskloom wizard + honest empty-response delivery
+
+### Metadata
+
+| Item | Value |
+|---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` |
+| Branch | `main` |
+| Starting HEAD | `21968206b3329f87fb1047b85439a778880d98ca` |
+| Phase | **Deterministic task-creation completeness gate + whitespace-response delivery fix** |
+| Status | **IMPLEMENTED and delivered** - focused, relevant, and full in-process suites green |
+| Database impact | **NONE** (no schema, migration, RLS, table, index, or SQL file touched) |
+| Live Render/Telegram verification | **NOT performed** (no production session or telemetry access in this workspace) |
+
+### Exact production problem and source-traced causes
+
+**Live reproduction:** the owner sent `یه تسک برای بیو بساز`. The wizard did not open; a task
+was persisted to Supabase (`task_id=9`, `action_names=bio_set_text`, `schedule_type=interval`,
+`fallback_reason=""`), the AI answer was normalized to a whitespace-only value, and the request
+message was left as the header-only shell (`
+────────────
+🤖 پری`).
+
+1. **The tool had no deterministic completeness boundary before the provider.**
+   `backend/ai/tools/task.py::CreateTaskTool._execute` set
+   `data.open_taskloom_wizard=true` only for `candidate_invalid*` and
+   `unsupported_capability`. `backend/ai/task_interpreter.py` instructs the model to return a
+   candidate whenever it recognises an action (returning `null` only for pure chit-chat), and
+   `backend/ai/task_candidate.py::TaskCandidate.from_untrusted` validates only *structure*.
+   For an underspecified request the model therefore invented `schedule_type=interval`,
+   `schedule={"seconds": 120}` and a content action, the candidate validated, and it was
+   persisted. There was no check that the owner's own request had actually expressed the
+   required creation fields.
+2. **A whitespace-only AI response was delivered as a broken shell.**
+   `backend/ai/tools/delivery.py::deliver_response` gated only on `if not response_text:`, so a
+   whitespace-only string (`" "`) passed. `process_output` then raised `ValueError`, the
+   `AI_OUTPUT_NORMALIZATION_FALLBACK` warning was logged, and the header-only message was still
+   sent to the owner.
+
+### Exact implementation
+
+1. **Deterministic completeness gate** (runs *before* any provider call), in
+   `CreateTaskTool._execute`. It reuses the existing conservative scheduling vocabulary in
+   `backend/ai/actions.py` — no second parser, no phrase table. A request is considered to have
+   expressed a schedule when any of these hold: `_is_scheduling_intent(words,
+   require_action_verb=False)`, a clock anchor (`ساعت` / `am` / `pm` / `at` / `H:MM`), an
+   event intent, or a bare `number + time-unit` pair. When none holds, the tool returns without
+   calling the provider:
+
+   ```
+   ToolResult(success=False,
+              message="I need a few structured choices for this task — pick them in the creation form below.",
+              data={"open_taskloom_wizard": True, "wizard_reason": "incomplete_request"})
+   ```
+
+   This is the **same** structured signal the previously delivered delivery-layer bridge already
+   consumes, so `backend/bot/handlers/ai_unified.py` opens the **existing** Taskloom wizard
+   (`taskloom_new`) for the owner. No new wizard, no new persistence path: the wizard still
+   converges `TaskDraft -> build_candidate() -> TaskCandidate.from_untrusted() ->
+   TaskCreationService -> TaskRepository`.
+2. **`backend/ai/actions.py`** — added `annually` to `_EN_RECUR_WORDS`, added
+   `_FA_CLOCK_WORDS` / `_EN_CLOCK_WORDS` (time-of-day anchors), and added the
+   `require_action_verb: bool = True` flag to `_is_scheduling_intent` so a bare cadence
+   expression still proves a schedule. Command routing behaviour is unchanged (default `True`).
+3. **`backend/bot/handlers/ai_unified.py`** — `_wizard_notice` renders a dedicated
+   `incomplete_request` notice so the text fallback (used only when the panel cannot be sent)
+   stays actionable.
+4. **`backend/ai/tools/delivery.py`** — `deliver_response` now treats a non-`str` or
+   whitespace-only response as **no** response (the existing honest `AI returned no response.`
+   path) instead of shelling out. The normalization fallback warning now carries a
+   content-free `nonempty_after_strip=` classification and never echoes raw AI output or
+   secrets. The `ValueError` is not hidden.
+
+### Behaviour split (critical distinction preserved)
+
+- **A — Complete NL request** (e.g. `هر ۲ دقیقه بیو رو آپدیت کن به یه دیالوگ رندوم از آیانامی ری`):
+  passes the gate, uses the existing `TaskInterpreter -> TaskCandidate -> TaskCreationService ->
+  TaskRepository` path unchanged.
+- **B — Underspecified request** (e.g. `یه تسک برای بیو بساز`): never reaches the provider, no
+  task is created, the existing Taskloom creation wizard is opened. No untrusted value is
+  prefilled.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/tools/task.py` | deterministic pre-provider completeness gate + `incomplete_request` signal |
+| `backend/ai/actions.py` | `annually`; clock-word sets; `require_action_verb` parameter |
+| `backend/ai/tools/delivery.py` | whitespace-only response is `no response`; content-free fallback classification |
+| `backend/bot/handlers/ai_unified.py` | `incomplete_request` wizard notice |
+| `tests/test_task_wizard_nl_bridge.py` | live-reproduction + invented-schedule + delivery regression tests |
+| `tests/test_task_nl_interval_creation.py` | ambiguous request now asserts the wizard signal, no task |
+| `tests/test_task_semantic_triggers.py` | genuine-ambiguity cases assert no task + wizard signal |
+| `IMPLEMENTATION_REPORT.md` | this phase report |
+
+### Test results
+
+- Focused: `tests/test_task_wizard_nl_bridge.py tests/test_task_wizard.py tests/test_task_semantic_triggers.py tests/test_task_nl_interval_creation.py` — **160 passed**
+- Full suite: `pytest tests -q` — **2254 passed, 24 skipped, 0 failed**
+- `py_compile` for every changed Python file — **OK**
+- `git diff --check` — **clean**
+
+Regression coverage added: `test_live_underspecified_request_never_creates_and_signals_the_wizard`,
+`test_invented_schedule_for_underspecified_request_is_never_persisted`,
+`test_english_underspecified_request_signals_the_wizard`,
+`test_whitespace_only_ai_response_is_not_delivered_as_a_shell`,
+`test_normalization_failure_is_logged_and_still_delivered`,
+`test_incomplete_request_delivery_preference`, plus the preserved panel-send / fallback-hint
+tests. No existing validation, source-attribution, language, schedule, persistence, or Bio
+Guardian behaviour was weakened.
+
+### Limitations
+
+- The completeness gate is deterministic and conservative: a request that expresses *a*
+  schedule but leaves content/constraints unstated still goes through the interpreter, which may
+  fill optional fields. Only the structurally required schedule boundary is enforced here.
+- **Live Telegram/Render verification was NOT performed in this coding workspace.**
+
+---
+
 ## Phase - Taskloom creation bridge, local-resource cooldown, and runtime diagnostics correctness
 
 ### Metadata

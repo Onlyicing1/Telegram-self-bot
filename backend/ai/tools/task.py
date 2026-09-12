@@ -146,6 +146,23 @@ class CreateTaskTool(Tool):
             unbind(bind_token)
 
     async def _execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        import re as _re
+
+        from backend.ai.actions import (
+            _FA_CLOCK_WORDS,
+            _EN_CLOCK_WORDS,
+            _FA_NUMBER_WORDS,
+            _FA_RECUR_WORDS,
+            _EN_RECUR_WORDS,
+            _FA_PLAN_WORDS,
+            _EN_PLAN_WORDS,
+            _INTERVAL_INTRO,
+            _TIME_UNITS,
+            _has_time_unit,
+            _is_event_intent,
+            _is_scheduling_intent,
+            _tokenize,
+        )
         from backend.ai.task_interpreter import TaskInterpreter, TaskUnsupportedError
         from backend.ai.task_creation import TaskCreationService
 
@@ -156,6 +173,54 @@ class CreateTaskTool(Tool):
         request = request.strip()
         if len(request) > MAX_REQUEST_CHARS:
             return ToolResult(success=False, message="Task request is too long.")
+
+        # Deterministic completeness gate — runs BEFORE any provider call and
+        # reuses the existing conservative scheduling vocabulary (no second
+        # parser, no phrase list). A request that expresses no schedule at all
+        # is structurally incomplete: the provider must never fill the missing
+        # schedule/content parameters for it, so it is routed to the EXISTING
+        # Taskloom creation wizard through the same structured signal the
+        # delivery layer already consumes.
+        words = _tokenize(request)
+        words_lower = [w.lower() for w in words]
+        clock_anchor = bool(
+            set(words_lower) & _FA_CLOCK_WORDS
+            or set(words_lower) & _EN_CLOCK_WORDS
+            or "at" in words_lower
+            or _re.search(r"\d{1,2}:\d{2}", request)
+        )
+        # A bare number+unit pair ("5 دقیقه", "پنج دقیقه یکبار") also proves
+        # a schedule was expressed even without an interval intro word.
+        def _is_number_token(token: str) -> bool:
+            return token.isdigit() or token in _FA_NUMBER_WORDS
+
+        has_schedule_expression = (
+            _is_scheduling_intent(words, require_action_verb=False)
+            or clock_anchor
+        )
+        if not has_schedule_expression and _is_event_intent(request, words):
+            has_schedule_expression = True
+        if not has_schedule_expression:
+            for i, token in enumerate(words):
+                if _is_number_token(token) and i + 1 < len(words) and words[i + 1] in _TIME_UNITS:
+                    has_schedule_expression = True
+                    break
+        if not has_schedule_expression:
+            logger.info(
+                "AI_TASK_TRACE stage=create_task_incomplete reason=no_schedule_expression "
+                "routed_to=taskloom_wizard",
+            )
+            return ToolResult(
+                success=False,
+                message=(
+                    "I need a few structured choices for this task — "
+                    "pick them in the creation form below."
+                ),
+                data={
+                    "open_taskloom_wizard": True,
+                    "wizard_reason": "incomplete_request",
+                },
+            )
 
         owner_id = getattr(context, "owner_id", 0)
         if not isinstance(owner_id, int) or owner_id <= 0:

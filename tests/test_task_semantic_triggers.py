@@ -370,12 +370,17 @@ async def test_unresolvable_sender_fails_closed_honestly():
     "occasionally do it",
 ])
 @pytest.mark.asyncio
-async def test_genuine_ambiguity_keeps_the_honest_rejection(phrase):
+async def test_genuine_ambiguity_never_creates_a_task(phrase):
+    """Genuinely ambiguous phrasing can never produce a task. The refusal is
+    now the completeness gate's structured-choice message (the schedule the
+    phrase lacks is exactly what the Taskloom wizard asks for); the provider
+    is never reached, so the model cannot invent the missing schedule."""
     pm, _ = _provider_manager("null")
     result, manager = await _create(pm, phrase)
     assert result.success is False
-    assert "could not turn that into a safe, unambiguous schedule" in result.message
+    assert "could not turn that into a safe, unambiguous schedule" not in result.message
     assert "not supported yet" not in result.message
+    assert result.data.get("open_taskloom_wizard") is True
     assert await _tasks(manager) == []
 
 
