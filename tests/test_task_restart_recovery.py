@@ -67,9 +67,8 @@ async def test_recovered_occurrence_honors_backoff_before_reexecution():
     task = await repo.create_task(1, task_data(next_run_at=None))
     occurrence = await repo.create_occurrence(1, {
         "task_id": task.id, "occurrence_key": "k", "definition_version": 1,
-        "action_snapshot": task.actions, "scheduled_for": NOW,
+        "action_snapshot": task.actions, "scheduled_for": NOW, "status": "interrupted",
     })
-    await repo.claim_occurrence(1, task.id, occurrence.occurrence_key)
     coordinator = RecordingCoordinator(repo)
     scheduler = TaskScheduler(repo, 1, execution_coordinator=coordinator)
 
@@ -181,9 +180,8 @@ async def test_concurrent_recoveries_do_not_multiply_attempts():
     task = await repo.create_task(1, task_data(next_run_at=None))
     occurrence = await repo.create_occurrence(1, {
         "task_id": task.id, "occurrence_key": "k", "definition_version": 1,
-        "action_snapshot": task.actions, "scheduled_for": NOW,
+        "action_snapshot": task.actions, "scheduled_for": NOW, "status": "interrupted",
     })
-    await repo.claim_occurrence(1, task.id, occurrence.occurrence_key)
 
     import asyncio
 
@@ -212,9 +210,8 @@ async def test_recover_is_resumable_after_previous_resolution():
     task = await repo.create_task(1, task_data(next_run_at=None))
     occurrence = await repo.create_occurrence(1, {
         "task_id": task.id, "occurrence_key": "k", "definition_version": 1,
-        "action_snapshot": task.actions, "scheduled_for": NOW,
+        "action_snapshot": task.actions, "scheduled_for": NOW, "status": "interrupted",
     })
-    await repo.claim_occurrence(1, task.id, occurrence.occurrence_key)
     scheduler = TaskScheduler(repo, 1)
     await scheduler.recover()
     resolved = await repo.get_occurrence(1, task.id, "k")
@@ -231,6 +228,34 @@ async def test_recover_is_resumable_after_previous_resolution():
     assert await again.recover() == 0
     final = await repo.get_occurrence(1, task.id, "k")
     assert final.status == "succeeded" and final.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_running_recovery_is_terminal_and_never_reexecutes():
+    """A persisted running row may represent an already-completed external
+    side effect whose terminal audit write was interrupted. Recovery must not
+    turn that uncertainty into a duplicate retry."""
+    repo = InMemoryTaskRepository()
+    task = await repo.create_task(1, task_data(next_run_at=None))
+    occurrence = await repo.create_occurrence(1, {
+        "task_id": task.id, "occurrence_key": "running", "definition_version": 1,
+        "action_snapshot": task.actions, "scheduled_for": NOW,
+    })
+    running = await repo.claim_occurrence(1, task.id, occurrence.occurrence_key)
+    assert running.status == "running"
+
+    scheduler = TaskScheduler(repo, 1)
+    assert await scheduler.recover() == 1
+    recovered = await repo.get_occurrence(1, task.id, "running")
+    assert recovered.status == "failed"
+    assert recovered.retry_at is None
+    assert recovered.error_metadata["error_class"] == "restart_side_effect_uncertain"
+
+    coordinator = RecordingCoordinator(repo)
+    assert await TaskScheduler(repo, 1, execution_coordinator=coordinator).run_once(
+        NOW + timedelta(hours=1)
+    ) == 0
+    assert coordinator.executed_keys == []
 
 
 # ── No-execution-authority path stays deterministic ────────────────────────

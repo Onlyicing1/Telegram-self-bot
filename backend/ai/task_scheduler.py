@@ -118,7 +118,27 @@ class TaskScheduler:
                         and occurrence.scheduled_for > now
                     ):
                         continue
-                    if occurrence.status in {"claimed", "running"}:
+                    if occurrence.status == "running":
+                        # A running row is past the durable claim boundary: an
+                        # external tool may already have produced a side
+                        # effect. Recovery cannot prove whether the process
+                        # died before or after that effect, so retrying it
+                        # would trade an honest uncertain failure for a
+                        # possible duplicate Telegram mutation.
+                        resolved = await self.repository.transition_occurrence(
+                            self.owner_id,
+                            occurrence.task_id,
+                            occurrence.occurrence_key,
+                            "failed",
+                            retry_at=None,
+                            error_metadata={
+                                "error_class": "restart_side_effect_uncertain",
+                                "attempt": occurrence.attempt,
+                            },
+                        )
+                        recovered += resolved is not None
+                        continue
+                    if occurrence.status == "claimed":
                         occurrence = await self.repository.transition_occurrence(
                             self.owner_id, occurrence.task_id, occurrence.occurrence_key, "interrupted"
                         )
