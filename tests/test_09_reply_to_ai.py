@@ -224,7 +224,7 @@ async def test_reply_to_ai_without_trigger_uses_full_text_as_message():
 async def test_reply_to_ai_persian_no_trigger_label_not_first_word():
     """Reply-to-AI with Persian text and no trigger: the first word must
     NOT be promoted to trigger_label. The label must be the generic 'AI'."""
-    from backend.bot.handlers.ai_unified import _format_response
+    from backend.ai.tools.delivery import format_presentation
 
     raw_text = "میشه بیشتر توضیح بدی؟"
     first_word = raw_text.split(None, 1)[0]
@@ -242,16 +242,16 @@ async def test_reply_to_ai_persian_no_trigger_label_not_first_word():
     assert trigger_label != first_word
     assert user_text == raw_text
 
-    formatted = _format_response(user_text, trigger_label, "response text")
-    assert "🤖 AI" in formatted
-    assert f"🤖 {first_word}" not in formatted
+    formatted = format_presentation(user_text, "response text", True)
+    assert f"│ {user_text}" in formatted
+    assert first_word not in formatted.split("\n")[0].replace(f"│ {user_text}", "")
 
 
 @pytest.mark.asyncio
 async def test_reply_to_ai_english_no_trigger_label_not_first_word():
     """Reply-to-AI with English text and no trigger: the first word must
     NOT be promoted to trigger_label."""
-    from backend.bot.handlers.ai_unified import _format_response
+    from backend.ai.tools.delivery import format_presentation
 
     raw_text = "Can you explain more?"
     first_word = raw_text.split(None, 1)[0]
@@ -269,9 +269,9 @@ async def test_reply_to_ai_english_no_trigger_label_not_first_word():
     assert trigger_label != first_word
     assert user_text == raw_text
 
-    formatted = _format_response(user_text, trigger_label, "response text")
-    assert "🤖 AI" in formatted
-    assert f"🤖 {first_word}" not in formatted
+    formatted = format_presentation(user_text, "response text", True)
+    assert f"│ {user_text}" in formatted
+    assert first_word not in formatted.split("\n")[0].replace(f"│ {user_text}", "")
 
 
 @pytest.mark.asyncio
@@ -367,9 +367,9 @@ async def test_response_edits_new_message_not_old():
     """The _execute_ai function edits event.message (the NEW user message),
     not the replied-to AI message. We verify by checking that
     _execute_ai calls event.edit, not reply_msg.edit."""
-    from backend.bot.handlers.ai_unified import _format_response
+    from backend.ai.tools.delivery import format_presentation
 
-    formatted = _format_response("user text", "AI", "AI response")
+    formatted = format_presentation("user text", "AI response", True)
     assert "user text" in formatted
     assert "AI response" in formatted
-    assert "🤖 AI" in formatted
+    assert "🤖" not in formatted

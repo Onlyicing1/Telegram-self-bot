@@ -307,8 +307,8 @@ def test_failure_notice_legacy_path_still_humanizes_raw_error():
 def test_format_failure_keeps_message_hierarchy():
     from backend.bot.handlers.ai_unified import _format_failure
 
-    text = _format_failure("prompt", "Nova", "✕ Couldn't get a response\nTimeout")
-    assert text.startswith("prompt\n────────────\n🤖 Nova\n")
+    text = _format_failure("prompt", "✕ Couldn't get a response\nTimeout", False)
+    assert text.startswith("└─ ✕ Couldn't get a response\n    Timeout")
     assert "❌ Error" not in text
 
 

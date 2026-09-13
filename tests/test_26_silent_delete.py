@@ -231,8 +231,8 @@ async def test_failed_delete_shows_error_not_success_confirmation():
 
     deliver_mock.assert_awaited_once()
     args = deliver_mock.call_args.args
-    assert args[3] == "Delete failed: boom"
-    assert "Deleted 5" not in args[3]
+    assert args[2] == "Delete failed: boom"
+    assert "Deleted 5" not in args[2]
     event.reply.assert_not_called()
 
 
@@ -244,4 +244,4 @@ async def test_non_delete_actions_still_deliver():
 
     deliver_mock.assert_awaited_once()
     args = deliver_mock.call_args.args
-    assert args[3] == "First Name: Parham"
+    assert args[2] == "First Name: Parham"

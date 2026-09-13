@@ -247,41 +247,29 @@ async def _restore_config(owner_id: int, config: dict | None = None) -> None:
         logger.warning("AI handler: config restore failed: %s", exc)
 
 
-def _format_thinking(user_message: str, trigger_label: str) -> str:
-    return (
-        f"{user_message}\n"
-        f"────────────\n"
-        f"🤖 {trigger_label}\n"
-        f"⏳ Thinking..."
-    )
+def _show_question_pref(owner_id: int) -> bool:
+    """The owner's "show my message in replies" presentation preference."""
+    from backend.ai.engine.telemetry import telemetry
+
+    return telemetry.get_show_question_pref(owner_id)
 
 
-def _format_response(user_message: str, trigger_label: str, response: str) -> str:
-    return (
-        f"{user_message}\n"
-        f"────────────\n"
-        f"🤖 {trigger_label}\n"
-        f"{response}"
-    )
+def _format_thinking(user_message: str, show_question: bool) -> str:
+    from backend.ai.tools.delivery import format_presentation
+
+    return format_presentation(user_message, "Thinking…", show_question)
 
 
-def _format_error(user_message: str, trigger_label: str, error: str) -> str:
-    return (
-        f"{user_message}\n"
-        f"────────────\n"
-        f"🤖 {trigger_label}\n"
-        f"❌ Error\n"
-        f"{error}"
-    )
+def _format_error(user_message: str, error: str, show_question: bool) -> str:
+    from backend.ai.tools.delivery import format_presentation
+
+    return format_presentation(user_message, f"Error\n{error}", show_question)
 
 
-def _format_failure(user_message: str, trigger_label: str, notice: str) -> str:
-    return (
-        f"{user_message}\n"
-        f"────────────\n"
-        f"🤖 {trigger_label}\n"
-        f"{notice}"
-    )
+def _format_failure(user_message: str, notice: str, show_question: bool) -> str:
+    from backend.ai.tools.delivery import format_presentation
+
+    return format_presentation(user_message, notice, show_question)
 
 
 def _failure_notice(result) -> str:
@@ -499,6 +487,9 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                       config: dict | None = None) -> None:
     """Execute the AI pipeline and deliver the result via centralized delivery.
 
+    ``trigger_word`` identifies the activation that started the request; the
+    reply presentation is renderer-owned and never shows a trigger label.
+
     ``config`` carries the ``ai_config`` snapshot the handler already read for
     this request (trigger resolution), so the config restore does not read the
     same row twice. ``None`` means "read it in the restore", never "empty".
@@ -524,10 +515,11 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     )
     logger.info("AI_EXEC_TRACE request_id=%s stage=telegram_received", rid)
 
+    show_question = _show_question_pref(owner_id)
     engine = _get_engine()
     if engine is None:
         try:
-            await event.edit(_format_error(prompt_text, trigger_word, "AI engine not available."))
+            await event.edit(_format_error(prompt_text, "AI engine not available.", show_question))
         except Exception as exc:
             logger.error("AI handler: failed to edit error state (no engine): %s", exc)
         ai_diag.register_end(rid)
@@ -542,14 +534,14 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         logger.warning("AI handler: rejecting request id=%s (concurrency limit reached)", rid)
         try:
             await event.edit(_format_error(
-                prompt_text, trigger_word,
+                prompt_text,
                 "Too many AI requests in progress. Please try again shortly.",
+                show_question,
             ))
         except Exception:
             pass
         return
 
-    trigger_label = trigger_word
     display_prompt = prompt_text
 
     try:
@@ -585,17 +577,13 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
 
         async def _status_callback(status: str) -> None:
             try:
-                await event.edit(
-                    f"{display_prompt}\n"
-                    f"────────────\n"
-                    f"🤖 {trigger_label}\n"
-                    f"{status}"
-                )
+                from backend.ai.tools.delivery import format_presentation
+                await event.edit(format_presentation(display_prompt, status, show_question))
             except Exception as exc:
                 logger.debug("AI handler: status edit failed: %s", exc)
 
         try:
-            await event.edit(_format_thinking(display_prompt, trigger_label))
+            await event.edit(_format_thinking(display_prompt, show_question))
         except Exception as exc:
             logger.warning("AI handler: failed to edit thinking state: %s", exc)
 
@@ -703,7 +691,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             if notes:
                 response_text = f"{response_text}\n\n" + "\n".join(notes)
             delivery_result = await deliver_response(
-                event, display_prompt, trigger_label, response_text,
+                event, display_prompt, response_text, show_question,
             )
             if delivery_result.success:
                 ai_diag.mark_success("TELEGRAM_REPLY")
@@ -738,7 +726,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 rid, result.provider, result.model,
             )
             final_text = _format_failure(
-                display_prompt, trigger_label, _failure_notice(result)
+                display_prompt, _failure_notice(result), show_question
             )
             try:
                 await event.edit(final_text)
@@ -750,7 +738,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                     pass
         else:
             error_msg = _describe_empty_result(result)
-            final_text = _format_error(display_prompt, trigger_label, error_msg)
+            final_text = _format_error(display_prompt, error_msg, show_question)
             try:
                 await event.edit(final_text)
             except Exception as exc:
@@ -760,8 +748,9 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
         trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s", rid=rid)
         logger.error("AI handler: request timed out after %ss (id=%s)", _AI_TIMEOUT, rid)
         error_text = _format_error(
-            display_prompt, trigger_label,
+            display_prompt,
             f"Request timed out after {int(_AI_TIMEOUT)} seconds.",
+            show_question,
         )
         try:
             await event.edit(error_text)
@@ -774,7 +763,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     except Exception as exc:
         logger.exception("AI handler error: %s (id=%s)", exc, rid)
         trace("AI_HANDLER_ERROR", error=str(exc))
-        error_text = _format_error(display_prompt, trigger_label, _humanize_error(str(exc)))
+        error_text = _format_error(display_prompt, _humanize_error(str(exc)), show_question)
         try:
             await event.edit(error_text)
         except Exception as edit_exc:
@@ -889,7 +878,9 @@ def register(client, owner_id: int, tz_str: str):
 
             if error_msg:
                 try:
-                    await event.edit(_format_error(trigger_label, trigger_label, error_msg))
+                    await event.edit(
+                        _format_error(user_text, error_msg, _show_question_pref(owner_id))
+                    )
                 except Exception as exc:
                     logger.warning("AI handler: failed to edit reply error: %s", exc)
                 return

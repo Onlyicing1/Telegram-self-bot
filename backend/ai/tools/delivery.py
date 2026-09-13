@@ -249,8 +249,70 @@ class DeliveryResult:
     error: str = ""
 
 
-def _format_message(user_message: str, trigger_label: str, response: str) -> str:
-    return f"{user_message}\n────────────\n🤖 {trigger_label}\n{response}"
+# ── Chat presentation ────────────────────────────────────────────────────────
+# Presentation-only rendering. The owner's message is quoted behind `│`; the
+# answer starts behind `└─ ` and every continuation line is indented by exactly
+# four ASCII spaces so all answer text starts at the same visual column. There
+# is no trigger label, header, emoji, or separator anywhere in the presentation.
+# The renderer never alters the answer text itself and owns no preference —
+# the caller decides whether the question is shown.
+
+_QUESTION_MARK = "│"
+_ANSWER_MARK = "└─"
+_ANSWER_INDENT = "    "
+_QUESTION_PREFIX = f"{_QUESTION_MARK} "
+_ANSWER_PREFIX = f"{_ANSWER_MARK} "
+
+
+def _presentation_lines(text: str) -> list[str]:
+    """Split into lines WITHOUT touching line content: the renderer adds
+    prefixes only, so the answer text (including significant indentation and
+    table padding) survives byte for byte."""
+    if not isinstance(text, str) or not text:
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.split("\n")
+
+
+def question_block(user_message: str) -> str:
+    """Quote every line of the owner's message behind ``│``.
+
+    Leading/trailing blank lines are dropped (they would read as stray bars);
+    an inner blank line renders as a bare ``│``.
+    """
+    lines = _presentation_lines(user_message)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(
+        f"{_QUESTION_PREFIX}{line}" if line.strip() else _QUESTION_MARK for line in lines
+    )
+
+
+def answer_block(response_text: str) -> str:
+    """Render an answer: ``└─ `` on the first line, four spaces afterwards."""
+    lines = _presentation_lines(response_text)
+    if not lines:
+        return _ANSWER_MARK
+    rendered = [f"{_ANSWER_PREFIX}{lines[0]}"]
+    rendered.extend(f"{_ANSWER_INDENT}{line}" for line in lines[1:])
+    return "\n".join(rendered)
+
+
+def format_presentation(user_message: str, response_text: str, show_question: bool) -> str:
+    """The single AI chat presentation shared by every delivery path.
+
+    ``show_question`` is presentation state only: it changes nothing about the
+    model input, history, prompts, providers, or tools.
+    """
+    answer = answer_block(response_text)
+    if not show_question:
+        return answer
+    question = question_block(user_message)
+    if not question:
+        return answer
+    return f"{question}\n{_QUESTION_MARK}\n{answer}"
 
 
 def _format_continuation(response: str, part: int, total: int) -> str:
@@ -334,24 +396,90 @@ def _align_to_character(text: str, units: int) -> int:
     return index
 
 
-def _format_chunks(user_message: str, trigger_label: str, response_text: str) -> list[str]:
-    full = _format_message(user_message, trigger_label, response_text)
+def _rendered_cost(lines: list[str], *, boundary: bool) -> int:
+    """UTF-16 cost of rendering ``lines`` as one answer page."""
+    if not lines:
+        return 0
+    total = _utf16_units(_ANSWER_PREFIX) + _utf16_units(lines[0])
+    for line in lines[1:]:
+        total += 1 + _utf16_units(_ANSWER_INDENT) + _utf16_units(line)
+    if boundary:
+        # A page that is not the last one keeps its terminating newline, which
+        # renders as one extra four-space continuation line.
+        total += 1 + _utf16_units(_ANSWER_INDENT)
+    return total
+
+
+def _paginate(body: str, budget: int) -> list[str]:
+    """Split ``body`` into pages whose rendered presentation fits ``budget``
+    UTF-16 units, preferring line boundaries; a single line wider than the
+    budget is split by the UTF-16 splitter. A page that is not the last one
+    keeps its terminating newline so the delivered chunks reconstruct the
+    original body exactly.
+    """
+    lines = body.split("\n")
+    pages: list[str] = []
+    current: list[str] = []
+
+    def flush(*, boundary: bool) -> None:
+        pages.append("\n".join(current + ([""] if boundary else [])))
+        current.clear()
+
+    for index, line in enumerate(lines):
+        last = index == len(lines) - 1
+        if _rendered_cost([line], boundary=not last) > budget:
+            if current:
+                flush(boundary=True)
+            pieces = _split_text(line, max(_MIN_SPLIT_CHUNK, budget - len(_ANSWER_INDENT)))
+            if not last:
+                # Keep the newline that terminated the split line so no line
+                # boundary is lost between two hard-split pages.
+                pieces[-1] = pieces[-1] + "\n"
+            pages.extend(pieces)
+            continue
+        if current and _rendered_cost(current + [line], boundary=not last) > budget:
+            flush(boundary=True)
+        current.append(line)
+    if current:
+        flush(boundary=False)
+    return pages or [""]
+
+
+def _format_chunks(user_message: str, response_text: str, show_question: bool = False) -> list[str]:
+    full = format_presentation(user_message, response_text, show_question)
     if _utf16_units(full) <= SAFE_LIMIT:
         return [full]
-    header = f"{user_message}\n────────────\n🤖 {trigger_label}\n"
-    body = _split_text(response_text, max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - _utf16_units(header)))
-    if len(body) == 1:
+    prefix = ""
+    if show_question:
+        candidate = f"{question_block(user_message)}\n{_QUESTION_MARK}\n"
+        if _utf16_units(candidate) < SAFE_LIMIT - _MIN_SPLIT_CHUNK:
+            prefix = candidate
+    footer_reserve = _utf16_units("\n\n_(9/99)_") + 2
+    budget = max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - _utf16_units(prefix) - footer_reserve)
+    pages = _paginate(response_text, budget)
+    if len(pages) == 1:
+        # The (rare) oversized question, not the answer, overflowed the limit.
         return _split_text(full, SAFE_LIMIT)
-    return [header + body[0]] + [_format_continuation(part, i + 1, len(body)) for i, part in enumerate(body[1:], 1)]
+    chunks = [prefix + answer_block(pages[0])]
+    for index, page in enumerate(pages[1:], 2):
+        chunks.append(_format_continuation(answer_block(page), index, len(pages)))
+    return chunks
 
 
-async def deliver_response(event: Any, user_message: str, trigger_label: str, response_text: str) -> DeliveryResult:
+async def deliver_response(
+    event: Any,
+    user_message: str,
+    response_text: str,
+    show_question: bool = False,
+) -> DeliveryResult:
     if not isinstance(response_text, str) or not response_text.strip():
         # A whitespace-only response is NO response (live evidence: response
         # == " " passed the truthiness check, then normalization raised
         # ValueError and the header-only shell was delivered anyway).
         try:
-            await event.edit(f"{user_message}\n────────────\n🤖 {trigger_label}\n❌ Error\nAI returned no response.")
+            await event.edit(
+                format_presentation(user_message, "Error\nAI returned no response.", show_question)
+            )
         except Exception as exc:
             logger.warning("delivery: empty-response edit failed: %s", exc)
             return DeliveryResult(False, 0, 0, str(exc))
@@ -367,7 +495,7 @@ async def deliver_response(event: Any, user_message: str, trigger_label: str, re
             "AI_OUTPUT_NORMALIZATION_FALLBACK error_type=%s nonempty_after_strip=%s",
             type(exc).__name__, bool(response_text and response_text.strip()),
         )
-    messages = _format_chunks(user_message, trigger_label, response_text)
+    messages = _format_chunks(user_message, response_text, show_question)
     delivered = 0
     try:
         await event.edit(messages[0])

@@ -19,7 +19,7 @@ Panels:
   ai_provider    — Provider selection (only available ones shown)
   ai_model       — Model selection (auto-fetched from provider API)
   ai_wizard      — Setup wizard (shown when no provider is configured)
-  ai_settings    — Personal settings (wake words, reply stats)
+  ai_settings    — Personal settings (wake words, reply stats, reply presentation)
   ai_settings_adv— Advanced (creativity, response length, memory, personality)
   ai_diagnostics — Diagnostics (owner/developer only)
 """
@@ -547,6 +547,7 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     reply_stats = telemetry.get_telemetry_pref(owner_id)
+    show_question = telemetry.get_show_question_pref(owner_id)
 
     en = (config.get("trigger_en", "") or "").strip()
     fa = (config.get("trigger_fa", "") or "").strip()
@@ -562,6 +563,7 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
         lines.append("! No wake word yet — set one to start chatting.")
     lines.append("")
     lines.append(f"Reply stats · {'On' if reply_stats else 'Off'}")
+    lines.append(f"My message in replies · {'On' if show_question else 'Off'}")
 
     builder = InlinePanelBuilder()
     builder.add_row("English wake word", "input:ai_settings:trigger_en")
@@ -569,6 +571,10 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     builder.add_row(
         f"Turn reply stats {'off' if reply_stats else 'on'}",
         "action:ai_toggle_telemetry",
+    )
+    builder.add_row(
+        f"Turn my message in replies {'off' if show_question else 'on'}",
+        "action:ai_toggle_show_question",
     )
     builder.add_row("Advanced", "panel:ai_settings_adv")
     _nav_buttons(builder)
@@ -988,6 +994,18 @@ async def _ai_toggle_telemetry_action(event, extra: str, chat_id: int) -> tuple[
 
     owner_id = await _get_owner_id()
     telemetry.set_telemetry_pref(owner_id, not telemetry.get_telemetry_pref(owner_id))
+    return await _ai_settings_panel_handler(event, extra)
+
+
+async def _ai_toggle_show_question_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Flip the "show my message in replies" presentation preference.
+
+    Presentation-only: only the chat rendering reads it.
+    """
+    from backend.ai.engine.telemetry import telemetry
+
+    owner_id = await _get_owner_id()
+    telemetry.set_show_question_pref(owner_id, not telemetry.get_show_question_pref(owner_id))
     return await _ai_settings_panel_handler(event, extra)
 
 
@@ -1752,6 +1770,7 @@ def register(client, owner_id: int) -> None:
         register_action("ai_diagnostics_refresh", _ai_diagnostics_refresh_action)
         register_action("ai_health_refresh", _ai_health_refresh_action)
         register_action("ai_toggle_telemetry", _ai_toggle_telemetry_action)
+        register_action("ai_toggle_show_question", _ai_toggle_show_question_action)
         register_input("ai_settings", "trigger_en", {
             "handler": _ai_trigger_en_input,
             "prompt": "**English wake word**\n\nOne word, said before your message.\nSend 'clear' to remove.\n\n_Reply below._",

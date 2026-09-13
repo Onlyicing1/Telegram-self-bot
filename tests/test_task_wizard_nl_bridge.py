@@ -387,7 +387,7 @@ async def test_whitespace_only_ai_response_is_not_delivered_as_a_shell(monkeypat
 
     event = SimpleNamespace(edit=edit, reply=reply)
     with caplog.at_level(logging.WARNING, logger=delivery_mod.logger.name):
-        result = await delivery_mod.deliver_response(event, "یه تسک برای بیو بساز", "Nova", "   ")
+        result = await delivery_mod.deliver_response(event, "یه تسک برای بیو بساز", "   ")
 
     assert result.success is True
     assert len(edits) == 1
@@ -428,7 +428,7 @@ async def test_normalization_failure_is_logged_and_still_delivered(monkeypatch, 
     monkeypatch.setattr(delivery_mod, "process_output", _boom)
     text = "a real response"
     with caplog.at_level(logging.WARNING, logger=delivery_mod.logger.name):
-        result = await delivery_mod.deliver_response(event, "msg", "Nova", text)
+        result = await delivery_mod.deliver_response(event, "msg", text)
 
     assert calls["n"] == 1
     assert result.success is True
@@ -436,7 +436,7 @@ async def test_normalization_failure_is_logged_and_still_delivered(monkeypatch, 
     assert "ValueError" in caplog.text
     assert "nonempty_after_strip=True" in caplog.text
     # The response still reached the owner (raw fallback), never hidden.
-    assert edits == ["msg\n────────────\n🤖 Nova\n" + text]
+    assert edits == ["└─ " + text]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,136 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Recursive task creation and message-ID provenance (Stage I/J gaps)
+## Latest phase — AI reply presentation redesign
+
+### Objective
+
+Replace the old trigger/header/emoji AI reply shell with a minimal,
+Unicode-first presentation, and add a presentation-only "show my message in
+replies" preference. Verified from source first: the delivery path was
+`backend/ai/tools/delivery.py::deliver_response` (edit-in-place of the owner's
+original message, reply only as a fallback when the edit itself fails), reached
+from `backend/bot/handlers/ai_unified.py::_execute_ai`, with the pre-delivery
+states rendered by `_format_thinking` / the engine status callback and the
+failure states by `_format_failure` / `_format_error`. All of them rendered
+`{user_message}\n────────────\n🤖 {trigger_label}\n{body}`.
+
+### Presentation contract (after)
+
+With the preference ON:
+
+```
+│ owner message line 1
+│ owner message line 2
+│
+└─ first answer line
+    every later answer line (exactly four ASCII spaces)
+```
+
+With the preference OFF the question block is absent and the answer block is
+byte-identical to the ON case (`shown == question + "│" + hidden`).
+
+* No trigger label, AI name, `🤖`, horizontal separator, header, or card.
+* No emoji is introduced by this UI; the transient state is `└─ Thinking…`.
+* Every owner-message line begins with `│`; exactly ONE blank connector line
+  (`│`) separates question from answer.
+* The first answer line begins exactly with `└─ `; every continuation line
+  begins with exactly four ASCII spaces and never repeats `└─` or `│`.
+* The renderer only ADDS prefixes: the answer text (including significant
+  indentation and rendered-table padding) is not rewritten, normalized, or
+  rstripped by the presentation layer. `process_output` remains the single
+  normalizer (NFC, markdown degradation, tables, entity offsets).
+* Chunked delivery keeps the rules per chunk: chunk 1 carries the question
+  block, every chunk renders its first line with `└─ `, and continuation
+  chunks never reintroduce the old header/separator format.
+
+### Preference (presentation-only)
+
+Stored per owner in the existing RAM-only chat-preference store
+(`ExecutionTelemetry`, the same store as the reply-stats toggle — no schema
+change): `get_show_question_pref` / `set_show_question_pref`. It is toggled from
+the existing AI → Settings panel (`action:ai_toggle_show_question`, state line
+`My message in replies · On/Off`). It is read by exactly two places, both
+presentation-only: `_execute_ai` (to render the state/error/answer) and the
+reply-mode error edit in `register()`. It is never read by prompt construction,
+`ConversationHistory`/`HistoryManager`, the context builder, the provider
+layer, the tool executor, or the scheduler.
+
+### Edit-in-place preserved
+
+The answer is applied with `await event.edit(messages[0])` on the owner's
+original message. A new Telegram message is only ever sent as the pre-existing
+fallback when the edit itself raises, or for continuation chunks of an
+oversized answer — behaviour unchanged by this phase.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/tools/delivery.py` | new single renderer (`question_block`, `answer_block`, `format_presentation`), pagination-aware chunking, `deliver_response(..., show_question=False)`; `_format_message` (old shell) removed |
+| `backend/bot/handlers/ai_unified.py` | `_format_thinking` / `_format_error` / `_format_failure` now delegate to the renderer; status callback uses it; `_show_question_pref`; preference passed to `deliver_response` |
+| `backend/ai/engine/telemetry.py` | `get_show_question_pref` / `set_show_question_pref` in the existing RAM-only preference store |
+| `backend/bot/handlers/ai.py` | Settings panel state line + toggle row + `ai_toggle_show_question` action registration |
+| `tests/test_ai_presentation_redesign.py` | NEW — 16 focused tests (A–I below) |
+| `tests/test_67_ai_output_pipeline.py` | call sites/expected strings updated to the new presentation; reconstruction helpers now invert the wrapper (`_unwrap`) |
+| `tests/test_26_silent_delete.py` | `deliver_response` argument index updated (trigger label removed) |
+| `tests/test_task_wizard_nl_bridge.py` | empty-response presentation expectation updated |
+| `tests/test_09_reply_to_ai.py` | trigger-label presentation assertions replaced by the presentation contract |
+| `tests/test_35_ai_retry_ux.py` | failure presentation expectation updated |
+
+No scheduler, recovery, `TaskExecutionCoordinator`, provider, ToolExecutor,
+ToolRegistry, context, memory, persistence, or schema change. `_execute_ai`'s
+`trigger_word` parameter is retained (callers pass it positionally) and is
+documented as activation metadata that is no longer rendered.
+
+### Focused tests (all executed)
+
+`tests/test_ai_presentation_redesign.py` (16 tests) covers: A show-question ON
+structure; B OFF omits the owner message; C every multiline question line
+starts with `│`; D exactly one bare `│` connector; E only the first answer line
+has `└─ ` and continuations are indented; F the indent is exactly four ASCII
+spaces (not three); G no trigger label / AI name / emoji / separator anywhere;
+H edit-in-place delivery with zero new messages; I the same model-facing
+`AIRequest` (user message + message id) with the preference ON and OFF while
+the delivered rendering differs; plus chunked-rule/UTF-16 safety, the settings
+toggle, and the transient thinking state.
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_ai_presentation_redesign.py tests/test_67_ai_output_pipeline.py -q` | **100 passed** |
+| `pytest tests/test_task_wizard_nl_bridge.py tests/test_09_reply_to_ai.py tests/test_35_ai_retry_ux.py tests/test_36_ai_settings_ux.py tests/test_33_ai_telemetry.py tests/test_26_silent_delete.py tests/test_02_ai_flow.py tests/test_18_ai_execution_agent.py tests/test_19_ai_actions.py tests/test_34_ai_model_ui.py tests/test_37_ai_memory_db.py tests/test_43_ai_per_message_details.py tests/test_ai_menu_state_consistency.py tests/test_ai_state_consistency.py -q` | **299 passed** |
+| `pytest tests -q` | **2556 passed, 24 skipped, 0 failed** (68 s) |
+| `py_compile` on every changed Python file | **OK** |
+| `git diff --check` | **clean** |
+| `git status --short` | only the intended files |
+
+Normalization, markdown degradation, table rendering, entity offsets, UTF-16
+length limits, chunk reconstruction, partial-delivery honesty, and empty-output
+handling all remain covered by the pre-existing `tests/test_67_ai_output_pipeline.py`
+suite, which passes unchanged in intent (only the wrapper expectations moved).
+
+### Remaining limitations
+
+1. **Not verified on a live device.** The four-space alignment assumes
+   Telegram's client monospace rendering; only a live device can prove exact
+   pixel alignment (and RTL bidi ordering of `│`/`└─` lines in the Telegram
+   client). Nothing beyond the in-process rendering was executed.
+2. The preference is RAM-only (same store and lifetime as the existing reply-stats
+   toggle); it resets on restart. Persisting it would require a schema/table
+   decision outside this presentation-only scope.
+3. A single answer line wider than the Telegram budget is still split
+   mid-line by the UTF-16 splitter (pre-existing behaviour); both halves keep
+   the presentation rules.
+4. `_format_failure`/`_format_error` bodies are rendered through the same
+   renderer, so a multi-line notice is indented like an answer (intended).
+
+### Delivery
+
+Committed as `feat: redesign AI response presentation` and pushed to
+`origin/main`; the exact SHA, push result and remote verification for this
+phase are recorded in the session's final response (this section was written
+before the commit so it does not invent a hash).
+
+## Previous phase — Recursive task creation and message-ID provenance (Stage I/J gaps)
 
 ### Revision under report
 
