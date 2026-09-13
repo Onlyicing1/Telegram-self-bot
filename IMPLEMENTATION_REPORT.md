@@ -54,6 +54,109 @@ No schema or RLS change was required, and no SQL was executed. Owner identity re
 
 ---
 
+## Investigation Plan — Current Task Semantic Completeness
+
+> **Planning only.** No investigation stage below has been executed. No
+> production code, tests, schema, or configuration is changed by this plan, and
+> no stage may change any file other than the final deliverable
+> (`INVESTIGATION.md`).
+
+### Baseline and current revision
+
+| Item | Value |
+|---|---|
+| Previous investigation baseline | `2551970` |
+| Current revision at plan writing | `f833cad` (tip of `main`) |
+| Semantic-completeness implementation under re-audit | `3763138d774d7df9aa0567f5d56118b5d0ad7888` (`feat: enforce semantic completeness for task creation`) |
+| Last recorded investigation document | `INVESTIGATION.md` (audit of `2551970`, committed `f833cad`) |
+
+### Objective
+
+Establish the **current-state** answer to one question, at the current revision:
+*after `3763138d`, can a schema-valid but semantically incomplete action still be
+persisted as a task, and which supported actions remain unguarded?*
+
+### Why the previous investigation is outdated
+
+1. The previous audit described the persistence boundary as enforcing semantic
+   completeness for `send_message` only, with no deterministic check for profile
+   content. `3763138d` added exactly that check
+   (`TaskSemanticCompletenessError` + `_semantic_completeness_error` in
+   `backend/ai/task_creation.py`, limited to
+   `_PROFILE_CONTENT_ACTIONS = {"bio_set_text", "username_set_text"}`), a
+   non-invention contract block in the interpreter prompt, and a
+   `candidate_semantically_incomplete` → Taskloom-wizard signal in
+   `backend/ai/tools/task.py`.
+2. Additional production commits landed after `2551970` in the same area —
+   `backend/ai/task_execution.py`, `backend/ai/preparation_policy.py`,
+   `backend/ai/actions.py`, `backend/ai/tools/message.py`,
+   `backend/ai/tools/task_management_tools.py`, `backend/ai/task_candidate.py`
+   (display-font allowlist) and `backend/ai/task_scheduler.py` (`177a31d`
+   recovery semantics), plus the new `backend/ai/task_wizard.py`.
+   Per-action verdicts from `2551970` therefore cannot be carried forward as
+   facts; each must be re-derived at the current revision.
+
+### Investigation stages
+
+Each stage is narrow, has one question, and **must stop when its completion
+criterion is met** — no stage may begin the next one in the same run.
+
+| Stage | Narrow source scope | Question | Evidence to collect | Completion criterion |
+|---|---|---|---|---|
+| **A — Boundary coverage of `3763138d`** | `backend/ai/task_creation.py` (`TaskSemanticCompletenessError`, `_PROFILE_CONTENT_ACTIONS`, `_semantic_completeness_error`, the call site in `TaskCreationService.create`); `backend/ai/tools/task.py` (`_fail` mapping + catch site); `backend/ai/task_interpreter.py` (non-invention prompt block); `tests/test_task_semantic_completeness.py` | Which cases does the new boundary reject, which does it explicitly not cover, and does the rejection provably occur before any repository call? | Exact accept/reject matrix; the ordering of checks inside `create()` relative to `repository.create_task`; the wizard-signal propagation path; the list of cases the added test file actually exercises | A written covered/not-covered matrix with a source citation for every row, and confirmation that no repository call precedes the check. |
+| **B — Action vocabulary and requirement classes** | `backend/ai/tools/registry.py::create_default_registry` (authoritative list); `backend/ai/tools/base.py` (`Tool` contract, `PermissionLevel`); each registered tool's `parameters`/`execute` only as far as needed to classify it | What is the exhaustive registered action set, and for each action: required args, optional args, content-bearing?, context-dependent?, permission level? | One row per registered action citing `registry.py` for registration and the tool's own `parameters`/`execute` for its requirements | Every registered name classified into exactly one requirement class with citations; no behavioural verdict yet. |
+| **C — Content-bearing actions at the persistence boundary** | `backend/ai/task_candidate.py` (`from_untrusted`, `_canonicalize_action`, alias sets); `backend/ai/task_creation.py` (`_semantic_completeness_error`); the content-bearing tools identified in Stage B | Can a schema-valid, semantically incomplete content action still reach `repository.create_task`? | Per action, the exact accept/reject trace candidate → creation → repository, naming the guard or its absence | Each content-bearing action carries PASS/GAP with a citation and, where GAP, the precise bypass. |
+| **D — Context-dependent actions at scheduled execution** | `backend/ai/task_execution.py` (`TaskExecutionCoordinator.execute`, `_fresh_context`, destination injection); `backend/ai/task_scheduler.py` (occurrence creation/advance); the context-dependent tools from Stage B | Can a task persist an action whose required runtime context cannot exist at a scheduled occurrence? | For each action: the exact `context.extra` key it reads, and the exact set of keys the coordinator injects; plus whether that action is persistable at the candidate/creation boundary | A table of action → required extra key → injected at execution? → persistable? → verdict, each cell cited. |
+| **E — Trusted vs model-supplied fields** | `backend/ai/task_candidate.py` (`notification_destination`, `chat_name`, delivery flags); `backend/ai/tools/task.py` (destination and trigger resolution); `backend/ai/task_trigger.py` (name→id resolution); `backend/ai/task_execution.py` (destination injection) | Can a provider-supplied id/recipient value survive to persistence where a trusted resolution was required? | A field-by-field trace of every field able to carry an identifier: dropped, overwritten, or surviving — with the deciding lines | Each field classified trusted / overwritten / survives, with evidence; the `2551970` hypothesis about a surviving model-supplied `chat_id` is either confirmed or refuted from source. |
+| **F — Permission- and confirmation-sensitive actions** | `backend/ai/tools/base.py` (`PermissionLevel` contract); `backend/ai/tools/executor.py` (confirmation enforcement and `execute_confirmed`); `backend/ai/tools/settings.py`; `backend/ai/tools/organize.py`; `backend/ai/task_execution.py` (`execute_calls` call site) | Can a scheduled task persist an action whose execution contract requires a confirmation the occurrence path cannot provide? | The exact executor branch for `ADMIN_ONLY` / `CONFIRMATION_REQUIRED`, whether `execute_calls` honours it, and whether such an action passes the candidate + creation boundary | PASS/GAP/UNCERTAIN per confirmation-gated action with citations; source inconclusiveness stated explicitly rather than guessed. |
+| **G — Residual unknowns** | Only the items left UNCERTAIN by Stages B–F, plus tools not conclusively covered there (`web_search`, `task_*`, `memory_*`, `account_show`, profile template/mood tools) | What remains unresolved, and is it resolvable from source at all? | Targeted reading of only the specific `execute` bodies still unresolved | Every open item resolved to PASS/GAP with citation, or re-affirmed UNCERTAIN with the reason and the exact reproduction needed. |
+| **H — Verdict and remaining gaps** | The evidence already collected in Stages A–G (source reads only to verify a citation) | What is the current-state verdict at the current revision, and which gaps remain? | Consolidated tables; the delta against the `2551970` findings (closed / persists / newly introduced) | `INVESTIGATION.md` replaced with the deliverable defined below. |
+
+### Scope discipline
+
+- **No-code-change rule (all stages):** production code under `backend/**`, all
+  `tests/**`, `supabase/**` migrations, configuration (`.env*`, `config.py`),
+  and every other repository file must remain untouched. The **only** file any
+  investigation stage may modify is `INVESTIGATION.md` at Stage H.
+- **No new architecture:** no second validator, AI judge, provider call, or
+  persistence path may be introduced by the investigation, and none may be
+  proposed as part of it beyond the documented fix surface.
+- **No repository-wide search:** each stage reads only the files named in its
+  scope, plus a narrowly justified neighbouring file when a citation requires it.
+- **No live verification:** no live Telegram, Supabase, Render, or provider
+  network call. Reproductions, where required, are bounded in-process tests.
+- **Evidence honesty:** every finding is labelled CONFIRMED (read directly from
+  source) or HYPOTHESIS/UNCERTAIN. Nothing is inferred from commit messages,
+  report prose, or filenames.
+
+### Source-only vs reproduction-required
+
+| Decidable from source alone | Requires a targeted in-process reproduction |
+|---|---|
+| Boundary coverage and check ordering (A); vocabulary and required args (B); guard presence/absence (C); injected `extra` keys vs required keys (D); permission branches (F) | Whether a model-supplied identifier actually survives to persistence end-to-end (E); whether a confirmation-gated action genuinely reaches persistence through the create path (F); whether an empty-content non-profile action executes as a no-op rather than failing (C) |
+
+### Final deliverable
+
+`INVESTIGATION.md` is replaced (never appended) with a current-state document at
+the audited revision containing:
+
+1. revision audited, baseline revision, and the stages actually executed;
+2. the enforcement-layer map as it exists now, including the `3763138d`
+   boundary and the `candidate_semantically_incomplete` wizard signal;
+3. the registered action vocabulary with requirement class per action;
+4. the action-by-action **PASS / GAP / UNCERTAIN** classification with an exact
+   file + function/class citation per row;
+5. confirmed facts separated from hypotheses, with each hypothesis stating what
+   would confirm or refute it;
+6. the delta against the `2551970` investigation;
+7. remaining work and the recommended fix surface (no implementation);
+8. validation performed and the explicit statement of what was not verified.
+
+The deliverable is documentation only: no production code, test, schema, or
+configuration change accompanies it. No stage is executed in this run.
+
+---
+
 > **Latest phase — Task execution reliability**
 >
 > This section is the current execution-reliability result. Earlier context and
