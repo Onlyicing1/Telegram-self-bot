@@ -547,7 +547,7 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     reply_stats = telemetry.get_telemetry_pref(owner_id)
-    show_question = telemetry.get_show_question_pref(owner_id)
+    show_question = bool(config.get("show_question", False))
 
     en = (config.get("trigger_en", "") or "").strip()
     fa = (config.get("trigger_fa", "") or "").strip()
@@ -1000,12 +1000,15 @@ async def _ai_toggle_telemetry_action(event, extra: str, chat_id: int) -> tuple[
 async def _ai_toggle_show_question_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Flip the "show my message in replies" presentation preference.
 
-    Presentation-only: only the chat rendering reads it.
+    Presentation-only and DURABLE: stored on the owner's ``ai_config`` row via
+    the existing config-store mechanism, so it survives restarts. Only the
+    chat rendering reads it.
     """
-    from backend.ai.engine.telemetry import telemetry
+    from backend.ai import config_store
 
     owner_id = await _get_owner_id()
-    telemetry.set_show_question_pref(owner_id, not telemetry.get_show_question_pref(owner_id))
+    current = bool((await config_store.get_config(owner_id)).get("show_question", False))
+    await config_store.update_setting(owner_id, "show_question", not current)
     return await _ai_settings_panel_handler(event, extra)
 
 

@@ -172,7 +172,6 @@ class ExecutionTelemetry:
     def __init__(self, maxlen: int = 200) -> None:
         self._records: deque[AIExecutionRecord] = deque(maxlen=maxlen)
         self._show_telemetry: dict[int, bool] = {}
-        self._show_question: dict[int, bool] = {}
 
     # ── Recording ──
 
@@ -285,20 +284,9 @@ class ExecutionTelemetry:
     def set_telemetry_pref(self, owner_id: int, enabled: bool) -> None:
         self._show_telemetry[owner_id] = bool(enabled)
 
-    # ── "Show my message in replies" presentation preference (RAM-only) ──
-    # Presentation state only: it is never read by prompt construction, the
-    # conversation history, the provider layer, or the tool layer.
-
-    def get_show_question_pref(self, owner_id: int) -> bool:
-        return bool(self._show_question.get(owner_id, False))
-
-    def set_show_question_pref(self, owner_id: int, enabled: bool) -> None:
-        self._show_question[owner_id] = bool(enabled)
-
     def reset_for_tests(self) -> None:
         self._records.clear()
         self._show_telemetry.clear()
-        self._show_question.clear()
 
 
 telemetry = ExecutionTelemetry()

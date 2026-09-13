@@ -35,6 +35,7 @@ Short responses edit the original message in-place (zero-spam).
 Oversized responses are safely split and delivered in chunks.
 """
 import asyncio
+import contextvars
 import logging
 import os
 import time
@@ -57,6 +58,14 @@ _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
 _AI_MAX_CONCURRENCY = 4
 _RPC_T = 30.0
+
+# The ``ai_config`` snapshot the activation handler already read (triggers),
+# visible to the presentation helpers for the request's lifetime. This avoids
+# a second durable config read per AI message — the preference is threaded,
+# never re-fetched. No cache: it is set fresh for every request.
+_PREFETCHED_CONFIG: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "prefetched_ai_config", default=None
+)
 
 # Appended to the text reply ONLY when the Taskloom wizard panel could not be
 # sent (helper bot unavailable): the owner still needs an actionable path to
@@ -248,28 +257,39 @@ async def _restore_config(owner_id: int, config: dict | None = None) -> None:
 
 
 def _show_question_pref(owner_id: int) -> bool:
-    """The owner's "show my message in replies" presentation preference."""
-    from backend.ai.engine.telemetry import telemetry
+    """The owner's "show my message in replies" presentation preference.
 
-    return telemetry.get_show_question_pref(owner_id)
+    Durable: read through the existing AI-config path (``config_store``),
+    never from any RAM store. When the caller already loaded the ``ai_config``
+    snapshot, it is threaded through instead of re-read.
+    """
+    from backend.ai.config_store import _DEFAULTS
+
+    try:
+        config = _PREFETCHED_CONFIG.get()
+    except LookupError:
+        return False  # outside a request: only the renderer default is known
+    if config is not None and "show_question" in config:
+        return bool(config["show_question"])
+    return bool(_DEFAULTS["show_question"])
 
 
 def _format_thinking(user_message: str, show_question: bool) -> str:
-    from backend.ai.tools.delivery import format_presentation
+    from backend.ai.tools.delivery import format_thinking
 
-    return format_presentation(user_message, "Thinking…", show_question)
+    return format_thinking(user_message, show_question)
 
 
 def _format_error(user_message: str, error: str, show_question: bool) -> str:
-    from backend.ai.tools.delivery import format_presentation
+    from backend.ai.tools.delivery import format_failure
 
-    return format_presentation(user_message, f"Error\n{error}", show_question)
+    return format_failure(user_message, f"Error\n{error}", show_question)
 
 
 def _format_failure(user_message: str, notice: str, show_question: bool) -> str:
-    from backend.ai.tools.delivery import format_presentation
+    from backend.ai.tools.delivery import format_failure
 
-    return format_presentation(user_message, notice, show_question)
+    return format_failure(user_message, notice, show_question)
 
 
 def _failure_notice(result) -> str:
@@ -516,6 +536,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     logger.info("AI_EXEC_TRACE request_id=%s stage=telegram_received", rid)
 
     show_question = _show_question_pref(owner_id)
+    _PREFETCHED_CONFIG.set(None)
     engine = _get_engine()
     if engine is None:
         try:
@@ -577,8 +598,8 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
 
         async def _status_callback(status: str) -> None:
             try:
-                from backend.ai.tools.delivery import format_presentation
-                await event.edit(format_presentation(display_prompt, status, show_question))
+                from backend.ai.tools.delivery import format_status
+                await event.edit(format_status(display_prompt, status, show_question))
             except Exception as exc:
                 logger.debug("AI handler: status edit failed: %s", exc)
 
@@ -828,6 +849,7 @@ def register(client, owner_id: int, tz_str: str):
         remaining = words[1].strip() if len(words) > 1 else ""
 
         trigger_en, trigger_fa, config_snapshot = await _load_triggers(owner_id)
+        _PREFETCHED_CONFIG.set(config_snapshot)
         trigger_matched = False
         if trigger_en or trigger_fa:
             from backend.ai.config_store import match_trigger

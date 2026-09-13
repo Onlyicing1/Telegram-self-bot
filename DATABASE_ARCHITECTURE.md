@@ -423,6 +423,7 @@ parameters.
 | `is_configured` | `boolean` | NO | `false` | Whether the user completed setup |
 | `trigger_en` | `text` | YES | `NULL` | English trigger word (case-insensitive matching). NULL = not set. |
 | `trigger_fa` | `text` | YES | `NULL` | Persian trigger word (exact matching). NULL = not set. |
+| `show_question` | `boolean` | NO | `false` | Presentation-only "Show my message in AI replies" preference. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload); toggled from AI → Settings. Consumed only by the Telegram reply renderer. Added by `20260913000000_add_ai_config_show_question.sql` — pending manual application. |
 | `last_request_at` | `timestamptz` | YES | `NULL` | Timestamp of the last AI request. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `last_latency_ms` | `real` | YES | `NULL` | Latency of the last AI request in ms. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `created_at` | `timestamptz` | YES | `now()` | When the config row was created |
@@ -1055,6 +1056,27 @@ the `ai_config` table — pending manual application.
 The columns exist in the migration (`20260805075707`). No action
 remaining for this item.
 
+### 19.2a `ai_config` — `show_question` presentation preference
+
+**Severity:** Medium
+
+**Problem:** `config_store.py` includes `show_question` (boolean, the
+durable "Show my message in AI replies" presentation preference) in every
+`ai_config` upsert payload and merges it in `get_config` with a `False`
+default. The base migration does not create this column. As with the
+trigger columns (§19.1), an un-migrated database makes the whole upsert
+degrade to the in-memory fallback, so the preference would be lost on
+restart.
+
+**Resolution [MIGRATION CREATED]:** Migration
+`20260913000000_add_ai_config_show_question.sql` adds
+`show_question BOOLEAN NOT NULL DEFAULT false` (idempotent, with
+rollback SQL) — pending manual application. Until it is applied, the
+application still serves the default (`false`) and the toggle degrades
+to the in-memory fallback exactly like every other `ai_config` key.
+No second preference store exists; the RAM-only `ExecutionTelemetry`
+store is NOT a source of truth for this preference.
+
 ### 19.3 `panel_settings` — 10 columns missing from migrations
 
 **Severity:** High
@@ -1426,6 +1448,7 @@ migration. No code change needed.
 | 7 | `20260801215007_create_username_state_table.sql` | `username_state` | Applied |
 | 8 | `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` | Applied |
 | 9 | `20260805075707_...create_ai_config_table.sql` | `ai_config` (base columns, no triggers) | Applied (incomplete — see §19.1) |
+| 9a | `20260913000000_add_ai_config_show_question.sql` | Added `show_question boolean NOT NULL DEFAULT false` to `ai_config` (idempotent, rollback documented) | Pending manual application (see §19.2a) |
 | 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Seen | Applied (verified by owner) |
 | 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Applied (verified by owner) |
 | 12 | `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds` (idempotent backfill + drop) | Pending manual application |

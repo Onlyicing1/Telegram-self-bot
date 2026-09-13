@@ -1,6 +1,176 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — AI reply presentation redesign
+## Latest phase — Presentation corrections: durable preference, direction-aware connector, distinct states
+
+Four confirmed defects in the previous presentation redesign were fixed. All
+four were re-verified from source before changing anything.
+
+### Defect 1 — the preference was RAM-only; it is now durable in `ai_config`
+
+**Root cause.** The toggle wrote `ExecutionTelemetry` (a RAM dict), so the
+preference was lost on every restart/redeploy.
+
+**Fix (no new store, no new table).** The "Show my message in AI replies"
+preference is now a real AI-config key:
+
+* `backend/ai/config_store.py` — added to `_DEFAULTS` (`show_question: False`
+  — the default preserves the previous intended behavior) and to every
+  `ai_config` upsert payload in `_save_config_sync`. It therefore round-trips
+  through the existing `get_config`/`update_setting` mechanisms, the
+  in-memory-fallback rules, and restart/redeploy restore. Nothing else in the
+  file changed.
+* `backend/bot/handlers/ai.py` — the Settings panel reads it from the config
+  row it already loaded; the toggle (`ai_toggle_show_question`) persists via
+  `config_store.update_setting` (a durable read-modify-write, the same
+  mechanism as every other AI setting).
+* `backend/bot/handlers/ai_unified.py` — `_show_question_pref` reads ONLY the
+  `ai_config` snapshot the activation handler already loaded for trigger
+  resolution (threaded via a request-scoped `ContextVar`, set fresh per
+  request, cleared after use — no second DB read per AI message and no
+  cross-request cache). Outside a request it falls back to the
+  `config_store` default (`False`), never to any RAM store.
+* `backend/ai/engine/telemetry.py` — the `get_show_question_pref` /
+  `set_show_question_pref` RAM accessors were REMOVED; `ExecutionTelemetry`
+  is no longer a source of truth for this preference.
+
+**MANUAL SUPABASE ACTION REQUIRED** — the agent did NOT execute any SQL.
+`supabase/migrations/20260913000000_add_ai_config_show_question.sql` (new,
+idempotent, additive) must be applied by the owner:
+
+```sql
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS show_question boolean NOT NULL DEFAULT false;
+```
+
+Rollback:
+
+```sql
+ALTER TABLE ai_config
+    DROP COLUMN IF EXISTS show_question;
+```
+
+Before the migration is applied the runtime still works: `get_config` serves
+the default (`false`) and saves degrade to the in-memory fallback exactly as
+they already do for every `ai_config` key on an un-migrated database.
+`DATABASE_ARCHITECTURE.md` was updated (§7 column table, new §19.2a, and the
+§20 migration list) to document the column and the pending manual step.
+
+### Defect 2 — OFF mode leaked question connectors
+
+**Root cause.** `format_presentation` rendered the answer block and only
+*skipped* the question text, so OFF mode still carried connector structure.
+
+**Fix.** OFF mode is now a genuinely different presentation mode:
+`format_presentation(..., False)` returns ONLY the answer block — no `│`
+question lines, no blank `│` connector, no structure implying a hidden
+question. `shown == question_block + "\n│\n" + hidden` remains an exact
+identity (proven by test), so no answer character ever depends on the
+preference.
+
+### Defect 3 — one fixed `└─` ignored text direction
+
+**Root cause.** The answer elbow was a single fixed glyph pair regardless of
+content direction.
+
+**Fix (Unicode/BiDi-verified).** Box-drawing characters are BiDi-neutral, so
+the elbow pair itself must carry the direction. The renderer picks it from
+the DOMINANT DIRECTION OF THE RENDERED TEXT using the output pipeline's own
+script classifier (`_profile` / `_script` / `_RTL_SCRIPTS` — the owner's
+language setting is never consulted):
+
+* clear LTR → `└─ ` (U+2514 U+2500; arm touches the text on its right)
+* clear RTL → ` ─┘ ` (U+2500 U+2518; arm touches the text on its left, with a
+  leading space keeping the two-column elbow aligned with the LTR form)
+* mixed RTL/LTR → the FIRST strong directional character decides (the same
+  rule the Unicode BiDi algorithm uses to pick the paragraph direction that
+  determines which side the text starts on); deterministic per text
+* neutral text → LTR
+
+The logical order of the text is never reversed. The decision is computed per
+rendered block, so a Persian answer with an English question renders RTL and
+vice versa. Continuation lines remain exactly four ASCII spaces in both
+directions.
+
+### Defect 4 — thinking/error states showed the answer connector
+
+**Root cause.** All states were routed through one answer renderer with a
+placeholder body (`"Thinking…"`), so the `└─` elbow appeared before any
+answer existed and failures looked like successful answers.
+
+**Fix — four distinct states, separate renderers:**
+
+| State | Renderer | Output |
+|---|---|---|
+| THINKING / LOADING | `format_thinking` / `format_status` | question bars + plain text (`Thinking…` / progress note); **no** `└`, `┘`, or fake answer structure |
+| SUCCESS WITH ANSWER | `format_presentation(..., True)` | question bars + one blank `│` connector + directional elbow answer |
+| SUCCESS, QUESTION HIDDEN | `format_presentation(..., False)` | answer only |
+| FAILURE / ERROR | `format_failure` | question bars + notice; **no** answer elbow — never reads as a success |
+
+The handler now uses them separately: `_format_thinking` → `format_thinking`,
+the engine status callback → `format_status`, `_format_error`/`_format_failure`
+→ `format_failure`, and only a produced answer reaches
+`format_presentation`/`deliver_response` (the empty-response edit now uses
+`format_failure` too).
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/ai/config_store.py` | durable `show_question` key (defaults + upsert payload) |
+| `backend/ai/tools/delivery.py` | four-state renderers, direction-aware elbow, pure OFF mode; `_answer_block`/`_question_block` are private now |
+| `backend/bot/handlers/ai_unified.py` | threaded request snapshot (`ContextVar`), state-specific formatters, status callback |
+| `backend/bot/handlers/ai.py` | settings panel reads config; toggle persists via `config_store.update_setting` |
+| `backend/ai/engine/telemetry.py` | removed the RAM preference accessors |
+| `supabase/migrations/20260913000000_add_ai_config_show_question.sql` | NEW — idempotent additive migration + rollback (manual application) |
+| `DATABASE_ARCHITECTURE.md` | §7 column, §19.2a gap entry, §20 migration row |
+| `tests/test_ai_presentation_redesign.py` | rewritten: 35 focused tests (A–M below) |
+| `tests/test_67_ai_output_pipeline.py`, `tests/test_35_ai_retry_ux.py` | expectations updated to the new contract |
+
+### Tests (all executed)
+
+`tests/test_ai_presentation_redesign.py` covers A–M: durable default/save-
+ON/save-OFF/reload roundtrip through a Supabase-shaped fake; upsert-payload
+persistence; survival of in-memory/telemetry state replacement; renderer
+independence from `ExecutionTelemetry` (RAM accessors removed); OFF purity;
+ON structure (bars + exactly one connector); four-space continuation (LTR and
+RTL); LTR elbow; RTL mirrored elbow; mixed-direction determinism (first
+strong character); neutral text; direction from rendered text not language
+setting; elbow only on the first answer line; thinking/status/failure states
+without the answer connector; no emoji/trigger/separator; edit-in-place end-
+to-end with the stored preference (zero replies); presentation/context
+separation (identical `AIRequest` user message + message id under both
+settings); failure end-to-end; chunked UTF-16 safety.
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_ai_presentation_redesign.py -q` | **35 passed** |
+| Adjacent delivery/settings/telemetry/retry/reply/silent-delete suites | **197 passed** |
+| `pytest tests -q` | **2575 passed, 24 skipped, 0 failed** (69 s) |
+| `py_compile` on every changed Python file | **OK** |
+| `git diff --check` | **clean** |
+
+### Confirmations and limitations
+
+* **Model context/history unchanged:** the preference is read only by the two
+  presentation sites; the model-facing `AIRequest` (user message, message id)
+  is byte-identical under both settings (proven end-to-end).
+* **Edit-in-place intact:** the answer is still `await event.edit(...)` on the
+  owner's original message; new messages remain only the pre-existing
+  edit-failure fallback and oversized-answer continuation chunks.
+* The four-space alignment and the mirrored RTL elbow can only be fully
+  proven on a live Telegram client (BiDi rendering, font metrics); the glyph
+  choice and generated strings were verified at the Unicode level here.
+* The preference is durable only after the owner applies the manual migration
+  above; until then it behaves exactly like every other `ai_config` key on an
+  un-migrated database (in-memory fallback, default on restart).
+
+### Delivery
+
+Committed as `fix: correct durable AI reply presentation` and pushed to
+`origin/main`; the exact SHA and remote verification are in the session's
+final response.
+
+## Previous phase — AI reply presentation redesign
 
 ### Objective
 

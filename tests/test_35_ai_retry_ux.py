@@ -308,8 +308,10 @@ def test_format_failure_keeps_message_hierarchy():
     from backend.bot.handlers.ai_unified import _format_failure
 
     text = _format_failure("prompt", "✕ Couldn't get a response\nTimeout", False)
-    assert text.startswith("└─ ✕ Couldn't get a response\n    Timeout")
+    # FAILURE state: the notice only — never the successful-answer elbow
+    assert text == "✕ Couldn't get a response\nTimeout"
     assert "❌ Error" not in text
+    assert "└" not in text and "┘" not in text
 
 
 # ── 6. Health panel states ──

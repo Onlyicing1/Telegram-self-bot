@@ -250,18 +250,42 @@ class DeliveryResult:
 
 
 # ── Chat presentation ────────────────────────────────────────────────────────
-# Presentation-only rendering. The owner's message is quoted behind `│`; the
-# answer starts behind `└─ ` and every continuation line is indented by exactly
-# four ASCII spaces so all answer text starts at the same visual column. There
-# is no trigger label, header, emoji, or separator anywhere in the presentation.
-# The renderer never alters the answer text itself and owns no preference —
-# the caller decides whether the question is shown.
+# Presentation-only rendering with four distinct states:
+#
+#   THINKING (format_thinking)        question bars + plain status, NO answer
+#                                     connector — no structure may imply that
+#                                     an answer already exists
+#   FAILURE (format_failure)          question bars + notice, NO answer
+#                                     connector — never looks like a success
+#   ANSWER, question shown            question bars + blank `│` connector +
+#                                     directional elbow answer block
+#   ANSWER, question hidden           ONLY the answer block — genuinely a
+#                                     different mode: no `│`, no connector
+#                                     lines, no structure pretending a
+#                                     hidden question exists
+#
+# The answer starts behind a directional elbow and every continuation line is
+# indented by exactly four ASCII spaces so all answer text starts at the same
+# visual column. There is no trigger label, header, emoji, or separator
+# anywhere in the presentation. The renderer never alters the text itself and
+# owns no preference — the caller decides whether the question is shown.
 
 _QUESTION_MARK = "│"
-_ANSWER_MARK = "└─"
 _ANSWER_INDENT = "    "
 _QUESTION_PREFIX = f"{_QUESTION_MARK} "
-_ANSWER_PREFIX = f"{_ANSWER_MARK} "
+# Box-drawing glyphs are BiDi-neutral, so the elbow pair is chosen from the
+# DOMINANT DIRECTION OF THE RENDERED TEXT instead of one fixed form: the
+# vertical stroke points at the first answer glyph and the horizontal arm
+# runs from the elbow toward that text.
+#   LTR  "└─ "  U+2514 U+2500 — arm touches the text on its right
+#   RTL  "─┘ "  U+2500 U+2518 — arm touches the text on its left
+# (the leading space keeps the two-column elbow aligned with the LTR form;
+# the logical character order of the text itself is never reversed)
+_LTR_ANSWER_MARK = "└─"
+_RTL_ANSWER_MARK = "─┘"
+_LTR_ANSWER_PREFIX = f"{_LTR_ANSWER_MARK} "
+_RTL_ANSWER_PREFIX = f" {_RTL_ANSWER_MARK} "
+_ANSWER_MARK = _LTR_ANSWER_MARK
 
 
 def _presentation_lines(text: str) -> list[str]:
@@ -274,7 +298,27 @@ def _presentation_lines(text: str) -> list[str]:
     return normalized.split("\n")
 
 
-def question_block(user_message: str) -> str:
+def _is_rtl_text(text: str) -> bool:
+    """Dominant visual direction of ``text`` for the connector glyphs.
+
+    Reuses the output pipeline's script classifier (the same ``_script`` /
+    ``_RTL_SCRIPTS`` that build ``OutputProfile``): clear RTL or clear LTR
+    follows the whole text, mixed RTL/LTR content follows the FIRST strong
+    directional character (mirroring the Unicode BiDi paragraph rule that
+    decides which side the text starts on), neutral text is LTR. The
+    owner's language setting is never consulted.
+    """
+    profile = _profile(text or "")
+    if profile.mixed_direction:
+        for char in text:
+            if not char.isalpha():
+                continue
+            return _script(char) in _RTL_SCRIPTS
+        return False
+    return profile.direction == "rtl"
+
+
+def _question_block(user_message: str) -> str:
     """Quote every line of the owner's message behind ``│``.
 
     Leading/trailing blank lines are dropped (they would read as stray bars);
@@ -290,29 +334,72 @@ def question_block(user_message: str) -> str:
     )
 
 
-def answer_block(response_text: str) -> str:
-    """Render an answer: ``└─ `` on the first line, four spaces afterwards."""
+def _answer_block(response_text: str) -> str:
+    """Render an answer block: the directional elbow on the first line and
+    exactly four ASCII spaces on every continuation line."""
     lines = _presentation_lines(response_text)
     if not lines:
         return _ANSWER_MARK
-    rendered = [f"{_ANSWER_PREFIX}{lines[0]}"]
+    prefix = _RTL_ANSWER_PREFIX if _is_rtl_text(response_text) else _LTR_ANSWER_PREFIX
+    rendered = [f"{prefix}{lines[0]}"]
     rendered.extend(f"{_ANSWER_INDENT}{line}" for line in lines[1:])
     return "\n".join(rendered)
 
 
 def format_presentation(user_message: str, response_text: str, show_question: bool) -> str:
-    """The single AI chat presentation shared by every delivery path.
+    """ANSWER state: the final presentation for a produced answer.
 
-    ``show_question`` is presentation state only: it changes nothing about the
-    model input, history, prompts, providers, or tools.
+    With ``show_question`` the question block and exactly one blank bar
+    connector precede the answer; without it the result is ONLY the answer
+    presentation (no question bars anywhere). ``show_question`` is presentation state
+    only: it changes nothing about the model input, history, prompts,
+    providers, or tools.
     """
-    answer = answer_block(response_text)
+    answer = _answer_block(response_text)
     if not show_question:
         return answer
-    question = question_block(user_message)
+    question = _question_block(user_message)
     if not question:
         return answer
     return f"{question}\n{_QUESTION_MARK}\n{answer}"
+
+
+def format_thinking(user_message: str, show_question: bool) -> str:
+    """THINKING state: no answer connector and no answer structure, the
+    AI has not answered yet, so nothing may look like an answer."""
+    if not show_question:
+        return "Thinking…"
+    question = _question_block(user_message)
+    if not question:
+        return "Thinking…"
+    return f"{question}\n{_QUESTION_MARK}\nThinking…"
+
+
+def format_status(user_message: str, status: str, show_question: bool) -> str:
+    """THINKING-state progress note under the question (never an answer
+    connector); empty/whitespace status falls back to the plain state."""
+    if not isinstance(status, str) or not status.strip():
+        return format_thinking(user_message, show_question)
+    body = status.strip()
+    if not show_question:
+        return body
+    question = _question_block(user_message)
+    if not question:
+        return body
+    return f"{question}\n{_QUESTION_MARK}\n{body}"
+
+
+def format_failure(user_message: str, notice: str, show_question: bool) -> str:
+    """FAILURE state: the notice only, never a successful-answer elbow,
+    so a failure can never read as an answer."""
+    if not isinstance(notice, str) or not notice.strip():
+        notice = "✕ Couldn't get a response"
+    if not show_question:
+        return notice
+    question = _question_block(user_message)
+    if not question:
+        return notice
+    return f"{question}\n{_QUESTION_MARK}\n{notice}"
 
 
 def _format_continuation(response: str, part: int, total: int) -> str:
@@ -397,10 +484,11 @@ def _align_to_character(text: str, units: int) -> int:
 
 
 def _rendered_cost(lines: list[str], *, boundary: bool) -> int:
-    """UTF-16 cost of rendering ``lines`` as one answer page."""
+    """UTF-16 cost of rendering ``lines`` as one answer page (the wider RTL
+    elbow is assumed so the budget is conservative for both directions)."""
     if not lines:
         return 0
-    total = _utf16_units(_ANSWER_PREFIX) + _utf16_units(lines[0])
+    total = _utf16_units(_RTL_ANSWER_PREFIX) + _utf16_units(lines[0])
     for line in lines[1:]:
         total += 1 + _utf16_units(_ANSWER_INDENT) + _utf16_units(line)
     if boundary:
@@ -451,7 +539,7 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
         return [full]
     prefix = ""
     if show_question:
-        candidate = f"{question_block(user_message)}\n{_QUESTION_MARK}\n"
+        candidate = f"{_question_block(user_message)}\n{_QUESTION_MARK}\n"
         if _utf16_units(candidate) < SAFE_LIMIT - _MIN_SPLIT_CHUNK:
             prefix = candidate
     footer_reserve = _utf16_units("\n\n_(9/99)_") + 2
@@ -460,9 +548,9 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
     if len(pages) == 1:
         # The (rare) oversized question, not the answer, overflowed the limit.
         return _split_text(full, SAFE_LIMIT)
-    chunks = [prefix + answer_block(pages[0])]
+    chunks = [prefix + _answer_block(pages[0])]
     for index, page in enumerate(pages[1:], 2):
-        chunks.append(_format_continuation(answer_block(page), index, len(pages)))
+        chunks.append(_format_continuation(_answer_block(page), index, len(pages)))
     return chunks
 
 
@@ -475,10 +563,11 @@ async def deliver_response(
     if not isinstance(response_text, str) or not response_text.strip():
         # A whitespace-only response is NO response (live evidence: response
         # == " " passed the truthiness check, then normalization raised
-        # ValueError and the header-only shell was delivered anyway).
+        # ValueError and a header-only shell was delivered anyway). FAILURE
+        # state: no answer connector may imply a produced answer.
         try:
             await event.edit(
-                format_presentation(user_message, "Error\nAI returned no response.", show_question)
+                format_failure(user_message, "Error\nAI returned no response.", show_question)
             )
         except Exception as exc:
             logger.warning("delivery: empty-response edit failed: %s", exc)

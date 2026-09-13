@@ -81,7 +81,8 @@ async def test_integration_delivery_uses_centralized_processor():
     from backend.ai.tools.delivery import deliver_response
     result = await deliver_response(SimpleNamespace(edit=edit, reply=reply), "Nova hi", "**سلام**  ، دنیا!")
     assert result.success
-    assert edits == ["└─ سلام، دنیا!"]
+    # Persian answer → mirrored RTL elbow
+    assert edits == [" ─┘ سلام، دنیا!"]
     assert replies == []
 
 

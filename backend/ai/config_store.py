@@ -30,6 +30,7 @@ _DEFAULTS: dict[str, Any] = {
     "is_configured": False,
     "trigger_en": "Nova",
     "trigger_fa": "",
+    "show_question": False,
 }
 
 _fallback_config: dict[int, dict[str, Any]] = {}
@@ -102,6 +103,7 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "is_configured": config.get("is_configured", False),
             "trigger_en": config.get("trigger_en", "") or None,
             "trigger_fa": config.get("trigger_fa", "") or None,
+            "show_question": bool(config.get("show_question", False)),
             "last_request_at": config.get("last_request_at") or None,
             "last_latency_ms": config.get("last_latency_ms", 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
