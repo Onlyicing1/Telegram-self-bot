@@ -1,584 +1,207 @@
-# AI Tool + Task/Event Execution Investigation
+# INVESTIGATION — AI task-creation semantic completeness
 
-## Metadata
+> **Investigation only. No production code, tests, configuration, schema, or UI
+> were modified.** This document is the full replacement of the previous
+> `INVESTIGATION.md`; nothing from the earlier investigation is retained.
 
-| Field | Value |
+| Item | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Source baseline | `c0abadeb6af0a2d773ce0e51c0b60125d4cf1eb3` |
-| Scope | AI tool execution and durable time/event task execution |
-| Evidence | Current source and existing in-process regression tests |
-| Live status | Live Telegram, provider-network, and live Supabase execution were not performed |
-| Change type | Documentation-only investigation handoff |
-
-This document transfers the completed audit into the repository. It is not a redesign proposal. Current source is authoritative; older reports and planned architecture are not proof of runtime behavior.
-
-## VERDICT
-
-The core AI-tool and task/event execution architecture is implemented and connected. Interactive AI requests, time-based tasks, and Telegram event-based tasks converge on one registered-tool boundary:
-
-```text
-AI request → Dispatcher/provider selection → ToolRegistry → ToolExecutor
-  → registered Tool → existing service → TelegramAPI/self-client or Supabase
-  → ToolResult
-
-create_task → TaskInterpreter → TaskCandidate → TaskCreationService → repository
-TaskScheduler → TaskExecutionCoordinator → ToolExecutor
-task_events → TaskEventDispatcher → TaskExecutionCoordinator → ToolExecutor
-```
-
-No second independent AI tool executor or task executor was found. No architecture replacement is justified by this audit.
-
-## Classification summary
-
-| Classification | Source-backed result |
-|---|---|
-| **CONFIRMED** | `ToolRegistry → ToolExecutor → registered tool → service` is the single AI execution authority. |
-| **CONFIRMED** | Provider-native calls, validated JSON actions, and applicable deterministic routes converge on that authority. |
-| **CONFIRMED** | Task creation is `create_task → TaskInterpreter → TaskCandidate → TaskCreationService`. |
-| **CONFIRMED** | Time and event execution share `TaskExecutionCoordinator` and `ToolExecutor`. |
-| **CONFIRMED** | Stored task actions are checked against `ToolRegistry` at execution time and fail closed if unregistered. |
-| **CONFIRMED** | Event execution has bounded task/execution counts and deterministic occurrence deduplication. |
-| **CONFIRMED** | Scheduled/event execution is silent unless notification or result delivery is explicitly enabled. |
-| **LIKELY RISK** | Static action snapshots can become stale after a tool name or contract changes; the safe result is a failed occurrence. |
-| **LIKELY RISK** | Natural-language task creation depends on provider availability, structured output, and unambiguous intent. |
-| **UNKNOWN** | Live Telegram/Supabase effects, provider-network behavior, and deployment credentials/configuration. |
-| **NOT FOUND** | Any AI path to arbitrary Telegram RPC, SQL, shell, filesystem access, or model-selected destinations outside trusted context. |
-
-## 1. AI tool execution
-
-`backend/ai/tools/registry.py` is the capability boundary:
-
-- `ToolRegistry.register()` stores canonical names and rejects duplicates.
-- `get()` and `has()` are used for lookup and validation.
-- `list_schemas()` exposes descriptions, parameters, permissions, and return types.
-- `create_default_registry(context)` registers the built-in tools, including task management, saved-item retrieval, and memory tools.
-
-`backend/ai/engine/dispatcher.py::Dispatcher._build_tool_definitions()` exposes registry schemas as provider-facing function definitions. Native provider calls are parsed and validated before execution. Structured JSON actions use `parse_action_text()` → `validate_action()` → `resolve_tool_calls()` and converge on the same executor. Bounded deterministic handling does not create another execution authority.
-
-`backend/ai/tools/executor.py` is the sole execution authority:
-
-- `ToolExecutor.execute_calls()` enforces the per-turn limit and executes calls sequentially.
-- `_execute_single()` validates argument shape, performs registry lookup, applies permission and timeout rules, contains errors, records history, and returns a structured result.
-- `execute_confirmed()` is only for a previously stored and explicitly confirmed administrative call and still uses the same execution checks.
-- Unknown tools return an error and are never executed.
-
-`ProviderManager` remains provider routing/fallback authority. `Dispatcher` remains AI orchestration authority. Tools remain adapters over the existing service layer; profile/bio and other AI-assisted operations do not create a second AI path.
-
-## 2. Task creation
-
-| Stage | Source/function | Confirmed responsibility |
-|---|---|---|
-| Entry | `backend/ai/tools/task.py::CreateTaskTool.execute()` | Accepts a bounded natural-language task request. |
-| Interpretation | `backend/ai/task_interpreter.py::TaskInterpreter.interpret()` | Uses the provider with `tools=[]`; ambiguity/failure creates no task. |
-| Validation | `backend/ai/task_candidate.py::TaskCandidate.from_untrusted()` / `parse_candidate_output()` | Validates fields, schedules, actions, triggers, and notification data. |
-| Creation | `backend/ai/task_creation.py::TaskCreationService.create()` | Revalidates schedules, computes the initial run, and persists under the authoritative owner id. |
-| Storage | `backend/ai/database/task_repository.py` | Stores versioned definitions and occurrence state. |
-
-`backend/ai/task_candidate.py::_canonicalize_action()` accepts `send`, `send_message`, `write_message`, and `send_text` only as bounded message-writing aliases and canonicalizes them to `send_message` with text only. Other registered tool names must match exactly. Destinations and owner identity are trusted runtime data, never model-generated arbitrary ids.
-
-## 3. Time-based task execution
-
-`backend/ai/task_scheduler.py::TaskScheduler` is the process-local scheduler. `start()` recovers interrupted occurrences and starts the loop. `run_once()` reads due tasks, parses schedules, creates/claims occurrences, and hands them to the coordinator. `_execute_claimed()` performs the repository claim and invokes the configured coordinator. Retry, recovery, catch-up, and per-wake work are bounded.
-
-`backend/ai/task_execution.py::TaskExecutionCoordinator.execute()` verifies owner and occurrence state, obtains fresh trusted client context when available, resolves the trusted destination, validates the stored action snapshot, checks every action against `ToolRegistry`, calls the same `ToolExecutor.execute_calls()` used by interactive AI, persists the outcome, and delivers a result only when explicitly enabled.
-
-## 4. Event-based task execution
-
-`backend/bot/handlers/task_events.py` is registered through `backend/bot/router.py` and rides the existing Telethon update path; it does not create a second update loop.
-
-- `task_events.register()` installs one `events.NewMessage()` handler for both directions.
-- `extract_event_context()` forwards bounded event metadata and bounded text, not a raw RPC surface.
-- `TaskEventDispatcher.handle_event()` evaluates a bounded set of active event tasks.
-- `backend/ai/task_trigger.py::event_trigger_matches()` performs deterministic matching against resolved sender/chat/content/media/reply/direction conditions; it never calls an LLM.
-- `event_occurrence_key()` creates `<task_id>:ev:<chat_id>:<message_id>`.
-- Repository uniqueness/CAS handling and `_dispatch()` prevent duplicate execution on redelivery or a race.
-- `MAX_EVENT_TASKS_PER_MESSAGE` and `MAX_EVENT_EXECUTIONS_PER_MESSAGE` bound work per update.
-- Matched occurrences use the same `TaskExecutionCoordinator` as `TaskScheduler` and therefore the same `ToolExecutor`.
-
-## 5. Authority and security boundaries
-
-The confirmed ownership model is:
-
-- `RuntimeSupervisor` — runtime lifecycle and wiring.
-- `ProviderManager` — provider selection and fallback.
-- `Dispatcher` — AI orchestration and tool-loop coordination.
-- `ToolRegistry` — canonical capability set.
-- `ToolExecutor` — sole caller of registered tool implementations.
-- Domain services — business logic.
-- `TelegramAPI` and the authenticated self-client — Telegram execution boundary.
-- Existing database/repository layers — Supabase access and fallback behavior.
-
-The audit found no AI-reachable path for arbitrary Telethon RPC, arbitrary SQL, shell/subprocess execution, filesystem access, or model-controlled destinations outside trusted request/task context. Event sender/chat identities are resolved from trusted runtime context; model-facing numeric identities are rejected. Some actions require AI interpretation, but interpretation remains inside the Dispatcher → registered Tool → ToolExecutor architecture.
-
-## 6. Notification behavior
-
-Scheduled and event-driven execution is silent by default. `backend/ai/task_interpreter.py` enables `deliver_result` or `notify_on_outcome` only when explicitly requested. `TaskExecutionCoordinator._deliver_result()` checks the persisted opt-in flag and trusted destination. The scheduler and event dispatcher use the shared notifier for persisted outcomes and do not create unsolicited status messages.
-
-## 7. Likely risks and limitations
-
-1. **Static action snapshot:** a task persists `name + arguments` at creation time and does not ask the AI to reinterpret the request at every occurrence. A later tool rename or contract change can fail closed as a failed occurrence.
-2. **Provider-dependent interpretation:** provider failure, invalid configuration, malformed structured output, or ambiguity prevents task creation rather than creating an unsafe task.
-3. **Canonical-name strictness:** outside the bounded send aliases, near-miss action names are rejected. This protects the boundary but can be user-visible.
-4. **Silent outcomes:** failed scheduled/event actions are not sent to Telegram unless notification was explicitly enabled; task state, occurrences, and logs are the operational record.
-5. **Bounded event fan-out:** the event path caps tasks examined and executions started per update, intentionally preventing unbounded work.
-
-## 8. Unknown / live-unverified behavior
-
-No live Telegram or Supabase execution was performed. The following remain unverified:
-
-- a real Telegram event causing an event task to run;
-- a real Telegram side effect from a scheduled or event task;
-- Supabase persistence, occurrence uniqueness, claim/CAS transitions, and recovery against the deployed database;
-- native tool-call serialization for every configured provider;
-- deployment provider availability, credentials, quotas, rate limits, and fallback behavior;
-- behavior during a real Telegram reconnect/rebuild while a task is running; and
-- correctness for every natural-language or Persian phrasing in a production model.
-
-Existing in-process and dummy-provider tests verify local contracts only; they do not establish these external behaviors. No live Telegram verification is claimed.
-
-## 9. Remaining implementation work
-
-No architecture replacement is required. Remaining work is deliberately bounded:
-
-1. Perform a controlled live Telegram verification with an owner-scoped, reversible test task.
-2. Perform opt-in live Supabase verification of task/occurrence persistence, uniqueness, claim/CAS behavior, and recovery when approved test data and credentials are available.
-3. Validate provider-specific native tool behavior in deployment.
-4. Add compatibility coverage only if requirements demand survival across future tool renames; never bypass registry validation or add a second executor.
-5. Improve visibility, if desired, through existing task inspection, occurrence, logging, and opt-in notification boundaries.
-
-## 10. In-process coverage referenced
-
-- `tests/test_capability_exposure_tools.py`, `tests/test_tool_health_audit.py`, `tests/test_10_tool_calls.py` — registry exposure and execution.
-- `tests/test_19_ai_actions.py`, `tests/test_new_tool_action_path.py` — validated action routing.
-- `tests/test_task_nl_creation.py`, `tests/test_task_candidate_contract.py`, `tests/test_stage12_interpreter.py` — interpretation and validation.
-- `tests/test_task_execution.py`, `tests/test_task_send_execution.py`, `tests/test_task_scheduler.py` — shared scheduled execution.
-- `tests/test_task_trigger_events.py` — event matching, bounds, and deduplication.
-- `tests/test_task_management.py`, `tests/test_task_repository.py` — lifecycle and persistence contracts.
-
-These are source/in-process checks, not live Telegram, provider-network, or live Supabase verification.
-
-## Delivery scope
-
-Only `INVESTIGATION.md` is intended to change for this handoff. No backend code, tests, provider configuration, environment file, database schema, migration, or deployment setting is changed. The pre-existing untracked nested `telegram-self-bot/` checkout is unrelated and remains untouched.
+| Revision audited | `2551970` |
+| Remote drift | `origin/main` advanced past the audited revision before this document was delivered (a `feat: enforce semantic completeness for task creation` commit is now present upstream). **All findings below describe `2551970`; they are not a statement about the newer revision.** |
+| Scope | Does the current task-creation path reject *schema-valid but semantically incomplete* candidates before persistence, for every supported task action? |
+| Verdict | **No — semantic completeness is enforced for exactly one action (`send_message`) at the persistence boundary.** |
+| Changes made | none (this document only) |
 
 ---
 
-# Phase 2 Audit — AI Task/Scheduler + Tool Execution Pipeline (2026-09-08)
+## 1. Objective and method
 
-A NEW source-first audit of the complete existing task/scheduler/tool pipeline on the
-current `main` baseline. No code was modified during this phase. The Phase 1 findings
-above were re-verified against current source; every claim below is re-derived from
-the actual files, not carried forward.
+The question is not "does the candidate parse" but "can a candidate be persisted
+whose selected action cannot execute deterministically, or whose required user
+intent the provider invented".
 
-## VERDICT (Phase 2)
+The audit traced, in source order:
 
-The pipeline is implemented, connected, and internally consistent end-to-end.
-Nothing is broken in the traced paths. Two confirmed architectural gaps (dormant
-`ai_instruction`/`preparation_metadata` machinery; event-direction asymmetry) and
-several bounded risks exist — all are limitations, not defects requiring redesign.
+```
+user request
+  → TaskInterpreter.interpret            (provider call, tools=[])
+  → TaskCandidate.from_untrusted        (untrusted candidate boundary)
+  → CreateTaskTool._execute             (NL-only repair gates, destination/trigger resolution)
+  → TaskCreationService.create          (deterministic creation boundary)
+  → TaskRepository.create_task          (ai_tasks)
+  ... later ...
+  → TaskScheduler.run_once              (occurrence creation)
+  → TaskExecutionCoordinator.execute    (registry check, preparation, ToolExecutor)
+  → Tool.execute                        (per-tool argument requirements)
+```
 
-## Primary question matrix
+Each registered tool's `execute` was read to derive the semantic inputs it
+actually needs at runtime; those requirements were then compared against what
+the pre-persistence layers validate.
 
-| # | Question | Verdict | Evidence (path → mechanism) |
+---
+
+## 2. Enforcement layers (confirmed)
+
+| # | Layer | File / function | What is enforced |
 |---|---|---|---|
-| A | Create durable task with registered tool action | WORKS | `ai/tools/task.py::CreateTaskTool.execute` → `ai/task_interpreter.py::TaskInterpreter.interpret` → `ai/task_candidate.py::TaskCandidate.from_untrusted` → `ai/task_creation.py::TaskCreationService.create` → `ai/database/task_repository.py::create_task` |
-| B | Persist action safely | WORKS | `task_repository._validate_task_input` (bounded JSONB, owner-scoped); schema `supabase/migrations/20260829000001_create_ai_tasks.sql` matches repository validation exactly |
-| C | Wake at correct scheduled time | WORKS | `ai/task_scheduler.py::TaskScheduler.run_once` → `ai/scheduling.py::parse_schedule` + `catch_up_occurrence`; 60s wake interval; DST-safe `_localize` with nonexistent-time normalization |
-| D | Exactly one occurrence created and claimed | WORKS | deterministic `occurrence_key` + unique index `uq_ai_task_occurrences_task_key` + CAS claim (`claim_occurrence` updates `.eq("status", current.status)`) |
-| E | Execute through the SAME ToolExecutor as interactive AI | WORKS | `ai/task_execution.py::TaskExecutionCoordinator.execute` calls `executor.execute_calls(...)` — the identical authority the Dispatcher uses |
-| F | Execute the correct registered tool | WORKS | `ai/tools/executor.py::_execute_single` registry lookup; unknown tool → structured failure, never executed |
-| G | AI-reasoning tools from tasks | PARTIAL — gap confirmed (see §G below) |
-| H | Event-triggered tasks execute the same way | WORKS | `bot/handlers/task_events.py` → `ai/task_event_dispatcher.py::TaskEventDispatcher` → same `TaskExecutionCoordinator` |
-| I | Prevent duplicate execution | WORKS | unique index + dedup-status skip in `_dispatch` + CAS claim as the final race guard |
-| J | Tool failure never reported as success | WORKS | executor never raises; failed `ToolResult` → `TaskExecutionCoordinator.handle_failure` → failed/retry occurrence |
-| K | Three-attempt retry contract | WORKS | `ai/retry.py` `MAX_ATTEMPTS=3`, `can_retry`, 30s→60s backoff; `retry_pending` recovery pass on scheduler start |
-| L | Owner isolation preserved | WORKS | every repository operation filters `.eq("owner_id", owner_id)`; owner identity never comes from model input |
-| M | Survive scheduler polling / runtime lifecycle | WORKS | scheduler owned solely by `RuntimeSupervisor` (`_start_task_scheduler` at READY, `_stop_task_scheduler` in stop); recovery pass; bounded per-wake work |
-| N | Telegram execution inside the Self Bot boundary | WORKS | only `TelegramAPI`/self-client; no arbitrary RPC/SQL/shell/filesystem reachability found from any task path |
+| 1 | Untrusted candidate boundary | `backend/ai/task_candidate.py` — `TaskCandidate.from_untrusted`, `_canonicalize_action` | Envelope field set, label/timezone bounds, 1–5 actions, action-object shape plus aliases (`tool`→`name`, `parameters`/`args`→`arguments`), interval schedule canonicalization, `chat_name` bounds, `deliver_result`/`notify_on_outcome` bool types, bounded payload. **Action semantics: `send_message` aliases only** (`_SEND_ACTION_ALIASES = {"send", "send_message", "write_message", "send_text"}`), which must carry bounded nonblank `text`. Any other action name is returned unchanged as `{"name": name, "arguments": args}`. |
+| 2 | Deterministic creation boundary | `backend/ai/task_creation.py` — `TaskCreationService.create` | Required/extra field sets, task↔schedule timezone agreement, `parse_schedule`, first-occurrence computation, `validate_ai_instruction`. **No per-action argument semantics.** |
+| 3 | NL-path repair gates (create_task only) | `backend/ai/tools/task.py` — `CreateTaskTool._execute` | (a) **source-fidelity gate**: `derive_policy(request)` active → force `ai_instruction = request` verbatim; (b) **profile-fidelity gate**: request mentions bio **and** has change intent/write verb → rewrite `send_message` actions to `bio_set_text`. Also resolves `chat_name`→`chat_id` and event-trigger names→ids from trusted context. |
+| 4 | Occurrence execution boundary | `backend/ai/task_execution.py` — `TaskExecutionCoordinator.execute` | `self.executor._registry.get(name) is None` → occurrence fails `unregistered_action`; prepared-call structure re-proof (`_validate_prepared_calls`); deterministic content policy re-proof (`_enforce_content_policy`); `chat_id` injected from `notification_destination`. |
 
-## §G — The AI-assisted tool question
-
-**Tool inventory (37 registered via `ai/tools/registry.py::create_default_registry`):**
-all bio/username tools take fully deterministic arguments (template/text/mood
-strings) — no AI reasoning is needed at execution time. The same holds for send,
-save, delete, retrieve, settings, memory, and task-management tools. `web_search`
-is deterministic per query. **No registered tool requires AI interpretation to
-execute from a static action snapshot.**
-
-**Supporting machinery for future AI-reasoning tools exists but is dormant:**
-- The `ai_tasks.ai_instruction` column, `validate_ai_instruction`, and the
-  `TaskCreationService` persistence path exist — but a repository-wide search finds
-  **zero runtime consumers** (no reader of `ai_instruction` anywhere outside
-  validation/persistence).
-- The `preparation_metadata` / `PreparedAction` contract (`ai/task_contract.py`)
-  is validated, persisted, and recovered — **no runtime producer or consumer**.
-- Consequence: if a future tool needs model-generated content at occurrence time,
-  the *transport* exists but the *invocation path* (coordinator → ProviderManager)
-  does not. This is a confirmed architectural gap, currently latent.
-
-**Confirmation gates:** `TaskExecutionCoordinator` calls `execute_calls` without
-`confirmed=True`, so an ADMIN_ONLY/CONFIRMATION_REQUIRED action returns
-`needs_confirmation`, is counted as a failure, retries, and fails after 3 attempts.
-No registered task-relevant tool is ADMIN_ONLY, so no false block today — but it is
-a latent trap if one is registered.
-
-**No arbitrary authority:** `ai/tools/message.py::SendMessageTool` accepts only a
-bounded `text` argument; the destination comes from trusted context
-(`notification_destination.chat_id` or the owner's own chat). Trigger identities are
-runtime-resolved (`ai/task_trigger.py::resolve_trigger_references`); model-invented
-numeric ids are rejected at creation.
-
-## Event-direction finding
-
-`bot/handlers/task_events.py::register` subscribes to `events.NewMessage()` (both
-directions), but `ai/task_trigger.py::_has_condition` treats `direction` as a
-non-condition — so a trigger with `direction: "outgoing"` alone is rejected at
-creation ("needs at least one condition"). Outgoing-trigger tasks are therefore not
-creatable through the AI path. Deterministic and fail-closed, no safety issue — but
-a functional limitation worth knowing.
-
-## Incomplete / risks (ranked)
-
-1. **Dormant AI-task contract** — `ai_instruction` and `preparation_metadata` are
-   validated and persisted but never executed; dead weight until wired.
-2. **Outgoing-only event triggers** are not creatable (condition rule above).
-3. **Static action snapshot** — a later tool rename/contract change fails closed at
-   execution time (by design; no compatibility layer exists).
-4. **Silent failures** — no Telegram notification unless `notify_on_outcome`/
-   `deliver_result` was explicitly opted in; occurrences and logs are the record.
-5. **Supabase fallback divergence** — `SupabaseTaskRepository` degrades to ONE shared
-   in-memory fallback (good), but a fallback write is non-durable and lost on
-   restart; `fallback_active` is surfaced for diagnostics but not user-visible.
-6. **Provider-dependent creation** — interpretation failures prevent creation
-   (fail-closed, correct behavior).
-7. **Event list bound** — `MAX_EVENT_TASKS_PER_MESSAGE = 20`; a 21st+ active event
-   task is silently never matched for that message.
-8. **Encapsulation smell** — `TaskExecutionCoordinator` reaches into
-   `executor._registry` (private attribute) for its fail-closed registry check.
-
-## Ruled out
-
-- No second scheduler, second executor, or second update loop anywhere.
-- No model-invented destinations, ids, or Telegram RPC paths.
-- No false-success path: every failure classifies and persists honestly.
-- No schema/code drift: repository validation ↔ migrations match exactly
-  (statuses, bounds, CHECK constraints, unique index).
-
-## Phase 2 test execution (exact commands, actual results)
-
-| Command | Result |
-|---|---|
-| `.venv/bin/python -m pytest tests/test_task_scheduler.py tests/test_task_execution.py tests/test_task_trigger_events.py tests/test_task_send_execution.py tests/test_task_candidate_contract.py tests/test_task_repository.py -q -p no:cacheprovider` | **133 passed in 0.48s** |
-| `.venv/bin/python -m pytest tests/test_task_nl_creation.py tests/test_task_hardening.py tests/test_task_management.py tests/test_taskloom_milestone.py tests/test_task_creation_diagnostics.py tests/test_task_show_intent.py tests/test_task_contract.py -q -p no:cacheprovider` | **94 passed in 2.42s** |
-
-227 task-focused tests, 0 failures. These are source/in-process checks only — no
-live Telegram, provider-network, or live Supabase verification was performed.
-
-## Phase 2 delivery scope
-
-Only `INVESTIGATION.md` changed in this phase (documentation-only). No backend code,
-tests, provider configuration, environment file, database schema, migration, or
-deployment setting was changed. The pre-existing untracked nested `telegram-self-bot/`
-checkout remains untouched.
+**Confirmed structural consequence:** the candidate layer intentionally does not
+consult the tool registry. Its own source comment states the unknown-action case
+"remains the existing execution-time registry check's responsibility and fails
+safely there", and
+`tests/test_task_candidate_contract.py::test_registered_non_send_tool_survives_but_unknown_tool_fails_execution`
+pins that behaviour. Therefore the *persistable* action vocabulary is unbounded
+(any nonblank name + dict arguments), and per-action completeness exists only
+where a layer names the action explicitly — which today means `send_message`
+only (plus the NL-path bio/username repairs).
 
 ---
 
-# Phase 3 Implementation — Occurrence-Time AI-Assisted Task Preparation (2026-09-08)
+## 3. Action-by-action classification
 
-Implements the confirmed architectural gap from Phase 2 (finding #1): the dormant
-`ai_instruction` / `preparation_metadata` contract is now an ACTIVE execution path,
-inside the existing single authority. No redesign, no second executor, no new
-scheduler.
+Requirements below are derived from each tool's `execute` implementation.
+"Pre-persistence check" = validated before `repository.create_task`.
 
-## What changed (exact files)
+| Action | Execution-required semantic input (source) | Pre-persistence check | Verdict |
+|---|---|---|---|
+| `send_message` | bounded nonblank `text` (`SendMessageTool.execute` rejects missing/blank/oversize) | `_canonicalize_action` enforces it at the candidate boundary; content policy on the AI path | **PASS** |
+| `bio_set_text` | non-empty profile text **or** `ai_instruction` authorizing generation (`BioSetTextTool` calls `bio_service.do_text(context.owner_id, text)` with `text = arguments.get("text", "")`) | NL path only (gates 3a/3b); candidate layer and `TaskCreationService` enforce nothing | **GAP** |
+| `username_set_text` | same as bio (`UsernameSetTextTool`, same `text` default) | interpreter prompt names it; **no username equivalent of gate 3b exists** (`CreateTaskTool` imports only `_has_bio_change_intent`, `_has_bio_mention`, `_write_text_present`, `_tokenize`) | **GAP** |
+| `bio_set_template` / `username_set_template` | non-empty `template` (tool returns "Missing template argument.") | none | **GAP** |
+| `bio_set_mood` / `username_set_mood` | `mood`; empty string is accepted by the tool (`do_mood(owner_id, "")`) | none | **GAP** |
+| `bio_on`, `bio_off`, `bio_show`, `get_bio`, `username_on`, `username_off`, `username_show` | none | n/a | **PASS** |
+| `delete` | explicit scope: `count` 1–500 **or** a filtered scope (`mode` ∈ all/until_time/until_message/filtered, `until_time`, `after_time`, `boundary_id`, `query`, `semantic`) | none (tool fails closed at execution) | **GAP** |
+| `delete_replied` | `context.extra["reply_msg"]` | none; **the coordinator never injects `reply_msg` for a scheduled occurrence** | **GAP** |
+| `save` | `context.extra["reply_msg"]` | none; never available to a scheduled occurrence | **GAP** |
+| `save_by_link` | non-empty `link` starting with `http` | none | **GAP** |
+| `delete_by_id` | integer `message_id` | none | **GAP** |
+| `delete_message_by_id` | positive `message_id` | none | **GAP** |
+| `delete_messages_by_ids` | non-empty list of positive ints | none | **GAP** |
+| `search` | non-empty `query` | none | **GAP** |
+| `list_saves` | optional `limit` | n/a | **PASS** |
+| `list_recent_messages` | optional `limit`; needs trusted `chat_id` (injected) | n/a | **PASS** |
+| `retrieve_save` | valid `save_code` + trusted `chat_id` | none for `save_code` | **GAP** |
+| `memory_store` | non-empty `content` (bounded by `MAX_MEMORY_ENTRY_CHARS`) | none | **GAP** |
+| `memory_list` | optional `tier`/`query`/`limit` | n/a | **PASS** |
+| `settings_get` | `key` | none | **GAP** |
+| `settings_set` | `key` + `value`; `PermissionLevel.ADMIN_ONLY` (confirmation expected) | none pre-persistence; the occurrence-time confirmation path was not traced in this pass | **UNCERTAIN** |
+| `organize_clean` | none, but `PermissionLevel.DANGEROUS` (confirmation expected) | none pre-persistence | **UNCERTAIN** |
+| `organize_list`, `database_stats` | none | n/a | **PASS** |
+| `account_show` | optional `fields` allowlist; invalid values are rejected by the tool | none pre-persistence; invalid values fail closed at execution | **PASS** (fails closed) |
+| `task_list`, `task_inspect` | none | n/a | **PASS** |
+| `task_transition` | task id + `expected_version` (+ status) | none | **GAP** |
+| `task_delete` | task id + `expected_version` | none | **GAP** |
+| `create_task` | non-empty `request` | none | **GAP** |
+| `web_search` | not read in this pass | — | **UNCERTAIN** |
+| any unregistered action name | — | candidate accepts a nonblank name; resolved only at execution (`unregistered_action`) | **GAP** |
 
-| Path | Change |
-|---|---|
-| `backend/ai/task_execution.py` | `TaskExecutionCoordinator` gains occurrence-time AI preparation: when the task record carries an `ai_instruction`, the coordinator resolves final tool arguments through the existing `ProviderManager` (`AIActionPreparator`) BEFORE execution, then runs the prepared calls through the SAME `ToolExecutor.execute_calls()`. Adds `AIActionPreparator` (single bounded provider round, `tools=[]`, fail-closed JSON contract), `_validate_prepared_calls` (defense-in-depth re-validation at the execution boundary), `_preparation_updates` (single-action audit record persisted to `occurrence.preparation_metadata` via the existing schema), and the optional `preparator=` constructor seam (defaults to the process ProviderManager; tests inject doubles). |
-| `tests/test_task_ai_preparation.py` | NEW — 13 focused tests: static tasks never invoke a provider; AI tasks resolve arguments through the executor; prepared-tool-name swap / malformed arguments / wrong action count / provider failure / preparation timeout / missing authority all fail closed with no execution; preparation timeout maps to the retryable path (attempt 2, `retry_at` set); `preparation_metadata` audit record verified; preparator unit contract (fence tolerance, no-tools request, instruction+templates travel to the model, prose/failed-response rejection). |
-| `INVESTIGATION.md` | This section. |
-
-No other production file changed. No schema/migration change: `ai_instruction` and
-`preparation_metadata` columns, their CHECK constraints, and the repository
-validation already existed — this phase only adds the missing runtime consumer.
-
-## Architecture (unchanged authority, new seam)
-
-```text
-Task / Event
-  → TaskScheduler / TaskEventDispatcher
-  → TaskExecutionCoordinator
-      ├─ static task:  action_snapshot → ToolExecutor (zero provider calls — unchanged)
-      └─ ai task:      action_snapshot → AIActionPreparator (ProviderManager, tools=[])
-                          → validated PreparedAction arguments
-                          → defense-in-depth re-validation
-                          → ToolExecutor → registered Tool → service
-```
-
-One execution authority is preserved: `ToolExecutor` remains the sole caller of
-tools. The model can only produce arguments for the task's OWN tool names, in the
-task's own order, with no destination/owner/chat identity — those come from trusted
-runtime context exactly as before. The provider never receives tool definitions,
-so it can never trigger an execution itself.
-
-## Fail-closed contract (verified by tests)
-
-| Failure | Behavior |
-|---|---|
-| Provider failure / malformed output / prose response | Occurrence `failed`, nothing executed |
-| Preparation timeout | Mapped to `TimeoutError` → existing retryable classification → `retry_pending`, attempt+1 |
-| Prepared tool-name swap, extra/missing actions, non-object arguments | Rejected at the coordinator boundary BEFORE execution; occurrence `failed` |
-| Unregistered template tool | Existing pre-preparation registry check fires first (`unregistered_action`) |
-| No preparation authority available | `failed` (`task preparation authority is unavailable`) |
-| Confirmation-gated (ADMIN_ONLY/CONFIRMATION_REQUIRED) prepared action | Unchanged pre-existing behavior: counts as failed and retries/fails — no unattended execution |
-
-## Phase 3 test execution (exact commands, actual results)
-
-| Command | Result |
-|---|---|
-| `.venv/bin/python -m pytest tests/test_task_ai_preparation.py -q -p no:cacheprovider` | **13 passed in 0.14s** |
-| `.venv/bin/python -m pytest tests/test_task_execution.py tests/test_task_contract.py tests/test_task_hardening.py tests/test_task_scheduler.py tests/test_task_trigger_events.py tests/test_task_repository.py tests/test_task_send_execution.py tests/test_task_nl_creation.py tests/test_task_candidate_contract.py tests/test_task_management.py -q -p no:cacheprovider` | **184 passed in 1.59s** |
-| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1801 passed, 24 skipped, 1 warning in 64.03s** |
-| `.venv/bin/python -m py_compile backend/ai/task_execution.py` | OK |
-
-Static task behavior is pinned as unchanged by the existing suites
-(`test_task_execution.py`, `test_task_hardening.py`, `test_task_scheduler.py`):
-identical code path, zero provider calls.
-
-## Remaining limitations (unchanged or newly known)
-
-1. Multi-action AI tasks (rare) persist execution results only — the single-slot
-   `preparation_metadata` schema records the prepared action for single-action
-   occurrences (the dominant case). Diagnostic only; never part of the outcome.
-2. Outgoing-only event triggers remain uncreatable (Phase 2 finding #2).
-3. Findings #3–#8 from Phase 2 are untouched by this phase.
-4. Live Telegram / provider-network / live Supabase verification remains NOT
-   performed; in-process and fake-provider checks only.
-
-## Phase 3 delivery scope
-
-Production: `backend/ai/task_execution.py`. Tests: `tests/test_task_ai_preparation.py`
-(new). Docs: `INVESTIGATION.md`. The pre-existing working-tree change to
-`backend/ai/task_candidate.py` (dormant-contract persistence from an earlier session,
-already covered by `tests/test_task_candidate_contract.py`) is preserved and included
-in this delivery. The untracked nested `telegram-self-bot/` checkout remains
-untouched.
+No action other than `send_message` has a pre-persistence semantic check.
 
 ---
 
-# Phase 4 — Restart/reconnect must never cause task spam (2026-09-08)
+## 4. Cross-cutting findings
 
-> Requirement: one logical scheduled occurrence executes at most once across
-> restart, scheduler recovery, polling, reconnect, duplicate wake-up, and
-> concurrent recovery. Recovery resumes unfinished work ONLY when the persisted
-> occurrence state proves it is legitimately executable. Completed occurrences
-> are never recreated or re-executed. Retries stay bounded and never multiply
-> across restart. Single Scheduler → TaskExecutionCoordinator → ToolExecutor
-> authority preserved; no second scheduler, no duplicate executor, no
-> fire-and-forget execution, no Telegram-side workaround.
+1. **Empty static content is accepted with no generation authorization.**
+   `{"name": "bio_set_text", "arguments": {"text": ""}}` (and the username
+   equivalent) passes `TaskCandidate.from_untrusted` and
+   `TaskCreationService.create`, then calls `do_text(owner_id, "")` at every
+   occurrence. The rule "an empty static field must not be valid merely because
+   `ai_instruction` exists" is not enforced in either direction at the boundary.
 
-## 4.1 Source-traced duplicate-execution analysis (before the fix)
+2. **The provider can attach generation semantics the user never requested.**
+   `ai_instruction` is only *repaired* to the verbatim request when
+   `derive_policy(request)` is active (gate 3a in `CreateTaskTool`). Otherwise a
+   model-supplied `ai_instruction` passes `validate_ai_instruction` (nonblank +
+   length bound) and is persisted for any action.
 
-Already correct (verified in source, pinned by existing + new tests):
+3. **Context-dependent actions are persistable but never executable.**
+   `TaskExecutionCoordinator.execute` injects `chat_id` from
+   `notification_destination`, but never `reply_msg`. `save` and
+   `delete_replied` therefore cannot succeed for any scheduled occurrence.
 
-| Safeguard | Where |
-|---|---|
-| Deterministic occurrence identity — `{task_id}:{scheduled_for.isoformat()}` (`occurrence_key`), `{task_id}:ev:{chat_id}:{message_id}` (events) | `backend/ai/task_scheduler.py`, `backend/ai/task_event_dispatcher.py` |
-| Unique `(task_id, occurrence_key)` identity: duplicate creation returns the SAME row | `InMemoryTaskRepository.create_occurrence`; `SupabaseTaskRepository.create_occurrence` (pre-select) + unique index in migration |
-| CAS claim — only one writer can move an occurrence to `running`; terminal/running states are unclaimable | `claim_occurrence` (`.eq("status", current.status)` / in-memory check), `_ALLOWED_OCCURRENCE_TRANSITIONS` |
-| Terminal occurrences are never recreated (idempotent occurrence creation) and never re-executed | `create_occurrence` + unclaimable terminal statuses |
+4. **Destination trust is only partially enforced.** `notification_destination`
+   is carried through `CreateTaskTool` as a plain dict. `chat_name` is popped
+   and resolved, and `chat_id` is overwritten when a trusted request chat id
+   exists or a name resolves — but the candidate layer does not strip a numeric
+   `chat_id` emitted by the model, so a model-supplied value can survive when no
+   trusted id is available. Recorded as a hypothesis (see §5).
 
-Confirmed gaps (all closed in `backend/ai/task_scheduler.py` only):
-
-1. **Restart backoff bypass (the spam vector).** After `recover()` marked an
-   interrupted occurrence `retry_pending` with a future `retry_at`, the wake
-   path in `run_once` still claimed any claimable occurrence it found under a
-   due task (retry_pending is claimable) and executed it IMMEDIATELY —
-   defeating the persisted backoff armed by recovery and re-executing the
-   occurrence right after a restart.
-2. **Unbounded wake-path resume surface.** The wake loop could execute any
-   claimable status; only `claimed` (provably never started) is legitimately
-   executable there. `retry_pending` belongs to the bounded retry path, and
-   `running`/`interrupted`/terminal states belong to recovery or are finished.
-3. **Concurrent recovery could multiply attempts.** Two overlapping
-   `recover()` calls (e.g. start + full-recovery restart) could each push the
-   same occurrence through `interrupted → retry_pending`, consuming attempts
-   twice; a racing external transition also raised `ValueError` out of
-   `start()`.
-4. **Deterministic no-authority parking.** With no coordinator wired, a due
-   occurrence stayed `claimed` forever (undiscoverable by recovery). It is now
-   parked as `interrupted` — the same contract the event dispatcher already
-   used — so a later restart resolves it deterministically through the retry
-   contract instead of blindly executing stale state.
-
-## 4.2 Changes (single file, single authority)
-
-`backend/ai/task_scheduler.py` (+47/−13):
-
-| Change | Guarantee restored |
-|---|---|
-| Wake path executes ONLY `occurrence.status == "claimed"` | Retry-pending occurrences are executed solely by `_run_due_retries`, which honors `retry_at` — restart backoff is respected; no early re-execution |
-| `recover()` serialized by an `asyncio.Lock`; a concurrent recovery returns 0 | Attempt counts cannot multiply across racing recoveries/restarts |
-| `recover()` treats `ValueError` from a transition as "another writer decided first" and skips | Recovery is deterministic on persisted state; never raises into `start()` |
-| No-coordinator due occurrence → `interrupted` | Recovery owns it later; no silently-stuck claimed rows |
-| `claimed` default (was `True`) so a skipped occurrence never counts as processed | `run_once` returns an honest count |
-
-Nothing else changed: no second scheduler, no duplicate executor, no schema or
-migration change, no notification or event-path change. The claim CAS remains
-the final duplicate guard; `MAX_ATTEMPTS = 3` remains the bounded retry
-contract across restarts.
-
-## 4.3 Regression coverage (new: `tests/test_task_restart_recovery.py`, 9 tests)
-
-| Scenario | Assertion |
-|---|---|
-| Recovered occurrence honors backoff | Wake before armed `retry_at` executes nothing; wake at `retry_at` executes exactly once |
-| Wake loop never executes retry_pending before backoff | Independent `retry_pending` occurrence untouched by the wake path until due |
-| Recovery at attempt limit | `failed` at attempt 3, no fourth attempt, no re-execution |
-| Repeated wake-ups (3×) | Exactly one occurrence, executed once |
-| Two overlapping schedulers on one repository | Exactly one execution (claim CAS) |
-| Concurrent recoveries | One recovers, the other returns 0; attempt = 2 exactly once; later recover is a no-op |
-| Recover after legitimate completion | Terminal occurrence never resurrected, attempt unchanged |
-| Due occurrence without coordinator | Parked `interrupted`, later resolved via retry contract |
-| Completed occurrence vs later wakes + restart recovery | Never re-executed |
-
-## 4.4 Test execution (exact commands, actual results)
-
-| Command | Result |
-|---|---|
-| `.venv/bin/python -m pytest tests/test_task_restart_recovery.py -q -p no:cacheprovider` | **9 passed in 0.18s** |
-| `.venv/bin/python -m pytest tests/test_task_scheduler.py tests/test_task_execution.py tests/test_task_hardening.py tests/test_task_trigger_events.py tests/test_task_repository.py tests/test_task_contract.py tests/test_task_ai_preparation.py tests/test_task_send_execution.py tests/test_task_nl_creation.py tests/test_task_candidate_contract.py -q -p no:cacheprovider` | **192 passed in 1.62s** |
-| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1810 passed, 24 skipped, 1 warning in 63.97s** (baseline 1801+24; +9 = the new restart/recovery tests) |
-| `.venv/bin/python -m py_compile backend/ai/task_scheduler.py` | OK |
-
-## 4.5 Phase 4 conclusion
-
-Restart/reconnect can no longer cause task spam: an interrupted occurrence is
-resolved exactly once from its persisted state, re-execution goes through the
-bounded retry path that honors the persisted backoff, duplicate wake-ups and
-overlapping schedulers collapse onto the single claim CAS, terminal occurrences
-are never recreated, and attempts cannot multiply across restarts — all inside
-the existing single scheduler/executor authority. No production behavior for
-normal (non-restart) scheduling changed; the prior static and AI-assisted task
-suites pin that unchanged.
+5. **Schedule invention is not a gap.** `parse_schedule` rejection is
+   unconditional, and interval shapes are canonicalized deterministically.
 
 ---
 
-# Phase 5 — Deterministic prepare-ahead execution for recurring AI-assisted tasks (2026-09-09)
+## 5. Confirmed facts vs hypotheses
 
-> Requirement: for a recurring AI-assisted task (e.g. "every minute, change my
-> bio to a random 50-character Persian dialogue"), content generation and
-> validation happen DURING the interval BEFORE the scheduled boundary; the
-> Telegram side effect happens exactly once AT the boundary. No Telegram
-> mutation during preparation. If preparation misses its deadline, execution
-> falls back to the honest occurrence-time path — never a late mutation
-> presented as on-time, never a shifted occurrence, never double execution.
+**Confirmed from source (read directly)**
 
-## 5.1 Architecture (no redesign — existing authority preserved)
+- `_canonicalize_action` special-cases only the `send_message` alias set and
+  raises `TaskCandidateError("message action requires bounded nonblank text
+  content")` otherwise it returns the action unchanged.
+- `TaskCreationService.create` validates fields, timezone agreement, schedule,
+  and `ai_instruction` only.
+- `TaskExecutionCoordinator.execute` is where registry membership is first
+  checked (`unregistered_action`).
+- `CreateTaskTool._execute` contains exactly two semantic repair gates
+  (source fidelity, bio profile fidelity) and resolves destinations/triggers
+  from trusted runtime context.
+- Every tool requirement listed in §3 is quoted from that tool's own `execute`.
+- `tests/test_task_candidate_contract.py` explicitly encodes the intended
+  behaviour that well-formed non-send actions persist and fail later at
+  execution; `tests/test_task_nl_creation.py` encodes the same for a scheduled
+  `delete {"mode": "all"}` action.
 
-```
-Wake at T (TaskScheduler.run_once — the single scheduler)
-  → execute occurrence N (boundary T) — existing occurrence-time path, or its
-    durably prepared action from occurrence N-1's wake
-  → advance next_run to T+60
-  → _prepare_next_ahead(task, T+60): create the N+1 occurrence idempotently
-    (deterministic occurrence_key), spawn ONE tracked bounded task
-    → TaskExecutionCoordinator.prepare_ahead(occurrence)
-        AI generation (provider, tools=[], no execution ability)
-        + deterministic validation (task contract + content policy)
-        → persist PreparedAction into occurrence.preparation_metadata
-          (existing column, no schema change)
-        NEVER calls the ToolExecutor, NEVER touches Telegram
-At T+60: the wake claims the occurrence; execute() re-proves the persisted
-  prepared action (kind, SAME definition_version, tool name == action
-  snapshot, contract-valid, policy-valid) and executes it exactly once
-  through the SAME ToolExecutor boundary. Stale/invalid → honest
-  occurrence-time preparation (or bounded failure), never a guessed run.
-```
+**Hypotheses (plausible, not proven in this pass)**
 
-Constants (derived, not invented): `PREPARE_AHEAD_HORIZON_SECONDS = 120.0`
-(2 × `WAKE_INTERVAL_SECONDS = 60` — a wake at T can only prepare a boundary
-it can see within its horizon; two consecutive wakes cover any interval ≥ 60s),
-`PREPARE_AHEAD_TIMEOUT_SECONDS = 150.0` (bounded rounds × per-round provider
-timeout), `MAX_PREPARATION_ATTEMPTS = 3` (= `MAX_ATTEMPTS` retry contract).
+- H1: a model-supplied numeric `chat_id` inside `notification_destination` can
+  reach persistence when the request lacks a usable chat id and no `chat_name`
+  is resolved. Requires a focused replay to confirm.
+- H2: `settings_set` (`ADMIN_ONLY`) and `organize_clean` (`DANGEROUS`) persisted
+  as scheduled task actions may bypass the confirmation semantics the executor
+  applies on the immediate path. The executor's confirmation branch was not
+  traced here.
+- H3: `web_search`'s required arguments were not inspected.
+- H4: whether any consumer other than `CreateTaskTool` calls
+  `TaskCreationService.create` directly (which would skip gates 3a/3b entirely)
+  was not exhaustively enumerated.
 
-## 5.2 Content policy — deterministic enforcement (`backend/ai/preparation_policy.py`, new)
+---
 
-Derived ONLY from the task's `ai_instruction`: named language (persian/chinese/
-arabic, script-based detection — digits/punctuation/emoji never violate) and
-numeric character requirements (exact / at-most, Persian and Arabic-Indic
-digits accepted). Validation fails closed and NEVER truncates: invalid content
-is regenerated (bounded rounds), then preparation fails into the existing
-retry/failure contract. Applied at BOTH preparation points:
-- inside `AIActionPreparator` (generation + `prepare_validated` regeneration loop),
-- at the execution boundary via `TaskExecutionCoordinator._enforce_content_policy`
-  (defense-in-depth: even a hostile preparator cannot push policy-violating
-  content into the ToolExecutor),
-- when re-proving a durably prepared action (`_prepared_from_metadata`).
+## 6. Remaining work (not implemented)
 
-## 5.3 Restart / anti-spam guarantees (extends Phase 4)
+1. Decide the pre-persistence contractual set of task actions (vs the
+   immediate-only set), and enforce it before `create_task`.
+2. Enforce per-action required arguments for that set, including the
+   empty-static-vs-authorized-generation rule and a username counterpart to the
+   bio profile-fidelity gate.
+3. Decide the correct handling of context-dependent actions (`save`,
+   `delete_replied`) for scheduled tasks.
+4. Resolve H1 (destination trust) and H2 (confirmation-gated actions).
+5. Add focused regression coverage for the incomplete-candidate cases once the
+   boundary is defined.
 
-- Recovery exempts ONLY a `claimed` occurrence whose `scheduled_for` is still
-  in the future (pre-created by prepare-ahead, never started). A claimed
-  occurrence whose boundary has passed resolves through the existing
-  interrupted → retry/failed contract.
-- Preparation is idempotent: deterministic occurrence key, one tracked task
-  per key, durable `preparation_metadata` checked before any provider round.
-- A late preparation persisting onto a running/terminal occurrence hits the
-  transition state machine (`claimed` not reachable from `running`/terminal →
-  `ValueError`) and the Supabase CAS; both fail closed, no spam.
-- Stale preparation (task edited → `definition_version` bump) is rejected at
-  the boundary and re-prepared honestly.
+---
 
-## 5.4 Bio tool execution hardening (`backend/services/bio_service.py`)
+## 7. Files / functions that would change if the gaps are fixed
 
-`do_template` / `do_text` / `do_mood` now apply the bio to Telegram
-immediately via a shared `_apply_profile` boundary (one
-`UpdateProfileRequest(about=...)` through the profile scheduler's client,
-30s bound, FloodWait surfaced, `last_bio` persisted only after a successful
-RPC) and report honestly ("saved, but the Telegram bio was NOT updated") on
-failure. The Glass-UI cron path is unchanged; the borrow never starts/stops
-the cron loop.
+| File | Symbol | Role in a fix |
+|---|---|---|
+| `backend/ai/task_candidate.py` | `TaskCandidate.from_untrusted`, `_canonicalize_action`, `_SEND_ACTION_ALIASES` | the only pre-persistence per-action gate today |
+| `backend/ai/task_creation.py` | `TaskCreationService.create` | second pre-persistence checkpoint |
+| `backend/ai/tools/task.py` | `CreateTaskTool._execute` | NL-path gates (source fidelity, bio profile fidelity) |
+| `backend/ai/actions.py` | `_has_bio_mention`, `_has_bio_change_intent`, `_write_text_present`, `_tokenize` | deterministic intent vocabulary; no username counterpart exists |
+| `backend/ai/task_interpreter.py` | interpreter prompt, `CANDIDATE_SCHEMA` | action contract currently names only `send_message`, `bio_set_text`, `username_set_text` |
+| `backend/ai/tools/registry.py`, `backend/ai/tools/base.py` | `ToolRegistry`, `Tool` | natural single source for a registry-derived `name → required arguments` contract |
+| `backend/ai/task_execution.py` | `TaskExecutionCoordinator.execute` | registry check stays as defence-in-depth |
+| `backend/ai/preparation_policy.py` | `derive_policy`, `validate_prepared_arguments` | generated-content policy |
+| `tests/test_task_candidate_contract.py`, `tests/test_task_nl_interval_creation.py` | — | existing contract tests to extend |
 
-## 5.5 Regression coverage (new: `tests/test_task_prepare_ahead.py`, 16 tests; extended `tests/test_task_restart_recovery.py`, +2)
-
-| Scenario | Assertion |
-|---|---|
-| `prepare_ahead` persists validated content, executes nothing | no tool call, occurrence stays `claimed` with `prepared_action` metadata |
-| Static tasks / no coordinator support / beyond horizon | no preparation, no occurrence row |
-| Idempotent preparation across duplicate arms | one provider round, one metadata record |
-| Failed preparation | logged, no side effect, occurrence stays unprepared for the honest path |
-| Full lifecycle across restart | T executes N + prepares N+1; fresh scheduler recovers 0; T+60 executes the PRE-prepared action exactly once (content-level proof, no boundary provider round) |
-| Duplicate wakes at the boundary | one execution |
-| Stale prepared action (version bump) | rejected at the boundary |
-| Policy-invalid content, bounded regeneration | 3 provider rounds max, zero tool executions, permanent failure — never a guess |
-| Regenerated valid content | exactly one execution with the valid content |
-| Policy units | exact-length/language derivation, Persian-only script check with digits/emoji tolerated, no truncation |
-| Real preparator wraps policy violations | fail closed |
-| Recovery: future claimed occurrence | untouched (no backoff, no early execution), executes once at its boundary |
-| Recovery: past-due claimed occurrence | still resolved via the retry contract (narrow exemption) |
-
-## 5.6 Test execution (exact commands, actual results)
-
-| Command | Result |
-|---|---|
-| `.venv/bin/python -m pytest tests/test_task_prepare_ahead.py tests/test_task_restart_recovery.py -q -p no:cacheprovider` | **27 passed** |
-| `.venv/bin/python -m pytest tests/test_task_*.py -q -p no:cacheprovider` (all task suites) | **118 passed** |
-| `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` (full suite) | **1827 passed, 24 skipped, 1 warning in 63.78s** (Phase-4 baseline 1810+24; +16 = prepare-ahead suite, +1 = recovery exemption pair) |
-| `.venv/bin/python -m py_compile backend/ai/task_scheduler.py backend/ai/task_execution.py backend/ai/preparation_policy.py backend/services/bio_service.py tests/test_task_prepare_ahead.py tests/test_task_restart_recovery.py` | OK |
-
-During the session a work-in-progress edit had accidentally removed
-`TaskScheduler.run()` (the wake loop) — restored verbatim from git HEAD and
-pinned by `test_scheduler_lifecycle_is_idempotent_and_cancel_safe`.
-
-## 5.7 Phase 5 conclusion
-
-Recurring AI-assisted tasks now prepare content ahead of the boundary and
-mutate Telegram exactly once at it; a missed deadline degrades to the existing
-honest occurrence-time contract instead of a late or duplicated mutation.
-Single scheduler/coordinator/executor authority, the occurrence state machine,
-and the bounded retry contract are unchanged; no schema, migration, or UI
-change was made. Live Telegram/provider verification remains NOT performed
-(in-process + fake-provider tests only), consistent with all prior phases.
+No production code, tests, configuration, or schema were modified by this
+investigation.
