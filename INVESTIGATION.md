@@ -1070,3 +1070,274 @@ No production fix, migration, SQL, schema change, provider change, scheduler/exe
 6. The candidate/service action-name boundary — unregistered action names persist and fail late. Expected invariant: unregistered action names are rejected before persistence while occurrence-time registry defense-in-depth is retained. Focused regression test: unknown-name rejection at creation with the coordinator check still present. Affects creation.
 
 The two UNCERTAIN items are excluded from implementation targets until their contracts are defined. No fix was implemented in this stage.
+
+## Stage I — Recursive/chained create_task semantics
+
+**Scope and audited revision.** The audited checkout is `main` at
+`86b00c69cbb23c184100be9cfdd0868edd895a45` (the revision carrying the
+semantic-completeness boundary fix). Stage G recorded the recursive
+`create_task` question as UNCERTAIN at `a3eb1c3`; this stage re-answers it at
+the current revision. Only `INVESTIGATION.md` was modified. No fix was
+implemented. No live Telegram, Supabase, Render, or provider call was made;
+the two reproductions below are bounded, in-process, and use an in-memory task
+repository with a stub provider and the REAL `CreateTaskTool`,
+`TaskCreationService`, `ToolExecutor`, and `TaskExecutionCoordinator`.
+
+### I0. Sources inspected
+
+| Source | What it establishes |
+|---|---|
+| `backend/ai/tools/task.py::CreateTaskTool.execute` / `_execute` | the scheduled-reachable creation tool: provider resolution, destination resolution, `TaskCreationService` call |
+| `backend/ai/task_interpreter.py` (`interpret`, prompt, `CANDIDATE_SCHEMA`) | what action names the provider contract asks for and whether `create_task` is excluded |
+| `backend/ai/task_candidate.py::_canonicalize_action` / `from_untrusted` | which action names survive candidate validation |
+| `backend/ai/task_creation.py::TaskCreationService.create` | the single persistence boundary and its eligibility checks |
+| `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` / `_fresh_context` | what runtime context a claimed occurrence supplies to tools |
+| `backend/ai/task_scheduler.py` | per-wake work bounds (`MAX_TASKS_PER_WAKE=10`, `MAX_SWEEPS_PER_WAKE=20`, `MAX_CONCURRENT_EXECUTIONS=4`, `MAX_RETRIES_PER_WAKE=10`) |
+| `backend/ai/database/task_repository.py::create_task` | the persisted task payload (any per-owner ceiling?) |
+| `backend/runtime/supervisor.py::_wire_ai_tools`, `::_start_task_scheduler` | production wiring: the same `ProviderManager` on the default Engine, and the coordinator's base `ToolContext` |
+| `backend/ai/tools/executor.py` (`execute_calls`, `session_id` handling) | whether the execution path carries any origin marker |
+
+### I1. Can a durable task create another task? CONFIRMED YES
+
+`TaskCandidate.from_untrusted` normalizes ONLY the message-writing aliases
+(`_SEND_ACTION_ALIASES` → `send_message`); every other action name is passed
+through unchanged as `{"name": <name>, "arguments": <object>}`. `create_task`
+is a registered tool, so:
+
+- a provider candidate whose action is
+  `{"name": "create_task", "arguments": {"request": "..."}}` passes candidate
+  validation;
+- the creation boundary added in `86b00c6` only requires `create_task`'s
+  declared `request` argument, so such a candidate reaches
+  `repository.create_task`;
+- the request text of the nested creation is model-supplied, so the nested
+  candidate is produced by the SAME provider interpretation path.
+
+The interpreter prompt (`task_interpreter.py`) enumerates `send_message`,
+`bio_set_text`, `username_set_text`, and read/report actions, and says "Never
+invent other action names: an action name that is not registered is rejected."
+It does NOT name `create_task` as a permitted action, but neither the prompt
+nor any validator forbids it, and `create_task` IS registered — so the contract
+is permissive here, not prohibitive.
+
+### I2. Can that creation actually run at occurrence time? CONFIRMED YES
+
+`TaskExecutionCoordinator.execute` builds `execution_context` from
+`self.context` (`_fresh_context`) and injects only the trusted `chat_id` taken
+from the task's persisted `notification_destination` (task_execution.py lines
+330–344). Production constructs that base context in
+`RuntimeSupervisor._start_task_scheduler` with `extra` unset, so an occurrence
+context carries NO `provider_manager`. `CreateTaskTool._execute` then falls
+back to `from backend.ai.engine.engine import get_engine; provider_manager =
+get_engine().provider_manager`, and the supervisor wires that same manager onto
+the default Engine in `_wire_ai_tools`. The occurrence therefore runs the real
+interpreter and the real creation service. The
+`session_id=f"task:{task_id}:{occurrence_key}"` the coordinator passes is used
+only for tool-history recording (`executor.py::_record_history`) and is never
+consulted by task creation.
+
+### I3. Is there a termination/depth/recursion bound? CONFIRMED NONE
+
+- No lineage metadata exists: the persisted task payload keys are exactly
+  `actions`, `ai_instruction`, `created_at`, `id`, `label`, `next_run_at`,
+  `notification_destination`, `owner_id`, `schedule`, `schedule_type`, `status`,
+  `terminal_at`, `timezone`, `updated_at`, `version` — no `parent_task_id`,
+  depth, generation, or origin field.
+- No context flag marks a creation as task-originated (only `chat_id` and,
+  for the interactive path, `provider_manager` / `request_id` / a deterministic
+  candidate are ever read).
+- No per-owner task ceiling exists in `TaskCreationService.create` or in the
+  repository `create_task` implementations.
+- The scheduler constants bound WORK PER WAKE (how many due tasks one sweep
+  claims) and concurrency; they do not bound how many tasks may exist or how
+  many a task may create over time.
+- `MAX_ACTIONS = 5` bounds actions per task (at most five `create_task`
+  actions per occurrence), which is a constant multiplier, not a terminator.
+
+### I4. Bounded in-process reproductions
+
+Reproduction 1 — repeated creation from one recurring parent (stub provider
+returns `create_task` for the parent request and `send_message` for the child
+request; in-memory repository; real registry/executor/coordinator):
+
+```
+parent create success: True
+parent action snapshot: [{'name': 'create_task', 'arguments': {'request': 'every 1 minute send hello'}}]
+occurrence occ0: success=True status=succeeded tasks_now=2
+occurrence occ1: success=True status=succeeded tasks_now=3
+occurrence occ2: success=True status=succeeded tasks_now=4
+final task count: 4   (all status=active, all scheduled)
+child payload keys: [... no parent/depth field ...]
+```
+
+Reproduction 2 — self-replication (stub provider returns a `create_task`
+action for EVERY interpretation):
+
+```
+gen0 -> child created: True succeeded
+gen1 actions: [{'name': 'create_task', 'arguments': {'request': 'every 1 minute create a task that sends hello'}}]
+gen1 -> grandchild created: True succeeded
+gen2 actions: [{'name': 'create_task', 'arguments': {'request': 'every 1 minute create a task that sends hello'}}]
+total durable tasks: 3
+all tasks recurring: True
+```
+
+Both runs were bounded (3 and 2 occurrences) and wrote only in-memory state.
+
+### I5. Normal tasks vs task-created-by-task
+
+Both enter through the same `CreateTaskTool` → `TaskInterpreter` →
+`TaskCreationService` → `TaskRepository` chain. Nothing distinguishes them:
+not the owner (single owner), not the destination (the child inherits the
+parent's trusted `chat_id` when present), not the payload, and not the
+`session_id`. A later fix therefore cannot identify task-originated creations
+from persisted state alone — it would need explicit lineage metadata or a
+creation-time guard, neither of which exists today.
+
+### I6. Stage I verdict
+
+**CONFIRMED GAP.** A durable task can hold a `create_task` action, that action
+runs through the real interpreter and creation service at occurrence time, and
+there is no depth, lineage, or population bound anywhere in the source. A
+recurring parent creates one new durable task per occurrence indefinitely
+(linear growth), and a candidate that reproduces `create_task` in its children
+compounds (each generation stays `active` and keeps firing). Whether a given
+request produces such a candidate depends on model output, so the honest
+statement is: the source guarantees neither a termination bound nor a
+prohibition. No fix was implemented.
+
+
+## Stage J — Delayed Telegram message-ID semantics
+
+**Scope.** Same audited revision (`86b00c6`). This stage traces every supported
+task action that can address a literal Telegram message ID after a delay, and
+distinguishes (a) ID durability from (b) plain integer persistence,
+(c) chat authority, and (d) ownership re-verification. No fix was implemented;
+no live Telegram, Supabase, Render, or provider call was made.
+
+### J0. Sources inspected
+
+| Source | What it establishes |
+|---|---|
+| `backend/ai/tools/delete.py::DeleteByIdTool` | "delete from this ID onward", trusted chat source, fetch + `out` check |
+| `backend/ai/tools/delete.py::DeleteMessageByIdTool` | single-ID deletion, trusted chat source, fetch + `out` check |
+| `backend/ai/tools/semantic.py::DeleteMessagesByIdsTool` | ID-list deletion contract ("never invent IDs") |
+| `backend/services/delete_service.py` (`delete_verified_self_messages`, `do_del_id_counts`, `_iter_messages_bounded`, `_is_self_owned`, `_resolve_me_id`) | the single deletion chokepoint and its fail-closed rules |
+| `backend/ai/tools/save.py::SaveByLinkTool` + `save_service.parse_telegram_link` | link-encoded chat+message reference resolved at execution |
+| `backend/ai/task_execution.py` (destination injection, `action_snapshot`) | what the occurrence supplies and what is frozen at creation |
+| `backend/ai/database/task_repository.py` (payload/snapshot) | how the ID is persisted and copied into the occurrence |
+| `backend/ai/task_creation.py::_action_eligibility_error` | what creation validates about ID arguments |
+
+### J1. Which actions address a literal message ID after a delay
+
+- `delete_message_by_id` — one explicit ID; never escalates to a range.
+- `delete_messages_by_ids` — an explicit ID list (bounded by `_MAX_DELETE_IDS`).
+- `delete_by_id` — "all outgoing messages from `message_id` forward", i.e. a
+  bounded open-ended RANGE anchored by one literal ID
+  (`client.iter_messages(chat, min_id=message_id - 1, from_user="me",
+  limit=_MAX_DELETE_SCAN_MESSAGES)`).
+- `save_by_link` — the chat + message ID are encoded inside a `t.me` /
+  `t.me/c/<id>/<msg>` URL stored as text and resolved only at execution.
+- Not literal-ID actions: `delete` (count/mode/time predicates),
+  `save`/`delete_replied` (rejected at creation since `86b00c6`),
+  `retrieve_save` (save code), `task_*` (task IDs, not Telegram message IDs).
+
+### J2. What happens between creation and execution
+
+The action name and its arguments — including the numeric ID(s) — are persisted
+verbatim in the task `actions` payload and copied into the occurrence
+`action_snapshot` when the occurrence is created. Nothing re-resolves,
+re-validates, or rewrites the ID between creation and execution. At execution
+the coordinator injects ONLY the trusted `chat_id` from the task's persisted
+`notification_destination`; it never injects message identity, and the ID is
+never resolved globally.
+
+### J3. Chat authority — CONFIRMED SAFE
+
+Every Telegram call is `(chat_id, id)`-scoped: `client.get_messages(chat_id,
+ids=...)` (single-ID tool and ownership verification),
+`client.delete_messages(chat_id, batch)`, and
+`client.iter_messages(chat_id, min_id=...)` (range tool). `chat_id` must come
+from `context.extra["chat_id"]`, which the coordinator sets from the persisted
+trusted destination (itself only ever a trusted request chat ID or a
+dialog-resolved `chat_name` after `86b00c6`). When no trusted chat context
+exists, the tools fail closed — they never fall back to another chat. Because a
+message ID is only ever read together with a chat, the same number in a
+different chat cannot be targeted.
+
+### J4. Ownership and stale targets — CONFIRMED SAFE
+
+- `DeleteMessageByIdTool` fetches the ID first and requires `msg.out` before
+  delegating; a missing message yields "Message N not found in this chat" and
+  no deletion.
+- `delete_verified_self_messages` (the single deletion chokepoint) re-fetches
+  every candidate and applies `_is_self_owned`, which requires a present
+  `out` flag, a present `sender_id`, and `sender_id == resolved account id`;
+  an unresolved account identity rejects everything. Failures to fetch are
+  rejected, not retried into a different target.
+- `delete_messages_by_ids` reports `deleted` and `rejected` separately, so a
+  stale or non-outgoing ID in a list is skipped rather than retargeted.
+- For `delete_by_id` the range boundary is purely NUMERIC
+  (`min_id = message_id - 1`), so a deleted/anchor-less ID does not shift the
+  boundary; the owner filter is applied by the RPC (`from_user="me"`) and
+  again by verification before each delete batch.
+
+### J5. Bounded in-process reproduction
+
+Real tools and real `delete_service` against a fake client (chat `-1001`;
+ID 42 = owner's outgoing message, ID 43 = someone else's, ID 999 = absent):
+
+```
+A no chat_id       -> False | No chat context for deletion.
+B stale id in chat -> False | Message 999 not found in this chat.
+C not outgoing     -> False | Message 43 was not sent by the owner, so it cannot be deleted (outgoing-only).
+D valid outgoing   -> True  | Deleted message 42. | deleted: [42]
+E mixed ids        -> True  | data: {'deleted': [42], 'rejected': [999, 43]}
+F ids, no chat     -> False | No chat context available.
+G range from id    -> True  | iter kwargs: [{'min_id': 41, 'from_user': 'me', 'limit': 1000}]
+```
+
+ID provenance check at the creation boundary (same candidate shape used for
+scheduled tasks):
+
+```
+H creation delete_message_by_id   -> PERSISTED args={'message_id': 12345}
+H creation delete_messages_by_ids -> PERSISTED args={'message_ids': [1, 2]}
+H creation delete_by_id           -> PERSISTED args={'message_id': 987654321}
+```
+
+### J6. Confirmed gap: literal-ID provenance
+
+The creation boundary validates only presence, emptiness, and the tool's own
+declared integer constraints. Nothing checks that a stored `message_id` /
+`message_ids` value came from trusted runtime context (there is no trusted
+message-ID source in a scheduled creation at all — unlike `chat_id`, which is
+overwritten from trusted context). A model-supplied number therefore becomes
+the delayed deletion target verbatim. The blast radius is bounded (the
+persisted trusted chat, owner-authored messages only), but:
+
+- an invented or misremembered ID can delete a DIFFERENT owner message in the
+  persisted chat;
+- `delete_by_id` deletes everything from that number forward — including
+  messages the owner writes AFTER the task was authored, because the range is
+  open-ended by construction.
+
+This is newly observed in Stage J; the A–H handoff covered destination
+identifiers (H1), not nested action ID arguments. No fix was implemented.
+
+### J7. Stage J verdict (split by property)
+
+| Property | Verdict | Decisive evidence |
+|---|---|---|
+| Chat targeting (can execution hit the wrong chat?) | **CONFIRMED SAFE** | every call is `(chat_id, id)`-scoped; `chat_id` comes from the persisted trusted destination; missing chat context fails closed (J3, reproductions A/F) |
+| Ownership re-verification at execution | **CONFIRMED SAFE** | fetch-time `out` check plus `_is_self_owned` (`out` + `sender_id == me`) in the single deletion chokepoint (J4, reproductions C/E) |
+| Stale/deleted target ID | **CONFIRMED SAFE** | stale IDs resolve to `None` and are rejected; range boundaries are numeric, not anchored on the message object (J4, reproductions B/E/G) |
+| Literal-ID provenance at creation | **CONFIRMED GAP** | arbitrary model-supplied numbers persist (J6, reproduction H) |
+| Absolute long-delay durability of a `(chat_id, message_id)` pair across Telegram-side state changes (basic-group → supergroup migration, ID remapping, chat-ID reuse) | **STILL UNCERTAIN** | the source proves only that the runtime re-verifies ownership and fails closed when resolution fails; it cannot prove what a server-side migrated/reused identifier denotes. Resolving this needs live Telegram observation, which is explicitly out of scope. |
+
+The Stage G uncertainty ("persisted IDs are re-fetched with outgoing-only
+verification, but the source cannot prove a delayed ID still denotes the
+intended semantic target") is now split precisely: the source-provable parts
+are SAFE, ID provenance is a GAP, and only the Telegram-side identifier
+lifetime question remains UNCERTAIN. No fix was implemented for either Stage I
+or Stage J; both are investigation results only.
