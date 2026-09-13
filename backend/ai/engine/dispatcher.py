@@ -1209,6 +1209,10 @@ class Dispatcher:
         # returns a prose response that is later converted into an action.
         extra["chat_id"] = request.chat_id
         extra["request_message_id"] = request.message_id
+        # The owner's own request text. Tools use it to prove that a literal
+        # Telegram reference (message ID or link) came from the owner rather
+        # than from model output — see task_contract's provenance rule.
+        extra["request_text"] = request.user_message
         extra["request_id"] = request.request_id
         # Capability tools must use the manager owned by this live Engine.
         # Looking up the process-global engine from inside a tool can route a

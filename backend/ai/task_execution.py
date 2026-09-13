@@ -12,7 +12,12 @@ from typing import Any
 import re
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
-from backend.ai.task_contract import PreparedAction, TaskContractError, validate_prepared_action
+from backend.ai.task_contract import (
+    SCHEDULED_OCCURRENCE_EXTRA,
+    PreparedAction,
+    TaskContractError,
+    validate_prepared_action,
+)
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
@@ -328,20 +333,26 @@ class TaskExecutionCoordinator:
         # notification_destination (set at creation time from trusted
         # runtime context), never from the model.
         execution_context = self._fresh_context()
+        # Trusted origin marker: this context belongs to a CLAIMED SCHEDULED
+        # occurrence, not to an interactive owner request. It is written here
+        # from runtime state (never from a model or a candidate) and is what
+        # lets a tool tell the two apart — durable task creation is refused
+        # from this context (see backend.ai.task_contract).
+        occurrence_extra = dict(execution_context.extra) if execution_context.extra else {}
+        occurrence_extra[SCHEDULED_OCCURRENCE_EXTRA] = True
         task = await self.repository.get_task(self.owner_id, occurrence.task_id)
         if task is not None:
             dest = task.notification_destination or {}
             chat_id = dest.get("chat_id")
             if isinstance(chat_id, int) and chat_id != 0:
-                extra = dict(execution_context.extra) if execution_context.extra else {}
-                extra["chat_id"] = chat_id
-                execution_context = ToolContext(
-                    telegram=execution_context.telegram,
-                    owner_id=execution_context.owner_id,
-                    tz_str=execution_context.tz_str,
-                    client=execution_context.client,
-                    extra=extra,
-                )
+                occurrence_extra["chat_id"] = chat_id
+        execution_context = ToolContext(
+            telegram=execution_context.telegram,
+            owner_id=execution_context.owner_id,
+            tz_str=execution_context.tz_str,
+            client=execution_context.client,
+            extra=occurrence_extra,
+        )
 
         actions = occurrence.action_snapshot
         if not isinstance(actions, list) or not actions or len(actions) > 5:

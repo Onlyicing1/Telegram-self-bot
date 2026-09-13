@@ -26,7 +26,12 @@ from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.preparation_policy import derive_policy
-from backend.ai.task_contract import ground_ai_instruction
+from backend.ai.task_contract import (
+    SCHEDULED_OCCURRENCE_EXTRA,
+    ground_ai_instruction,
+    message_reference_provenance_error,
+    scheduled_creation_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +301,27 @@ class CreateTaskTool(Tool):
                 + (f" [failure category: {safe_category}]" if safe_category else "")
             ), data=data)
 
+        # Trusted-origin refusal (recursive task creation). A claimed scheduled
+        # occurrence executes with a context marker written by
+        # TaskExecutionCoordinator; durable task creation from that context is
+        # the recursion vector (the child is scheduled too and can create
+        # again), and no lineage/population bound exists to terminate such a
+        # chain. Refusing it here is deterministic, needs no provider round,
+        # and leaves every owner-initiated creation path unchanged.
+        scheduled_refusal = scheduled_creation_error(
+            bool(extra.get(SCHEDULED_OCCURRENCE_EXTRA))
+        )
+        if scheduled_refusal:
+            _trace(
+                "create_task_refused", category="scheduled_creation_blocked",
+                persisted="false",
+            )
+            return ToolResult(success=False, message=(
+                "Scheduled tasks cannot create other tasks, so no task was "
+                "created. Ask me directly (outside a scheduled task) and I can "
+                "create it."
+            ))
+
         _trace(
             "create_task_received", owner_scope=owner_id,
             chat_id=chat_id if isinstance(chat_id, int) else "-",
@@ -495,6 +521,33 @@ class CreateTaskTool(Tool):
 
         if isinstance(candidate, TaskCandidate):
             candidate = candidate.as_creation_candidate()
+
+        # Message-reference provenance (fail closed). A literal Telegram message
+        # reference — a numeric message ID argument, or the chat+message ID
+        # encoded in a Telegram link — is only trustworthy when the OWNER's own
+        # request or trusted runtime message identity grounds it. A
+        # provider-shaped number with no such grounding is refused here, before
+        # persistence, so it can never become a durable scheduled target. The
+        # execution-side chat scoping and outgoing-ownership checks are
+        # unchanged and remain the last line of defence.
+        provenance_error = message_reference_provenance_error(
+            candidate, extra=extra, request_text=extra.get("request_text"),
+        )
+        if provenance_error:
+            _trace(
+                "create_task_message_reference_rejected",
+                reason="ungrounded_message_reference", persisted="false",
+            )
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=create_task_refused "
+                "category=ungrounded_message_reference detail=%s persisted=false",
+                request_id, provenance_error[:160],
+            )
+            return ToolResult(success=False, message=(
+                "I did not create the task: it referenced a Telegram message "
+                "that your request does not authorize. Reply to that message "
+                "(or write its ID/link in the request) and I can schedule it."
+            ))
 
         if schedule_type == "event":
             # Resolve the model-facing trigger (names only) to trusted ids

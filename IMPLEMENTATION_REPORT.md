@@ -1,6 +1,193 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Task semantic-completeness boundaries (six confirmed gaps)
+## Latest phase — Recursive task creation and message-ID provenance (Stage I/J gaps)
+
+### Revision under report
+
+This section describes the revision carrying it — the commit
+`fix: close remaining task semantic gaps` (starting HEAD
+`3ac0384c7c21e351196e5805b2c8a14f15f08c0e`, which is the commit that recorded
+Stages I and J). It implements ONLY the two gaps confirmed by those stages. No
+new scheduler, executor, provider, queue, lineage framework, cache, or schema
+was introduced.
+
+### Root cause — Stage I (recursive/chained `create_task`)
+
+A durable task's actions are stored verbatim and executed later by the single
+`TaskExecutionCoordinator` through the registered `ToolExecutor`. `create_task`
+is a registered tool, so a candidate whose action is
+`{"name": "create_task", "arguments": {"request": "..."}}` passed candidate
+validation and the creation boundary (which only required its `request`
+argument). At occurrence time the coordinator supplied a context with **no
+origin marker**, and `CreateTaskTool` resolved the provider manager from the
+engine fallback — so the occurrence ran the real interpreter and created a new
+durable task. Nothing distinguished that creation from an owner-initiated one:
+no parent/depth/generation field existed in the persisted payload, no origin
+flag existed in the context, and no per-owner population bound existed. Stage I
+reproduced both linear growth (a recurring parent creating one child per
+occurrence) and self-replication (each generation carrying `create_task`
+again).
+
+### Root cause — Stage J (literal message-ID provenance)
+
+The creation boundary validated only presence/emptiness and the tool's own
+declared integer constraints for action arguments. Nothing proved that a
+numeric `message_id` / `message_ids` value (or the chat+message ID encoded in a
+`save_by_link` URL) came from the owner: unlike `chat_id` — which is
+always overwritten from trusted runtime context — a model-supplied message
+reference became the delayed deletion/save target verbatim. Stage J confirmed
+that three arbitrary numbers persisted unchanged through
+`TaskCreationService`/`TaskRepository`.
+
+### Exact enforcement points
+
+**Gap I — trusted scheduled-occurrence marker + fail-closed refusal**
+
+- `backend/ai/task_contract.py` — `SCHEDULED_OCCURRENCE_EXTRA` (the
+  `ToolContext.extra` key) and `scheduled_creation_error(is_scheduled)` (the
+  single rule text/predicate).
+- `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` — the
+  claimed-occurrence context is now built with
+  `extra["scheduled_occurrence"] = True`. The marker is written only here,
+  from trusted runtime state (the same site that injects the trusted
+  `chat_id`); no model, candidate field, or task argument can set it. The
+  existing chat-scope injection is unchanged otherwise.
+- `backend/ai/tools/task.py::CreateTaskTool._execute` — BEFORE any provider
+  resolution, a context carrying the marker is refused with an honest message
+  and a bounded trace (`stage=create_task_refused
+  category=scheduled_creation_blocked persisted=false`). The refusal therefore
+  needs no provider round and cannot depend on model behavior.
+
+**Gap J — message-reference provenance**
+
+- `backend/ai/task_contract.py` — `MESSAGE_ID_ACTION_ARGUMENTS`
+  (`delete_message_by_id`, `delete_by_id`, `delete_messages_by_ids`),
+  `MESSAGE_LINK_ACTION`/`MESSAGE_LINK_ARGUMENT` (`save_by_link`),
+  `trusted_message_ids(extra)`, `request_declared_message_ids(text)`, and
+  `message_reference_provenance_error(candidate, extra, request_text)`. Value
+  coercion reuses `backend.ai.persian.coerce_int`, the SAME coercion the
+  executing tools use, so digit strings (ASCII/Persian/Arabic-Indic) cannot
+  slip past a numeric-shape check — this is a provenance rule, not integer
+  validation.
+- `backend/ai/engine/dispatcher.py::Dispatcher._build_tool_context` — the
+  interactive context now also carries `extra["request_text"] =
+  request.user_message` (the owner's own raw message, trusted), alongside the
+  existing `request_message_id` and `reply_msg`.
+- `backend/ai/tools/task.py::CreateTaskTool._execute` — immediately after the
+  candidate is normalized to its creation-candidate dict and BEFORE
+  destination/trigger resolution and persistence, the provenance rule runs; a
+  reference with no grounding is refused with a bounded, content-free trace.
+  Provenance sources are trusted context only: the owner's triggering message,
+  the message the owner replied to, or a number the owner explicitly wrote in
+  the request text. A link must appear in the owner's request text.
+
+### Before / after behavior
+
+| Case | Before | After |
+|---|---|---|
+| A claimed scheduled occurrence calls `create_task` | child durable task created (chain continues on every occurrence) | refused before provider resolution; no child is persisted |
+| A task whose stored action is `create_task` (pre-existing row) | created a further durable task per occurrence | occurrence fails closed; no child created; the row itself is NOT deleted |
+| Owner-initiated creation (`Nova …` / `.task` / Taskloom) | worked | unchanged |
+| Ordinary scheduled actions (`send_message`, profile, read-only) | worked | unchanged (only the context gained an inert marker key) |
+| Provider returns `delete_message_by_id` with an invented number | persisted, deleted that number later | refused before persistence |
+| Provider returns an ID the owner replied to / wrote in the request | persisted | persisted (unchanged) |
+| Provider returns `save_by_link` with a link the owner never sent | persisted, saved an arbitrary message later | refused before persistence |
+| Provider returns a model `notification_destination.chat_id` | dropped/overwritten by trusted scope (already fixed) | unchanged |
+
+### Files changed
+
+- `backend/ai/task_contract.py` — occurrence marker key, scheduled-creation rule, message-reference provenance rule
+- `backend/ai/task_execution.py` — trusted occurrence marker on the execution context
+- `backend/ai/tools/task.py` — both refusals at the creation boundary
+- `backend/ai/engine/dispatcher.py` — trusted `request_text` in the interactive tool context
+- `tests/test_task_recursion_and_message_id_provenance.py` — focused regression tests (new)
+- `IMPLEMENTATION_REPORT.md` — this current-state record
+
+No scheduler, recovery, `ToolExecutionCoordinator` execution logic, provider,
+Taskloom UI, Supabase schema, migration, SQL, configuration, or deployment file
+was modified. No database schema change was needed: the marker lives in the
+in-process trusted context and the provenance rule uses data already present in
+the request context.
+
+### Tests and validation
+
+- Focused gap suite (`tests/test_task_recursion_and_message_id_provenance.py`):
+  **15 passed** — direct user creation still succeeds; scheduled creation is
+  refused with no persistence, no provider call, and with `get_engine`
+  patched to raise (proving the guard is provider-independent); the
+  coordinator writes the marker (and the marker is not sourced from task
+  arguments); a seeded occurrence whose action is `create_task` persists no
+  child end-to-end through the real registry/executor/coordinator; ordinary
+  scheduled actions still succeed; invented IDs are refused while reply-,
+  request-text- (ASCII and Persian digits) and per-ID-list grounding is
+  accepted; a link absent from the request is refused and a link present in it
+  is accepted; a model destination cannot override the persisted trusted chat
+  scope; unrelated actions are not over-blocked; and execution-side
+  stale/non-outgoing/no-chat-context handling still fails safely.
+- Focused + adjacent task/tool suites (semantic completeness, source fidelity,
+  NL creation, semantic triggers, candidate contract, creation diagnostics,
+  wizard and wizard bridge, trigger events, execution, hardening, management,
+  AI preparation, prepare-ahead, interpretation diagnostics, tool health
+  audit, task contract, durable delete, advanced execution, runtime wiring):
+  **633 passed**.
+- Full suite: **2540 passed, 24 skipped, 0 failed**.
+- `py_compile` for every changed Python file (including the new test file):
+  **passed**.
+- `git diff --check`: **clean**; only the files listed above changed.
+
+### Database / schema / RLS impact
+
+None. No table, column, index, policy, migration, or SQL statement changed and
+no Supabase call was executed. Stage I proved no lineage/depth field exists and
+that the smaller existing-context guard is sufficient, so no schema was
+invented.
+
+### Security boundaries preserved
+
+Owner scoping, trusted-destination handling, execution-time chat scoping, and
+the outgoing-ownership/stale-message checks in
+`delete_service.delete_verified_self_messages` are unchanged; nothing was
+weakened. Diagnostics stay bounded and content-free (action and argument names
+plus a reason token; never message content, links, or raw provider output).
+
+### Known limitations
+
+1. A durable task persisted BEFORE this change whose action is `create_task` is
+   not deleted or rewritten (silent cleanup was explicitly out of scope); each
+   of its occurrences now fails closed with no child task created.
+2. Interactive creation of a candidate action named `create_task` remains
+   persistable, because the previous phase's contract explicitly allows that
+   action once its `request` argument is present. Such a task can now never
+   execute that action, so it fails closed at every occurrence instead of
+   creating children. Removing it from creation would contradict the recorded
+   A–H contract and its tests, so it was left alone.
+3. The provenance rule treats a number the owner wrote anywhere in the request
+   text as user-declared (the architecture keeps semantic interpretation with
+   the provider; this is authorization grounding, not intent parsing). A
+   scheduled occurrence can never ground a reference at all, because it carries
+   neither the request text nor a trusted message identity.
+4. Telegram-side identifier lifetime across chat migration/ID remapping remains
+   as recorded in Stage J (STILL UNCERTAIN) — unchanged, and unprovable without
+   live Telegram observation.
+5. No live Telegram, Supabase, Render, or provider verification was performed;
+   every result above was verified in-process against the real interpreter,
+   candidate, creation, registry, executor, coordinator, and delete tools with
+   an in-memory repository.
+
+### Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `3ac0384c7c21e351196e5805b2c8a14f15f08c0e` |
+| Implementation commit | this revision — `fix: close remaining task semantic gaps` |
+| Push target | `origin/main` (no force, no rebase, no history rewrite) |
+
+The pushed SHA, the remote `refs/heads/main`, and the working-tree state are
+verified and reported in the accompanying response; the SHA is not recorded
+self-referentially inside this file because the report and the implementation
+are delivered in a single commit.
+
+## Previous phase — Task semantic-completeness boundaries (six confirmed gaps)
 
 ### Revision under report
 
