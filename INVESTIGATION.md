@@ -607,3 +607,315 @@ maintenance rather than user-facing content actions).
  unresolved cases explicitly marked UNCERTAIN. Stage C was not started; no
 production code, tests, schema, configuration, UI, or `IMPLEMENTATION_REPORT.md`
 was modified.
+
+---
+
+## Stage C — Content and semantic requirement enforcement
+
+### C1. Scope
+
+**Revision inspected:** `9ae1757` (`main`). This stage starts from the 39-action
+registry and traces every registered action with meaningful persisted arguments
+through `TaskCandidate.from_untrusted`, `CreateTaskTool._execute`, and
+`TaskCreationService.create` to the `repository.create_task` call. Runtime
+context is handled separately in Stage D.
+
+The relevant path is:
+
+```
+provider JSON
+→ TaskCandidate.from_untrusted()
+→ CreateTaskTool normalization/repair gates (NL path)
+→ TaskCreationService.create()
+→ repository.create_task()
+```
+
+`TaskCandidate.from_untrusted` validates the action envelope and that
+`arguments` is an object, except for the special send-action canonicalizer.
+`TaskCreationService._semantic_completeness_error` is the only action-specific
+creation check observed; its set is exactly `{"bio_set_text",
+"username_set_text"}`. Tool-level checks occur after persistence and therefore
+are not pre-persistence semantic enforcement.
+
+The interpreter NON-INVENTION and AI-GENERATED CONTENT text is provider
+instruction only. It is not a runtime assertion that the provider supplied the
+value or that a nonblank `ai_instruction` represents an explicit user request.
+
+### C2. Action enforcement matrix
+
+| Action | Required semantic input | Pre-persistence enforcement | Generation exception | Verdict | Evidence |
+|---|---|---|---|---|---|
+| `send_message` | `text`: string, nonblank, max 4096; optional registered `font` | Yes. Send aliases are canonicalized, text is type/blank/length checked, and font is allow-listed | None for missing static text; the prompt requires user-supplied static text | **PASS** for required execution input; provenance is not independently proven | `backend/ai/task_candidate.py::_canonicalize_action`; `backend/ai/tools/message.py::SendMessageTool.execute` |
+| `bio_set_text` | Nonblank static `text`, or a nonblank generation instruction | Partial. The service accepts either, but does not verify that the instruction authorizes generation or that static text is a string | Nonblank `ai_instruction` is accepted; NL source-fidelity repair applies only when `derive_policy(request).active` | **GAP** | `backend/ai/task_creation.py::_semantic_completeness_error`; `backend/ai/tools/task.py::_execute` |
+| `username_set_text` | Nonblank static `text`, or a nonblank generation instruction | Same partial check as bio; non-string static values can satisfy `str(...).strip()` | Same presence-only instruction exception; no authorization proof | **GAP** | `backend/ai/task_creation.py::_semantic_completeness_error`; `backend/ai/tools/username.py::UsernameSetTextTool.execute` |
+| `bio_set_template` | Truthy non-empty `template` | None; missing/empty template reaches persistence | None established; generic `ai_instruction` is not a source-proven template substitute | **GAP** | `backend/ai/tools/bio.py::BioSetTemplateTool.execute`; `backend/ai/task_creation.py::TaskCreationService.create` |
+| `username_set_template` | Truthy non-empty `template` | None; missing/empty template reaches persistence | None established | **GAP** | `backend/ai/tools/username.py::UsernameSetTemplateTool.execute`; `backend/ai/task_creation.py::TaskCreationService.create` |
+| `bio_set_mood` | None is required by the tool: missing/empty mood is explicitly passed through and accepted; a supplied value has no creation-time type check | Missing/empty is a valid execution case; malformed supplied values are not checked before persistence | None established | **GAP** only for malformed supplied values; **PASS** for the documented empty/missing case | `backend/ai/tools/bio.py::BioSetMoodTool.execute`; `backend/services/bio_service.py::do_mood` |
+| `username_set_mood` | Same as `bio_set_mood` | Missing/empty is accepted; supplied value type is not checked before persistence | None established | **GAP** only for malformed supplied values; **PASS** for the documented empty/missing case | `backend/ai/tools/username.py::UsernameSetMoodTool.execute`; `backend/services/username_service.py::do_mood` |
+| `memory_store` | Nonblank `content`, bounded by `MAX_MEMORY_ENTRY_CHARS`; tier/category/importance have bounded domains | None; empty content and invalid argument combinations reach persistence | No action-specific authorization that `ai_instruction` may generate memory content | **GAP** | `backend/ai/tools/memory.py::MemoryStoreTool.execute`; `backend/ai/task_creation.py::TaskCreationService.create` |
+| `save_by_link` | Non-empty, parseable Telegram message `link` | None; link validation is execution-only | No instruction substitute for a source link | **GAP** | `backend/ai/tools/save.py::SaveByLinkTool.execute`; `backend/ai/task_candidate.py::TaskCandidate.from_untrusted` |
+| `search` | Non-empty `query` | None; missing query reaches the tool | None established | **GAP** | `backend/ai/tools/retrieve.py::SearchTool.execute` |
+| `delete` | Explicit deletion scope: bounded count or valid filtered scope; some modes need a boundary | None; an empty action object reaches execution and is rejected there | None; AI preparation does not establish a user-authorized deletion scope | **GAP** | `backend/ai/tools/delete.py::DeleteTool.execute`; `backend/ai/task_creation.py::_semantic_completeness_error` |
+| `delete_by_id` | `message_id` | None; missing ID reaches the tool | None | **GAP** | `backend/ai/tools/delete.py::DeleteByIdTool.execute` |
+| `delete_message_by_id` | Positive `message_id` | None; missing/nonpositive ID reaches the tool | None | **GAP** | `backend/ai/tools/delete.py::DeleteMessageByIdTool.execute` |
+| `delete_messages_by_ids` | Non-empty list of positive IDs, bounded to 100 after coercion | None; empty/unusable list reaches the tool | None; IDs are not a generated-content contract | **GAP** | `backend/ai/tools/semantic.py::DeleteMessagesByIdsTool.execute` |
+| `retrieve_save` | Non-empty alphanumeric `save_code` | None; missing/invalid code reaches the tool | None | **GAP** | `backend/ai/tools/retrieve_save.py::RetrieveSaveTool.execute` |
+| `settings_get` | Truthy `key` | None; missing key reaches the tool | None | **GAP** | `backend/ai/tools/settings.py::SettingsGetTool.execute` |
+| `settings_set` | Truthy `key` and a present `value` | None; missing key/value reaches the tool | None; confirmation is a separate runtime concern | **GAP** | `backend/ai/tools/settings.py::SettingsSetTool.execute` |
+| `web_search` | Non-empty `query`; optional count/freshness/domains have bounded normalization in the tool | No query check before persistence; required query is rejected only at execution | None established | **GAP** | `backend/ai/tools/websearch.py::WebSearchTool.execute`; `backend/services/web_search_service.py::do_web_search` |
+| `create_task` | Non-empty nested `request`, max 2000 chars | None; an outer task can persist a `create_task` action with no request | None; recursive scheduled-task semantics are not an accepted generation exception | **GAP** | `backend/ai/tools/task.py::CreateTaskTool._execute`; `backend/ai/task_creation.py::TaskCreationService.create` |
+| `task_inspect` | Positive `task_id` | None; missing/nonpositive ID reaches the tool | None | **GAP** | `backend/ai/tools/task_management_tools.py::TaskInspectTool.execute` |
+| `task_transition` | Positive `task_id`, valid status, positive `expected_version` | None; all are checked only by the tool | None; CAS version is not generated content | **GAP** | `backend/ai/tools/task_management_tools.py::TaskTransitionTool.execute` |
+| `task_delete` | Positive `task_id` and positive `expected_version` | None; both are checked only by the tool | None | **GAP** | `backend/ai/tools/task_management_tools.py::TaskDeleteTool.execute` |
+| `task_list` | No required argument; supplied `status` must be allow-listed | Missing status is valid, but an invalid supplied status reaches persistence and is rejected only by the tool | None | **GAP** for malformed optional input; missing status is valid | `backend/ai/tools/task_management_tools.py::TaskListTool.execute` |
+| `list_saves` | No required argument; supplied `limit` is optional | Missing limit is defaulted by the tool; there is no creation-time check for a malformed supplied limit | None | **GAP** for malformed optional input; missing limit is valid | `backend/ai/tools/retrieve.py::ListSavesTool.execute`; `backend/services/discover_service.py::do_list` |
+| `account_show` | No required argument; supplied `fields` must be a nonempty allow-list | Missing fields is valid, but invalid supplied fields reach persistence and `_normalize_fields` rejects them only at execution | None | **GAP** for malformed optional input; missing fields is valid | `backend/ai/tools/account.py::_normalize_fields`; `AccountShowTool.execute` |
+| `memory_list` | No required argument; supplied tier/limit must be bounded | Missing options are valid; invalid tier or non-integer limit reaches persistence and is rejected only by the tool | None | **GAP** for malformed optional input; missing options are valid | `backend/ai/tools/memory.py::MemoryListTool.execute` |
+| `list_recent_messages` | No required argument; `limit` is optional and coerced/defaulted/clamped to 1–100 | Tool normalizes missing and malformed limits to a bounded value; no required semantic input is absent | None | **PASS** for argument completeness; destination context is Stage D | `backend/ai/tools/semantic.py::ListRecentMessagesTool.execute` |
+
+The no-argument actions (`bio_on`, `bio_off`, `bio_show`, `get_bio`,
+`username_on`, `username_off`, `username_show`, `database_stats`,
+`organize_list`, `organize_clean`, and `memory_list`'s missing-option case)
+do not acquire a missing required argument merely by having `{}`. Their
+context and permission behavior is not reclassified by this stage.
+
+**Persistence paths for the confirmed required-argument gaps:**
+`TaskCandidate.from_untrusted` accepts any registered-looking action name with
+an object `arguments` value (and does not inspect nested fields), then
+`TaskCreationService.create` checks only the envelope, schedule, and the two
+profile text names. Therefore, for each GAP above, an otherwise valid
+candidate containing `{"name": <action>, "arguments": {}}` (or an object
+missing the named field) reaches `TaskCreationService.create`, passes
+`_semantic_completeness_error`, resolves its schedule, and calls
+`repository.create_task`. The tool's own missing-argument response is later
+than persistence. The exception is the special send canonicalizer and the
+profile blank-text/no-instruction check already documented in Stage A.
+
+### C3. Confirmed PASS
+
+- `send_message` has a deterministic candidate-layer contract: bounded,
+  nonblank string text, optional canonical font, and no model-supplied
+  destination field. This proves execution-input completeness, not that the
+  provider's nonblank text was actually supplied by the user.
+- `list_recent_messages` has no mandatory argument; its optional limit is
+  coerced, defaulted, and clamped before the tool uses it.
+- `bio_set_mood` and `username_set_mood` treat absent/empty mood as a valid
+  state in their actual tool/service contract. Requiring nonblank mood would
+  invent a requirement not established by source. Malformed supplied mood
+  values remain the GAP subcase shown in C2.
+- For both profile text actions, the specific case of blank text with no
+  nonblank instruction is rejected before persistence by Stage A's service
+  boundary. It is a confirmed PASS subcase, not a full action PASS.
+
+### C4. Confirmed GAP
+
+1. **Presence is not authorization for generated profile content.** A blank
+   `bio_set_text` or `username_set_text` value plus any nonblank
+   `ai_instruction` passes `_semantic_completeness_error`. The service receives
+   no original user request and cannot prove that the provider did not invent
+   the generation request. The NL source-fidelity gate repairs an instruction
+   only when `derive_policy(request).active`; otherwise the model-supplied
+   nonblank instruction remains sufficient.
+2. **Nested required arguments are not checked at creation.** Empty/missing
+   `template`, `content`, `link`, query, deletion scope/IDs, save code, setting
+   key/value, nested task request, task IDs/status/version, and other fields in
+   C2 all reach `repository.create_task` before their tool-level validators run.
+3. **Malformed optional values can also be persisted.** The candidate boundary
+   does not validate nested argument types, so invalid `status`, `fields`,
+   memory options, and supplied mood values are stored in the action snapshot
+   and fail or normalize only during execution. `send_message.font` is the
+   explicit exception because the candidate canonicalizer validates it.
+4. **Provider non-invention is not runtime-enforced.** The interpreter's
+   NON-INVENTION CONTRACT says not to fabricate values, but it is prompt text.
+   The deterministic creation boundary does not compare ordinary static action
+   arguments or arbitrary `ai_instruction` against the original request.
+
+### C5. UNCERTAIN
+
+No action-level C2 result is UNCERTAIN: each listed required field or optional
+bounded field was either read in its tool implementation or explicitly treated
+as an accepted omission/default. The unresolved questions are not evidence
+shortfalls for this stage: recursive `create_task` meaning and destination
+trust are separated into Stage D and the later Stage E boundary.
+
+### C6. Stage C verdict
+
+Stage C classified **2 PASS**, **25 GAP**, and **0 UNCERTAIN** action-level
+findings. The PASS count treats the documented empty/missing mood cases and
+profile blank-text rejection as PASS subcases rather than full action PASS
+rows; the two full PASS actions are `send_message` and
+`list_recent_messages`. The dominant confirmed defect is that nested action
+arguments are schema-shaped but not semantically validated before
+`repository.create_task`; the existing profile boundary is only a narrow
+exception and does not prove generation authorization. No fix was implemented.
+
+---
+
+## Stage D — Scheduled runtime-context enforcement
+
+### D1. Scope
+
+This stage compares every Stage B runtime-context requirement with the context
+actually constructed for a scheduled occurrence. The source path is:
+
+```
+RuntimeSupervisor._start_task_scheduler
+→ base ToolContext(telegram=TelegramAPI(client), owner_id, tz_str, client, extra=None)
+→ TaskExecutionCoordinator.execute
+→ optional extra = {"chat_id": task.notification_destination["chat_id"]}
+→ ToolExecutor.execute_calls(context_override=execution_context)
+→ tool.execute()
+```
+
+The base context is constructed in
+`backend/runtime/supervisor.py::RuntimeSupervisor._start_task_scheduler`.
+`backend/ai/task_execution.py::TaskExecutionCoordinator.execute` copies only a
+nonzero persisted destination `chat_id` into `extra`. The event dispatcher
+(`backend/ai/task_event_dispatcher.py::_execute_one`) calls the same coordinator
+and does not add the triggering message as `reply_msg` or add a dynamic event
+chat to the tool context.
+
+The four concepts are kept separate below: the tool's requirement, what the
+scheduled path injects, whether creation rejects a missing value, and what the
+tool does when the value is absent.
+
+### D2. Runtime-context matrix
+
+| Action | Required context | Scheduled context actually injected | Creation-time guard | Runtime fail-closed behavior | Verdict | Evidence |
+|---|---|---|---|---|---|---|
+| `save` | `extra["reply_msg"]` with chat/message identity; Telegram client | Telegram/client supplied; no `reply_msg` | None; zero-argument action can persist | `SaveTool.execute` returns `No replied message to save.` before service call | **GAP** | `backend/ai/tools/save.py::SaveTool.execute`; `backend/runtime/supervisor.py::_start_task_scheduler`; `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` |
+| `delete_replied` | `extra["reply_msg"]` with chat/message identity; Telegram client | Telegram/client supplied; no `reply_msg`, including event-trigger executions | None; zero-argument action can persist | Returns `No replied message to delete. Reply to a message first.` | **GAP** | `backend/ai/tools/delete.py::DeleteRepliedTool.execute`; `backend/ai/task_event_dispatcher.py::_execute_one` |
+| `delete` | `extra["chat_id"]`; `request_message_id`/`reply_msg` only help resolve an implicit message boundary | Only a nonzero persisted destination chat ID is copied; no request/reply metadata | None; empty destination and boundary-dependent modes can persist | Missing chat → `No chat context for deletion.`; missing `until_message` boundary → `No message boundary could be resolved` | **GAP** | `backend/ai/tools/delete.py::DeleteTool.execute`; `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` |
+| `delete_by_id` | `extra["chat_id"]` plus Telegram client | Conditional destination chat ID; base Telegram/client | None | `No chat context for deletion.` | **GAP** | `backend/ai/tools/delete.py::DeleteByIdTool.execute`; `TaskExecutionCoordinator.execute` |
+| `delete_message_by_id` | `extra["chat_id"]` plus Telegram client | Conditional destination chat ID; base Telegram/client | None | `No chat context for deletion.` | **GAP** | `backend/ai/tools/delete.py::DeleteMessageByIdTool.execute`; `TaskExecutionCoordinator.execute` |
+| `list_recent_messages` | `extra["chat_id"]` plus Telegram client | Conditional destination chat ID; base Telegram/client | None | `No chat context available.` | **GAP** | `backend/ai/tools/semantic.py::ListRecentMessagesTool.execute`; `TaskExecutionCoordinator.execute` |
+| `delete_messages_by_ids` | `extra["chat_id"]` plus Telegram client | Conditional destination chat ID; base Telegram/client; IDs are persisted but not contextualized | None | `No chat context available.` before deletion; with chat, IDs are re-fetched and ownership-checked | **GAP** | `backend/ai/tools/semantic.py::DeleteMessagesByIdsTool.execute`; `TaskExecutionCoordinator.execute` |
+| `retrieve_save` | Nonzero `extra["chat_id"]` plus Telegram client | Conditional destination chat ID; base Telegram/client | None | `No trusted destination chat is available; nothing was retrieved.` | **GAP** | `backend/ai/tools/retrieve_save.py::RetrieveSaveTool.execute`; `TaskExecutionCoordinator.execute` |
+| `save_by_link` | Telegram client/raw client for link resolution and Deep Save | Supplied by the supervisor's base context | No special context guard needed in normal scheduler wiring | Returns an honest no-client failure if the base client is absent; normal path supplies it | **PASS** | `backend/ai/tools/save.py::SaveByLinkTool.execute`; `backend/runtime/supervisor.py::_start_task_scheduler` |
+| `bio_on` | `context.telegram.client` | Supplied in the base context | No special guard needed in normal scheduler wiring | Service/tool catches failures and returns a failed result | **PASS** | `backend/ai/tools/bio.py::BioOnTool.execute`; `RuntimeSupervisor._start_task_scheduler` |
+| `username_on` | `context.telegram.client` | Supplied in the base context | No special guard needed in normal scheduler wiring | Service/tool catches failures and returns a failed result | **PASS** | `backend/ai/tools/username.py::UsernameOnTool.execute`; `RuntimeSupervisor._start_task_scheduler` |
+| `get_bio` | `context.telegram` | Supplied in the base context | No special guard needed in normal scheduler wiring | `Telegram is not available.` if absent; normal path supplies it | **PASS** | `backend/ai/tools/bio.py::BioGetTool.execute`; `RuntimeSupervisor._start_task_scheduler` |
+| `account_show` | `context.telegram` | Supplied in the base context | No special guard needed in normal scheduler wiring | `Telegram is not available.` if absent | **PASS** | `backend/ai/tools/account.py::AccountShowTool.execute`; `RuntimeSupervisor._start_task_scheduler` |
+| `web_search` | `extra["provider_manager"]` is optional; engine fallback is part of the tool contract | No manager in `extra`; `WebSearchTool`/service resolve `get_engine().provider_manager` | No guard needed for the optional key | Engine absence returns a controlled unavailable/failed result | **PASS** for context resolution | `backend/ai/tools/websearch.py::WebSearchTool.execute`; `backend/services/web_search_service.py::do_web_search` |
+| `create_task` | `extra["provider_manager"]` is optional with engine fallback; `request_id` is tracing-only; `chat_id` supplies a nested default destination when present | No manager/request metadata in `extra`; manager falls back to engine; absent chat remains absent | No guard for nested destination or recursive semantics | Missing manager fails honestly; behavior of a nested scheduled `create_task` without chat context is not established | **UNCERTAIN** | `backend/ai/tools/task.py::_execute`; `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` |
+| `send_message` | Telegram client; `extra["chat_id"]` is optional because owner ID is fallback | Base Telegram/client supplied; destination chat copied when available, otherwise tool falls back to `owner_id` | No special context guard needed | If owner ID and transport are unavailable, returns trusted-destination/transport failure | **PASS** for context availability; destination trust remains Stage E | `backend/ai/tools/message.py::SendMessageTool.execute`; `RuntimeSupervisor._start_task_scheduler` |
+
+**Concrete GAP paths:**
+
+- `save` / `delete_replied`:
+
+  ```
+  task creation → persisted zero-argument action
+  → scheduled base context with no reply_msg
+  → tool.execute()
+  → controlled no-reply failure; no source message can be resolved
+  ```
+
+- Chat-dependent family:
+
+  ```
+  task creation with notification_destination={}
+  → repository.create_task
+  → scheduled coordinator sees no persisted chat_id
+  → extra has no chat_id
+  → tool.execute()
+  → controlled no-chat failure before the Telegram operation
+  ```
+
+  For `delete(mode="until_message")`, the scheduled context also has no
+  `reply_msg` or `request_message_id`; only a durable `boundary_id` can make
+  that mode self-contained. This is a second, source-proven context gap.
+
+These are creation-time enforcement gaps even though the execution behavior is
+fail-closed. They do not assert that a missing-context tool performs an unsafe
+side effect.
+
+### D3. Confirmed PASS
+
+1. Normal supervisor wiring supplies a live `TelegramAPI` and raw client, so
+   `save_by_link`, `bio_on`, `username_on`, `get_bio`, and `account_show` do not
+   lack their base Telegram context at scheduled execution.
+2. `web_search` does not require a manager in `extra`; the service explicitly
+   resolves the engine manager and returns a controlled failure when the engine
+   is unavailable.
+3. `send_message` has a documented owner-ID destination fallback, so lack of a
+   persisted chat ID alone does not make its required context unavailable.
+
+### D4. Confirmed GAP
+
+1. `save` and `delete_replied` are immediate-reply actions. Their required
+   `reply_msg` metadata is never injected by either the time scheduler or the
+   event dispatcher, while creation has no guard against persisting them.
+2. `delete`, `delete_by_id`, `delete_message_by_id`,
+   `list_recent_messages`, `delete_messages_by_ids`, and `retrieve_save` can
+   persist with an empty destination. The coordinator adds `chat_id` only from
+   a nonzero persisted destination, and each tool fails closed when it is
+   absent. `delete` additionally lacks an implicit scheduled boundary unless a
+   durable `boundary_id` was persisted.
+
+### D5. UNCERTAIN
+
+- `create_task` can resolve a missing scheduled `provider_manager` through the
+  process engine, but source evidence here does not establish whether
+  recursively creating tasks is a supported finite contract or whether a
+  nested task with no scheduled chat destination is semantically valid.
+- `delete_messages_by_ids` can receive a chat when one is persisted, but
+  whether literal message IDs remain meaningful durable targets over time is an
+  argument-lifetime question, not a missing context-key finding. It remains
+  outside this stage's context verdict.
+
+### D6. Stage D verdict
+
+Stage D classified **7 PASS**, **8 GAP**, and **1 UNCERTAIN** context findings.
+The supervisor supplies the base Telegram context and the documented manager
+fallback, but only conditionally supplies a destination chat ID and never
+supplies immediate reply metadata. Thus reply-dependent actions are
+persistable but unexecutable on the scheduled path, and chat-dependent actions
+are persistable without a guaranteed chat context. All observed runtime
+protections fail closed at execution time; none replaces a creation-time guard.
+No fix was implemented.
+
+### Combined C+D Findings
+
+**Confirmed creation-layer gaps (Stage C):**
+
+- Required nested fields for profile templates, memory writes, link saves,
+  searches, deletes, retrieval, settings, web search, nested task creation,
+  and task-management actions are not validated before `repository.create_task`.
+- The profile boundary rejects blank text without an instruction, but a
+  nonblank instruction is accepted without deterministic proof of explicit
+  user generation intent; non-string profile text can also satisfy the current
+  coercive check.
+- Malformed optional nested values are also persistable for moods, list/task
+  filters, account fields, and memory-list options. The send font is the
+  explicit candidate-layer exception.
+
+**Confirmed scheduled-context gaps (Stage D):**
+
+- `save` and `delete_replied` require immediate reply metadata that scheduled
+  execution never provides.
+- The chat-dependent deletion/list/retrieval family can persist without a
+  destination `chat_id`, and `delete` can lack a scheduled message boundary.
+
+**Execution-time-only protections:**
+
+- Tool argument checks, no-context failures, registry lookup, permission
+  handling, Telegram ownership re-fetches, and bounded service failures occur
+  after persistence. They are useful defense-in-depth, not pre-persistence
+  semantic completeness.
+- The interpreter NON-INVENTION text is provider guidance, not a runtime
+  validator.
+
+**Unresolved for Stage E (not investigated):**
+
+- Whether every task-creation path populates `notification_destination.chat_id`
+  from trusted state, and whether model-supplied destination fields can survive
+  or bypass that resolution.
+- Whether persisted message IDs are durable semantic targets, and whether event
+  trigger source chat should be the execution destination.
+- Confirmation/permission semantics for persisted actions remain outside C+D
+  and belong to the planned later stage.
+
+Stages C and D are complete at their stated stopping conditions. Stage E was
+not started; no production code, tests, configuration, database/schema, UI,
+scheduler, provider, ToolExecutor, or Taskloom files were modified.
