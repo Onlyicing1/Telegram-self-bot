@@ -205,3 +205,140 @@ No action other than `send_message` has a pre-persistence semantic check.
 
 No production code, tests, configuration, or schema were modified by this
 investigation.
+
+---
+
+## Stage A — Boundary coverage of 3763138d
+
+> **Stage A only.** Sections 1–7 above describe revision `2551970` and are
+> preserved unchanged. This section audits the **current** revision
+> (`22a9dfb`) and adds no later stage. No stage beyond A was started.
+
+### Scope executed
+
+| Source | Region read |
+|---|---|
+| `backend/ai/task_creation.py` | `TaskSemanticCompletenessError` (L35), `_PROFILE_CONTENT_ACTIONS` (L39), `_semantic_completeness_error` (L42–59), the call site in `TaskCreationService.create` (L120–123), and the full ordering of `create()` (L99–177) |
+| `backend/ai/tools/task.py` | the `TaskSemanticCompletenessError` import (L167), `_fail` (L241–287), and the `create()` catch site (L590–591) |
+| `backend/ai/task_interpreter.py` | the NON-INVENTION CONTRACT block (L401–411 of the interpret prompt) |
+| `tests/test_task_semantic_completeness.py` | all four tests and their assertions |
+| Narrowly necessary neighbour | `backend/bot/handlers/taskloom.py` L811–820 — the wizard's `TaskCreationService.create` call and its `except Exception` handler |
+| Narrowly necessary neighbour | `backend/ai/task_candidate.py` L218–244 — `_canonicalize_action`, to establish what argument shape reaches the check |
+
+### PASS
+
+**P1 — The check exists, is deterministic, and is keyed on an explicit action set.**
+`task_creation.py:39` — `_PROFILE_CONTENT_ACTIONS = frozenset({"bio_set_text", "username_set_text"})`. `task_creation.py:42–59` — `_semantic_completeness_error(candidate)` returns a reason string or `None`.
+
+**P2 — An empty profile action with no generation contract is rejected.**
+`task_creation.py:59` — `if not (isinstance(instruction, str) and instruction.strip()) and not str(arguments.get("text") or "").strip():` → `"profile content requires explicit content or an AI instruction"`. The condition requires *both* a nonblank instruction *and* nonblank text to be absent before rejecting, so either one alone is sufficient to accept.
+
+**P3 — `ai_instruction` is genuinely required to be nonblank when static profile content is empty.**
+Same expression as P2: acceptance requires `isinstance(instruction, str) and instruction.strip()`. A supplied but blank/whitespace-only instruction does not satisfy it (and is separately rejected earlier — see P4).
+
+**P4 — An empty or whitespace-only `ai_instruction` is rejected, and this rejection is broader than the profile set.**
+`task_creation.py:52–53` runs **before** the action loop:
+`if instruction is not None and (not isinstance(instruction, str) or not instruction.strip()): return "AI instruction is invalid"`.
+Because it precedes `for action in actions`, this fires for *any* candidate carrying a non-`None`, non-nonblank-string instruction — including candidates whose actions are entirely outside `_PROFILE_CONTENT_ACTIONS`. The action set gates only the two *content* rejections, not the instruction-validity rejection.
+
+**P5 — A malformed covered-action argument container is rejected.**
+`task_creation.py:55–56` — `if not isinstance(arguments, dict): return "content action arguments are invalid"`.
+
+**P6 — Rejection provably happens before schedule resolution.**
+In `TaskCreationService.create` the order is: field-set checks (L116–119) → **`_semantic_completeness_error` (L120–123)** → task/schedule timezone agreement (L124–131) → schedule resolution via `parse_schedule` / `initial_next_run` (L132–146) → payload assembly + `validate_ai_instruction` (L147–155) → `repository.create_task` (L168). The requested logical order **candidate → semantic validation → schedule resolution → repository persistence is correct as written**; two steps sit between candidate parsing and the semantic check (`isinstance` guard + required/allowed field-set checks), and payload/instruction validation sits between schedule resolution and persistence.
+
+**P7 — Rejection provably happens before repository persistence, for every caller.**
+The check is **inside** the service, not in a caller. `repository.create_task` is reached only after it (L120→L168), and the raise occurs before the `payload` is even built. Confirmed for both `create()` call sites: `tools/task.py:586` (NL path) and `bot/handlers/taskloom.py:813` (Taskloom wizard path).
+
+**P8 — Detection produces a defined error, a defined Taskloom signal, and no persistence.**
+- Error: `TaskSemanticCompletenessError` (subclass of `TaskCreationError` → `ValueError`), message = the reason string (`task_creation.py:35`, `L120–123`).
+- Trace: `_creation_trace("semantic_incomplete", reason=semantic_error)` (L121).
+- NL path (`tools/task.py:590–591`): `isinstance(exc, TaskSemanticCompletenessError)` → `_fail("create_task_semantics", "candidate_semantically_incomplete", exc)`.
+- `_fail` (L272–277) sets `data = {"open_taskloom_wizard": True, "wizard_reason": "candidate_semantically_incomplete"}` because the category is explicitly listed alongside the `candidate_invalid*` prefix, and logs one terminal record with `failed_stage=create_task_semantics`, `persisted=false`.
+- Persistence skipped: the exception is raised before `payload`/`repository_call`, so `create_task_repository_create_result` and the repository call are never reached.
+- Taskloom path (`taskloom.py:814–819`): caught by the generic `except Exception` and rendered as `× Save failed (TaskSemanticCompletenessError); nothing durable was written.` with the draft preserved — persistence likewise skipped.
+
+**P9 — The happy paths are preserved.** A well-formed candidate with either nonblank static text or a nonblank instruction passes unchanged; the check returns `None` and creation proceeds exactly as before.
+
+### GAP
+
+**G1 — Coverage is exactly two action names.** `_PROFILE_CONTENT_ACTIONS` contains only `bio_set_text` and `username_set_text` (`task_creation.py:39`). Every other registered action is not evaluated by this boundary (the loop `continue`s at L54–55). This is the implementation's own scope, not an inferred defect: the added tests cover only `bio_set_text`.
+
+**G2 — A candidate whose `actions` is not a list short-circuits the entire check.** `task_creation.py:50–51` — `if not isinstance(actions, list): return None`. The check then never runs, and `create()` does not itself validate list-ness of `actions` (the required-field check only tests key presence), so `payload` is built and `repository.create_task` is called. Unreachable through `TaskCandidate.from_untrusted` (which enforces a list), but reachable from a direct `create(validated, now)` caller such as the wizard path (`taskloom.py:813` accepts a raw `validated` dict).
+
+**G3 — Action-name matching is exact and case-sensitive.** `action.get("name") not in _PROFILE_CONTENT_ACTIONS` (`L54`). `_canonicalize_action` (`task_candidate.py:224`) only `.strip()`s the name, never lower-cases it, so `BIO_SET_TEXT` bypasses this boundary. What happens downstream is outside Stage A’s scope and is not claimed here.
+
+**G4 — A truthy non-string `text` satisfies the check.** `str(arguments.get("text") or "").strip()` (`L59`) coerces: `{"text": 123}` yields `"123"` and is accepted. The check validates *presence*, not *type*; whether that value is then usable by the profile service belongs to a later stage.
+
+**G5 — The check does not verify that `ai_instruction` was authorized by the user.** It only requires a nonblank string. A provider-supplied invented instruction is therefore sufficient to pass the boundary. The deterministic verbatim-repair gate that ties the instruction to the original request lives in `CreateTaskTool`, *outside* this boundary, and is not exercised by `TaskCreationService` when called directly.
+
+**G6 — No action-registration check.** An unregistered action name in a covered position is not rejected here; registration is resolved later at occurrence execution (established in the `2551970` sections; not re-derived in Stage A).
+
+**G7 — Owner-facing message does not distinguish semantic incompleteness.** `_fail` returns the same generic “I could not turn that into a safe, unambiguous schedule …” text used for ambiguity, appending only `[failure category: candidate_semantically_incomplete]` (`L278–286`). The wizard data is accurate; the prose is not semantic-incompleteness-specific.
+
+### UNCERTAIN
+
+- **U1 — Downstream consumption of the `open_taskloom_wizard` signal.** Stage A read only the producer (`_fail`). What `backend/bot/handlers/ai_unified.py` does with the flag is not established here.
+- **U2 — Whether any path can reach `repository.create_task` without `TaskCreationService.create`.** Only the two `create()` call sites were checked; the repository’s other callers are out of Stage A scope.
+- **U3 — Execution-time consequences of G3/G4/G6.** Whether a case-variant name, a coerced non-string `text`, or an unregistered name fails closed at occurrence execution is a later-stage question.
+- **U4 — Reachability of G2 from a live draft.** That the wizard passes a raw `validated` dict is confirmed by the call shape at `taskloom.py:813`; whether any live wizard draft can actually produce a non-list `actions` value was not traced in Stage A.
+
+### Coverage Matrix
+
+| Case | Covered? | Accepted/Rejected | Evidence |
+|---|---|---|---|
+| `bio_set_text`, nonblank string `text`, no instruction | yes | **Accepted** | `task_creation.py:59` (text branch truthy) |
+| `bio_set_text`, blank text, nonblank `ai_instruction` | yes | **Accepted** | `task_creation.py:59` (instruction branch truthy) |
+| `bio_set_text`, blank/missing text, no `ai_instruction` key | yes | **Rejected** — `profile content requires explicit content or an AI instruction` | `task_creation.py:59` |
+| `bio_set_text`, blank text, `ai_instruction` = `""` / whitespace | yes | **Rejected** — `AI instruction is invalid` (raised before the action loop) | `task_creation.py:52–53` |
+| `username_set_text`, the same four cases | yes | identical to `bio_set_text` | `task_creation.py:39`, `L54–59` |
+| covered action, `arguments` not a dict | yes | **Rejected** — `content action arguments are invalid` | `task_creation.py:55–56` |
+| covered action, truthy non-string `text` (e.g. `123`) | yes | **Accepted** (coerced by `str()`) | `task_creation.py:59` |
+| any candidate, `ai_instruction` present but not a nonblank string | yes (broader than the profile set) | **Rejected** — `AI instruction is invalid` | `task_creation.py:52–53` |
+| `send_message`, unregistered names, `bio_set_template`, `bio_set_mood`, `username_set_template`, `username_set_mood`, `delete*`, `save*`, `search`, `retrieve_save`, `memory_*`, `settings_*`, `task_*`, `create_task`, `web_search`, `account_show`, `list_*`, `organize_*`, `database_stats` | **no** | Not evaluated (`continue`) | `task_creation.py:54–55` |
+| case-variant name (`BIO_SET_TEXT`) | **no** | Not evaluated (exact set membership) | `task_creation.py:39`, `L54`; `task_candidate.py:224` |
+| candidate whose `actions` is not a list | **no** | Whole check returns `None` | `task_creation.py:50–51` |
+| whether `ai_instruction` was user-authorized | **no** | Not evaluated (nonblank string suffices) | `task_creation.py:52`, `L59` |
+| whether the action name is registered | **no** | Not evaluated | `task_creation.py:54–55` |
+| destination / target / trusted-field semantics | **no** | Not evaluated | `task_creation.py:42–59` (no such reads) |
+| permission / confirmation level of the action | **no** | Not evaluated | `task_creation.py:42–59` (no such reads) |
+
+### Persistence Ordering
+
+The requested sequence is **confirmed**, with the intermediate steps made explicit:
+
+```
+TaskCandidate.from_untrusted            (candidate: shape, schedule, alias/shape normalization)
+  → CreateTaskTool._execute             (destination + event-trigger resolution; policy gates)
+  → TaskCreationService.create
+        1. isinstance guard                      (L109–111)
+        2. reference tz-aware check              (L112–113)
+        3. unsupported-field check               (L116–117)
+        4. missing-required-field check          (L118–119)
+        5. ► SEMANTIC COMPLETENESS ◄             (L120–123)  ← raise here
+        6. task/schedule timezone agreement      (L124–131)
+        7. ► SCHEDULE RESOLUTION ◄               (L132–146)
+        8. payload assembly + validate_ai_instruction (L147–155)
+        9. ► repository.create_task ◄            (L168)
+```
+
+No task-creating side effect precedes step 5. The only actions earlier in the NL path are the interpreter provider call and read-only `client.get_dialogs()` during destination/trigger resolution.
+
+### Test Evidence
+
+`tests/test_task_semantic_completeness.py` — four tests, assertions inspected:
+
+| Test | What the assertions actually prove |
+|---|---|
+| `test_schema_valid_empty_profile_candidate_is_not_persisted` | Empty `bio_set_text` + no instruction ⇒ `result.success is False`; `result.data` equals **exactly** `{"open_taskloom_wizard": True, "wizard_reason": "candidate_semantically_incomplete"}`; `repository_manager.task.list_tasks(OWNER) == []`. Proves the rejection, the exact wizard payload, and that nothing was persisted. |
+| `test_fully_specified_generated_profile_candidate_creates_directly` | Same candidate **with** `ai_instruction=REQUEST` ⇒ `success is True`, exactly one task, `tasks[0].ai_instruction == REQUEST`, `provider.calls == 1`. Proves the instruction-accepting half and that the interpreter ran once. |
+| `test_direct_creation_service_rejects_empty_profile_candidate_before_repository` | Calls `TaskCreationService(repository, OWNER).create(TaskCandidate.from_untrusted(_candidate()), now)` directly and asserts `pytest.raises(TaskSemanticCompletenessError)`, then `repository.list_tasks(OWNER) == []`. Proves the check lives **in the service** (not only in the tool) and precedes persistence. |
+| `test_interpreter_prompt_forbids_inventing_missing_requirements` | Asserts the substrings `"Never invent missing schedule"` and `"schedule expression alone does not authorize invented content"` appear in the system prompt, plus `CANDIDATE_SCHEMA["required"]` is truthy. Proves **prompt text presence only** — no behavioural assertion. |
+
+**Directly proven:** the empty-profile-without-instruction rejection, the nonblank-instruction acceptance, the service-level placement before persistence, and the exact `open_taskloom_wizard` / `wizard_reason` payload.
+**Implied by implementation but not asserted:** nonblank *static* profile text is accepted (no test); `username_set_text` is covered (every test uses `bio_set_text`); the `"AI instruction is invalid"` and `"content action arguments are invalid"` reasons; ordering relative to schedule resolution; G2/G3/G4.
+**Not tested:** the `semantic_incomplete` trace record; the Taskloom-wizard caller’s failure notice; any downstream consumption of `open_taskloom_wizard`; any action outside the two-name set.
+
+### Stage A Verdict
+
+The `3763138d` boundary works as implemented and is correctly placed: it is a deterministic, in-service check that provably rejects an empty profile-content action lacking a generation contract **before schedule resolution and before every repository write**, and it degrades honestly into the existing Taskloom wizard signal instead of persisting a guessed task. Its deliberate scope is exactly two actions (`bio_set_text`, `username_set_text`) plus a broader `ai_instruction`-validity rejection. Outside its scope remain: every other registered action (G1), non-list `actions` (G2), case-variant names (G3), non-string content (G4), instruction authorization (G5), action registration (G6), destination/permission semantics, and the downstream wizard-signal consumption (U1). Stage B was not started; no production code, tests, schema, or configuration were modified.
