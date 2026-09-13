@@ -22,6 +22,10 @@ class SearchTool(Tool):
         return "search"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("query",)
+
+    @property
     def description(self) -> str:
         return "Search saved items by keyword query."
 

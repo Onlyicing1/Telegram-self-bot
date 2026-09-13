@@ -23,6 +23,10 @@ class BioSetTemplateTool(Tool):
         return "bio_set_template"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("template",)
+
+    @property
     def description(self) -> str:
         return "Set the bio template. Supports {time}, {mood}, {text} tokens."
 
@@ -115,6 +119,10 @@ class BioSetMoodTool(Tool):
     @property
     def name(self) -> str:
         return "bio_set_mood"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("mood",)
 
     @property
     def description(self) -> str:

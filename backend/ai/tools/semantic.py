@@ -219,6 +219,10 @@ class DeleteMessagesByIdsTool(Tool):
         return "delete_messages_by_ids"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("message_ids",)
+
+    @property
     def description(self) -> str:
         return (
             "Delete specific outgoing messages by their message IDs. Use IDs "

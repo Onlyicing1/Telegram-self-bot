@@ -23,6 +23,10 @@ class UsernameSetTemplateTool(Tool):
         return "username_set_template"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("template",)
+
+    @property
     def description(self) -> str:
         return "Set the username template. Supports {time}, {mood}, {text} tokens."
 
@@ -115,6 +119,10 @@ class UsernameSetMoodTool(Tool):
     @property
     def name(self) -> str:
         return "username_set_mood"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("mood",)
 
     @property
     def description(self) -> str:

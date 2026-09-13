@@ -30,6 +30,10 @@ class SaveTool(Tool):
         return "save"
 
     @property
+    def requires_reply_context(self) -> bool:
+        return True
+
+    @property
     def description(self) -> str:
         return (
             "Deep-save a message to Saved Messages by downloading and "
@@ -122,6 +126,10 @@ class SaveByLinkTool(Tool):
     @property
     def name(self) -> str:
         return "save_by_link"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("link",)
 
     @property
     def description(self) -> str:

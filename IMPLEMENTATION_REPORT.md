@@ -1,6 +1,255 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — AI task semantic-completeness boundary
+## Latest phase — Task semantic-completeness boundaries (six confirmed gaps)
+
+### Revision under report
+
+This section describes the revision carrying it — the commit
+`fix: enforce task semantic completeness boundaries` (starting HEAD
+`b51887af9cb5047fa633876cdc4b6a73ea9eb16b`). It implements ONLY the six gaps
+proven by the completed A–H investigation in `INVESTIGATION.md`; no new
+architecture was introduced.
+
+### Objective
+
+Close the proven semantic-completeness gaps at the durable-task creation
+boundary so that a schema-valid candidate is never trusted as executable:
+registered action, required arguments, user-grounded generation
+authorization, trusted destination, scheduled-context compatibility, and
+permission/confirmation compatibility — all enforced before
+`repository.create_task`, with the existing
+TaskCandidate → CreateTaskTool/Taskloom → TaskCreationService → TaskRepository
+→ TaskScheduler → TaskExecutionCoordinator → ToolExecutor architecture
+unchanged.
+
+### Confirmed root causes (INVESTIGATION.md Stages A–H)
+
+1. `TaskCreationService.create` validated candidate shape and schedule but never
+the nested action arguments: `web_search`, `memory_store`, the `task_*`
+management actions, `delete`, the profile template/mood actions,
+`save_by_link`, `retrieve_save`, `search`, `settings_get`, `settings_set`,
+`create_task`, and the message-id deletions could all reach
+`repository.create_task` and fail only at occurrence execution.
+2. `CreateTaskTool` treated ANY nonblank provider-supplied `ai_instruction` as
+authorization for generated content (the only deterministic repair was the
+`derive_policy(request).active` verbatim gate), so a provider could
+manufacture authorization simply by returning the field.
+3. **H1 (Stage E, confirmed):** a model-supplied numeric
+`notification_destination.chat_id` survived when the request carried no usable
+trusted chat id and no `chat_name` resolved, and was later injected into the
+scheduled tool context by `TaskExecutionCoordinator`.
+4. `save` and `delete_replied` were persistable although scheduled execution
+never provides `ToolContext.extra["reply_msg"]`.
+5. **H2 (Stage F, confirmed for `settings_set`):** `settings_set`
+(`ADMIN_ONLY`) was persistable although scheduled execution calls
+`execute_calls(confirmed=False)` and therefore always terminated with
+`needs_confirmation` / `confirmation_required`.
+6. An action name absent from the ToolRegistry persisted and failed only at
+occurrence execution (`unregistered_action`).
+
+### Exact implementation
+
+**Authoritative action contract on the Tool itself**
+(`backend/ai/tools/base.py`)
+
+- New optional Tool declarations: `required_arguments`,
+  `required_any_arguments` (at least one must be present), and
+  `requires_reply_context`.
+- New readers that tolerate their absence: `declared_required_arguments`,
+  `declared_any_arguments`, `requires_reply_context`.
+- New shared predicate `requires_owner_confirmation(tool)`
+  (ADMIN_ONLY / CONFIRMATION_REQUIRED). `ToolExecutor._is_auto_executable`
+  now delegates to it, so the executor's gate and the creation boundary can
+  never drift.
+
+Declarations were added only where the tool's own `execute()` already rejects
+their absence: `delete` (scope `count`/`mode`/`until_time`/`after_time`/
+`boundary_id`/`query`/`semantic`), `delete_replied` (reply context),
+`delete_by_id`, `delete_message_by_id`, `delete_messages_by_ids`, `save`
+(reply context), `save_by_link`, `search`, `web_search`, `retrieve_save`,
+`memory_store`, `settings_get`, `settings_set`, `bio_set_template`,
+`bio_set_mood`, `username_set_template`, `username_set_mood`, `task_inspect`,
+`task_transition` (`task_id`/`expected_version` plus `action`|`action_status`),
+`task_delete`, `create_task`, `send_message`. No tool's optional argument was
+turned into a required one, and each tool's own parameter schema supplies any
+enum/minimum constraint that is enforced.
+
+**Creation boundary** (`backend/ai/task_creation.py::TaskCreationService.create`)
+
+Before schedule resolution and before `repository.create_task`, every action is
+checked against the attached registry: it must be a registered tool, must be
+auto-executable (no owner confirmation round-trip), must not declare an
+immediate replied-message dependency, and must carry its declared required
+arguments (with the tool's own enum/minimum constraints applied). A content
+argument (`text`, `message`, `content`, `body`) may be absent only when the
+task carries a nonblank `ai_instruction`, because that is the documented
+per-occurrence generation contract whose arguments the preparation path
+supplies and validates at execution time. Rejections raise `TaskCreationError`
+before persistence, so `TaskCreationService.create` remains the single
+authority for every creation path (AI tool, `.task` command, Taskloom wizard).
+
+The registry is resolved from the ALREADY-constructed Engine
+(`backend/ai/engine/engine.py::active_engine()`, new — it never constructs an
+Engine) or injected explicitly into `TaskCreationService(..., tool_registry=)`.
+When no registry is attached there is no authority to consult, so the check is
+skipped rather than failing against an invented one; the coordinator's
+existing occurrence-time registry check stays as the backstop, and production
+always attaches the registry at boot
+(`RuntimeSupervisor._wire_ai_tools` → `Engine.attach_tools`). No action matrix
+is duplicated anywhere: everything is read from the Tool's own declarations.
+
+**AI-instruction authorization / non-invention**
+(`backend/ai/task_contract.py::ground_ai_instruction`)
+
+One deterministic, idempotent rule, applied at BOTH boundaries:
+
+- provider-output boundary — `TaskInterpreter.interpret` grounds the raw
+  provider object before candidate validation;
+- creation boundary — `CreateTaskTool._execute`.
+
+Generation is authorized ONLY by the original request: it derives a content
+policy (named source/person/character, length bound, language) or it asks to
+CHANGE the owner's profile content (the established bio/username generation
+contract). When authorized, the persisted `ai_instruction` is the user's
+request VERBATIM — a provider can neither paraphrase, translate, weaken, nor
+omit it for a policy-bearing request. When the request does not authorize
+generation, a provider-supplied `ai_instruction` is dropped, so a static
+request can never be silently converted into per-occurrence generated content.
+No second model judge, validator, provider, cache, scheduler or executor was
+added; the decision is pure deterministic application-layer code.
+
+**Trusted destination enforcement (H1)**
+(`backend/ai/task_interpreter.py::_without_untrusted_destination_identifiers`
+plus the allow-listed destination construction in `CreateTaskTool._execute`)
+
+Provider output may name a destination (`chat_name`, resolved against the
+authenticated account's dialogs) and declare the two boolean task-definition
+flags (`deliver_result`, `notify_on_outcome`); nothing else survives. Every
+other destination key — including a numeric `chat_id`/`chat_title` — is dropped
+at the parse boundary and again by the creation-time allow-list. Only trusted
+runtime resolution may set an identifier: the trusted request chat id
+(`AIRequest.chat_id`) or a resolved `chat_name` (`chat_resolution`, whose ids
+always come from the Telegram client). With no trusted destination the
+pre-existing owner/default behavior is preserved. The Taskloom wizard path is
+untouched: its `chat_id` comes from the trusted Telegram event, not the model.
+
+### Before / after behavior
+
+| Case | Before | After |
+|---|---|---|
+| `web_search` task with an empty/absent `query` | persisted, then `Missing query argument` at execution | rejected before persistence |
+| `memory_store` with no content, `task_*` with no/zero id or version, `delete` with no scope, `bio_set_*`/`username_set_*` template/mood, `save_by_link`, `retrieve_save`, `search`, `settings_get` with no arguments | persisted, then failed at execution | rejected before persistence |
+| provider returns `ai_instruction` for a static request | persisted → per-occurrence generation ran forever | instruction dropped; task stays static |
+| source/length/language request with a paraphrased or omitted instruction | repaired to the verbatim request (unchanged) | repaired by the same shared rule (unchanged) |
+| `update my bio …` + provider instruction | instruction persisted | grounded to the request verbatim |
+| model supplies `notification_destination.chat_id` | could become the scheduled target (H1) | dropped; only a trusted chat id or resolved `chat_name` can persist a destination |
+| scheduled `save` / `delete_replied` | persisted, then `No replied message…` on every occurrence | rejected at creation; immediate reply usage unchanged |
+| scheduled `settings_set` | persisted, then `needs_confirmation` / `confirmation_required` | rejected at creation; immediate confirmed execution unchanged |
+| unregistered action name | persisted, then `unregistered_action` at execution | rejected at creation (occurrence-time check retained) |
+
+### Files changed
+
+- `backend/ai/tools/base.py` — Tool declarations, readers, shared confirmation predicate
+- `backend/ai/tools/executor.py` — `_is_auto_executable` delegates to the shared predicate
+- `backend/ai/engine/engine.py` — `active_engine()` (non-constructing accessor)
+- `backend/ai/task_creation.py` — creation-time action eligibility boundary
+- `backend/ai/task_contract.py` — shared AI-instruction grounding rule
+- `backend/ai/task_interpreter.py` — provider-output grounding + destination identifier drop
+- `backend/ai/tools/task.py` — shared grounding call + trusted destination allow-list
+- `backend/ai/tools/{delete,bio,username,retrieve,retrieve_save,save,semantic,settings,websearch,memory,message,task_management_tools}.py` — declarations only
+- `tests/test_task_semantic_completeness.py` — focused regression tests
+- `IMPLEMENTATION_REPORT.md` — this current-state record
+
+No provider, scheduler, recovery, TaskExecutionCoordinator, Taskloom UI,
+database schema, Supabase migration, SQL, configuration or deployment file was
+modified.
+
+### Tests and validation
+
+- Focused semantic-completeness suite (`tests/test_task_semantic_completeness.py`): **74 passed**
+  (4 pre-existing + 70 new behavioural tests: incomplete-argument rejection with a
+  persistence assertion, complete-argument acceptance, declared enum/minimum
+  enforcement, content-argument generation exemption, non-content argument
+  requirement, provider-invented instruction dropped, authorized generation
+  grounded, ungrounded instruction cannot authorize profile content, blank
+  instruction rejected, interpreter-level grounding and destination drop,
+  model `chat_id` never persisted, trusted request chat id, resolved
+  `chat_name`, `save`/`delete_replied` rejection, immediate reply-based save
+  still executing, `settings_set` scheduled rejection, immediate confirmed
+  `settings_set` unchanged, unregistered action rejection, and the
+  no-registry-attached path).
+- Adjacent task/AI suites (source fidelity, NL interval creation, semantic
+  triggers, candidate contract, creation diagnostics, NL creation, wizard and
+  wizard bridge, trigger events, execution, hardening, management, AI
+  preparation, interpretation diagnostics, tool health audit, task contract,
+  memory tools, capability-exposure tools, prepare-ahead) together with the
+  focused file: **596 passed** (74 focused + 522 adjacent).
+- Full suite: **2525 passed, 24 skipped, 0 failed**.
+- `py_compile` for every changed Python file (including the test file): **passed**.
+- `git diff --check`: **clean**; changed files are exactly the list above.
+
+### Database / schema / RLS impact
+
+None. No table, column, index, policy, migration or SQL statement changed; no
+Supabase call was executed. Every new decision uses data already available in
+process (registry, candidate, request text, persisted task row).
+
+### Security boundaries preserved
+
+Owner scoping is unchanged; no candidate can introduce an identifier that
+authority did not resolve. No session string, credential, API key, bot token,
+provider secret, filesystem path or environment value is read, logged or
+propagated by the new code. Diagnostics remain bounded and content-free (action
+and argument NAMES plus a reason token; never message content, destinations or
+raw provider output).
+
+### Explicitly NOT implemented (Stage G UNCERTAIN, out of scope)
+
+1. **Recursive/chained scheduled `create_task` termination semantics.** A
+   `create_task` action remains persistable when its `request` argument is
+   present — only its argument contract is now validated. No termination or
+   recursion contract was invented.
+2. **Delayed literal Telegram message-ID durability.** Unchanged; no semantic
+   lifetime contract was invented.
+
+No fix was applied for either, and no test asserts a behavior for them.
+
+### Other known limitations
+
+1. With no runtime-attached registry (service-only/unit callers) the
+   registration and argument checks are skipped, because the registry is the
+   single source of truth and a missing registry is an unavailable authority,
+   not evidence of absence. Production attaches it at boot; the coordinator's
+   occurrence-time registry check remains.
+2. A `delete` action whose only scope is `mode: "until_message"` still depends
+   on runtime context (the replied-to message or request message id) that a
+   scheduled occurrence does not carry; it is not reply-context-dependent in the
+   declared sense (the mode itself is a valid scope), so it remains persistable
+   and fails closed at execution — unchanged from before this phase.
+3. Conditional argument interplay beyond the tools' declared enum/minimum
+   constraints (e.g. cross-argument combinations inside a single service call)
+   stays the tool/service layer's responsibility at execution time.
+4. **No live Telegram, Supabase, Render or provider verification was
+   performed.** Everything above was verified in-process against the real
+   interpreter, candidate, creation, registry, executor and repository
+   boundaries. The two Stage G UNCERTAIN items are the only proven limitations
+   carried forward.
+
+### Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `b51887af9cb5047fa633876cdc4b6a73ea9eb16b` |
+| Implementation commit | this revision — `fix: enforce task semantic completeness boundaries` |
+| Push target | `origin/main` (no force, no rebase, no history rewrite) |
+| Working tree | clean (`## main...origin/main`) |
+
+The pushed SHA, the remote `refs/heads/main`, and the working-tree state are
+verified and reported in the accompanying response; the SHA is not recorded
+self-referentially inside this file because the report and the implementation
+are delivered in a single commit.
+
+## Previous phase — AI task semantic-completeness boundary
 
 ### Objective
 

@@ -24,6 +24,10 @@ class RetrieveSaveTool(Tool):
         return "retrieve_save"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("save_code",)
+
+    @property
     def description(self) -> str:
         return (
             "Re-send a saved item (by its save code, e.g. S0001) into the "

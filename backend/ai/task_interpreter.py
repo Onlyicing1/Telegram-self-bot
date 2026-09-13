@@ -6,11 +6,12 @@ import json
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import Any
 
 from backend.ai.providers.base.contract import ProviderResponse
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
-from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS
+from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS, ground_ai_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,39 @@ class TaskUnsupportedError(TaskInterpretationError):
     def __init__(self, capability: str) -> None:
         super().__init__(f"unsupported capability: {capability}")
         self.capability = capability
+
+
+#: Destination keys a parsed model candidate may keep. ``chat_name`` is a
+#: NAME the creation path resolves against the authenticated account's dialogs;
+#: the two flags are the only candidate-declared task-definition options. Every
+#: other key is either a destination IDENTIFIER (``chat_id``, ``chat_title``)
+#: or an unknown value, and identifiers are resolved from trusted runtime
+#: context only.
+_KEEP_DESTINATION_KEYS = frozenset({"chat_name", "deliver_result", "notify_on_outcome"})
+
+
+def _without_untrusted_destination_identifiers(candidate: TaskCandidate) -> TaskCandidate:
+    """Drop model-supplied destination identifiers from a parsed candidate.
+
+    A numeric ``chat_id``/``chat_title`` in provider output must never become
+    authoritative for a scheduled side effect merely because the model sent
+    it: only trusted runtime resolution (the request chat or a resolved
+    ``chat_name``) may set a destination. Unknown keys are dropped for the same
+    reason — the destination is a bounded task-definition field, not a
+    free-form bag.
+    """
+    destination = candidate.notification_destination
+    if not destination:
+        return candidate
+    filtered = {key: value for key, value in destination.items() if key in _KEEP_DESTINATION_KEYS}
+    if filtered == destination:
+        return candidate
+    logger.info(
+        "AI_TASK_TRACE stage=candidate_destination_normalized dropped_keys=%s kept_keys=%s",
+        ",".join(sorted(set(destination) - set(filtered))) or "-",
+        ",".join(sorted(filtered)) or "-",
+    )
+    return replace(candidate, notification_destination=filtered)
 
 
 def _response_shape(value: Any) -> str:
@@ -610,7 +644,19 @@ class TaskInterpreter:
                 and value["unsupported"].strip()
             ):
                 raise TaskUnsupportedError(value["unsupported"].strip()[:200])
+            # Provider output is UNTRUSTED: its ai_instruction is grounded to
+            # the original request (or dropped as unauthorized) before the
+            # candidate is validated, so no later creation path can be handed
+            # a model-manufactured generation authorization.
+            if isinstance(value, dict):
+                grounding = ground_ai_instruction(value, request)
+                if grounding:
+                    logger.info(
+                        "AI_TASK_TRACE request_id=%s stage=ai_instruction_grounded reason=%s",
+                        request_id or "-", grounding,
+                    )
             candidate = parse_candidate_output(value)
+            candidate = _without_untrusted_destination_identifiers(candidate)
         except TaskUnsupportedError:
             raise
         except (json.JSONDecodeError, TaskCandidateError) as exc:

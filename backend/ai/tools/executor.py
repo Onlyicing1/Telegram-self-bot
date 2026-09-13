@@ -41,7 +41,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, ToolResult
+from backend.ai.tools.base import ToolResult, requires_owner_confirmation
 from backend.ai.tools.context import ToolContext
 from backend.ai.tools.registry import ToolRegistry
 
@@ -343,14 +343,11 @@ class ToolExecutor:
         READ_ONLY, READ_WRITE, and DANGEROUS tools execute directly: the
         owner's message IS the authorization in this single-owner self-bot,
         and destructive tools validate deterministic arguments themselves.
-        ADMIN_ONLY and CONFIRMATION_REQUIRED still require confirmation.
+        ADMIN_ONLY and CONFIRMATION_REQUIRED still require confirmation — the
+        predicate is shared with the task-creation eligibility boundary so a
+        durable task can never store an action this gate would always block.
         """
-        level = tool.permission_level
-        return level in (
-            PermissionLevel.READ_ONLY,
-            PermissionLevel.READ_WRITE,
-            PermissionLevel.DANGEROUS,
-        )
+        return not requires_owner_confirmation(tool)
 
     def _record_history(
         self,

@@ -17,6 +17,67 @@ class TaskContractError(ValueError):
     """A task AI contract is malformed or exceeds its safety bounds."""
 
 
+def _generation_authorized(request: str) -> tuple[bool, bool]:
+    """``(authorized, policy_active)`` for one human request.
+
+    Generation is authorized when the request derives a deterministic content
+    policy (a named source/person/character, a length bound, a language) or
+    asks to CHANGE the owner's profile content — the established
+    per-occurrence profile-generation contract. Anything else leaves the task
+    static. Reuses the existing intent vocabulary; no new phrase list.
+    """
+    from backend.ai.actions import (
+        _USERNAME_WORDS,
+        _has_bio_change_intent,
+        _has_bio_mention,
+        _tokenize,
+        _write_text_present,
+    )
+    from backend.ai.preparation_policy import derive_policy
+
+    if derive_policy(request).active:
+        return True, True
+    words = _tokenize(request)
+    if not words or not (_has_bio_change_intent(words) or _write_text_present(words)):
+        return False, False
+    return (_has_bio_mention(words) or any(word in _USERNAME_WORDS for word in words)), False
+
+
+def ground_ai_instruction(candidate: dict[str, Any], request: str) -> str:
+    """Ground a candidate's ``ai_instruction`` in the ORIGINAL user request.
+
+    Generated content is authorized ONLY by the request. When it is
+    authorized the instruction becomes the request VERBATIM — a provider can
+    neither weaken, paraphrase, translate, nor drop it; when it is not
+    authorized, a provider-supplied instruction is not authorization at all
+    and is dropped, so the task stays static instead of turning a static
+    request into generated content.
+
+    Idempotent: the same rule is applied at the provider-output boundary and
+    again at the creation boundary, so applying it twice changes nothing.
+    Returns the applied reason for the caller's trace ("" when nothing
+    changed).
+    """
+    if not isinstance(candidate, dict) or not isinstance(request, str) or not request.strip():
+        return ""
+    supplied = candidate.get("ai_instruction")
+    authorized, policy_active = _generation_authorized(request)
+    if policy_active:
+        if supplied == request:
+            return ""
+        candidate["ai_instruction"] = request
+        return "model_repaired" if supplied else "omitted"
+    if not supplied:
+        return ""
+    if authorized:
+        if supplied == request:
+            return ""
+        candidate["ai_instruction"] = request
+        return "grounded_to_request"
+    del candidate["ai_instruction"]
+    return "ungrounded_dropped"
+
+
 def validate_ai_instruction(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TaskContractError("AI instruction must be a nonblank string")

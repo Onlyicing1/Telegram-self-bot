@@ -66,6 +66,10 @@ class MemoryStoreTool(Tool):
         return "memory_store"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("content",)
+
+    @property
     def description(self) -> str:
         return (
             "Store a fact about the owner in your long-term memory so you can "

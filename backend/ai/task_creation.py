@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from backend.ai.database.task_repository import TaskRecord, TaskRepository
+from backend.ai.preparation_policy import CONTENT_FIELDS
 from backend.ai.scheduling import (
     ScheduleError,
     advance_interval,
@@ -18,6 +19,12 @@ from backend.ai.scheduling import (
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.task_contract import AIInstruction, validate_ai_instruction
 from backend.ai.task_trace import bound_text, task_trace
+from backend.ai.tools.base import (
+    declared_any_arguments,
+    declared_required_arguments,
+    requires_owner_confirmation,
+    requires_reply_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +44,133 @@ class TaskSemanticCompletenessError(TaskCreationError):
 
 
 _PROFILE_CONTENT_ACTIONS = frozenset({"bio_set_text", "username_set_text"})
+
+
+def _attached_tool_registry() -> Any | None:
+    """The ToolRegistry the runtime has attached, or ``None``.
+
+    Resolved through the ALREADY-constructed Engine (never constructing one):
+    a service-only caller has no authoritative registry to consult, and the
+    occurrence-time check in ``TaskExecutionCoordinator`` remains the
+    defense-in-depth backstop there.
+    """
+    try:
+        from backend.ai.engine.engine import active_engine
+
+        engine = active_engine()
+    except Exception:  # noqa: BLE001
+        return None
+    if engine is None:
+        return None
+    return getattr(engine, "tool_registry", None)
+
+
+def _argument_missing(value: Any) -> bool:
+    """True when a value cannot satisfy a required action argument."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
+        return not value
+    return False
+
+
+def _declared_constraint_error(
+    action_name: str, argument: str, value: Any, spec: dict[str, Any]
+) -> str | None:
+    """Enforce the Tool's OWN declared enum/minimum for a required argument."""
+    enum = spec.get("enum")
+    if isinstance(enum, (list, tuple)) and enum:
+        if isinstance(value, str):
+            candidate = value.strip().lower()
+            allowed: set[Any] = {str(item).strip().lower() for item in enum}
+        else:
+            candidate = value
+            allowed = set(enum)
+        if candidate not in allowed:
+            return f"action '{action_name}' has an unsupported '{argument}' value"
+    if spec.get("type") == "integer":
+        # The Tool itself declares the integer contract and coerces with
+        # ``coerce_int``; a value it cannot read is missing for its purposes.
+        from backend.ai.persian import coerce_int
+
+        number = coerce_int(value)
+        if number is None:
+            return f"action '{action_name}' requires an integer '{argument}'"
+        minimum = spec.get("minimum")
+        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and number < minimum:
+            return f"action '{action_name}' requires '{argument}' >= {minimum}"
+    return None
+
+
+def _action_eligibility_error(
+    action: Any, registry: Any | None, *, generation_authorized: bool
+) -> str | None:
+    """Reject an action a scheduled occurrence could never execute.
+
+    A durable task's actions run later through the registered ToolExecutor
+    with no owner present, so each one must be registered, runnable without
+    an owner confirmation round-trip or an immediate replied message, and
+    carry the arguments its ``Tool.execute()`` contract requires. A content
+    argument may be absent only when the task's ``ai_instruction`` authorizes
+    per-occurrence generation (the preparation path supplies and validates it
+    at execution time).
+
+    The checks read the Tool's OWN declarations (``parameters``,
+    ``required_arguments``, ``required_any_arguments``,
+    ``requires_reply_context``, ``permission_level``) so there is no second
+    action matrix to keep in sync.
+    """
+    if not isinstance(action, dict):
+        return "each action must be an object"
+    name = action.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "each action requires a tool name"
+    arguments = action.get("arguments")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return "action arguments must be objects"
+    if registry is None or not hasattr(registry, "get"):
+        # No authoritative registry in this process: registration cannot be
+        # judged here, and the coordinator's own registry check still fails
+        # the occurrence closed. Never invent a registry to fail against.
+        return None
+    tool = registry.get(name)
+    if tool is None:
+        return f"action '{name}' is not a registered tool"
+    if requires_owner_confirmation(tool):
+        return (
+            f"action '{name}' requires owner confirmation that a scheduled "
+            "occurrence cannot provide"
+        )
+    if requires_reply_context(tool):
+        return (
+            f"action '{name}' requires the immediate replied message that a "
+            "scheduled occurrence does not have"
+        )
+    required = declared_required_arguments(tool)
+    required_any = declared_any_arguments(tool)
+    if required_any and all(_argument_missing(arguments.get(item)) for item in required_any):
+        return f"action '{name}' requires one of: {', '.join(required_any)}"
+    schema = getattr(tool, "parameters", None) or {}
+    checked = list(required)
+    checked.extend(item for item in required_any if item not in set(required))
+    for argument in checked:
+        value = arguments.get(argument)
+        if _argument_missing(value):
+            if argument not in set(required):
+                continue  # an unchosen alternative of a required-any group
+            if generation_authorized and argument in CONTENT_FIELDS:
+                continue
+            return f"action '{name}' requires the '{argument}' argument"
+        spec = schema.get(argument) if isinstance(schema, dict) else None
+        if isinstance(spec, dict):
+            error = _declared_constraint_error(name, argument, value, spec)
+            if error:
+                return error
+    return None
 
 
 def _semantic_completeness_error(candidate: dict[str, Any]) -> str | None:
@@ -85,11 +219,20 @@ def initial_next_run(
 
 
 class TaskCreationService:
-    def __init__(self, repository: TaskRepository, owner_id: int) -> None:
+    def __init__(
+        self,
+        repository: TaskRepository,
+        owner_id: int,
+        tool_registry: Any | None = None,
+    ) -> None:
         if not isinstance(owner_id, int) or owner_id <= 0:
             raise TaskCreationError("owner identity is required")
         self.repository = repository
         self.owner_id = owner_id
+        #: The authoritative action registry. Left unset, the service resolves
+        #: the runtime-attached registry; a caller with no runtime registry
+        #: (unit/service harness) may inject the real one explicitly.
+        self._tool_registry = tool_registry
 
     async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
         started = time.perf_counter()
@@ -121,6 +264,22 @@ class TaskCreationService:
         if semantic_error:
             _creation_trace("semantic_incomplete", reason=semantic_error)
             raise TaskSemanticCompletenessError(semantic_error)
+        actions = candidate.get("actions")
+        if isinstance(actions, list) and actions:
+            registry = (
+                self._tool_registry
+                if self._tool_registry is not None
+                else _attached_tool_registry()
+            )
+            instruction = candidate.get("ai_instruction")
+            generation_authorized = isinstance(instruction, str) and bool(instruction.strip())
+            for action in actions:
+                eligibility_error = _action_eligibility_error(
+                    action, registry, generation_authorized=generation_authorized
+                )
+                if eligibility_error:
+                    _creation_trace("action_ineligible", reason=eligibility_error)
+                    raise _invalid(eligibility_error)
         if (
             candidate.get("timezone") != candidate["schedule"].get("timezone")
             and candidate["schedule_type"] not in ("interval", "event")

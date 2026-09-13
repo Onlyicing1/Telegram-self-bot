@@ -115,6 +115,10 @@ class TaskInspectTool(Tool):
         return "task_inspect"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id",)
+
+    @property
     def description(self) -> str:
         return (
             "Inspect one scheduled task by id: label, status, version, "
@@ -170,6 +174,16 @@ class TaskTransitionTool(Tool):
     @property
     def name(self) -> str:
         return "task_transition"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id", "expected_version")
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        # ``action`` (native tool calls) and ``action_status`` (JSON action
+        # field name) are the two accepted spellings of the target status.
+        return ("action", "action_status")
 
     @property
     def description(self) -> str:
@@ -324,6 +338,10 @@ class TaskDeleteTool(Tool):
     @property
     def name(self) -> str:
         return "task_delete"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id", "expected_version")
 
     @property
     def description(self) -> str:

@@ -204,6 +204,10 @@ class SettingsGetTool(Tool):
         return "settings_get"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("key",)
+
+    @property
     def description(self) -> str:
         return f"Read a bot setting value by key. {_setting_key_contract()}"
 
@@ -265,6 +269,10 @@ class SettingsSetTool(Tool):
     @property
     def name(self) -> str:
         return "settings_set"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("key", "value")
 
     @property
     def description(self) -> str:

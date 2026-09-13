@@ -26,10 +26,19 @@ from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.preparation_policy import derive_policy
+from backend.ai.task_contract import ground_ai_instruction
 
 logger = logging.getLogger(__name__)
 
 MAX_REQUEST_CHARS = 2000
+
+
+#: Destination keys a candidate may carry without being a destination
+#: IDENTIFIER. They are explicit, boolean, contract-validated task-definition
+#: flags; every other candidate-supplied destination key is dropped and can
+#: only be set by trusted runtime resolution.
+_TRUSTED_DESTINATION_FLAGS = ("deliver_result", "notify_on_outcome")
+
 INTERPRET_TIMEOUT_SECONDS = 30.0
 # Interpreter (30s) plus creation + persistence margin, still bounded.
 EXECUTION_TIMEOUT_SECONDS = 45.0
@@ -84,6 +93,10 @@ class CreateTaskTool(Tool):
     @property
     def name(self) -> str:
         return "create_task"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("request",)
 
     @property
     def description(self) -> str:
@@ -375,15 +388,26 @@ class CreateTaskTool(Tool):
         # chats. If no chat_name is given, the destination is the current
         # request chat (for immediate/scheduled sends from this chat).
         if isinstance(candidate, TaskCandidate):
-            destination = dict(candidate.notification_destination)
-            chat_name = destination.pop("chat_name", None)
+            model_destination = dict(candidate.notification_destination)
             schedule_type = candidate.schedule_type
             candidate_schedule = candidate.schedule or {}
         else:
-            destination = dict(candidate.get("notification_destination", {}))
-            chat_name = destination.pop("chat_name", None)
+            model_destination = dict(candidate.get("notification_destination", {}))
             schedule_type = candidate.get("schedule_type")
             candidate_schedule = candidate.get("schedule") or {}
+        chat_name = model_destination.pop("chat_name", None)
+        # A model-supplied destination IDENTIFIER is never authoritative: a
+        # numeric chat_id/chat_title present in the candidate must not become
+        # the target of a scheduled side effect merely because it was sent.
+        # Only trusted runtime resolution below (the trusted request chat id,
+        # or a chat_name resolved against the authenticated account's dialogs)
+        # may set them; with no trusted destination the task keeps the existing
+        # owner/default behavior. The declared task-definition flags survive.
+        destination = {
+            key: model_destination[key]
+            for key in _TRUSTED_DESTINATION_FLAGS
+            if key in model_destination
+        }
         trigger_spec: dict = {}
         if schedule_type == "event" and isinstance(candidate_schedule, dict):
             trigger_spec = dict(candidate_schedule.get("trigger") or {})
@@ -506,22 +530,17 @@ class CreateTaskTool(Tool):
 
         candidate["notification_destination"] = destination
 
-        # Deterministic source-fidelity gate: when the ORIGINAL human request
-        # itself derives a content policy (a named source/person/character,
-        # a length bound, a language requirement), the durable task must
-        # carry the request VERBATIM as its ai_instruction so the occurrence
-        # path generates and validates content under the exact semantics.
-        # A model that omits or paraphrases ai_instruction cannot weaken the
-        # contract; the verbatim request repairs it. Static content tasks
-        # (no policy in the request) are untouched.
+        # Deterministic source-fidelity + authorization gate (one shared rule
+        # with the provider-output boundary): generated content is authorized
+        # ONLY by the original request, and an authorized task always carries
+        # that request VERBATIM. A provider can neither weaken, paraphrase, nor
+        # manufacture authorization by returning ai_instruction on its own.
         if isinstance(candidate, dict):
-            policy = derive_policy(request)
-            if policy.active and candidate.get("ai_instruction") != request:
-                model_supplied = bool(candidate.get("ai_instruction"))
-                candidate["ai_instruction"] = request
+            reason = ground_ai_instruction(candidate, request)
+            if reason:
+                policy = derive_policy(request)
                 _trace(
-                    "create_task_ai_instruction_gate", applied=True,
-                    reason="model_repaired" if model_supplied else "omitted",
+                    "create_task_ai_instruction_gate", applied=True, reason=reason,
                     source_present=bool(policy.source),
                     length_constrained=policy.max_length is not None or policy.exact_length is not None,
                 )

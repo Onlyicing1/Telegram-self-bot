@@ -40,6 +40,10 @@ class SendMessageTool(Tool):
         return "send_message"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("text",)
+
+    @property
     def description(self) -> str:
         return (
             "Send a text message to the owner's own Saved Messages chat. "

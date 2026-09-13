@@ -223,6 +223,17 @@ def get_engine() -> Engine:
     return _default_engine
 
 
+def active_engine() -> Engine | None:
+    """The ALREADY-constructed default Engine, or None.
+
+    Unlike ``get_engine()`` this never constructs an Engine: callers that only
+    want to observe runtime state the supervisor already wired (e.g. the
+    attached ToolRegistry) must not trigger a parallel construction with
+    default configuration.
+    """
+    return _default_engine
+
+
 def engine_health() -> str:
     """Module-level health check — delegates to the default engine."""
     return get_engine().engine_health()

@@ -39,6 +39,10 @@ class DeleteTool(Tool):
         return "delete"
 
     @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        return ("count", "mode", "until_time", "after_time", "boundary_id", "query", "semantic")
+
+    @property
     def description(self) -> str:
         return (
             "Delete self-owned messages in the current chat. Use count for the "
@@ -289,6 +293,10 @@ class DeleteRepliedTool(Tool):
         return "delete_replied"
 
     @property
+    def requires_reply_context(self) -> bool:
+        return True
+
+    @property
     def description(self) -> str:
         return (
             "Delete the message the owner replied to in the current chat. "
@@ -394,6 +402,10 @@ class DeleteByIdTool(Tool):
         return "delete_by_id"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("message_id",)
+
+    @property
     def description(self) -> str:
         return "Delete all outgoing messages from a given message ID onward in the current chat."
 
@@ -484,6 +496,10 @@ class DeleteMessageByIdTool(Tool):
     @property
     def name(self) -> str:
         return "delete_message_by_id"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("message_id",)
 
     @property
     def description(self) -> str:

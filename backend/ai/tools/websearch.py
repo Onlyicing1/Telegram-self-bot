@@ -26,6 +26,10 @@ class WebSearchTool(Tool):
         return "web_search"
 
     @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("query",)
+
+    @property
     def description(self) -> str:
         return (
             "Search the live web for current information (news, prices, "

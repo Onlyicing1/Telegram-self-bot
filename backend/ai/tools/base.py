@@ -153,6 +153,37 @@ the existing service layer and return a ``ToolResult``.
         """
         ...
 
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        """Argument names whose absence makes this tool unable to run.
+
+        Optional declaration — tools with no required arguments omit it. It is
+        consumed by the durable-task creation boundary (which may store an
+        action whose ToolExecutor call happens later, with no owner present),
+        so it must mirror exactly what ``execute()`` rejects. Never declare an
+        optional argument here.
+        """
+        ...
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        """Argument names of which at least ONE must be present (optional).
+
+        For tools whose contract accepts several alternative argument shapes
+        (e.g. a deletion scope given by count OR mode OR a filter).
+        """
+        ...
+
+    @property
+    def requires_reply_context(self) -> bool:
+        """True when ``execute()`` fundamentally needs the replied message.
+
+        Such a tool reads the current turn's ``ToolContext.extra["reply_msg"]``,
+        which a scheduled occurrence never carries. Optional — defaults to
+        False.
+        """
+        ...
+
     async def execute(self, context: "ToolContext", arguments: dict[str, Any]) -> ToolResult:
         """Perform the action and return a structured result.
 
@@ -161,3 +192,36 @@ the existing service layer and return a ``ToolResult``.
             arguments: Parsed arguments matching the tool's parameter schema.
         """
         ...
+
+
+def requires_owner_confirmation(tool: Tool) -> bool:
+    """True when the ToolExecutor refuses to auto-execute ``tool``.
+
+    ADMIN_ONLY and CONFIRMATION_REQUIRED tools only ever run through the
+    Dispatcher's explicit owner-confirmation round-trip
+    (``ToolExecutor.execute_confirmed``). A scheduled occurrence calls
+    ``execute_calls(confirmed=False)`` and can never supply that approval, so
+    this single predicate is the one authority both the executor and the
+    task-creation eligibility boundary consult.
+    """
+    return tool.permission_level in (
+        PermissionLevel.ADMIN_ONLY,
+        PermissionLevel.CONFIRMATION_REQUIRED,
+    )
+
+
+def declared_required_arguments(tool: Tool) -> tuple[str, ...]:
+    """The argument names ``tool`` declares as required (empty by default)."""
+    declared = getattr(tool, "required_arguments", ()) or ()
+    return tuple(str(name) for name in declared)
+
+
+def declared_any_arguments(tool: Tool) -> tuple[str, ...]:
+    """The alternative argument names ``tool`` declares (at least one)."""
+    declared = getattr(tool, "required_any_arguments", ()) or ()
+    return tuple(str(name) for name in declared)
+
+
+def requires_reply_context(tool: Tool) -> bool:
+    """True when ``tool`` declares an immediate replied-message dependency."""
+    return bool(getattr(tool, "requires_reply_context", False))
