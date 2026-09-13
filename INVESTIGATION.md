@@ -342,3 +342,268 @@ No task-creating side effect precedes step 5. The only actions earlier in the NL
 ### Stage A Verdict
 
 The `3763138d` boundary works as implemented and is correctly placed: it is a deterministic, in-service check that provably rejects an empty profile-content action lacking a generation contract **before schedule resolution and before every repository write**, and it degrades honestly into the existing Taskloom wizard signal instead of persisting a guessed task. Its deliberate scope is exactly two actions (`bio_set_text`, `username_set_text`) plus a broader `ai_instruction`-validity rejection. Outside its scope remain: every other registered action (G1), non-list `actions` (G2), case-variant names (G3), non-string content (G4), instruction authorization (G5), action registration (G6), destination/permission semantics, and the downstream wizard-signal consumption (U1). Stage B was not started; no production code, tests, schema, or configuration were modified.
+
+---
+
+## Stage B — Action vocabulary and requirement classes
+
+> **Inventory/classification only.** This stage does **not** decide or implement
+> any validator, and it does **not** check whether the task-creation layer
+> enforces these requirements (Stages C–G). No file other than this document was
+> modified. `IMPLEMENTATION_REPORT.md` was read, not changed. No repository-wide
+> search was performed; the registry plus the concrete tool implementations were
+> inspected directly.
+
+### Scope executed
+
+| Item | Value |
+|---|---|
+| Revision inspected | `960cb35` (`main`, Stage A recorded) |
+| Authoritative vocabulary source | `backend/ai/tools/registry.py` → `create_default_registry()` |
+| Execution contract sources | `backend/ai/tools/<domain>.py` tool classes; `backend/ai/tools/executor.py`; `backend/ai/task_execution.py`; `backend/runtime/supervisor.py` |
+| Persistence-shape sources (context only) | `backend/ai/task_candidate.py` → `_canonicalize_action` |
+| Evidence rule | every classification cites the tool class/method that reads the field or context key |
+
+**How a scheduled action actually gets a context** (the baseline for every
+“runtime context” column below):
+
+- `backend/runtime/supervisor.py::RuntimeSupervisor._start_task_scheduler` builds
+  the base `ToolContext(telegram=TelegramAPI(client), owner_id, tz_str, client)` —
+  **`extra` is left unset/`None`** — and hands it to
+  `TaskExecutionCoordinator` (and `ToolExecutor`).
+- `backend/ai/task_execution.py::TaskExecutionCoordinator.execute` then resolves the
+  trusted destination and, when `task.notification_destination["chat_id"]` is a
+  non-zero int, installs a new context whose `extra == {"chat_id": <int>}`.
+  Nothing else is ever added: **no `reply_msg`, no `request_message_id`, no
+  `request_id`, no `provider_manager`, no `deterministic_task_candidate`.**
+- `TaskExecutionCoordinator.execute` resolves each snapshotted name through
+  `executor._registry.get(name)` and fails the occurrence with
+  `unregistered_action` when absent; names are otherwise unconstrained.
+
+### B1. Authoritative action vocabulary
+
+39 tool names are registered by `create_default_registry()` — this is the
+complete registry, enumerated from the `registry.register(...)` calls (not from
+documentation):
+
+```
+01 save                      21 username_show
+02 save_by_link              22 search
+03 delete                    23 list_saves
+04 delete_by_id              24 database_stats
+05 delete_replied            25 account_show
+06 delete_message_by_id      26 settings_get
+07 list_recent_messages      27 settings_set
+08 delete_messages_by_ids    28 organize_list
+09 bio_set_template          29 organize_clean
+10 bio_set_text              30 web_search
+11 bio_set_mood              31 create_task
+12 bio_on                    32 task_list
+13 bio_off                   33 task_inspect
+14 bio_show                  34 task_transition
+15 get_bio                   35 task_delete
+16 username_set_template     36 retrieve_save
+17 username_set_text         37 send_message
+18 username_set_mood         38 memory_store
+19 username_on               39 memory_list
+20 username_off
+```
+
+**Persistence-layer alias set (context only — not registry names).**
+`backend/ai/task_candidate.py::_canonicalize_action` (L215–247) normalizes the
+four send aliases `send`, `send_message`, `write_message`, `send_text` to the
+single registered name `send_message`, taking content from the first present of
+`text`/`content`/`message`/`body` and an optional allow-listed `font`. Every
+other name is passed through verbatim (`{"name": name, "arguments": args}`), and
+`TaskCandidate.from_untrusted` (L293–303) also tolerates `tool`→`name` and
+`parameters`/`args`→`arguments`. So the *persistable* name set is not closed by
+the candidate layer — the registry is the only closed vocabulary.
+
+### B2. Action contract matrix
+
+“Required args” = arguments the tool’s own `execute()` rejects when absent
+(deterministic, in-tool). “Runtime context” = the `ToolContext`/`extra` keys the
+tool actually reads. “Scheduled viability” is judged only against the trusted
+context the coordinator builds (above) — never against an immediate request.
+
+| Action | Required args | Optional args | Runtime context | Trusted target | Permission/confirmation | Scheduled-task viability | Source |
+|---|---|---|---|---|---|---|---|
+| `save` | None (schema `{}`) | None | **`extra["reply_msg"]` required** (chat_id + message_id); Telegram client | Destination is Saved Messages (owner's own); source = replied message | READ_WRITE (auto) | **NO — unexecutable**: scheduled `extra` never carries `reply_msg` | `tools/save.py::SaveTool.execute` |
+| `save_by_link` | `link` (non-empty; `http` prefixed; parsed by `save_service.parse_telegram_link`) | None | Telegram client | Destination Saved Messages; source from the link | READ_WRITE (auto); long_running | Yes (static link) | `tools/save.py::SaveByLinkTool.execute` |
+| `delete` | an explicit scope: `count` 1–500 **or** a filtered scope (`mode` ∈ last_n/all/until_time/until_message/filtered, or `until_time`/`after_time`/`boundary_id`/`query`/`semantic`) | `count`, `mode`, `until_time`, `after_time`, `boundary_id`, `query`, `semantic` | **`extra["chat_id"]` required**; `extra["request_message_id"]`, `extra["reply_msg"]` optional (boundary resolution) | Chat from trusted `chat_id`; outgoing-only enforced in service | DANGEROUS (auto) | Yes, **if** `chat_id` exists; `until_message` fails closed when no boundary resolves | `tools/delete.py::DeleteTool.execute` |
+| `delete_by_id` | `message_id` int | None | **`extra["chat_id"]` required** | Chat from `chat_id`; outgoing-only in service | DANGEROUS (auto) | Yes, if `chat_id` exists | `tools/delete.py::DeleteByIdTool.execute` |
+| `delete_replied` | None (schema `{}`) | None | **`extra["reply_msg"]` required** (chat_id + message_id) | Replied message in `reply_msg` chat; outgoing-only | DANGEROUS (auto) | **NO — unexecutable**: no `reply_msg` at scheduled time | `tools/delete.py::DeleteRepliedTool.execute` |
+| `delete_message_by_id` | `message_id` positive int | None | **`extra["chat_id"]` required** | Chat from `chat_id`; outgoing-only | DANGEROUS (auto) | Yes, if `chat_id` exists | `tools/delete.py::DeleteMessageByIdTool.execute` |
+| `list_recent_messages` | None | `limit` 1–100 (default 50) | **`extra["chat_id"]` required** | Chat from `chat_id` | READ_ONLY | Yes, if `chat_id` exists | `tools/semantic.py::ListRecentMessagesTool.execute` |
+| `delete_messages_by_ids` | `message_ids` non-empty id list (max 100 after coercion) | None | **`extra["chat_id"]` required** | Chat from `chat_id`; every id re-fetched + outgoing-only | DANGEROUS (auto) | Conditional — static ids only; ids from a prior `list_recent_messages` are not durable | `tools/semantic.py::DeleteMessagesByIdsTool.execute` |
+| `bio_set_template` | `template` truthy string | None | None (owner_id only) | n/a (own profile `about`) | READ_WRITE (auto) | Yes | `tools/bio.py::BioSetTemplateTool.execute` |
+| `bio_set_text` | None in-tool — `arguments.get("text", "")` accepts empty | `text` | None | n/a (own profile) | READ_WRITE (auto) | Yes (content semantics = Stage A boundary) | `tools/bio.py::BioSetTextTool.execute` |
+| `bio_set_mood` | None in-tool — accepts empty default `""` | `mood` | None | n/a (own profile) | READ_WRITE (auto) | Yes | `tools/bio.py::BioSetMoodTool.execute` |
+| `bio_on` | None | None | `context.telegram.client` | n/a | READ_WRITE (auto) | Yes (engine start; process-local) | `tools/bio.py::BioOnTool.execute` |
+| `bio_off` | None | None | None | n/a | READ_WRITE (auto) | Yes | `tools/bio.py::BioOffTool.execute` |
+| `bio_show` | None | None | None | n/a | READ_ONLY | Yes (read) | `tools/bio.py::BioShowTool.execute` |
+| `get_bio` | None | None | **`context.telegram` required** | n/a | READ_ONLY | Yes (read) | `tools/bio.py::BioGetTool.execute` |
+| `username_set_template` | `template` truthy string | None | None | n/a (own profile `first_name`) | READ_WRITE (auto) | Yes | `tools/username.py::UsernameSetTemplateTool.execute` |
+| `username_set_text` | None in-tool — accepts empty | `text` | None | n/a (own profile) | READ_WRITE (auto) | Yes (content semantics = Stage A boundary) | `tools/username.py::UsernameSetTextTool.execute` |
+| `username_set_mood` | None in-tool — accepts empty default `""` | `mood` | None | n/a (own profile) | READ_WRITE (auto) | Yes | `tools/username.py::UsernameSetMoodTool.execute` |
+| `username_on` | None | None | `context.telegram.client` | n/a | READ_WRITE (auto) | Yes (process-local) | `tools/username.py::UsernameOnTool.execute` |
+| `username_off` | None | None | None | n/a | READ_WRITE (auto) | Yes | `tools/username.py::UsernameOffTool.execute` |
+| `username_show` | None | None | None | n/a | READ_ONLY | Yes (read) | `tools/username.py::UsernameShowTool.execute` |
+| `search` | `query` truthy | None | None | n/a (owner-scoped saved items) | READ_ONLY | Yes (read) | `tools/retrieve.py::SearchTool.execute` |
+| `list_saves` | None | `limit` 1–50 (default 10) | None | n/a (owner-scoped) | READ_ONLY | Yes (read) | `tools/retrieve.py::ListSavesTool.execute` |
+| `database_stats` | None | None | None | n/a | READ_ONLY | Yes (read) | `tools/database.py::DatabaseStatsTool.execute` |
+| `account_show` | None | `fields` ⊆ {first_name,last_name,full_name,username} (defaults first_name+username) | **`context.telegram` required** | n/a (own identity; phone/id never returned) | READ_ONLY | Yes (read) | `tools/account.py::AccountShowTool.execute` |
+| `settings_get` | `key` truthy | None | None (config_store / settings_service) | n/a | READ_ONLY | Yes (read) | `tools/settings.py::SettingsGetTool.execute` |
+| `settings_set` | `key` truthy **and** `value` not None | `key`, `value` | None | n/a (global owner settings) | **ADMIN_ONLY → requires confirmation; never auto-executed** | **NO — cannot execute**: `executor.execute_calls` returns `needs_confirmation` | `tools/settings.py::SettingsSetTool`; `tools/executor.py::_is_auto_executable` |
+| `organize_list` | None | None | None | n/a | READ_ONLY | Yes (read) | `tools/organize.py::OrganizeListTool.execute` |
+| `organize_clean` | None | None | None | n/a (owner's bot logs) | DANGEROUS (auto) | Yes (purges logs > 7 days) | `tools/organize.py::OrganizeCleanTool.execute` |
+| `web_search` | `query` non-empty | `count` 1–100, `freshness` ∈ day/week/month/year, `include_domains` list | `extra["provider_manager"]` **optional** — falls back to `get_engine().provider_manager`, else honest failure; Telegram not used | n/a (external retrieval) | READ_ONLY | Yes — engine fallback resolves the manager | `tools/websearch.py::WebSearchTool.execute`; `services/web_search_service.do_web_search` |
+| `create_task` | `request` non-empty ≤ 2000 chars | None | `extra["request_id"]`, `extra["chat_id"]`, `extra["provider_manager"]` (engine fallback), `extra["deterministic_task_candidate"]` optional | owner_id from context; destination resolved during interpretation | READ_WRITE (auto) | UNCERTAIN — reachable via engine fallback, but a scheduled task that creates tasks is outside the audited semantics | `tools/task.py::CreateTaskTool.execute` |
+| `task_list` | None | `status` ∈ active/paused/completed | None (repository manager) | owner-scoped in service | READ_ONLY | Yes (read) | `tools/task_management_tools.py::TaskListTool.execute` |
+| `task_inspect` | `task_id` positive int | None | None | owner-scoped in service | READ_ONLY | Yes (read) | `tools/task_management_tools.py::TaskInspectTool.execute` |
+| `task_transition` | `task_id` positive int, `action`/`action_status` ∈ paused/active/completed, `expected_version` positive int | None | None | owner-scoped + CAS version | READ_WRITE (auto) | Yes, but CAS version must match a value read at run time → practically requires AI preparation | `tools/task_management_tools.py::TaskTransitionTool.execute` |
+| `task_delete` | `task_id` positive int, `expected_version` positive int | None | None | owner-scoped + CAS version | READ_WRITE (auto) | Same CAS caveat | `tools/task_management_tools.py::TaskDeleteTool.execute` |
+| `retrieve_save` | `save_code` non-empty alphanumeric (upper-cased) | None | **`extra["chat_id"]` required** (non-zero int) | Chat from `chat_id`; code owner-scoped in service | READ_WRITE (auto) | Yes, if `chat_id` exists | `tools/retrieve_save.py::RetrieveSaveTool.execute` |
+| `send_message` | `text` non-blank ≤ 4096 (also enforced at candidate layer) | `font` (must be in the font registry) | `extra["chat_id"]` optional — falls back to `owner_id`; Telegram client | **Never model-supplied**: owner's own chat / creation chat | READ_WRITE (auto) | Yes — the canonical scheduled action | `tools/message.py::SendMessageTool.execute` |
+| `memory_store` | `content` non-empty ≤ `MAX_MEMORY_ENTRY_CHARS` | `tier` ∈ long/permanent, `category` ∈ fact/preference/context/summary/instruction, `importance` 0.0–1.0 | None (engine memory manager, with in-memory fallback) | n/a (owner-scoped memory) | READ_WRITE (auto) | Yes | `tools/memory.py::MemoryStoreTool.execute` |
+| `memory_list` | None | `tier` ∈ long/permanent, `query`, `limit` 1–20 | None | n/a (owner-scoped) | READ_ONLY | Yes (read) | `tools/memory.py::MemoryListTool.execute` |
+
+### B3. Requirement classifications
+
+An action may appear in more than one group; groups are derived from the
+contract matrix above, not from names.
+
+**NO_ARGUMENT_REQUIREMENTS** (schema has no required field):
+`save`, `delete_replied`, `list_recent_messages`, `bio_on`, `bio_off`, `bio_show`,
+`get_bio`, `username_on`, `username_off`, `username_show`, `list_saves`,
+`database_stats`, `account_show`, `organize_list`, `organize_clean`, `task_list`,
+`memory_list`.
+
+**STATIC_ARGUMENTS** (execution depends on at least one persisted argument):
+`save_by_link` (`link`), `delete` (scope), `delete_by_id` (`message_id`),
+`delete_message_by_id` (`message_id`), `delete_messages_by_ids` (`message_ids`),
+`bio_set_template`/`username_set_template` (`template`),
+`bio_set_text`/`username_set_text` (`text`), `bio_set_mood`/`username_set_mood`
+(`mood`), `search` (`query`), `settings_get`/`settings_set` (`key`[+`value`]),
+`web_search` (`query`), `create_task` (`request`), `task_inspect` (`task_id`),
+`task_transition`/`task_delete` (`task_id` + `expected_version`),
+`retrieve_save` (`save_code`), `send_message` (`text`), `memory_store` (`content`).
+
+**CONTENT_BEARING** — free text that a human reads back:
+`send_message.text`, `bio_set_text.text`, `username_set_text.text`,
+`memory_store.content`, plus `bio_set_mood.mood` / `username_set_mood.mood`
+(short single-token values) and `bio_set_template.template` /
+`username_set_template.template` (token-bearing strings). Note the deterministic
+ai-preparation content policy (`preparation_policy.CONTENT_FIELDS`) recognizes
+exactly `{text, message, content, body}` — so of the above only
+`send_message.text`, `bio_set_text.text`, `username_set_text.text`, and
+`memory_store.content` are policy-validated content fields.
+
+**RUNTIME_CONTEXT_REQUIRED** (`ToolContext`/`extra`, not arguments):
+`save` and `delete_replied` → `extra["reply_msg"]` **required**;
+`delete`, `delete_by_id`, `delete_message_by_id`, `delete_messages_by_ids`,
+`list_recent_messages`, `retrieve_save` → `extra["chat_id"]` **required**;
+`bio_on`/`username_on` → `context.telegram.client` required;
+`get_bio`/`account_show` → `context.telegram` required;
+`send_message` → `extra["chat_id"]` optional (fallback `owner_id`);
+`web_search`/`create_task` → `extra["provider_manager"]` optional (engine fallback);
+`create_task` → `extra["request_id"]`/`extra["chat_id"]` used for tracing.
+
+**TRUSTED_DESTINATION_REQUIRED** (destination must come from runtime context,
+never from the model): `send_message`, `retrieve_save`, `delete`,
+`delete_by_id`, `delete_message_by_id`, `delete_messages_by_ids`,
+`list_recent_messages`, and service-side source identity for `save`/`save_by_link`.
+
+**CONFIRMATION_OR_PERMISSION_SENSITIVE**: `settings_set` (ADMIN_ONLY). All
+DANGEROUS actions (`delete`, `delete_by_id`, `delete_replied`,
+`delete_message_by_id`, `delete_messages_by_ids`, `organize_clean`) are
+auto-executable by design in this single-owner self-bot and therefore are
+*not* confirmation-gated.
+
+**IMMEDIATE_ONLY_CONTEXT** (the required context exists only during a live reply
+request): `save`, `delete_replied`.
+
+**OTHER**: `create_task`, `task_list`, `task_inspect`, `task_transition`,
+`task_delete`, `organize_list`, `organize_clean`, `database_stats` (meta /
+maintenance rather than user-facing content actions).
+
+### B4. Confirmed facts vs uncertainties
+
+**CONFIRMED**
+
+1. The registry is the authoritative vocabulary and contains exactly the 39 names
+   in B1 (`registry.py::create_default_registry`).
+2. A scheduled occurrence receives `extra == {"chat_id": <int>}` at most; the base
+   context carries `telegram`, `owner_id`, `tz_str`, `client` and no `extra`
+   (`supervisor.py::_start_task_scheduler`, `task_execution.py::execute`).
+3. `save` and `delete_replied` require `extra["reply_msg"]`, which the scheduled
+   path never sets — they are persistable names that can never execute as a
+   scheduled occurrence (`tools/save.py`, `tools/delete.py`).
+4. `settings_set` is ADMIN_ONLY and `executor.execute_calls` never passes the
+   `confirmed` flag, so a snapshotted `settings_set` action always returns
+   `needs_confirmation` instead of executing (`executor.py::_execute_single`,
+   `executor.py::_is_auto_executable`).
+5. Every action whose name is not in the registry fails the occurrence with
+   `unregistered_action` before execution (`task_execution.py::execute`).
+6. `send_message` is the only action with an explicit candidate-layer contract
+   (bounded non-blank `text` + optional font) and a trusted-destination fallback
+   to the owner's own chat (`task_candidate.py::_canonicalize_action`,
+   `tools/message.py::SendMessageTool.execute`).
+7. Several tools accept an empty/absent content argument without any in-tool
+   rejection: `bio_set_text` and `username_set_text` (`arguments.get("text", "")`),
+   `bio_set_mood` and `username_set_mood` (`arguments.get("mood", "")`).
+   Their rejection, when it happens at all, is a creation-layer concern (Stage A)
+   and is not enforced by the tool.
+8. `web_search` and `create_task` tolerate a missing `extra["provider_manager"]`
+   by resolving the process-global engine, so they are not hard-dependent on
+   `extra` (`tools/websearch.py`, `tools/task.py::_execute`).
+
+**UNCERTAIN**
+
+- **U-B1:** Whether `notification_destination["chat_id"]` is populated for every
+  created task. The mechanism is confirmed; per-task population is a creation-
+  layer/destination question deferred to Stage E. Affects the entire
+  `chat_id`-dependent family.
+- **U-B2:** Whether a persisted `create_task` action is meaningful — it is
+  reachable via the engine fallback but the recursion semantics are outside this
+  stage's scope.
+- **U-B3:** Whether persisting literal message IDs for `delete_messages_by_ids`
+  can ever be a durable semantic contract (ids are chat-relative and time-relative).
+- **U-B4:** Event-schedule tasks (`schedule_type == "event"`) use the same action
+  vocabulary but a different trigger contract; trigger semantics were not audited
+  here.
+- **U-B5:** The ai-preparation path validates only `CONTENT_FIELDS`
+  (`text`/`message`/`content`/`body`); whether that is sufficient for
+  `mood`/`template`-bearing actions is a Stage C question, not decided here.
+
+### B5. Stage B verdict
+
+1. **Vocabulary established.** The complete currently registered task-action
+   vocabulary was established from `registry.py` — 39 names, plus the
+   candidate-layer send aliases that normalize into `send_message`.
+2. **Every action classified.** All 39 received a requirement classification
+   with source evidence; 37 are fully confirmed and 2 carry an explicit
+   UNCERTAIN mark (`create_task` viability, `delete_messages_by_ids` id-durability).
+3. **Actions requiring later investigation.**
+   - **Stage C (content at the persistence boundary):** `send_message`,
+     `bio_set_text`, `username_set_text`, `memory_store`, `bio_set_mood`,
+     `username_set_mood`, `bio_set_template`, `username_set_template`.
+   - **Stage D (context-dependent actions at scheduled execution):** `save`,
+     `delete_replied` (unexecutable), and the `chat_id`-dependent family
+     (`delete`, `delete_by_id`, `delete_message_by_id`,
+     `delete_messages_by_ids`, `list_recent_messages`, `retrieve_save`),
+     plus the CAS-dependent `task_transition` / `task_delete`.
+   - **Stage E (trusted vs model-supplied fields):** destination population and
+     per-action trusted-target enforcement.
+   - **Stage F (permission/confirmation):** `settings_set`, and the DANGEROUS
+     auto-execution set.
+   - **Stage G (residual):** U-B1–U-B5.
+4. **Still unknown.** Whether any of the required args/context above are checked
+   *before persistence* — this stage deliberately did not examine the
+   creation-layer enforcement (Stages C–G).
+
+**Stopping condition met:** every currently registered task action enumerated;
+ every action assigned an execution-contract classification with source evidence;
+ unresolved cases explicitly marked UNCERTAIN. Stage C was not started; no
+production code, tests, schema, configuration, UI, or `IMPLEMENTATION_REPORT.md`
+was modified.
