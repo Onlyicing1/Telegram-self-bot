@@ -582,3 +582,124 @@ Single scheduler/coordinator/executor authority, the occurrence state machine,
 and the bounded retry contract are unchanged; no schema, migration, or UI
 change was made. Live Telegram/provider verification remains NOT performed
 (in-process + fake-provider tests only), consistent with all prior phases.
+
+## Stage E — Trusted vs model-supplied fields
+
+### Scope and verdict
+
+This stage traced the current source only through `TaskCandidate`, the natural-language task tool, trigger resolution, task persistence, and scheduled execution. No production or test code was modified, and the bounded reproduction used the existing in-memory repository and executor only.
+
+**VERDICT: CONFIRMED GAP.** The previous hypothesis is confirmed: a provider-supplied numeric `notification_destination.chat_id` can survive into persisted task state when the request has no trusted `chat_id` and no `chat_name` is resolved. It is then used as the scheduled tool destination. The source does not currently reject or universally overwrite that candidate field.
+
+### Field classification
+
+Each identifier/recipient-bearing path is classified by its actual behavior, not by comments or intended use.
+
+| Field/path | Classification | Exact source-backed behavior |
+|---|---|---|
+| `ToolContext.extra["chat_id"]` at task creation | **TRUSTED** | `CreateTaskTool._execute()` reads this from the runtime request context. It is not provider output. When it is a nonzero integer and no destination name is supplied, it is written into the candidate destination. |
+| `notification_destination.chat_id` from the candidate | **MODEL_SUPPLIED_VALUE_SURVIVES** | `TaskCandidate.from_untrusted()` requires only that `notification_destination` be a dict and does not validate or remove `chat_id`. `CreateTaskTool` copies the dict; it overwrites `chat_id` only after successful `chat_name` resolution or when a trusted request chat id is present. With neither, the model number remains. |
+| `notification_destination.chat_name` | **REJECTED** | The field is bounded by `TaskCandidate`, then removed by `CreateTaskTool`. A missing, ambiguous, or unresolvable name returns before `TaskCreationService.create()`, so the raw model name cannot reach persistence. On success, the result is a trusted resolved id/title, not the raw name. |
+| `notification_destination.chat_title` | **MODEL_SUPPLIED_VALUE_SURVIVES** | It is not validated or canonicalized by `TaskCandidate` and is not removed when no `chat_name` is supplied. It can therefore be persisted as metadata. Scheduled sending does not use this title as authority; the persisted `chat_id` is the value that matters. If `chat_name` is resolved, `CreateTaskTool` overwrites `chat_title` with the trusted resolver result. |
+| Destination/recipient keys in a send alias action (`send`, `send_message`, `write_message`, `send_text`) | **REJECTED** | `TaskCandidate._canonicalize_action()` reduces these aliases to `send_message` with only bounded `text` and optional allow-listed `font`; destination, recipient, chat-id, and Telegram-method keys are dropped. `SendMessageTool` reads destination only from trusted runtime context. |
+| Event trigger names (`schedule.trigger.sender` / `schedule.trigger.chat`) | **OVERWRITTEN_BY_TRUSTED_VALUE** | `validate_trigger_spec()` accepts names only. `resolve_trigger_references()` resolves them against authenticated dialogs and replaces them with `sender_id` / `chat_id` plus trusted display metadata before `candidate["schedule"]` is persisted. An unresolved/ambiguous name fails closed. |
+| Event trigger numeric ids (`sender_id`, `chat_id`) in model-facing candidate data | **REJECTED** | `validate_trigger_spec()` allows only the unresolved name form; numeric identity fields are unsupported and cause `TaskCandidateError`. Persisted numeric trigger ids can only be produced by `resolve_trigger_references()` from trusted runtime data. |
+| Event trigger display fields (`sender_name`, `chat_title`) in model-facing candidate data | **REJECTED** | They are not allowed by the unresolved trigger vocabulary. The similarly named fields that appear after resolution are generated from trusted dialog matches, not accepted from the model. |
+
+The `notification_destination.chat_id` classification is the central finding: the same persisted field is later read by `TaskExecutionCoordinator.execute()` at `backend/ai/task_execution.py:331-344`, copied into `ToolContext.extra["chat_id"]`, and passed to `ToolExecutor.execute_calls(..., context_override=execution_context)`. `SendMessageTool.execute()` then uses that context value at `backend/ai/tools/message.py:111-129`; `_deliver_result()` independently reads the same task destination at `backend/ai/task_execution.py:691-696`. Thus the value can reach both the scheduled action destination and optional result delivery.
+
+### Exact persistence path for the confirmed gap
+
+```text
+provider candidate
+  → TaskCandidate.from_untrusted()
+      notification_destination is only type-checked as dict
+  → CreateTaskTool._execute()
+      no chat_name; request context has no valid chat_id
+      candidate destination dict is left unchanged
+  → TaskCreationService.create()
+      validates required fields/schedule/profile semantics only
+      copies notification_destination into payload
+  → TaskRepository.create_task()
+      validates it as a bounded JSON object and persists it
+  → occurrence.action_snapshot + task notification_destination
+  → TaskExecutionCoordinator.execute()
+      reads task.notification_destination["chat_id"]
+      injects it into scheduled ToolContext.extra
+  → ToolExecutor.execute_calls()
+  → SendMessageTool.execute()
+      sends to the persisted numeric id
+```
+
+The bounded in-process reproduction created a schema-valid interval candidate with `notification_destination={"chat_id": 987654321}`, no request chat id, and no `chat_name`. `TaskCandidate.from_untrusted()` returned that value unchanged; `TaskCreationService` persisted it in `InMemoryTaskRepository` unchanged. This directly resolves the former source-only hypothesis: it is **confirmed**, not uncertain. No Telegram call was made.
+
+### Trusted-value overwrite conditions and remaining limitation
+
+A trusted request `chat_id` overwrites a model-supplied value in the no-`chat_name` branch. A successfully resolved `chat_name` also overwrites the model destination with a trusted id/title. Those branches are safe for the destination field. The uncovered branch is the absence of both trusted inputs: the implementation treats the model dict as usable rather than rejecting the task or supplying a trusted owner/current-chat value.
+
+Event trigger identity is stricter than notification destination identity: numeric model ids are rejected and names must resolve through authenticated dialogs. The send-message action itself is also strict. The gap is specifically the task-level `notification_destination` object, not the trigger resolver or send-action canonicalizer.
+
+No live Telegram, Supabase, provider, or Render call was performed. No fix is proposed or implemented in this stage.
+
+## Stage F — Permission- and confirmation-sensitive actions
+
+### Scope and verdict
+
+This stage traced `PermissionLevel`, `ToolExecutor.execute_calls()`, `execute_confirmed()`, the settings and organize tools, task candidate/creation validation, and the scheduled coordinator path. The bounded reproduction used the existing in-memory repository and a real `ToolExecutor` with no external services.
+
+**VERDICT: one confirmed GAP and one confirmed PASS; no UNCERTAIN result.** The gap is `settings_set`: it can pass task-candidate and task-creation validation and become durable, but scheduled execution cannot satisfy its ADMIN_ONLY confirmation contract. `organize_clean` is a PASS under the current single-owner self-bot contract because DANGEROUS tools are explicitly auto-executable; it does not require a confirmation round-trip.
+
+### Action classification
+
+| Action | Declared level | Confirmation-sensitive result | Evidence |
+|---|---|---|---|
+| `settings_set` | `PermissionLevel.ADMIN_ONLY` | **GAP** | `SettingsSetTool.permission_level()` returns `ADMIN_ONLY`. `ToolExecutor.execute_calls()` calls `_execute_single(..., confirmed=False)`, and `_is_auto_executable()` admits only READ_ONLY, READ_WRITE, and DANGEROUS. The call therefore returns `needs_confirmation=True` / `error="confirmation_required"` without invoking `SettingsSetTool.execute()`. |
+| `organize_clean` | `PermissionLevel.DANGEROUS` | **PASS** | `OrganizeCleanTool.permission_level()` returns `DANGEROUS`. `_is_auto_executable()` explicitly includes DANGEROUS, so scheduled `execute_calls()` invokes the tool directly. The current contract says the owner's task creation is authorization and the service performs the bounded cleanup. No confirmation is required by this implementation. |
+| Other registered DANGEROUS actions (the delete variants and `delete_messages_by_ids`) | `PermissionLevel.DANGEROUS` | **PASS for the declared contract** | They take the same executor branch as `organize_clean`. Their deterministic tool/service argument validation remains the execution contract; the executor does not require confirmation for DANGEROUS in this single-owner self-bot. |
+| Any registered `PermissionLevel.CONFIRMATION_REQUIRED` tool | No built-in tool in the inspected registry returns this level | **PASS / not applicable** | The enum exists, but the bounded registered-tool inventory showed no built-in tool declaring it. `ToolExecutor` would nevertheless reject it on the unconfirmed scheduled path. |
+
+### Complete source-backed `settings_set` path
+
+```text
+candidate action {name: "settings_set", arguments: {key, value}}
+  → TaskCandidate.from_untrusted()
+      non-send action name/arguments are shape-normalized, not registry- or
+      permission-validated
+  → TaskCreationService.create()
+      validates task fields, schedule, and profile semantic completeness;
+      no permission/confirmation check is present
+  → TaskRepository.create_task()
+      persists the bounded action snapshot
+  → occurrence.action_snapshot
+  → TaskExecutionCoordinator.execute()
+      validates that "settings_set" exists in ToolRegistry
+      calls ToolExecutor.execute_calls(...), never execute_confirmed()
+  → ToolExecutor._execute_single(confirmed=False)
+      ADMIN_ONLY is not auto-executable
+      returns needs_confirmation=True, error="confirmation_required"
+      does not call SettingsSetTool.execute()
+  → coordinator sees a failed ToolExecutionResult
+  → `handle_failure()` classifies the confirmation error as unknown/unclassified
+      and transitions the occurrence to terminal `failed`
+```
+
+The persisted task therefore survives creation but its occurrence does not perform the setting mutation. The scheduled path has no owner confirmation UI/continuation and no call to `execute_confirmed()`. The bounded reproduction confirmed the exact terminal behavior: `settings_set` was persisted, `ToolExecutor.execute_calls()` returned `needs_confirmation=True`, `error=confirmation_required`, and `success=False`; the tool implementation was not invoked. This is a correctness/contract gap, not an implemented fix.
+
+### Complete source-backed `organize_clean` path
+
+```text
+candidate organize_clean
+  → TaskCandidate / TaskCreationService / repository persistence
+  → occurrence action snapshot
+  → TaskExecutionCoordinator.execute()
+  → ToolExecutor.execute_calls()
+  → _is_auto_executable(DANGEROUS) == True
+  → OrganizeCleanTool.execute()
+  → organize_service.do_clean(owner_id)
+```
+
+### Stage F conclusion
+
+**PASS:** the executor correctly blocks ADMIN_ONLY/CONFIRMATION_REQUIRED actions on ordinary unconfirmed calls and provides `execute_confirmed()` only for an explicit interactive confirmation path. **GAP:** task creation does not reject or otherwise mark confirmation-sensitive actions, while scheduled execution has no confirmation mechanism; `settings_set` can therefore become a durable task whose occurrence deterministically fails instead of applying the setting. No permission system, scheduler, executor, persistence path, or action behavior was modified.
+
+No live Telegram, Supabase, provider, or Render call was performed. No fix is proposed or implemented in this stage.
