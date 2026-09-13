@@ -983,3 +983,90 @@ The bounded reproduction persisted the action and observed `needs_confirmation=T
 The executor's interactive `execute_confirmed()` path remains separate and is not available to scheduled execution. No permission system, scheduler, executor, persistence path, or action behavior was modified. No live Telegram, Supabase, provider, or Render call was performed.
 
 **Stage G and Stage H were NOT started.**
+
+## Stage G — Residual unknowns
+
+Stage G re-opened only the items left UNCERTAIN or unclassified after Stages A–F. The audited revision is `main` at `a3eb1c38a4854393d0e80e1c0d13e547d7`. No historical A–F finding was re-audited, rewritten, or deleted, and no production code, tests, configuration, schema, UI, scheduler, or provider file was modified.
+
+### Scope executed
+
+| Source read | Purpose |
+|---|---|
+| `backend/ai/tools/websearch.py` | resolve the Stage B `web_search` argument uncertainty |
+| `backend/ai/tools/memory.py` | resolve the Stage B `memory_*` requirement uncertainty |
+| `backend/ai/tools/task_management_tools.py` | resolve the Stage B `task_*` requirement uncertainty |
+| `backend/ai/task_candidate.py`, `backend/ai/task_creation.py` | confirm whether nested action arguments are validated before persistence |
+| `backend/ai/task_trigger.py`, `backend/ai/task_event_dispatcher.py`, `backend/ai/task_execution.py` | confirm event-source vs persisted-destination separation |
+
+### G1. Residuals resolved
+
+| Residual | Verdict | Decisive evidence |
+|---|---|---|
+| `web_search` argument requirements | **GAP** | `WebSearchTool.execute` rejects a missing or blank `query`, but `TaskCandidate.from_untrusted` and `TaskCreationService.create` never inspect nested action arguments, so an action with an empty `query` reaches `TaskRepository.create_task` and fails only at execution. |
+| `memory_store` argument requirements | **GAP** | `MemoryStoreTool.execute` requires bounded nonblank `content`; that requirement is enforced only after the task is already durable. |
+| `memory_list` argument requirements | **PASS** | `MemoryListTool` declares no required argument; omitted `tier`/`query`/`limit` are valid defaults. |
+| `task_*` argument requirements | **GAP** | `TaskInspectTool`, `TaskTransitionTool`, and `TaskDeleteTool` require positive IDs, positive `expected_version`, and/or allow-listed status; creation validates none of these before `repository.create_task`. |
+| Persistence path that bypasses the semantic-completeness boundary | **PASS (no bypass found)** | The inspected creation callers use `TaskCreationService.create`, which is itself the caller of `repository.create_task`; the boundary runs before payload assembly, so no inspected path persists around it. |
+| Event-trigger source vs action destination | **PASS as a data-flow fact** | `resolve_trigger_references` resolves trigger names to trusted IDs. The event dispatcher consumes event data for matching, occurrence identity, and timestamps, while the coordinator delivers using the persisted `notification_destination`. These are distinct fields with distinct authority. |
+
+### G2. Remaining uncertainties
+
+| Residual | Verdict | Exact uncertainty |
+|---|---|---|
+| Recursive scheduled `create_task` | **UNCERTAIN** | A scheduled occurrence can reach the same creation service through the engine fallback, but the source defines no bounded or guaranteed-terminating contract for tasks that create further tasks. No recursive durable execution was attempted because it would write task state. |
+| Literal Telegram message-ID durability | **UNCERTAIN** | Persisted IDs are re-fetched in the persisted chat with outgoing-only verification, but the source cannot prove that a delayed ID still denotes the intended semantic target. Live Telegram behavior was explicitly out of scope. |
+
+### G3. Stage G result
+
+**Stage G: PASS 2, GAP 3, UNCERTAIN 2.** H1 (Stage E) and H2 (Stage F) remain confirmed findings rather than residual uncertainties.
+
+## Stage H — Final verdict and remaining gaps
+
+Latest revision actually audited by Stages A–G: `main` at `a3eb1c38a4854393d0e80e1c0d13e547d7`.
+
+1. **Is semantic completeness enforced for every supported task action?** No. It is enforced for `send_message` only, plus the narrower profile gates recorded in Stages A–F.
+2. **Which actions are PASS?** `send_message`, `bio_on`, `bio_off`, `bio_show`, `get_bio`, `username_on`, `username_off`, `username_show`, `list_saves`, `list_recent_messages`, `memory_list`, `organize_list`, `database_stats`, `task_list`, and `account_show` (fails closed on invalid input).
+3. **Which actions are confirmed GAP?** `web_search`, `memory_store`, the `task_*` management actions, `bio_set_template`/`username_set_template`, `bio_set_mood`/`username_set_mood`, `delete`, `delete_by_id`, `delete_message_by_id`, `delete_messages_by_ids`, `save_by_link`, `search`, `settings_get`, `retrieve_save`, `create_task`, `save`, `delete_replied`, and any unregistered action name.
+4. **Which actions remain UNCERTAIN?** Only the two Stage G residuals: recursive scheduled `create_task` termination and delayed literal message-ID durability.
+5. **Can model-supplied destination/identifier values bypass trusted resolution?** Yes. H1 is confirmed: a model-supplied numeric `chat_id` inside `notification_destination` survives when no trusted request chat ID exists and no `chat_name` resolves, and is later injected into the scheduled tool context.
+6. **Can confirmation-sensitive actions become invalid scheduled tasks?** Yes. `settings_set` declares `PermissionLevel.ADMIN_ONLY` and is persistable, but the scheduled execution path calls `execute_calls(confirmed=False)`, so `_is_auto_executable()` excludes it and the occurrence terminates with `needs_confirmation` / `confirmation_required`.
+7. **Which actions are immediate-only because required runtime context is unavailable to scheduled execution?** `save` and `delete_replied`, because the coordinator never injects `extra["reply_msg"]` for a scheduled occurrence.
+8. **Can unregistered actions persist and only fail at execution?** Yes. The candidate and creation layers do not consult the tool registry; membership is first checked by `TaskExecutionCoordinator.execute`, which fails the occurrence with `unregistered_action`.
+9. **Can schema-valid but semantically incomplete candidates still reach persistence?** Yes. Schema validity alone is not sufficient, and the current boundary does not check semantic completeness for every action.
+
+### CONFIRMED FACTS
+
+- The canonical creation path remains `TaskCandidate` → `CreateTaskTool`/wizard → `TaskCreationService.create` → `TaskRepository.create_task`; no separate inspected write path bypasses the service.
+- H1 is confirmed: model-supplied `notification_destination.chat_id` can survive without trusted replacement and reaches scheduled tool context.
+- H2 is split: `settings_set` is a confirmed scheduled confirmation gap, while `organize_clean` and the other DANGEROUS actions pass under the explicit owner-only contract.
+- `save` and `delete_replied` are immediate-only; unregistered action names are rejected at occurrence execution rather than at creation.
+
+### CONFIRMED GAPS
+
+1. Required or malformed nested action arguments are not universally validated before persistence.
+2. Model-supplied destination identifiers can survive without trusted replacement and reach scheduled destination/result-delivery context.
+3. Reply-dependent actions can be persisted although scheduled execution has no reply metadata.
+4. `settings_set` can be persisted although scheduled execution has no ADMIN_ONLY confirmation round-trip.
+5. A nonblank model-supplied `ai_instruction` can satisfy the narrow profile check without universal proof of user authorization.
+6. Unregistered action names are rejected too late, at occurrence execution rather than creation.
+
+### REMAINING UNCERTAINTIES
+
+- Whether recursive or chained scheduled `create_task` actions are supported, and what finite termination rule applies.
+- Whether delayed literal Telegram message IDs remain durable semantic targets.
+- Whether a complete required-field contract exists for every static action (Stages A–C record the missing general provenance enforcement without defining one).
+
+### NOT INVESTIGATED / OUT OF SCOPE
+
+No production fix, migration, SQL, schema change, provider change, scheduler/executor redesign, UI work, or live Telegram, Supabase, Render, or provider call was performed. Stages A–F were not re-audited or rewritten. Stages G and H are investigation and handoff only.
+
+### Final implementation handoff targets
+
+1. `backend/ai/task_creation.py::TaskCreationService.create` — required nested arguments are not validated before persistence. Expected invariant after the fix: schema-invalid or incomplete nested arguments never reach `repository.create_task`. Focused regression test: incomplete candidate is rejected with a repository non-invocation assertion. Affects immediate and scheduled creation.
+2. `backend/ai/tools/task.py::CreateTaskTool._execute` plus the service boundary — a provider-supplied `ai_instruction` can act as ungrounded authorization for generated content. Expected invariant: generated content is used only when authorized by the user's request. Focused regression test: omitted, blank, invented, and verbatim authorization cases. Affects both immediate and scheduled creation.
+3. `backend/ai/tools/task.py::CreateTaskTool._execute` / `backend/ai/task_candidate.py::TaskCandidate.from_untrusted` — model-supplied destinations are not stripped. Expected invariant: only trusted or explicitly resolved destinations reach persistence and scheduled context. Focused regression test: trusted, resolved, absent, and model-ID cases. Affects both paths.
+4. The existing creation eligibility boundary for reply-dependent actions — `save` and `delete_replied` are persistable but unexecutable. Expected invariant: no action is persisted whose required runtime context scheduled execution cannot provide. Focused regression test: creation rejection for those actions while the immediate reply flow still works. Affects creation and scheduled execution.
+5. The existing creation eligibility boundary plus `ToolExecutor` — `settings_set` is persistable but cannot satisfy confirmation on the scheduled path. Expected invariant: `settings_set` never becomes an invalid scheduled task, without changing interactive confirmation. Focused regression test: scheduled persistence rejection plus unchanged admin confirmation flow. Affects scheduled execution.
+6. The candidate/service action-name boundary — unregistered action names persist and fail late. Expected invariant: unregistered action names are rejected before persistence while occurrence-time registry defense-in-depth is retained. Focused regression test: unknown-name rejection at creation with the coordinator check still present. Affects creation.
+
+The two UNCERTAIN items are excluded from implementation targets until their contracts are defined. No fix was implemented in this stage.
