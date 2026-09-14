@@ -1,6 +1,124 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — RTL answer elbow logical order (visual `─┘`)
+## Latest phase — RTL connector column alignment (corner flush with the bars)
+
+Live Telegram evidence (a screenshot taken after the previous phase) confirmed
+the MIDDLE spacer line is now visually CORRECT for a Persian question and the
+logical RTL elbow order is correct, but the vertical connector column was still
+slightly misaligned: the `┘` corner sat one column INWARD (to the left) of the
+`│` bars and the `│` spacer instead of forming one continuous column. Those
+bars and the spacer are deliberately UNCHANGED by this phase.
+
+### Confirmed cause (Unicode classes, not a guess)
+
+Measured in this environment (`unicodedata.bidirectional`):
+
+| Character | Code point | BiDi class |
+|---|---|---|
+| `│` | U+2502 | `ON` (Other Neutral) |
+| `─` | U+2500 | `ON` |
+| `┘` | U+2518 | `ON` |
+| `└` | U+2514 | `ON` |
+| ` ` (space) | U+0020 | `WS` (Whitespace) |
+| `U+200F` RLM | U+200F | `R` (strong RTL, zero width) |
+| `U+200E` LRM | U+200E | `L` (strong LTR, zero width) |
+
+The RTL presentation line is `U+2067 RLI + U+200F RLM + payload + U+2069 PDI`.
+The zero-width RLM is the isolate's first strong character, so the isolate's
+content is laid out right-to-left and the first VISIBLE payload character is
+drawn at the isolate's right (start) edge.
+
+* The `│` bars and the `│` spacer are payload characters #1, so they start
+  flush at that edge and share one visual column.
+* The RTL elbow used `_RTL_ANSWER_PREFIX = " ┘─ "`, whose payload character #1
+  is a space (`WS`). Inside an RTL run a leading space is laid out first, so it
+  occupied the isolate's rightmost column and pushed the `┘` corner to the
+  second column — exactly the "slightly offset/back" behaviour in the
+  screenshot. String equality tests could not detect this because the logical
+  string was internally consistent.
+
+### Exact minimal fix
+
+`backend/ai/tools/delivery.py`: `_RTL_ANSWER_PREFIX` changed from `" ┘─ "` to
+`"┘─ "` — the leading space is removed so the corner is the isolate's first
+visible character, i.e. flush in the same column as the bars and the spacer.
+The TRAILING space is kept because it is what separates the arm from the answer
+text. Consequence: both directions now reserve the same two columns before the
+answer text (LTR `└─ `, RTL `┘─ `), which the leading space had broken.
+
+One constant (plus its explanatory comment). The `│` question bars, the `│`
+spacer and its RLI/RLM anchoring, the RTL logical elbow order `┘─`, the LTR
+elbow `└─ `, the four-ASCII-space continuation indent, the plain
+`show_question=False` output, and the edit-in-place delivery path are all
+untouched. Pagination still measures the prefix via
+`_utf16_units(_RTL_ANSWER_PREFIX)`, so the reduced length is accounted for
+automatically.
+
+### Resulting logical strings
+
+| Mode | Stored logical form | Required visual form |
+|---|---|---|
+| LTR | `└─ ` (U+2514 U+2500) | `└─ `, corner LEFT, arm extending right |
+| RTL | `┘─ ` (U+2518 U+2500) | `─┘ `, corner RIGHT, arm extending left |
+
+### What the automated tests prove (and what they do not)
+
+Proven, at the Unicode/control-character level (`tests/test_ai_presentation_redesign.py`,
+63 focused tests):
+
+* the exact delivered sequence
+  `\u2067\u200f│ سؤال من\u2069\n\u2067\u200f│\u2069\n\u2067\u200f┘─ پاسخ من\u2069`
+  and its LTR counterpart `\u2066\u200e│ …\u2066\u200e└─ …`;
+* the BiDi classes above (box drawing `ON`, space `WS`, RLM `R`), i.e. why a
+  leading space displaces the corner;
+* the connector-column invariant: on every connected line the connector glyph
+  is the first character of its isolate payload and is therefore never
+  space-shifted, and for same-direction blocks the bars, the spacer and the
+  elbow share one opener+anchor;
+* the matrix: Persian/Persian, Persian/English-only, Persian/mixed,
+  Persian/numeric-neutral, Persian/URL+username+code-like, Persian with an
+  English-only continuation line, and English/English;
+* OFF mode contains no `│`, `─`, `└`, `┘` **and no `U+200E/U+200F/U+2066/
+  U+2067/U+2069` presentation controls** at all.
+
+NOT proven here: actual Telegram pixel placement. No BiDi renderer (FriBidi /
+Pango / ICU / `python-bidi`) is installed and no Telegram client can be driven
+from this environment, so the visual column can only be confirmed on a device.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused presentation tests | **63 passed** |
+| Relevant AI/presentation/settings/delivery suites | **347 passed** |
+| Full suite (`pytest tests -q`) | **2,603 passed, 24 skipped, 3 warnings** |
+| `py_compile` changed Python files | **passed** |
+| `git diff --check` | **clean** |
+| Live Telegram rendering | **not available; requires the manual cases below** |
+
+### Manual Telegram verification still required (acceptance criterion)
+
+Preference ON, then inspect the edited original message on Android, Desktop and
+iOS:
+
+1. `سؤال من` → `پاسخ من`: the `│` of the question line, the standalone `│`
+   spacer, and the RIGHT-side corner of the elbow must form ONE column, with
+   the arm extending LEFT toward the answer;
+2. `این سؤال من است` → Persian line, English-only continuation, Persian line:
+   the connector column must not shift;
+3. `My question` → `My answer`: unchanged LTR behaviour (`└─ `, four-space
+   continuations);
+4. `سؤال` → `12345?! ---`, `سؤال` → `https://example.com/u/@name`,
+   `سؤال` → `@username` and `` `x = 1` ``: the RTL block stays RTL;
+5. Preference OFF: plain answer text, no connector glyphs and no directional
+   presentation controls.
+
+If a client still renders the corner off-column, the remaining variable is that
+client's isolate/space handling, not this logical string.
+
+---
+
+## Previous phase — RTL answer elbow logical order (visual `─┘`)
 
 Live Telegram evidence (a screenshot taken after the previous phase) showed two
 things: the MIDDLE spacer line is now visually CORRECT for a Persian question
@@ -29,8 +147,9 @@ deliberately UNCHANGED.
 
 `backend/ai/tools/delivery.py`: `_RTL_ANSWER_MARK` changed from `─┘`
 (U+2500 U+2518) to `┘─` (U+2518 U+2500). One constant;
-`_RTL_ANSWER_PREFIX` still wraps it as `" ┘─ "`, so the two-column elbow
-alignment is unchanged. The comment above the constants now records that the
+`_RTL_ANSWER_PREFIX` wrapped it as `" ┘─ "` at the time — **superseded by the
+latest phase above**, which removed that leading space because it displaced the
+corner from the bar column. The comment above the constants records that the
 RTL order is stored in logical (right-to-left) order.
 
 Nothing else changed: the `│` question bars, the `│` spacer and its RLI/RLM
@@ -43,7 +162,7 @@ untouched.
 | Mode | Stored logical form | Required visual form |
 |---|---|---|
 | LTR | `└─ ` (U+2514 U+2500) | `└─ `, corner LEFT, arm extending right |
-| RTL | ` ┘─ ` (U+2518 U+2500) | ` ─┘ `, corner RIGHT, arm extending left |
+| RTL | ` ┘─ ` (U+2518 U+2500) — superseded, now `┘─ ` | `─┘ `, corner RIGHT, arm extending left |
 
 ### Automated evidence
 

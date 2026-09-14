@@ -286,12 +286,21 @@ _QUESTION_PREFIX = f"{_QUESTION_MARK} "
 #                                       arm extending right toward the text)
 #   RTL  logical "┘─ " → visual "─┘ "  (U+2518 U+2500, corner on the RIGHT,
 #                                       arm extending left toward the text)
-# (the leading space keeps the two-column elbow aligned with the LTR form;
-# the answer text itself is never reordered)
+#
+# The RTL elbow deliberately carries NO leading space. The `│` question bar
+# and the `│` spacer are both the FIRST visible character of their isolate, so
+# they start flush at the isolate's edge and share one visual column. A leading
+# space on the RTL elbow is laid out first inside the right-to-left run and
+# would push the `┘` corner one column INWARD, breaking that single-column
+# alignment (live Telegram evidence: the corner sat slightly back from the bar
+# column). Keeping the corner flush restores it; the TRAILING space is what
+# separates the arm from the answer text, so both directions reserve the same
+# two columns before the text (LTR "└─ ", RTL "┘─ "). The answer text itself
+# is never reordered.
 _LTR_ANSWER_MARK = "└─"
 _RTL_ANSWER_MARK = "┘─"
 _LTR_ANSWER_PREFIX = f"{_LTR_ANSWER_MARK} "
-_RTL_ANSWER_PREFIX = f" {_RTL_ANSWER_MARK} "
+_RTL_ANSWER_PREFIX = f"{_RTL_ANSWER_MARK} "
 _ANSWER_MARK = _LTR_ANSWER_MARK
 _BIDI_LRI = "\u2066"
 _BIDI_RLI = "\u2067"
