@@ -259,10 +259,11 @@ class DeliveryResult:
 #                                     connector — never looks like a success
 #   ANSWER, question shown            question bars + blank `│` connector +
 #                                     directional elbow answer block
-#   ANSWER, question hidden           ONLY the answer block — genuinely a
-#                                     different mode: no `│`, no connector
-#                                     lines, no structure pretending a
-#                                     hidden question exists
+#   ANSWER, question hidden           the PLAIN answer text — no `│`, no
+#                                     `─`, no elbow, and no replacement
+#                                     separator: the connector design
+#                                     belongs ONLY to the quoted-question
+#                                     mode
 #
 # The answer starts behind a directional elbow and every continuation line is
 # indented by exactly four ASCII spaces so all answer text starts at the same
@@ -334,12 +335,20 @@ def _question_block(user_message: str) -> str:
     )
 
 
-def _answer_block(response_text: str) -> str:
-    """Render an answer block: the directional elbow on the first line and
-    exactly four ASCII spaces on every continuation line."""
+def _answer_block(response_text: str, decorated: bool = True) -> str:
+    """Render an answer block.
+
+    ``decorated`` (question-shown mode): the directional elbow on the first
+    line and exactly four ASCII spaces on every continuation line.
+    Plain (question-hidden mode): the answer text exactly as produced — the
+    elbow is part of the quoted-question design and must never appear
+    without the question, so no connector or separator is added.
+    """
     lines = _presentation_lines(response_text)
     if not lines:
-        return _ANSWER_MARK
+        return _ANSWER_MARK if decorated else ""
+    if not decorated:
+        return "\n".join(lines)
     prefix = _RTL_ANSWER_PREFIX if _is_rtl_text(response_text) else _LTR_ANSWER_PREFIX
     rendered = [f"{prefix}{lines[0]}"]
     rendered.extend(f"{_ANSWER_INDENT}{line}" for line in lines[1:])
@@ -350,14 +359,14 @@ def format_presentation(user_message: str, response_text: str, show_question: bo
     """ANSWER state: the final presentation for a produced answer.
 
     With ``show_question`` the question block and exactly one blank bar
-    connector precede the answer; without it the result is ONLY the answer
-    presentation (no question bars anywhere). ``show_question`` is presentation state
-    only: it changes nothing about the model input, history, prompts,
-    providers, or tools.
+    connector precede the decorated answer; without it the result is the
+    PLAIN answer text only — no `│`, no `─`, no elbow, no replacement
+    separator. ``show_question`` is presentation state only: it changes
+    nothing about the model input, history, prompts, providers, or tools.
     """
-    answer = _answer_block(response_text)
     if not show_question:
-        return answer
+        return _answer_block(response_text, decorated=False)
+    answer = _answer_block(response_text)
     question = _question_block(user_message)
     if not question:
         return answer
@@ -543,6 +552,20 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
         if _utf16_units(candidate) < SAFE_LIMIT - _MIN_SPLIT_CHUNK:
             prefix = candidate
     footer_reserve = _utf16_units("\n\n_(9/99)_") + 2
+    if not show_question:
+        # Plain mode: no presentation prefix and no per-page elbow — each
+        # page is the answer text itself, so no connector can leak into a
+        # question-hidden continuation chunk either.
+        budget = max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - footer_reserve)
+        pages = _paginate(response_text, budget)
+        if len(pages) == 1:
+            return _split_text(full, SAFE_LIMIT)
+        chunks = [pages[0]]
+        chunks.extend(
+            _format_continuation(page, index, len(pages))
+            for index, page in enumerate(pages[1:], 2)
+        )
+        return chunks
     budget = max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - _utf16_units(prefix) - footer_reserve)
     pages = _paginate(response_text, budget)
     if len(pages) == 1:

@@ -1002,14 +1002,21 @@ async def _ai_toggle_show_question_action(event, extra: str, chat_id: int) -> tu
 
     Presentation-only and DURABLE: stored on the owner's ``ai_config`` row via
     the existing config-store mechanism, so it survives restarts. Only the
-    chat rendering reads it.
+    chat rendering reads it. The re-rendered panel reflects what the
+    authoritative config now actually says — when the durable write failed
+    the panel shows the failure notice instead of silently displaying the
+    old state as if the toggle had succeeded.
     """
     from backend.ai import config_store
 
     owner_id = await _get_owner_id()
     current = bool((await config_store.get_config(owner_id)).get("show_question", False))
-    await config_store.update_setting(owner_id, "show_question", not current)
-    return await _ai_settings_panel_handler(event, extra)
+    persisted = await config_store.update_setting(owner_id, "show_question", not current)
+    result = await _ai_settings_panel_handler(event, extra)
+    if not persisted and result is not None:
+        title, body, buttons = result
+        result = (title, "× Couldn't save — the panel shows the saved state. Try again.\n\n" + body, buttons)
+    return result
 
 
 async def _ai_diagnostics_panel_handler(event, extra: str) -> tuple[str, str, list] | None:

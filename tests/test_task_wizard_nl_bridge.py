@@ -436,7 +436,7 @@ async def test_normalization_failure_is_logged_and_still_delivered(monkeypatch, 
     assert "ValueError" in caplog.text
     assert "nonempty_after_strip=True" in caplog.text
     # The response still reached the owner (raw fallback), never hidden.
-    assert edits == ["└─ " + text]
+    assert edits == [text]
 
 
 @pytest.mark.asyncio

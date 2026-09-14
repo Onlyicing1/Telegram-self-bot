@@ -1,5 +1,85 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## Latest phase — toggle honesty fix + plain hidden-question presentation
+
+Two remaining user-confirmed defects were fixed. The full callback chain
+(Settings button → `_handle_action` → `_ai_toggle_show_question_action` →
+`_get_owner_id` → `config_store.get_config` → `update_setting` → `save_config`
+→ panel re-read/re-render) was traced end to end before changing anything.
+
+### Bug 1 — hidden-question mode still showed the answer connector
+
+**Root cause.** `format_presentation(..., show_question=False)` returned
+`_answer_block(..., decorated=True)`, which always prepends the directional
+elbow (`└─ ` / ` ─┘ `). The elbow is part of the quoted-question design, so
+rendering it without the question contradicted the presentation contract.
+
+**Fix** (`backend/ai/tools/delivery.py`): `_answer_block` gained a
+``decorated`` flag; hidden-question mode renders the plain answer text —
+no `│`, no `─`, no elbow, no replacement separator. The decorated path
+(question shown) is unchanged: question bars, exactly one blank `│`
+connector, directional elbow chosen from the rendered text's dominant
+direction (first strong character for mixed text), four-ASCII-space
+continuation lines. Oversized answers: the chunker now paginates plain-mode
+answers without a per-page elbow, so a hidden-question continuation chunk can
+never leak a connector either.
+
+### Bug 2 — the Settings toggle did not actually toggle
+
+**Root cause.** The toggle logic itself was correct; the failure was the
+DB-write fallback semantics in `backend/ai/config_store.py`:
+`_save_config_sync`/`save_config` caught a failed durable write, stored the
+value only in the in-memory `_fallback_config`, and returned `True`
+("success"). The panel then re-read the config, which prefers the database —
+so the panel re-rendered the OLD durable state every time. In production
+(healthy reads, failing writes — e.g. a stale PostgREST schema cache before
+the `show_question` column is visible), this is exactly a toggle that "does
+not toggle", with no error anywhere.
+
+**Fix.**
+* `backend/ai/config_store.py` — `save_config`/`_save_config_sync` now return
+  `False` when the durable `ai_config` row was NOT written (the RAM fallback
+  still keeps the value for this process, per the documented degradation, but
+  it is no longer reported as durable persistence).
+* `backend/bot/handlers/ai.py` — `_ai_toggle_show_question_action` surfaces an
+  honest failure notice ("× Couldn't save — the panel shows the saved state.
+  Try again.") instead of silently re-rendering the old state as if the
+  toggle had succeeded.
+
+No SQL was executed and no schema change was made (`show_question` already
+exists; migration `20260913000000_add_ai_config_show_question.sql` is
+unchanged). No new store, cache, provider, scheduler, or subsystem.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused presentation/toggle tests (`tests/test_ai_presentation_redesign.py`) | **40 passed** |
+| Focused + adjacent delivery/wizard/settings/telemetry/retry/reply/silent-delete suites | **202 passed** |
+| Full suite `pytest tests -q` | **2580 passed, 24 skipped, 0 failed** |
+| `py_compile` changed files / `git diff --check` | OK / clean |
+
+New regression coverage: OFF-mode is plain text (no `│`/`─`/`└`/`┘`, byte-equal
+to the answer); ON-mode structure, RTL/LTR/mixed/neutral connector, four-space
+continuation, thinking/failure states connector-free; real toggle round-trip
+(False→True→False against a Supabase-shaped fake), immediate re-render of the
+new state (state line AND button label), fresh-store restore of the persisted
+value, honest-failure path (write fails → persisted value unchanged, notice
+shown, `save_config` returns False), single-owner/single-row write proof with
+the exact `show_question: True` payload.
+
+### Limitations
+
+* The fallback-mode preference (no Supabase env) is intentionally unchanged:
+  RAM-only for the process lifetime, never durable — that is the documented
+  DB-unavailable degradation, now honestly reported.
+* Exact Telegram-client rendering (RTL elbow alignment, four-space column)
+  still requires live-device verification; everything above is in-process
+  evidence.
+
+---
+
+
 ## Latest phase — Presentation corrections: durable preference, direction-aware connector, distinct states
 
 Four confirmed defects in the previous presentation redesign were fixed. All

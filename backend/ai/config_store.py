@@ -117,19 +117,30 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
         logger.info("[AI_CONFIG] save_config OK owner_id=%s provider='%s' model='%s'", owner_id, payload["provider"], payload["model"])
         return True
     except Exception as exc:
-        logger.warning("[AI_CONFIG] DB save failed for owner_id=%s: %s — saving to fallback", owner_id, exc)
+        # The durable row was NOT updated. The in-memory fallback keeps the
+        # value available for this process (documented degradation), but this
+        # must be reported as a FAILED save: callers that re-read the config
+        # (which prefers the DB) would otherwise render a state the durable
+        # store never accepted — e.g. a Settings toggle that "doesn't toggle".
+        logger.warning("[AI_CONFIG] DB save failed for owner_id=%s: %s — fallback only (NOT durable)", owner_id, exc)
         _fallback_config[owner_id] = dict(config)
-        return True
+        return False
 
 
 async def save_config(owner_id: int, config: dict[str, Any]) -> bool:
-    """Save AI config for an owner. Upserts the row."""
+    """Save AI config for an owner. Upserts the row.
+
+    Returns True only when the durable ``ai_config`` row was written. When
+    the write fails (or no DB is available) the value is kept in the
+    in-memory fallback for this process and False is returned, so callers
+    can honestly distinguish durable persistence from temporary RAM state.
+    """
     try:
         return await _run_sync(_save_config_sync, owner_id, config)
     except Exception as exc:
-        logger.warning("[AI_CONFIG] save_config failed for owner_id=%s: %s — saving to fallback", owner_id, exc)
+        logger.warning("[AI_CONFIG] save_config failed for owner_id=%s: %s — fallback only (NOT durable)", owner_id, exc)
         _fallback_config[owner_id] = dict(config)
-        return True
+        return False
 
 
 async def update_provider(owner_id: int, provider: str, model: str = "") -> bool:

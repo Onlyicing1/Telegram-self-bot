@@ -81,8 +81,8 @@ async def test_integration_delivery_uses_centralized_processor():
     from backend.ai.tools.delivery import deliver_response
     result = await deliver_response(SimpleNamespace(edit=edit, reply=reply), "Nova hi", "**سلام**  ، دنیا!")
     assert result.success
-    # Persian answer → mirrored RTL elbow
-    assert edits == [" ─┘ سلام، دنیا!"]
+    # question hidden (default) → plain answer text, no connector
+    assert edits == ["سلام، دنیا!"]
     assert replies == []
 
 
@@ -348,7 +348,7 @@ async def test_integration_delivery_uses_repaired_output():
         "set the file_name to 2*3*4",
     )
     assert result.success
-    assert edits == ["└─ set the file_name to 2*3*4"]
+    assert edits == ["set the file_name to 2*3*4"]
     assert replies == []
 
 
@@ -524,7 +524,7 @@ async def test_delivery_delivers_rendered_table():
         "| a | b |\n|---|---|\n| c | d |",
     )
     assert result.success
-    assert edits == ["└─ ```\n    a | b\n    --- | ---\n    c | d\n    ```"]
+    assert edits == ["```\na | b\n--- | ---\nc | d\n```"]
     assert replies == []
 
 
@@ -539,7 +539,7 @@ async def test_delivery_delivers_dot_preserved_text():
         "run main.py now and check report.txt",
     )
     assert result.success
-    assert edits == ["└─ run main.py now and check report.txt"]
+    assert edits == ["run main.py now and check report.txt"]
     assert replies == []
 
 

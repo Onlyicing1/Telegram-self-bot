@@ -47,24 +47,22 @@ _FA_QUESTION = "هی"
 _FA_ANSWER = "سلام!"
 
 
-# ── B. OFF mode: answer presentation only ────────────────────────────────────
+# ── B. OFF mode: PLAIN answer text, no connector anywhere ────────────────────
 
 
-def test_off_mode_contains_no_question_connector_structure():
+def test_off_mode_is_plain_answer_text_with_no_connector():
     out = format_presentation(_FA_QUESTION, _FA_ANSWER, False)
-    assert out == " ─┘ سلام!"  # RTL answer → mirrored elbow, no question bars
-    assert "│" not in out
+    assert out == "سلام!"
+    for glyph in ("│", "─", "└", "┘"):
+        assert glyph not in out
     assert _FA_QUESTION not in out
 
 
-def test_off_mode_multiline_rtl_answer_has_no_bars_at_all():
+def test_off_mode_multiline_rtl_answer_has_no_connector_at_all():
     out = format_presentation(_FA_QUESTION, _RTL_ANSWER, False)
-    assert "│" not in out
-    lines = out.split("\n")
-    assert lines[0].startswith(" ─┘ ")
-    for line in lines[1:]:
-        assert line.startswith("    ")
-        assert "│" not in line
+    for glyph in ("│", "─", "└", "┘"):
+        assert glyph not in out
+    assert out == _RTL_ANSWER
 
 
 # ── C. ON mode: question bars + one blank connector + answer ─────────────────
@@ -127,18 +125,19 @@ def test_rtl_answer_uses_mirrored_elbow():
 
 
 def test_mixed_direction_follows_the_first_strong_character():
-    mixed_rtl_first = format_presentation("q", "سلام دنیا this is English بعد از فارسی", False)
-    mixed_ltr_first = format_presentation("q", "this is English سلام دنیا and فارسی", False)
+    mixed_rtl_first = format_presentation("q", "سلام دنیا this is English بعد از فارسی", True).split("\n│\n", 1)[1]
+    mixed_ltr_first = format_presentation("q", "this is English سلام دنیا and فارسی", True).split("\n│\n", 1)[1]
     assert mixed_rtl_first.startswith(" ─┘ ")
     assert mixed_ltr_first.startswith("└─ ")
     # deterministic: same input, same direction decision
     for text in ("سلام دنیا this is English بعد از فارسی", "this is English سلام دنیا"):
-        once = format_presentation("q", text, False)
-        assert format_presentation("q", text, False) == once
+        once = format_presentation("q", text, True)
+        assert format_presentation("q", text, True) == once
 
 
 def test_neutral_text_defaults_to_ltr():
-    assert format_presentation("q", "12345 **bold** ---", False).startswith("└─ ")
+    answer = format_presentation("q", "12345 **bold** ---", True).split("\n│\n", 1)[1]
+    assert answer.startswith("└─ ")
 
 
 def test_direction_decided_from_the_rendered_text_not_any_language_setting():
@@ -155,8 +154,8 @@ def test_direction_decided_from_the_rendered_text_not_any_language_setting():
 
 @pytest.mark.parametrize("answer", [_LTR_ANSWER, _RTL_ANSWER])
 def test_connector_appears_only_on_the_first_answer_line(answer):
-    body = format_presentation("q", answer, False)
-    first, *rest = body.split("\n")
+    body = format_presentation("q", answer, True)
+    first, *rest = body.split("\n│\n", 1)[1].split("\n")
     assert first.lstrip(" ").startswith(("└─", "─┘"))
     for line in rest:
         assert not ("└─" in line or "─┘" in line)
@@ -344,7 +343,7 @@ def test_renderer_does_not_depend_on_execution_telemetry_as_source_of_truth():
 
     broken = _Broken()
     with patch.object(telemetry_module, "telemetry", broken):
-        assert delivery.format_presentation(_FA_QUESTION, _FA_ANSWER, False) == " ─┘ سلام!"
+        assert delivery.format_presentation(_FA_QUESTION, _FA_ANSWER, False) == "سلام!"
         assert delivery.format_thinking(_FA_QUESTION, True) == "│ هی\n│\nThinking…"
 
 
@@ -464,7 +463,10 @@ async def test_answer_edits_the_original_message_with_stored_preference(stored_p
     if stored_pref:
         assert final == "│ هی\n│\n ─┘ پاسخ من"
     else:
-        assert final == " ─┘ پاسخ من"
+        # hidden question → PLAIN answer text, no connector of any kind
+        assert final == "پاسخ من"
+        for glyph in ("│", "─", "└", "┘"):
+            assert glyph not in final
     # thinking/status edits never contain the answer elbow
     for edit in captured["edits"][:-1]:
         assert "└" not in edit and "┘" not in edit
@@ -484,7 +486,7 @@ async def test_preference_changes_presentation_but_not_the_model_request():
     assert on["message_id"] == off["message_id"] == 456
     # only the rendered presentation differs
     assert on["edits"][-1] == "│ هی\n│\n ─┘ پاسخ من"
-    assert off["edits"][-1] == " ─┘ پاسخ من"
+    assert off["edits"][-1] == "پاسخ من"
 
 
 @pytest.mark.asyncio
@@ -549,7 +551,16 @@ def test_chunked_delivery_keeps_rules_and_utf16_safety():
         assert all(_utf16_units(chunk) <= SAFE_LIMIT for chunk in chunks)
         for chunk in chunks:
             assert "🤖" not in chunk and "────────────" not in chunk
-            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", chunk)
+        if not show:
+            # plain-mode chunks: no connector glyphs anywhere, each page is
+            # the raw answer text plus only the continuation footer
+            for chunk in chunks:
+                for glyph in ("│", "─", "└", "┘"):
+                    assert glyph not in chunk
+            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", chunks[0])
+            assert body == _paginate_answer_head(response)
+        else:
+            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", chunks[0])
             lines = body.split("\n")
             elbows = [l for l in lines if l.lstrip(" ").startswith(("└─", "─┘"))]
             # exactly one directional elbow per chunk: its first answer line
@@ -558,8 +569,190 @@ def test_chunked_delivery_keeps_rules_and_utf16_safety():
                 if line is elbows[0] or line.startswith("│"):
                     continue
                 assert line.startswith("    ")
-        if not show:
-            assert not any("│" in chunk for chunk in chunks)
-        else:
             assert chunks[0].startswith("│ سؤال من\n│\n")
             assert sum(1 for line in chunks[0].split("\n") if line == "│") == 1
+
+
+def _paginate_answer_head(response: str) -> str:
+    """The raw answer text of the first plain-mode page — the exact payload
+    delivered when the question is hidden."""
+    from backend.ai.tools.delivery import _MIN_SPLIT_CHUNK, _paginate
+
+    footer_reserve = _utf16_units("\n\n_(9/99)_") + 2
+    budget = max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - footer_reserve)
+    pages = _paginate(response, budget)
+    return pages[0]
+
+
+# ── Toggle: durable round-trip, owner consistency, honest failure ────────────
+
+
+class _ToggleTable:
+    """Supabase-shaped ai_config table for the toggle round-trip.
+
+    Mirrors the real client shape: select→eq→maybe_single probes, then
+    update/insert + eq. ``fail_write`` makes every write raise (schema-cache
+    miss) while reads keep working — the exact DB state that used to make
+    the toggle silently not toggle.
+    """
+
+    def __init__(self, store: dict, fail_write: bool, payloads: list) -> None:
+        self._store = store
+        self._fail_write = fail_write
+        self._payloads = payloads
+        self._owner = None
+        self._payload = None
+
+    def select(self, *_a):
+        return self
+
+    def eq(self, _key, value):
+        self._owner = value
+        return self
+
+    def maybe_single(self):
+        return self
+
+    def update(self, payload=None):
+        if self._fail_write:
+            raise RuntimeError("PGRST204: Could not find the 'show_question' column")
+        self._payload = payload
+        return self
+
+    def insert(self, payload):
+        if self._fail_write:
+            raise RuntimeError("PGRST204: Could not find the 'show_question' column")
+        self._payload = payload
+        return self
+
+    def execute(self):
+        class _Result:
+            data = None
+
+        if self._payload is not None:
+            self._payloads.append(dict(self._payload))
+            owner = self._owner if self._owner is not None else self._payload.get("owner_id")
+            self._store[owner] = dict(self._payload)
+            self._payload = None
+        else:
+            row = self._store.get(self._owner)
+            _Result.data = dict(row) if row else None
+        return _Result()
+
+
+class _ToggleDB:
+    def __init__(self, fail_write: bool = False) -> None:
+        self.store: dict = {}
+        self.payloads: list[dict] = []
+        self._fail_write = fail_write
+
+    def table(self, _name):
+        return _ToggleTable(self.store, self._fail_write, self.payloads)
+
+
+async def _toggle_roundtrip(pressed_times: int):
+    """Press the real Settings toggle N times against a healthy DB and return
+    the persisted values after each press."""
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+
+    config_store._fallback_config.clear()
+    db = _ToggleDB()
+    owner = 4242
+    persisted_values = []
+    with patch.object(config_store, "_get_db", lambda: db), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=owner)):
+        # pressed_times = 0 → the initial panel must read the persisted state
+        for _ in range(pressed_times):
+            result = await ai_mod._ai_toggle_show_question_action(None, "", owner)
+            assert result is not None
+            body = result[1]
+            assert "Couldn't save" not in body
+            persisted_values.append((await config_store.get_config(owner))["show_question"])
+    return persisted_values, db
+
+
+@pytest.mark.asyncio
+async def test_toggle_roundtrip_flips_the_persisted_value_each_press():
+    from backend.bot.handlers import ai as ai_mod
+
+    values, _ = await _toggle_roundtrip(2)
+    # initial persisted default False → first press must flip to True,
+    # second press must flip back to False
+    assert values == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_toggle_renders_the_new_state_immediately():
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+
+    config_store._fallback_config.clear()
+    db = _ToggleDB()
+    owner = 4243
+    with patch.object(config_store, "_get_db", lambda: db), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=owner)):
+        first = await ai_mod._ai_toggle_show_question_action(None, "", owner)
+        second = await ai_mod._ai_toggle_show_question_action(None, "", owner)
+    assert "My message in replies · On" in first[1]
+    texts = [getattr(btn, "text", "") for row in first[2] for btn in row]
+    assert "Turn my message in replies off" in texts
+    assert "My message in replies · Off" in second[1]
+    texts = [getattr(btn, "text", "") for row in second[2] for btn in row]
+    assert "Turn my message in replies on" in texts
+
+
+@pytest.mark.asyncio
+async def test_fresh_read_and_fresh_store_restore_the_persisted_value():
+    from backend.ai import config_store
+
+    _, db = await _toggle_roundtrip(1)
+    # a fresh read through a brand-new config-store state restores the value
+    with patch.object(config_store, "_get_db", lambda: db):
+        config_store._fallback_config.clear()
+        assert (await config_store.get_config(4242))["show_question"] is True
+
+
+@pytest.mark.asyncio
+async def test_toggle_failure_is_honest_neither_silent_nor_false_success():
+    """When the durable write fails, the toggle must NOT claim success: the
+    persisted value stays unchanged and the panel says so."""
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+
+    config_store._fallback_config.clear()
+    db = _ToggleDB(fail_write=True)
+    owner = 4244
+    with patch.object(config_store, "_get_db", lambda: db), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=owner)):
+        result = await ai_mod._ai_toggle_show_question_action(None, "", owner)
+        assert result is not None
+        assert "Couldn't save" in result[1]
+        # the durable row never changed
+        assert (await config_store.get_config(owner))["show_question"] is False
+        # and save_config honestly reports the failure
+        assert await config_store.update_setting(owner, "show_question", True) is False
+
+
+@pytest.mark.asyncio
+async def test_toggle_uses_one_owner_and_the_authoritative_config_row():
+    """The whole toggle path — read, write, re-render — must touch the SAME
+    owner's ai_config row and nothing else."""
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+
+    config_store._fallback_config.clear()
+    db = _ToggleDB()
+    owner = 4245
+    other_owner = 9999
+    with patch.object(config_store, "_get_db", lambda: db):
+        with patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=owner)):
+            await ai_mod._ai_toggle_show_question_action(None, "", owner)
+    # exactly one durable row was written, for the resolved owner
+    assert set(db.store) == {owner}
+    payloads = [p for p in db.payloads if "owner_id" in p]
+    assert len(payloads) == 1 and payloads[0]["owner_id"] == owner
+    assert payloads[0]["show_question"] is True
+    # the other owner's row is untouched by the toggle
+    with patch.object(config_store, "_get_db", lambda: db):
+        assert (await config_store.get_config(other_owner))["show_question"] is False
