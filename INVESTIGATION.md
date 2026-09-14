@@ -1341,3 +1341,319 @@ intended semantic target") is now split precisely: the source-provable parts
 are SAFE, ID provenance is a GAP, and only the Telegram-side identifier
 lifetime question remains UNCERTAIN. No fix was implemented for either Stage I
 or Stage J; both are investigation results only.
+
+---
+
+## Stage K — Telegram surrounding-message provenance
+
+> **Investigation only.** Same audited revision (`fdcc798`, `feat: add Telegram
+> surrounding message context for AI`). No production code, tests, schema,
+> migrations, presentation, provider, scheduler, or prompt formatting was
+> modified. No live Telegram, Supabase, Render, or provider call was made. Only
+> this document changed.
+
+### K1. Scope
+
+Given the live Telegram observation that the newly-added surrounding-message
+context contains previous self-bot/AI output, determine **whether the current
+architecture can reliably distinguish**, for every message in that window:
+
+| Case | Meaning |
+|---|---|
+| **A** | a genuine, human-authored owner message |
+| **B** | a human owner message later edited **in place** by the AI |
+| **C** | a message **created** by the self-bot/AI as a new Telegram message |
+| **D** | a temporary AI status/presentation message |
+| **E** | another participant's message |
+| **F** | a durable or request-scoped marker that separates the above |
+
+The task explicitly forbids solving this by dropping every `sender_id ==
+owner_id` message, because the owner legitimately produces both human messages
+and AI-touched messages from the same account.
+
+### K2. Current surrounding-context behavior (traced)
+
+```
+Telegram event
+  → ai_unified._execute_ai                (ai_unified.py:572)
+      request_chat_id      = event.chat_id                 (:594)
+      request_message_id   = event.message.id              (:595)
+      _load_telegram_chat_context(...)                     (:539)
+  → fetch_telegram_chat_context           (telegram_context.py:364)
+      _read_window: client.iter_messages(chat_id,
+           limit=MAX_CONTEXT_MESSAGES, max_id=message_id)  (:309-320)
+  → build_chat_context                    (telegram_context.py:241)
+      drop current id + exclude_message_ids (reply target) (:262-270)
+      drop any id > anchor ("never invent future")         (:271-274)
+      sort ascending, cap 10, 200 chars/message, 1500 total
+      _to_record -> TelegramContextMessage                 (:205-222)
+  → AIRequest(telegram_context=snapshot)  (ai_unified.py:668)
+  → ContextBuilder → PromptBuilder render (`[Telegram Chat Context]`)
+```
+
+**The window applies no provenance filter of any kind.** `_to_record` reads
+`out` (`telegram_context.py:218`) and `sender_id` (:210), but `out` is used only
+for the render attribution label `"You"` (:117-125) and to skip sender-name
+resolution (:332). Every message the owner's account appears to have sent is
+included verbatim — human-authored, AI-edited, or AI-created alike. The
+per-message `body` is the message's **current** text (:184-190), which for an
+AI-edited message is the AI answer.
+
+Hard bounds (unchanged by this stage): 10 messages, 200 chars/message,
+1500 chars total, <=4 sender resolutions, 3.0 s wall-clock
+(`telegram_context.py:40-52`).
+
+### K3. Provenance data actually available (per message)
+
+Every field below was traced in source; nothing is assumed.
+
+| Field | Source | Provenance value |
+|---|---|---|
+| `msg.id` | Telegram; read at `telegram_context.py:214` | identity only — carries no authorship |
+| `msg.out` | read at `:218` | True for **any** owner-account message (A, B, C). Cannot separate human from AI |
+| `msg.sender_id` | read at `:210` | equals the owner for A, B, C. Cannot separate |
+| `msg.from_id` | same lineage as `sender_id` | same limitation |
+| `msg.date` | read at `:220` | send time; an AI in-place edit does **not** change it |
+| `msg.edit_date` | Telegram attribute, **never read by this module** | set on any edit — including the AI's in-place delivery, but also on human edits. Not authoritative (see K9) |
+| `msg.message` / `msg.text` | read at `:184-190` | the **current** text; for B this is already the AI answer. Content is renderer-owned, not a marker |
+| `msg.reply_to` | not read | reply linkage only |
+| `msg.media` | via `classify_message` at `:192-203` | media presence only |
+
+Request/event-level provenance:
+
+| Signal | Source | Covers |
+|---|---|---|
+| `event.message.id`, `event.chat_id` | `ai_unified.py:594-595` | the current trigger message only |
+| `ReplyContext.is_ai_message`, `ai_session_id`, `ai_role`, `ai_content` | `context_builder.py:69`; produced at `ai_unified.py:493-527`; consumed at `builder.py:294` | the **replied-to** message only |
+| **`ReplyResolver`** (`get_resolver()`) | `backend/ai/context/reply_resolver.py` | **the only positive source-level marker that a given Telegram message ID holds AI output** |
+
+`ReplyResolver` is an in-memory singleton: `register(telegram_msg_id, ...)`
+(`reply_resolver.py:81-128`) and `resolve(id)` (`:130-141`), RAM-only, with an
+LRU cap of `_MAX_ENTRIES = 500` (`:26`, eviction at `:120-127`) and **no
+persistence**. It is written after a successful in-place delivery at
+`ai_unified.py:803` (`telegram_msg_id=event.message.id`) and read for the
+reply-to-AI check at `:495` and `:949`.
+
+Task-side provenance (`task_contract.py`) exists but is **not applicable** here:
+`SCHEDULED_OCCURRENCE_EXTRA` (`:21`), `trusted_message_ids` (`:139`), and
+`message_reference_provenance_error` (`:190`) govern *task-creation argument*
+authority, not the surrounding-window read.
+
+### K4. Message lifecycle analysis
+
+**Case B is the reported symptom, and it is structural.** The AI never sends a
+separate answer for the primary path: `deliver_response` edits the triggering
+message in place (`delivery.py:668` `await event.edit(messages[0])`), and the
+status/thinking states are edits of that same message
+(`ai_unified.py:676`, `:681`; `delivery.format_status` :435,
+`format_thinking` :424). So:
+
+```
+T0  owner types  "هی"                    -> id 100, out=True, sender=owner
+T1  AI eats it and edits id 100 in place -> id 100, out=True, sender=owner,
+                                            text="└─ سلام...", edit_date bumped
+T2  owner asks something else            -> id 101
+    surrounding window for id 101 = [id 100]
+    id 100 renders as  "You: └─ سلام..."
+```
+
+The Telegram message keeps the owner's id, the owner's `sender_id`, and
+`out=True`. **`out=True` (or `sender_id == owner_id`) therefore does not prove
+human authorship** — exactly the case the task flagged.
+
+**Case C exists and is unmarked.** The self-bot also creates *new* Telegram
+messages, none of which are registered anywhere:
+
+| Producer | Source | Registered? |
+|---|---|---|
+| chunked/split AI answer (`messages[1:]`) | `delivery.py:679` `event.reply(message)` | **no** (returned `Message` discarded) |
+| edit-failure fallback for the first chunk | `delivery.py:673` `event.reply(messages[0])` | **no** |
+| error/failure fallback reply | `ai_unified.py:831` `event.reply(final_text)` | **no** |
+| scheduled `send_message` action | `tools/message.py:133` `telegram.send_message(chat_id, text)` | **no** |
+| task result delivery | `task_execution.py:727` `telegram.send_message(chat_id, text)` | **no** |
+| task outcome notification | `supervisor.py:380` `TelegramAPI(self.client).send_message(owner, message)` | **no** |
+| Deep Save re-upload to Saved Messages | `save_service.py:397`, `:428` `send_message("me", ...)` / `send_file` | **no** |
+
+Only `event.message.id` (`ai_unified.py:803`) is ever registered — one id per AI
+turn, for the edited trigger message only.
+
+**Case D is not a separate Telegram message on the primary path.**
+`format_thinking` :424 / `format_status` :435 / `format_failure` :449 are all
+rendered into the *same* triggering message by `event.edit(...)`
+(`ai_unified.py:610`, `:624`, `:676`, `:681`, `:851`) and are overwritten by the
+final answer. A transient string such as `Reading messages...` is therefore a
+**state of a case-B message**, not a distinct message, and needs no separate
+filter. (When delivery falls back to `event.reply`, the transient/final text
+becomes a **case-C** message instead.)
+
+**Case E** is trivially distinct: `out=False` and `sender_id != owner` (the
+window already renders such senders by display name at
+`telegram_context.py:117-125`, `:323-361`).
+
+### K5. Owner-authored vs AI-edited messages
+
+The distinction is **provable in-process and only in-process**:
+
+- `get_resolver().resolve(id) is not None` ⇒ that Telegram message's content was
+  replaced by an AI answer (case B).
+- `resolve(id) is None` ⇒ **not proof of human authorship** (case A). It also
+  covers a case-B message whose marker was evicted (LRU cap 500) or lost to a
+  process restart — the resolver is RAM-only (`reply_resolver.py:26`, and the
+  module docstring's "process-wide in-memory singleton" contract).
+
+This asymmetry matters: the resolver is usable as a **denylist** ("exclude what
+we positively know is AI") but never as an allowlist ("keep only what we know is
+human"). Using it as a denylist is conservative and cannot remove a genuine
+human message.
+
+The same marker is already used this way in the very same handler for the
+reply target (`ai_unified.py:493-495`, `:945-949` →
+`ReplyContext.is_ai_message`), so the mechanism is pre-existing architecture,
+not a new one.
+
+### K6. AI-generated message detection
+
+| Sub-case | Detectable from current source? | Mechanism |
+|---|---|---|
+| B — in-place AI answer (the reported symptom) | **YES** | `ReplyResolver.resolve(id) is not None` |
+| C — new self-bot message (chunks, fallbacks, sends, notifications, saves) | **NO** | no marker is recorded anywhere |
+| D — status/thinking text | **N/A** | not a separate message; it is case B/C |
+| A — human message | only as "not known to be AI" | absence in the resolver |
+| E — other participant | **YES** | `out=False` |
+
+### K7. Temporary/status message detection
+
+Status/thinking/failure strings are in-place edits of the trigger message
+(`ai_unified.py:676`, `:681`, `:610`, `:624`, `:851`). Because `iter_messages`
+returns the message's **current** content, a transient status string is never
+observed as a separate surrounding message; by the time a later request reads
+the window, that id holds either the final answer (case B) or the failure text
+(still the same id). No status-specific filter is required — filtering case B
+by the resolver subsumes it.
+
+### K8. Safe filtering possibilities (source-provable)
+
+1. **Keep case E, drop nothing else by sender.** `out=False` messages render as
+   the other participant (`telegram_context.py:117-125`) and must stay.
+2. **Exclude messages positively identified as AI output** — the denylist:
+   exclude any window message id for which `ReplyResolver.resolve(id)` returns a
+   record. This is deterministic, provider-independent, needs no schema, and
+   cannot remove a human message that the system does not *know* to be AI
+   (K5). It reuses the exact mechanism already applied to the reply target.
+3. **Preserve the existing exclusions** — the current trigger id and the reply
+   target (`telegram_context.py:262-270`; `ai_unified.py:539`, `exclude`); and
+   never read anything at or after the anchor (`:271-274`).
+4. **Preserve attribution** — an AI-cleared window must still render genuine
+   owner messages as `You` and other participants by name; nothing about the
+   prompt contract, ordering, bounds, or authority statement changes.
+
+### K9. Unsafe heuristics (must not be used)
+
+| Heuristic | Why it is unsafe |
+|---|---|
+| Text matching on `│`, `─`, `┘`, `└─`, `┘─` | Presentation is renderer-owned and has already changed three times (`IMPLEMENTATION_REPORT.md` RTL phases). Not an authoritative provenance mechanism |
+| Text matching on `Reading messages...`, the trigger word, the AI name, `🤖` | These are human-reproducible strings; a human message may contain them and a future status string may not |
+| `sender_id == owner_id` / `out=True` | Removes cases A and B together — explicitly forbidden, and would delete legitimate human context (K4) |
+| `edit_date is not None` | Humans edit messages too; not read by the module today, and not authoritative |
+| Length, recency, Markdown/formatting shape, emoji presence | Correlation, not provenance |
+| `is_ai_message` applied to the *whole* window | The field is derived from the resolver for the reply target only; treating it as ground truth for arbitrary messages would be an allowlist built on absence (K5) |
+| Asking the provider/model to classify provenance | Non-deterministic and provider-dependent; the task forbids provider-dependent protection |
+
+### K10. CONFIRMED SAFE
+
+- Other participants are identifiable: `out=False` + `sender_id`
+  (`telegram_context.py:210`, `:218`, `:117-125`).
+- Current trigger message and reply target are already excluded
+  (`telegram_context.py:262-270`; `ai_unified.py:539` exclude tuple).
+- Messages at/after the anchor are never included (`telegram_context.py:271-274`).
+- A positive, in-process marker for AI-in-place content exists: `ReplyResolver`
+  (`reply_resolver.py:81-141`), written after a successful delivery
+  (`ai_unified.py:803`) and already consumed by `ReplyContext` (`:493-527`;
+  `context_builder.py:69`; `builder.py:294`).
+- Status/thinking/presentation strings do not persist as separate Telegram
+  messages on the primary path (`ai_unified.py:676`, `:681`, `:851`).
+
+### K11. CONFIRMED GAP
+
+- **G-K1 — The surrounding window has no provenance filter at all.** `_to_record`
+  reads `out`/`sender_id` only for display (`telegram_context.py:205-222`,
+  `:117-125`); `build_chat_context` never consults anything provenance-related
+  (`:241-297`). This is the direct cause of the observed symptom.
+- **G-K2 — New self-bot messages are unmarked.** Chunked answers, edit-failure
+  fallbacks, scheduled sends, task results/notifications, and Deep Save uploads
+  create Telegram messages (`delivery.py:673`, `:679`; `ai_unified.py:831`;
+  `message.py:133`; `task_execution.py:727`; `supervisor.py:380`;
+  `save_service.py:397`, `:428`) whose ids are discarded (`deliver_response`
+  returns only counts — `delivery.py:635-683`) and never registered.
+- **G-K3 — Provenance is not durable.** The only marker is RAM-only and
+  LRU-evicted at 500 entries (`reply_resolver.py:26`, `:120-127`), so after a
+  restart *no* previously AI-edited message can be recognized.
+
+### K12. UNCERTAIN
+
+- **U-K1** — Whether the live chat's residual AI text is case B only or also
+  case C. Source cannot decide it without the actual chat; the two cases need
+  different minimum fixes (K13).
+- **U-K2** — Whether the owner ever triggers the AI in Saved Messages, where the
+  Deep Save re-uploads (`save_service.py:397`, `:428`) and scheduled
+  `send_message` output (`message.py:133`) accumulate as `out=True` messages.
+- **U-K3** — Whether provenance must survive a process restart. The reported
+  behavior is live-process; if a restart is involved, even case B becomes
+  unrecognizable (K11, G-K3).
+- **U-K4** — Whether Telegram's `edit_date` is populated for the in-place AI
+  edit on every client (relevant only if someone proposes it as a fallback; not
+  needed for the resolver path).
+
+### K13. Minimum required fix surface (not implemented)
+
+**Phase 1 — use the marker that already exists (fixes the observed symptom, no
+schema, no new subsystem).** Thread provenance into the window build as a
+predicate/exclusion set computed once in `_load_telegram_chat_context`, where
+`get_resolver` is *already* imported and used (`ai_unified.py:493`, `:945`):
+
+| File | Change |
+|---|---|
+| `backend/ai/conversation/telegram_context.py` | optional `is_ai_message` / `exclude_ai_ids` input to `build_chat_context` and `fetch_telegram_chat_context`; one filter in the existing exclusion loop (`:262-270`) |
+| `backend/bot/handlers/ai_unified.py` | supply `get_resolver().resolve` at the single call site (`:539`) — the one Telegram read is preserved |
+
+This removes case B (previous in-place AI answers) deterministically and leaves
+keep-cases A and E untouched.
+
+**Phase 2 — only if U-K1 shows case C in the live chat.** Extend the existing
+registry rather than adding one: capture the `Message` objects that
+`delivery.deliver_response` currently discards (`delivery.py:673`, `:679`) and
+register their ids through the same `ReplyResolver`. Reuses the existing map;
+no new store, no schema.
+
+**Explicitly not required:** any database column/table or migration, a second
+history system, a message database, new Telegram polling, prompt-format changes,
+or changes to delivery, providers, scheduler, ToolExecutor, Taskloom, or the AI
+runtime history.
+
+### K14. Recommendation for the next stage
+
+Proceed with **Phase 1 only** as Stage L: implement the bounded
+`ReplyResolver`-based exclusion for the surrounding window, with focused tests
+using a fake client and a fake resolver proving that (a) a previously AI-edited
+message id is excluded from the window, (b) a genuine owner message is kept and
+still renders as `You`, (c) another participant's message is kept, (d) an empty
+resolver leaves current behavior byte-identical, and (e) the single-read and
+all existing bounds (10 / 200 / 1500 / 4 / 3.0 s) are unchanged. Do **not**
+introduce a new provenance store or text-based heuristic. Then observe the live
+chat once more to resolve U-K1 and decide whether Phase 2 (registering new
+self-bot message ids) is needed.
+
+### K15. Stage K verdict
+
+| Property | Verdict | Decisive evidence |
+|---|---|---|
+| Can the system tell other participants from the owner? | **CONFIRMED SAFE** | `out`/`sender_id` read and rendered (K10) |
+| Can the system positively identify an in-place AI answer (case B)? | **CONFIRMED SAFE** (in-process) | `ReplyResolver` register/resolve, already used for the reply target (K10) |
+| Can the system identify a NEW self-bot message (case C)? | **CONFIRMED GAP** | no marker recorded; `event.reply(...)` results discarded (K11, G-K2) |
+| Does the surrounding window apply any provenance filter today? | **CONFIRMED GAP** | `_to_record` / `build_chat_context` read no provenance (K11, G-K1) |
+| Does provenance survive a restart? | **CONFIRMED GAP** | RAM-only, LRU 500 (K11, G-K3) |
+| Is text matching (`│`, `Reading messages...`, ...) acceptable? | **UNSAFE** | not authoritative; presentation is renderer-owned (K9) |
+| Is dropping all `sender_id == owner_id` acceptable? | **UNSAFE** | removes cases A and B together; explicitly forbidden (K9) |
+| Which case caused the live symptom? | **UNCERTAIN** | needs the live chat (U-K1) |
+
+No fix was implemented. Only this document was modified.
