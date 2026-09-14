@@ -60,6 +60,15 @@ _tz_str: str = "UTC"
 _trigger_cache: dict[str, Any] = {"en": "", "fa": "", "ts": 0.0, "config": None}
 _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
+#: Envelope for one AI EXECUTION (not for waiting on a concurrency slot, which
+#: keeps ``_AI_TIMEOUT``). The inner work is already bounded: every provider HTTP
+#: call carries ``ProviderConfig.timeout`` (30s), the tool loop is bounded by
+#: ``MAX_TOOL_ROUNDS``, and the tool executor exempts ``long_running`` tools from
+#: the generic 10s tool timeout. A 60s envelope silently defeated that exemption:
+#: chunked history work (and Deep Save) were killed mid-flight and surfaced as a
+#: timeout instead of a result. This is the backstop, and it must be wide enough
+#: for the work the tool contract already declares long-running.
+_AI_EXECUTE_TIMEOUT = 240.0
 _AI_MAX_CONCURRENCY = 4
 _RPC_T = 30.0
 
@@ -668,6 +677,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             telegram_context=telegram_context,
             timezone=tz_str,
             request_id=rid,
+            timeout_s=_AI_EXECUTE_TIMEOUT,
         )
 
         async def _status_callback(status: str) -> None:
@@ -684,7 +694,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
 
         result = await asyncio.wait_for(
             engine.execute(request, status_callback=_status_callback),
-            timeout=_AI_TIMEOUT,
+            timeout=request.timeout_s or _AI_EXECUTE_TIMEOUT,
         )
         record_event("ai", "execute", 0, "SUCCESS" if result.success else "FAILED",
                      f"provider={result.provider}")
@@ -840,11 +850,14 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 logger.warning("AI handler: failed to edit no-response error: %s", exc)
 
     except asyncio.TimeoutError:
-        trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_TIMEOUT}s", rid=rid)
-        logger.error("AI handler: request timed out after %ss (id=%s)", _AI_TIMEOUT, rid)
+        # The module constant, never ``request.timeout_s``: an earlier bounded
+        # await in this block can raise TimeoutError before the request object
+        # exists.
+        trace("AI_TRIGGER_TIMEOUT", owner_id=owner_id, timeout=f"{_AI_EXECUTE_TIMEOUT}s", rid=rid)
+        logger.error("AI handler: request timed out after %ss (id=%s)", _AI_EXECUTE_TIMEOUT, rid)
         error_text = _format_error(
             display_prompt,
-            f"Request timed out after {int(_AI_TIMEOUT)} seconds.",
+            f"Request timed out after {int(_AI_EXECUTE_TIMEOUT)} seconds.",
             show_question,
         )
         try:

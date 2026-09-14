@@ -1230,6 +1230,10 @@ class Dispatcher:
         # than from model output — see task_contract's provenance rule.
         extra["request_text"] = request.user_message
         extra["request_id"] = request.request_id
+        # The caller's wall-clock envelope for this request. Long-running tools
+        # derive their internal budget from it, so no second, contradictable
+        # timeout constant exists in the tool layer.
+        extra["request_timeout_s"] = request.timeout_s
         # Capability tools must use the manager owned by this live Engine.
         # Looking up the process-global engine from inside a tool can route a
         # request through a stale/unconfigured provider mesh.

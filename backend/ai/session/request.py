@@ -25,6 +25,9 @@ Fields (from AI_MASTER_DESIGN.md §25):
   timezone:      Owner's timezone string (e.g. ``"Asia/Tehran"``).
   metadata:      Arbitrary extra metadata (future use).
   allow_tools:   Whether this request may expose or execute AI tools.
+  timeout_s:     The caller's wall-clock envelope for this request. Long-running
+                 tools derive their own internal budget from it instead of
+                 hardcoding a second, easily-contradicted limit.
 """
 from __future__ import annotations
 
@@ -55,6 +58,7 @@ class AIRequest:
         timezone:       Owner's timezone string.
         metadata:       Arbitrary extra metadata for future use.
         allow_tools:    Whether this request may expose or execute AI tools.
+        timeout_s:      Wall-clock envelope the caller allows this request.
     """
 
     session_id: str
@@ -71,3 +75,4 @@ class AIRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     request_id: str = ""
     allow_tools: bool = True
+    timeout_s: float = 60.0

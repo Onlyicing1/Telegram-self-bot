@@ -79,6 +79,17 @@ def _request_id(context: ToolContext) -> str:
     return str(value) if value else ""
 
 
+def _request_timeout(context: ToolContext) -> Any:
+    """The caller's wall-clock envelope for this request.
+
+    Set by ``Dispatcher._build_tool_context`` from ``AIRequest.timeout_s``. The
+    history AI service derives its pacing budget from it, so the tool layer owns
+    no second timeout constant. ``None`` means "use the service default".
+    """
+    extra = context.extra if context is not None else None
+    return extra.get("request_timeout_s") if extra else None
+
+
 def _count(arguments: dict[str, Any]) -> int:
     """Coerce the requested count; the history bound is applied by the service.
 
@@ -176,6 +187,7 @@ class TranslateHistoryTool(Tool):
                 provider_manager=_provider_manager(context),
                 current_message_id=_current_message_id(context),
                 request_id=request_id,
+                timeout_s=_request_timeout(context),
             )
         except Exception as exc:  # noqa: BLE001 — boundary: never crash a request
             logger.warning(
@@ -266,6 +278,7 @@ class SummarizeHistoryTool(Tool):
                 provider_manager=_provider_manager(context),
                 current_message_id=_current_message_id(context),
                 request_id=request_id,
+                timeout_s=_request_timeout(context),
             )
         except Exception as exc:  # noqa: BLE001 — boundary: never crash a request
             logger.warning(

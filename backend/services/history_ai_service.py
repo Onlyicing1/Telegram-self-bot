@@ -26,10 +26,14 @@ Rules this module exists to enforce:
     local extractive/frequency/keyword "summarizer" and no heuristic translation.
   * Chunking keeps a single request inside the existing architecture: the
     history is cut into chunks whose size is derived from the project's own
-    token estimator and the active provider's output budget, the map phase runs
-    with bounded concurrency (the provider manager's own default), and the whole
-    operation is bounded by ``LLM_BUDGET_S`` inside the AI request's 60s
-    envelope (``backend/bot/handlers/ai_unified.py::_AI_TIMEOUT``).
+    token estimator, the context budget and the active provider's output budget.
+    The map phase is PACED (``MAX_CALL_SPACING_S``) and bounded to
+    ``MAP_CONCURRENCY`` calls in flight, so a large history never arrives at a
+    provider as a burst — the burst is what used to trip a 429, and the provider
+    manager then cools that provider down for 60s, failing the whole operation.
+    The whole operation is bounded by a budget derived from the request's own
+    envelope (``AIRequest.timeout_s``, threaded through
+    ``ToolContext.extra["request_timeout_s"]``).
   * Failures are honest: a retrieval, provider, or budget failure returns
     ``success=False`` with the real reason. Partial work is never presented as a
     completed translation or summary.
@@ -55,32 +59,81 @@ SUMMARIZE = "summarize"
 #: Below this many messages a request is not worth chunking at all.
 DEFAULT_COUNT = 100
 
-#: Concurrency of the map phase. Mirrors the provider manager's own default
-#: (``backend/ai/providers/manager/manager.py::_DEFAULT_CONCURRENCY``), so this
-#: never asks the provider mesh for more parallelism than it is built for.
-MAP_CONCURRENCY = 4
-#: Conservative wall-clock allowance for one wave of concurrent map calls.
-WAVE_ALLOWANCE_S = 4.0
-#: Wall-clock budget for ALL LLM work of one request. The AI request envelope is
-#: ``ai_unified._AI_TIMEOUT`` (60s), which must also cover retrieval, the initial
-#: provider round and delivery.
-LLM_BUDGET_S = 40.0
+#: Envelope assumed only when a caller supplies none. It mirrors the handler's
+#: long-running execution backstop (``ai_unified._AI_EXECUTE_TIMEOUT``) because
+#: these tools are declared ``long_running`` — the authoritative value is always
+#: the caller's own (``AIRequest.timeout_s``, threaded through
+#: ``ToolContext.extra["request_timeout_s"]``), so a tighter caller stays
+#: tighter; this default must not silently refuse work the caller would allow.
+DEFAULT_ENVELOPE_S = 240.0
+#: Time inside the envelope reserved for retrieval, the initial provider round
+#: and final delivery. Only the remainder may be spent on chunked LLM work.
+ENVELOPE_RESERVE_S = 20.0
+#: Floor for the LLM budget, so a very small envelope still allows one call.
+MIN_LLM_BUDGET_S = 20.0
+#: Concurrency of the map phase. Bounded to 2 so a large history never puts a
+#: burst of simultaneous requests on one provider (the 429 that follows is
+#: expensive: ``providers/manager/health.py::DEFAULT_COOLDOWN_SECONDS`` cools
+#: that provider down for 60s, which then fails the rest of the operation).
+MAP_CONCURRENCY = 2
+#: Minimum interval between two map-call starts. This is the rate-limit guard:
+#: the old behaviour fired every chunk at once. 5s spacing holds a big request
+#: to at most ~12 provider calls per minute, below the per-minute quotas of the
+#: providers this project supports (e.g. Gemini free tier 15 RPM).
+MAX_CALL_SPACING_S = 5.0
 #: Bounded timeout for a single provider call. Mirrors
-#: ``backend/ai/task_interpreter.py::INTERPRET_TIMEOUT_SECONDS``.
+#: ``backend/ai/task_interpreter.py::INTERPRET_TIMEOUT_SECONDS`` and
+#: ``ProviderConfig.timeout`` (30s), the provider HTTP bound.
 PER_CALL_TIMEOUT_S = 30.0
-#: Ceiling on provider calls for one request (map phase). Derived from the
-#: budget, the wave allowance and the manager's concurrency:
-#: ``4 concurrent calls x (40s / 4s)`` = 40. A history that would need more
-#: calls than this cannot be processed inside one AI turn and is refused
-#: honestly instead of being silently truncated.
-MAX_MAP_CALLS = MAP_CONCURRENCY * int(LLM_BUDGET_S // WAVE_ALLOWANCE_S)
 
-#: Tokens of history text per chunk. Derived from existing architecture, not
-#: invented: the design allocates at most ``DEFAULT_MAX_CONTEXT_TOKENS`` to a
-#: context block, and a translated chunk is roughly as long as its input, so a
-#: chunk may use at most half of the provider's configured output budget
-#: (``ProviderConfig.max_tokens``, 4096 by default).
-CHUNK_TOKEN_BUDGET = min(DEFAULT_MAX_CONTEXT_TOKENS, ProviderConfig().max_tokens // 2)
+#: Tokens of history text per TRANSLATION chunk. A translated chunk is roughly
+#: as long as its input, so it is bounded by the provider's configured output
+#: budget (``ProviderConfig.max_tokens``, 4096 by default) as well as by the
+#: context budget.
+TRANSLATE_CHUNK_TOKEN_BUDGET = min(
+    DEFAULT_MAX_CONTEXT_TOKENS, ProviderConfig().max_tokens // 2,
+)
+#: Tokens of history text per SUMMARIZATION chunk. A chunk summary is far
+#: shorter than its input, so the binding constraint is the context budget, not
+#: the output budget — using it means far fewer provider calls for the same
+#: history (which is exactly what keeps a 500/1000-message request under the
+#: provider's rate limit).
+SUMMARIZE_CHUNK_TOKEN_BUDGET = DEFAULT_MAX_CONTEXT_TOKENS
+
+
+# ── budget / pacing ───────────────────────────────────────────────────────
+
+
+def llm_budget(envelope_s: Any) -> float:
+    """LLM time available inside a request envelope (never below the floor)."""
+    try:
+        envelope = float(envelope_s)
+    except (TypeError, ValueError):
+        envelope = DEFAULT_ENVELOPE_S
+    if envelope <= 0:
+        envelope = DEFAULT_ENVELOPE_S
+    return max(MIN_LLM_BUDGET_S, envelope - ENVELOPE_RESERVE_S)
+
+
+def max_map_calls(budget_s: float) -> int:
+    """Paced provider calls that fit in ``budget_s``.
+
+    One call's worst-case latency is reserved at the end, because the last
+    paced call still has to run to completion inside the same budget.
+    """
+    if budget_s <= PER_CALL_TIMEOUT_S:
+        return max(1, int(budget_s / MAX_CALL_SPACING_S))
+    return max(1, int((budget_s - PER_CALL_TIMEOUT_S) / MAX_CALL_SPACING_S) + 1)
+
+
+def call_spacing(calls: int, budget_s: float) -> float:
+    """Start interval that fits ``calls`` paced calls inside ``budget_s``."""
+    if calls <= 1:
+        return 0.0
+    room = budget_s - PER_CALL_TIMEOUT_S
+    if room <= 0:
+        return MAX_CALL_SPACING_S
+    return min(MAX_CALL_SPACING_S, room / (calls - 1))
 
 MAX_INSTRUCTION_CHARS = 500
 
@@ -377,24 +430,51 @@ async def _call(
     return text
 
 
-async def _map(manager: Any, chunks: Sequence[_Chunk], worker: Any) -> list[str]:
-    """Run the map phase with bounded concurrency inside the LLM budget."""
-    semaphore = asyncio.Semaphore(MAP_CONCURRENCY)
+async def _map(
+    manager: Any,
+    chunks: Sequence[_Chunk],
+    worker: Any,
+    *,
+    budget_s: float,
+    request_id: str = "",
+) -> list[str]:
+    """Run the map phase paced inside the budget (never as one burst).
 
-    async def _one(chunk: _Chunk) -> str:
+    Starts are spaced by :func:`call_spacing` so a large history does not put a
+    simultaneous wave of requests on one provider; the semaphore still bounds
+    how many are in flight at once. Results keep the chunk order.
+    """
+    semaphore = asyncio.Semaphore(MAP_CONCURRENCY)
+    spacing = call_spacing(len(chunks), budget_s)
+    loop = asyncio.get_running_loop()
+    base = loop.time()
+    logger.info(
+        "AI_EXEC_TRACE request_id=%s stage=map_planned calls=%s spacing_s=%.2f "
+        "budget_s=%.0f concurrency=%s",
+        request_id or "-", len(chunks), spacing, budget_s, MAP_CONCURRENCY,
+    )
+
+    async def _one(index: int, chunk: _Chunk) -> str:
+        if spacing:
+            wait = (base + index * spacing) - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
         async with semaphore:
             return await worker(chunk)
 
     try:
         results = await asyncio.wait_for(
-            asyncio.gather(*(_one(chunk) for chunk in chunks), return_exceptions=True),
-            timeout=LLM_BUDGET_S,
+            asyncio.gather(
+                *(_one(index, chunk) for index, chunk in enumerate(chunks)),
+                return_exceptions=True,
+            ),
+            timeout=budget_s,
         )
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
         raise HistoryAIError(
-            f"the AI work did not finish within {LLM_BUDGET_S:.0f}s",
+            f"the AI work did not finish within {budget_s:.0f}s",
             code=ERROR_PROVIDER,
         ) from exc
 
@@ -551,6 +631,7 @@ async def translate_history(
     provider_manager: Any = None,
     current_message_id: Any = None,
     request_id: str = "",
+    timeout_s: Any = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Translate the most recent eligible Telegram messages.
 
@@ -582,12 +663,16 @@ async def translate_history(
         return True, "There are no messages to translate in this chat.", _result_data(plan)
 
     chunks = _chunk_history(
-        plan.messages, with_attribution=False, token_budget=CHUNK_TOKEN_BUDGET,
+        plan.messages, with_attribution=False,
+        token_budget=TRANSLATE_CHUNK_TOKEN_BUDGET,
     )
-    if len(chunks) > MAX_MAP_CALLS:
+    budget = llm_budget(timeout_s)
+    capacity = max_map_calls(budget)
+    if len(chunks) > capacity:
         return False, (
             f"❌ These {len(plan.messages)} messages need {len(chunks)} AI passes, "
-            f"more than the {MAX_MAP_CALLS} one request can run. Try fewer messages."
+            f"more than the {capacity} one request can run while paced to stay "
+            "under the provider's rate limits. Try fewer messages."
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
 
     if not chunks:
@@ -606,7 +691,10 @@ async def translate_history(
         )
 
     try:
-        raw_results = await _map(manager, chunks, _translate_chunk)
+        raw_results = await _map(
+            manager, chunks, _translate_chunk,
+            budget_s=budget, request_id=request_id,
+        )
         translated: dict[int, str] = {}
         for chunk, raw in zip(chunks, raw_results, strict=False):
             translated.update(_parse_translation(raw, chunk.message_ids))
@@ -631,6 +719,7 @@ async def summarize_history(
     provider_manager: Any = None,
     current_message_id: Any = None,
     request_id: str = "",
+    timeout_s: Any = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Summarize the most recent eligible Telegram messages with the LLM.
 
@@ -664,12 +753,18 @@ async def summarize_history(
         return True, "There are no messages to summarize in this chat.", _result_data(plan)
 
     chunks = _chunk_history(
-        plan.messages, with_attribution=True, token_budget=CHUNK_TOKEN_BUDGET,
+        plan.messages, with_attribution=True,
+        token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
     )
-    if len(chunks) > MAX_MAP_CALLS:
+    budget = llm_budget(timeout_s)
+    # When a reduce step follows, its own call must fit inside the same budget.
+    map_budget = budget - PER_CALL_TIMEOUT_S if len(chunks) > 1 else budget
+    capacity = max_map_calls(map_budget)
+    if len(chunks) > capacity:
         return False, (
             f"❌ These {len(plan.messages)} messages need {len(chunks)} AI passes, "
-            f"more than the {MAX_MAP_CALLS} one request can run. Try fewer messages."
+            f"more than the {capacity} one request can run while paced to stay "
+            "under the provider's rate limits. Try fewer messages."
         ), {"error": ERROR_TOO_LARGE, **_result_data(plan)}
 
     system = _with_instruction(_SUMMARIZE_SYSTEM, plan.instruction)
@@ -681,7 +776,10 @@ async def summarize_history(
         )
 
     try:
-        partials = await _map(manager, chunks, _summarize_chunk)
+        partials = await _map(
+            manager, chunks, _summarize_chunk,
+            budget_s=map_budget, request_id=request_id,
+        )
         if len(partials) == 1:
             final = partials[0]
         else:

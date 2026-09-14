@@ -69,6 +69,8 @@ _STATUS_LABELS: dict[str, str] = {
     "delete_message_by_id": "🗑️ Deleting...",
     "delete_messages_by_ids": "🗑️ Deleting...",
     "list_recent_messages": "📋 Reading messages...",
+    "translate_history": "🌐 Translating messages...",
+    "summarize_history": "🧠 Summarizing messages...",
     "settings_get": "⚙️ Checking settings...",
     "settings_set": "⚙️ Updating settings...",
     "create_task": "🗓 Creating task...",

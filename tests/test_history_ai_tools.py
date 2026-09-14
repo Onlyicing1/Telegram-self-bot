@@ -52,6 +52,15 @@ CHAT = -100555000
 OWNER = 7770001
 NOW = datetime(2026, 9, 14, 14, 2, tzinfo=timezone.utc)
 
+#: The real pacing function, for the tests that prove pacing itself.
+_REAL_CALL_SPACING = history_ai_service.call_spacing
+
+
+@pytest.fixture(autouse=True)
+def _fast_pacing(monkeypatch):
+    """Keep the suite fast: call spacing has its own dedicated tests below."""
+    monkeypatch.setattr(history_ai_service, "call_spacing", lambda calls, budget: 0.0)
+
 
 # ── Fake Telegram surface ──
 
@@ -391,7 +400,7 @@ async def test_translate_excludes_ai_provenance_messages_centrally():
 
 @pytest.mark.asyncio
 async def test_translate_chunks_large_histories_without_losing_messages(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 6)
+    monkeypatch.setattr(history_ai_service, "TRANSLATE_CHUNK_TOKEN_BUDGET", 6)
     provider = _ScriptedProvider(_translating_provider)
     result = await _run_translate(_manager(provider), _FakeClient(_conversation(6)), {"count": 6})
 
@@ -437,7 +446,7 @@ async def test_summarize_small_history_uses_one_llm_call_and_no_reduce():
 
 @pytest.mark.asyncio
 async def test_summarize_multi_chunk_history_aggregates_hierarchically(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 6)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
     provider = _ScriptedProvider(_summarizing_provider)
     result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
 
@@ -497,12 +506,12 @@ async def test_no_chunk_exceeds_the_token_budget():
         conservative = max(
             estimate_tokens(payload, "English"), estimate_tokens(payload, "Persian")
         )
-        assert conservative <= history_ai_service.CHUNK_TOKEN_BUDGET + 40
+        assert conservative <= history_ai_service.SUMMARIZE_CHUNK_TOKEN_BUDGET + 40
 
 
 @pytest.mark.asyncio
 async def test_oversized_single_message_is_its_own_chunk_and_never_split(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 4)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 4)
     huge = "y" * 2000
     provider = _ScriptedProvider(_summarizing_provider)
     client = _FakeClient([_FakeMessage(1, huge), _FakeMessage(2, "small")])
@@ -570,7 +579,7 @@ async def test_summarize_reports_truncated_history_honestly():
 
 @pytest.mark.asyncio
 async def test_summarize_chunk_failure_is_not_presented_as_a_summary(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 6)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
     provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={2})
     result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
 
@@ -581,7 +590,7 @@ async def test_summarize_chunk_failure_is_not_presented_as_a_summary(monkeypatch
 
 @pytest.mark.asyncio
 async def test_summarize_final_aggregation_failure_is_honest(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 6)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
     provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={4})
     result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
 
@@ -592,7 +601,7 @@ async def test_summarize_final_aggregation_failure_is_honest(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_summarize_budget_timeout_is_an_honest_failure(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "LLM_BUDGET_S", 0.01)
+    monkeypatch.setattr(history_ai_service, "llm_budget", lambda _envelope: 0.01)
     provider = _ScriptedProvider(_summarizing_provider, delay=0.2)
     result = await _run_summarize(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
 
@@ -603,8 +612,8 @@ async def test_summarize_budget_timeout_is_an_honest_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_history_too_large_for_one_request_is_refused_honestly(monkeypatch):
-    monkeypatch.setattr(history_ai_service, "CHUNK_TOKEN_BUDGET", 1)
-    monkeypatch.setattr(history_ai_service, "MAX_MAP_CALLS", 2)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 1)
+    monkeypatch.setattr(history_ai_service, "max_map_calls", lambda _budget: 2)
     provider = _ScriptedProvider(_summarizing_provider)
     result = await _run_summarize(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
 
@@ -630,13 +639,16 @@ async def test_missing_ai_engine_is_reported():
 # ── 3. Architecture ──
 
 
-def test_chunk_budget_is_derived_from_existing_architecture():
-    assert history_ai_service.CHUNK_TOKEN_BUDGET == min(
+def test_chunk_budgets_are_derived_from_existing_architecture():
+    assert history_ai_service.TRANSLATE_CHUNK_TOKEN_BUDGET == min(
         DEFAULT_MAX_CONTEXT_TOKENS, ProviderConfig().max_tokens // 2
     )
-    assert history_ai_service.MAP_CONCURRENCY == 4
-    assert history_ai_service.MAX_MAP_CALLS == 40
-    assert history_ai_service.PER_CALL_TIMEOUT_S == 30.0
+    # A chunk summary is far shorter than its input, so summarization may use
+    # the whole context budget — fewer provider calls for the same history.
+    assert history_ai_service.SUMMARIZE_CHUNK_TOKEN_BUDGET == DEFAULT_MAX_CONTEXT_TOKENS
+    assert history_ai_service.MAP_CONCURRENCY == 2
+    assert history_ai_service.MAX_CALL_SPACING_S == 5.0
+    assert history_ai_service.PER_CALL_TIMEOUT_S == ProviderConfig().timeout
 
 
 @pytest.mark.asyncio
@@ -941,6 +953,170 @@ def test_analysis_routing_does_not_divert_delete_or_save_commands():
 
     result = parse_command_intent("پیام‌های خلاصه رو پاک کن", has_reply=False)
     assert result.action == "delete_messages"
+
+
+# ── 6. Rate-limit protection: pacing, capacity, envelope ──
+
+
+def _context_with_envelope(
+    manager: ProviderManager,
+    client: Any,
+    *,
+    timeout_s: Any = None,
+) -> ToolContext:
+    """The dispatcher's request scope, with (or without) the caller's envelope."""
+    extra: dict[str, Any] = {
+        "chat_id": CHAT,
+        "request_id": "req-envelope",
+        "provider_manager": manager,
+    }
+    if timeout_s is not None:
+        extra["request_timeout_s"] = timeout_s
+    return ToolContext(
+        telegram=TelegramAPI(client),
+        owner_id=OWNER,
+        tz_str="UTC",
+        client=client,
+        extra=extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_map_calls_are_paced_instead_of_fired_as_one_burst(monkeypatch):
+    """A large history must never arrive at the provider as one simultaneous wave."""
+    import time as _time
+
+    monkeypatch.setattr(history_ai_service, "call_spacing", _REAL_CALL_SPACING)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.05)
+    starts: list[float] = []
+
+    class _TimedProvider(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            starts.append(_time.monotonic())
+            return await super().chat(messages, **kwargs)
+
+    provider = _TimedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is True
+    assert len(starts) == 4  # 3 chunk summaries + 1 merge
+    map_starts = starts[:3]
+    gaps = [later - earlier for earlier, later in zip(map_starts, map_starts[1:])]
+    assert min(gaps) >= 0.045
+    # The merge call is sequential, so the whole phase is still not a burst.
+    assert starts[-1] - starts[0] >= 0.09
+
+
+@pytest.mark.asyncio
+async def test_map_never_exceeds_the_concurrency_cap(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "call_spacing", _REAL_CALL_SPACING)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.01)
+    in_flight = 0
+    peak = 0
+
+    class _CountingProvider(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await super().chat(messages, **kwargs)
+            finally:
+                in_flight -= 1
+
+    provider = _CountingProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(4)), {"count": 4})
+
+    assert result.success is True
+    assert peak <= history_ai_service.MAP_CONCURRENCY
+
+
+def test_call_spacing_fits_every_call_inside_the_budget():
+    spacing = _REAL_CALL_SPACING(20, 220.0)
+    assert spacing == history_ai_service.MAX_CALL_SPACING_S
+    # One call needs no wait, and a very tight budget still spaces calls.
+    assert _REAL_CALL_SPACING(1, 220.0) == 0.0
+    assert _REAL_CALL_SPACING(4, 40.0) > 0
+    # The last paced call plus its worst-case latency must still fit.
+    assert (20 - 1) * spacing + history_ai_service.PER_CALL_TIMEOUT_S <= 220.0
+
+
+def test_capacity_scales_with_the_request_envelope():
+    short = history_ai_service.max_map_calls(history_ai_service.llm_budget(60.0))
+    long = history_ai_service.max_map_calls(history_ai_service.llm_budget(240.0))
+    assert short < long
+    assert long >= 30
+
+
+@pytest.mark.asyncio
+async def test_a_large_history_is_refused_under_a_short_envelope_but_runs_under_the_long_one(
+    monkeypatch,
+):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+
+    short_provider = _ScriptedProvider(_summarizing_provider)
+    short_context = _context_with_envelope(
+        _manager(short_provider), _FakeClient(_conversation(6)), timeout_s=25.0,
+    )
+    refused = await SummarizeHistoryTool(short_context).execute(short_context, {"count": 6})
+
+    assert refused.success is False
+    assert refused.data["error"] == history_ai_service.ERROR_TOO_LARGE
+    assert short_provider.calls == 0
+    assert "rate limits" in refused.message
+
+    long_provider = _ScriptedProvider(_summarizing_provider)
+    long_context = _context_with_envelope(
+        _manager(long_provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+    completed = await SummarizeHistoryTool(long_context).execute(long_context, {"count": 6})
+
+    assert completed.success is True
+    assert completed.message == "FINAL"
+
+
+@pytest.mark.asyncio
+async def test_the_request_envelope_is_what_the_service_budgets_against(monkeypatch):
+    seen: list[Any] = []
+    real = history_ai_service.llm_budget
+
+    def _record(envelope):
+        seen.append(envelope)
+        return real(envelope)
+
+    monkeypatch.setattr(history_ai_service, "llm_budget", _record)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(3)), timeout_s=240.0,
+    )
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    assert result.success is True
+    assert seen == [240.0]
+
+
+def test_ai_request_carries_the_envelope_and_the_tool_context_receives_it():
+    from backend.ai.engine.dispatcher import Dispatcher
+    from backend.ai.session.request import AIRequest
+    from backend.bot.handlers import ai_unified as handler
+
+    request = AIRequest(
+        session_id="s", user_message="m", owner_id=OWNER, chat_id=CHAT,
+        message_id=1, timeout_s=123.0,
+    )
+    assert request.timeout_s == 123.0
+
+    assert handler._AI_EXECUTE_TIMEOUT > handler._AI_TIMEOUT
+    handler_source = inspect.getsource(handler._execute_ai)
+    assert "timeout_s=_AI_EXECUTE_TIMEOUT" in handler_source
+    assert "timeout=request.timeout_s or _AI_EXECUTE_TIMEOUT" in handler_source
+    assert (
+        'extra["request_timeout_s"] = request.timeout_s'
+        in inspect.getsource(Dispatcher._build_tool_context)
+    )
 
 
 def test_trigger_exclusion_adds_no_text_heuristic_to_the_ai_path():
