@@ -1,6 +1,237 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Telegram surrounding-message context for the AI
+## Latest phase — Durable invisible AI provenance for Telegram messages
+
+Fix for the provenance gap the surrounding-message context investigation
+(`INVESTIGATION.md`) confirmed: the AI answers by editing the owner's own
+Telegram message in place, so an AI-produced message keeps `out=True` and
+`sender_id=owner` and was therefore read back into the next request's
+surrounding window and labelled `You: …`. The only positive marker,
+`ReplyResolver`, is RAM-only and disappears on restart.
+
+**The visible presentation is unchanged.** The AI answer now additionally
+carries an invisible, durable provenance marker inside the Telegram message
+text. With the marker stripped the delivered text is byte-for-byte the previous
+presentation.
+
+### Why durable provenance was needed
+
+* `sender_id == owner_id` and `out=True` are true for genuine human messages AND
+  for AI output — using either as provenance would delete legitimate human
+  context, which the requirement forbids.
+* `ReplyResolver` (`backend/ai/context/reply_resolver.py`) is process-scoped
+  (in-memory, LRU cap 500, never rebuilt), so after a restart no previously
+  AI-answered message could be recognised.
+* Chunked answers and the edit-failure fallback are *new* messages whose ids
+  were discarded, so they could never be registered at all.
+
+### Exact marker strategy
+
+The single authoritative constant is `AI_PROVENANCE_MARKER` in the new module
+`backend/ai/context/provenance.py`:
+
+```python
+AI_PROVENANCE_MARKER = "\u2061\u2062\u2063\u2064"
+```
+
+Four code points from the Unicode "invisible operator" block, chosen from the
+actual properties of the characters (asserted in
+tests/test_ai_provenance.py::test_marker_code_points_are_non_rendering_and_direction_neutral):
+
+| Property | Value | Why it matters here |
+|---|---|---|
+| General category | `Cf` (format) | nothing is rendered; no glyph is drawn |
+| Combining class | `0` | never attaches to a neighbouring character |
+| BiDi class | `BN` (boundary neutral) | cannot set or change paragraph direction, cannot reorder the `│` / `┘─` / `└─` connector columns in RTL, LTR, or mixed text |
+| `str.isspace()` / `str.strip()` | `False` / survives | the delivery normalizer cannot silently drop it |
+| NFC / NFKC / NFD | unchanged | a normalized read still finds it |
+| Sequence | 4 distinct code points, ascending | does not occur in ordinary human or model text |
+
+`U+200E`/`U+200F` (LRM/RLM) were rejected because they carry a strong
+direction; `U+200B`/`U+200D`/`U+FEFF` were rejected because they are common
+zero-width characters that other tooling strips; `U+034F` (CGJ) was rejected
+because it is a combining mark.
+
+Three deterministic helpers, no other marker literal anywhere in the codebase:
+`has_ai_provenance_marker(text)`, `strip_ai_provenance_marker(text)`,
+`apply_ai_provenance_marker(text)` — re-exported from
+`backend/ai/context/__init__.py`.
+
+### Placement — `show_question=true`
+
+The marker is inserted at the exact question/answer boundary — after the `│`
+connector line, before the answer block. Neither block's own characters are
+touched:
+
+```logical
+┌ isolate │ هی، چطوری؟ ┐
+┌ isolate │ ┐<MARKER>
+┌ isolate ┘─ سلام! خوبم ممنون. ┐
+    ┌ isolate دارم روی یک پروژه کار می‌کنم. ┐
+```
+
+### Placement — `show_question=false`
+
+The marker is appended at the ABSOLUTE END of the final answer. No `│`, no
+`─`, no elbow, no separator, no added line, and no added whitespace:
+
+```logical
+سلام! خوبم ممنون.<MARKER>
+```
+
+### Implementation point
+
+`backend/ai/tools/delivery.py` gained `apply_presentation_provenance(presentation,
+user_message, show_question)`: it takes the ALREADY rendered presentation and
+only inserts/appends the marker (idempotently). `format_presentation`,
+`_question_block`, `_answer_block`, the connector logic, and the RTL/BiDi
+handling are untouched — no existing test expectation had to change to keep the
+renderer's output identical.
+
+The marker is applied inside `deliver_response` AFTER normalization, pagination,
+and UTF-16 splitting, so:
+
+* the marker can never be split across two delivered messages;
+* every delivered chunk of a successful answer is marked exactly once;
+* no thinking/status/failure text can ever receive it (the empty-response
+  branch, `format_thinking`, `format_status`, `format_failure`, and the handler's
+  error/timeout edits return before the marker is applied).
+
+The pagination budget now reserves the marker's 4 UTF-16 units
+(`_AI_PROVENANCE_UNITS`), so a delivered message stays within `SAFE_LIMIT`
+including the marker.
+
+### Proof that the visible presentation is preserved
+
+`strip_ai_provenance_marker` removes only the marker, so the acceptance criterion
+is an exact string comparison. Verified for both modes and for Persian (RTL),
+English (LTR), and mixed-direction content:
+
+```
+strip_ai_provenance_marker(delivered) == format_presentation(question, answer, show_question)
+```
+
+Representative live check of the real delivery path (`deliver_response`):
+Persian+RTL shown/hidden, English+LTR shown/hidden, and mixed Persian/English
+shown — all reported `markers: 1` and `visible preserved: True`.
+
+### How the surrounding-context collector detects it
+
+`backend/ai/conversation/telegram_context.py::build_chat_context` drops any
+window message whose text carries the marker, using `_message_text(msg)` (the
+full text, before per-message truncation):
+
+```python
+if has_ai_provenance_marker(_message_text(msg)):
+    continue
+```
+
+* The marker is the ONLY authorship signal the window trusts; `sender_id` and
+  `out` are still read for display only and are never provenance.
+* The existing exclusions are unchanged: the triggering message id, the
+  `exclude_message_ids` (reply target), the anchor/future rule, chronological
+  ordering, and all bounds (10 / 200 / 1500 / 4 / 3.0s).
+* No extra Telegram read, no cache, no polling, no scheduler, no database
+  object.
+
+### How marker stripping works
+
+`_to_record` strips the marker from any text that does reach the snapshot
+(`strip_ai_provenance_marker(_message_text(msg))`), so the marker is metadata and
+can never be presented to the model as content even if the builder-level filter
+were bypassed.
+
+### How restart persistence is achieved
+
+The marker lives in the Telegram message text itself. `deliver_response`
+writes it through `event.edit(...)`/`event.reply(...)`, so Telegram stores it;
+the next process reads the same message back through `iter_messages` and detects
+it from the text alone. Nothing is persisted locally and no schema was changed.
+
+### ReplyResolver's remaining role
+
+Unchanged and still used for in-process reply handling (`ReplyContext.is_ai_message`,
+full AI content for the replied-to message, the per-message Details panel). It
+and the marker are complementary: `ReplyResolver` maps a Telegram id to the full
+AI content while the process lives; the marker durably records that the message
+was AI-produced. No resolver replacement, no second store, no polling, and no
+second Telegram read was introduced.
+
+### Manual-edit edge case
+
+The marker means "this Telegram message has AI provenance" — the message was
+answered or overwritten by the AI — not "the current exact text was generated by
+AI". A later manual edit by the owner keeps the marker: the durable fact (the AI
+produced this message) remains true, and the marker is the only signal that can
+survive a restart.
+
+### Files changed
+
+* `backend/ai/context/provenance.py` (new) — the marker constant and the three
+  helpers.
+* `backend/ai/context/__init__.py` — re-exports the provenance helpers beside
+  `ReplyResolver`.
+* `backend/ai/tools/delivery.py` — `apply_presentation_provenance` + the
+  provenance step in `deliver_response` + the pagination reserve.
+* `backend/ai/conversation/telegram_context.py` — marker filter in
+  `build_chat_context` and marker stripping in `_to_record`.
+* `tests/test_ai_provenance.py` (new) — 35 focused tests.
+* `tests/test_ai_presentation_redesign.py`, `tests/test_67_ai_output_pipeline.py`,
+  `tests/test_task_wizard_nl_bridge.py` — the delivered-text comparisons now
+  assert the visible (marker-stripped) text AND the presence of the marker;
+  no assertion was weakened and the renderer's own expectations are unchanged.
+
+### Tests and validation
+
+| Check | Result |
+|---|---|
+| `tests/test_ai_provenance.py` (new, focused) | 35 passed |
+| `tests/test_ai_presentation_redesign.py` | passed |
+| `tests/test_telegram_chat_context.py` | passed |
+| `tests/test_67_ai_output_pipeline.py` | passed |
+| `tests/test_09_reply_to_ai.py` | passed |
+| Full suite (`python -m pytest tests/`) | 2,676 passed, 24 skipped |
+| `py_compile` (all changed files) | passed |
+| `git diff --check` | clean |
+
+Focused coverage: marker code-point properties; shown/hidden placement
+(including the exact splice index); visual preservation for RTL, LTR, and mixed
+content; existing connector glyphs, four-space continuation indent, and line
+breaks unchanged; detection (marked / unmarked / duplicated / unexpected
+position / partial sequence / non-string); stripping exactness; idempotence
+(apply twice, retry/re-entry, every presentation mode); status/thinking/failure
+never marked; UTF-8 wire round-trip and NFC/NFKC/NFD survival; survival of the
+project's own output normalizer; no partially split marker across chunks;
+delivered chunks within `SAFE_LIMIT`; genuine owner message kept as `You`; marked
+owner message excluded despite `sender_id == owner_id` and `out=True`; other
+participants unchanged (named, kept); trigger/reply-target exclusions unchanged;
+restart simulation (empty `ReplyResolver` + marked Telegram text → excluded);
+and the end-to-end path (deliver an answer → feed the stored text back as the
+previous window message → it is excluded).
+
+### Live Telegram round-trip verification — NOT performed
+
+No live Telegram account/session is available in this workspace, so the marker's
+survival through a real `edit` → Telegram → `iter_messages` round trip was NOT
+observed. What is proven is: the marker survives UTF-8 wire encoding and
+NFC/NFKC/NFD normalization (tested), the delivery path writes it through the
+real Telethon `event.edit`/`event.reply` calls, and the collector detects it from
+the message text alone. The end-to-end confirmation in production must be done
+manually (answer once with the trigger, then send a second message in the same
+chat and verify the previous AI answer is not repeated in the context block).
+
+### Limitations
+
+* The marker is inferred from the message text, so a human who types those four
+exact invisible code points in order would be classified as AI provenance
+(vanishingly unlikely; the sequence is not producible by normal typing).
+* Only the AI answer delivery path is marked. Messages the self-bot creates
+  through scheduled `send_message`, task results/notifications, and Deep Save
+  re-uploads remain unmarked (the `INVESTIGATION.md` G3 gap) — they are outside
+  this feature's "AI response" scope and no unrelated tool was modified.
+* `ReplyResolver` remains in-memory; the marker is the durable half.
+
+## Previous phase — Telegram surrounding-message context for the AI
 
 New feature (not a fix): the AI request now carries the REAL nearby Telegram
 messages of the chat it was triggered in, as a clearly separated, bounded,
@@ -31,7 +262,8 @@ Telegram NewMessage (outgoing, owner)
 ```
 
 `ContextBuilder` stays a pure assembler: it receives the snapshot as an argument
-and never reads Telegram. `PromptBuilder` only formats it. The dispatcher does
+and never reads Telegram (messages carrying the durable AI provenance marker are
+dropped by `build_chat_context` — see the latest phase above). `PromptBuilder` only formats it. The dispatcher does
 not re-read anything; the snapshot is attached to the already-built context with
 `dataclasses.replace`, so no layer below it touches Telegram for chat context.
 The background AI activation path (`ghost_seen_v2`) passes no snapshot and

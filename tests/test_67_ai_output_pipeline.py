@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 import re
+from backend.ai.context.provenance import (
+    has_ai_provenance_marker,
+    strip_ai_provenance_marker,
+)
 from backend.ai.tools.delivery import (
     SAFE_LIMIT,
     _entity_valid,
@@ -81,8 +85,11 @@ async def test_integration_delivery_uses_centralized_processor():
     from backend.ai.tools.delivery import deliver_response
     result = await deliver_response(SimpleNamespace(edit=edit, reply=reply), "Nova hi", "**سلام**  ، دنیا!")
     assert result.success
-    # question hidden (default) → plain answer text, no connector
-    assert edits == ["سلام، دنیا!"]
+    # question hidden (default) → plain answer text, no connector. The
+    # delivered text carries the invisible durable provenance marker, so the
+    # comparison is made on the marker-stripped (visible) text.
+    assert [strip_ai_provenance_marker(text) for text in edits] == ["سلام، دنیا!"]
+    assert all(has_ai_provenance_marker(text) for text in edits)
     assert replies == []
 
 
@@ -348,7 +355,8 @@ async def test_integration_delivery_uses_repaired_output():
         "set the file_name to 2*3*4",
     )
     assert result.success
-    assert edits == ["set the file_name to 2*3*4"]
+    assert [strip_ai_provenance_marker(text) for text in edits] == ["set the file_name to 2*3*4"]
+    assert all(has_ai_provenance_marker(text) for text in edits)
     assert replies == []
 
 
@@ -524,7 +532,8 @@ async def test_delivery_delivers_rendered_table():
         "| a | b |\n|---|---|\n| c | d |",
     )
     assert result.success
-    assert edits == ["```\na | b\n--- | ---\nc | d\n```"]
+    assert [strip_ai_provenance_marker(text) for text in edits] == ["```\na | b\n--- | ---\nc | d\n```"]
+    assert all(has_ai_provenance_marker(text) for text in edits)
     assert replies == []
 
 
@@ -539,7 +548,8 @@ async def test_delivery_delivers_dot_preserved_text():
         "run main.py now and check report.txt",
     )
     assert result.success
-    assert edits == ["run main.py now and check report.txt"]
+    assert [strip_ai_provenance_marker(text) for text in edits] == ["run main.py now and check report.txt"]
+    assert all(has_ai_provenance_marker(text) for text in edits)
     assert replies == []
 
 
@@ -763,10 +773,16 @@ async def test_delivery_large_table_first_edit_then_replies():
     assert result.total_chunks == len(expected) > 1
     assert result.chunks_delivered == result.total_chunks
     assert len(edits) == 1 and len(replies) == len(expected) - 1
-    assert edits == expected[:1]
-    assert replies == expected[1:]
-    assert all(_u16(message) <= SAFE_LIMIT for message in edits + replies)
-    assert _reconstruct(edits + replies) == rendered
+    # every delivered message carries the marker exactly once, and stripping it
+    # yields exactly the unmarked chunks — the marker neither replaces nor
+    # reorders any visible character
+    delivered = edits + replies
+    assert all(has_ai_provenance_marker(message) for message in delivered)
+    visible = [strip_ai_provenance_marker(message) for message in delivered]
+    assert visible[:1] == expected[:1]
+    assert visible[1:] == expected[1:]
+    assert all(_u16(message) <= SAFE_LIMIT for message in delivered)
+    assert _reconstruct(visible) == rendered
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.ai.context.provenance import (
+    AI_PROVENANCE_MARKER,
+    has_ai_provenance_marker,
+    strip_ai_provenance_marker,
+)
 from backend.ai.engine.result import EngineResult
 from backend.ai.tools.delivery import (
     SAFE_LIMIT,
@@ -684,9 +689,16 @@ async def test_answer_edits_the_original_message_with_stored_preference(stored_p
     )
     captured = await _drive_execute_ai(9, "هی", result, stored_pref)
     # edit-in-place: the answer goes into the original message, never a new one
-    assert _without_bidi_controls(captured["edits"][-1]).endswith("پاسخ من")
     assert captured["replies"] == []
-    final = _without_bidi_controls(captured["edits"][-1])
+    # the answer is the visible end of the message once the invisible durable
+    # provenance marker is stripped
+    assert _without_bidi_controls(
+        strip_ai_provenance_marker(captured["edits"][-1])
+    ).endswith("پاسخ من")
+    final = _without_bidi_controls(
+        strip_ai_provenance_marker(captured["edits"][-1])
+    )
+    assert has_ai_provenance_marker(captured["edits"][-1])
 
     if stored_pref:
         assert final == "│ هی\n│\n┘─ پاسخ من"
@@ -712,9 +724,12 @@ async def test_preference_changes_presentation_but_not_the_model_request():
     # the model sees exactly the same request either way
     assert on["user_message"] == off["user_message"] == "هی"
     assert on["message_id"] == off["message_id"] == 456
-    # only the rendered presentation differs
-    assert _without_bidi_controls(on["edits"][-1]) == "│ هی\n│\n┘─ پاسخ من"
-    assert off["edits"][-1] == "پاسخ من"
+    # only the rendered presentation differs; the provenance marker is
+    # invisible, so the visible text is compared with it stripped
+    assert _without_bidi_controls(
+        strip_ai_provenance_marker(on["edits"][-1])
+    ) == "│ هی\n│\n┘─ پاسخ من"
+    assert strip_ai_provenance_marker(off["edits"][-1]) == "پاسخ من"
 
 
 @pytest.mark.asyncio
@@ -750,9 +765,16 @@ async def test_delivery_edits_in_place_and_uses_the_answer_state():
     assert result.success
     assert len(edits) == 1
     assert replies == []
-    assert _without_bidi_controls(edits[0]) == _without_bidi_controls(
-        format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
-    )
+    # visible presentation is untouched: stripping provenance yields exactly
+    # the unmarked presentation, byte for byte
+    unmarked = format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
+    assert strip_ai_provenance_marker(edits[0]) == unmarked
+    # the marker sits at the question/answer boundary: after the quoted
+    # question block and its `│` connector line, before the answer block
+    boundary = unmarked.index("\n", unmarked.index("\n") + 1)
+    assert edits[0] == f"{unmarked[:boundary]}{AI_PROVENANCE_MARKER}{unmarked[boundary:]}"
+    assert _without_bidi_controls(unmarked[:boundary]).endswith("│")
+    assert _without_bidi_controls(unmarked[boundary + 1:]).startswith("┘─ ")
 
 
 @pytest.mark.asyncio
@@ -1250,7 +1272,9 @@ async def test_reply_rendering_uses_the_durable_preference_after_a_restart(
     )
 
     captured = await _drive_execute_ai_from_durable_store(31, "هی", result, db)
-    final = _without_bidi_controls(captured["edits"][-1])
+    final = _without_bidi_controls(
+        strip_ai_provenance_marker(captured["edits"][-1])
+    )
 
     if expected:
         assert final == "│ هی\n│\n┘─ پاسخ من"

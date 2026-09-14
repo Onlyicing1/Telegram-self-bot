@@ -9,6 +9,12 @@ from typing import Any
 
 from telethon.tl import types as tg_types
 
+from backend.ai.context.provenance import (
+    AI_PROVENANCE_MARKER,
+    apply_ai_provenance_marker,
+    has_ai_provenance_marker,
+)
+
 logger = logging.getLogger(__name__)
 SAFE_LIMIT = 4000
 _MIN_SPLIT_CHUNK = 100
@@ -270,6 +276,12 @@ class DeliveryResult:
 # visual column. There is no trigger label, header, emoji, or separator
 # anywhere in the presentation. The renderer never alters the text itself and
 # owns no preference — the caller decides whether the question is shown.
+#
+# ANSWER messages additionally carry the DURABLE, INVISIBLE AI provenance
+# marker (backend/ai/context/provenance.py). It is added by
+# `apply_presentation_provenance` AFTER the blocks below are rendered, so it
+# changes no visible character: with the marker stripped the delivered text is
+# byte-for-byte the rendered presentation.
 
 _QUESTION_MARK = "│"
 _ANSWER_INDENT = "    "
@@ -308,6 +320,10 @@ _BIDI_LRM = "\u200e"
 _BIDI_RLM = "\u200f"
 _BIDI_PDI = "\u2069"
 _BIDI_ISOLATE_UNITS = _utf16_units(_BIDI_RLI + _BIDI_RLM + _BIDI_PDI)
+# The durable provenance marker is appended to every delivered chunk, so its
+# UTF-16 cost is reserved out of the pagination budget: a delivered message
+# stays within SAFE_LIMIT *including* the invisible marker.
+_AI_PROVENANCE_UNITS = _utf16_units(AI_PROVENANCE_MARKER)
 
 
 def _bidi_isolate(text: str, rtl: bool) -> str:
@@ -419,6 +435,41 @@ def format_presentation(user_message: str, response_text: str, show_question: bo
     if not question:
         return answer
     return f"{question}\n{_question_connector(user_message)}\n{answer}"
+
+
+def apply_presentation_provenance(
+    presentation: str, user_message: str = "", show_question: bool = False
+) -> str:
+    """Add the invisible durable AI provenance marker to a FINAL answer.
+
+    Called only on an already-rendered successful answer, so the visible
+    presentation is never recomputed, reordered, or reformatted — the marker
+    is the sole difference between the input and the output (proved by
+    ``strip_ai_provenance_marker``). Placement follows the presentation mode:
+
+      * ``show_question``: the marker is inserted at the question/answer
+        boundary — after the ``│`` connector, before the answer block — so it
+        never touches either block's own characters;
+      * otherwise (and whenever no question block was rendered): the marker is
+        appended at the absolute end of the answer.
+
+    Neither placement adds a line, a separator, a space, or any other visible
+    character, and the call is idempotent.
+    """
+    if not isinstance(presentation, str) or not presentation:
+        return presentation
+    if has_ai_provenance_marker(presentation):
+        return presentation
+    if show_question and user_message:
+        # Boundary = the exact rendered question block + its connector line, as
+        # produced above. When it is not a prefix (hidden/empty question, a
+        # continuation chunk) the answer is the whole message and the marker
+        # belongs at its end.
+        boundary = f"{_question_block(user_message)}\n{_question_connector(user_message)}"
+        if boundary and presentation.startswith(f"{boundary}\n"):
+            remainder = presentation[len(boundary):]
+            return f"{boundary}{AI_PROVENANCE_MARKER}{remainder}"
+    return apply_ai_provenance_marker(presentation)
 
 
 def format_thinking(user_message: str, show_question: bool) -> str:
@@ -606,7 +657,7 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
         candidate = f"{_question_block(user_message)}\n{_question_connector(user_message)}\n"
         if _utf16_units(candidate) < SAFE_LIMIT - _MIN_SPLIT_CHUNK:
             prefix = candidate
-    footer_reserve = _utf16_units("\n\n_(9/99)_") + 2
+    footer_reserve = _utf16_units("\n\n_(9/99)_") + 2 + _AI_PROVENANCE_UNITS
     if not show_question:
         # Plain mode: no presentation prefix and no per-page elbow — each
         # page is the answer text itself, so no connector can leak into a
@@ -614,7 +665,7 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
         budget = max(_MIN_SPLIT_CHUNK, SAFE_LIMIT - footer_reserve)
         pages = _paginate(response_text, budget)
         if len(pages) == 1:
-            return _split_text(full, SAFE_LIMIT)
+            return _split_text(full, SAFE_LIMIT - _AI_PROVENANCE_UNITS)
         chunks = [pages[0]]
         chunks.extend(
             _format_continuation(page, index, len(pages))
@@ -625,7 +676,7 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
     pages = _paginate(response_text, budget)
     if len(pages) == 1:
         # The (rare) oversized question, not the answer, overflowed the limit.
-        return _split_text(full, SAFE_LIMIT)
+        return _split_text(full, SAFE_LIMIT - _AI_PROVENANCE_UNITS)
     chunks = [prefix + _answer_block(pages[0])]
     for index, page in enumerate(pages[1:], 2):
         chunks.append(_format_continuation(_answer_block(page), index, len(pages)))
@@ -662,7 +713,14 @@ async def deliver_response(
             "AI_OUTPUT_NORMALIZATION_FALLBACK error_type=%s nonempty_after_strip=%s",
             type(exc).__name__, bool(response_text and response_text.strip()),
         )
-    messages = _format_chunks(user_message, response_text, show_question)
+    # Provenance is added HERE — after normalization, pagination, and UTF-16
+    # splitting — so the marker can never be split across two messages and no
+    # status/thinking/failure text can ever carry it. Every delivered chunk of
+    # a successful answer is marked exactly once.
+    messages = [
+        apply_presentation_provenance(message, user_message, show_question)
+        for message in _format_chunks(user_message, response_text, show_question)
+    ]
     delivered = 0
     try:
         await event.edit(messages[0])

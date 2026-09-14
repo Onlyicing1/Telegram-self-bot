@@ -436,7 +436,15 @@ async def test_normalization_failure_is_logged_and_still_delivered(monkeypatch, 
     assert "ValueError" in caplog.text
     assert "nonempty_after_strip=True" in caplog.text
     # The response still reached the owner (raw fallback), never hidden.
-    assert edits == [text]
+    # The delivered text additionally carries the invisible durable AI
+    # provenance marker, so the visible text is compared with it stripped.
+    from backend.ai.context.provenance import (
+        has_ai_provenance_marker,
+        strip_ai_provenance_marker,
+    )
+
+    assert [strip_ai_provenance_marker(message) for message in edits] == [text]
+    assert all(has_ai_provenance_marker(message) for message in edits)
 
 
 @pytest.mark.asyncio

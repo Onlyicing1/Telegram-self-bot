@@ -25,6 +25,19 @@ Design rules:
     surrounding context is optional enrichment and must never fail an AI
     request.
   * Nothing here is user-configurable; the bounds are hard constants.
+
+AI provenance:
+
+  * Messages carrying the DURABLE invisible AI provenance marker
+    (``backend/ai/context/provenance.py``) were answered/overwritten by the AI
+    and are NEVER part of the surrounding semantic context. The marker is read
+    from the message text itself, so the filter keeps working after a process
+    restart — ``ReplyResolver`` alone could not.
+  * The marker is provenance, not content: it is also stripped from any text
+    that does reach the snapshot, so the model never sees it.
+  * ``sender_id == owner_id`` and ``out=True`` are NEVER used as provenance:
+    the AI edits the owner's own message in place, so genuine human messages
+    and AI answers share both values.
 """
 from __future__ import annotations
 
@@ -33,6 +46,11 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+from backend.ai.context.provenance import (
+    has_ai_provenance_marker,
+    strip_ai_provenance_marker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +226,9 @@ def _to_record(
     tz_str: str,
 ) -> TelegramContextMessage:
     sender_id = _coerce_id(getattr(msg, "sender_id", 0))
-    text = _message_text(msg)
+    # Defense in depth: the marker is metadata and must never be presented to
+    # the model as content, even if a caller bypasses the builder-level filter.
+    text = strip_ai_provenance_marker(_message_text(msg))
     if len(text) > MAX_MESSAGE_CHARS:
         text = text[:MAX_MESSAGE_CHARS].rstrip() + _TRUNCATION_SUFFIX
     return TelegramContextMessage(
@@ -260,6 +280,10 @@ def build_chat_context(
                             (e.g. the replied-to message, which travels as the
                             higher-fidelity ``ReplyContext``) — deduplicated.
 
+    Messages bearing the durable AI provenance marker are always dropped, in
+    addition to the ids above: they are AI output, not surrounding human
+    conversation.
+
     Returns:
         A frozen ``TelegramChatContext`` (possibly empty).
     """
@@ -273,6 +297,12 @@ def build_chat_context(
     for msg in raw_messages or ():
         msg_id = _coerce_id(getattr(msg, "id", 0))
         if msg_id in excluded:
+            continue
+        # Durable AI provenance: a message the AI answered/overwrote in place
+        # is excluded from the surrounding semantic context. This is the only
+        # authorship signal the window trusts — sender identity and `out` are
+        # identical for genuine owner messages and AI output.
+        if has_ai_provenance_marker(_message_text(msg)):
             continue
         # Never invent future context: with an anchor, only strictly earlier
         # messages qualify, whatever the client returned.
