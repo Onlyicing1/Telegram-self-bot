@@ -33,7 +33,11 @@ Rules this module exists to enforce:
     manager then cools that provider down for 60s, failing the whole operation.
     The whole operation is bounded by a budget derived from the request's own
     envelope (``AIRequest.timeout_s``, threaded through
-    ``ToolContext.extra["request_timeout_s"]``).
+    ``ToolContext.extra["request_timeout_s"]``). Inside that budget every single
+    provider call is bounded by :func:`call_timeout` — the provider safety
+    ceiling intersected with the time left in the operation — so no step of a
+    long operation is cut back to the bare provider HTTP timeout and no call is
+    ever unbounded.
   * Failures are honest: a retrieval, provider, or budget failure returns
     ``success=False`` with the real reason. Partial work is never presented as a
     completed translation or summary.
@@ -81,10 +85,25 @@ MAP_CONCURRENCY = 2
 #: to at most ~12 provider calls per minute, below the per-minute quotas of the
 #: providers this project supports (e.g. Gemini free tier 15 RPM).
 MAX_CALL_SPACING_S = 5.0
-#: Bounded timeout for a single provider call. Mirrors
+#: Latency assumed for ONE provider call when pacing the map phase and sizing
+#: how many calls fit a budget. Mirrors
 #: ``backend/ai/task_interpreter.py::INTERPRET_TIMEOUT_SECONDS`` and
-#: ``ProviderConfig.timeout`` (30s), the provider HTTP bound.
-PER_CALL_TIMEOUT_S = 30.0
+#: ``ProviderConfig.timeout`` (30s), the provider HTTP bound — i.e. a typical
+#: call. This is a PACING assumption, not the bound a call actually runs under:
+#: that is :func:`call_timeout`.
+ASSUMED_CALL_LATENCY_S = 30.0
+#: Finite safety ceiling for ONE provider call, derived from the operation's own
+#: default envelope (half of it): a single call may never consume the whole
+#: operation, but it must be allowed to exceed the provider HTTP bound, because
+#: ``ProviderManager.chat`` walks a model-level candidate chain — every candidate
+#: contributing its configured model and then a retry — so one successful call's
+#: wall time is not one HTTP timeout. The effective per-call timeout is
+#: ``min(this, time left in the operation)``.
+PROVIDER_CALL_SAFETY_TIMEOUT_S = DEFAULT_ENVELOPE_S / 2
+#: A provider call is not worth starting with less time left than one pacing
+#: interval: the operation fails honestly instead of starting work it cannot
+#: finish before its deadline.
+MIN_PROVIDER_CALL_TIMEOUT_S = MAX_CALL_SPACING_S
 
 #: Tokens of history text per TRANSLATION chunk. A translated chunk is roughly
 #: as long as its input, so it is bounded by the provider's configured output
@@ -121,19 +140,49 @@ def max_map_calls(budget_s: float) -> int:
     One call's worst-case latency is reserved at the end, because the last
     paced call still has to run to completion inside the same budget.
     """
-    if budget_s <= PER_CALL_TIMEOUT_S:
+    if budget_s <= ASSUMED_CALL_LATENCY_S:
         return max(1, int(budget_s / MAX_CALL_SPACING_S))
-    return max(1, int((budget_s - PER_CALL_TIMEOUT_S) / MAX_CALL_SPACING_S) + 1)
+    return max(1, int((budget_s - ASSUMED_CALL_LATENCY_S) / MAX_CALL_SPACING_S) + 1)
 
 
 def call_spacing(calls: int, budget_s: float) -> float:
     """Start interval that fits ``calls`` paced calls inside ``budget_s``."""
     if calls <= 1:
         return 0.0
-    room = budget_s - PER_CALL_TIMEOUT_S
+    room = budget_s - ASSUMED_CALL_LATENCY_S
     if room <= 0:
         return MAX_CALL_SPACING_S
     return min(MAX_CALL_SPACING_S, room / (calls - 1))
+
+
+def llm_deadline(budget_s: Any) -> float:
+    """Monotonic deadline for an LLM phase that starts now."""
+    try:
+        budget = float(budget_s)
+    except (TypeError, ValueError):
+        budget = MIN_LLM_BUDGET_S
+    return asyncio.get_running_loop().time() + max(0.0, budget)
+
+
+def remaining_s(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline``; ``None`` when there is no deadline."""
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - asyncio.get_running_loop().time())
+
+
+def call_timeout(deadline: float | None) -> float:
+    """Effective timeout for ONE provider call.
+
+    ``min(provider safety ceiling, time left in the operation)`` — finite in both
+    directions: a genuinely stuck HTTP/provider operation can never wait forever,
+    and a step of a long operation is never cut back to the provider HTTP timeout
+    while the operation still has minutes of its envelope left.
+    """
+    left = remaining_s(deadline)
+    if left is None:
+        return PROVIDER_CALL_SAFETY_TIMEOUT_S
+    return min(PROVIDER_CALL_SAFETY_TIMEOUT_S, left)
 
 MAX_INSTRUCTION_CHARS = 500
 
@@ -365,34 +414,55 @@ def _failure_reason(response: Any) -> str:
 
 
 async def _call(
-    manager: Any, *, system: str, payload: str, request_id: str = "",
+    manager: Any,
+    *,
+    system: str,
+    payload: str,
+    request_id: str = "",
+    deadline: float | None = None,
 ) -> str:
-    """One bounded LLM call through the existing ProviderManager.
+    """One LLM call through the existing ProviderManager, bounded by ``deadline``.
 
     ``tools=[]`` keeps the auxiliary call a plain completion — the history
-    operations never request further tool calls.
+    operations never request further tool calls. The bound is
+    :func:`call_timeout`: the provider safety ceiling intersected with the time
+    left in the operation — never unlimited, never a bare HTTP timeout.
     """
+    timeout = call_timeout(deadline)
+    if timeout < MIN_PROVIDER_CALL_TIMEOUT_S:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed "
+            "error=deadline_exhausted timeout_s=%.1f",
+            request_id or "-", timeout,
+        )
+        raise HistoryAIError(
+            "the AI work did not finish: the request's time budget ran out "
+            "before this AI provider call",
+            code=ERROR_PROVIDER,
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": payload},
     ]
     logger.info(
-        "AI_EXEC_TRACE request_id=%s stage=provider_call_started", request_id or "-",
+        "AI_EXEC_TRACE request_id=%s stage=provider_call_started timeout_s=%.1f",
+        request_id or "-", timeout,
     )
     try:
         response = await asyncio.wait_for(
             manager.chat(messages, tools=[]),
-            timeout=PER_CALL_TIMEOUT_S,
+            timeout=timeout,
         )
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
         logger.warning(
-            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=timeout",
-            request_id or "-",
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=timeout "
+            "timeout_s=%.1f",
+            request_id or "-", timeout,
         )
         raise HistoryAIError(
-            f"the AI provider did not respond within {PER_CALL_TIMEOUT_S:.0f}s",
+            f"the AI provider did not respond within {timeout:g}s",
             code=ERROR_PROVIDER,
         ) from exc
     except Exception as exc:  # noqa: BLE001 — provider mesh boundary
@@ -667,6 +737,7 @@ async def translate_history(
         token_budget=TRANSLATE_CHUNK_TOKEN_BUDGET,
     )
     budget = llm_budget(timeout_s)
+    deadline = llm_deadline(budget)
     capacity = max_map_calls(budget)
     if len(chunks) > capacity:
         return False, (
@@ -687,7 +758,7 @@ async def translate_history(
     async def _translate_chunk(chunk: _Chunk) -> str:
         return await _call(
             manager, system=system, payload="\n".join(chunk.lines),
-            request_id=request_id,
+            request_id=request_id, deadline=deadline,
         )
 
     try:
@@ -757,8 +828,14 @@ async def summarize_history(
         token_budget=SUMMARIZE_CHUNK_TOKEN_BUDGET,
     )
     budget = llm_budget(timeout_s)
-    # When a reduce step follows, its own call must fit inside the same budget.
-    map_budget = budget - PER_CALL_TIMEOUT_S if len(chunks) > 1 else budget
+    # One deadline for the whole operation; every call is bounded by what is left
+    # of it (capped by the provider safety ceiling in :func:`call_timeout`).
+    deadline = llm_deadline(budget)
+    # When a reduce step follows, the map phase stops one call short of the
+    # deadline so the reduce still has room — the reduce itself is NOT capped at
+    # that reservation: it may use the remaining budget up to the ceiling.
+    map_budget = budget - ASSUMED_CALL_LATENCY_S if len(chunks) > 1 else budget
+    map_deadline = min(deadline, llm_deadline(map_budget))
     capacity = max_map_calls(map_budget)
     if len(chunks) > capacity:
         return False, (
@@ -772,7 +849,7 @@ async def summarize_history(
     async def _summarize_chunk(chunk: _Chunk) -> str:
         return await _call(
             manager, system=system, payload="\n".join(chunk.lines),
-            request_id=request_id,
+            request_id=request_id, deadline=map_deadline,
         )
 
     try:
@@ -783,22 +860,17 @@ async def summarize_history(
         if len(partials) == 1:
             final = partials[0]
         else:
-            final = await asyncio.wait_for(
-                _call(
-                    manager,
-                    system=_with_instruction(_REDUCE_SYSTEM, plan.instruction),
-                    payload=_summarize_payload(partials, plan.instruction),
-                    request_id=request_id,
-                ),
-                timeout=PER_CALL_TIMEOUT_S,
+            # Bounded by the operation's remaining time (up to the provider
+            # safety ceiling) — not by one call's assumed latency.
+            final = await _call(
+                manager,
+                system=_with_instruction(_REDUCE_SYSTEM, plan.instruction),
+                payload=_summarize_payload(partials, plan.instruction),
+                request_id=request_id,
+                deadline=deadline,
             )
     except asyncio.CancelledError:
         raise
-    except asyncio.TimeoutError:
-        return False, (
-            f"❌ Summary failed: the final AI step did not finish within "
-            f"{PER_CALL_TIMEOUT_S:.0f}s."
-        ), {"error": ERROR_PROVIDER, **_result_data(plan)}
     except HistoryAIError as exc:
         return False, f"❌ Summary failed: {exc}", {
             "error": exc.code, **_result_data(plan),

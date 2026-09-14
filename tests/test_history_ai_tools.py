@@ -648,7 +648,14 @@ def test_chunk_budgets_are_derived_from_existing_architecture():
     assert history_ai_service.SUMMARIZE_CHUNK_TOKEN_BUDGET == DEFAULT_MAX_CONTEXT_TOKENS
     assert history_ai_service.MAP_CONCURRENCY == 2
     assert history_ai_service.MAX_CALL_SPACING_S == 5.0
-    assert history_ai_service.PER_CALL_TIMEOUT_S == ProviderConfig().timeout
+    # The pacing assumption mirrors the provider HTTP bound...
+    assert history_ai_service.ASSUMED_CALL_LATENCY_S == ProviderConfig().timeout
+    # ...while the per-call bound is the ceiling and one pacing interval.
+    assert (
+        history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+        == history_ai_service.DEFAULT_ENVELOPE_S / 2
+    )
+    assert history_ai_service.MIN_PROVIDER_CALL_TIMEOUT_S == history_ai_service.MAX_CALL_SPACING_S
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1048,7 @@ def test_call_spacing_fits_every_call_inside_the_budget():
     assert _REAL_CALL_SPACING(1, 220.0) == 0.0
     assert _REAL_CALL_SPACING(4, 40.0) > 0
     # The last paced call plus its worst-case latency must still fit.
-    assert (20 - 1) * spacing + history_ai_service.PER_CALL_TIMEOUT_S <= 220.0
+    assert (20 - 1) * spacing + history_ai_service.ASSUMED_CALL_LATENCY_S <= 220.0
 
 
 def test_capacity_scales_with_the_request_envelope():
@@ -1130,3 +1137,195 @@ def test_trigger_exclusion_adds_no_text_heuristic_to_the_ai_path():
         assert "startswith(" not in source
         assert "has_ai_provenance_marker" not in source
         assert "re.compile(" not in source
+
+
+# ── 7. Deadline-aware per-call timeout (long operations) ──
+#
+# The observed failure: a 1000-message summary reached the reduce step and died
+# with "the final AI step did not finish within 30s" even though the operation
+# owned a 240s envelope. Each provider call was bounded by one call's assumed
+# latency instead of by the operation's remaining budget. These tests exercise
+# the real ``asyncio.wait_for(manager.chat(...))`` bound -- not the constants.
+
+
+def _record_call_timeouts(monkeypatch) -> list[float]:
+    """Observe the real per-call bound without replacing the mechanism."""
+    seen: list[float] = []
+    real = history_ai_service.call_timeout
+
+    def _record(deadline):
+        value = real(deadline)
+        seen.append(value)
+        return value
+
+    monkeypatch.setattr(history_ai_service, "call_timeout", _record)
+    return seen
+
+
+def _reduce_timed_provider(delay: float):
+    """Scripted provider that times its FINAL (reduce) call."""
+    starts: list[float] = []
+    durations: list[float] = []
+
+    class _Instrumented(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            if "merge partial summaries" in messages[0]["content"]:
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                starts.append(started)
+                await asyncio.sleep(delay)
+                durations.append(loop.time() - started)
+            return await super().chat(messages, **kwargs)
+
+    return _Instrumented(_summarizing_provider), starts, durations
+
+
+@pytest.mark.asyncio
+async def test_call_timeout_is_finite_and_bounded_by_the_ceiling(monkeypatch):
+    """No deadline still means a finite bound; a deadline only ever tightens it."""
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+
+    assert history_ai_service.call_timeout(None) == ceiling
+
+    bounded = history_ai_service.call_timeout(history_ai_service.llm_deadline(10.0))
+    assert 0 < bounded <= 10.0
+    assert bounded < ceiling
+
+    expired = asyncio.get_running_loop().time() - 1.0
+    assert history_ai_service.call_timeout(expired) == 0.0
+    assert history_ai_service.remaining_s(expired) == 0.0
+    assert history_ai_service.remaining_s(None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_long_operation_lets_the_final_reduce_call_run_past_the_old_per_call_bound(
+    monkeypatch,
+):
+    """The reduce step is no longer cut at one call's assumed latency."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    # The size the previous implementation hard-capped every call at, compressed
+    # so the difference is observable in milliseconds instead of 30 seconds.
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 0.05)
+    bounds = _record_call_timeouts(monkeypatch)
+    provider, starts, durations = _reduce_timed_provider(0.25)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert result.message == "FINAL"
+    assert len(starts) == 1                     # exactly one reduce step
+    # The reduce call really ran longer than the old per-call cap...
+    assert durations[0] > history_ai_service.ASSUMED_CALL_LATENCY_S
+    assert durations[0] >= 0.2
+    # ...because its bound was the (finite) safety ceiling, not that cap.
+    assert bounds[-1] == history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_a_generous_envelope_bounds_every_call_by_the_finite_ceiling(monkeypatch):
+    """No step is capped at one call's latency, and no step is unbounded."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert len(bounds) == provider.calls >= 2   # map calls + the reduce
+    assert all(value == ceiling for value in bounds)
+    assert ceiling > history_ai_service.ASSUMED_CALL_LATENCY_S
+
+
+@pytest.mark.asyncio
+async def test_a_tighter_envelope_bounds_map_calls_and_the_reduce_by_the_budget(monkeypatch):
+    """``min(ceiling, remaining budget)``: the budget binds, above the old cap."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+    assumed = history_ai_service.ASSUMED_CALL_LATENCY_S
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=120.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    budget = history_ai_service.llm_budget(120.0)
+    map_values, reduce_value = bounds[:-1], bounds[-1]
+
+    assert result.success is True
+    assert len(bounds) == provider.calls >= 2
+    assert map_values
+    assert all(0 < value <= budget - assumed + 1.0 for value in map_values)
+    assert 0 < reduce_value <= budget + 1.0
+    # The budget binds (below the ceiling) yet is still far above the old cap.
+    assert map_values[0] < ceiling
+    assert map_values[0] > assumed
+    assert reduce_value > assumed
+
+
+@pytest.mark.asyncio
+async def test_a_slow_final_call_cannot_outlive_the_operation_deadline(monkeypatch):
+    """A stuck reduce is cut at the operation's deadline -- never awaited forever."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    # Compress the budget arithmetic so a 3s operation deadline is observable.
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 1.0)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.2)
+    monkeypatch.setattr(history_ai_service, "MIN_PROVIDER_CALL_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(history_ai_service, "llm_budget", lambda _envelope: 3.0)
+    provider, starts, durations = _reduce_timed_provider(10.0)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(4)), timeout_s=240.0,
+    )
+
+    import time as _time
+
+    started = _time.monotonic()
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 4})
+    elapsed = _time.monotonic() - started
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+    assert len(starts) == 1        # the reduce was started...
+    assert durations == []         # ...and cut before it could finish
+    assert elapsed < 6.0           # bounded by the deadline, not by its own 10s
+
+
+@pytest.mark.asyncio
+async def test_translation_map_calls_share_the_same_deadline_aware_bound(monkeypatch):
+    """Translation has no reduce, and its map calls use the same bound."""
+    monkeypatch.setattr(history_ai_service, "TRANSLATE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 0.05)
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_translating_provider, delay=0.2)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert len(bounds) == provider.calls
+    # The ceiling is finite, and every call outlived the old per-call cap.
+    assert all(value == history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S for value in bounds)
+    assert history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S > history_ai_service.ASSUMED_CALL_LATENCY_S
+    assert sorted(set(_sent_ids(provider))) == list(range(1, 7))
+
+
+def test_the_deadline_mechanism_leaves_pacing_and_capacity_unchanged():
+    """The per-call deadline is separate from the rate-limit guard."""
+    assert history_ai_service.llm_budget(60.0) == 40.0
+    assert history_ai_service.llm_budget(240.0) == 220.0
+    assert _REAL_CALL_SPACING(20, 220.0) == history_ai_service.MAX_CALL_SPACING_S
+    assert history_ai_service.max_map_calls(history_ai_service.llm_budget(60.0)) < \
+        history_ai_service.max_map_calls(history_ai_service.llm_budget(240.0))
+    assert history_ai_service.MAP_CONCURRENCY == 2
+    assert history_ai_service.MIN_PROVIDER_CALL_TIMEOUT_S > 0
+    assert history_ai_service.DEFAULT_ENVELOPE_S == 240.0
