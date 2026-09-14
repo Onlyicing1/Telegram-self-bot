@@ -275,15 +275,21 @@ _QUESTION_MARK = "│"
 _ANSWER_INDENT = "    "
 _QUESTION_PREFIX = f"{_QUESTION_MARK} "
 # Box-drawing glyphs are BiDi-neutral, so the elbow pair is chosen from the
-# DOMINANT DIRECTION OF THE RENDERED TEXT instead of one fixed form: the
-# vertical stroke points at the first answer glyph and the horizontal arm
-# runs from the elbow toward that text.
-#   LTR  "└─ "  U+2514 U+2500 — arm touches the text on its right
-#   RTL  "─┘ "  U+2500 U+2518 — arm touches the text on its left
+# DOMINANT DIRECTION OF THE RENDERED TEXT instead of one fixed form.
+#
+# The RTL elbow line is anchored right-to-left (see _bidi_isolate), and an RTL
+# paragraph lays its characters out from the right, so its LOGICAL order is the
+# reverse of the intended VISUAL order. Live Telegram evidence: the previous
+# logical `─┘` rendered with the corner on the LEFT, so the RTL logical order is
+# the swapped pair below.
+#   LTR  logical "└─ " → visual "└─ "  (U+2514 U+2500, corner on the LEFT,
+#                                       arm extending right toward the text)
+#   RTL  logical "┘─ " → visual "─┘ "  (U+2518 U+2500, corner on the RIGHT,
+#                                       arm extending left toward the text)
 # (the leading space keeps the two-column elbow aligned with the LTR form;
-# the logical character order of the text itself is never reversed)
+# the answer text itself is never reordered)
 _LTR_ANSWER_MARK = "└─"
-_RTL_ANSWER_MARK = "─┘"
+_RTL_ANSWER_MARK = "┘─"
 _LTR_ANSWER_PREFIX = f"{_LTR_ANSWER_MARK} "
 _RTL_ANSWER_PREFIX = f" {_RTL_ANSWER_MARK} "
 _ANSWER_MARK = _LTR_ANSWER_MARK

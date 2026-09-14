@@ -1,6 +1,102 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — RTL Telegram connector rendering investigation
+## Latest phase — RTL answer elbow logical order (visual `─┘`)
+
+Live Telegram evidence (a screenshot taken after the previous phase) showed two
+things: the MIDDLE spacer line is now visually CORRECT for a Persian question
+(the standalone `│` sits on the RIGHT), and the final RTL answer elbow is still
+visually WRONG. The previous phase therefore overstated its result for the
+elbow; this phase corrects it. The already-correct spacer and question bars are
+deliberately UNCHANGED.
+
+### Evidence and reasoning
+
+* The RTL elbow line is anchored by `_bidi_isolate(..., rtl=True)`:
+  `U+2067 RLI + U+200F RLM + payload + U+2069 PDI`. `U+200F` is Unicode class
+  `R` (`unicodedata.bidirectional("\u200f") == "R"`), so the first strong
+  character inside that isolate is RTL and the isolate's contents are laid out
+  right-to-left.
+* A right-to-left layout places the first logical character rightmost, so for a
+  line of BiDi-neutral box-drawing glyphs the LOGICAL order is the reverse of
+  the intended VISUAL order. The previously stored logical `─┘` therefore
+  rendered with the corner on the LEFT — exactly what the screenshot shows, and
+  something Python string assertions cannot detect.
+* No BiDi renderer (FriBidi / Pango / ICU / `python-bidi`) is installed in this
+  environment, so the visual result still cannot be reproduced automatically
+  here. That limitation is stated, not papered over.
+
+### Exact minimal fix
+
+`backend/ai/tools/delivery.py`: `_RTL_ANSWER_MARK` changed from `─┘`
+(U+2500 U+2518) to `┘─` (U+2518 U+2500). One constant;
+`_RTL_ANSWER_PREFIX` still wraps it as `" ┘─ "`, so the two-column elbow
+alignment is unchanged. The comment above the constants now records that the
+RTL order is stored in logical (right-to-left) order.
+
+Nothing else changed: the `│` question bars, the `│` spacer and its RLI/RLM
+anchoring, the LTR elbow `└─`, the four-ASCII-space continuation indent, the
+plain `show_question=False` output, and the edit-in-place delivery path are all
+untouched.
+
+### Resulting logical strings
+
+| Mode | Stored logical form | Required visual form |
+|---|---|---|
+| LTR | `└─ ` (U+2514 U+2500) | `└─ `, corner LEFT, arm extending right |
+| RTL | ` ┘─ ` (U+2518 U+2500) | ` ─┘ `, corner RIGHT, arm extending left |
+
+### Automated evidence
+
+`tests/test_ai_presentation_redesign.py` (53 focused tests) now pins the
+corrected logical order through a single test constant
+(`_RTL_ELBOW = "┘─"`): the full ON-mode string, the isolated RTL elbow line,
+mixed-direction answers, cross-direction cases (English question + Persian
+answer and Persian question + English answer), continuation-line isolation,
+chunk pagination, and OFF mode. The new
+`test_rtl_elbow_is_stored_in_the_order_telegram_needs` documents that the RTL
+logical order is the reverse of the required visual order and asserts the
+superseded `─┘` order does not return.
+
+These assertions are string-level. They prove the delivered logical order, the
+isolate/anchor controls, and that no connector leaks into OFF / thinking /
+failure states — NOT how Telegram draws them on a device.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused presentation tests | **53 passed** |
+| Relevant AI/presentation/task-wizard suites | **251 passed** |
+| Full suite (`pytest tests -q`) | **2,593 passed, 24 skipped, 3 warnings** |
+| `py_compile` changed Python files | **passed** |
+| `git diff --check` | **clean** |
+| Live Telegram rendering | **not available; requires the manual cases below** |
+
+### Manual Telegram verification still required (acceptance criterion)
+
+Preference ON, then inspect the edited original message on Android, Desktop and
+iOS:
+
+1. `سؤال من` → `پاسخ من`: question bar and spacer on the RIGHT, and the answer
+   elbow as visual `─┘` with the corner on the RIGHT and the arm extending LEFT
+   toward the answer text;
+2. `این سؤال من است` → Persian line, then an English-only continuation line,
+   then Persian: the connector must not jump to the LEFT;
+3. `سلام این سؤال منه` → `Hello, how can I help?`: LTR elbow `└─` with
+   four-space continuations;
+4. `سؤال` → `12345?! ---` and `سؤال` → `https://example.com/u/@name`: the RTL
+   block stays RTL for neutral / URL-only answers;
+5. Preference OFF: plain answer text with no `│`, `─`, `┘`, `└`, or directional
+   presentation controls.
+
+If a client still shows the corner on the wrong side, the remaining variable is
+that client's isolate/anchor handling, not the logical order — the next step
+would be client-specific rendered evidence, not another blind control-character
+change.
+
+---
+
+## Previous phase — RTL Telegram connector rendering investigation
 
 The prior report overstated the result: LRI/RLI/PDI isolation alone was not
 sufficiently grounded for a line containing only neutral box-drawing glyphs,
@@ -32,9 +128,11 @@ The RLM/LRM anchors the neutral connector payload to the intended direction.
 The question bars and spacer use the question direction; the answer elbow and
 all continuation lines use the answer direction, so an English-only answer
 line cannot establish a competing paragraph direction. The visible payload is
-unchanged: RTL remains the exact logical `─┘` sequence, LTR remains `└─`, and
-continuation lines retain the required four ASCII spaces. `_BIDI_ISOLATE_UNITS`
-was updated so UTF-16 pagination includes the additional mark.
+unchanged: LTR remains `└─` and continuation lines retain the required four
+ASCII spaces. `_BIDI_ISOLATE_UNITS` was updated so UTF-16 pagination includes
+the additional mark. **Superseded for the elbow:** the RTL logical order claimed
+here as `─┘` was corrected to `┘─` in the latest phase above (the spacer and the
+RLI/RLM anchoring described here are still current).
 
 Question-hidden mode remains byte-identical plain answer text with no
 presentation controls or connector glyphs. Edit-in-place delivery, thinking

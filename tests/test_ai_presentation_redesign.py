@@ -11,8 +11,11 @@ Four distinct presentation states, rendered by `backend/ai/tools/delivery.py`:
   ANSWER OFF format_presentation(..., False) — ONLY the answer block: no `│`,
             no connector lines, no structure pretending a question exists
 
-The elbow follows the dominant direction of the rendered text
-(LTR `└─ ` / RTL `─┘ `); continuation lines use exactly four ASCII spaces.
+The elbow follows the dominant direction of the rendered text. The LTR elbow
+is stored in visual order (`└─ `). The RTL elbow is stored in the LOGICAL order
+Telegram needs in an RTL paragraph, which lays characters out from the right:
+the stored `┘─ ` is therefore rendered as the visual `─┘ ` (corner on the
+RIGHT, arm extending LEFT). Continuation lines use exactly four ASCII spaces.
 The "show my message in replies" preference is presentation-only and DURABLE:
 it lives on the owner's `ai_config` row via `backend/ai/config_store.py`
 (ExecutionTelemetry is never its source of truth), is threaded through the
@@ -45,6 +48,11 @@ _LTR_ANSWER = "Hello, how can I help?\nI can also continue here."
 _RTL_ANSWER = "سلام، ممنونم. تو خوبی؟\nمن خوبم و آماده‌ام کمکت کنم.\nهر چیزی خواستی بپرس."
 _FA_QUESTION = "هی"
 _FA_ANSWER = "سلام!"
+
+# Logical elbow pairs as delivered. `_RTL_ELBOW` is deliberately the swapped
+# order: live Telegram rendering reverses it into the visual `─┘`.
+_LTR_ELBOW = "└─"
+_RTL_ELBOW = "┘─"
 
 
 _BIDI_CONTROLS = "\u200e\u200f\u2066\u2067\u2069"
@@ -93,7 +101,7 @@ def test_each_connected_line_isolated_in_the_question_direction(question, answer
     anchor = "\u200f" if question_rtl else "\u200e"
     assert lines[connector_index] == f"{question_opener}{anchor}│{closer}"
     assert lines[answer_index].startswith(answer_opener) and lines[answer_index].endswith(closer)
-    expected_mark = "─┘" if answer_rtl else "└─"
+    expected_mark = _RTL_ELBOW if answer_rtl else _LTR_ELBOW
     assert expected_mark in lines[answer_index]
     for line in lines[answer_index + 1:]:
         assert line.startswith("    " + answer_opener)
@@ -106,7 +114,7 @@ def test_rtl_spacer_and_question_markers_share_right_to_left_isolation():
     assert lines[0].startswith("\u2067\u200f│")
     assert lines[1].startswith("\u2067\u200f│")
     assert lines[2] == "\u2067\u200f│\u2069"
-    assert lines[3].startswith("\u2067\u200f ─┘")
+    assert lines[3].startswith(f"\u2067\u200f {_RTL_ELBOW}")
 
 
 def test_ltr_spacer_preserves_left_to_right_isolation():
@@ -152,7 +160,7 @@ def test_on_mode_renders_question_connector_and_answer():
     assert _without_bidi_controls(out) == (
         "│ هی\n"
         "│\n"
-        " ─┘ سلام، ممنونم. تو خوبی؟\n"
+        " ┘─ سلام، ممنونم. تو خوبی؟\n"
         "    من خوبم و آماده‌ام کمکت کنم.\n"
         "    هر چیزی خواستی بپرس."
     )
@@ -167,7 +175,7 @@ def test_on_mode_multiline_question_and_exactly_one_connector():
     assert lines[1] == "│ که چند خطه و ادامه داره"
     assert lines[2] == "│"
     assert sum(1 for line in lines if line == "│") == 1
-    assert lines[3].startswith(" ─┘ ")
+    assert lines[3].startswith(f" {_RTL_ELBOW} ")
 
 
 # ── D. four-space continuation ───────────────────────────────────────────────
@@ -190,24 +198,42 @@ def test_continuation_lines_use_exactly_four_ascii_spaces(answer):
 
 def test_ltr_answer_uses_left_elbow():
     out = _without_bidi_controls(format_presentation("Hello", _LTR_ANSWER, True))
-    assert "└─ Hello, how can I help?" in out
-    assert "─┘" not in out
+    assert f"{_LTR_ELBOW} Hello, how can I help?" in out
+    assert _RTL_ELBOW not in out
 
 
 def test_rtl_answer_uses_mirrored_elbow():
     out = _without_bidi_controls(format_presentation(_FA_QUESTION, _RTL_ANSWER, True))
-    assert " ─┘ سلام، ممنونم. تو خوبی؟" in out
-    assert "└─" not in out
-    # mirrored elbow: arm first, then the vertical stroke pointing at the text
+    assert f" {_RTL_ELBOW} سلام، ممنونم. تو خوبی؟" in out
+    assert _LTR_ELBOW not in out
+    # mirrored elbow: the corner sits on the RIGHT and the arm extends LEFT,
+    # which an RTL paragraph produces from the swapped logical stored order.
     first = _without_bidi_controls(out).split("\n│\n", 1)[1].split("\n")[0]
-    assert first[:4] == " ─┘ "
+    assert first[:4] == f" {_RTL_ELBOW} "
+
+
+def test_rtl_elbow_is_stored_in_the_order_telegram_needs():
+    """The RTL elbow logical order is the reverse of its visual result.
+
+    A live Telegram screenshot showed the previously stored logical `─┘`
+    rendering with the corner on the LEFT. Because the RTL elbow line is
+    anchored right-to-left, the paragraph lays it out from the right, so the
+    stored order must be `┘─` for the required visual `─┘` (corner RIGHT, arm
+    extending LEFT). This assertion pins the LOGICAL order only; the visual
+    result still requires a live client (see IMPLEMENTATION_REPORT.md).
+    """
+    out = _without_bidi_controls(format_presentation("سؤال من", "پاسخ من", True))
+    first = out.split("\n│\n", 1)[1].split("\n")[0]
+    assert first == " ┘─ پاسخ من"
+    # the superseded order must not come back
+    assert "─┘" not in first
 
 
 def test_mixed_direction_follows_the_first_strong_character():
     mixed_rtl_first = _without_bidi_controls(format_presentation("q", "سلام دنیا this is English بعد از فارسی", True)).split("\n│\n", 1)[1]
     mixed_ltr_first = _without_bidi_controls(format_presentation("q", "this is English سلام دنیا and فارسی", True)).split("\n│\n", 1)[1]
-    assert mixed_rtl_first.startswith(" ─┘ ")
-    assert mixed_ltr_first.startswith("└─ ")
+    assert mixed_rtl_first.startswith(f" {_RTL_ELBOW} ")
+    assert mixed_ltr_first.startswith(f"{_LTR_ELBOW} ")
     # deterministic: same input, same direction decision
     for text in ("سلام دنیا this is English بعد از فارسی", "this is English سلام دنیا"):
         once = _without_bidi_controls(format_presentation("q", text, True))
@@ -216,16 +242,16 @@ def test_mixed_direction_follows_the_first_strong_character():
 
 def test_neutral_text_defaults_to_ltr():
     answer = _without_bidi_controls(format_presentation("q", "12345 **bold** ---", True)).split("\n│\n", 1)[1]
-    assert answer.startswith("└─ ")
+    assert answer.startswith(f"{_LTR_ELBOW} ")
 
 
 def test_direction_decided_from_the_rendered_text_not_any_language_setting():
     # An English answer with a Persian QUESTION must still render LTR.
     out = _without_bidi_controls(format_presentation("سلام این سؤال منه", _LTR_ANSWER, True))
-    assert "└─ Hello, how can I help?" in out
+    assert f"{_LTR_ELBOW} Hello, how can I help?" in out
     # A Persian answer with an English QUESTION must still render RTL.
     out = _without_bidi_controls(format_presentation("my question", _RTL_ANSWER, True))
-    assert " ─┘ سلام، ممنونم. تو خوبی؟" in out
+    assert f" {_RTL_ELBOW} سلام، ممنونم. تو خوبی؟" in out
 
 
 # ── H. multiline answers keep the elbow only on the first line ───────────────
@@ -235,8 +261,8 @@ def test_direction_decided_from_the_rendered_text_not_any_language_setting():
 def test_connector_appears_only_on_the_first_answer_line(answer):
     out = _without_bidi_controls(format_presentation("q", answer, True))
     first, *rest = out.split("\n│\n", 1)[1].split("\n")
-    assert first.lstrip(" ").startswith(("└─", "─┘"))
-    assert all("└─" not in line and "─┘" not in line for line in rest)
+    assert first.lstrip(" ").startswith((_LTR_ELBOW, _RTL_ELBOW))
+    assert all(_LTR_ELBOW not in line and _RTL_ELBOW not in line for line in rest)
     assert all(line.startswith("    ") for line in rest)
 
 
@@ -246,7 +272,7 @@ def test_connector_appears_only_on_the_first_answer_line(answer):
 def test_thinking_state_never_shows_the_answer_connector():
     for show in (True, False):
         out = format_thinking(_FA_QUESTION, show)
-        assert "└─" not in out and "─┘" not in out
+        assert _LTR_ELBOW not in out and _RTL_ELBOW not in out
         assert "└" not in out and "┘" not in out
     assert _without_bidi_controls(format_thinking(_FA_QUESTION, True)) == "│ هی\n│\nThinking…"
     assert format_thinking(_FA_QUESTION, False) == "Thinking…"
@@ -268,7 +294,7 @@ def test_status_note_is_part_of_the_thinking_state_only():
 def test_failure_state_has_no_answer_connector():
     for show in (True, False):
         out = format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", show)
-        assert "└─" not in out and "─┘" not in out
+        assert _LTR_ELBOW not in out and _RTL_ELBOW not in out
     assert _without_bidi_controls(format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", True)) == (
         "│ هی\n│\n✕ Couldn't get a response\nTimeout"
     )
@@ -541,7 +567,7 @@ async def test_answer_edits_the_original_message_with_stored_preference(stored_p
     final = _without_bidi_controls(captured["edits"][-1])
 
     if stored_pref:
-        assert final == "│ هی\n│\n ─┘ پاسخ من"
+        assert final == "│ هی\n│\n ┘─ پاسخ من"
     else:
         # hidden question → PLAIN answer text, no connector of any kind
         assert final == "پاسخ من"
@@ -565,7 +591,7 @@ async def test_preference_changes_presentation_but_not_the_model_request():
     assert on["user_message"] == off["user_message"] == "هی"
     assert on["message_id"] == off["message_id"] == 456
     # only the rendered presentation differs
-    assert _without_bidi_controls(on["edits"][-1]) == "│ هی\n│\n ─┘ پاسخ من"
+    assert _without_bidi_controls(on["edits"][-1]) == "│ هی\n│\n ┘─ پاسخ من"
     assert off["edits"][-1] == "پاسخ من"
 
 
@@ -646,7 +672,7 @@ def test_chunked_delivery_keeps_rules_and_utf16_safety():
             body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", _without_bidi_controls(chunks[0]))
 
             lines = body.split("\n")
-            elbows = [l for l in lines if l.lstrip(" ").startswith(("└─", "─┘"))]
+            elbows = [l for l in lines if l.lstrip(" ").startswith((_LTR_ELBOW, _RTL_ELBOW))]
             # exactly one directional elbow per chunk: its first answer line
             assert len(elbows) == 1
             for line in lines:
