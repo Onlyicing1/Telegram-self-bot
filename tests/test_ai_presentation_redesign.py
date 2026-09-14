@@ -580,6 +580,11 @@ def test_telemetry_store_has_no_show_question_preference_anymore():
 def test_show_question_pref_reads_the_threaded_config_snapshot():
     from backend.bot.handlers import ai_unified as module
 
+    # The caller's own snapshot is authoritative (that is the row the request
+    # resolved its triggers from, cache hit or not).
+    assert module._show_question_pref(1, {"show_question": True}) is True
+    assert module._show_question_pref(1, {"show_question": False}) is False
+
     token = module._PREFETCHED_CONFIG.set({"show_question": True})  # noqa: F841
     try:
         assert module._show_question_pref(1) is True
@@ -983,3 +988,273 @@ async def test_toggle_uses_one_owner_and_the_authoritative_config_row():
     # the other owner's row is untouched by the toggle
     with patch.object(config_store, "_get_db", lambda: db):
         assert (await config_store.get_config(other_owner))["show_question"] is False
+
+
+# ── M. persistence / restore across a process restart ────────────────────────
+#
+# The durable row IS the source of truth. These tests never mock the config
+# accessor: they drive the real config_store read path against a Supabase-shaped
+# store and distinguish the three states a config can be in — durable row,
+# in-process fallback, compiled default — so a persisted preference can never
+# be lost by a fresh process or by a failed read.
+
+
+class _ReadFailTable(_FakeTable):
+    """Supabase-shaped table whose SELECT read raises while a failure budget
+    lasts — the shape of a real read error, never of an authoritative "no
+    row" response."""
+
+    def __init__(self, store: dict, payloads: list[dict], failures: list[int],
+                 exc: Exception) -> None:
+        super().__init__(store, payloads)
+        self._failures = failures
+        self._exc = exc
+
+    def execute(self):
+        if self._payload is None and self._failures[0] > 0:
+            self._failures[0] -= 1
+            raise self._exc
+        return super().execute()
+
+
+class _ReadFailDB:
+    """Durable store whose first ``fail_times`` reads raise (writes still work)."""
+
+    def __init__(self, fail_times: int = 0) -> None:
+        self.store: dict = {}
+        self.payloads: list[dict] = []
+        self.failures = [fail_times]
+        self.exc = OSError(11, "Resource temporarily unavailable")
+
+    def table(self, _name) -> _ReadFailTable:
+        return _ReadFailTable(self.store, self.payloads, self.failures, self.exc)
+
+
+def _restart(config_store) -> None:
+    """Drop all in-process config state: a fresh process knows nothing."""
+    config_store._fallback_config.clear()
+
+
+@pytest.mark.asyncio
+async def test_persisted_true_is_restored_after_a_simulated_restart():
+    from backend.ai import config_store
+
+    db = _FakeDB()
+    with patch.object(config_store, "_get_db", lambda: db):
+        assert await config_store.update_setting(1, "show_question", True) is True
+    assert db.store[1]["show_question"] is True, "the row must hold the durable value"
+
+    _restart(config_store)
+    with patch.object(config_store, "_get_db", lambda: db):
+        restored = await config_store.get_config(1)
+        vanished = await config_store.get_config(999)
+
+    assert restored["show_question"] is True
+    assert config_store.DEGRADED_READ_KEY not in restored
+    # a genuinely absent row is a different state: default False, not degraded
+    assert vanished["show_question"] is False
+    assert config_store.DEGRADED_READ_KEY not in vanished
+
+
+@pytest.mark.asyncio
+async def test_persisted_false_is_restored_after_a_simulated_restart():
+    from backend.ai import config_store
+
+    db = _FakeDB()
+    db.store[2] = dict(config_store._DEFAULTS, show_question=True)
+    with patch.object(config_store, "_get_db", lambda: db):
+        assert await config_store.update_setting(2, "show_question", False) is True
+    assert db.store[2]["show_question"] is False
+
+    _restart(config_store)
+    with patch.object(config_store, "_get_db", lambda: db):
+        restored = await config_store.get_config(2)
+
+    assert restored["show_question"] is False
+    assert config_store.DEGRADED_READ_KEY not in restored
+
+
+@pytest.mark.asyncio
+async def test_warm_trigger_cache_still_threads_the_durable_preference():
+    """A cache hit must serve the row it cached — not the compiled default.
+
+    This is the production defect: the activation handler caches triggers for
+    ``_CACHE_TTL``; returning no snapshot on a hit pushed every reply onto the
+    default preference, so a persisted ``true`` behaved as ``false``.
+    """
+    from backend.ai import config_store
+    from backend.bot.handlers import ai_unified as module
+
+    db = _FakeDB()
+    db.store[7] = dict(config_store._DEFAULTS, trigger_en="Nova", show_question=True)
+    _restart(config_store)
+    module._trigger_cache.update({"en": "", "fa": "", "ts": 0.0, "config": None})
+
+    with patch.object(config_store, "_get_db", lambda: db):
+        cold = await module._load_triggers(7)
+        warm = await module._load_triggers(7)
+
+    assert cold[2] is not None and cold[2]["show_question"] is True
+    assert warm[2] is cold[2], "a cache hit must not re-read (or drop) the row"
+    assert module._show_question_pref(7, warm[2]) is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_durable_read_never_reports_the_stored_true_as_false():
+    from backend.ai import config_store
+
+    db = _ReadFailDB(fail_times=1)
+    db.store[5] = dict(config_store._DEFAULTS, show_question=True)
+    _restart(config_store)
+
+    with patch.object(config_store, "_get_db", lambda: db):
+        config = await config_store.get_config(5)
+
+    assert config["show_question"] is True, "a transient read error is retried, not fabricated"
+    assert config_store.DEGRADED_READ_KEY not in config
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_read_failure_is_never_reported_as_a_stored_false():
+    from backend.ai import config_store
+
+    db = _ReadFailDB(fail_times=99)
+    db.store[6] = dict(config_store._DEFAULTS, show_question=True)
+    _restart(config_store)
+
+    with patch.object(config_store, "_get_db", lambda: db):
+        config = await config_store.get_config(6)
+
+    # unknown durable state is flagged as unknown — it is NOT the stored value
+    assert config[config_store.DEGRADED_READ_KEY] is True
+    # and nothing was written back as if the defaults were the stored row
+    assert db.payloads == []
+    assert db.store[6]["show_question"] is True
+
+
+@pytest.mark.asyncio
+async def test_settings_panel_shows_the_restored_value_and_never_a_fabricated_off():
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+
+    config_store._fallback_config.clear()
+    db = _FakeDB()
+    db.store[8] = dict(config_store._DEFAULTS, trigger_en="Nova", show_question=True)
+    with patch.object(config_store, "_get_db", lambda: db), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=8)):
+        _, body, buttons = await ai_mod._ai_settings_panel_handler(None, "")
+    assert "My message in replies · On" in body
+    labels = [getattr(row[0], "text", "") if isinstance(row, list) else "" for row in buttons]
+    labels += [getattr(btn, "text", "") for row in buttons
+               for btn in (row if isinstance(row, list) else [row])]
+    assert "Turn my message in replies off" in labels
+
+    # a failed durable read with no in-process value: UNKNOWN, never "Off"
+    config_store._fallback_config.clear()
+    broken = _ReadFailDB(fail_times=99)
+    with patch.object(config_store, "_get_db", lambda: broken), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=8)):
+        _, body, _buttons = await ai_mod._ai_settings_panel_handler(None, "")
+    assert "unavailable (database read failed)" in body
+    assert "My message in replies · Off" not in body
+
+
+@pytest.mark.asyncio
+async def test_toggle_makes_the_next_request_read_the_new_value():
+    """Press the toggle, then resolve the triggers again: the cached snapshot
+    must not keep serving the pre-toggle value for the rest of its TTL."""
+    from backend.ai import config_store
+    from backend.bot.handlers import ai as ai_mod
+    from backend.bot.handlers import ai_unified as module
+
+    config_store._fallback_config.clear()
+    db = _FakeDB()
+    db.store[9] = dict(config_store._DEFAULTS, trigger_en="Nova", show_question=False)
+    module._trigger_cache.update({"en": "", "fa": "", "ts": 0.0, "config": None})
+
+    with patch.object(config_store, "_get_db", lambda: db), \
+         patch.object(ai_mod, "_get_owner_id", new=AsyncMock(return_value=9)):
+        warmed = await module._load_triggers(9)
+        assert warmed[2]["show_question"] is False
+        result = await ai_mod._ai_toggle_show_question_action(None, "", 9)
+        assert result is not None and "Couldn't save" not in result[1]
+        after = await module._load_triggers(9)
+
+    assert db.store[9]["show_question"] is True
+    assert after[2] is not None and after[2]["show_question"] is True
+
+
+async def _drive_execute_ai_from_durable_store(owner_id: int, prompt: str,
+                                               result: EngineResult, db) -> dict:
+    """Drive the REAL activation + execute path against a durable ai_config
+    store (no config accessor is mocked).
+
+    The snapshot handed to ``_execute_ai`` is the one the SECOND
+    ``_load_triggers`` call returns — i.e. a cache hit inside the TTL window,
+    which is exactly the production sequence that used to lose the preference.
+    """
+    from backend.bot.handlers import ai_unified as module
+
+    captured: dict = {}
+
+    class _Engine:
+        provider_manager = _FakePM()
+        conversation_manager = MagicMock()
+
+        async def execute(self, request, status_callback=None):
+            captured["user_message"] = request.user_message
+            await status_callback("Reading context…")
+            return result
+
+    event = MagicMock()
+    event.chat_id = 123
+    event.message = MagicMock(id=456)
+    event.edit = AsyncMock()
+    event.reply = AsyncMock()
+    with (
+        patch.object(module, "_engine", _Engine()),
+        patch("backend.ai.config_store._get_db", lambda: db),
+        patch("backend.ai.config_store.record_request", new=AsyncMock(return_value=None)),
+        patch(
+            "backend.runtime.task_guard.guarded_create_task",
+            new=lambda coro, **kw: asyncio.ensure_future(coro),
+        ),
+    ):
+        module._trigger_cache.update({"en": "", "fa": "", "ts": 0.0, "config": None})
+        await module._load_triggers(owner_id)              # cold: real row read
+        _, _, snapshot = await module._load_triggers(owner_id)  # warm: cache hit
+        assert snapshot is not None, "a cache hit must still carry the durable row"
+        module._PREFETCHED_CONFIG.set(snapshot)
+        await module._execute_ai(
+            event, owner_id, prompt, "Nova", "UTC", config=snapshot,
+        )
+
+    captured["edits"] = [call.args[0] for call in event.edit.await_args_list]
+    return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored,expected", [(True, True), (False, False)])
+async def test_reply_rendering_uses_the_durable_preference_after_a_restart(
+    stored, expected,
+):
+    """DB ``show_question`` → restart → the reply renderer follows the row."""
+    from backend.ai import config_store
+
+    db = _FakeDB()
+    db.store[31] = dict(config_store._DEFAULTS, trigger_en="Nova", show_question=stored)
+    config_store._fallback_config.clear()  # restart: no in-process state
+    result = EngineResult(
+        success=True, provider="dummy", model="dummy", latency=0.1,
+        response="پاسخ من", metadata={},
+    )
+
+    captured = await _drive_execute_ai_from_durable_store(31, "هی", result, db)
+    final = _without_bidi_controls(captured["edits"][-1])
+
+    if expected:
+        assert final == "│ هی\n│\n┘─ پاسخ من"
+    else:
+        assert final == "پاسخ من"
+        for glyph in ("│", "─", "└", "┘"):
+            assert glyph not in final

@@ -1,6 +1,162 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — RTL connector column alignment (corner flush with the bars)
+## Latest phase — `show_question` persistence / restore across a process restart
+
+Reported symptom (real account, real Render process): the `ai_config` row holds
+`show_question = true`, the setting can be turned on before a restart, and after
+the restart the AI → Settings panel shows `My message in replies · Off` while
+replies behave as if the preference were `false`. No SQL was executed and no
+schema change was made or needed — `show_question` already exists on
+`ai_config` (migration `20260913000000_add_ai_config_show_question.sql`).
+
+### Root cause — TWO independent source-confirmed defects
+
+Both were reproduced against the pre-fix `HEAD` source in this workspace
+(see *Evidence* below); neither is a schema or Supabase problem.
+
+**RC1 — the reply path discarded the durable row (warm trigger cache).**
+`ai_unified._load_triggers()` serves the trigger words from a 30-second TTL
+cache and returned `None` as the snapshot on every cache hit. The activation
+handler stores that value in `_PREFETCHED_CONFIG`, and `_show_question_pref()`
+interpreted "no snapshot" as "use the compiled default". The compiled default
+is `show_question: False`, so for every message inside the TTL window (i.e.
+almost all of them) the renderer used `False` even though the row said `true`.
+Measured on HEAD: `snapshot = None`, `_show_question_pref() = False` while the
+stored row was `True`.
+
+**RC2 — a failed durable read was silently reported as a stored `false`.**
+`config_store._get_config_sync()` collapsed "the database reported no row" and
+"the read failed" into the same `None`, returning`_fallback_config.get(owner_id)`.
+With an empty fallback (exactly the state after a restart) `get_config()` then
+returned `dict(_DEFAULTS)`, so a read error became an authoritative-looking
+`show_question: False` — with no marker, no error to the caller, and nothing an
+operator could distinguish. Measured on HEAD with the row `show_question = true`
+and a failing read: `get_config()['show_question'] = False`, no degraded marker.
+Before the restart the RAM fallback written by the toggle masked this; after
+the restart it is empty, which is why the preference "came back Off".
+
+Investigation also ruled out the other candidates from the task list by source
+inspection: the owner id is set once at connect (`supervisor.set_owner_id` →
+`helper.inline_engine._owner_id`) and is the same for the toggle and for the
+panel; `ai_config` has exactly one writer (`config_store`) so no startup path,
+bootstrap, migration, `record_request()`, or provider healing rewrites the
+column (the phantom-config heal copies the row it read, so it preserves it);
+and a genuine no-row response (`maybe_single() → None` / the `204 Missing
+response` shape) is still handled as "no row".
+
+### Exact minimal fix
+
+1. `backend/ai/config_store.py`
+   * `_get_config_sync()` now returns `(row, read_failed)`. "No row" stays
+     authoritative (`None, False`), a failed read is retried `_READ_ATTEMPTS =
+     2` times (transient contention must not look like a stored value) and is
+     then reported as `read_failed=True` together with the last value this
+     process actually knows.
+   * `get_config()` keeps the stored row as the only source of truth. When the
+     read failed and no value is known, the returned defaults carry the new
+     `DEGRADED_READ_KEY = "durable_read_failed"` marker, so callers can tell
+     "the database could not be read" apart from "the row says the default".
+     The marker is never persisted (`_save_config_sync` builds an explicit
+     column payload) and is never part of `_DEFAULTS`.
+2. `backend/bot/handlers/ai_unified.py`
+   * `_trigger_cache` now stores the `ai_config` snapshot next to the trigger
+     words, and `_load_triggers()` returns it on a cache hit — so a cache hit
+     threads the durable row (no extra read; `tests/test_external_call_
+     efficiency.py` still proves a warm cache performs **no** config read).
+   * New `invalidate_config_cache()` drops the cached snapshot.
+   * `_show_question_pref(owner_id, config=None)` prefers the caller's own
+     snapshot (the same row the request resolved its triggers from), then the
+     request-scoped context value, and uses the compiled default only when no
+     snapshot exists at all. `_execute_ai` passes the snapshot it was given;
+     the reply-error path passes `config_snapshot`.
+3. `backend/bot/handlers/ai.py`
+   * The toggle invalidates the cached snapshot after a **successful** durable
+     write, so the next message renders the new value instead of one cached up
+     to `_CACHE_TTL` ago (a failed write leaves the cache alone).
+   * The Settings line renders `My message in replies · unavailable (database
+     read failed)` when the config came back degraded — it never prints `Off`
+     for a state the database did not report.
+
+Nothing else changed: no schema, no SQL, no second store, no cache added (the
+existing TTL cache is reused), no AI history/context, providers, scheduler,
+ToolExecutor/Taskloom, or delivery-renderer change.
+
+### Evidence
+
+Pre-fix (HEAD source, executed in this workspace):
+
+```
+HEAD, durable row show_question=True, read fails, empty fallback:
+   get_config()['show_question'] = False | degraded marker: False
+HEAD, warm trigger cache, row show_question=True:
+   snapshot handed to the request = None
+   _show_question_pref()          = False
+```
+
+Post-fix:
+
+```
+FIXED, transient read failure -> True | degraded: False
+FIXED, permanent read failure -> False | degraded: True
+FIXED, healthy read after restart -> True
+FIXED, warm cache snapshot show_question = True | pref = True
+```
+
+### Regression tests (`tests/test_ai_presentation_redesign.py`, section M)
+
+The durable row is exercised through the REAL `config_store` read path against a
+Supabase-shaped store (`_FakeDB`, `_ReadFailDB`); no test mocks the config
+accessor to return `True`.
+
+| Test | What it pins |
+|---|---|
+| `test_persisted_true_is_restored_after_a_simulated_restart` | row `true` → cleared fallback (restart) → `get_config` → `True`; a genuinely absent row is `False` and NOT degraded |
+| `test_persisted_false_is_restored_after_a_simulated_restart` | row `false` → restart → `False`, not degraded |
+| `test_warm_trigger_cache_still_threads_the_durable_preference` | a cache hit returns the SAME snapshot object (no re-read, nothing dropped) |
+| `test_a_failed_durable_read_never_reports_the_stored_true_as_false` | transient read error is retried → stored `True` survives |
+| `test_a_permanent_read_failure_is_never_reported_as_a_stored_false` | permanent failure → degraded marker, no write-back, row untouched |
+| `test_settings_panel_shows_the_restored_value_and_never_a_fabricated_off` | panel shows `On` for the restored row; shows `unavailable (database read failed)` — never `Off` — for a failed read |
+| `test_toggle_makes_the_next_request_read_the_new_value` | press the toggle → the next trigger resolution returns the new value |
+| `test_reply_rendering_uses_the_durable_preference_after_a_restart` (`True`/`False`) | full activation → cache-hit snapshot → `_execute_ai` against the durable store: `True` renders `│ هی\n│\n┘─ پاسخ من`, `False` renders the plain answer |
+| `test_show_question_pref_reads_the_threaded_config_snapshot` (extended) | an explicitly threaded snapshot is authoritative |
+| `tests/test_external_call_efficiency.py::test_warm_trigger_cache_performs_no_config_read` (updated) | the warm cache returns the snapshot AND performs no config read |
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused presentation suite (`tests/test_ai_presentation_redesign.py`) | 72 passed |
+| AI settings/efficiency suites (`test_external_call_efficiency.py`, `test_36_ai_settings_ux.py`) | 18 passed |
+| Full suite (`pytest tests -q`) | 2,612 passed, 24 skipped, 3 warnings |
+| `py_compile` (all 5 changed files) | passed |
+| `git diff --check` | clean |
+
+### What is NOT verified here
+
+* **No live Supabase / Render run**: the durable read was exercised against a
+  Supabase-shaped in-process store, not the production database. The exact
+  production `ai_config` row was not queried (the task forbids executing SQL).
+* The reported reason a *healthy* read returned `false` in production cannot be
+  proven from source alone — what IS now guaranteed is that a failed read can no
+  longer be presented as a stored `false`, and that the reply path can no longer
+  discard a stored `true` for a whole TTL window.
+* The previous phase's live Telegram visual check (RTL connector column) is
+  still outstanding and unchanged by this phase.
+
+### Manual production confirmation
+
+1. With the row saying `show_question = true`, restart/redeploy, open AI →
+   Settings: the line must read `My message in replies · On`.
+2. Send `Nova <anything>` twice within 30 s: BOTH replies must show the
+   `│ … │` question block and the elbow (the second one is the cache hit that
+   used to fail).
+3. Press the toggle, then message immediately: the next reply must follow the
+   new value (no 30-second lag).
+4. Grep the logs for `get_config owner_id=… → defaults after a FAILED durable
+   read`: if it appears, the database read is genuinely failing and the panel
+   will say so instead of claiming `Off`.
+
+## Previous phase — RTL connector column alignment (corner flush with the bars)
 
 Live Telegram evidence (a screenshot taken after the previous phase) confirmed
 the MIDDLE spacer line is now visually CORRECT for a Persian question and the

@@ -53,7 +53,11 @@ logger = logging.getLogger(__name__)
 _engine = None
 _owner_id: int = 0
 _tz_str: str = "UTC"
-_trigger_cache: dict[str, str] = {"en": "", "fa": "", "ts": 0.0}
+#: TTL cache of the owner's ``ai_config`` snapshot: the trigger words AND the
+#: row they were read from. The snapshot is cached with them so a cache hit
+#: still threads the DURABLE row (the presentation preference lives in it)
+#: instead of forcing the callers to fall back to a compiled default.
+_trigger_cache: dict[str, Any] = {"en": "", "fa": "", "ts": 0.0, "config": None}
 _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
 _AI_MAX_CONCURRENCY = 4
@@ -222,13 +226,20 @@ def _get_engine():
 async def _load_triggers(owner_id: int) -> tuple[str, str, dict | None]:
     """Resolve the owner's trigger words (TTL-cached) and hand back the row.
 
-    The third value is the ``ai_config`` snapshot this call actually read, or
-    ``None`` when the cache served the triggers. The activation handler passes
-    it to the config restore so one request reads that row at most once.
+    The third value is the ``ai_config`` snapshot this call read — and on a
+    cache hit it is the snapshot that read stored, because the presentation
+    preference lives in the same row as the triggers. Returning ``None`` here
+    for a cache hit would push every caller that needs the preference onto the
+    compiled default for the whole TTL window, i.e. a persisted
+    ``show_question = true`` would be ignored by the reply renderer. ``None``
+    is only returned when no row could be read at all.
+
+    The caller passes the snapshot to the config restore so one request reads
+    that row at most once.
     """
     now = time.monotonic()
     if (now - _trigger_cache["ts"]) < _CACHE_TTL and _trigger_cache["en"] is not None:
-        return _trigger_cache["en"], _trigger_cache["fa"], None
+        return _trigger_cache["en"], _trigger_cache["fa"], _trigger_cache.get("config")
     try:
         from backend.ai.config_store import get_config
         config = await get_config(owner_id)
@@ -238,11 +249,26 @@ async def _load_triggers(owner_id: int) -> tuple[str, str, dict | None]:
         _trigger_cache["fa"] = fa
         _trigger_cache["ts"] = now
         # Same request, same row: the restore reuses THIS snapshot instead of
-        # issuing a second identical read. Nothing is cached across requests.
+        # issuing a second identical read. It is also retained by the trigger
+        # cache so a later cache hit threads the same durable row rather than
+        # falling back to compiled defaults.
+        _trigger_cache["config"] = config
         return en, fa, config
     except Exception as exc:
         logger.warning("AI handler: failed to load triggers: %s", exc)
+        _trigger_cache["config"] = None
         return "", "", None
+
+
+def invalidate_config_cache() -> None:
+    """Drop the cached ``ai_config`` snapshot so the next request re-reads it.
+
+    Called after an interactive settings change (e.g. the AI → Settings
+    "my message in replies" toggle) so the change is visible on the very next
+    message instead of up to ``_CACHE_TTL`` later.
+    """
+    _trigger_cache["ts"] = 0.0
+    _trigger_cache["config"] = None
 
 
 async def _restore_config(owner_id: int, config: dict | None = None) -> None:
@@ -256,22 +282,30 @@ async def _restore_config(owner_id: int, config: dict | None = None) -> None:
         logger.warning("AI handler: config restore failed: %s", exc)
 
 
-def _show_question_pref(owner_id: int) -> bool:
+def _show_question_pref(owner_id: int, config: dict | None = None) -> bool:
     """The owner's "show my message in replies" presentation preference.
 
     Durable: read through the existing AI-config path (``config_store``),
-    never from any RAM store. When the caller already loaded the ``ai_config``
-    snapshot, it is threaded through instead of re-read.
+    never from any RAM store. The caller's already-loaded ``ai_config``
+    snapshot is authoritative when present (that is the same row the request
+    resolved its triggers from); the request-scoped context value is used as
+    the fallback for call sites that do not hold the snapshot. Only when no
+    snapshot exists at all is the compiled default used.
     """
+    for candidate in (config, _context_config()):
+        if candidate is not None and "show_question" in candidate:
+            return bool(candidate["show_question"])
     from backend.ai.config_store import _DEFAULTS
 
-    try:
-        config = _PREFETCHED_CONFIG.get()
-    except LookupError:
-        return False  # outside a request: only the renderer default is known
-    if config is not None and "show_question" in config:
-        return bool(config["show_question"])
     return bool(_DEFAULTS["show_question"])
+
+
+def _context_config() -> dict | None:
+    """The request's ``ai_config`` snapshot, or ``None`` outside a request."""
+    try:
+        return _PREFETCHED_CONFIG.get()
+    except LookupError:
+        return None
 
 
 def _format_thinking(user_message: str, show_question: bool) -> str:
@@ -535,7 +569,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
     )
     logger.info("AI_EXEC_TRACE request_id=%s stage=telegram_received", rid)
 
-    show_question = _show_question_pref(owner_id)
+    show_question = _show_question_pref(owner_id, config)
     _PREFETCHED_CONFIG.set(None)
     engine = _get_engine()
     if engine is None:
@@ -901,7 +935,7 @@ def register(client, owner_id: int, tz_str: str):
             if error_msg:
                 try:
                     await event.edit(
-                        _format_error(user_text, error_msg, _show_question_pref(owner_id))
+                        _format_error(user_text, error_msg, _show_question_pref(owner_id, config_snapshot))
                     )
                 except Exception as exc:
                     logger.warning("AI handler: failed to edit reply error: %s", exc)

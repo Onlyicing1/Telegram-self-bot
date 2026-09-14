@@ -177,12 +177,16 @@ def test_trigger_resolution_hands_its_snapshot_to_the_config_restore(config_read
 def test_warm_trigger_cache_performs_no_config_read(config_reads):
     from backend.bot.handlers import ai_unified
 
-    reads, _row = config_reads
-    ai_unified._trigger_cache.update({"en": "Nova", "fa": "", "ts": 10 ** 9})
+    reads, row = config_reads
+    # A warm cache holds the snapshot the read stored with the triggers: the
+    # durable preference lives in that same row, so a cache hit must still
+    # hand it back instead of forcing callers onto a compiled default.
+    ai_unified._trigger_cache.update({"en": "Nova", "fa": "", "ts": 10 ** 9, "config": dict(row)})
 
     en, fa, snapshot = _run(ai_unified._load_triggers(1))
 
-    assert (en, fa, snapshot) == ("Nova", "", None)
+    assert (en, fa) == ("Nova", "")
+    assert snapshot == row
     assert reads == [], "a warm trigger cache must not read the config row"
 
 

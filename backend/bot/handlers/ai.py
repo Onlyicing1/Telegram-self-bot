@@ -542,12 +542,16 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     Informational state lives in the text; actions live in buttons; the
     technical knobs live behind Advanced so this surface stays readable.
     """
+    from backend.ai.config_store import DEGRADED_READ_KEY
     from backend.ai.engine.telemetry import telemetry
 
     owner_id = await _get_owner_id()
     config = await _get_saved_config(owner_id)
     reply_stats = telemetry.get_telemetry_pref(owner_id)
     show_question = bool(config.get("show_question", False))
+    # A failed durable read means the stored preference is UNKNOWN — showing
+    # "Off" there would claim a saved state the database never reported.
+    read_failed = bool(config.get(DEGRADED_READ_KEY))
 
     en = (config.get("trigger_en", "") or "").strip()
     fa = (config.get("trigger_fa", "") or "").strip()
@@ -563,7 +567,10 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
         lines.append("! No wake word yet — set one to start chatting.")
     lines.append("")
     lines.append(f"Reply stats · {'On' if reply_stats else 'Off'}")
-    lines.append(f"My message in replies · {'On' if show_question else 'Off'}")
+    if read_failed:
+        lines.append("My message in replies · unavailable (database read failed)")
+    else:
+        lines.append(f"My message in replies · {'On' if show_question else 'Off'}")
 
     builder = InlinePanelBuilder()
     builder.add_row("English wake word", "input:ai_settings:trigger_en")
@@ -1012,6 +1019,12 @@ async def _ai_toggle_show_question_action(event, extra: str, chat_id: int) -> tu
     owner_id = await _get_owner_id()
     current = bool((await config_store.get_config(owner_id)).get("show_question", False))
     persisted = await config_store.update_setting(owner_id, "show_question", not current)
+    if persisted:
+        # The activation handler caches the ai_config snapshot it read for the
+        # trigger words; drop it so the next message renders the value the
+        # owner just chose instead of the one cached up to _CACHE_TTL ago.
+        from backend.bot.handlers.ai_unified import invalidate_config_cache
+        invalidate_config_cache()
     result = await _ai_settings_panel_handler(event, extra)
     if not persisted and result is not None:
         title, body, buttons = result

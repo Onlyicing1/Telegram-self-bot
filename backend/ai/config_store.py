@@ -20,6 +20,21 @@ logger = logging.getLogger(__name__)
 
 _DB_TIMEOUT = 10.0
 
+#: How many times a failed durable read is retried before it is reported as
+#: failed. A transient failure (contention, ``EAGAIN``, thread/socket pressure)
+#: must never be reported as if the database had said "no row".
+_READ_ATTEMPTS = 2
+
+#: Present on a returned config ONLY when the durable ``ai_config`` row could
+#: not be read AND no in-process value is known: the stored state is UNKNOWN,
+#: so a consumer that displays durable state must not present the compiled
+#: defaults as if the database had reported them (that is how a persisted
+#: ``show_question = true`` silently became an effective ``false`` after a
+#: restart, when the in-memory fallback is empty). Never persisted —
+#: ``_save_config_sync`` builds an explicit column payload — and never part of
+#: ``_DEFAULTS``, so it can never be written back as a real value.
+DEGRADED_READ_KEY = "durable_read_failed"
+
 _DEFAULTS: dict[str, Any] = {
     "provider": "",
     "model": "",
@@ -55,29 +70,61 @@ def _is_missing_config_response(exc: Exception) -> bool:
     )
 
 
-def _get_config_sync(owner_id: int) -> dict[str, Any] | None:
+def _get_config_sync(owner_id: int) -> tuple[dict[str, Any] | None, bool]:
+    """Read the owner's durable ``ai_config`` row → ``(row, read_failed)``.
+
+    ``row is None`` with ``read_failed=False`` means the database
+    authoritatively reported NO row for this owner — never that a read
+    failed. A failed read is retried (``_READ_ATTEMPTS``) so transient
+    contention cannot masquerade as a stored value; if every attempt fails it
+    is reported as ``read_failed=True`` together with the last value this
+    process actually knows (the in-memory fallback, or ``None``).
+    """
     db = _get_db()
     if not db:
         logger.info("[AI_CONFIG] DB unavailable — using fallback for owner_id=%s", owner_id)
-        return _fallback_config.get(owner_id)
-    try:
-        result = db.table("ai_config").select("*").eq("owner_id", owner_id).maybe_single().execute()
-        return result.data if result else None
-    except Exception as exc:
-        if _is_missing_config_response(exc):
-            return None
-        logger.warning("[AI_CONFIG] DB get failed for owner_id=%s: %s — using fallback", owner_id, exc)
-        return _fallback_config.get(owner_id)
+        return _fallback_config.get(owner_id), False
+    last_exc: Exception | None = None
+    for _attempt in range(_READ_ATTEMPTS):
+        try:
+            result = db.table("ai_config").select("*").eq("owner_id", owner_id).maybe_single().execute()
+            return (result.data if result else None), False
+        except Exception as exc:
+            if _is_missing_config_response(exc):
+                return None, False
+            last_exc = exc
+    logger.warning(
+        "[AI_CONFIG] durable read FAILED for owner_id=%s after %d attempt(s): %s — "
+        "durable state unknown (NOT reporting defaults as stored values)",
+        owner_id, _READ_ATTEMPTS, last_exc,
+    )
+    return _fallback_config.get(owner_id), True
 
 
 async def get_config(owner_id: int) -> dict[str, Any]:
-    """Get the AI config for an owner. Returns defaults if not found."""
+    """Get the AI config for an owner. Returns defaults if not found.
+
+    A stored row always wins. When the durable read FAILS and this process
+    knows no value for the owner, the result carries ``DEGRADED_READ_KEY`` so
+    callers can tell "the database could not be read" apart from "the row
+    says the default" — a persisted preference must never be silently
+    downgraded to the compiled default by a read error.
+    """
     try:
-        row = await _run_sync(_get_config_sync, owner_id)
+        row, read_failed = await _run_sync(_get_config_sync, owner_id)
         if row:
             merged = {k: row.get(k, v) for k, v in _DEFAULTS.items()}
             logger.info("[AI_CONFIG] get_config OK owner_id=%s provider='%s' model='%s'", owner_id, merged.get("provider", ""), merged.get("model", ""))
             return merged
+        if read_failed:
+            logger.warning(
+                "[AI_CONFIG] get_config owner_id=%s → defaults after a FAILED durable read "
+                "(stored state unknown)",
+                owner_id,
+            )
+            degraded = dict(_DEFAULTS)
+            degraded[DEGRADED_READ_KEY] = True
+            return degraded
     except Exception as exc:
         logger.warning("[AI_CONFIG] get_config failed for owner_id=%s: %s", owner_id, exc)
     logger.info("[AI_CONFIG] get_config → defaults owner_id=%s", owner_id)
