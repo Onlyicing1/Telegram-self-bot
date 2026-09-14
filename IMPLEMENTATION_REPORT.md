@@ -1,6 +1,112 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Live fix: history-analysis routing and trigger-message exclusion
+## Latest phase — Live fix: rate-limit pacing and a long-running execution envelope
+
+After the routing/exclusion fix, the live Persian request worked — but with a
+large count it hit a provider rate limit and the operation died. Source tracing
+found two independent 60-second limits, both introduced by the phase-2 work
+itself rather than by the provider.
+
+### Root causes (source-proven)
+
+| # | Symptom | Root cause | Evidence |
+|---|---|---|---|
+| 1 | Provider 429s on large counts, then the whole operation fails | The map phase fired **every chunk at once** (4 concurrent, no spacing). The first 429 makes the provider manager cool that provider down for 60s (`providers/manager/health.py::DEFAULT_COOLDOWN_SECONDS = 60.0`), so the remaining chunks all failed over and the operation failed honestly — but uselessly | `history_ai_service._map` (pre-fix): one `asyncio.gather` over all chunks with `MAP_CONCURRENCY = 4` |
+| 2 | Even without a 429, a big request was killed at 60s | The handler's execution envelope was `_AI_TIMEOUT = 60.0`, while the tool contract already declares these tools `long_running=True` and the tool executor already exempts them from the generic 10s tool timeout. The 60s envelope silently defeated that exemption | `ai_unified.py::_execute_ai` `asyncio.wait_for(engine.execute(...), timeout=_AI_TIMEOUT)`; `tools/executor.py` (long_running exemption) |
+| 3 | Too many provider calls to begin with | Summarization used the *translation* chunk budget (bounded by the provider's **output** budget, `max_tokens // 2` = 2048), even though a chunk summary is far shorter than its input | `history_ai_service.CHUNK_TOKEN_BUDGET` (pre-fix), one budget for both operations |
+
+### The fix
+
+1. **Pacing (rate-limit guard).** The map phase is no longer one burst: starts are
+   spaced by `call_spacing()` and bounded to `MAP_CONCURRENCY = 2` in flight, so a
+   large history holds at most ~12 provider calls per minute
+   (`MAX_CALL_SPACING_S = 5.0`) instead of 4-at-once forever. The spacing is
+   derived from the available budget: `min(MAX_CALL_SPACING_S, (budget - one call) / (calls - 1))`,
+   so a small request is not slowed down and the last paced call still finishes
+   inside the budget.
+2. **One real envelope, threaded (no duplicated constant).** `AIRequest` gains
+   `timeout_s`; the handler sets it to the new `_AI_EXECUTE_TIMEOUT = 240.0` and
+   uses the same value for its `wait_for` backstop (`_AI_TIMEOUT = 60.0` now
+   governs only how long a request waits for a concurrency slot). The dispatcher
+   threads it to tools as `ToolContext.extra["request_timeout_s"]`, the history
+   tools pass it on, and the service derives its LLM budget from it
+   (`llm_budget(envelope) = max(20, envelope - 20)`). Capacity therefore scales
+   with the caller: **3 paced calls at a 60s envelope, 39 at 240s** (33 when a
+   reduce step must also fit).
+3. **Per-operation chunk budgets.** `TRANSLATE_CHUNK_TOKEN_BUDGET = min(context, max_tokens // 2)`
+   (2048 — a translated chunk is as long as its input) and
+   `SUMMARIZE_CHUNK_TOKEN_BUDGET = DEFAULT_MAX_CONTEXT_TOKENS` (4000 — a chunk
+   summary is much shorter than its input). Summarization now needs far fewer
+   calls for the same history.
+4. **Honest capacity refusal.** A history that cannot be processed inside the
+   given envelope is still refused up front (`ERROR_TOO_LARGE`) — now with the
+   real capacity in the message — rather than being killed mid-flight.
+5. **Status label.** `executor._STATUS_LABELS` gains `translate_history` /
+   `summarize_history`, so a long paced operation shows a real status
+   (`🌐 Translating messages...` / `🧠 Summarizing messages...`) instead of
+   sitting on the generic thinking state.
+
+Nothing else changed: no second scheduler, executor, client or provider path;
+no new Telegram send; retrieval and provenance authority still live in
+`history_service`; the bounded request-scoped context is untouched.
+
+### Files changed
+
+| File | Role |
+|---|---|
+| `backend/services/history_ai_service.py` | pacing, per-operation chunk budgets, envelope-derived LLM budget and capacity, `map_planned` trace |
+| `backend/ai/session/request.py` | `AIRequest.timeout_s` (the caller's envelope) |
+| `backend/bot/handlers/ai_unified.py` | `_AI_EXECUTE_TIMEOUT = 240s` used for both the request and the `wait_for` backstop |
+| `backend/ai/engine/dispatcher.py` | threads `request.timeout_s` into `ToolContext.extra["request_timeout_s"]` |
+| `backend/ai/tools/history_ai.py` | reads the envelope and passes `timeout_s` to the service |
+| `backend/ai/tools/executor.py` | status labels for the two history tools |
+| `tests/test_history_ai_tools.py` | 59 tests (7 new for pacing/capacity/envelope), fast via an autouse no-delay fixture |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Tests
+
+| Run | Result |
+|---|---|
+| `tests/test_history_ai_tools.py` | **59 passed** (7 new) |
+| Adjacent suite (history service, provenance, bounded context, delivery pipeline, presentation redesign) | **282 passed** |
+| Full suite `tests/` | **2767 passed, 24 skipped** (2760 before) |
+| `py_compile` on every changed Python file | OK |
+| `git diff --check` | clean |
+
+New tests prove: map calls are **spaced**, not fired at once (measured start
+intervals); in-flight calls never exceed `MAP_CONCURRENCY`; `call_spacing` always
+leaves room for the last call's worst-case latency; capacity scales with the
+envelope (short envelope → honest `ERROR_TOO_LARGE` with zero provider calls,
+long envelope → the same history completes); the service budgets against the
+**caller's** envelope (`request_timeout_s`); and `AIRequest.timeout_s` is carried
+through `Dispatcher._build_tool_context` into the tool context while the handler
+uses one long envelope for both the request and the `wait_for`.
+
+### Live verification
+
+**Not performed — no live Telegram session exists in this workspace.** Concrete
+numbers are derived from the source, not measured against a provider: at a 240s
+envelope the service can run 39 paced calls (~12/minute); chunk counts for a real
+500/1000-message history depend on the messages' length.
+
+### What this does *not* fix
+
+A provider whose **per-minute token** quota is smaller than the history's total
+size can still rate-limit a very large request; pacing only removes the burst,
+it cannot make the work smaller than the request. If that happens the owner gets
+the existing honest failure (and the request is retried by asking again with a
+smaller count). If it recurs, the next step is a per-provider quota check before
+starting the operation.
+
+### Commit
+
+| Item | Value |
+|---|---|
+| Code + tests commit | `96dbc39b4766090f7833303177929c924c9c1770` — *fix: pace history AI calls and give long-running tools a real envelope* |
+
+---
+
+## Previous phase — Live fix: history-analysis routing and trigger-message exclusion
 
 A live request — `خلاصه ۳۰ پیام آخر رو بده` (Telegram message id `57494`) — was
 answered with the **raw message listing** instead of a summary, and the listing
