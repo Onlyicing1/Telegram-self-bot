@@ -147,13 +147,21 @@ async def iter_messages(
     limit: int = 100,
     from_user: str | None = None,
     min_id: int | None = None,
+    max_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Iterate messages in a chat. Returns list of serialized dicts."""
+    """Iterate messages in a chat. Returns list of serialized dicts.
+
+    ``min_id`` is an exclusive lower bound and ``max_id`` an exclusive upper
+    bound (Telegram semantics), which is what lets a caller page backwards
+    through a bounded range without re-reading what it already has.
+    """
     kwargs: dict[str, Any] = {"limit": limit}
     if from_user:
         kwargs["from_user"] = from_user
     if min_id is not None:
         kwargs["min_id"] = min_id
+    if max_id is not None:
+        kwargs["max_id"] = max_id
     try:
         results: list[dict[str, Any]] = []
         async for msg in client.iter_messages(chat_id, **kwargs):

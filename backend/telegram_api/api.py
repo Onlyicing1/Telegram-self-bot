@@ -85,8 +85,9 @@ class TelegramAPI:
         limit: int = 100,
         from_user: str | None = None,
         min_id: int | None = None,
+        max_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        return await messages.iter_messages(self._client, chat_id, limit, from_user, min_id)
+        return await messages.iter_messages(self._client, chat_id, limit, from_user, min_id, max_id)
 
     async def search_messages(
         self,
