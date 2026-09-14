@@ -1,579 +1,525 @@
-# Telegram Surrounding-Message Provenance Investigation
+# Telegram History Access — Architectural Investigation
 
-> **Investigation only — nothing was implemented.** This document replaces the
-> previous `INVESTIGATION.md` entirely; no earlier content is preserved, merged,
-> or appended. No production code, tests, `IMPLEMENTATION_REPORT.md`, schema,
-> migrations, configuration, presentation, delivery logic, or context-retrieval
-> logic was modified. No fix, provenance system, cache, database object, or
-> polling loop was added.
+> **Investigation only — nothing was implemented.** This document reports the
+> source-backed findings of the reusable-Telegram-history investigation. It
+> replaces the previous `INVESTIGATION.md` entirely; no earlier content is
+> preserved, merged, or appended. No production code, tests,
+> `IMPLEMENTATION_REPORT.md`, schema, migrations, configuration, presentation,
+> delivery logic, or context-retrieval logic was modified. No `HistoryService`,
+> cache, scheduler, client, or polling loop was created.
 
 | Item | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Revision audited | `79e4b7b` (`docs: investigate Telegram message provenance for chat context`) |
-| Feature under review | Telegram surrounding-message context for the AI (`IMPLEMENTATION_REPORT.md`, "Latest phase") |
-| Question | Can the surrounding Telegram window distinguish human-authored from self-bot/AI-generated or AI-modified messages? |
-| Verdict | **Partially — exactly one positive provenance signal exists (in-memory, non-durable), and the window does not consult it today.** |
+| Revision audited | `73bbda6` (`feat: add durable invisible AI provenance to AI answers`) |
+| Question | Where should reusable, arbitrary-N Telegram history retrieval live, so that "translate/summarize the last N messages" is possible without dumping N messages into one prompt? |
+| Verdict | **No reusable history layer exists today.** Two independent, non-overlapping, non-extensible readers exist; the correct boundary is a narrow services-layer history capability over the already-existing `backend/telegram_api` facade, with provenance eligibility owned there — **not** in individual AI tools, and **not** by enlarging the bounded conversational snapshot. |
 | Changes made | only this document |
 
----
+Every claim below is labelled as one of:
 
-## 1. Scope
-
-The AI now receives a bounded window of nearby messages from the same Telegram
-chat (`IMPLEMENTATION_REPORT.md`, "Latest phase — Telegram surrounding-message
-context for the AI"). A live Telegram test showed that the resulting context can
-contain previous **self-bot/AI output**, which is not desired.
-
-This investigation determines, from source only, whether the current
-architecture carries authoritative provenance that separates the six message
-categories in the lifecycle:
-
-| # | Category |
-|---|---|
-| 1 | Genuine human-authored owner messages |
-| 2 | Owner messages later edited **in place** by the AI |
-| 3 | Messages sent/created by the self-bot |
-| 4 | Temporary AI status messages (e.g. `Reading messages...`) |
-| 5 | Final AI-generated responses |
-| 6 | Messages from other Telegram users |
-
-Hard constraint honored throughout: **`sender_id == owner_id` is never treated
-as proof of human authorship.** The AI edits the owner's own Telegram message in
-place (3, 6), so the owner's account legitimately holds both human-authored and
-AI-produced content.
-
-Trace covered end-to-end:
-
-```
-Telegram message/event
-  -> AI trigger
-  -> AI request creation
-  -> original Telegram message identity
-  -> edit-in-place delivery
-  -> surrounding-message retrieval
-  -> (provenance filtering -- ABSENT)
-  -> prompt/context construction
-```
+- **[CURRENT]** — implemented behavior verified in source at `73bbda6`.
+- **[FINDING]** — a conclusion derived from that source, with the evidence cited.
+- **[RECOMMENDED]** — a future implementation proposal. **Nothing in this
+  section is implemented.**
 
 ---
 
-## 2. Current Context Retrieval
+## 1. Scope and method
 
-### 2.1 The exact path (traced in source)
+The investigation answers one architectural question: given a request such as
+*"translate the last 500 messages"* or *"summarize the last 1000 messages"*,
+which existing layer should own Telegram history retrieval, and how do the
+bounded conversational context and that layer relate?
+
+Method: read-only source tracing from the AI trigger handler outward to
+Telethon, plus the `telegram_api` facade, the services layer, the dispatcher,
+the token-budget module, and the existing tests. No repository-wide search was
+performed beyond targeted `grep` for the reader/history entry points named in
+the task. No live Telegram, Supabase, or Render access was used.
+
+---
+
+## 2. Current Telegram context architecture
+
+**[CURRENT]** The bounded surrounding-context snapshot is built exactly once per
+AI request and threaded forward as data:
 
 ```
 Telegram NewMessage (outgoing, owner)
-  `- ai_unified handler                      backend/bot/handlers/ai_unified.py
-      `- _execute_ai                         (:572)
-          request_chat_id    = event.chat_id            (:594)
-          request_message_id = event.message.id         (:595)
-          `- _load_telegram_chat_context(...)           (:539)
-              `- fetch_telegram_chat_context(...)       telegram_context.py (:364)
-                    `- _read_window(...)                (:309)
-                          client.iter_messages(
-                              chat_id,
-                              limit=MAX_CONTEXT_MESSAGES,   # 10
-                              max_id=message_id)            (:316)
-                    `- _resolve_sender_names(...)        (:323)  <=4 lookups
-                    `- build_chat_context(...)           (:241)
-                          `- _to_record(...)             (:205)
-          `- AIRequest(telegram_context=snapshot)       (:668)
-              `- ContextBuilder (pure assembler)
-                  `- dataclasses.replace(ctx, telegram_chat=...)
-                      `- PromptBuilder -> `[Telegram Chat Context]`
+  └─ backend/bot/handlers/ai_unified.py::_execute_ai
+       request_chat_id    = event.chat_id
+       request_message_id = event.message.id
+       └─ _load_telegram_chat_context(...)            ai_unified.py:539
+            └─ fetch_telegram_chat_context(...)       telegram_context.py:394   ← the ONLY I/O
+                 ├─ _read_window(...)                 telegram_context.py:339
+                 │    client.iter_messages(chat_id, limit=MAX_CONTEXT_MESSAGES,
+                 │                          max_id=message_id)   :346
+                 ├─ _resolve_sender_names(...)        (≤ MAX_SENDER_RESOLVES lookups)
+                 └─ build_chat_context(...)           telegram_context.py:261   ← PURE
+                      └─ _to_record(...)              telegram_context.py:223
+       └─ AIRequest(telegram_context=snapshot)        ai_unified.py:668
+            └─ engine.execute(request)                bounded by asyncio.wait_for(
+                                                       _AI_TIMEOUT = 60.0)  ai_unified.py:62, :687
+                 └─ ContextBuilder                        backend/ai/conversation/context_builder.py
+                      telegram_chat=snapshot              context_builder.py:203, :238, :290
+                      └─ PromptBuilder                    backend/ai/prompt/builder.py
+                           if ctx.telegram_chat.is_empty: ...   builder.py:276
+                           telegram_block = ctx.telegram_chat.render()  builder.py:289, :409
+                           → `[Telegram Chat Context]`
 ```
 
-One Telegram read per request; `ContextBuilder` and `PromptBuilder` perform no
-I/O on the snapshot (documented in `IMPLEMENTATION_REPORT.md` and asserted in
-`tests/test_telegram_chat_context.py`, e.g.
-`test_prompt_builder_only_formats_the_already_built_snapshot`).
+Supporting facts, verified:
 
-### 2.2 Hard bounds (`backend/ai/conversation/telegram_context.py`)
+| Fact | Evidence |
+|---|---|
+| The snapshot is a **frozen value object**, never persisted, never merged into AI history | `TelegramChatContext` (`telegram_context.py`), module docstring rules |
+| Exactly one Telegram read per request | `fetch_telegram_chat_context` → single `_read_window` call (`:339`–`:346`) |
+| `build_chat_context` performs **no I/O** | signature + docstring (`telegram_context.py:261`); asserted by `tests/test_telegram_chat_context.py::test_prompt_builder_only_formats_the_already_built_snapshot` |
+| `AIRequest.telegram_context` is typed as this snapshot | `backend/ai/session/request.py:36`, `:66` |
+| The whole AI turn, including the prompt round and tool rounds, sits inside one `_AI_TIMEOUT = 60.0` | `ai_unified.py:62`, `:619`, `:687` |
 
-| Constant | Value | Line |
-|---|---|---|
-| `MAX_CONTEXT_MESSAGES` | 10 | `:40` |
-| `MAX_MESSAGE_CHARS` | 200 (per message, `...` suffix) | `:43` |
-| `MAX_TOTAL_CHARS` | 1500 (oldest dropped first) | `:46` |
-| `MAX_SENDER_RESOLVES` | 4 | `:49` |
-| `FETCH_TIMEOUT_S` | 3.0 (whole read) | `:52` |
-
-### 2.3 What the window keeps and drops
-
-`build_chat_context` (`:241`) is the only selection step:
-
-- drops the triggering message id and any `exclude_message_ids`
-  (`if msg_id in excluded`, `:275`) — the handler passes the reply target
-  (`ai_unified.py:539`, `exclude` tuple);
-- drops anything at/after the anchor ("never invent future context");
-- sorts chronologically, keeps the newest `MAX_CONTEXT_MESSAGES`, then applies
-  the per-message and total text budgets.
-
-### 2.4 There is no provenance filter of any kind
-
-`_to_record` (`:205`) reads exactly: `sender_id` (`:210`), `id` (`:215`),
-`out` (`:218`), `date` (`:219`), the message text, and a media label. Of these,
-`out` is used **only** for the render label (`attribution`, `:117-125`,
-returning `"You"`) and to skip name resolution (`:334`). Nothing in
-`build_chat_context` or `fetch_telegram_chat_context` consults AI provenance.
-
-Consequence: `msg.body` is the message's **current** text, so a previous AI
-answer is included verbatim and labelled `You: ...`.
+**[FINDING]** The snapshot is request-scoped enrichment, not a history API. Its
+selection logic is deliberately a single `iter_messages` window anchored on the
+triggering message id (`max_id=message_id`), with "never invent future context"
+and "newest N win" semantics.
 
 ---
 
-## 3. Message Lifecycle
+## 3. Current Telegram history readers
 
-### 3.1 Primary path — the AI never sends a separate answer
+**[CURRENT]** There are **two** end-user-facing conversation readers plus one
+typed facade and one bounded scan helper. They do not share code.
 
-`deliver_response` edits the triggering message in place
-(`backend/ai/tools/delivery.py:668`, `await event.edit(messages[0])`), and the
-thinking/status states are edits of that **same** message
-(`ai_unified.py:676`, `:681`). Therefore:
-
-```
-T0  owner types "hi"
-      -> Telegram msg id 100, out=True, sender_id=owner
-T1  AI handles it and edits msg 100 in place
-      -> same id 100, out=True, sender_id=owner,
-         text = the AI answer, edit_date bumped,
-         ReplyResolver[100] = the AI record
-T2  owner sends the next message
-      -> msg id 101; surrounding window for 101 = [msg 100]
-         renders as:  "You: <previous AI answer>"
-```
-
-The Telegram message keeps the owner's `id`, the owner's `sender_id`, and
-`out=True`. **`out=True` / `sender_id == owner_id` therefore cannot distinguish
-category 1 from categories 2 and 5** — the exact trap the task flagged.
-
-### 3.2 Category matrix (as observed by the window)
-
-| Category | `id` | `out` | `sender_id` | Text visible to window | Positive marker? |
+| # | Reader | Location | Retrieval | Output | Provenance-aware? |
 |---|---|---|---|---|---|
-| 1 Human owner message | own | `True` | owner | as typed | none (absence only) |
-| 2 Owner message AI-edited in place (= 5 after delivery) | own | `True` | owner | **the AI answer** | `ReplyResolver` (4.3) |
-| 3 Self-bot-created message | new | `True` | owner | self-bot/AI text | none |
-| 4 Temporary status string | n/a | n/a | n/a | **never a separate message** (8) | none |
-| 5 Final AI response | own (edited) or new (category 3) | `True` | owner | AI text | only when it reused the trigger id |
-| 6 Other participant | own | `False` | other | as typed | `out=False` |
+| 1 | Bounded surrounding window | `backend/ai/conversation/telegram_context.py::_read_window` (`:339`) → `build_chat_context` (`:261`) | `client.iter_messages(chat_id, limit=10, max_id=anchor)` | `TelegramChatContext` (frozen records) | **Yes** — `has_ai_provenance_marker` filter (`:305`) + `strip_ai_provenance_marker` (`:231`) |
+| 2 | Recent-message listing tool | `backend/ai/tools/semantic.py::ListRecentMessagesTool.execute` (`:87`, `:142`) | `client.iter_messages(chat_id, limit=limit)` (`:165`), reversed to chronological | `ToolResult.data.messages` = list of dicts | **No** |
+| 3 | Typed Telegram facade | `backend/telegram_api/messages.py::iter_messages` (`:144`), `search_messages` (`:172`), `get_messages` (`:95`); exposed on `telegram_api/api.py` (`:71`, `:82`, `:91`) | `client.iter_messages(...)` + `serialize_message` | serialized dicts (`limit` default 100; supports `from_user`, `min_id`) | **No** |
+| 4 | Bounded scan helper (services) | `backend/services/delete_service.py::_iter_messages_bounded` (`:43`) | `client.iter_messages` with `rpc_await(..., timeout=5.0)` **per page/RPC** | raw Telethon messages (internal) | **No** (uses ownership, not provenance) |
+
+**[FINDING] All four are independent implementations.** Reader 1 does not use
+the facade (it calls the Telethon client directly); reader 2 does not use the
+facade either; reader 3 is a thin serializer used by some tools
+(`backend/ai/tools/delete.py`, `backend/ai/tools/context.py`) but **not** by
+either conversation reader; reader 4 is the only one with per-RPC timeouts.
+
+Additional raw history touch points exist for single-message fetches, not
+conversation history: `backend/ai/tools/delete.py:345`, `:553`;
+`backend/ai/tools/save.py:108`; `backend/bot/handlers/delete.py:158`, `:233`;
+`backend/bot/handlers/save.py:104`; `backend/bot/handlers/misc.py:473`, `:512`,
+`:561`; `backend/helper/target_context.py:41`;
+`backend/services/database_service.py:54`; `backend/services/save_service.py:506`.
+
+**[FINDING] No shared conversation-history layer exists.** There is no
+`HistoryService`, no history repository, no message-normalization utility, and
+no pagination abstraction anywhere in `backend/`. The only reusable primitives
+that exist are the `telegram_api` serializer and the bounded-iteration pattern
+in `delete_service`.
 
 ---
 
-## 4. Available Provenance Signals
+## 4. Current limits, and why the bounded context cannot serve N = 500/1000
 
-### 4.1 Per-message Telegram metadata (all traced; nothing assumed)
+**[CURRENT]** Hard constants, none user-configurable:
 
-| Field | Read at | Provenance value |
+### 4.1 Bounded surrounding context — `backend/ai/conversation/telegram_context.py`
+
+| Constant | Value | Meaning |
 |---|---|---|
-| `msg.id` | `telegram_context.py:215` | identity only — no authorship |
-| `msg.out` | `:218` | True for **every** owner-account message (1, 2, 3, 5) |
-| `msg.sender_id` | `:210`, `:334` | owner for 1/2/3/5; other for 6 |
-| `msg.from_id` | not read | same lineage as `sender_id` |
-| `msg.date` | `:219` | send time; an in-place edit does **not** change it |
-| `msg.edit_date` | **never read by this module** | set on any edit — AI's and humans' alike; not authoritative (10) |
-| `msg.message` / `msg.text` | `_message_text` (`:184-190`) | **current** text; for category 2 this is already the AI answer. Renderer-owned content, not a marker |
-| `msg.reply_to` | not read | reply linkage only |
-| `msg.media` | `classify_message` via `_media_type` (`:192-203`) | media presence only |
+| `MAX_CONTEXT_MESSAGES` | `10` (`:58`) | surrounding messages per request |
+| `MAX_MESSAGE_CHARS` | `200` (`:61`) | per-message truncation, `…` suffix |
+| `MAX_TOTAL_CHARS` | `1500` (`:64`) | total text across the block; oldest dropped first |
+| `MAX_SENDER_RESOLVES` | `4` (`:67`) | display-name lookups per request |
+| `FETCH_TIMEOUT_S` | `3.0` (`:70`) | wall-clock bound for the whole read; any failure degrades to an **empty** context |
 
-### 4.2 Request-level metadata available when the AI request starts
+### 4.2 Recent-message tool — `backend/ai/tools/semantic.py`
 
-| Signal | Source | Covers |
+| Limit | Value | Evidence |
 |---|---|---|
-| `request_chat_id`, `request_message_id` | `ai_unified.py:594-595` | the current trigger message only |
-| `event.message` | handler entry | the trigger message object |
-| `ReplyContext.is_ai_message`, `ai_session_id`, `ai_role`, `ai_content`, `ai_provider`, `ai_model`, `ai_timestamp` | built at `ai_unified.py:493-527`; fields at `context_builder.py:69`; consumed at `prompt/builder.py:294` | the **replied-to** message only |
-| `TelegramChatContext` snapshot | `telegram_context.py:134` | the surrounding window (no provenance field) |
-| `ReplyResolver` record | `backend/ai/context/reply_resolver.py` | **the only positive marker that a Telegram message id holds AI output** |
+| `_DEFAULT_CANDIDATES` | `50` | `:32` (default when `limit` is absent) |
+| `_MAX_CANDIDATES` | `100` | `:31`; enforced `max(1, min(limit, _MAX_CANDIDATES))` in `execute` (`:142`) and declared as `"maximum": 100` in `parameters` |
+| Per-message text | unbounded previews (`text` field) | `execute` builds `data.messages` dicts |
+| No timeout wrapper | — | `execute` iterates directly (`:165`) |
 
-### 4.3 The one positive marker — `ReplyResolver`
+### 4.3 Typed facade — `backend/telegram_api/messages.py`
 
-`backend/ai/context/reply_resolver.py`:
-
-- **What it is:** a process-wide in-memory singleton mapping
-  `telegram_msg_id -> ResolvedAIContent` (module docstring, `:10`;
-  `_MAX_ENTRIES = 500`, `:26`).
-- **Who writes it:** `ai_unified.py:803`, after a **successful** in-place
-  delivery — `get_resolver().register(telegram_msg_id=event.message.id, ...)`.
-  Only the trigger message id is ever registered.
-- **Who reads it:** the reply-to-AI check at `ai_unified.py:495` and `:949`
-  (`get_resolver().resolve(reply_msg.id)`), which feeds
-  `ReplyContext.is_ai_message` (`context_builder.py:69`) and
-  `prompt/builder.py:294`.
-- **Lifetime:** RAM-only; `register` (`:81`) evicts the oldest entry at the cap
-  (`:126`); `resolve` is `:130`; `clear()` exists for tests. Nothing is
-  persisted and nothing is rebuilt after a restart.
-
-Task-side provenance exists but is **not applicable here**:
-`backend/ai/task_contract.py` `SCHEDULED_OCCURRENCE_EXTRA` (`:21`),
-`trusted_message_ids` (`:139`), and `message_reference_provenance_error`
-(`:190`) govern *task-creation argument* authority (which message a task may
-delete/save later), not the surrounding-window read.
-
-### 4.4 Answers to the twelve required questions
-
-| # | Question | Answer (evidence) |
-|---|---|---|
-| 1 | What Telegram metadata is available for surrounding messages? | `id`, `out`, `sender_id`, `date`, `message`/`text`, media — 4.1 |
-| 2 | What metadata is available when an AI request starts? | `request_chat_id`, `request_message_id`, `ReplyContext`, the snapshot — 4.2 |
-| 3 | How is the original user message identified? | `event.message.id` captured before any status edit — `ai_unified.py:595` — and excluded from the window (`telegram_context.py:275`) |
-| 4 | How is edit-in-place delivery implemented? | `deliver_response` -> `event.edit(messages[0])` — `delivery.py:668`; statuses via `event.edit` — `ai_unified.py:676`, `:681` |
-| 5 | Is there existing internal tracking of AI-handled message IDs? | **Yes, one:** `ReplyResolver`, for the edited trigger id only — 4.3 (`ai_unified.py:803`) |
-| 6 | Can a manually-authored owner message be distinguished from an owner message later edited by AI? | **Only in-process, and only in one direction:** resolver hit => AI-edited; resolver miss => *not proven* human (5, 6) |
-| 7 | Can previous AI responses be identified reliably? | Only when the answer reused the trigger id **and** the process still holds the mapping; new-message responses cannot (7) |
-| 8 | Can temporary AI/status messages be identified reliably? | **Not needed** — they never persist as separate messages (8) |
-| 9 | Can this be done after a process restart? | **No** — the only marker is RAM-only (6.3, 12 G2) |
-| 10 | Does the architecture persist any provenance information? | **No.** `ReplyResolver` is in-memory; no table/column/field exists for it (6.3) |
-| 11 | Which filtering approaches are authoritative? | Only the `ReplyResolver` denylist and `out=False` for other participants — 9 |
-| 12 | Which approaches would be unsafe heuristics? | Text/format matching, `out`-based owner dropping, `edit_date`, length/recency — 10 |
-
----
-
-## 5. Genuine Owner Messages
-
-**Identifiable positively: no. Identifiable negatively: yes.**
-
-- Telegram metadata for such a message is identical to an AI-edited owner
-  message: `out=True`, `sender_id=owner`, arbitrary text
-  (`telegram_context.py:210`, `:218`).
-- The only available discriminator is the **absence** of a `ReplyResolver`
-  record — and absence is not proof: it also describes an AI-edited message
-  whose mapping was evicted (`reply_resolver.py:126`) or lost to a restart.
-- Therefore the system can only conclude "not *known* to be AI". Treating that
-  as "known to be human" would be an allowlist built on absence (10).
-
-Practical consequence: a filter may **keep** these messages (they must be kept),
-but the system cannot certify them as human, and must never use certification as
-a precondition for keeping.
-
----
-
-## 6. AI-Edited Owner Messages
-
-This is category 2/5 and it is the **structural** cause of the reported symptom.
-
-### 6.1 Why it happens
-
-The AI answers by editing the owner's own Telegram message (`delivery.py:668`);
-the message therefore remains `out=True` with `sender_id=owner`, and its stored
-text becomes the AI answer (`_message_text`, `telegram_context.py:184-190`). A
-later request's window reads that text back (2.4) and labels it `You`
-(`:117-125`).
-
-### 6.2 How they can be recognized (in-process)
-
-`get_resolver().resolve(message_id) is not None` => that id's content is AI
-output:
-
-- written at `ai_unified.py:803` after successful delivery;
-- read at `:495` and `:949` for the reply target;
-- surfaced as `ReplyContext.is_ai_message` (`context_builder.py:69`) and used by
-  `prompt/builder.py:294`.
-
-Because the very same handler already uses this mechanism for the reply target,
-applying it to the surrounding window is a **reuse of existing architecture**,
-not a new provenance system.
-
-### 6.3 Limits of that recognition
-
-| Limit | Evidence |
+| Limit | Value |
 |---|---|
-| RAM-only: a restart empties the map | `reply_resolver.py:10`, `:130` |
-| LRU cap 500 with eviction of the oldest | `reply_resolver.py:26`, `:126` |
-| Only one id per AI turn is registered (the edited trigger message) | `ai_unified.py:803` |
-| Not written on failure paths (only after a successful delivery) | `ai_unified.py:800-818` |
+| `iter_messages` default `limit` | `100` (`:147`) |
+| Range support | `from_user`, `min_id` only (`:148`–`:156`); **no** `max_id`, no offset/range pair |
+| Timeout | none inside the function; `asyncio.TimeoutError` is only translated to `TelegramTimeoutError` if a caller already bounded it |
 
-### 6.4 Policy question — deliberately left open
+### 4.4 Bounded scan precedent — `backend/services/delete_service.py`
 
-Whether an **historically** AI-edited owner message should be shown to the model
-as context or excluded is a product policy, not a source fact. The source proves
-such messages **can** be identified while the process lives and **cannot** be
-identified after a restart. That case is recorded as uncertain (13, U1/U3)
-rather than silently decided.
-
----
-
-## 7. Self-Bot / AI-Generated Messages
-
-Messages the self-bot **creates** are a different failure mode from in-place
-edits: they have **no marker at all**.
-
-| Producer | Source | Registered? |
+| Constant | Value | Evidence |
 |---|---|---|
-| chunked/split AI answer (`messages[1:]`) | `delivery.py:679` `event.reply(message)` | **no** — returned `Message` discarded |
-| edit-failure fallback for the first chunk | `delivery.py:673` `event.reply(messages[0])` | **no** |
-| error/failure fallback reply | `ai_unified.py:831` `event.reply(final_text)` | **no** |
-| scheduled `send_message` action | `backend/ai/tools/message.py:133` `telegram.send_message(chat_id, text)` | **no** |
-| task result delivery | `backend/ai/task_execution.py:727` `telegram.send_message(chat_id, text)` | **no** |
-| task outcome notification | `backend/runtime/supervisor.py:380` `TelegramAPI(self.client).send_message(owner, message)` | **no** |
-| Deep Save re-upload to Saved Messages | `backend/services/save_service.py:397`, `:428` `send_message("me", ...)` / `send_file` | **no** |
+| `_MAX_DELETE_SCAN_MESSAGES` | `1000` (`:23`) | proves the codebase already scans 1000 messages — **bounded per RPC, not per request** |
+| `_DELETE_RPC_TIMEOUT_SECONDS` | `5.0` (`:25`) | applied to **every** iteration step via `rpc_await` (`:51`–`:54`) |
 
-`deliver_response` returns only counts
-(`DeliveryResult(True, delivered, len(messages))`, `delivery.py:683`); the
-`Message` objects from `event.reply(...)` are not captured anywhere.
+### 4.5 Prompt/token limits — `backend/ai/prompt/budget.py`
 
-**Therefore these messages are indistinguishable from genuine owner messages by
-any current source mechanism** — they carry `out=True`, `sender_id=owner`, and
-no resolver entry. This is a confirmed gap (12, G1/G3), bounded by the fact that
-it only affects chats where the self-bot actually posts (Saved Messages for
-scheduled sends/saves/notifications, and the trigger chat for long answers and
-failure fallbacks).
+| Cap | Value | Line |
+|---|---|---|
+| `DEFAULT_MAX_TOTAL_TOKENS` | `8500` | `:25` |
+| `DEFAULT_MAX_OUTPUT_TOKENS` | `1000` | `:26` |
+| `DEFAULT_MAX_SYSTEM_TOKENS` | `2000` | `:27` |
+| `DEFAULT_MAX_CONTEXT_TOKENS` | `4000` | `:28` |
+| `DEFAULT_MAX_MEMORY_TOKENS` | `1000` | `:29` |
+| `DEFAULT_MAX_TOOL_RESULT_TOKENS` | `1500` | `:31` — **declared and re-exported, never applied anywhere** (only hits: `budget.py:31`, `prompt/__init__.py:85`, `:132`) |
+| Estimation rule | 1 token ≈ 4 English chars, ≈ 2 non-English chars | `estimate_tokens` |
 
----
+### 4.6 Execution-model limits
 
-## 8. Temporary / Status Messages
+| Limit | Value | Evidence |
+|---|---|---|
+| `MAX_TOOL_ROUNDS` | `3` | `backend/ai/engine/dispatcher.py:58`, loop at `:704` |
+| Whole AI turn | `_AI_TIMEOUT = 60.0` s | `ai_unified.py:62`, `:687` |
+| Tool results injected verbatim into the continuation round | JSON `{tool, success, message, data, error}` | `Dispatcher._build_continuation_messages` (`:1933`–`:1973`) |
+| Deterministic listing renderer | `_summarize_tool_results` (`:1794`) → `_render_message_list` (`:1821`) | uses `data.messages` (`:1813`–`:1815`) |
 
-**On the primary path they are not separate Telegram messages at all.**
+**[FINDING] Why the bounded context cannot be raised to 500/1000.** The snapshot
+is not merely capped by a constant; it is *designed* as a proximate, anchored
+window and every downstream layer assumes that:
 
-- `format_thinking` (`delivery.py:424`), `format_status` (`:435`), and
-  `format_failure` (`:449`) are rendered into the **same** triggering message by
-  `event.edit(...)`: `ai_unified.py:676` (status callback), `:681` (thinking),
-  `:610`, `:624`, `:851` (error/timeout states).
-- Because `iter_messages` returns a message's **current** content, a transient
-  string such as `Reading messages...` is never observed as a surrounding
-  message. By the time a later request reads the window, that id holds either
-  the final answer (category 2/5) or the failure text — still the same id.
-- Exception: when delivery falls back to `event.reply(...)`
-  (`delivery.py:673`, `:679`; `ai_unified.py:831`), that text becomes a **new**
-  message and joins category 3, inheriting its "no marker" gap.
+1. **Selection semantics are anchor-bound** — `max_id=message_id`
+   (`telegram_context.py:346`) with "never invent future context". A 1000-message
+   history request is a *range* request, not "the messages just before the
+   trigger", so it is a different query, not a bigger window.
+2. **Truncation is lossy by design** — 200 chars/message + 1500 chars total
+   (`:61`, `:64`). Translating a 1000-message range at 200 chars/message would
+   silently drop most of the content; translation must not be lossy.
+3. **The read is a single 3.0 s window** (`:70`) — a 1000-message fetch cannot
+   honestly fit that budget, and its failure mode is *silent empty context*
+   (`fetch_telegram_chat_context` returns `EMPTY_CHAT_CONTEXT` on any error or
+   timeout). Silent emptiness is acceptable for optional enrichment and
+   dangerous for an explicit user request.
+4. **Everything lands in one prompt** — `PromptBuilder` renders the snapshot into
+   one `[Telegram Chat Context]` block (`builder.py:289`) inside the same turn
+   that is capped at ~8 500 input tokens / 4 000 context tokens and a 60 s wall
+   clock. 1000 messages at ~50 chars each already exceed the total prompt budget;
+   mixed Persian/English at 2–4 chars/token makes it far worse.
+5. **The value object is frozen and request-scoped** — it deliberately carries no
+   pagination cursor, no date range, no ordering contract beyond "chronological",
+   and no chunk state, which are exactly the fields a large-range operation needs.
 
-Consequence: **no status-specific filter is required**, and no status text can
-serve as a provenance marker (it does not persist).
+**Conclusion:** raising `MAX_CONTEXT_MESSAGES` would degrade ordinary requests
+(more irrelevant context, more truncation loss, higher fetch-failure odds) while
+still not producing a valid 500/1000-message operation. The two capabilities are
+architecturally distinct.
 
----
+**[FINDING] The separation already exists conceptually in the source**, even
+though the large-history side is unimplemented:
 
-## 9. Safe Filtering Mechanisms
-
-Only two filters are authoritative from source.
-
-### 9.1 Keep non-owner messages (category 6)
-
-`out=False` (`telegram_context.py:218`) is authoritative for "not the owner's
-account". These messages render by display name (`:117-125`, `:323-361`) and
-must be kept unchanged.
-
-### 9.2 Exclude messages positively identified as AI output (the denylist)
-
-Exclude any window message id for which `ReplyResolver.resolve(id)`
-(`reply_resolver.py:130`) returns a record. This is:
-
-- deterministic and provider-independent (no model involvement);
-- grounded in trusted runtime state written by the handler itself
-  (`ai_unified.py:803`);
-- **conservative**: it removes only content the system positively knows is AI,
-  so it can never remove a message it merely *suspects*;
-- already the established mechanism for the reply target
-  (`ai_unified.py:495`, `:949`; `context_builder.py:69`; `builder.py:294`).
-
-### 9.3 Preserve existing selection rules
-
-Keep the current-key exclusion and `exclude_message_ids`
-(`telegram_context.py:275`; `ai_unified.py:539`), the anchor/future rule, the
-chronological sort, and all bounds (`:40-52`).
-
-### 9.4 Fail-open on uncertainty (keep, don't drop)
-
-Because absence of a marker is not proof of humanity (5), any filter must
-default to **keeping** a message it cannot classify. Excluding an unclassifiable
-message would risk deleting legitimate human context, which the requirement
-explicitly forbids.
+- `telegram_context.py` documents itself as "the bounded surrounding-message
+  snapshot … request-scoped … never persisted" and explicitly distinguishes
+  itself from `HistoryManager` / `ConversationContext.history` (the AI session's
+  own turns) and `ReplyContext` (the replied-to message). It is *not* a Telegram
+  history API.
+- `ListRecentMessagesTool` is documented as "a bounded window of the REAL recent
+  Telegram messages … the first step of semantic delete" — a tool-scoped preview,
+  and its `limit` schema is capped at 100.
+- `delete_service._iter_messages_bounded` (`_MAX_DELETE_SCAN_MESSAGES = 1000`)
+  demonstrates the existing pattern for large history work: iterate in the
+  services layer, bound each RPC, keep raw message objects, and never put the
+  result into a prompt.
 
 ---
 
-## 10. Unsafe Heuristics
+## 5. Where the two paths diverge (root cause of the observed gap)
 
-None of the following may be used as authoritative provenance.
+**[CURRENT]/[FINDING]** The surrounding-context path filters AI output; the
+tool-rendering path does not:
 
-| Heuristic | Why it is unsafe (source-grounded reason) |
+```
+path A (surrounding context)                     path B (list_recent_messages)
+telegram_context._read_window                    semantic.ListRecentMessagesTool.execute
+  → build_chat_context                                   → raw dicts incl. marked text
+      drop if has_ai_provenance_marker (:305)             (no marker check)
+      strip marker in _to_record (:231)                   → Dispatcher._summarize_tool_results
+  → prompt: marker-free                                    → _render_message_list (:1821)
+                                                             text reproduced verbatim (marker invisible)
+                                                           → _build_continuation_messages JSON (tool role)
+                                                             data.message JSON → provider
+```
+
+**[FINDING]** The divergence is therefore not "a missing marker check in a
+tool". It is that the provenance *invariant* ("marker text never reaches the
+model; AI output is not surrounding human conversation") is enforced only inside
+`telegram_context`, while the tool-result → model chokepoint
+(`Dispatcher._build_continuation_messages`, `dispatcher.py:1933`) and the
+deterministic renderer (`_render_message_list`, `:1821`) inject tool `data`
+verbatim.
+
+**[CURRENT] Provenance today is one deterministic pair of helpers plus one
+in-process registry:**
+
+| Piece | Location | Role |
+|---|---|---|
+| `AI_PROVENANCE_MARKER = "\u2061\u2062\u2063\u2064"` | `backend/ai/context/provenance.py:40` | the single authoritative marker literal |
+| `has_ai_provenance_marker` / `strip_ai_provenance_marker` / `apply_ai_provenance_marker` | `provenance.py:43`, `:53`, `:64` | substring detection / removal / idempotent append |
+| Applied only to the final successful presentation | `backend/ai/tools/delivery.py::apply_presentation_provenance` (`:440`), called from `deliver_response` (`:686`, `:721`) | durable half |
+| Read by the bounded collector | `telegram_context.py:305` (drop), `:231` (strip) | exclusion + sanitization |
+| `ReplyResolver` | `backend/ai/context/reply_resolver.py` | in-process, RAM-only, LRU-capped mapping of Telegram msg id → AI content — still an in-process optimization, not durable storage |
+
+`backend/ai/context/__init__.py` re-exports the marker helpers, so a shared layer
+can consume them without importing `telegram_context`.
+
+---
+
+## 6. Correct architectural boundary
+
+### 6.1 Answers to the required determinations
+
+**A. Is there already a shared history/context layer that should own provenance
+eligibility? — [FINDING] No.** §3 proves there is no history layer; §2 proves the
+snapshot is the only context layer and that it is bounded and anchor-scoped.
+
+**B. (n/a — no such layer exists.)**
+
+**C. Where does the responsibility belong? [RECOMMENDED]** Two distinct answers,
+because eligibility and retrieval are different concerns:
+
+| Concern | Owner | Why |
+|---|---|---|
+| History **retrieval + normalization + pagination + range semantics + media metadata + message-ID preservation** | a new narrow module in the **services layer** (`backend/services/`), built over the existing `backend/telegram_api/messages.py` facade and the existing `rpc_await`-style per-RPC bounding (`backend/helper/rpc_timeout.py:20`; pattern already used by `delete_service.py:43`) | `AGENTS.md §13.3` (services own business logic, tools are thin wrappers); the facade and the bounded-RPC pattern already exist, so this **extends** an established pattern rather than inventing a new subsystem |
+| History **provenance eligibility** (is this message AI output?) | the `backend/ai/context/provenance.py` helpers, consumed by whichever layer materializes history for the model | it is the single authoritative durable signal; re-implementing it per tool would create N definitions of the same predicate |
+
+**D. Why a marker check directly inside `ListRecentMessagesTool` would violate the
+current architecture — [FINDING] three source-grounded reasons:**
+
+1. **The tool's own contract requires complete ID coverage.**
+   `ListRecentMessagesTool` is documented (`semantic.py:88`–`:94`, `:106`–`:113`)
+   as the first step of semantic delete: *"then call `delete_messages_by_ids` with
+   only the IDs you saw here. Never invent IDs."* Dropping AI-marked messages
+   would make them **undeletable**, because `DeleteMessagesByIdsTool` can only
+   act on IDs the listing revealed. Filtering here breaks a documented contract.
+2. **It is exactly the per-tool ad-hoc filtering the constraint forbids**, and it
+   would have to be duplicated in every future reader (translate, summarize,
+   search, export), each with its own definition of eligibility.
+3. **The architecture already has a chokepoint.** The tool-result → model path is
+   `Dispatcher._summarize_tool_results` / `_render_message_list` /
+   `_build_continuation_messages` — the tool-path equivalent of
+   `telegram_context._to_record`. Enforcing marker sanitization there matches the
+   existing design instead of scattering it.
+
+**E. Is a new abstraction justified? — [FINDING] Partially: retrieval, yes;
+provenance, no.** The source proves *no* existing layer can perform
+arbitrary-N, range-aware, lossless retrieval (readers 1–4 in §3 are each
+unsuitable: 1 is bounded/anchor/lossy, 2 is capped at 100 and contractually
+raw-for-delete, 3 has no `max_id`/range and no timeout, 4 is delete-specific).
+Provenance, by contrast, already has a correct abstraction
+(`backend/ai/context/provenance.py`) and must be **reused**, not reinvented.
+
+### 6.2 Why the alternative locations are wrong
+
+| Candidate | Verdict | Reason (source) |
+|---|---|---|
+| Enlarge `MAX_CONTEXT_MESSAGES` | **wrong** | §4 — anchor semantics, lossy truncation, 3 s single-shot read with silent-empty failure, single-prompt budget, frozen request-scoped object |
+| Proliferate the marker check into every tool | **wrong** | breaks `ListRecentMessagesTool`'s delete-ID contract; duplicates a predicate that already has one authoritative home; contradicts `AGENTS.md §13.3` |
+| Put history retrieval inside the AI tool itself | **wrong** | the tool would own Telegram retrieval policy (pagination, timeouts, ordering, media), which the task and `AGENTS.md` both place in the services layer |
+| Add a second Telegram client / update loop / scheduler | **not needed** | `RuntimeSupervisor` is the single connection authority; the existing `client` is already reachable through `ToolContext` and the `telegram_api` facade |
+| Persist history in Supabase | **not needed / forbidden** | the requirement is retrieval of Telegram history, which is already durable in Telegram; no schema change is justified |
+
+---
+
+## 7. [RECOMMENDED] Relationship between the bounded context and large-history operations
+
+Bounded context stays exactly as it is: one request-scoped, anchored, 10-message,
+3 s snapshot, provenance-filtered. Large-history retrieval is a **separate,
+explicitly requested operation** that:
+
+1. is never placed into `AIRequest.telegram_context` and never rendered into the
+   `[Telegram Chat Context]` block;
+2. returns a **normalized message collection** (id, sender, date, text/caption,
+   media metadata, provenance flag) instead of a prompt string;
+3. is consumed by an AI tool as *data*, then reduced (translated/summarized)
+   **outside** the prompt-sized path — chunked, processed, and aggregated — so
+   the model only ever sees bounded slices.
+
+**[RECOMMENDED] Data flow — "translate the last N messages"**
+
+```
+user request ("translate the last 500 messages")
+ → AI tool (thin) parses N / range from arguments
+ → history retrieval (services layer) over telegram_api facade:
+      chronological fetch, per-RPC bounded, ID-preserving, provenance-labelled
+ → eligibility policy applied once, centrally (provenance helpers)
+ → chunk into prompt-sized slices (respect MAX_TOTAL_TOKENS / context cap)
+ → per-chunk translation through the existing provider path (ProviderManager)
+ → reassemble in original message order, one translated block per source message
+ → deliver (unchanged presentation path)
+```
+
+**[RECOMMENDED] Data flow — "summarize the last N messages"**
+
+```
+user request ("summarize the last 1000 messages")
+ → same retrieval + eligibility + chunking
+ → map step: per-chunk extraction/summary (bounded, provider round per chunk)
+ → reduce step: aggregate the chunk summaries into the final answer
+ → deliver
+```
+
+**[FINDING]** Neither flow exists today: there is **no translation tool/service**
+and **no summarization tool/service** (§8). The dispatcher's bounds
+(`MAX_TOOL_ROUNDS = 3`, `_AI_TIMEOUT = 60.0`) mean a 1000-message map/reduce
+cannot honestly run inside one tool invocation as currently structured; the
+source supports bounded per-slice work, not an unbounded in-turn loop.
+
+---
+
+## 8. Existing translation and summarization capabilities
+
+**[CURRENT] Translation: none.** Every repository hit for `translate` /
+`translation` is unrelated: a dispatcher comment about translating tool schemas
+(`backend/ai/engine/dispatcher.py:350`), digit translation
+(`backend/ai/persian.py:25`, `backend/ai/task_candidate.py:50`), and prompt text
+instructing the model *not* to translate tool values / user instructions
+(`backend/ai/prompt/template.py:88`, `backend/ai/task_interpreter.py:97`, `:452`).
+There is no translation tool, service, provider configuration, or test. The model
+can translate ad hoc because it is an LLM, but no architecture receives a batch
+of Telegram messages for translation, and no message-boundary or order
+preservation exists.
+
+**[CURRENT] Summarization of Telegram content: none.** Hits are unrelated:
+`UsageSummary` aggregation (`backend/ai/database/usage_reader.py`), the explicit
+statement that `HistoryManager` has "no summaries" (`history.py:5`, `:45`), a
+config comment about a history budget (`backend/ai/config/defaults.py:15`), and
+the dispatcher's `_summarize_tool_results` — which is **deterministic string
+assembly of tool results**, not model summarization (`dispatcher.py:1794`).
+
+**[FINDING]** Therefore both target capabilities need the same missing
+prerequisite first: a reusable history retrieval + normalization layer. Neither
+needs a new provider, executor, or scheduler.
+
+---
+
+## 9. Chunking, pagination, token limits, hierarchical processing
+
+**[CURRENT]** What the architecture already provides:
+
+| Primitive | Location | Reusable for large history? |
+|---|---|---|
+| Per-RPC timeout wrapper | `backend/helper/rpc_timeout.py::rpc_await` (`:20`) | **Yes** — the right building block for long fetches |
+| Generic bounded await with diagnostics | `backend/runtime/operation_watchdog.py::guarded_await` (`:81`) | **Yes** |
+| Bounded iteration over history | `backend/services/delete_service.py::_iter_messages_bounded` (`:43`) | **Yes as a pattern** (delete-specific today) |
+| Serialized message dicts | `backend/telegram_api/messages.py::serialize_message` (used by `iter_messages` `:144`) | **Yes** — already the facade's output shape |
+| Token estimation + caps | `backend/ai/prompt/budget.py` (`estimate_tokens`, caps `:25`–`:31`) | **Yes** for slice sizing; note `DEFAULT_MAX_TOOL_RESULT_TOKENS` is currently unused |
+| Provider round abstraction | `ProviderManager` via `Dispatcher` | **Yes** — map/reduce steps are ordinary provider rounds |
+| Tool timeouts / long-running exemption | `ToolExecutor` (`long_running=True` skips the generic 10 s tool timeout) | available, but **not** a substitute for an honest multi-step design |
+
+**[FINDING]** Missing pieces for correct chunking: no `max_id`/range pair in the
+facade (`iter_messages` supports only `from_user`/`min_id`, `messages.py:148`),
+no chunk state, no aggregation stage, no per-operation progress/failure contract
+for partially completed ranges. `DEFAULT_MAX_TOOL_RESULT_TOKENS = 1500` is
+declared and exported but never enforced anywhere — a large history result
+injected into a prompt would not be capped by it today.
+
+---
+
+## 10. [RECOMMENDED] Minimum future change set (not implemented)
+
+| File | Likely change |
 |---|---|
-| Presentation characters `│`, `─`, `└─`, `┘─` | Presentation is renderer-owned and has already changed three times (`IMPLEMENTATION_REPORT.md`: RTL connector phases). The visible format is not a persisted attribute of the message. **Not reliable.** |
-| Status/AI text `Reading messages...`, the trigger word, the AI name, `🤖` | Human-reproducible strings. `format_status` (`delivery.py:435`) does not persist (8), and a human may type any of these. **Not reliable.** |
-| `sender_id == owner_id` / `out=True` | True for categories 1, 2, 3 and 5 alike (`telegram_context.py:218`) — removes legitimate human context. Explicitly forbidden. |
-| `edit_date is not None` / `edit_date` ordering | Humans edit messages too; the field is not even read by the module today. Not authoritative. |
-| Text length, recency window, Markdown/emoji shape | Correlational at best; no source attribute proves authorship. |
-| Applying `is_ai_message` to arbitrary window messages | That field is derived from the resolver **for the reply target only** (`context_builder.py:69`); reusing it as ground truth for other ids is an allowlist built on absence (5). |
-| Asking the provider/model to classify provenance | Non-deterministic and provider-dependent; the architecture requires deterministic, fail-closed behavior. |
+| `backend/services/history_service.py` *(new)* | the narrow retrieval/normalization capability: chronological fetch over `telegram_api`, range/count semantics, per-RPC bounding via `rpc_await`, ID + media + provenance-labelled normalized records, explicit failure contract |
+| `backend/ai/context/provenance.py` | **no change expected** — consumed as-is; it is already the single authoritative eligibility predicate |
+| `backend/helpers`/`telegram_api/messages.py` | possible addition of a `max_id`/range parameter to `iter_messages` (facade currently lacks it) |
+| `backend/ai/tools/registry.py` | register thin translate/summarize history tools (thin wrappers only) |
+| `backend/ai/tools/<translate|summarize>.py` *(new)* | tool wrappers that parse N/range, call the service, chunk, and drive the provider rounds — no Telegram policy inside |
+| `backend/ai/engine/dispatcher.py` | only if the aggregation path needs an explicit multi-step contract; `_build_continuation_messages` (`:1933`) / `_render_message_list` (`:1821`) are the chokepoint for marker sanitization of any tool result that can carry message text |
+| `backend/ai/conversation/telegram_context.py` | **no change expected** — stays bounded |
+| Tests | extend `tests/test_telegram_chat_context.py` (bounded behavior unchanged) and add focused history-service/tool tests |
 
-**Explicit verdict:** `│`, `└─`, `┘─`, and `Reading messages...` are **NOT**
-reliable provenance markers, and the source proves nothing that would make them
-authoritative.
+**Must not be touched:** `RuntimeSupervisor` and the single Telegram client,
+`Taskloom`/`backend/ai/task_scheduler.py`, `ToolExecutor` architecture,
+provider architecture, Supabase (`backend/db/`, `supabase/migrations/`),
+`DATABASE_ARCHITECTURE.md`, delivery/presentation (`backend/ai/tools/delivery.py`
+visual paths), and `backend/ai/conversation/history.py`.
 
----
-
-## 11. CONFIRMED SAFE
-
-1. **Other participants are identifiable.** `out=False` + `sender_id` read at
-   `telegram_context.py:218`, `:210`, rendered at `:117-125`. (-> 9.1)
-2. **The triggering message and the reply target are already excluded.**
-   `telegram_context.py:275` (`if msg_id in excluded`) plus the anchor bound;
-   `ai_unified.py:539` supplies the reply-target exclusion. No duplication.
-3. **Messages at/after the anchor are never included.** `build_chat_context`
-   (`telegram_context.py:241`) enforces the "no future context" rule.
-4. **A positive, in-process marker for AI-in-place content exists.**
-   `ReplyResolver.register` (`reply_resolver.py:81`) / `resolve` (`:130`), called
-   at `ai_unified.py:803`, and already consumed for the reply target
-   (`ai_unified.py:495`, `:949`; `context_builder.py:69`;
-   `prompt/builder.py:294`).
-5. **Status/thinking/presentation strings do not persist as separate Telegram
-   messages on the primary path.** `ai_unified.py:676`, `:681`, `:851`;
-   `delivery.py:424`, `:435`, `:449`. (-> 8)
-6. **The surrounding read is single-shot and bounded**, so a narrowing filter
-   cannot introduce extra Telegram traffic: `telegram_context.py:316`
-   (one `iter_messages`), `:40-52` (bounds).
+**[RECOMMENDED] Required tests for any future implementation:** count semantics
+(exactly N, N > available, N = 0/negative); range semantics with `min_id`/`max_id`
+and inclusive/exclusive boundaries; strict chronological ordering after
+pagination; message-ID preservation; per-message text integrity (no lossy 200-char
+truncation); provenance exclusion and marker stripping on the history path;
+marker sanitization at the tool-result → model chokepoint; media metadata
+labelling without downloads; per-RPC timeout/failure behavior (partial range →
+explicit honest failure, never a silent empty result); no duplicate reads;
+concurrency safety for two simultaneous history requests; bounded prompt size per
+chunk; ordering preserved in translated/summarized output; and regression tests
+proving the bounded surrounding context and the visible presentation are
+unchanged.
 
 ---
 
-## 12. CONFIRMED GAP
+## 11. Risks and safeguards
 
-**G1 — The surrounding window applies no provenance filter at all.**
-`_to_record` (`telegram_context.py:205-222`) reads `out`/`sender_id` for display
-only (`:117-125`, `:334`); `build_chat_context` (`:241`) consults nothing
-provenance-related. This is the direct cause of the observed live behavior.
-
-**G2 — Provenance is not durable.**
-The only marker is RAM-only with an LRU cap of 500
-(`reply_resolver.py:10`, `:26`, `:126`) and is never rebuilt or persisted, so
-after a restart no previously AI-edited message can be recognized.
-
-**G3 — Self-bot-created messages are unmarked.**
-Chunked answers and fallback replies (`delivery.py:673`, `:679`;
-`ai_unified.py:831`), scheduled sends (`tools/message.py:133`), task results
-(`task_execution.py:727`), task notifications (`supervisor.py:380`), and Deep
-Save re-uploads (`save_service.py:397`, `:428`) create messages whose ids are
-discarded (`delivery.py:683`) and never registered anywhere.
-
-**G4 — No provenance is persisted anywhere in the architecture.**
-There is no table, column, or request-scoped record describing which Telegram
-message ids the self-bot produced or overwrote. (`ReplyResolver` is the only
-tracking, and it is memory-only.)
-
----
-
-## 13. UNCERTAIN
-
-**U1 — Which category caused the live symptom.**
-Source cannot decide whether the observed residual AI text came from
-in-place-edited messages (category 2, fixable today via the resolver) or from
-self-bot-created messages (category 3, needing a new marker), because the actual
-chat content was not inspected (no live access in this investigation).
-
-**U2 — Whether the AI is ever triggered where the self-bot posts as itself**
-(e.g. Saved Messages, where scheduled `send_message`, task notifications, and
-Deep Save re-uploads accumulate as `out=True` messages — `message.py:133`,
-`supervisor.py:380`, `save_service.py:397`, `:428`).
-
-**U3 — Whether provenance must survive a process restart.** The reported
-behavior is live-process; G2 means any restart-based expectation would require
-the (non-existent) durable provenance.
-
-**U4 — Whether `edit_date` is populated for the in-place AI edit on every
-Telegram client.** Relevant only as a hypothetical fallback; the field is not
-read today and is not authoritative in any case (10).
-
-**U5 — How historically AI-edited owner messages should be treated.** Depends on
-U1/U3 and on a product decision; the source cannot make it (6.4).
-
-**Hypotheses (plausible, not proven):**
-
-- **H1** — The observed contamination is predominantly category 2, since the
-  primary delivery path always reuses the trigger message (`delivery.py:668`)
-  and long answers/scheduled output are less common than ordinary replies.
-- **H2** — If the chat is Saved Messages, a substantial share of the window is
-  category 3 from scheduled tasks and Deep Save uploads.
-- **H3** — After any process restart, category 2 collapses into
-  "indistinguishable from category 1" for the pre-restart history (direct
-  consequence of G2).
-
----
-
-## 14. Minimum Required Fix Surface
-
-Identified, **not implemented**. No schema, no new store, no new subsystem.
-
-**Phase 1 — reuse the marker that already exists** (addresses the observed
-symptom if it is category 2):
-
-| File | Change |
+| Risk | Evidence / mitigation (source) |
 |---|---|
-| `backend/ai/conversation/telegram_context.py` | optional `is_ai_message` predicate / pre-computed `exclude_ai_ids` accepted by `build_chat_context` (`:241`) and `fetch_telegram_chat_context` (`:364`); one check in the existing exclusion loop (`:275`), fail-open on miss |
-| `backend/bot/handlers/ai_unified.py` | `get_resolver` is already imported/used in this module (`:493`, `:495`, `:945`, `:949`) — supply the predicate at the single call site (`:539`), preserving the single Telegram read |
-
-Effect: category 2/5 is removed deterministically; categories 1, 4 and 6 are
-untouched; bounds and ordering are unchanged.
-
-**Phase 2 — only if U1 shows category 3 in the live chat:**
-extend the existing registry instead of adding one — capture the `Message`
-objects currently discarded by `deliver_response` (`delivery.py:673`, `:679`)
-and register their ids through the same `ReplyResolver`
-(`ai_unified.py:803` is the existing write site). No new map, no schema.
-
-**Explicitly not required / not permitted:** database column, table, or
-migration; a second provenance system; a new cache; a message database; new
-Telegram polling or update loop; changes to delivery, presentation, providers,
-scheduler, ToolExecutor, Taskloom, or the AI runtime history; any text-based
-heuristic.
+| Token/context overflow | caps in `prompt/budget.py:25`–`:31`; `DEFAULT_MAX_TOOL_RESULT_TOKENS` is **not enforced today**, so chunking must size slices explicitly |
+| Telegram API cost/latency | `_read_window` today is 10 messages / 3.0 s (`telegram_context.py:58`, `:70`); 1000 messages is ~100× the RPC count — per-RPC bounding (`rpc_await`, `delete_service.py:51`) is the existing answer |
+| Memory on large N | `delete_service` already scans up to 1000 messages (`_MAX_DELETE_SCAN_MESSAGES = 1000`, `:23`) without accumulating normalized records; a history layer must stream/chunk rather than materialize 1000 fully-normalized records at once if N grows |
+| Whole-turn timeout | `_AI_TIMEOUT = 60.0` (`ai_unified.py:62`) bounds the request; a large map/reduce cannot fit one turn as currently structured |
+| Tool-round exhaustion | `MAX_TOOL_ROUNDS = 3` (`dispatcher.py:58`) — multi-step aggregation must not rely on the model chaining many rounds |
+| Duplicate Telegram reads | currently one read per request (`telegram_context.py:339`); a history fetch plus the surrounding snapshot for the same turn would double-read — the design must not re-read the same window |
+| Concurrent large requests | no queueing exists for history; `asyncio` semaphore guarding exists only for AI requests (`ai_unified.py:619`) |
+| Ordering errors | `build_chat_context` sorts by id (`telegram_context.py:261` region); `ListRecentMessagesTool` manually reverses (`semantic.py:168`) — pagination must sort explicitly, not trust Telethon order |
+| Message-ID loss | `_render_message_list` prints `[id]` (`dispatcher.py:1830`) and the delete contract depends on it; normalized history must keep ids |
+| Media handling | context never downloads media (`TelegramContextMessage.media_type` label only); history must do the same |
+| Provenance handling | one authoritative helper set (`provenance.py:40`–`:74`); never re-implement or regex |
+| AI-generated messages accidentally included | the durable marker is the only trusted signal (`telegram_context.py:305`); `sender_id`/`out` are explicitly not provenance |
+| Very large N requested by the user | requires an explicit cap + honest "requested N, retrieved M" reporting; no such contract exists today |
+| Failure halfway through a multi-chunk operation | `fetch_telegram_chat_context` degrades to *silent empty* (`EMPTY_CHAT_CONTEXT`) — acceptable for enrichment, unacceptable for an explicit request; a history layer needs an explicit error contract |
+| Visible presentation | unchanged by any of the above; delivery is untouched (`delivery.py:422`, `:440`, `:686`) |
 
 ---
 
-## 15. Recommended Next Implementation Stage
+## 12. Open questions the source cannot answer
 
-**Stage: implement Phase 1 only — bounded `ReplyResolver`-based exclusion of
-known AI-edited messages from the surrounding window.**
-
-Focused tests (fake Telegram client + fake/real resolver, no live Telegram) must
-prove:
-
-1. a previously AI-edited message id is excluded from the window;
-2. a genuine owner message is kept and still renders as `You`;
-3. another participant's message (`out=False`) is kept and named;
-4. an empty resolver leaves current behavior unchanged;
-5. an unknown/failed resolver lookup fails **open** (message kept, never dropped);
-6. the single Telegram read is preserved and all bounds
-   (10 / 200 / 1500 / 4 / 3.0 s) are unchanged;
-7. the reply target is still excluded exactly once and never duplicated;
-8. `[Current Request]` ordering and the context-is-not-instruction contract are
-   unchanged.
-
-Then re-observe the live chat to resolve U1/U2 and decide whether Phase 2
-(registering new self-bot message ids) is required.
-
-**Do not** proceed to Phase 2, add durability, or adopt any text-based heuristic
-before U1 is resolved.
+1. Whether a future map/reduce summarization should run inside one AI turn
+   (subject to `MAX_TOOL_ROUNDS = 3` / 60 s) or as a durable Taskloom task — no
+   source states the intended pattern.
+2. Whether `DEFAULT_MAX_TOOL_RESULT_TOKENS = 1500` was intended to be enforced and
+   was simply never wired; it is declared and exported but referenced nowhere.
+3. Whether the unspecified product policy should also exclude AI-provenance
+   messages from *explicit* history listings (`list_recent_messages`), given that
+   the same tool is the ID source for deletion — the source proves the trade-off
+   but not the decision.
+4. Whether per-message translation should preserve message boundaries (one
+   translated line per source message) or translate a merged block; only the
+   former preserves the ID/ordering contract that delete and review rely on.
+5. Whether the facade should grow `max_id`/range support, or whether the history
+   layer should page with `min_id` only.
+6. What the intended upper bound on N is (the only existing number is
+   `_MAX_DELETE_SCAN_MESSAGES = 1000`).
 
 ---
 
-## 16. Validation Status
+## 13. Validation status
 
 | Item | Status |
 |---|---|
 | Scope honored | only `INVESTIGATION.md` modified |
-| Production code / tests / `IMPLEMENTATION_REPORT.md` / schema / migrations / config | **untouched** |
-| Fix implemented | **none** (investigation only) |
-| New provenance system / cache / table / polling | **none added** |
-| Source evidence | every conclusion cites the exact file and function/line (2-10) |
+| Production code / tests / `IMPLEMENTATION_REPORT.md` / schema / migrations / config / `DATABASE_ARCHITECTURE.md` | **untouched** |
+| Implementation performed | **none** (investigation + documentation only) |
+| New abstraction created | **none** — the `history_service.py` module is a recommendation, not a file |
+| Evidence | every claim cites an exact path + symbol/line (§2–§9) |
 | `git status` | only `INVESTIGATION.md` changed |
-| `git diff --check` | clean |
-| Full-file review | performed start-to-end; all previous content removed |
-| Automated tests run | **none** — no code changed, so no suite is relevant to this document |
-| Live Telegram / Supabase / Render verification | **not performed** (out of scope for this investigation) |
+| Tests run | none — no code changed |
+| Live Telegram / Supabase / Render verification | **not performed** (out of scope) |
 
-### What is proven vs. what is not
+**Proven from source:** the two-reader architecture and its exact call paths and
+bounds (§2–§4); the absence of any shared history layer, translation service, or
+summarization service (§3, §8); the provenance mechanism and its single
+enforcement point in `telegram_context` (§5); the tool-result chokepoint that
+bypasses marker sanitization (§5); the execution/token limits that make a
+single-prompt 1000-message operation infeasible (§4.5–§4.6, §9).
 
-**Proven from source:** the retrieval path and its bounds and exclusions (2);
-the absence of any provenance filter in the window (2.4); the in-place delivery
-mechanism and its consequences for `out`/`sender_id` (3, 6); the existence,
-write site, read sites, and non-durable lifetime of `ReplyResolver` (4.3, 6.3);
-the unmarked status of self-bot-created messages (7); the non-persistence of
-status strings (8); the list of authoritative vs. unsafe filters (9, 10).
-
-**Not proven / not verified:** the actual content of the live chat and therefore
-which category caused the observed contamination (U1); any behavior after a
-process restart in production (U3); Telegram client rendering/behavior details
-(U4); and whether the recommended Phase 1 change is sufficient in practice
-(requires the live chat and, later, an implementation stage).
+**Not proven / not measured:** real Telegram latency, RPC cost, and memory for
+N = 500/1000 (no live access); whether `_AI_TIMEOUT = 60.0` can be met by any
+particular map/reduce design; and the product decisions listed in §12.
 
 ---
 
-**No fix was implemented. Only this document was modified.**
+**No fix or feature was implemented. Only this document was modified.**
