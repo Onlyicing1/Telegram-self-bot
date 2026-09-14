@@ -137,6 +137,8 @@ EXPECTED_TOOLS = {
     "task_transition": PermissionLevel.READ_WRITE,
     "task_delete": PermissionLevel.READ_WRITE,
     "retrieve_save": PermissionLevel.READ_WRITE,
+    "translate_history": PermissionLevel.READ_ONLY,
+    "summarize_history": PermissionLevel.READ_ONLY,
     "send_message": PermissionLevel.READ_WRITE,
     "memory_store": PermissionLevel.READ_WRITE,
     "memory_list": PermissionLevel.READ_ONLY,
@@ -150,7 +152,7 @@ def test_registry_contains_exactly_the_expected_tools():
         f"registry mismatch: missing={set(EXPECTED_TOOLS) - names} "
         f"extra={names - set(EXPECTED_TOOLS)}"
     )
-    assert len(registry.list()) == 39
+    assert len(registry.list()) == 41
 
 
 @pytest.mark.asyncio
@@ -169,7 +171,7 @@ async def test_every_tool_has_valid_schema_and_permission():
 
 @pytest.mark.asyncio
 async def test_every_tool_is_provider_schema_visible():
-    """The dispatcher's native tool definitions must include all 32 tools."""
+    """The dispatcher's native tool definitions must include every registered tool."""
     registry, _ctx, _ex = make_registry(FakeTelegramAPI())
 
     # The dispatcher wraps the registry the same way the Engine does.

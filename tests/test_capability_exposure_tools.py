@@ -467,4 +467,4 @@ async def test_new_tools_are_provider_schema_visible():
 def test_no_duplicate_registrations():
     registry, _ctx, _executor = make_chain()
     names = registry.list_names()
-    assert len(names) == len(set(names)) == 39
+    assert len(names) == len(set(names)) == 41

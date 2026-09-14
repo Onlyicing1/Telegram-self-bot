@@ -65,7 +65,14 @@ MAX_TOOL_ROUNDS = 3
 #   task_list — production: the tool returned the owner's tasks and the model
 #               answered from stale context instead ("...it may have completed
 #               or been removed"), which the fresh tool result contradicted.
-_VERBATIM_READ_TOOLS = frozenset({"get_bio", "task_list"})
+#   translate_history / summarize_history — the tool's text IS the deliverable
+#               (a translation is line-per-message, a summary is model prose): a
+#               continuation round could paraphrase it, and the result is far
+#               too large to re-inject into a prompt. The tool already performed
+#               the LLM work through the same ProviderManager.
+_VERBATIM_READ_TOOLS = frozenset(
+    {"get_bio", "task_list", "translate_history", "summarize_history"}
+)
 
 # Read tools whose result is a PREREQUISITE for a CAS-guarded mutation in the
 # same request: task_transition/task_delete need the task's CURRENT version,
