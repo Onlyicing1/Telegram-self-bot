@@ -1,83 +1,85 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — RTL Telegram connector isolation
+## Latest phase — RTL Telegram connector rendering investigation
 
-The remaining RTL presentation defect was fixed without changing the
-presentation design, model context, settings, providers, scheduler, delivery
-mode, or database schema.
+The prior report overstated the result: LRI/RLI/PDI isolation alone was not
+sufficiently grounded for a line containing only neutral box-drawing glyphs,
+and the live Telegram screenshot disproved that the visual issue was solved.
+This phase makes the smallest Unicode-level correction while explicitly
+leaving client-rendering verification open.
 
-### Confirmed cause
+### Confirmed Unicode cause
 
-`backend/ai/tools/delivery.py` already selected the correct logical elbow from
-the rendered answer (`└─` for LTR and `─┘` for RTL), but its neutral box-drawing
-characters were emitted directly into each Telegram line. Telegram's Unicode
-BiDi resolution could therefore place the `│` markers on the left of Persian
-text, resolve the spacer inconsistently, or let an English continuation line
-change the apparent direction of an RTL answer block.
+`unicodedata.bidirectional()` reports `ON` (Other Neutral) for `│`, `─`, `┘`,
+and `└`. The old spacer payload was therefore `RLI + ON + PDI` (or its LTR
+counterpart), with no strong directional character inside the isolate. An
+isolate constrains interaction with surrounding text but does not by itself
+turn that neutral-only line into a right-to-left or left-to-right paragraph.
+This explains why string-level tests could pass while Telegram placed the
+spacer and other neutral markers incorrectly. The local environment has no
+FriBidi, Pango, ICU BiDi renderer, or equivalent client renderer, so Telegram
+pixel placement was not reproduced here.
 
-### Exact fix
+### Exact minimal fix
 
-`delivery.py` now wraps each connected presentation line in an invisible
-Unicode directional isolate:
+`backend/ai/tools/delivery.py::_bidi_isolate` now puts a matching invisible
+strong directional mark inside every isolate:
 
-* U+2066 LRI for LTR question/answer lines;
-* U+2067 RLI for RTL question/answer lines;
-* U+2069 PDI to close each isolate.
+* RTL: `U+2067 RLI + U+200F RLM + payload + U+2069 PDI`;
+* LTR: `U+2066 LRI + U+200E LRM + payload + U+2069 PDI`.
 
-The question markers and the single spacer use the question's dominant
-paragraph direction. The answer elbow and every answer continuation use the
-answer's dominant direction, preserving mixed question/answer behavior. The
-visible logical glyphs remain unchanged: RTL answers still contain the exact
-`─┘` sequence, LTR answers still contain `└─`, question markers remain `│`, and
-continuation lines still begin with exactly four ASCII spaces before their
-isolated content. Hidden-question mode remains byte-identical plain answer
-text and contains no connector controls or glyphs.
+The RLM/LRM anchors the neutral connector payload to the intended direction.
+The question bars and spacer use the question direction; the answer elbow and
+all continuation lines use the answer direction, so an English-only answer
+line cannot establish a competing paragraph direction. The visible payload is
+unchanged: RTL remains the exact logical `─┘` sequence, LTR remains `└─`, and
+continuation lines retain the required four ASCII spaces. `_BIDI_ISOLATE_UNITS`
+was updated so UTF-16 pagination includes the additional mark.
 
-The UTF-16 pagination cost now includes the added isolate controls, so chunking
-continues to stay within Telegram's size limit without dropping the controls.
-Thinking, status, and failure states use the same question/spacer isolation but
-never gain the final-answer elbow.
+Question-hidden mode remains byte-identical plain answer text with no
+presentation controls or connector glyphs. Edit-in-place delivery, thinking
+state, failure state, model context, history, providers, tools, and schema are
+unchanged.
 
-### Focused regression coverage
+### Automated evidence
 
-`tests/test_ai_presentation_redesign.py` now verifies Persian, English, mixed,
-neutral/numeric, multiline, cross-direction, spacer, continuation, and plain
-hidden-question cases. It asserts both the visible logical layout (after
-removing invisible controls) and the exact LRI/RLI/PDI placement that prevents
-line-level direction leakage.
-
-No SQL was executed and no schema or persistence behavior changed.
+`tests/test_ai_presentation_redesign.py` verifies the visible logical layout
+after removing invisible controls and the exact RLI/RLM or LRI/LRM/PDI sequence
+for Persian, English, mixed, neutral/numeric, multiline, cross-direction,
+URL, username, code-like, spacer, continuation, and hidden-question cases.
+It also verifies that RLM is Unicode class `R` and LRM is class `L`.
 
 ### Validation
 
 | Check | Result |
 |---|---|
-| Focused presentation tests (`tests/test_ai_presentation_redesign.py`) | **49 passed** |
-| Relevant broader presentation/AI suites | **269 passed, 2 warnings** |
+| Focused presentation tests (`tests/test_ai_presentation_redesign.py`) | **50 passed** |
+| Relevant presentation/AI suites | **154 passed** |
+| Full suite (`pytest tests -q`) | **2,592 passed, 24 skipped, 3 warnings** |
 | `py_compile` changed Python files | **passed** |
 | `git diff --check` | **clean** |
-| Live Telegram rendering | **not available in this environment** |
+| Live Telegram rendering | **not available; not claimed solved** |
+| Local BiDi renderer | **unavailable** |
+| SQL/schema changes | **none** |
 
 ### Manual Telegram verification still required
 
-Exact pixel placement cannot be reproduced by Python string tests alone. Send
-these owner-only test cases through the live AI path with the preference ON,
-then inspect the edited original message on Telegram Android, Desktop, and
-iOS:
+With the preference ON, send these through the live AI path and inspect the
+edited original message on Telegram Android, Desktop, and iOS:
 
-1. Persian question `این سؤال من است` with Persian answer `این پاسخ فارسی است`;
-2. Persian question with answer lines `خط اول فارسی`, `English continuation`,
-   `خط سوم فارسی`;
-3. English question `What is this?` with Persian answer `این یک پاسخ است`;
-4. Persian question with numeric/punctuation answer `12345?! ---`;
-5. multiline Persian question and multiline English answer;
-6. repeat cases 1–5 with the preference OFF and confirm the answer is plain,
-   with no `│`, `─`, `┘`, or `└`.
+1. Persian question `این سؤال من است` → `این پاسخ فارسی است`;
+2. Persian question → `خط اول فارسی`, `English continuation`, `خط سوم فارسی`;
+3. Persian question → `12345?! ---`;
+4. Persian question → `https://example.com/u/@name`;
+5. Persian question → `@username` and `` `x = 1` ``;
+6. English question `What is this?` → Persian answer `این یک پاسخ است`;
+7. Repeat the cases with the preference OFF and verify plain answer text has
+   no `│`, `─`, `┘`, `└`, or directional presentation controls.
 
-The expected RTL visual result is the question/spacer vertical marker on the
-right and the answer elbow visually rendered as `─┘` with its corner on the
-right. The normal AI response continues to edit the original Telegram
-message; no new answer message is introduced.
+Acceptance requires visually seeing Persian question bars and the spacer on
+the RIGHT, and the RTL answer elbow as `─┘` with `┘` on the RIGHT. The
+automated tests prove the Unicode sequence and anchoring intent only; they do
+not prove how Telegram's Android/Desktop/iOS clients render it.
 
 ---
 

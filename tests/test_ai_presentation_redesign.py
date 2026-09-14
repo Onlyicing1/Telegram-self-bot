@@ -47,7 +47,7 @@ _FA_QUESTION = "هی"
 _FA_ANSWER = "سلام!"
 
 
-_BIDI_CONTROLS = "\u2066\u2067\u2069"
+_BIDI_CONTROLS = "\u200e\u200f\u2066\u2067\u2069"
 
 
 def _without_bidi_controls(text: str) -> str:
@@ -65,6 +65,8 @@ def _without_bidi_controls(text: str) -> str:
         ("سؤال فارسی English", "پاسخ فارسی English", True),
         ("English question فارسی", "answer فارسی", False),
         ("سؤال فارسی", "12345?! ---", False),
+        ("سؤال فارسی", "https://example.com/u/@name", False),
+        ("سؤال فارسی", "@username `x = 1`", False),
         ("سؤال فارسی", "خط اول فارسی\nEnglish continuation\nخط سوم فارسی", True),
         ("English question", "first line\nپاسخ دوم", False),
     ],
@@ -88,7 +90,8 @@ def test_each_connected_line_isolated_in_the_question_direction(question, answer
     connector_index = question_lines
     answer_index = connector_index + 1
     assert all(line.startswith(question_opener) and line.endswith(closer) for line in lines[:question_lines])
-    assert lines[connector_index] == f"{question_opener}│{closer}"
+    anchor = "\u200f" if question_rtl else "\u200e"
+    assert lines[connector_index] == f"{question_opener}{anchor}│{closer}"
     assert lines[answer_index].startswith(answer_opener) and lines[answer_index].endswith(closer)
     expected_mark = "─┘" if answer_rtl else "└─"
     assert expected_mark in lines[answer_index]
@@ -100,19 +103,30 @@ def test_each_connected_line_isolated_in_the_question_direction(question, answer
 def test_rtl_spacer_and_question_markers_share_right_to_left_isolation():
     out = format_presentation("سؤال\nادامه", "جواب", True)
     lines = out.split("\n")
-    assert lines[0].startswith("\u2067│")
-    assert lines[1].startswith("\u2067│")
-    assert lines[2] == "\u2067│\u2069"
-    assert lines[3].startswith("\u2067 ─┘")
+    assert lines[0].startswith("\u2067\u200f│")
+    assert lines[1].startswith("\u2067\u200f│")
+    assert lines[2] == "\u2067\u200f│\u2069"
+    assert lines[3].startswith("\u2067\u200f ─┘")
 
 
 def test_ltr_spacer_preserves_left_to_right_isolation():
     out = format_presentation("question\ncontinued", "answer", True)
     lines = out.split("\n")
-    assert lines[0].startswith("\u2066│")
-    assert lines[1].startswith("\u2066│")
-    assert lines[2] == "\u2066│\u2069"
-    assert lines[3].startswith("\u2066└─")
+    assert lines[0].startswith("\u2066\u200e│")
+    assert lines[1].startswith("\u2066\u200e│")
+    assert lines[2] == "\u2066\u200e│\u2069"
+    assert lines[3].startswith("\u2066\u200e└─")
+
+
+def test_directional_marks_anchor_neutral_connectors_inside_each_isolate():
+    import unicodedata
+
+    rtl = format_presentation("سؤال", "جواب", True).splitlines()
+    ltr = format_presentation("question", "answer", True).splitlines()
+    assert rtl[1] == "\u2067\u200f│\u2069"
+    assert ltr[1] == "\u2066\u200e│\u2069"
+    assert unicodedata.bidirectional("\u200f") == "R"
+    assert unicodedata.bidirectional("\u200e") == "L"
 
 
 def test_off_mode_is_plain_answer_text_with_no_connector():

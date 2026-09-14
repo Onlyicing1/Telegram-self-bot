@@ -289,13 +289,24 @@ _RTL_ANSWER_PREFIX = f" {_RTL_ANSWER_MARK} "
 _ANSWER_MARK = _LTR_ANSWER_MARK
 _BIDI_LRI = "\u2066"
 _BIDI_RLI = "\u2067"
+_BIDI_LRM = "\u200e"
+_BIDI_RLM = "\u200f"
 _BIDI_PDI = "\u2069"
-_BIDI_ISOLATE_UNITS = _utf16_units(_BIDI_RLI + _BIDI_PDI)
+_BIDI_ISOLATE_UNITS = _utf16_units(_BIDI_RLI + _BIDI_RLM + _BIDI_PDI)
 
 
 def _bidi_isolate(text: str, rtl: bool) -> str:
-    """Keep neutral connector glyphs in the intended paragraph direction."""
-    return f"{_BIDI_RLI if rtl else _BIDI_LRI}{text}{_BIDI_PDI}"
+    """Anchor neutral connector glyphs to the intended paragraph direction.
+
+    Isolates constrain surrounding text but do not assign a direction to a
+    line containing only neutral box-drawing characters. A matching strong
+    directional mark makes the spacer resolve with the question paragraph,
+    and also keeps neutral elbows stable when a line contains only LTR/neutral
+    content inside an RTL answer block.
+    """
+    opener = _BIDI_RLI if rtl else _BIDI_LRI
+    anchor = _BIDI_RLM if rtl else _BIDI_LRM
+    return f"{opener}{anchor}{text}{_BIDI_PDI}"
 
 
 def _presentation_lines(text: str) -> list[str]:
