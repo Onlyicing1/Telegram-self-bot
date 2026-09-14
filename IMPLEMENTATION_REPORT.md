@@ -1,6 +1,100 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Telegram history translation and summarization (LLM map-reduce)
+## Latest phase — Live fix: history-analysis routing and trigger-message exclusion
+
+A live request — `خلاصه ۳۰ پیام آخر رو بده` (Telegram message id `57494`) — was
+answered with the **raw message listing** instead of a summary, and the listing
+contained the owner's own command. Both symptoms have deterministic root causes
+in the existing source; no new architecture was introduced.
+
+### Root causes (source-proven)
+
+| # | Symptom | Root cause | Evidence |
+|---|---|---|---|
+| 1 | No summary — the owner received history instead | `parse_command_intent` (`backend/ai/actions.py`) classified the request as the *review listing* (a count + the word "پیام"), and `Dispatcher._try_local_fast_path` executed `list_recent_messages` and returned **before any provider round** | `dispatcher.py::_try_local_fast_path` → `execute_calls(...)` → `_build_fast_path_result`; the status the owner saw, `📋 Reading messages...`, is `executor._STATUS_LABELS["list_recent_messages"]` |
+| 2 | The owner's own command appeared in the "history" | `ListRecentMessagesTool` is a raw reader (no cursor), and the history AI path called `history_service.fetch_recent_history(...)` with no `before_id` cursor | `history_ai_service._prepare` (pre-fix); `backend/ai/tools/semantic.py::ListRecentMessagesTool` |
+
+The heartbeat corroborates root cause 1: `ai_last_provider_s=-1.0` (no provider
+call at all) with a recent `ai_last_tg_reply_s` — the reply came from the local
+deterministic path, never from the model. Telethon itself was healthy
+(`self_connected=True`, `last_update_age` ~1s), so the connection layer was not
+involved.
+
+### The fix
+
+1. **Routing** — `backend/ai/actions.py` gains `_is_history_analysis_intent(words)`
+   (Persian stems `خلاص` / `ترجم` plus the English summarize/translate
+   vocabulary — the same deterministic-vocabulary convention the file already
+   uses for scheduling, event and semantic-delete intents). The review branch
+   now returns `KIND_CONVERSATIONAL` for an analysis request, so the provider
+   decides and the registered `summarize_history` / `translate_history` tools
+   run. Delete / save / send precedence is untouched: the guard sits *inside*
+   the review branch, after those paths.
+2. **Trigger exclusion** — `history_ai.py` reads the request-scoped
+   `ToolContext.extra["request_message_id"]` (set by
+   `Dispatcher._build_tool_context`) and passes it as `current_message_id`;
+   `history_ai_service._prepare` forwards it as the history service's exclusive
+   `before_id`. This is identity-based, never text-based: a *different* message
+   with the same text is still history, and the same identity is excluded
+   regardless of its wording. No regex, keyword, length, recency, `out`,
+   `sender_id`, `edit_date` or provenance heuristic was added.
+3. **Observability** — the history AI path emits `AI_EXEC_TRACE` stages carrying
+   the request id: `history_retrieval_started` / `history_retrieval_completed` /
+   `history_retrieval_failed`, `provider_call_started` / `provider_call_completed`
+   / `provider_call_failed`, and `tool_result` (`success=True|False`). Nothing
+   sensitive is logged (no message bodies, no provider secrets, no session data).
+   Final delivery was already traced (`AI_RESPONSE_SEND_START`, then
+   `stage=telegram_response success=...`), so nothing was added there.
+
+### Files changed
+
+| File | Role |
+|---|---|
+| `backend/ai/actions.py` | analysis-intent vocabulary (`_ANALYSIS_STEMS`, `_EN_ANALYSIS`, `_is_history_analysis_intent`) + review-branch guard |
+| `backend/ai/tools/history_ai.py` | request-scoped message id → `current_message_id`; `tool_result` stage log |
+| `backend/services/history_ai_service.py` | `before_id` cursor + retrieval/provider stage logs |
+| `tests/test_history_ai_tools.py` | 12 new focused tests (52 total in the file) |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+Unchanged: `history_service.py` (provenance authority and bounds untouched —
+no marker logic was added to any tool), `telegram_context.py` (still bounded at
+10 messages), `ListRecentMessagesTool` (still a raw reader by contract), the
+provider architecture, the dispatcher's execution flow, Taskloom, and Supabase.
+
+### Tests
+
+| Run | Result |
+|---|---|
+| `tests/test_history_ai_tools.py` | **52 passed** (12 new) |
+| Adjacent suite (action routing, delete/send/bio determinism, history service, provenance, delivery pipeline, bounded context) | **560 passed** |
+| Full suite `tests/` | **2760 passed, 24 skipped** (2748 before) |
+| `py_compile` on every changed Python file | OK |
+| `git diff --check` | clean |
+
+The new tests prove: the trigger is excluded **by id** (the fetch carries
+`max_id == request_message_id`); exclusion is identity-based (identical text at a
+different id is kept); a 30-message summarize completes through the tool path
+with the command excluded; the routing guard sends the live Persian command and
+its English variants to the provider while review requests still resolve
+deterministically and delete/save commands are not diverted; retrieval failure
+and provider failure are surfaced honestly (never an empty success) and traced;
+and the summary result is still deliverable through `deliver_response` unchanged.
+
+### Live verification
+
+**Not performed — no live Telegram session exists in this workspace.** The
+analysis is source-level plus the heartbeat evidence above, and the behaviour is
+pinned by the test suite.
+
+### Commit
+
+| Item | Value |
+|---|---|
+| Code + tests commit | `fdb0f08e5c997c9e209e3b5a2236058cdb682891` — *fix: route history analysis to the model and exclude the asking message* |
+
+---
+
+## Previous phase — Telegram history translation and summarization (LLM map-reduce)
 
 Phase 2 of the Telegram-history project: the owner can now ask the assistant to
 **translate** or **summarize** an arbitrary number of Telegram messages.
