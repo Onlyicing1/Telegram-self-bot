@@ -1,6 +1,278 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Durable invisible AI provenance for Telegram messages
+## Latest phase — Reusable arbitrary-N Telegram history service (`backend/services/history_service.py`)
+
+Implementation of the boundary the Telegram-history investigation
+(`INVESTIGATION.md`, §6/§10) established: one shared, provenance-aware,
+bounded-and-paginated Telegram history capability, so future translate /
+summarize features do not each re-implement Telethon traversal, paging, or
+provenance filtering. This phase adds **no** user-facing tool, no translation,
+and no summarization — it is the reusable retrieval layer only.
+
+### 1. Starting state
+
+| Item | Value |
+|---|---|
+| HEAD before this phase | `2870683` — *docs: investigate reusable Telegram history access boundary* |
+| Last functional change before it | `73bbda6` — *feat: add durable invisible AI provenance to AI answers* |
+| Architectural state | Two independent history readers (bounded request-scoped snapshot; `ListRecentMessagesTool`) and a typed `backend/telegram_api` facade that could bound only the **lower** end of a range (`min_id`), with no shared retrieval layer, no translation tool and no summarization tool |
+| Provenance state | Durable marker helpers in `backend/ai/context/provenance.py`, consumed only by `backend/ai/conversation/telegram_context.py` |
+
+### 2. What was implemented
+
+`backend/services/history_service.py` is the shared retrieval capability. It
+owns:
+
+* chronological, lossless retrieval of **eligible** history;
+* backwards paging with an exclusive `max_id` cursor and a bounded number of
+  RPCs;
+* **provenance eligibility** — the single place the durable AI marker is
+  consulted for history consumers;
+* an explicit failure contract (`HistoryError`).
+
+It deliberately does **not** own: prompt construction, provider selection,
+chunk sizing, translation, summarization, the bounded request-scoped snapshot,
+or any scheduling. It reaches Telegram exclusively through the existing
+`backend.telegram_api` facade (`backend/telegram_api/messages.py::iter_messages`,
+imported as `_facade_iter_messages`); it never imports Telethon and never calls
+`client.iter_messages` itself. A `TelegramAPI` instance is accepted and
+normalized to its wrapped client through the facade's documented
+service-layer-only `.client` property.
+
+### 3. Telegram paging design
+
+* **Exclusive bounds** — `backend/telegram_api/messages.py::iter_messages` and
+  `TelegramAPI.iter_messages` (in `backend/telegram_api/api.py`) gained an
+  optional `max_id` argument, forwarded to Telethon only when set. `min_id`
+  (exclusive lower) already existed, so both ends of a range are now
+  expressible.
+* **Traversal direction** — pages are fetched newest → oldest. The first fetch
+  uses `max_id = before_id` (or none); every subsequent fetch uses
+  `max_id = min(message ids of the previous page)`. Because Telegram treats
+  `max_id` as exclusive, the previous page's oldest id is never returned again
+  — duplicates are structurally impossible, and no page can be skipped
+  (the cursor only moves to a strictly smaller id).
+* **Page ordering** — every page's raw records are normalized and sorted by
+  message id ascending before being accumulated, so page contents are
+  deterministic regardless of the order Telegram returned them.
+* **Final chronological ordering** — the accumulated newest-first list is
+  reversed once at the end, so the returned history is oldest → newest.
+* **Duplicate prevention** — exclusive `max_id` cursor plus a defensive
+  `next_cursor >= cursor_max` guard (which stops and reports truncation instead
+  of looping); nothing is re-fetched.
+* **Termination** — deterministic and honest: an empty page, a page shorter
+  than the requested limit, or a cursor that cannot strictly decrease ends the
+  scan. A `target` (count) or the scan cap also ends it.
+* **RPC bounding** — every page fetch goes through the existing
+  `backend/helper/rpc_timeout.py::rpc_await` with
+  `HISTORY_RPC_TIMEOUT_S = 5.0` and label `history.iter_messages` — the same
+  mechanism `backend/services/delete_service.py` uses for its bounded scan.
+  `asyncio.CancelledError` is re-raised, never swallowed.
+
+### 4. Provenance design
+
+* **Reused helpers** — `has_ai_provenance_marker` and
+  `strip_ai_provenance_marker` from `backend/ai/context/provenance.py`. The
+  marker literal is not duplicated or redefined anywhere.
+* **Enforcement point** — inside the history layer's normalization step
+  (`history_service._normalize` / `_collect`). A record whose text carries the
+  durable marker is skipped unless the caller explicitly opts in with
+  `include_ai=True`.
+* **Why not in the tools** — `backend/ai/tools/semantic.py::ListRecentMessagesTool`
+  is unchanged on purpose: its documented contract is complete ID coverage for
+  the semantic-delete flow (*"then call `delete_messages_by_ids` with only the
+  IDs you saw here"*), so excluding AI messages there would make them
+  undeletable, and duplicating the predicate per tool would create as many
+  definitions of "AI output" as there are readers.
+* **Restart survival** — the decision is made from the message text
+  (which Telegram persists), not from `ReplyResolver`; an AI answer that was
+  overwritten **or** sent before a process restart is still recognised, and
+  `sender_id == owner_id` / `out=True` are never used as provenance.
+* **Marker never leaks** — `HistoryMessage.text` is always marker-stripped, so
+  a consumer cannot pass the marker to a model as content; `ai_provenance`
+  carries the classification instead.
+
+### 5. Error behavior
+
+* `backend.services.history_service.HistoryError` — the dedicated retrieval
+  failure type.
+* Raised for: any facade/RPC exception or timeout; an unusable source (no
+  client, or an object that is neither a `TelegramAPI` nor a client); and a
+  chat id that coerces to 0 (a concrete chat is required).
+* **Failure vs empty eligible history** — empty eligible history is a
+  *successful* result (`HistorySlice.messages == ()`, `scanned` reflecting the
+  real scan, no exception). A retrieval failure raises `HistoryError` carrying
+  the chat id and the underlying error; it is never converted into an empty
+  result. This differs deliberately from the bounded snapshot, which degrades
+  to `EMPTY_CHAT_CONTEXT` because it is optional enrichment.
+* **Partial results** — none. A page failure aborts the request with
+  `HistoryError`; already-fetched pages are discarded rather than returned as a
+  silently truncated history. `HistorySlice.truncated` exists to make a
+  *bounded but successful* result explicit.
+
+### 6. Data contract
+
+```
+HistoryMessage (frozen)
+  message_id:      int                 # real Telegram message id (> 0)
+  chat_id:         int
+  sender_id:       int                 # 0 when Telegram supplied none
+  out:             bool                # owner's own account sent it
+  date:            datetime | None     # Telegram send time
+  text:            str                 # FULL text, marker-stripped, never truncated
+  reply_to_msg_id: int | None
+  has_media:       bool                # media is never downloaded by this layer
+  ai_provenance:   bool                # durable marker was present in the text
+
+HistoryPage (frozen)
+  chat_id:  int
+  messages: tuple[HistoryMessage, ...] # one chunk, oldest → newest
+  has_more: bool                       # another page follows, or older eligible history exists
+
+HistorySlice (frozen)
+  chat_id:   int
+  messages:  tuple[HistoryMessage, ...] # oldest → newest, ≤ requested
+  requested: int                        # count actually pursued (clamped; 0 if none)
+  scanned:   int                        # raw Telegram messages examined
+  truncated: bool                       # a bound stopped the scan (conservative)
+```
+
+Entry points: `fetch_recent_history(source, chat_id, *, count, page_size,
+before_id, after_id, include_ai)`, `fetch_history_page(source, chat_id, *,
+limit, before_id, after_id, include_ai)` (explicit cursor walk), and
+`iter_history_pages(...)` (async generator of bounded, non-overlapping,
+mutually ordered pages, oldest page first).
+
+### 7. Bounds and performance
+
+| Bound | Value | Purpose |
+|---|---|---|
+| `DEFAULT_PAGE_SIZE` | 100 | one Telegram page (matches the facade default) |
+| `MAX_PAGE_SIZE` | 1000 | hard ceiling for a caller-supplied page size |
+| `MAX_HISTORY_MESSAGES` | 1000 | eligible messages per request (mirrors `delete_service._MAX_DELETE_SCAN_MESSAGES`) |
+| `MAX_HISTORY_SCAN_MESSAGES` | 5000 | raw messages examined per request, so an all-AI window cannot scan forever |
+| `HISTORY_RPC_TIMEOUT_S` | 5.0 | per page fetch, enforced by `rpc_await` |
+
+Memory: the service accumulates the requested result set (≤ `MAX_HISTORY_MESSAGES`
+normalized records) and never more; `iter_history_pages` chunks that bounded
+set afterwards, so no unbounded buffer exists. Typical costs at the default
+page size: 50 → 1 page; 100 → 1 page; 500 → 5 pages; 1000 → 10 pages
+(one bounded `rpc_await` each). `truncated` is conservative — when the count
+bound lands exactly on a full page it reports `True` even if a further fetch
+would return nothing; a caller can confirm cheaply by paging once more.
+
+### 8. Existing architecture preserved
+
+* Bounded request-scoped context (`backend/ai/conversation/telegram_context.py`)
+  was **not** modified and **not** expanded: 10 messages, 200 chars/message,
+  1500 chars total, ≤ 4 sender resolves, 3.0 s fetch bound, and its
+  degrade-to-empty failure semantics are all unchanged (pinned by tests).
+* No second Telegram client, polling loop, scheduler, executor, AI engine,
+  history repository, provenance store, provider abstraction, database table,
+  migration, or Supabase/schema change was introduced.
+* `DATABASE_ARCHITECTURE.md`, the dispatcher, Taskloom, providers, delivery /
+  presentation, the UI/panels, and every AI tool (including
+  `ListRecentMessagesTool`) were untouched.
+
+### 9. Exact files changed
+
+| File | Status | Role |
+|---|---|---|
+| `backend/services/history_service.py` | **added** | the shared history capability (contracts, paging, provenance eligibility, `HistoryError`) |
+| `backend/telegram_api/messages.py` | modified | `iter_messages` gains the optional exclusive `max_id` boundary |
+| `backend/telegram_api/api.py` | modified | `TelegramAPI.iter_messages` forwards `max_id` |
+| `tests/test_history_service.py` | **added** | focused behavioral tests |
+| `IMPLEMENTATION_REPORT.md` | modified | this report section |
+
+### 10. Tests
+
+| Run | Result |
+|---|---|
+| `pytest tests/test_history_service.py -q` | **32 passed** |
+| Adjacent suite (`test_telegram_chat_context`, `test_ai_provenance`, `test_context_architecture`, `test_32_semantic_delete`, `test_30/31` delete timeout+RPC, `test_27/28/29` delete ownership/regression/expansion, `test_14_tool_honesty_glass`) | **232 passed** |
+| Full suite `pytest tests/ -q` | **2708 passed, 24 skipped** (was 2676 passed before this phase) |
+| `python -m py_compile` on both new files and both facade files | OK |
+| `git diff --check` | clean |
+
+What the focused tests pin: facade-only access (no Telethon import, no direct
+`client.iter_messages`); identical results for a `TelegramAPI` facade vs a raw
+client; chronological ordering despite Telegram's newest-first order; strictly
+decreasing exclusive cursors (`[None, 151, 51]` for 250 messages at page size
+100) with no duplicates; deterministic page boundaries across repeated runs;
+`iter_history_pages` covering every message exactly once in order; count
+semantics (exact N, N > available, 0/negative performs **no** Telegram call,
+clamping to `MAX_HISTORY_MESSAGES`); exclusive `before_id`/`after_id` ranges;
+explicit cursor walking via `fetch_history_page`; central provenance exclusion;
+marked messages not consuming the requested count; `include_ai` returning them
+classified and marker-free; the scan cap on an all-AI window; lossless 5000-char
+text (no 200-char truncation); marker stripping preserving exact visible text;
+identity/media/reply metadata preservation; `HistoryError` on failure and on a
+bounded RPC timeout; `CancelledError` re-raised; unusable source/chat rejected;
+concurrent requests sharing no state; empty eligible history being
+indistinguishable from success (and distinguishable from failure); every page
+bounded by `rpc_await` with the documented timeout/label; and regressions
+proving the bounded snapshot's constants and its own silent-empty failure
+semantics are unchanged.
+
+No existing test was weakened.
+
+### 11. Limitations (not verified)
+
+1. **No live Telegram/Telethon verification.** No live session exists in this
+   workspace, so exclusivity of `max_id`/`min_id`, real pagination against the
+   Telegram API, and restart behaviour were **not** exercised against Telegram.
+   Verification is against a Telethon-shaped fake client
+   (`limit`/`min_id`/`max_id`, newest → oldest) plus the real facade and
+   serialization path.
+2. **No AI tool consumes the service yet** — by design for this phase; the
+   service is exercised only by tests until the translate/summarize phase wires
+   it into the registry.
+3. **Sender display names are not resolved** — records carry `sender_id`/`out`;
+   resolving names would add RPCs and is left to consumers (the bounded context
+   already does its own bounded name resolution).
+4. `truncated` is conservative at an exact count/page boundary (see §7).
+5. Only the Telegram path is covered; no Supabase persistence of history was
+   added or is planned.
+
+### 12. Next-phase boundary
+
+Future translate / summarize features are expected to consume this service as
+their only Telegram-history source, exactly as the architecture line in
+`INVESTIGATION.md` prescribes:
+
+```
+Telegram → backend/telegram_api → backend/services/history_service.py
+         → translate / summarize consumers
+```
+
+* A tool parses the owner's requested N / range, calls
+  `fetch_recent_history(...)` (or iterates `iter_history_pages(...)` for
+  chunk-at-a-time processing), then chunks the bounded result into
+  prompt-sized slices **in the consumer** — the history layer never builds a
+  prompt and never sizes chunks.
+* Provenance eligibility is already applied, so a consumer never re-checks the
+  marker; `include_ai=True` remains available for reviewers that must see AI
+  output explicitly.
+* Ordering, identity, and losslessness are guaranteed by the service, so
+  translated/summarized output can be reassembled in source order without the
+  consumer tracking cursors or deduplicating.
+* Translation / summarization business logic, provider rounds, and aggregation
+  remain future work and were **not** implemented in this phase.
+
+### 13. Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `2870683` |
+| Implementation commit | `042d69ee5f5e49a255c498f1af5b515cb292c297` — *feat: add reusable provenance-aware Telegram history service* |
+| Implementation push | `2870683..042d69e  main -> main` (no force, no rebase) |
+| Files in the implementation commit | `backend/services/history_service.py` (added), `backend/telegram_api/api.py`, `backend/telegram_api/messages.py`, `tests/test_history_service.py` (added) |
+| This report section | delivered in the follow-up docs commit that also hardens the focused tests; no source file changes in it |
+| Working tree | clean apart from the pre-existing untracked `telegram-self-bot/` directory |
+
+---
+
+## Previous phase — Durable invisible AI provenance for Telegram messages
 
 Fix for the provenance gap the surrounding-message context investigation
 (`INVESTIGATION.md`) confirmed: the AI answers by editing the owner's own

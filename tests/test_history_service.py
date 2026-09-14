@@ -36,10 +36,13 @@ import pytest
 
 from backend.ai.context.provenance import AI_PROVENANCE_MARKER
 from backend.ai.conversation.telegram_context import (
+    FETCH_TIMEOUT_S,
     MAX_CONTEXT_MESSAGES,
     MAX_MESSAGE_CHARS,
+    MAX_SENDER_RESOLVES,
     MAX_TOTAL_CHARS,
     build_chat_context,
+    fetch_telegram_chat_context,
 )
 from backend.services import history_service
 from backend.services.history_service import (
@@ -347,6 +350,20 @@ async def test_include_ai_returns_marked_messages_classified_and_marker_free():
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_human_owner_messages_stay_eligible_despite_out_and_sender_id():
+    owner_id = 7770001
+    human = _FakeMessage(1, "a genuine owner message", sender_id=owner_id, out=True)
+    marked = _FakeMessage(2, f"an AI answer{AI_PROVENANCE_MARKER}", sender_id=owner_id, out=True)
+    slice_ = await fetch_recent_history(_FakeClient([human, marked]), CHAT, count=10)
+    returned = [m.message_id for m in slice_.messages]
+    assert returned == [1]
+    assert slice_.messages[0].out is True
+    assert slice_.messages[0].sender_id == owner_id
+    assert slice_.messages[0].text == "a genuine owner message"
+
+
+@pytest.mark.asyncio
 async def test_scan_cap_bounds_a_window_that_is_entirely_ai_output(monkeypatch):
     monkeypatch.setattr(history_service, "MAX_HISTORY_SCAN_MESSAGES", 5)
     client = _FakeClient([_ai(mid) for mid in range(1, 21)])
@@ -395,6 +412,45 @@ async def test_message_identity_and_media_metadata_are_preserved():
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_every_page_fetch_is_bounded_by_rpc_await(monkeypatch):
+    bounds: list[dict[str, Any]] = []
+    real_rpc_await = history_service.rpc_await
+
+    async def _recording_rpc(coro, timeout=None, label=""):
+        bounds.append({"timeout": timeout, "label": label})
+        return await real_rpc_await(coro, timeout=timeout, label=label)
+
+    monkeypatch.setattr(history_service, "rpc_await", _recording_rpc)
+    client = _FakeClient(_conversation(250))
+    await fetch_recent_history(client, CHAT, count=250, page_size=100)
+
+    assert len(client.calls) == 3
+    assert len(bounds) == len(client.calls)
+    assert {b["timeout"] for b in bounds} == {HISTORY_RPC_TIMEOUT_S}
+    assert {b["label"] for b in bounds} == {"history.iter_messages"}
+
+
+@pytest.mark.asyncio
+async def test_empty_eligible_history_is_distinguishable_from_a_retrieval_failure():
+    # Empty chat: an honest, successful empty result — no exception.
+    empty = await fetch_recent_history(_FakeClient([]), CHAT, count=10)
+    assert empty.messages == ()
+    assert empty.scanned == 0
+    assert empty.truncated is False
+
+    # Chat with only AI output: also a successful empty eligible history, and
+    # the scan proves it looked at real messages.
+    all_ai = await fetch_recent_history(_FakeClient([_ai(1)]), CHAT, count=10)
+    assert all_ai.messages == ()
+    assert all_ai.scanned == 1
+
+    # Retrieval failure: distinct, typed, and never an empty history.
+    with pytest.raises(HistoryError):
+        await fetch_recent_history(_FailingClient(), CHAT, count=10)
+
+
+@pytest.mark.asyncio
 async def test_fetch_failure_raises_history_error_instead_of_returning_empty():
     with pytest.raises(HistoryError):
         await fetch_recent_history(_FailingClient(), CHAT, count=5)
@@ -440,6 +496,19 @@ def test_bounded_context_bounds_are_unchanged():
     assert MAX_CONTEXT_MESSAGES == 10
     assert MAX_MESSAGE_CHARS == 200
     assert MAX_TOTAL_CHARS == 1500
+    assert MAX_SENDER_RESOLVES == 4
+    assert FETCH_TIMEOUT_S == 3.0
+    assert HISTORY_RPC_TIMEOUT_S != FETCH_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_bounded_context_keeps_its_own_failure_semantics():
+    # A failing read still degrades to the empty snapshot: the bounded context
+    # is optional enrichment and must never raise, unlike the explicit history
+    # request which must raise HistoryError.
+    snapshot = await fetch_telegram_chat_context(_FailingClient(), CHAT, 99)
+    assert snapshot.is_empty is True
+    assert snapshot.render() == ""
 
 
 def test_bounded_context_still_drops_marked_messages():
