@@ -1,6 +1,156 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Live fix: rate-limit pacing and a long-running execution envelope
+## Latest phase — Live fix: deadline-aware per-call provider timeout (large history)
+
+Starting HEAD: `57ccb273c4ade36ee8b14844b265d04297c56ad7`.
+
+The previous phase gave the history operations a 240s execution envelope
+(`AIRequest.timeout_s` → `ToolContext.extra["request_timeout_s"]`) and paced the
+map phase. It did **not** change how long a *single* provider call was allowed to
+take: `history_ai_service._call` still wrapped `manager.chat(...)` in a hard
+`asyncio.wait_for(..., timeout=PER_CALL_TIMEOUT_S)` with
+`PER_CALL_TIMEOUT_S = 30.0`, and the summarization reduce step was wrapped in a
+second hard 30s `wait_for`. The envelope therefore controlled how *many* calls
+fitted, not how long one call could run.
+
+### The observed failure (source-proven)
+
+A large live request (`خلاصه ۱۰۰۰ چت رو بده بهم`) reached the reduce step and
+failed with:
+
+> Summary failed: the final AI step did not finish within 30s.
+
+That message came from the outer `asyncio.wait_for(..., timeout=PER_CALL_TIMEOUT_S)`
+around the reduce call in `summarize_history` — not from the provider. Two facts
+make the 30s bound wrong for this operation:
+
+1. `ProviderManager.chat` walks a **model-level candidate chain** (each candidate
+   contributing its configured model, then its discovery-fed alternatives, each
+   with one immediate retry — `providers/manager/manager.py::chat`). One
+   *successful* call's wall time is therefore not one HTTP timeout, so the
+   provider HTTP bound (`ProviderConfig.timeout`, 30s) is a *typical* latency, not
+   a ceiling for the whole call.
+2. The operation owned a 240s envelope (220s of LLM budget), so cutting its final
+   step at 30s contradicted the envelope the caller had granted.
+
+### The fix — one bound, derived from the operation's remaining budget
+
+The per-call bound is now computed by a single new primitive in the same module:
+
+```
+call_timeout(deadline) = min(PROVIDER_CALL_SAFETY_TIMEOUT_S, remaining(deadline))
+```
+
+* `PROVIDER_CALL_SAFETY_TIMEOUT_S = DEFAULT_ENVELOPE_S / 2` (**120s**) is the
+  finite safety ceiling: it is derived from the operation's own envelope (a single
+  call may never consume the whole operation) and it is deliberately above the
+  provider HTTP bound so a legitimately slow candidate-chain call can finish.
+  There is no unbounded path — `call_timeout(None)` returns the ceiling.
+* The **operation deadline** is created once per request with
+  `llm_deadline(llm_budget(timeout_s))`, so it comes from the threaded
+  `request_timeout_s` envelope; the earlier `max_map_calls` / `call_spacing`
+  pacing math is unchanged (`ASSUMED_CALL_LATENCY_S = 30.0` — the same value under
+  a name that says it is a *pacing assumption*, not the bound a call runs under).
+* Summarization keeps one deadline for the whole operation and gives the map
+  phase `map_deadline = min(deadline, llm_deadline(budget - ASSUMED_CALL_LATENCY_S))`,
+  so the reduce still has at least the old reservation available — and may now use
+  everything left up to the ceiling instead of being capped at that reservation.
+* If less than one pacing interval remains, `_call` refuses to start the call and
+  fails honestly (`the AI work did not finish: the request's time budget ran out
+  before this AI provider call`) instead of starting work it cannot finish. This
+  reuses `MIN_PROVIDER_CALL_TIMEOUT_S = MAX_CALL_SPACING_S` (5s).
+* The redundant outer `wait_for` around the reduce call, and its now-dead
+  `except asyncio.TimeoutError` branch, were removed — one timeout mechanism
+  remains (`asyncio.wait_for` inside `_call`).
+
+Applies identically to **translation map calls**, **summarization map calls** and
+the **final summarization/reduce call**: all three go through `_call`, and each is
+handed the deadline of the phase it belongs to.
+
+### What is deliberately unchanged
+
+* The 240s envelope and its separation from the 60s slot-acquisition timeout
+  (`ai_unified._AI_EXECUTE_TIMEOUT` vs `_AI_TIMEOUT`).
+* The propagation chain `AIRequest.timeout_s` → `Dispatcher._build_tool_context`
+  → `ToolContext.extra["request_timeout_s"]` → tools → service.
+* Rate-limit protection: `MAP_CONCURRENCY = 2`, `call_spacing()`,
+  `MAX_CALL_SPACING_S = 5.0`, `max_map_calls()` capacity and the honest
+  `ERROR_TOO_LARGE` refusal — untouched (the deadline only bounds each call).
+* Trigger-message exclusion (`before_id`), `history_service` as the sole history
+  authority and its provenance filtering, `ListRecentMessagesTool`, provider
+  architecture/fallback/cooldown, Supabase and migrations.
+* Existing trace stages (`history_retrieval_*`, `provider_call_*`, `tool_result`);
+  `provider_call_started` / `provider_call_failed` now also carry the effective
+  `timeout_s`, and a new honest `error=deadline_exhausted` failure is traced.
+
+### Files changed
+
+| File | Role |
+|---|---|
+| `backend/services/history_ai_service.py` | `llm_deadline` / `remaining_s` / `call_timeout`, deadline-aware `_call`, deadline wiring for translate map, summarize map and reduce; `ASSUMED_CALL_LATENCY_S` renamed from `PER_CALL_TIMEOUT_S` (pacing assumption, not the bound) |
+| `tests/test_history_ai_tools.py` | 7 new behavioral tests (section 7) + the renamed-constant assertions |
+
+No other file changed — no integration file needed a change: the envelope was
+already threaded through `AIRequest`/`Dispatcher`/`history_ai` in the previous
+phase.
+
+### Tests and exact results
+
+| Run | Result |
+|---|---|
+| `tests/test_history_ai_tools.py` | **66 passed** (was 59; +7) |
+| Adjacent: history service, provenance, telegram chat context, AI output pipeline, tool health audit, capability exposure, memory tools, semantic delete, task recursion | **416 passed** |
+| Full suite `pytest tests/ -q` | **2774 passed, 24 skipped** |
+| `py_compile` on both changed files | OK |
+| `git diff --check` | clean |
+
+The new tests exercise the real `asyncio.wait_for(manager.chat(...))` path, not
+the constants:
+
+* **The old bound is provably gone.** A reduce call that takes 0.25s succeeds
+  while the old per-call cap is simulated at 0.05s (compressed so the difference
+  is observable in ms) — the recorded bound for that call is the 120s ceiling.
+  Re-running the same scenario with the old-style cap reproduces the failure
+  (`success=False`, reduce never completes), so the test is not vacuous.
+* **The ceiling is finite and binds on a generous envelope** (240s → every call's
+  bound is exactly `PROVIDER_CALL_SAFETY_TIMEOUT_S`).
+* **A tighter envelope binds on the budget, for map calls and the reduce alike**
+  (120s → map ≈ `llm_budget - ASSUMED_CALL_LATENCY_S`, reduce ≈ `llm_budget`,
+  both < ceiling and both > the old 30s cap).
+* **A stuck reduce cannot outlive the deadline**: with a 3s compressed operation
+  window and a 10s reduce, the call is started, cut, and the tool returns
+  `success=False` / `ERROR_PROVIDER` in <6s (no hang, no fabricated success).
+* **Translation map calls use the same bound** (a 0.2s-per-call provider
+  completes all six chunks under the ceiling and every message id is preserved).
+* **Pacing/capacity are unchanged**: `llm_budget(60) = 40`, `llm_budget(240) = 220`,
+  `call_spacing(20, 220) = MAX_CALL_SPACING_S`, capacity still scales with the
+  envelope, `MAP_CONCURRENCY = 2`.
+
+### Live Telegram verification
+
+**Not performed — no live Telegram session exists in this workspace.** Every
+number above comes from the test suite driving the real service, the real
+`ProviderManager` and the real `asyncio.wait_for` bound through a scripted
+provider; nothing was measured against production Telegram or a real provider.
+
+### What this does *not* guarantee
+
+A 1000-message request is **not** guaranteed to succeed. The provider's own quota
+and availability can still produce an honest failure (429 → the manager's 60s
+cooldown → `ai_provider_failed`), and a request whose history needs more paced
+calls than the envelope allows is still refused with `ERROR_TOO_LARGE`. This fix
+removes the artificial 30s cap on each step; it cannot remove the provider's
+limits.
+
+### Commit
+
+| Item | Value |
+|---|---|
+| Code + tests commit | `ce8ebb60ae027f734b89c9debd3a413478faac1e` — *fix: bound history AI provider calls by the operation budget* |
+
+---
+
+## Previous phase — Live fix: rate-limit pacing and a long-running execution envelope
 
 After the routing/exclusion fix, the live Persian request worked — but with a
 large count it hit a provider rate limit and the operation died. Source tracing
