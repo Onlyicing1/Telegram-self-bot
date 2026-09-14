@@ -17,12 +17,15 @@ AI service and the existing provider architecture.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.services import history_ai_service
 from backend.services import history_service
+
+logger = logging.getLogger(__name__)
 
 _MAX_COUNT = history_service.MAX_HISTORY_MESSAGES
 
@@ -45,6 +48,35 @@ def _source(context: ToolContext) -> Any:
 def _provider_manager(context: ToolContext) -> Any:
     extra = context.extra if context is not None else None
     return extra.get("provider_manager") if extra else None
+
+
+def _current_message_id(context: ToolContext) -> int | None:
+    """The Telegram message that triggered this request, from the request scope.
+
+    Used as the history service's exclusive ``before_id`` so the owner's own
+    triggering command can never appear inside the history it just commanded.
+    The key is set by ``Dispatcher._build_tool_context``; no text matching is
+    involved (an AI-provenance or command-shaped message is still a real
+    message — only the request's own id is excluded).
+    """
+    extra = context.extra if context is not None else None
+    if not extra:
+        return None
+    for key in ("request_message_id", "current_message_id", "message_id"):
+        try:
+            value = int(extra.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value:
+            return value
+    return None
+
+
+def _request_id(context: ToolContext) -> str:
+    """The owning request's id, for the shared ``AI_EXEC_TRACE`` stage logs."""
+    extra = context.extra if context is not None else None
+    value = extra.get("request_id") if extra else None
+    return str(value) if value else ""
 
 
 def _count(arguments: dict[str, Any]) -> int:
@@ -130,6 +162,7 @@ class TranslateHistoryTool(Tool):
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         chat_id = _chat_id(context)
+        request_id = _request_id(context)
         if not chat_id:
             return ToolResult(success=False, message="No chat context available.")
 
@@ -141,12 +174,22 @@ class TranslateHistoryTool(Tool):
                 language=arguments.get("language"),
                 instruction=arguments.get("instruction"),
                 provider_manager=_provider_manager(context),
+                current_message_id=_current_message_id(context),
+                request_id=request_id,
             )
         except Exception as exc:  # noqa: BLE001 — boundary: never crash a request
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=False error=%s",
+                request_id or "-", self.name, type(exc).__name__,
+            )
             return ToolResult(
                 success=False,
                 message=f"❌ Translation failed: {type(exc).__name__}: {exc}",
             )
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",
+            request_id or "-", self.name, ok,
+        )
         return ToolResult(success=ok, message=text, data=data)
 
 
@@ -210,6 +253,7 @@ class SummarizeHistoryTool(Tool):
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         chat_id = _chat_id(context)
+        request_id = _request_id(context)
         if not chat_id:
             return ToolResult(success=False, message="No chat context available.")
 
@@ -220,10 +264,20 @@ class SummarizeHistoryTool(Tool):
                 count=_count(arguments),
                 instruction=arguments.get("instruction"),
                 provider_manager=_provider_manager(context),
+                current_message_id=_current_message_id(context),
+                request_id=request_id,
             )
         except Exception as exc:  # noqa: BLE001 — boundary: never crash a request
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=False error=%s",
+                request_id or "-", self.name, type(exc).__name__,
+            )
             return ToolResult(
                 success=False,
                 message=f"❌ Summarization failed: {type(exc).__name__}: {exc}",
             )
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=tool_result tool=%s success=%s",
+            request_id or "-", self.name, ok,
+        )
         return ToolResult(success=ok, message=text, data=data)

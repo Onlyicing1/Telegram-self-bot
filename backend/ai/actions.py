@@ -952,6 +952,34 @@ _ID_TOKENS = frozenset({"id", "msgid", "message_id", "ایدی", "آیدی", "ش
 
 _DEFAULT_LIST_LIMIT = 50
 
+# History-ANALYSIS requests (summarize / translate) reference a message count
+# and the word "message" exactly like the deterministic "review the last N
+# messages" rule below, but they are NOT reviews: they ask the AI to produce
+# new text FROM the history. Live evidence: "خلاصه ۳۰ پیام آخر رو بده" matched
+# the review rule, so the local fast path answered with the raw message listing
+# before any provider round — the owner received history (including their own
+# command) instead of a summary, and the summarize tool could never run.
+_ANALYSIS_STEMS = ("خلاص", "ترجم")
+_EN_ANALYSIS = frozenset({
+    "summarize", "summarise", "summary", "summarizing", "summarising",
+    "translate", "translation", "translating",
+})
+
+
+def _is_history_analysis_intent(words: list[str]) -> bool:
+    """True when the request asks the AI to summarize/translate the history.
+
+    Such a request must reach the provider (which owns the semantic choice of
+    ``summarize_history`` / ``translate_history``), never the deterministic
+    review listing.
+    """
+    for tok in words:
+        if tok in _EN_ANALYSIS:
+            return True
+        if any(tok.startswith(stem) for stem in _ANALYSIS_STEMS):
+            return True
+    return False
+
 # Read-only status/query intent keywords (matched only after the imperative
 # save/delete/review paths fall through, so "اینو سیو کن" and "پیام آخر رو
 # پاک کن" always take precedence).
@@ -1857,6 +1885,13 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
         and not save_mentioned
         and not send_mentioned
     ):
+        if _is_history_analysis_intent(words):
+            # A summarize/translate request is history ANALYSIS, not a review:
+            # it must reach the provider, which owns the registered
+            # summarize_history / translate_history tools. Live evidence:
+            # "خلاصه ۳۰ پیام آخر رو بده" was answered with the raw message
+            # listing by the local fast path before any provider round.
+            return ActionParseResult(kind=KIND_CONVERSATIONAL)
         limit = count if count is not None else _DEFAULT_LIST_LIMIT
         args: dict[str, Any] = {"limit": limit} if count is not None else {}
         return ActionParseResult(

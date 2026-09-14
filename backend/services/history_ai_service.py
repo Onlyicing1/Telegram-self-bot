@@ -161,21 +161,44 @@ async def _prepare(
     count: Any,
     language: Any = None,
     instruction: Any = None,
+    current_message_id: Any = None,
+    request_id: str = "",
 ) -> HistoryPlan:
-    """Retrieve the eligible history for one operation through the history service."""
+    """Retrieve the eligible history for one operation through the history service.
+
+    ``current_message_id`` is the Telegram message that triggered this request.
+    It becomes the history service's exclusive ``before_id`` cursor, so the
+    owner's own command can never be part of the history it asked about.
+    """
     bound = history_service.MAX_HISTORY_MESSAGES
     requested = _coerce_int(count, DEFAULT_COUNT)
     if requested <= 0:
         requested = DEFAULT_COUNT
     capped = requested > bound
     effective = min(requested, bound)
+    before_id = _coerce_int(current_message_id, 0) or None
 
+    logger.info(
+        "AI_EXEC_TRACE request_id=%s stage=history_retrieval_started "
+        "operation=%s count=%s before_id=%s",
+        request_id or "-", operation, effective, before_id if before_id else "-",
+    )
     try:
         slice_ = await history_service.fetch_recent_history(
-            source, chat_id, count=effective,
+            source, chat_id, count=effective, before_id=before_id,
         )
     except HistoryError as exc:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=history_retrieval_failed "
+            "operation=%s error=%s",
+            request_id or "-", operation, exc,
+        )
         raise HistoryAIError(str(exc), code=ERROR_HISTORY) from exc
+    logger.info(
+        "AI_EXEC_TRACE request_id=%s stage=history_retrieval_completed "
+        "operation=%s messages=%s truncated=%s",
+        request_id or "-", operation, len(slice_.messages), slice_.truncated,
+    )
 
     language_text = _clamp_instruction(language)
     return HistoryPlan(
@@ -288,7 +311,9 @@ def _failure_reason(response: Any) -> str:
     return text or category or "unknown provider error"
 
 
-async def _call(manager: Any, *, system: str, payload: str) -> str:
+async def _call(
+    manager: Any, *, system: str, payload: str, request_id: str = "",
+) -> str:
     """One bounded LLM call through the existing ProviderManager.
 
     ``tools=[]`` keeps the auxiliary call a plain completion — the history
@@ -298,6 +323,9 @@ async def _call(manager: Any, *, system: str, payload: str) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": payload},
     ]
+    logger.info(
+        "AI_EXEC_TRACE request_id=%s stage=provider_call_started", request_id or "-",
+    )
     try:
         response = await asyncio.wait_for(
             manager.chat(messages, tools=[]),
@@ -306,26 +334,46 @@ async def _call(manager: Any, *, system: str, payload: str) -> str:
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=timeout",
+            request_id or "-",
+        )
         raise HistoryAIError(
             f"the AI provider did not respond within {PER_CALL_TIMEOUT_S:.0f}s",
             code=ERROR_PROVIDER,
         ) from exc
     except Exception as exc:  # noqa: BLE001 — provider mesh boundary
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
+            request_id or "-", type(exc).__name__,
+        )
         raise HistoryAIError(
             f"the AI provider call failed: {type(exc).__name__}: {exc}",
             code=ERROR_PROVIDER,
         ) from exc
 
     if not getattr(response, "success", False):
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=%s",
+            request_id or "-", _failure_reason(response),
+        )
         raise HistoryAIError(
             f"the AI provider failed ({_failure_reason(response)})",
             code=ERROR_PROVIDER,
         )
     text = str(getattr(response, "text", "") or "").strip()
     if not text:
+        logger.warning(
+            "AI_EXEC_TRACE request_id=%s stage=provider_call_failed error=empty_response",
+            request_id or "-",
+        )
         raise HistoryAIError(
             "the AI provider returned an empty response", code=ERROR_PROVIDER,
         )
+    logger.info(
+        "AI_EXEC_TRACE request_id=%s stage=provider_call_completed chars=%s",
+        request_id or "-", len(text),
+    )
     return text
 
 
@@ -501,6 +549,8 @@ async def translate_history(
     language: Any = None,
     instruction: Any = None,
     provider_manager: Any = None,
+    current_message_id: Any = None,
+    request_id: str = "",
 ) -> tuple[bool, str, dict[str, Any]]:
     """Translate the most recent eligible Telegram messages.
 
@@ -508,6 +558,8 @@ async def translate_history(
     ``backend/services/web_search_service.do_web_search``. Message ids and
     chronological order are preserved; empty/media-only messages keep their
     place with a placeholder instead of being dropped.
+
+    ``current_message_id`` excludes the requesting command from the history.
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
@@ -519,6 +571,7 @@ async def translate_history(
         plan = await _prepare(
             source, chat_id, operation=TRANSLATE, count=count,
             language=language, instruction=instruction,
+            current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
         return False, f"❌ Couldn't read the Telegram history: {exc}", {
@@ -547,7 +600,10 @@ async def translate_history(
     )
 
     async def _translate_chunk(chunk: _Chunk) -> str:
-        return await _call(manager, system=system, payload="\n".join(chunk.lines))
+        return await _call(
+            manager, system=system, payload="\n".join(chunk.lines),
+            request_id=request_id,
+        )
 
     try:
         raw_results = await _map(manager, chunks, _translate_chunk)
@@ -573,6 +629,8 @@ async def summarize_history(
     count: Any = DEFAULT_COUNT,
     instruction: Any = None,
     provider_manager: Any = None,
+    current_message_id: Any = None,
+    request_id: str = "",
 ) -> tuple[bool, str, dict[str, Any]]:
     """Summarize the most recent eligible Telegram messages with the LLM.
 
@@ -580,6 +638,8 @@ async def summarize_history(
     then the chunk summaries are merged by one further provider call when the
     history spans more than one chunk. A single-chunk history returns that one
     summary — no fake aggregation step.
+
+    ``current_message_id`` excludes the requesting command from the history.
     """
     manager = _resolve_manager(provider_manager)
     if manager is None:
@@ -589,7 +649,9 @@ async def summarize_history(
 
     try:
         plan = await _prepare(
-            source, chat_id, operation=SUMMARIZE, count=count, instruction=instruction,
+            source, chat_id, operation=SUMMARIZE, count=count,
+            instruction=instruction,
+            current_message_id=current_message_id, request_id=request_id,
         )
     except HistoryAIError as exc:
         return False, f"❌ Couldn't read the Telegram history: {exc}", {
@@ -613,7 +675,10 @@ async def summarize_history(
     system = _with_instruction(_SUMMARIZE_SYSTEM, plan.instruction)
 
     async def _summarize_chunk(chunk: _Chunk) -> str:
-        return await _call(manager, system=system, payload="\n".join(chunk.lines))
+        return await _call(
+            manager, system=system, payload="\n".join(chunk.lines),
+            request_id=request_id,
+        )
 
     try:
         partials = await _map(manager, chunks, _summarize_chunk)
@@ -625,6 +690,7 @@ async def summarize_history(
                     manager,
                     system=_with_instruction(_REDUCE_SYSTEM, plan.instruction),
                     payload=_summarize_payload(partials, plan.instruction),
+                    request_id=request_id,
                 ),
                 timeout=PER_CALL_TIMEOUT_S,
             )

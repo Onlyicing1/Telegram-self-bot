@@ -722,3 +722,235 @@ def test_dispatcher_delivers_both_tools_verbatim():
 
 def test_bounded_request_scoped_context_is_unchanged():
     assert MAX_CONTEXT_MESSAGES == 10
+
+
+# ── 4. Request-scoped trigger exclusion (live "خلاصه ۳۰ پیام آخر رو بده") ──
+
+
+def _context_with_request(
+    manager: ProviderManager,
+    client: Any,
+    message_id: int,
+    *,
+    request_id: str = "req-1",
+) -> ToolContext:
+    """The dispatcher's request scope: chat, triggering message id, manager.
+
+    ``request_message_id`` is the key ``Dispatcher._build_tool_context`` sets,
+    so this is the real production context shape.
+    """
+    return ToolContext(
+        telegram=TelegramAPI(client),
+        owner_id=OWNER,
+        tz_str="UTC",
+        client=client,
+        extra={
+            "chat_id": CHAT,
+            "request_message_id": message_id,
+            "request_id": request_id,
+            "provider_manager": manager,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_triggering_message_is_excluded_by_id_from_the_retrieved_history():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 30})
+
+    assert result.success is True
+    assert client.calls[0]["max_id"] == 30          # exclusive cursor, not a text filter
+    assert _sent_ids(provider) == list(range(1, 30))
+    assert 30 not in _sent_ids(provider)
+    assert "[30]" not in result.message
+    assert result.data["processed"] == 29
+
+
+@pytest.mark.asyncio
+async def test_trigger_exclusion_is_identity_based_not_text_based():
+    """The same text is kept when it is not the triggering message."""
+    provider = _ScriptedProvider(_translating_provider)
+    command = "خلاصه ۳۰ پیام آخر رو بده"
+    client = _FakeClient([
+        _FakeMessage(1, command),   # older message with identical text
+        _FakeMessage(2, "hello"),
+        _FakeMessage(3, command),   # the triggering command itself
+    ])
+    context = _context_with_request(_manager(provider), client, 3)
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 3})
+
+    assert result.success is True
+    assert _sent_ids(provider) == [1, 2]
+    assert "[1]" in result.message and "[3]" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_summarize_30_message_request_completes_through_the_tool_path():
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 30})
+
+    assert result.success is True
+    assert provider.calls >= 1
+    assert result.message.strip()
+    assert result.data["operation"] == "summarize"
+    assert result.data["processed"] == 29
+    assert 30 not in _sent_ids(provider)
+
+
+@pytest.mark.asyncio
+async def test_request_without_a_scoped_message_id_keeps_the_full_window():
+    """An internal caller with no triggering message is not cursor-bounded."""
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 5})
+
+    assert result.success is True
+    assert client.calls[0].get("max_id") is None
+    assert result.data["processed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_stage_traces_distinguish_retrieval_provider_and_tool_result(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+    context = _context_with_request(_manager(provider), client, 5, request_id="req-trace")
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 5})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is True
+    assert any("stage=history_retrieval_started" in t and "req-trace" in t for t in traces)
+    assert any("stage=history_retrieval_completed" in t for t in traces)
+    assert any("before_id=5" in t for t in traces)
+    assert any("stage=provider_call_started" in t for t in traces)
+    assert any("stage=provider_call_completed" in t for t in traces)
+    assert any("stage=tool_result" in t and "tool=summarize_history" in t for t in traces)
+    assert any("success=True" in t and "stage=tool_result" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_history_retrieval_failure_is_traced_and_never_a_silent_empty_result(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_request(
+        _manager(provider), _FailingClient(), 3, request_id="req-fail",
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_HISTORY
+    assert provider.calls == 0
+    assert any("stage=history_retrieval_failed" in t for t in traces)
+    assert any("stage=tool_result" in t and "success=False" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_traced_and_surfaced_honestly(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={1})
+    client = _FakeClient(_conversation(3))
+    context = _context_with_request(_manager(provider), client, 3, request_id="req-pfail")
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+    assert any("stage=provider_call_failed" in t for t in traces)
+    assert any("stage=tool_result" in t and "success=False" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_summary_result_remains_deliverable_through_the_delivery_path():
+    from types import SimpleNamespace
+
+    from backend.ai.context.provenance import strip_ai_provenance_marker
+    from backend.ai.tools.delivery import deliver_response
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 30})
+
+    edits: list[str] = []
+    replies: list[str] = []
+
+    async def edit(text):
+        edits.append(text)
+
+    async def reply(text):
+        replies.append(text)
+
+    delivered = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply),
+        "خلاصه ۳۰ پیام آخر رو بده",
+        result.message,
+    )
+
+    assert result.success is True
+    assert delivered.success is True
+    assert len(edits) == 1 and replies == []
+    assert strip_ai_provenance_marker(edits[0]) == result.message.strip()
+
+
+# ── 5. Routing: analysis requests reach the provider ──
+
+
+def test_history_analysis_requests_are_not_routed_to_the_review_listing():
+    from backend.ai.actions import KIND_CONVERSATIONAL, parse_command_intent
+
+    for text in (
+        "خلاصه ۳۰ پیام آخر رو بده",
+        "ترجمه ۱۰ پیام آخر",
+        "summarize the last 500 messages",
+        "translate the last 100 messages to English",
+    ):
+        result = parse_command_intent(text, has_reply=False)
+        assert result.kind == KIND_CONVERSATIONAL, text
+        assert result.action != "list_recent_messages", text
+
+
+def test_review_requests_still_resolve_deterministically():
+    from backend.ai.actions import parse_command_intent
+
+    for text, count in (("ده پیام آخر رو بررسی کن", 10), ("last 10 messages", 10)):
+        result = parse_command_intent(text, has_reply=False)
+        assert result.action == "list_recent_messages", text
+        assert result.count == count, text
+
+
+def test_analysis_routing_does_not_divert_delete_or_save_commands():
+    from backend.ai.actions import parse_command_intent
+
+    result = parse_command_intent("پیام‌های خلاصه رو پاک کن", has_reply=False)
+    assert result.action == "delete_messages"
+
+
+def test_trigger_exclusion_adds_no_text_heuristic_to_the_ai_path():
+    from backend.ai.tools import history_ai as history_ai_tools
+
+    tool_source = inspect.getsource(history_ai_tools)
+    service_source = inspect.getsource(history_ai_service)
+    assert "request_message_id" in tool_source          # request-scoped identity
+    assert "before_id=before_id" in service_source      # cursor, not matching
+    for source in (tool_source, service_source):
+        assert "startswith(" not in source
+        assert "has_ai_provenance_marker" not in source
+        assert "re.compile(" not in source
