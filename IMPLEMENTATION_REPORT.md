@@ -1,6 +1,233 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Reusable arbitrary-N Telegram history service (`backend/services/history_service.py`)
+## Latest phase — Telegram history translation and summarization (LLM map-reduce)
+
+Phase 2 of the Telegram-history project: the owner can now ask the assistant to
+**translate** or **summarize** an arbitrary number of Telegram messages.
+Translation preserves message identity and order; summarization is genuine LLM
+work (map per chunk → reduce). Telegram history still comes exclusively from
+`backend/services/history_service.py`; the LLM work goes through the existing
+`ProviderManager`.
+
+### 1. Starting state
+
+| Item | Value |
+|---|---|
+| HEAD before this phase | `0874c2a05f19ef4be5a187952d5d86c87f98db67` — *docs: report the reusable Telegram history service phase* |
+| Architectural state | `history_service.py` could retrieve bounded, lossless, provenance-filtered, paginated history — but nothing consumed it; there was **no** translation tool, **no** summarization tool, and no way for a tool to do LLM work |
+| Provider access from tools | Established by `tools/websearch.py` (`context.extra["provider_manager"]`, engine fallback) and by `tools/task.py` → `TaskInterpreter(provider_manager)` — the pattern this phase follows |
+| Registry size | 39 tools |
+
+### 2. Exact files changed
+
+| File | Status | Role |
+|---|---|---|
+| `backend/services/history_ai_service.py` | **added** | the orchestration boundary: retrieve via `history_service`, chunk, LLM map, LLM reduce, assemble the result |
+| `backend/ai/tools/history_ai.py` | **added** | two thin tools — `TranslateHistoryTool`, `SummarizeHistoryTool` |
+| `backend/ai/tools/registry.py` | modified | imports + registers both tools |
+| `backend/ai/engine/dispatcher.py` | modified | adds both names to `_VERBATIM_READ_TOOLS` (one-line contract change, commented) |
+| `tests/test_history_ai_tools.py` | **added** | 40 focused tests |
+| `tests/test_tool_health_audit.py` | modified | registry contract: `EXPECTED_TOOLS` + count 39 → 41 |
+| `tests/test_capability_exposure_tools.py` | modified | registry count constant 39 → 41 |
+| `tests/test_memory_tools.py` | modified | registry count constant 39 → 41 |
+| `IMPLEMENTATION_REPORT.md` | modified | this section |
+
+### 3. Translation architecture
+
+```
+tool translate_history (thin: args + chat from ToolContext)
+  -> history_ai_service.translate_history(...)
+       -> history_service.fetch_recent_history(...)      # the ONLY history source
+       -> chunk the text-bearing messages
+       -> manager.chat(...) per chunk (bounded concurrency)
+       -> parse "[id] translation" lines, require every id
+       -> reassemble in chronological order by message id
+```
+
+* **Identity and order** — every output line is `[id] translated text`, emitted
+  strictly chronologically; ids come from the history records, never from the
+  model's ordering.
+* **Bounded messages** — a message is never merged with another, never split,
+  and never dropped. If the model omits any id the whole request fails honestly
+  instead of silently dropping that message.
+* **Empty/media-only messages** — never sent to the model (nothing to
+  translate) but kept in place in the output as `[media]` / `(empty message)`,
+  so identity and ordering survive.
+* **Target language** — the owner's explicit language is passed to the prompt;
+  when none is given the prompt instructs English. No language-detection
+  subsystem was invented.
+
+### 4. Summarization architecture
+
+```
+ tool summarize_history (thin: args + chat from ToolContext)
+  -> history_ai_service.summarize_history(...)
+       -> history_service.fetch_recent_history(...)
+       -> chunk (chronological)
+       -> MAP:    manager.chat(...) per chunk  -> partial summaries
+       -> REDUCE: manager.chat(...) over the partials (only when > 1 chunk)
+       -> return the final summary text
+```
+
+* A **single-chunk** history returns that chunk's summary directly — no fake
+  aggregation round.
+* A **multi-chunk** history always merges the chunk summaries with one further
+  provider call, so the final text is one coherent summary rather than a
+  concatenation of parts.
+* The output is model prose. There is **no** local extractive, frequency,
+  keyword, regex or scoring summarizer anywhere in the change.
+
+### 5. How LLM calls are performed
+
+Both operations call the **existing** provider architecture: the tool takes
+`context.extra["provider_manager"]` (the value the Dispatcher injects at
+`dispatcher.py:1229`, exactly like `web_search`), the service falls back to
+`get_engine().provider_manager` when it is absent, and every call is
+`manager.chat(messages, tools=[])` — the same never-raising, fallback-capable
+entry point the Dispatcher and `TaskInterpreter` use. No second provider
+abstraction, engine, executor or client was introduced; `tools=[]` keeps the
+auxiliary calls plain completions that cannot request further tools.
+
+### 6. How chunking works
+
+* Chunk sizing is **derived from existing architecture**, not invented:
+  `CHUNK_TOKEN_BUDGET = min(DEFAULT_MAX_CONTEXT_TOKENS, ProviderConfig().max_tokens // 2)`
+  = `min(4000, 2048)` = **2048 tokens** — the design's context-block allowance
+  (`AI_MASTER_DESIGN.md` §28.6) capped by half the provider's configured output
+  budget (translation output is roughly as long as its input).
+* Tokens are estimated with the project's own estimator
+  (`backend/ai/prompt/budget.py::estimate_tokens`, 2 chars/token for non-English)
+  taking the **conservative** branch so Persian/mixed content still fits.
+* A single message larger than the budget becomes its own chunk; text is never
+  truncated to fit (asserted by a test).
+* Concurrency: `MAP_CONCURRENCY = 4`, mirroring the provider manager's own
+  `_DEFAULT_CONCURRENCY`, guarded by an `asyncio.Semaphore`.
+* Bounded calls: `MAX_MAP_CALLS = 40` (`4 concurrent × 40s/4s`), so one request
+  can never fan out into hundreds of provider calls.
+* Wall-clock bound: `LLM_BUDGET_S = 40.0` for all LLM work, with
+  `PER_CALL_TIMEOUT_S = 30.0` per call (mirroring
+  `task_interpreter.INTERPRET_TIMEOUT_SECONDS`). This sits inside the AI
+  request's existing 60s envelope (`ai_unified._AI_TIMEOUT`), which must also
+  cover retrieval, the initial provider round and delivery.
+
+### 7. How 500 / 1000 messages are handled
+
+* The requested count is passed to `history_service.fetch_recent_history`,
+  which pages backwards in 100-message pages until the count is satisfied
+  (500 → ~6 pages, 1000 → ~11 pages) with bounded per-page RPCs.
+* 500/1000 short messages chunk into a handful of chunks (tests assert > 1 chunk
+  and that **every** id reaches the provider), and the summaries are merged by
+  one reduce call — genuinely hierarchical, never one oversized prompt.
+* A request above the service bound (`MAX_HISTORY_MESSAGES = 1000`) is capped at
+  1000 and **stated** in the reply; the tool deliberately does not clamp so the
+  service's honest cap note survives (a test would have caught the hidden cap).
+* A history whose *content* needs more than `MAX_MAP_CALLS` passes is refused
+  with an honest explanation (`history_too_large_for_one_request`) — no silent
+  truncation, no partial summary presented as complete.
+
+### 8. How provenance exclusion is centralized
+
+Unchanged and single-sourced: `backend/ai/context/provenance.py` →
+`backend/services/history_service.py`. Neither new module imports the marker,
+tests the marker, or filters messages by anything (asserted by an
+architecture test that inspects both modules' source for
+`has_ai_provenance_marker`, `AI_PROVENANCE_MARKER`, `.iter_messages(`, a Telethon
+import and a direct `ProviderManager(` construction). `ListRecentMessagesTool`,
+`telegram_context.py`, the dispatcher's prompt path and the prompt builder were
+not touched. AI-provenance messages therefore stay excluded by default and can
+never appear in a translation or summary.
+
+### 9. How truncation is handled
+
+`HistorySlice.truncated` / a shortfall is surfaced, never hidden: when fewer
+messages are available than requested, the result carries
+`⚠️ Only N of the requested M messages were available` (plus “older messages may
+exist” when the history service reported truncation), and when the request
+exceeded the service bound it carries
+`⚠️ The most recent 1000 messages is the maximum per request.` The tool never
+claims the requested range was fully processed.
+
+### 10. How failures are handled
+
+| Failure | Behaviour |
+|---|---|
+| Telegram retrieval (`HistoryError`) | `success=False`, `❌ Couldn't read the Telegram history: …`, `data.error = history_unavailable`; **never** an empty success |
+| Provider failure / timeout / empty response / incomplete model output | `success=False`, `❌ …`, `data.error = ai_provider_failed`; no partial translation or summary is fabricated |
+| Reduce (final aggregation) failure | `success=False`; the chunk summaries are never returned as if they were the summary |
+| LLM budget exhausted | `success=False`, “did not finish within 40s” |
+| Too many passes needed | `success=False`, `history_too_large_for_one_request`, **zero** provider calls |
+| Empty eligible history | `success=True` with an explicit message and `processed=0` — distinguishable from every failure above |
+| No AI engine | `success=False`, `ai_engine_unavailable` |
+
+### 11. Tests
+
+| Run | Result |
+|---|---|
+| `pytest tests/test_history_ai_tools.py -q` (focused, new) | **40 passed** |
+| Adjacent suite (history service, chat context, provenance, failure simulation, tool calls, advanced execution, execution status, fast path, output pipeline, task-wizard bridge) | **342 passed** |
+| Full suite `pytest tests/ -q` | **2748 passed, 24 skipped** (2708 passed before this phase) |
+| `python -m py_compile` on all 5 changed/added Python files | OK |
+| `git diff --check` | clean (exit 0) |
+
+The focused tests cover, per the phase’s matrix: requested count; ordering;
+message identity; multi-page history (so the 250-message case proves both
+history paging *and* multi-chunk output); empty history; media-only/empty
+text; `HistoryError`; truncation reporting; provider failure; incomplete model
+output; provenance exclusion; count capping; raw client vs facade equivalence;
+small-history summarization (one call, no reduce); multi-page summarization;
+500-message and 1000-message scale (map-reduce with every id accounted for);
+chunk-count/token-budget bounds; oversized-message integrity; hierarchical
+aggregation; chunk-failure and reduce-failure honesty; budget timeout;
+too-large refusal; registry/permission/long-running contract; real
+`ToolExecutor` execution; dispatcher verbatim delivery; tool → `history_service`
+routing; and the unchanged bounded snapshot. **No existing test was weakened** —
+the three modified tests are exact-registry contract tests that now include the
+two new tools (39 → 41).
+
+### 12. Limitations (not verified)
+
+1. **No live Telegram or live provider verification.** No session exists in this
+   workspace, so real paging against Telegram, real model outputs, and real
+   provider latency were **not** exercised. Verification uses a Telethon-shaped
+   fake client and a scripted provider registered in the **real**
+   `ProviderRegistry`/`ProviderManager`.
+2. **Scale is bounded by the request envelope.** A 1000-message request whose
+   content needs more than 40 provider calls is refused honestly rather than
+   processed; typical chat messages fit well inside that, very long messages
+   do not. The design favours an honest refusal over silent truncation.
+3. **Mixed rounds are not verbatim.** If the model requests one of these tools
+   in the same round as another tool, the dispatcher’s verbatim short-circuit
+   does not apply and the (large) result travels into the continuation prompt —
+   existing behaviour for every read tool, not new here.
+4. **Translation id parsing is strict by design.** A model that ignores the
+   `[id] text` format produces an honest failure rather than a guess.
+5. Sender **display names** are still not resolved (records carry `sender_id`),
+   so summaries attribute speakers as `You` / `User <id>`.
+6. Translation output always keeps `[id]` prefixes so translated text maps to
+   its source message; that is a deliberate identity requirement, not internal
+   leakage (chunk numbers, provider names and cursors are never shown).
+
+### 13. Next-phase boundary
+
+Any further history capability (export, per-message actions, searching history)
+should consume `history_service` the same way, keep provenance ownership there,
+and only add a thin tool. Translation and summarization are complete as
+requested; nothing else was added.
+
+### 14. Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `0874c2a` |
+| Implementation commit | `16f260abe99230b745866acb371e6bb88dbe4110` — *feat: add LLM translation and summarization of Telegram history* (8 files, +1613/−5) |
+| Report commit | the `docs:` commit that carries this section (this report only) |
+| Push | `0874c2a..` into `origin/main`, no force, no rebase, no history rewrite |
+| Working tree | clean apart from the pre-existing untracked `telegram-self-bot/` directory |
+| Live verification | **not performed** (no live Telegram session or provider key available in this workspace) |
+
+---
+
+## Previous phase — Reusable arbitrary-N Telegram history service (`backend/services/history_service.py`)
 
 Implementation of the boundary the Telegram-history investigation
 (`INVESTIGATION.md`, §6/§10) established: one shared, provenance-aware,
