@@ -425,8 +425,17 @@ class Dispatcher:
             tool_block = ""
             if tools_allowed and self._tool_registry and not self._tool_registry.is_empty():
                 tool_block = self._render_tool_schemas(self._tool_registry.list_schemas())
+            conversation_context = await self._build_context(request, session)
+            # The Telegram surrounding-message snapshot is request-scoped and
+            # already fetched (exactly once) by the activation handler. It is
+            # attached HERE, so the ContextBuilder stays a pure assembler and
+            # no layer below this point reads Telegram for chat context again.
+            if request.telegram_context is not None:
+                conversation_context = replace(
+                    conversation_context, telegram_chat=request.telegram_context
+                )
             prompt_package = self._prompt_builder.build(
-                await self._build_context(request, session),
+                conversation_context,
                 tool_block=tool_block,
             )
             safe_call(self._hooks, "after_prompt", prompt_package)

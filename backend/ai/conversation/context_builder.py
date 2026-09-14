@@ -28,6 +28,7 @@ from typing import Any
 from backend.ai.conversation.history import HistoryEntry
 from backend.ai.conversation.session import ConversationSession
 from backend.ai.conversation.state import ConversationState
+from backend.ai.conversation.telegram_context import TelegramChatContext
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,8 @@ class ConversationContext:
         history:         Recent conversation history entries.
         memory:          Memory text blocks from MemoryManager (permanent/long/short).
         preferences:     AI preferences snapshot (language, personality, etc.).
+        telegram_chat:   Surrounding Telegram chat messages (bounded snapshot
+                         fetched ONCE by the caller, never read here).
         created_at:      UTC timestamp when this context was assembled.
     """
 
@@ -197,6 +200,7 @@ class ConversationContext:
     history: list[HistoryEntry]
     memory: dict[str, str] = field(default_factory=dict)
     preferences: PreferencesContext = field(default_factory=PreferencesContext)
+    telegram_chat: TelegramChatContext = field(default_factory=TelegramChatContext)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -231,6 +235,7 @@ class ContextBuilder:
         message_id: int,
         current_menu: str = "main",
         reply: ReplyContext | None = None,
+        telegram_chat: TelegramChatContext | None = None,
         tool: ToolContext | None = None,
         settings: SettingsContext | None = None,
         runtime: RuntimeContext | None = None,
@@ -246,6 +251,8 @@ class ContextBuilder:
             message_id:    Telegram message ID of the triggering message.
             current_menu:  Current top-level menu name.
             reply:         Reply context (or None for no reply).
+            telegram_chat: Already-fetched Telegram surrounding-message snapshot
+                           (or None for none). Never fetched here.
             tool:          Tool context (or None for defaults).
             settings:      Settings context (or None for empty).
             runtime:       Runtime context (or None for defaults).
@@ -280,6 +287,7 @@ class ContextBuilder:
             current_time=current_time,
             user_text=user_text,
             reply=reply or ReplyContext(),
+            telegram_chat=telegram_chat or TelegramChatContext(),
             tool=tool or ToolContext(
                 current_tool=session.current_tool,
                 last_tool=session.last_tool,

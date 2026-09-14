@@ -158,7 +158,7 @@ class PromptBuilder:
         sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(ctx)
         sections[PromptSection.TOOL_METADATA] = self._render_tool_metadata(ctx, tool_block)
         sections[PromptSection.TOOL_RESULTS] = self._render_tool_results(ctx)
-        sections[PromptSection.USER_MESSAGE] = ctx.user_text
+        sections[PromptSection.USER_MESSAGE] = self._render_user_message(ctx)
         sections[PromptSection.OUTPUT_INSTRUCTIONS] = OUTPUT_INSTRUCTIONS_TEMPLATE
 
         return sections
@@ -264,11 +264,31 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _render_user_message(ctx: ConversationContext) -> str:
+        """Render the owner's request as the authoritative current request.
+
+        When a Telegram surrounding block is present the request is explicitly
+        labeled, so the model can never mistake one of the nearby Telegram
+        lines for the instruction it must act on. Without surrounding context
+        the request text travels byte-identical to before.
+        """
+        if ctx.telegram_chat.is_empty:
+            return ctx.user_text
+        return f"[Current Request]\n{ctx.user_text}"
+
     def _render_conversation_state(self, ctx: ConversationContext) -> str:
         """Render the conversation state block."""
         lines: list[str] = ["[Conversation State]"]
         lines.append(f"State: {ctx.state.value}")
         lines.append(f"Flow: {ctx.current_flow or 'None'}")
+
+        # The REAL surrounding Telegram messages of this chat travel here as
+        # context DATA. They are rendered before the reply/history blocks and
+        # never merged into the runtime AI history.
+        telegram_block = ctx.telegram_chat.render()
+        if telegram_block:
+            lines.append(telegram_block)
 
         if ctx.reply.exists:
             if ctx.reply.is_ai_message:
@@ -386,6 +406,7 @@ class PromptBuilder:
                 history=history,
                 memory=ctx.memory,
                 preferences=ctx.preferences,
+                telegram_chat=ctx.telegram_chat,
                 created_at=ctx.created_at,
             )
             sections[PromptSection.CONVERSATION_STATE] = self._render_conversation_state(trimmed_ctx)

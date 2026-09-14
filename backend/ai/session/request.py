@@ -16,6 +16,9 @@ Fields (from AI_MASTER_DESIGN.md §25):
   chat_id:       Telegram chat ID where the conversation lives.
   message_id:    Telegram message ID of the triggering message.
   reply_context: Optional ``ReplyContext`` (replied message metadata).
+  telegram_context: Optional bounded Telegram surrounding-message snapshot
+                    (the REAL nearby chat messages, fetched once by the
+                    activation handler). Never the runtime AI history.
   tool_request:  Optional tool request name (future, empty for now).
   timestamp:     UTC datetime when this request was created.
   language:      Owner's language (e.g. ``"English"``).
@@ -30,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.ai.conversation.context_builder import ReplyContext
+from backend.ai.conversation.telegram_context import TelegramChatContext
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,8 @@ class AIRequest:
         chat_id:        Telegram chat ID where the conversation lives.
         message_id:    Telegram message ID of the triggering message.
         reply_context:  Reply metadata, or a default (no reply).
+        telegram_context: Surrounding Telegram chat messages around the
+                          triggering message, or None when unavailable/disabled.
         tool_request:   Tool name to invoke (future — empty for now).
         timestamp:      UTC datetime when this request was created.
         language:       Owner's language.
@@ -57,6 +63,7 @@ class AIRequest:
     chat_id: int
     message_id: int
     reply_context: ReplyContext = field(default_factory=ReplyContext)
+    telegram_context: TelegramChatContext | None = None
     tool_request: str = ""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     language: str = "English"

@@ -536,6 +536,39 @@ async def _extract_reply_context(
     return user_message, reply_ctx, ""
 
 
+async def _load_telegram_chat_context(client, chat_id, message_id, reply_context,
+                                      tz_str: str):
+    """Fetch this request's bounded Telegram surrounding-message window ONCE.
+
+    Optional enrichment: the surrounding Telegram messages of the chat the AI
+    was triggered in. The snapshot is request-scoped (never persisted, never
+    merged into the AI history) and threaded to the Context/Prompt layers
+    through the ``AIRequest``. A missing anchor, an unavailable client, a
+    Telegram failure, or a timeout all degrade to ``None`` — the AI request
+    always proceeds with the context it already had.
+
+    The replied-to message (when this request is a reply) is EXCLUDED from the
+    window: it already travels as the higher-fidelity ``ReplyContext``, so the
+    same message is never rendered twice.
+    """
+    from backend.ai.conversation.telegram_context import fetch_telegram_chat_context
+
+    exclude: tuple[int, ...] = ()
+    if reply_context is not None and getattr(reply_context, "exists", False):
+        exclude = (int(getattr(reply_context, "message_id", 0) or 0),)
+
+    snapshot = await fetch_telegram_chat_context(
+        client, chat_id, message_id, tz_str=tz_str, exclude_message_ids=exclude,
+    )
+    if snapshot.is_empty:
+        return None
+    logger.info(
+        "TELEGRAM_CHAT_CONTEXT chat_id=%s message_id=%s messages=%d truncated=%s",
+        chat_id, message_id, len(snapshot.messages), snapshot.truncated,
+    )
+    return snapshot
+
+
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                       tz_str: str, reply_context=None, client=None,
                       config: dict | None = None) -> None:
@@ -619,6 +652,12 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             logger.debug("AI handler: provider resolve log failed: %s", exc)
 
         session_id = f"owner-{owner_id}"
+        # One bounded Telegram read per request, threaded forward as a snapshot;
+        # no later layer (ContextBuilder, PromptBuilder, dispatcher, tools,
+        # delivery) reads these messages again.
+        telegram_context = await _load_telegram_chat_context(
+            client, request_chat_id, request_message_id, reply_context, tz_str,
+        )
         request = AIRequest(
             session_id=session_id,
             user_message=prompt_text,
@@ -626,6 +665,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             chat_id=request_chat_id,
             message_id=request_message_id,
             reply_context=reply_context or ReplyContext(),
+            telegram_context=telegram_context,
             timezone=tz_str,
             request_id=rid,
         )
