@@ -1,5 +1,86 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## Latest phase — RTL Telegram connector isolation
+
+The remaining RTL presentation defect was fixed without changing the
+presentation design, model context, settings, providers, scheduler, delivery
+mode, or database schema.
+
+### Confirmed cause
+
+`backend/ai/tools/delivery.py` already selected the correct logical elbow from
+the rendered answer (`└─` for LTR and `─┘` for RTL), but its neutral box-drawing
+characters were emitted directly into each Telegram line. Telegram's Unicode
+BiDi resolution could therefore place the `│` markers on the left of Persian
+text, resolve the spacer inconsistently, or let an English continuation line
+change the apparent direction of an RTL answer block.
+
+### Exact fix
+
+`delivery.py` now wraps each connected presentation line in an invisible
+Unicode directional isolate:
+
+* U+2066 LRI for LTR question/answer lines;
+* U+2067 RLI for RTL question/answer lines;
+* U+2069 PDI to close each isolate.
+
+The question markers and the single spacer use the question's dominant
+paragraph direction. The answer elbow and every answer continuation use the
+answer's dominant direction, preserving mixed question/answer behavior. The
+visible logical glyphs remain unchanged: RTL answers still contain the exact
+`─┘` sequence, LTR answers still contain `└─`, question markers remain `│`, and
+continuation lines still begin with exactly four ASCII spaces before their
+isolated content. Hidden-question mode remains byte-identical plain answer
+text and contains no connector controls or glyphs.
+
+The UTF-16 pagination cost now includes the added isolate controls, so chunking
+continues to stay within Telegram's size limit without dropping the controls.
+Thinking, status, and failure states use the same question/spacer isolation but
+never gain the final-answer elbow.
+
+### Focused regression coverage
+
+`tests/test_ai_presentation_redesign.py` now verifies Persian, English, mixed,
+neutral/numeric, multiline, cross-direction, spacer, continuation, and plain
+hidden-question cases. It asserts both the visible logical layout (after
+removing invisible controls) and the exact LRI/RLI/PDI placement that prevents
+line-level direction leakage.
+
+No SQL was executed and no schema or persistence behavior changed.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused presentation tests (`tests/test_ai_presentation_redesign.py`) | **49 passed** |
+| Relevant broader presentation/AI suites | **269 passed, 2 warnings** |
+| `py_compile` changed Python files | **passed** |
+| `git diff --check` | **clean** |
+| Live Telegram rendering | **not available in this environment** |
+
+### Manual Telegram verification still required
+
+Exact pixel placement cannot be reproduced by Python string tests alone. Send
+these owner-only test cases through the live AI path with the preference ON,
+then inspect the edited original message on Telegram Android, Desktop, and
+iOS:
+
+1. Persian question `این سؤال من است` with Persian answer `این پاسخ فارسی است`;
+2. Persian question with answer lines `خط اول فارسی`, `English continuation`,
+   `خط سوم فارسی`;
+3. English question `What is this?` with Persian answer `این یک پاسخ است`;
+4. Persian question with numeric/punctuation answer `12345?! ---`;
+5. multiline Persian question and multiline English answer;
+6. repeat cases 1–5 with the preference OFF and confirm the answer is plain,
+   with no `│`, `─`, `┘`, or `└`.
+
+The expected RTL visual result is the question/spacer vertical marker on the
+right and the answer elbow visually rendered as `─┘` with its corner on the
+right. The normal AI response continues to edit the original Telegram
+message; no new answer message is introduced.
+
+---
+
 ## Latest phase — toggle honesty fix + plain hidden-question presentation
 
 Two remaining user-confirmed defects were fixed. The full callback chain

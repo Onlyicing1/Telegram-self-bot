@@ -287,6 +287,15 @@ _RTL_ANSWER_MARK = "─┘"
 _LTR_ANSWER_PREFIX = f"{_LTR_ANSWER_MARK} "
 _RTL_ANSWER_PREFIX = f" {_RTL_ANSWER_MARK} "
 _ANSWER_MARK = _LTR_ANSWER_MARK
+_BIDI_LRI = "\u2066"
+_BIDI_RLI = "\u2067"
+_BIDI_PDI = "\u2069"
+_BIDI_ISOLATE_UNITS = _utf16_units(_BIDI_RLI + _BIDI_PDI)
+
+
+def _bidi_isolate(text: str, rtl: bool) -> str:
+    """Keep neutral connector glyphs in the intended paragraph direction."""
+    return f"{_BIDI_RLI if rtl else _BIDI_LRI}{text}{_BIDI_PDI}"
 
 
 def _presentation_lines(text: str) -> list[str]:
@@ -330,9 +339,18 @@ def _question_block(user_message: str) -> str:
         lines.pop(0)
     while lines and not lines[-1].strip():
         lines.pop()
+    rtl = _is_rtl_text(user_message)
     return "\n".join(
-        f"{_QUESTION_PREFIX}{line}" if line.strip() else _QUESTION_MARK for line in lines
+        _bidi_isolate(
+            f"{_QUESTION_PREFIX}{line}" if line.strip() else _QUESTION_MARK,
+            rtl,
+        )
+        for line in lines
     )
+
+
+def _question_connector(user_message: str) -> str:
+    return _bidi_isolate(_QUESTION_MARK, _is_rtl_text(user_message))
 
 
 def _answer_block(response_text: str, decorated: bool = True) -> str:
@@ -349,9 +367,13 @@ def _answer_block(response_text: str, decorated: bool = True) -> str:
         return _ANSWER_MARK if decorated else ""
     if not decorated:
         return "\n".join(lines)
-    prefix = _RTL_ANSWER_PREFIX if _is_rtl_text(response_text) else _LTR_ANSWER_PREFIX
-    rendered = [f"{prefix}{lines[0]}"]
-    rendered.extend(f"{_ANSWER_INDENT}{line}" for line in lines[1:])
+    rtl = _is_rtl_text(response_text)
+    prefix = _RTL_ANSWER_PREFIX if rtl else _LTR_ANSWER_PREFIX
+    rendered = [_bidi_isolate(f"{prefix}{lines[0]}", rtl)]
+    # Keep the required four ASCII spaces as the literal line prefix while
+    # isolating the content so an English continuation cannot change an RTL
+    # answer block's paragraph direction.
+    rendered.extend(f"{_ANSWER_INDENT}{_bidi_isolate(line, rtl)}" for line in lines[1:])
     return "\n".join(rendered)
 
 
@@ -370,7 +392,7 @@ def format_presentation(user_message: str, response_text: str, show_question: bo
     question = _question_block(user_message)
     if not question:
         return answer
-    return f"{question}\n{_QUESTION_MARK}\n{answer}"
+    return f"{question}\n{_question_connector(user_message)}\n{answer}"
 
 
 def format_thinking(user_message: str, show_question: bool) -> str:
@@ -381,7 +403,7 @@ def format_thinking(user_message: str, show_question: bool) -> str:
     question = _question_block(user_message)
     if not question:
         return "Thinking…"
-    return f"{question}\n{_QUESTION_MARK}\nThinking…"
+    return f"{question}\n{_question_connector(user_message)}\nThinking…"
 
 
 def format_status(user_message: str, status: str, show_question: bool) -> str:
@@ -395,7 +417,7 @@ def format_status(user_message: str, status: str, show_question: bool) -> str:
     question = _question_block(user_message)
     if not question:
         return body
-    return f"{question}\n{_QUESTION_MARK}\n{body}"
+    return f"{question}\n{_question_connector(user_message)}\n{body}"
 
 
 def format_failure(user_message: str, notice: str, show_question: bool) -> str:
@@ -408,7 +430,7 @@ def format_failure(user_message: str, notice: str, show_question: bool) -> str:
     question = _question_block(user_message)
     if not question:
         return notice
-    return f"{question}\n{_QUESTION_MARK}\n{notice}"
+    return f"{question}\n{_question_connector(user_message)}\n{notice}"
 
 
 def _format_continuation(response: str, part: int, total: int) -> str:
@@ -497,13 +519,13 @@ def _rendered_cost(lines: list[str], *, boundary: bool) -> int:
     elbow is assumed so the budget is conservative for both directions)."""
     if not lines:
         return 0
-    total = _utf16_units(_RTL_ANSWER_PREFIX) + _utf16_units(lines[0])
+    total = _BIDI_ISOLATE_UNITS + _utf16_units(_RTL_ANSWER_PREFIX) + _utf16_units(lines[0])
     for line in lines[1:]:
-        total += 1 + _utf16_units(_ANSWER_INDENT) + _utf16_units(line)
+        total += _BIDI_ISOLATE_UNITS + 1 + _utf16_units(_ANSWER_INDENT) + _utf16_units(line)
     if boundary:
         # A page that is not the last one keeps its terminating newline, which
-        # renders as one extra four-space continuation line.
-        total += 1 + _utf16_units(_ANSWER_INDENT)
+        # renders as one extra four-space continuation line plus its isolate.
+        total += 1 + _BIDI_ISOLATE_UNITS + _utf16_units(_ANSWER_INDENT)
     return total
 
 
@@ -527,7 +549,14 @@ def _paginate(body: str, budget: int) -> list[str]:
         if _rendered_cost([line], boundary=not last) > budget:
             if current:
                 flush(boundary=True)
-            pieces = _split_text(line, max(_MIN_SPLIT_CHUNK, budget - len(_ANSWER_INDENT)))
+            pieces = _split_text(
+                line,
+                max(
+                    _MIN_SPLIT_CHUNK,
+                    budget - _utf16_units(_RTL_ANSWER_PREFIX) - _BIDI_ISOLATE_UNITS,
+                ),
+            )
+
             if not last:
                 # Keep the newline that terminated the split line so no line
                 # boundary is lost between two hard-split pages.
@@ -548,7 +577,7 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
         return [full]
     prefix = ""
     if show_question:
-        candidate = f"{_question_block(user_message)}\n{_QUESTION_MARK}\n"
+        candidate = f"{_question_block(user_message)}\n{_question_connector(user_message)}\n"
         if _utf16_units(candidate) < SAFE_LIMIT - _MIN_SPLIT_CHUNK:
             prefix = candidate
     footer_reserve = _utf16_units("\n\n_(9/99)_") + 2

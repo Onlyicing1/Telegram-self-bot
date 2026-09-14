@@ -47,7 +47,72 @@ _FA_QUESTION = "هی"
 _FA_ANSWER = "سلام!"
 
 
+_BIDI_CONTROLS = "\u2066\u2067\u2069"
+
+
+def _without_bidi_controls(text: str) -> str:
+    return text.translate(str.maketrans("", "", _BIDI_CONTROLS))
+
+
 # ── B. OFF mode: PLAIN answer text, no connector anywhere ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("question", "answer", "rtl"),
+    [
+        ("سؤال فارسی", "پاسخ فارسی", True),
+        ("English question", "English answer", False),
+        ("سؤال فارسی English", "پاسخ فارسی English", True),
+        ("English question فارسی", "answer فارسی", False),
+        ("سؤال فارسی", "12345?! ---", False),
+        ("سؤال فارسی", "خط اول فارسی\nEnglish continuation\nخط سوم فارسی", True),
+        ("English question", "first line\nپاسخ دوم", False),
+    ],
+)
+def test_each_connected_line_isolated_in_the_question_direction(question, answer, rtl):
+    """The controls are the machine-verifiable part of the Telegram BiDi fix.
+
+    The logical glyph order remains the public presentation contract; the
+    isolate controls stop neutral box-drawing characters and an English line
+    from resolving against the surrounding paragraph. Pixel placement still
+    needs live Telegram clients (documented in IMPLEMENTATION_REPORT.md).
+    """
+    out = format_presentation(question, answer, True)
+    lines = out.split("\n")
+    question_rtl = any("\u2067" in char_line for char_line in lines[:1])
+    answer_rtl = rtl
+    question_opener = "\u2067" if question_rtl else "\u2066"
+    answer_opener = "\u2067" if answer_rtl else "\u2066"
+    closer = "\u2069"
+    question_lines = len(question.splitlines())
+    connector_index = question_lines
+    answer_index = connector_index + 1
+    assert all(line.startswith(question_opener) and line.endswith(closer) for line in lines[:question_lines])
+    assert lines[connector_index] == f"{question_opener}│{closer}"
+    assert lines[answer_index].startswith(answer_opener) and lines[answer_index].endswith(closer)
+    expected_mark = "─┘" if answer_rtl else "└─"
+    assert expected_mark in lines[answer_index]
+    for line in lines[answer_index + 1:]:
+        assert line.startswith("    " + answer_opener)
+        assert line.endswith(closer)
+
+
+def test_rtl_spacer_and_question_markers_share_right_to_left_isolation():
+    out = format_presentation("سؤال\nادامه", "جواب", True)
+    lines = out.split("\n")
+    assert lines[0].startswith("\u2067│")
+    assert lines[1].startswith("\u2067│")
+    assert lines[2] == "\u2067│\u2069"
+    assert lines[3].startswith("\u2067 ─┘")
+
+
+def test_ltr_spacer_preserves_left_to_right_isolation():
+    out = format_presentation("question\ncontinued", "answer", True)
+    lines = out.split("\n")
+    assert lines[0].startswith("\u2066│")
+    assert lines[1].startswith("\u2066│")
+    assert lines[2] == "\u2066│\u2069"
+    assert lines[3].startswith("\u2066└─")
 
 
 def test_off_mode_is_plain_answer_text_with_no_connector():
@@ -70,7 +135,7 @@ def test_off_mode_multiline_rtl_answer_has_no_connector_at_all():
 
 def test_on_mode_renders_question_connector_and_answer():
     out = format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
-    assert out == (
+    assert _without_bidi_controls(out) == (
         "│ هی\n"
         "│\n"
         " ─┘ سلام، ممنونم. تو خوبی؟\n"
@@ -80,9 +145,9 @@ def test_on_mode_renders_question_connector_and_answer():
 
 
 def test_on_mode_multiline_question_and_exactly_one_connector():
-    out = format_presentation("این سؤال منه\nکه چند خطه و ادامه داره",
+    out = _without_bidi_controls(format_presentation("این سؤال منه\nکه چند خطه و ادامه داره",
                               "این هم جواب منه که می‌تونه\nچند خط ادامه داشته باشه و\nظاهرش همچنان تمیز بمونه.",
-                              True)
+                              True))
     lines = out.split("\n")
     assert lines[0] == "│ این سؤال منه"
     assert lines[1] == "│ که چند خطه و ادامه داره"
@@ -96,7 +161,7 @@ def test_on_mode_multiline_question_and_exactly_one_connector():
 
 @pytest.mark.parametrize("answer", [_LTR_ANSWER, _RTL_ANSWER])
 def test_continuation_lines_use_exactly_four_ascii_spaces(answer):
-    out = format_presentation("q", answer, True)
+    out = _without_bidi_controls(format_presentation("q", answer, True))
     body = out.split("\n│\n", 1)[-1]  # drop the question block
     lines = body.split("\n")
     for line in lines[1:]:
@@ -110,42 +175,42 @@ def test_continuation_lines_use_exactly_four_ascii_spaces(answer):
 
 
 def test_ltr_answer_uses_left_elbow():
-    out = format_presentation("Hello", _LTR_ANSWER, True)
+    out = _without_bidi_controls(format_presentation("Hello", _LTR_ANSWER, True))
     assert "└─ Hello, how can I help?" in out
     assert "─┘" not in out
 
 
 def test_rtl_answer_uses_mirrored_elbow():
-    out = format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
+    out = _without_bidi_controls(format_presentation(_FA_QUESTION, _RTL_ANSWER, True))
     assert " ─┘ سلام، ممنونم. تو خوبی؟" in out
     assert "└─" not in out
     # mirrored elbow: arm first, then the vertical stroke pointing at the text
-    first = out.split("\n│\n", 1)[1].split("\n")[0]
+    first = _without_bidi_controls(out).split("\n│\n", 1)[1].split("\n")[0]
     assert first[:4] == " ─┘ "
 
 
 def test_mixed_direction_follows_the_first_strong_character():
-    mixed_rtl_first = format_presentation("q", "سلام دنیا this is English بعد از فارسی", True).split("\n│\n", 1)[1]
-    mixed_ltr_first = format_presentation("q", "this is English سلام دنیا and فارسی", True).split("\n│\n", 1)[1]
+    mixed_rtl_first = _without_bidi_controls(format_presentation("q", "سلام دنیا this is English بعد از فارسی", True)).split("\n│\n", 1)[1]
+    mixed_ltr_first = _without_bidi_controls(format_presentation("q", "this is English سلام دنیا and فارسی", True)).split("\n│\n", 1)[1]
     assert mixed_rtl_first.startswith(" ─┘ ")
     assert mixed_ltr_first.startswith("└─ ")
     # deterministic: same input, same direction decision
     for text in ("سلام دنیا this is English بعد از فارسی", "this is English سلام دنیا"):
-        once = format_presentation("q", text, True)
-        assert format_presentation("q", text, True) == once
+        once = _without_bidi_controls(format_presentation("q", text, True))
+        assert _without_bidi_controls(format_presentation("q", text, True)) == once
 
 
 def test_neutral_text_defaults_to_ltr():
-    answer = format_presentation("q", "12345 **bold** ---", True).split("\n│\n", 1)[1]
+    answer = _without_bidi_controls(format_presentation("q", "12345 **bold** ---", True)).split("\n│\n", 1)[1]
     assert answer.startswith("└─ ")
 
 
 def test_direction_decided_from_the_rendered_text_not_any_language_setting():
     # An English answer with a Persian QUESTION must still render LTR.
-    out = format_presentation("سلام این سؤال منه", _LTR_ANSWER, True)
+    out = _without_bidi_controls(format_presentation("سلام این سؤال منه", _LTR_ANSWER, True))
     assert "└─ Hello, how can I help?" in out
     # A Persian answer with an English QUESTION must still render RTL.
-    out = format_presentation("my question", _RTL_ANSWER, True)
+    out = _without_bidi_controls(format_presentation("my question", _RTL_ANSWER, True))
     assert " ─┘ سلام، ممنونم. تو خوبی؟" in out
 
 
@@ -154,11 +219,11 @@ def test_direction_decided_from_the_rendered_text_not_any_language_setting():
 
 @pytest.mark.parametrize("answer", [_LTR_ANSWER, _RTL_ANSWER])
 def test_connector_appears_only_on_the_first_answer_line(answer):
-    body = format_presentation("q", answer, True)
-    first, *rest = body.split("\n│\n", 1)[1].split("\n")
+    out = _without_bidi_controls(format_presentation("q", answer, True))
+    first, *rest = out.split("\n│\n", 1)[1].split("\n")
     assert first.lstrip(" ").startswith(("└─", "─┘"))
-    for line in rest:
-        assert not ("└─" in line or "─┘" in line)
+    assert all("└─" not in line and "─┘" not in line for line in rest)
+    assert all(line.startswith("    ") for line in rest)
 
 
 # ── I. THINKING state: no answer connector, no fake answer structure ─────────
@@ -169,13 +234,13 @@ def test_thinking_state_never_shows_the_answer_connector():
         out = format_thinking(_FA_QUESTION, show)
         assert "└─" not in out and "─┘" not in out
         assert "└" not in out and "┘" not in out
-    assert format_thinking(_FA_QUESTION, True) == "│ هی\n│\nThinking…"
+    assert _without_bidi_controls(format_thinking(_FA_QUESTION, True)) == "│ هی\n│\nThinking…"
     assert format_thinking(_FA_QUESTION, False) == "Thinking…"
 
 
 def test_status_note_is_part_of_the_thinking_state_only():
     out = format_status(_FA_QUESTION, "Reading context…", True)
-    assert out == "│ هی\n│\nReading context…"
+    assert _without_bidi_controls(out) == "│ هی\n│\nReading context…"
     assert format_status(_FA_QUESTION, "Reading context…", False) == "Reading context…"
     # empty/whitespace status falls back to the plain thinking state
     assert format_status(_FA_QUESTION, "  ", True) == format_thinking(_FA_QUESTION, True)
@@ -190,7 +255,7 @@ def test_failure_state_has_no_answer_connector():
     for show in (True, False):
         out = format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", show)
         assert "└─" not in out and "─┘" not in out
-    assert format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", True) == (
+    assert _without_bidi_controls(format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", True)) == (
         "│ هی\n│\n✕ Couldn't get a response\nTimeout"
     )
     assert format_failure(_FA_QUESTION, "✕ Couldn't get a response\nTimeout", False) == (
@@ -344,7 +409,7 @@ def test_renderer_does_not_depend_on_execution_telemetry_as_source_of_truth():
     broken = _Broken()
     with patch.object(telemetry_module, "telemetry", broken):
         assert delivery.format_presentation(_FA_QUESTION, _FA_ANSWER, False) == "سلام!"
-        assert delivery.format_thinking(_FA_QUESTION, True) == "│ هی\n│\nThinking…"
+        assert _without_bidi_controls(delivery.format_thinking(_FA_QUESTION, True)) == "│ هی\n│\nThinking…"
 
 
 def test_telemetry_store_has_no_show_question_preference_anymore():
@@ -457,9 +522,10 @@ async def test_answer_edits_the_original_message_with_stored_preference(stored_p
     )
     captured = await _drive_execute_ai(9, "هی", result, stored_pref)
     # edit-in-place: the answer goes into the original message, never a new one
-    assert captured["edits"][-1].endswith("پاسخ من")
+    assert _without_bidi_controls(captured["edits"][-1]).endswith("پاسخ من")
     assert captured["replies"] == []
-    final = captured["edits"][-1]
+    final = _without_bidi_controls(captured["edits"][-1])
+
     if stored_pref:
         assert final == "│ هی\n│\n ─┘ پاسخ من"
     else:
@@ -485,7 +551,7 @@ async def test_preference_changes_presentation_but_not_the_model_request():
     assert on["user_message"] == off["user_message"] == "هی"
     assert on["message_id"] == off["message_id"] == 456
     # only the rendered presentation differs
-    assert on["edits"][-1] == "│ هی\n│\n ─┘ پاسخ من"
+    assert _without_bidi_controls(on["edits"][-1]) == "│ هی\n│\n ─┘ پاسخ من"
     assert off["edits"][-1] == "پاسخ من"
 
 
@@ -497,7 +563,8 @@ async def test_failure_does_not_render_as_a_successful_answer():
         metadata={"failure_type": "network", "retry_count": 0, "fallback_used": False},
     )
     captured = await _drive_execute_ai(9, "هی", result, True)
-    final = captured["edits"][-1]
+    final = _without_bidi_controls(captured["edits"][-1])
+
     assert "└" not in final and "┘" not in final
     assert "temporarily unavailable" in final or "✕" in final
 
@@ -521,7 +588,9 @@ async def test_delivery_edits_in_place_and_uses_the_answer_state():
     assert result.success
     assert len(edits) == 1
     assert replies == []
-    assert edits[0] == format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
+    assert _without_bidi_controls(edits[0]) == _without_bidi_controls(
+        format_presentation(_FA_QUESTION, _RTL_ANSWER, True)
+    )
 
 
 @pytest.mark.asyncio
@@ -538,9 +607,9 @@ async def test_empty_response_uses_the_failure_state():
         SimpleNamespace(edit=edit, reply=reply), "msg", "   ", True,
     )
     assert result.success
-    assert edits == ["│ msg\n│\nError\nAI returned no response."]
+    assert _without_bidi_controls(edits[0]) == "│ msg\n│\nError\nAI returned no response."
     assert replies == []
-    assert "└" not in edits[0] and "┘" not in edits[0]
+    assert "└" not in _without_bidi_controls(edits[0]) and "┘" not in _without_bidi_controls(edits[0])
 
 
 def test_chunked_delivery_keeps_rules_and_utf16_safety():
@@ -557,10 +626,11 @@ def test_chunked_delivery_keeps_rules_and_utf16_safety():
             for chunk in chunks:
                 for glyph in ("│", "─", "└", "┘"):
                     assert glyph not in chunk
-            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", chunks[0])
+            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", _without_bidi_controls(chunks[0]))
             assert body == _paginate_answer_head(response)
         else:
-            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", chunks[0])
+            body = re.sub(r"\n\n_\(\d+/\d+\)_$", "", _without_bidi_controls(chunks[0]))
+
             lines = body.split("\n")
             elbows = [l for l in lines if l.lstrip(" ").startswith(("└─", "─┘"))]
             # exactly one directional elbow per chunk: its first answer line
@@ -569,8 +639,8 @@ def test_chunked_delivery_keeps_rules_and_utf16_safety():
                 if line is elbows[0] or line.startswith("│"):
                     continue
                 assert line.startswith("    ")
-            assert chunks[0].startswith("│ سؤال من\n│\n")
-            assert sum(1 for line in chunks[0].split("\n") if line == "│") == 1
+            assert _without_bidi_controls(chunks[0]).startswith("│ سؤال من\n│\n")
+            assert sum(1 for line in _without_bidi_controls(chunks[0]).split("\n") if line == "│") == 1
 
 
 def _paginate_answer_head(response: str) -> str:
