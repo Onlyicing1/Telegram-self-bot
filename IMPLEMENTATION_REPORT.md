@@ -161,7 +161,14 @@ media resolution or download.
 
 ### Delivery
 
-- Implementation commit: `9fd64095a0b603b7dd9f3541fdc2b2a33046f1ef` (code + tests).
+- Implementation commit (code + tests): `9fd64095a0b603b7dd9f3541fdc2b2a33046f1ef`.
+- Report commit: `f00892149031562c27e08e45901e723ee29a9af9`.
+- **Remote main verified: YES** — `git push origin main` moved `d60e671..f008921`,
+  `git rev-parse origin/main` = `f00892149031562c27e08e45901e723ee29a9af9` = local
+  HEAD at verification time, and `git merge-base --is-ancestor
+  9fd64095a0b603b7dd9f3541fdc2b2a33046f1ef origin/main` confirms the
+  implementation commit is on `origin/main`. This delivery section is a
+  docs-only revision on top of that verified state.
 - No rebase, no force-push, no reset, no history rewrite; the pre-existing
   untracked clone was left exactly as found.
 
