@@ -1,6 +1,160 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Live bug fix: source-sender identity in `preview_save` + a deterministic `retrieve_save` route
+## Latest phase — Saved-item PREVIEW metadata authority (persisted row, delivered verbatim)
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `f765465f810b64aa095489371aa5370f8947edee` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone) |
+| Implementation commit (code + tests) | `0bbf3a95031fff0a531e31ade459ecb3f2f92321` |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Delete / retrieve / save behaviour | **unchanged and re-asserted by tests** |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+
+### The exact task
+
+Preview must return the metadata that was **already stored** for the saved item
+identified by the save code — it must never compose, re-fetch, re-derive, or
+repair a metadata snapshot at display time. Preview was reported as returning
+values that did not belong to the item.
+
+### Root cause #1 — the tool's stored-metadata text was replaced by model prose (FIXED)
+
+`backend/ai/engine/dispatcher.py::_VERBATIM_READ_TOOLS` contained
+`get_bio`, `task_list`, `translate_history`, `summarize_history` — but **not
+`preview_save`**. `Dispatcher._read_results_authoritative()` therefore returned
+`False` for a preview tool-call round, and the dispatcher ran a **continuation
+provider round** (`dispatcher.py`, after the tool-execution block) with the tool
+result re-injected as context. The final owner-visible text was the **model's
+re-statement** of the metadata, not `retrieve_service.format_preview(row)`.
+That is exactly "Preview creates fresh metadata": the stored values were read
+correctly by the tool and then discarded in favour of freshly composed prose
+(which can paraphrase, drop, or invent a field — e.g. a sender name).
+`get_bio` was put in that set for the identical production failure ("a real bio
+was regenerated as unrelated text").
+
+### Root cause #2 — a request for one item's metadata was answered by the listing (FIXED)
+
+`backend/ai/actions.py::parse_command_intent` had no preview route, so
+`_parse_status_intent` owned the outcome:
+
+```
+if _has_save_mention(words) and (wordset & _SAVE_LIST_WORDS):
+    → action="list_saved_items" → tool "list_saves"
+```
+
+`_SAVE_LIST_WORDS` contains the near-universal Persian request words `بده`,
+`نشون`, `وضعیت`, `لیست`, so a message that **names exactly one item and its
+explicit code** (`مشخصات سیو S0001 رو بده`) resolved deterministically to
+`list_saves` → `discover_service.do_list` → `db_client.list_recent_saves`:
+the **recent-saves listing**, rendered at display time, instead of the requested
+item's row. The requested row was never read at all.
+
+### Root cause #3 — the Glass UI item panel bypassed the owner/row checks (FIXED)
+
+`backend/bot/handlers/retrieve.py::_retrieve_item_panel_handler` called
+`db_client.query_save(code)` **directly** and rendered `format_preview(row)`.
+`query_save` is a code-only lookup (the DB layer adds no owner predicate), so
+the item panel — the primary Glass UI preview surface — was the only preview
+path that skipped the owner-isolation and row-identity checks
+`retrieve_service.do_preview` applies.
+
+### Exact data lineage (authoritative, after the fix)
+
+```
+owner message (…S0001…)            e.g. "مشخصات سیو S0001 رو بده"
+  → parse_command_intent           backend/ai/actions.py  (explicit-code route, BEFORE the list vocabulary)
+  → action preview_saved_item      tool_calls = [{"name": "preview_save", "save_code": "S0001"}]
+  → ToolExecutor / PreviewSaveTool backend/ai/tools/retrieve_save.py (thin wrapper; no DB, no Telethon)
+  → retrieve_service.do_preview    backend/services/retrieve_service.py
+  → retrieve_service.load_saved_item(save_code, owner_id)
+        → db_client.query_save(save_code)        persisted saved_items row
+        → owner_id check + save_code identity check
+  → retrieve_service.format_preview(row)         pure field mapping of the stored row
+  → ToolResult.message
+  → delivered VERBATIM: fast path (_summarize_tool_results) or the verbatim
+    read authority for a model-issued native tool call
+```
+
+### Source of truth for Preview (source-proven)
+
+**The `saved_items` row is the canonical, authoritative source.** Preview reads
+`db_client.query_save(save_code)` and nothing else:
+
+- The Telegram Saved Messages copy is **never** fetched for preview — no
+  `get_messages`, `iter_messages`, `get_entity`, or `get_sender` on this path,
+  and the AI preview tool does not even require a working client.
+- `format_preview(row)` maps each displayed line to a persisted column
+  (`media_type`, `mime_type`, `file_size`, `sender_name`, `created_at`,
+  `save_code`); only byte-size and date are human-readable *formatting* of those
+  stored values (`_format_size`, `_format_date`) — no semantic value is
+  derived.
+- `saved_items.caption` (built once at save time by `save_service.build_caption`)
+  is a separate persisted artifact used by **retrieve**, not by preview; the
+  Telegram caption is not consulted.
+
+### Exact files changed (4 + 1 new test file)
+
+| File | Role |
+|---|---|
+| `backend/services/retrieve_service.py` | new `load_saved_item(save_code, owner_id)` — the ONE owner-scoped, row-identity-verified read (read-only by contract); `do_preview` now uses it, keeping its `❌ No item found` / `❌ DB error` conventions |
+| `backend/bot/handlers/retrieve.py` | the item preview panel renders the same owner-verified row instead of the raw `query_save` result |
+| `backend/ai/engine/dispatcher.py` | `preview_save` added to `_VERBATIM_READ_TOOLS` (stored metadata delivered exactly; no continuation round) |
+| `backend/ai/actions.py` | `_PREVIEW_WORDS` + a deterministic explicit-save-code preview route resolved **before** the list vocabulary, guarded by `not do_delete / not do_save / not send_intent` |
+| `tests/test_saved_item_preview_metadata.py` | **new** — 25 focused regression tests |
+
+No other file was touched. Unchanged by design: the save pipeline and
+`save_service._resolve_sender`, `do_retrieve`/`do_delete`/`do_rename`/`do_move`,
+the bounded Telegram context, provider architecture, Taskloom, history
+services, `DATABASE_ARCHITECTURE.md`.
+
+### Tests (all executed, real commands)
+
+| Run | Result |
+|---|---|
+| `tests/test_saved_item_preview_metadata.py` (new) | **25 passed** |
+| Adjacent (saved-items mgmt, sender/retrieve, retrieve owner isolation, actions, execution status, tool-action path, fast path, tool calls, capability exposure, tool health, history AI tools, save engine, tool honesty, memory tools, delete regression, bio determinism, reliability) | **546 passed** |
+| Full suite `tests/` | **2859 passed, 24 skipped** (was 2834 + 24) |
+| `py_compile` on all changed Python files | OK |
+| `git diff --check` | clean |
+
+**Non-vacuous:** reverting the four source files in-tree made **15 of the 25**
+new tests fail (verbatim authority, every preview routing case, the panel's
+owner-scoped lookup, and the end-to-end preview dispatch); restoring the fix
+made all 25 pass. The remaining 10 are deliberate "unchanged behaviour" pins
+(delete/retrieve/save/list/ordinary-deletion routing).
+
+### What is proven / NOT yet proven
+
+**PROVEN by source + tests:** preview renders the persisted row's own values;
+the stored `sender_name` is shown exactly as stored (including a historical
+`-100…` value — preview never "repairs" it); a foreign row or a row belonging to
+another code yields the same `❌ No item found` wording and is not logged;
+missing fields render `—` rather than fabricated values; preview performs no
+write (`insert_save`, `update_save_field`, `delete_save_row`, `delete_save` are
+never awaited) and never touches Telegram (booby-trapped client); the AI preview
+path returns the stored metadata with **no provider round and no prompt**; the
+Glass UI item panel uses the same owner-scoped row.
+
+**NOT PROVEN (live):** the Telegram-level rendering of the message the owner
+receives, and whether any *pre-existing* row already carries a wrong stored
+`sender_name` from before the earlier sender-resolution fix. Already-stored rows
+are returned as stored — this phase deliberately does **not** backfill or repair
+history (no migration was written), so a historically wrong stored value stays
+visible until that item is saved again.
+
+### Delivery
+
+| Item | Value |
+|---|---|
+| Implementation commit | `0bbf3a95031fff0a531e31ade459ecb3f2f92321` (code + focused tests) |
+| Report commit | this document's commit on `main` (see the delivery follow-up note) |
+| Remote `main` | verified after push (exact remote HEAD recorded in the follow-up note) |
+
+---
+
+## Previous phase — Live bug fix: source-sender identity in `preview_save` + a deterministic `retrieve_save` route
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
