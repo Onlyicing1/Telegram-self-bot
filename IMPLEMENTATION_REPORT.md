@@ -1,6 +1,169 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Save-code grammar: the generator's all-letter codes (`SAXCK`)
+## Latest phase — Media Processing M1: the controlled media boundary
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `b4c6d30db0a95f54ebce150635a7d2df9ed4de5e` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone) |
+| Implementation commit (code + tests) | `f99fa90c2787e24650487ae5eb66fb506b41c24a` |
+| Remote `main` after push | `f99fa90c2787e24650487ae5eb66fb506b41c24a` (**verified**) |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL, no persistence at all) |
+| Provider architecture impact | **none** (no provider/manager/adapter/`vision()` change, no provider switching) |
+| Native multimodal provider integration | **NOT implemented** (explicitly out of scope for M1) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+
+### The exact task
+
+Implement **only** the M1 prework/first layer of the Media Processing phase that
+`INVESTIGATION.md` (`b4c6d30`) found ready with **GO WITH REQUIRED PREWORK**: the
+provider-independent, controlled foundation for handling Telegram media, without
+native multimodal provider support, without changing the owner's selected LLM
+provider, and without ever handing Telegram conversational context to a model.
+
+### Root cause / gap this phase closes (source-confirmed)
+
+`INVESTIGATION.md` §5 and §11 proved at `b4c6d30`:
+
+1. **Every media download path was unbounded.** `backend/services/save_service.py:439`
+   called `client.download_media(...)` directly, and `backend/telegram_api/media.py`
+   wrapped the same call with **no timeout at all** (`telegram_api/messages.py`
+   bounds every short call with `guarded_await`; the media module did not).
+2. **No media capability existed in `backend/ai/`** and no service-layer boundary
+   could download, validate and normalize an asset for processing: media was
+   *detected and labelled* (`backend/ai/media.py::classify_message`), never
+   *processed*.
+3. `ProviderManager.vision` was (and remains) broken, unimplemented and
+   off-policy — using it would have switched the owner's provider. It is not
+   touched by this phase.
+
+### Exact M1 boundary implemented (IMPLEMENTED)
+
+```
+trusted runtime-resolved media message   (the same object execute_save receives)
+  → backend/services/media_service.py::analyze_media
+      classify via backend/ai/media.py::classify_message   (existing classifier, unchanged)
+      fail-closed gate on type / extractability / declared size
+      transfer through backend/telegram_api/media.download_media  (bounded)
+      validate: returned, exists, non-empty, within the limit
+      extract text when the asset is a text document (standard library only)
+      remove the per-operation temp directory on every exit path
+  → MediaAnalysis  (provider-independent, serializable, Telethon-free)
+```
+
+**Download safety (PROTECTED)**
+
+| Control | Behaviour |
+|---|---|
+| Time bound | `MEDIA_DOWNLOAD_TIMEOUT_S = 120.0` in `backend/telegram_api/media.py`, applied through the existing `runtime.operation_watchdog.guarded_await`; the facade now raises `TelegramTimeoutError` instead of hanging |
+| Caller bound | `timeout` is clamped: a caller may only ask for **less** (`min(caller, ceiling)`); `None`/`0`/negative/junk all resolve to the ceiling |
+| Size gate | Telegram's declared size is checked **before** any transfer; the transferred size is re-checked afterwards — both fail closed |
+| Size authority | Reuses the project's single established bound, `settings_service.max_deep_save_mb()` (default 50 MB) — no second size constant was invented |
+| Path safety | Telegram filenames are untrusted: basename-only, backslashes and NUL stripped, `.`/`..`/empty → `media.bin`, length-capped, and the final path is verified to stay inside the per-operation `tempfile.mkdtemp()` directory |
+| Cleanup | `shutil.rmtree(..., ignore_errors=True)` in `finally` — success, failure, timeout and cancellation; `asyncio.CancelledError` is re-raised unchanged |
+| Event loop | file-based transfer through the facade (never an in-RAM `BytesIO`) |
+
+**Normalization (IMPLEMENTED)** — `MediaAnalysis` carries `media_type`,
+`mime_type`, `file_size`, `file_name`, `status`, `content`, `reason`, `caption`,
+`source_chat_id`, `source_message_id`, `truncated`, with `as_dict()`, `has_content`
+and `as_context_text()`. It holds **no** Telethon object, client reference,
+filesystem handle, reply context or conversation state (`as_dict()` is
+JSON-serializable plain data and a test proves it).
+
+**Unsupported behaviour (IMPLEMENTED, honest)** — `MediaStatus.UNSUPPORTED` +
+`reason`, never fabricated content, and the asset is **never transferred**:
+`WebPage`/`Contact`/`Poll`/`Location`/`Unknown` are not downloadable assets, and
+the media types this phase has no extractor for (Photo, Video, Voice, Audio,
+Sticker, Animation/GIF, non-text documents) are reported without a transfer.
+Hard failures (nothing to resolve, no media on the resolved message, oversized,
+transfer failure/timeout, missing/empty/malformed download) raise `MediaError`.
+
+**M1 extraction scope** — text-bearing assets only (`text/*` plus the common
+text-shaped `application/*` MIME types: json, ndjson, xml, yaml, javascript,
+x-sh, sql, csv), read with the standard library, bounded to
+`MAX_EXTRACTED_CHARS = DEFAULT_MAX_CONTEXT_TOKENS * 4` (the project's own
+conversation-context budget) and reported via `truncated`. **No OCR, STT, vision,
+PDF or video stack was added and no dependency was added.**
+
+### AI context isolation (PROTECTED — zero Telegram context)
+
+Nothing in this phase calls a provider, registers a tool, changes the dispatcher,
+the registry or the activation handler: the capability is a foundation and is
+**not yet reachable from the AI**, so no Telegram/conversational context can
+reach a model as a result of this change. The rule is additionally enforced
+structurally: `analyze_media` accepts only the runtime-resolved message (it never
+searches for one — the fakes' `get_messages`/`iter_messages` fail the test if
+called), and the single model-facing surface `as_context_text()` renders type,
+MIME, size, status, reason and content **only** — the caption, sender, chat id,
+message id and file name are deliberately excluded (pinned by tests).
+
+### Files changed (2 modified, 2 new — nothing else)
+
+| File | Change |
+|---|---|
+| `backend/telegram_api/media.py` | download is now bounded (`guarded_await` + `MEDIA_DOWNLOAD_TIMEOUT_S`), raises `TelegramTimeoutError`, optional clamped `timeout` |
+| `backend/telegram_api/api.py` | facade `download_media` forwards the optional bound |
+| `backend/services/media_service.py` | **new** — the M1 boundary (resolution, bounded transfer, validation, normalization, `MediaError`, `MediaStatus`, `MediaAnalysis`) |
+| `tests/test_media_processing.py` | **new** — 61 focused tests |
+
+### Intentionally unchanged
+
+Save/Saved Items (`save_service` still downloads through the client with its own
+pattern — untouched), History AI, Task system/Taskloom, scheduler,
+`RuntimeSupervisor`, provider architecture (`vision()` left exactly as it was),
+`ToolRegistry`/`ToolExecutor`/`Dispatcher`, `ai_unified`, `backend/ai/media.py`
+(the classifier is reused, not modified), Supabase schema/migrations, and
+`DATABASE_ARCHITECTURE.md`. No new scheduler, loop, executor, client, table or
+`ToolContext` key was introduced.
+
+### Tests and validation (actually run)
+
+| Run | Result |
+|---|---|
+| `tests/test_media_processing.py` (new) | **61 passed** |
+| Adjacent suites (`test_12_save_engine`, `test_14_tool_honesty_glass`, `test_51_execution27`, `test_current_bio_determinism`, `test_get_bio_full_profile`, `test_history_ai_tools`, `test_history_service`, `test_saved_item_sender_and_retrieve`, `test_saved_item_preview_metadata`, `test_saved_items_ai_management`, `test_task_send_execution`, `test_telegram_chat_context`, `test_tool_health_audit`, `test_11_runtime_wiring`) | **470 passed, 23 skipped** |
+| Full suite (`pytest tests -q`) | **2938 passed, 24 skipped** (was 2877 + 24) |
+| `py_compile` (3 changed modules + the test file) | OK |
+| `git diff --check` | clean |
+
+**Non-vacuous (measured, not assumed):** removing the facade's `guarded_await`
+bound **and** the temporary-directory cleanup while keeping the tests unchanged
+produced **14 failures** (timeout tests, cleanup tests and all 7 path-safety
+cases); restoring both made all 61 pass again. The tests exercise the real
+Telethon-shaped objects (`MessageMediaDocument`, `Document`, `DocumentAttribute*`,
+`MessageMediaPhoto`, `MessageMediaGeo`) through the **unmodified** classifier and
+the real facade, so the boundary — not a stub — is what is being asserted.
+
+### Limitations / NOT YET PROVEN
+
+- **Live Telegram verification was NOT performed** (no live session in this
+  workspace). The real Telegram transfer (latency, memory for a large asset) is
+  **NOT YET PROVEN**.
+- **No media content reaches any model yet.** Only text-bearing documents
+  produce content; photos/video/voice/audio/stickers are reported
+  `UNSUPPORTED` by design. Wiring the normalized result into the owner's selected
+  provider (with `as_context_text()` as the only model-facing surface) is the
+  next, explicitly separate phase.
+- The text extractor trusts Telegram's declared MIME type. An asset mislabelled
+  as `text/plain` is decoded with `errors="replace"` (never raises) and its
+  garbage content is reported as extracted rather than detected as binary.
+- `MAX_EXTRACTED_CHARS` bounds the text at 16 000 characters; a longer document
+  is truncated and reported via `truncated=True`.
+
+### Delivery
+
+- Implementation commit: `f99fa90c2787e24650487ae5eb66fb506b41c24a` (code + tests).
+- **Remote main verified: YES** — `git push origin main` moved
+  `b4c6d30..f99fa90`, and `git rev-parse origin/main` =
+  `f99fa90c2787e24650487ae5eb66fb506b41c24a` = local HEAD (`git merge-base
+  --is-ancestor` confirms the commit is on `origin/main`).
+- No rebase, no force-push, no reset, no history rewrite; the pre-existing
+  untracked clone was left exactly as found.
+
+---
+
+## Previous phase — Save-code grammar: the generator's all-letter codes (`SAXCK`)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
