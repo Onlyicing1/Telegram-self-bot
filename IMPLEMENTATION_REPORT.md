@@ -1,6 +1,127 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Saved-item PREVIEW metadata authority (persisted row, delivered verbatim)
+## Latest phase — Save-code grammar: the generator's all-letter codes (`SAXCK`)
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `1b355d70af5317d74fa17ecbb57f4853934212b3` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone) |
+| Implementation commit (code + tests) | `fe9652e7d873b4c8a5ecf98f8f7422fc38258507` |
+| Remote `main` after push | `fe9652e7d873b4c8a5ecf98f8f7422fc38258507` (**verified**) |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+
+### The exact task — reported behaviour
+
+A saved item carries the valid save code `SAXCK`. Its preview renders correctly,
+but **replying to that preview message** with "send this" ends in
+`❌ Unsupported action: send` instead of delivering the item.
+
+### Root cause (source-confirmed)
+
+`backend/db/client.py::get_next_save_code()` builds every code as
+`_SHORT_CODE_PREFIX` (`"S"`) + four characters from `_SHORT_CODE_ALPHABET`
+(`A–Z` + `0–9`): a zero-padded sequential code (`f"{count+1:04d}"` → `S0001`) or
+four random characters (`random.choices(..., k=4)` → `SAXCK`). The real grammar
+is therefore **`S` + exactly 4 alphanumerics**, and an all-letter code is one the
+generator really produces (P(4 letters) = (26/36)⁴ ≈ 27 %).
+
+`backend/ai/actions.py` accepted a token as a save code only when it contained a
+digit (`_SAVE_CODE_TOKEN_RE.match(tok) and any(ch.isdigit() ...)`). `SAXCK` has
+none, so `_extract_single_save_code(reply_text)` returned `None` on the reply
+path and `_extract_save_code(words)` returned `None` on the explicit path; the
+deterministic `retrieve_save` route never fired and the request fell through to
+the generic send vocabulary. The same rule made such an item unaddressable in
+the preview and delete routes too (`سیو SAXCK رو پاک کن`, `مشخصات سیو SAXCK رو بده`).
+
+### Behaviour fixed (IMPLEMENTED)
+
+The incorrect digit assumption is replaced by the generator's actual shape, in
+one place (`backend/ai/actions.py`):
+
+- **Digit-bearing tokens** keep their exact previous rule and precedence
+  (`^s[0-9a-z]{1,11}$` + a digit) — `S0001`, `s0001`, `s4h` are unaffected.
+- **All-letter tokens** are accepted only in the generator's *canonical*
+  upper-case shape `S[A-Z0-9]{4}` (standalone), which is how every surface
+  renders a code (the item line **Sara**&nbsp;`SAXCK`, the save confirmation's
+  **Code:**&nbsp;`S0001`). Ordinary prose never
+  matches it: a word starting with a capital S ("Saved", "Size", "Sender", a
+  sender name "Sarah") continues in lower case.
+- When only lower-cased tokens are available (the tokenizer), an all-letter
+  token is accepted only as the **single** generator-shaped candidate that is
+  not already parser vocabulary (`_SAVE_CODE_STOP_WORDS`, built from the
+  existing `_EN_*`/`_LIST_*`/`_PREVIEW_*` sets) — so "save"/"saved"/"share"
+  are never read as codes.
+- **Digit-bearing codes win** over all-letter candidates in the same message
+  (deterministic precedence, never a guess); with two all-letter candidates the
+  result stays `None` so the existing message-deletion behaviour is kept.
+
+The three explicit-code routes (retrieve / preview / delete) now pass the raw
+request text to the extractor, so a code named in the owner's own message is read
+canonically; the reply path (`_extract_single_save_code`) reads the replied
+message the same way. **No reply content is passed to any provider**: resolution
+happens inside `parse_command_intent` before any provider round, and only the
+validated `save_code` reaches the `retrieve_save` / `delete_save` / `preview_save`
+tool call (asserted by JSON-serialising the tool call in the tests).
+
+### Files changed
+
+| File | Role in this phase |
+|---|---|
+| `backend/ai/actions.py` | Grammar + extraction: canonical `S[A-Z0-9]{4}` shape, `_SAVE_CODE_STOP_WORDS`, `_canonical_save_codes`, digit-first selection; the three call sites pass the request text |
+| `tests/test_save_code_grammar.py` | **new** — 17 focused regression tests (generator alphabet, all-letter codes, the reported reply-to-preview flow, exclusions, route coverage, no-context leak) |
+| `tests/test_saved_items_ai_management.py` | the one test that pinned the buggy rule (`a_code_shaped_token_without_a_digit_is_not_a_save_code`) is **corrected**: the all-letter generator shape now resolves, and an outside-the-shape token (`SABCDE`) still does not |
+
+Nothing else was touched: `retrieve_service.py`, `delete_service.py`,
+`save_service.py`, the dispatcher, the provider layer, the bounded
+`telegram_context`, Taskloom, Supabase and `DATABASE_ARCHITECTURE.md` are unchanged.
+
+### Tests and validation (actually run)
+
+| Run | Result |
+|---|---|
+| `tests/test_save_code_grammar.py` (new) | **17 passed** |
+| `tests/test_save_code_grammar.py` + saved-items suites + `test_19_ai_actions.py` | **141 passed** |
+| Full suite (`pytest tests -q`) | **2877 passed, 24 skipped** (was 2859 + 24) |
+| `py_compile` (actions.py + both test files) | OK |
+| `git diff --check` | clean |
+
+**Non-vacuous:** restoring the pre-fix `backend/ai/actions.py` from git makes
+**9 of the 17** new tests fail (plus the corrected pinned test); re-applying the
+fix makes all 17 pass. The other 8 new tests deliberately pin *unchanged*
+behaviour (numeric codes, ambiguity, message-deletion fallbacks, the permissive
+digit branch).
+
+The suite is run as `pytest tests -q`: collecting the repository root also picks
+up the pre-existing untracked `telegram-self-bot/` clone and errors with
+`ImportPathMismatchError` — unrelated to this change.
+
+### Limitations / not proven
+
+- **Live Telegram verification was NOT performed** (no session in this workspace).
+  The Telegram-level round trip (reply → delivery) remains **NOT YET PROVEN**.
+- An all-letter code typed **lower-case** by the owner in their own message
+  (`سیو saxck رو بفرست`) is not resolved — codes are shown and copied upper-case,
+  and the canonical spelling is what the extractor requires. Digit-bearing codes
+  stay case-insensitive.
+- A random code that collides with parser vocabulary (`SAVED`, `SAVES`, `SENDE`,
+  `STORE`, `SHARE`, …) would not resolve: probability ≈ 5/456 976 per generated
+  code. No extra exception was invented for them.
+- `pytest tests -q` is used because the untracked `telegram-self-bot/` clone
+  breaks root-level collection (pre-existing, untouched).
+
+### Delivery
+
+- Implementation commit: `fe9652e7d873b4c8a5ecf98f8f7422fc38258507` (code + tests).
+- **Remote main verified: YES** — `git rev-parse origin/main` =
+  `fe9652e7d873b4c8a5ecf98f8f7422fc38258507` = local HEAD after `git push origin main`.
+- No rebase, no force-push, no reset, no history rewrite; the pre-existing
+  untracked clone was left exactly as found.
+
+---
+
+## Previous phase — Saved-item PREVIEW metadata authority (persisted row, delivered verbatim)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
