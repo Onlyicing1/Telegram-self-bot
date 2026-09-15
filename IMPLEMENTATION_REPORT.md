@@ -179,6 +179,51 @@ and DB boundaries.
   path; they were not added to the deterministic vocabulary to avoid opening a
   broad keyword surface.
 
+### Delivery and remote verification (mandatory block)
+
+| Item | Value |
+|---|---|
+| Implementation date | **2026-09-15** |
+| Starting HEAD | `5e98d37346e6c5f8ba578d85a4609cb3627293f2` |
+| Final implementation commit (code + tests) | `afd36ff84ad9952162b1589e0d199fdb1c1d2b8f` |
+| Remote main contains it | verified with `git merge-base --is-ancestor afd36ff origin/main` → true |
+| Report commit | the docs commit on top of `afd36ff` (this section); it is the then-current `origin/main` HEAD |
+| Re-checked on the final HEAD | `py_compile` OK · `git diff --check` clean · focused 24 passed · adjacent 198 passed · full suite 2834 passed / 24 skipped |
+
+```
+Final commit: afd36ff84ad9952162b1589e0d199fdb1c1d2b8f
+Remote main verified: YES
+```
+
+The remote verification is reproducible from the repository at any time:
+`git fetch origin main && git merge-base --is-ancestor afd36ff84ad9952162b1589e0d199fdb1c1d2b8f origin/main`
+(exits 0) and `git ls-remote origin refs/heads/main` returns that commit or a
+descendant of it (the report commit itself for this phase).
+
+Explicit confirmations for this phase:
+
+1. **The AI receives ZERO Telegram conversational context** — confirmed. The
+   retrieve route is an executable fast-path intent: no provider round runs, no
+   prompt is built, and no replied text, replied metadata, chat history, sender
+   information, peer object or hidden `reply_context` is placed in any
+   model-visible field. `retrieve_save`'s argument schema is exactly
+   `{"save_code"}`.
+2. **The retrieve destination is resolved from trusted runtime state, not AI
+   output** — confirmed. `RetrieveSaveTool` reads
+   `context.extra["chat_id"]`, populated by `Dispatcher._build_tool_context`
+   from `request.chat_id`; `target_chat` is not a tool argument and no chat id is
+   exposed to the model. A missing trusted destination fails honestly.
+3. **Delete behaviour preserved** — confirmed. `DeleteSaveTool`, `do_delete`,
+   the `delete_saved_item` route and the replied-save-code deletion path were not
+   modified, and are re-asserted by the adjacent suite (198 passed), including
+   the `delete this` + save-code reply regression pin.
+4. **Live Telegram verification performed** — **NO**. No Telegram session exists
+   in this workspace; all evidence comes from the real
+   parser → fast-path → `ToolExecutor` → tool → service chain with faked
+   Telegram and DB boundaries.
+5. **Supabase / schema / `DATABASE_ARCHITECTURE.md`** — untouched; no migration,
+   no column, no RLS change, no SQL executed.
+
 ## Previous phase — Live bug fix: deterministic replied-save-code deletion + verified preview
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
