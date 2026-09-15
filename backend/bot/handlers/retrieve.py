@@ -127,10 +127,13 @@ async def _retrieve_saved_inline_builder(event, extra: str) -> list:
 # ── Panel: retrieve_item (preview + actions) ──
 
 async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    from backend.helper.inline_engine import _owner_id
     code = _parse_extra_id(extra)
     if not code:
         return "Item", "Item not found.", []
-    row = await db_client.query_save(code)
+    # The persisted row, owner-verified by the service layer — the panel
+    # renders stored metadata exactly like the AI preview does.
+    row = await retrieve_service.load_saved_item(code, _owner_id)
     if not row:
         return "Item", f"❌ No item found for `{code}`", []
 

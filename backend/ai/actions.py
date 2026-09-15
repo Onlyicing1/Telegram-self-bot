@@ -1008,6 +1008,15 @@ def _is_history_analysis_intent(words: list[str]) -> bool:
             return True
     return False
 
+# Explicit "show me THIS stored item" vocabulary (مشخصات / جزئیات / اطلاعات /
+# پیش‌نمایش, "details" / "info" / "preview"). Only consulted when the owner's
+# message also carries an explicit save code, so the generic save-list words
+# below keep answering "لیست سیوها رو بده" exactly as before.
+_PREVIEW_WORDS = frozenset({
+    "مشخصات", "مشخصاتش", "مشخصه", "ویژگی", "ویژگی‌ها", "جزئیات", "جزئیاتش",
+    "اطلاعات", "اطلاعاتش", "پیش‌نمایش", "پیش‌نمایشش", "دیتیل", "دیتالس",
+    "info", "detail", "details", "metadata", "preview",
+})
 # Read-only status/query intent keywords (matched only after the imperative
 # save/delete/review paths fall through, so "اینو سیو کن" and "پیام آخر رو
 # پاک کن" always take precedence).
@@ -1769,6 +1778,38 @@ def parse_command_intent(
                     {"name": "retrieve_save", "arguments": {"save_code": retrieve_code}}
                 ],
             )
+
+    # Saved-item PREVIEW addresses ONE stored item by the code the owner
+    # named, exactly like delete/retrieve above — and it reads that item's
+    # PERSISTED metadata through ``retrieve_service.load_saved_item``. It must
+    # therefore resolve BEFORE the generic list vocabulary below, which
+    # otherwise answers a request for one item's metadata with the recent
+    # saves listing (live misroute: "مشخصات سیو S0001 رو بده" returned the
+    # listing — the requested row was never read). A delete/save/send keeps
+    # its existing precedence, and a request with NO explicit code stays
+    # exactly where it was (the provider owns conversational previews).
+    preview_code = _extract_save_code(words)
+    if (
+        preview_code
+        and not do_delete
+        and not do_save
+        and not send_intent
+        and (
+            save_mentioned
+            or _has_save_mention(words)
+            or bool(set(words) & _PREVIEW_WORDS)
+            or any(_is_show_verb_token(w) for w in words)
+        )
+    ):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="preview_saved_item",
+            target="saved_item",
+            save_code=preview_code,
+            tool_calls=[
+                {"name": "preview_save", "arguments": {"save_code": preview_code}}
+            ],
+        )
 
     # Immediate text-write ("بنویس سلام", "write hello") resolves
     # deterministically to the registered send_message tool — the owner's

@@ -2,6 +2,9 @@
 Retrieve service — all retrieval business logic lives here.
 
 Unified workflow:
+  - load_saved_item(save_code, owner_id): the ONE owner-scoped, row-identity
+    verified read of a persisted saved_items row (shared by every preview
+    surface) — preview never regenerates metadata, it reads the stored row
   - format_preview(row): rich metadata display for the preview panel
   - build_metadata_block(row): the LifeOS metadata block injected into
     retrieved file captions
@@ -94,27 +97,48 @@ def format_preview(row: dict) -> str:
     )
 
 
-async def do_preview(self_client, owner_id: int, save_code: str) -> str:
-    save_code = save_code.upper().strip()
+async def load_saved_item(save_code: str, owner_id: int) -> dict | None:
+    """Return the owner's persisted saved_items row for ``save_code``.
+
+    The ONE verified row lookup every preview surface shares. ``query_save``
+    is a code-only lookup (the DB layer adds no owner predicate), so the row
+    is verified here — owner isolation AND row identity — before ANY surface
+    formats it. Owner isolation + row identity are the same checks
+    ``do_retrieve``/``do_delete`` apply.
+
+    Read-only by contract: it reads the persisted row and returns it
+    untouched. Nothing is re-fetched from Telegram, no field is re-derived
+    from ``origin_chat_id``/``file_id``, and no row is written, repaired, or
+    backfilled — the stored metadata IS the preview's source of truth.
+
+    Returns ``None`` when the row is missing, foreign, or belongs to another
+    code (all three are reported identically by callers, so a foreign item is
+    never distinguishable from a missing one). Raises only when the DB layer
+    itself fails, so callers can keep an honest DB-error path.
+    """
+    code = save_code.upper().strip()
     t0 = asyncio.get_event_loop().time()
     try:
-        row = await db_client.query_save(save_code)
+        row = await db_client.query_save(code)
         record_event("database", "query_save", (asyncio.get_event_loop().time() - t0) * 1000, "SUCCESS")
     except Exception as exc:
-        logger.error("preview db error: %s", exc)
+        logger.error("saved-item lookup error for %s: %s", code, exc)
         record_event("database", "query_save", 0, "ERROR", str(exc))
+        raise
+    if not row or row.get("owner_id") != owner_id:
+        return None
+    if str(row.get("save_code") or "").upper() != code:
+        return None
+    return row
+
+
+async def do_preview(self_client, owner_id: int, save_code: str) -> str:
+    save_code = save_code.upper().strip()
+    try:
+        row = await load_saved_item(save_code, owner_id)
+    except Exception as exc:
         return f"❌ DB error: {exc}"
     if not row:
-        return f"❌ No item found for `{save_code}`"
-    # Owner isolation + row identity, identical to do_retrieve/do_delete:
-    # ``query_save`` is a code-only lookup (the DB layer adds no owner
-    # predicate), so an unverified row could belong to another owner — or, if
-    # the lookup ever handed back a different row, present another item's
-    # metadata under this code. Both are reported with the same not-found
-    # wording, so a foreign item is never distinguishable from a missing one.
-    if row.get("owner_id") != owner_id:
-        return f"❌ No item found for `{save_code}`"
-    if str(row.get("save_code") or "").upper() != save_code:
         return f"❌ No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Preview {save_code}", {"save_code": save_code})
     return format_preview(row)

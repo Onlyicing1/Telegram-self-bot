@@ -70,8 +70,13 @@ MAX_TOOL_ROUNDS = 3
 #               continuation round could paraphrase it, and the result is far
 #               too large to re-inject into a prompt. The tool already performed
 #               the LLM work through the same ProviderManager.
+#   preview_save — the tool's text IS the item's PERSISTED metadata, formatted
+#               once by ``retrieve_service.format_preview`` from the stored
+#               row. A continuation round made the model re-state that
+#               metadata in its own words — i.e. the owner saw freshly
+#               composed values instead of the stored ones.
 _VERBATIM_READ_TOOLS = frozenset(
-    {"get_bio", "task_list", "translate_history", "summarize_history"}
+    {"get_bio", "task_list", "translate_history", "summarize_history", "preview_save"}
 )
 
 # Read tools whose result is a PREREQUISITE for a CAS-guarded mutation in the
