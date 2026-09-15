@@ -1,6 +1,173 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1: the controlled media boundary
+## Latest phase — Media Processing M1.1: the normalized media analysis reaches the selected LLM
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `d60e671e5873d1a47a9b947d3bbe701e9b8ecd6f` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone) |
+| Implementation commit (code + tests) | `9fd64095a0b603b7dd9f3541fdc2b2a33046f1ef` |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL; media processing is read-only and persists nothing) |
+| Provider architecture impact | **none** (no `ProviderManager`, registry, adapter, `capabilities` or `vision()` change; no provider switching, no native multimodal path) |
+| Native multimodal provider integration | **NOT implemented** (explicitly out of scope for this phase) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+
+### The exact task
+
+Wire the **already-existing** controlled `MediaAnalysis` result (M1, `f99fa90`)
+into the owner's **currently selected** LLM as ordinary model input — without
+touching provider selection/fallback, without provider-specific message shapes,
+without adding any media engine or dependency, and without ever passing Telegram
+conversational context to the model.
+
+### Exact behaviour implemented
+
+**Deterministic resolution — outside the model (IMPLEMENTED)**
+`Dispatcher._media_target(request)` returns **at most one** `(chat_id, message_id)`,
+from the runtime's own identifiers in a fixed order: the **replied-to message**
+(the owner addressed it explicitly), else the **triggering message itself**
+(`AIRequest.request_media_type`, set by `ai_unified._media_type_of` from the
+event's own message). Nothing else can select media — no recency, no sender, no
+caption/text matching, no history search, no "last media". A media type the
+boundary may not transfer (`WebPage`/`Contact`/`Poll`/`Location`/`Unknown`)
+resolves to `None`, so those requests keep their existing conversational
+behaviour byte-for-byte. When no target resolves, the media route is skipped
+entirely (no fetch, no download, no provider round of its own).
+
+**Bounded, single-target fetch (IMPLEMENTED)**
+`backend/services/media_service.py::resolve_media_message` performs **one**
+bounded `get_messages(chat_id, ids=message_id)` through the existing
+`runtime.operation_watchdog.guarded_await` (`MEDIA_RESOLVE_TIMEOUT_S = 30.0`, the
+same order as the facade's short-call bound), then hands the object to the
+existing `analyze_media` (M1 transfer/validation/cleanup unchanged). One media
+download path, one classifier, one normalization — nothing duplicated.
+
+**The model-facing payload (IMPLEMENTED)**
+`backend/services/media_ai_service.py` (new, mirrors `history_ai_service.py`)
+builds the message list **itself**:
+
+```
+[system]  MEDIA_ANALYSIS_SYSTEM_PROMPT   (static; names no chat, person or message)
+[user]    the owner's authored request
+          + MediaAnalysis.as_context_text()
+```
+
+Two messages, plain `str` content, through
+`ProviderManager.chat(messages, tools=[])` — the ordinary provider-neutral path.
+No content parts, image URLs, base64 or provider-specific shapes; `vision()` is
+never called and `ProviderManager`'s routing/fallback code is untouched.
+
+**Context isolation (PROTECTED)** — `build_media_messages` is the only
+construction point, and a media request **never reaches the prompt/context
+builders at all** (the route returns before Stage 2). Reply context, the
+10-message Telegram window, AI session history, memory and tool schemas are
+therefore structurally unable to enter a media request. The M1 contract for
+`as_context_text()` is unchanged: no caption, no sender, no chat id, no message
+id, no filename.
+
+**Unsupported / failed media (IMPLEMENTED, honest)**
+`MediaAnalysis.has_content == False` (Photo, Video, Voice, Audio, Sticker,
+Animation/GIF, non-text documents, non-downloadable types) → the deterministic
+explanation, **no provider round, no fabricated content**
+(`analysis.status == "unsupported"`, `finish_state=local_fast_path`).
+`MediaError` (unresolvable target, no media, oversized, transfer/timeout,
+malformed or empty download) → the existing local failure result: `success=False`,
+the exact reason in `errors`, no fallback to another media source, no retry of a
+different target, no model guess. A failed/degenerate provider response is
+reported with the manager's own exhaustion reason. The provider call is bounded
+by `media_call_timeout` ∈ {`:120s` ceiling, the caller's envelope}, never
+unlimited, and a request whose budget is already spent fails **before** any
+provider call.
+
+**Activation (IMPLEMENTED, minimal)** — the empty-`raw_text` guard in
+`ai_unified` is **unchanged**: a caption-less media message still never becomes
+an AI task. A media message that *does* carry an owner-authored request is marked
+as a media request through the triggering message's own classifier label, which
+adds no new trigger model. The classifier itself is untouched.
+
+### Files changed (5 source, 3 test/doc)
+
+| File | Change |
+|---|---|
+| `backend/services/media_ai_service.py` | **new** — the only place a normalized analysis reaches the LLM (message construction, honest unsupported, bounded provider call, existing trace stages `media_resolution_*` / `media_analysis_*`) |
+| `backend/services/media_service.py` | `resolve_media_message` (one bounded fetch by runtime ids) + `_bounded`/`MEDIA_RESOLVE_TIMEOUT_S`; `status` now stores the plain `MediaStatus.value` |
+| `backend/ai/session/request.py` | `request_media_type: str = ""` (documented as never prompt-rendered) |
+| `backend/ai/engine/dispatcher.py` | `_media_target` + `_try_media_analysis` + `_telegram_source`, invoked after the deterministic fast path and before prompt construction; `_build_fast_path_result` gained `provider`/`model`/`fallback_used`; the two media-service imports are **function-local** (they import `backend.ai.media`, whose package initializer loads this module — a module-level import would close an import cycle) |
+| `backend/bot/handlers/ai_unified.py` | `_media_type_of` (pure attribute inspection) + threading `request_media_type` into `AIRequest` |
+| `tests/test_media_ai_integration.py` | **new** — 32 tests |
+| `tests/test_context_architecture.py` | one fixture change: the "reply to a non-AI message keeps its reply context" case now uses a **non-downloadable** media label (`WebPage`), because a reply to a **downloadable** media message is now a media request and deliberately receives **zero** Telegram context (see below) |
+
+### Intentionally changed existing behaviour (1 case, documented)
+
+`tests/test_context_architecture.py::test_reply_to_non_ai_message_remains_distinguishable`
+previously proved that replying to a **Photo** message rendered `[Reply Context]`
+(the media message's sender name, chat title and 200-char text preview) into the
+prompt. That is exactly the leak this phase forbids, so a reply whose target
+carries a transferable asset is now a media request with no reply context. The
+test's own purpose (a non-AI reply stays distinguishable from a reply to an AI
+message, and its context is rendered) is preserved unchanged; only its media
+label moved to a non-downloadable one.
+
+### Intentionally unchanged
+
+Save/Deep Save/Saved Items, retrieval, delete, History AI, Taskloom/scheduler,
+`RuntimeSupervisor`, helper/Glass UI, Supabase and `DATABASE_ARCHITECTURE.md`,
+all providers and the manager, the media classifier, `analyze_media`'s transfer
+limits/cleanup, and every text-only request path (still the ordinary prompt and
+context pipeline).
+
+### Tests and validation (actually run)
+
+| Run | Result |
+|---|---|
+| `tests/test_media_ai_integration.py` (new) | **32 passed** |
+| `tests/test_media_processing.py` + new suite | **93 passed** |
+| Adjacent (`test_19_ai_actions`, `test_25_fast_path`, `test_10_tool_calls`, `test_18_ai_execution_agent`, `test_09_reply_to_ai`, `test_21_execution_status`, `test_12_save_engine`, `test_26_silent_delete`, `test_14_tool_honesty_glass`, `test_01_end_to_end`, `test_02_ai_flow`, `test_context_architecture`) | **217 passed** |
+| Full suite (`pytest tests -q`) | **2970 passed, 24 skipped** (was 2938 + 24) |
+| `py_compile` (5 changed modules + the new/updated test files) | OK |
+| `git diff --check` | clean |
+
+**Non-vacuous (measured, not assumed).** Four independent mutations were applied
+to the implementation, and the focused suite was re-run after each, then the
+files were restored and verified byte-identical (`md5sum -c`):
+
+| Mutation | Focused-suite result |
+|---|---|
+| `as_context_text()` also renders the caption | **2 failed** |
+| `_media_target()` disabled (media route off) | **16 failed** |
+| the triggering-message branch removed | **2 failed** |
+| the handler stops marking media messages | **1 failed** |
+
+Tests run against real `telethon.tl.types` objects and a provider registered in
+the **real** `ProviderRegistry`/`ProviderManager` (so the provider-neutral call
+path and "no provider switching" are exercised for real), with a scripted
+Telegram client; a "trap" client fails the test if a text-only request touches
+media resolution or download.
+
+### Limitations / NOT YET PROVEN
+
+- **Live Telegram verification was NOT performed** (no live session here): the
+  real Telegram round trip and real provider latency for a media request are
+  **NOT YET PROVEN**.
+- **This phase does not make models *see* media.** Only text-bearing documents
+  yield extracted content; Photo/Video/Voice/Audio/Sticker/Animation are answered
+  honestly as unsupported. There is no OCR, STT, vision, PDF or video engine and
+  no new dependency.
+- A reply to *any* transferable-media message is now a media request, including
+  when the owner's question was about something else in that message.
+- The resolve bound (30 s) and the download bound (120 s) are finite but
+  unmeasured against real Telegram.
+
+### Delivery
+
+- Implementation commit: `9fd64095a0b603b7dd9f3541fdc2b2a33046f1ef` (code + tests).
+- No rebase, no force-push, no reset, no history rewrite; the pre-existing
+  untracked clone was left exactly as found.
+
+---
+
+## Previous phase — Media Processing M1: the controlled media boundary
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
