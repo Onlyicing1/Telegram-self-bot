@@ -7,7 +7,7 @@ Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation dat
 | Item | Value |
 |---|---|
 | Starting HEAD | `916ec05` (origin/main — the M1.2 document-extraction delivery record) |
-| Implementation commit (code + tests) | _(recorded in the accompanying docs commit)_ |
+| Implementation commit (code + tests) | `d038835d39c3982c73b84b87141f00f19e9d7f26` |
 | Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
 | Provider architecture impact | **none** (`media_ai_service.py` untouched — it still receives plain-string `as_context_text()`) |
 | Prompt architecture impact | **none** (no `PromptBuilder`, context-builder or `MEDIA_ANALYSIS_SYSTEM_PROMPT` change) |
