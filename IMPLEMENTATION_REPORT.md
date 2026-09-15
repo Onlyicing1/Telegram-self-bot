@@ -524,6 +524,56 @@ cache, no polling, no new table or column, no SQL.
 * `asyncio.wait_for` bounds the *awaited* recognition result; a non-cooperative
   engine's worker thread is not force-stopped.
 
+### Delivery and remote verification (M1.3 delivery/recovery pass, 2026-09-15)
+
+| Item | Value |
+|---|---|
+| Starting HEAD of this pass | `2c2d6e68375198b6e866d150a3b838889937df65` (origin/main — the M1.4 STT boundary record) |
+| M1.3 implementation commit (code + tests) | `d038835d39c3982c73b84b87141f00f19e9d7f26` — *feat: add the bounded OCR boundary for image media* |
+| M1.3 delivery-record commit | `83306a5` — *docs: record the Media Processing M1.3 OCR boundary phase* |
+| Delivered state found | **already on origin/main** — `git merge-base --is-ancestor <sha> origin/main` confirms **both** commits are ancestors; `git ls-remote origin refs/heads/main` matched local `HEAD` |
+| Code change required by this pass | **none** — the M1.3 boundary, its bounds, its tests and the no-engine decision are exactly as recorded above |
+| Change made by this pass | this delivery/remote-verification block only (documentation) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+| Live OCR recognition verification | **NOT performed** — the engine remains unprovisioned, so no image was ever recognised |
+
+**Why no engine was provisioned in this pass.** The source-based decision recorded
+in *The scoping decision that shaped this phase* above is unchanged and was
+re-checked, not re-litigated: the runtime has **no** local OCR engine and **no** OCR
+dependency (`tesseract` binary absent; `rapidocr_onnxruntime`, `pytesseract`,
+`paddleocr`, `onnxruntime`, `PIL`, `cv2` all absent), `backend/requirements.txt` is
+unchanged (`pypdf` remains the only added dependency), and the measured evidence
+(548.7 MB peak RSS for a single recognition against a 512 MB process ceiling;
+no Arabic/Persian charset in the bundled model; Tesseract undeliverable through
+`requirements.txt`) still excludes every named candidate. No candidate was
+re-measured in this pass, and **no recognition result was fabricated**: an image is
+still answered with the deterministic `UNSUPPORTED` explanation rather than OCR
+text.
+
+**Re-verification actually executed in this pass** (Python 3.10.12 in a fresh
+`git`-ignored `.venv` built from `backend/requirements.txt` plus `pytest` and
+`pytest-asyncio`, `--asyncio-mode=auto`; note the deployed target pins 3.11.7 in
+`render.yaml`, so the interpreter differs from production — recorded rather than
+hidden):
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_image_ocr.py -q` | **54 passed** (identical to this phase's own record) |
+| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_ai_integration.py tests/test_remediation_rc6_a123.py -q` | **136 passed** (identical) |
+| `pytest tests -q` (full suite) | **3 116 passed, 24 skipped, 0 failed** (112.9 s) |
+| `git status --short` / `git diff --check` | clean |
+
+The full-suite count is higher than this phase's own figure (3 052) because the
+M1.4 tests are now part of the tree; nothing in this phase's numbers was rewritten.
+M1.2 PDF/DOCX extraction, the shared `MediaAnalysis` contract, `media_ai_service`,
+the provider mesh and the zero-context rule are all unchanged and green.
+
+**Engine decision, hard bounds, cleanup guarantee, context isolation, Persian
+coverage status, limitations and deferred work** for M1.3 are recorded in the
+sections above; this pass adds only the delivery state and the re-run evidence.
+Provisioning an OCR engine therefore remains an explicit, still-open decision at
+the single `set_ocr_engine` seam, and no Persian recognition-quality claim is made.
+
 ---
 
 ## Previous phase — Media Processing M1.2: bounded PDF/DOCX document extraction
