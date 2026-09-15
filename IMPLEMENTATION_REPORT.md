@@ -1,6 +1,185 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Live bug fix: deterministic replied-save-code deletion + verified preview
+## Latest phase — Live bug fix: source-sender identity in `preview_save` + a deterministic `retrieve_save` route
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `5e98d37346e6c5f8ba578d85a4609cb3627293f2` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone present) |
+| Implementation commit (code + tests) | `afd36ff84ad9952162b1589e0d199fdb1c1d2b8f` |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Delete path | **unchanged and re-asserted by tests** |
+
+### The exact task
+
+Two Saved Items bugs reported from live Telegram usage:
+
+1. `preview_save` displayed the wrong sender/source identity.
+2. `retrieve_save` / "send this saved item here" did not reliably send the
+   saved item into the current chat.
+
+The saved-item **delete** flow was already working and was not modified.
+
+### Bug #1 — root cause (Issue 1): the Sender field was not the source sender
+
+Traced end to end, and the wrong identity is introduced at **save time**, not
+in presentation:
+
+```
+original source Telegram message
+  → save_service._resolve_sender(source_message)      backend/services/save_service.py
+  → payload["sender_name"] / ["sender_id"]             save_service.execute_save
+  → saved_items row                                   db_client.insert_save
+  → db_client.query_save(save_code)                   (code-only lookup, correct row)
+  → retrieve_service.do_preview → format_preview      Sender = row["sender_name"]
+```
+
+`_resolve_sender` only handled **user-shaped** entities
+(`first_name`/`last_name`) and fell back to `str(sender_id)`. Telethon sets the
+sender to the **CHANNEL itself** for a channel post (`Message._finish_init`:
+`if post or (not out and isinstance(peer_id, PeerUser)): sender_id = peer_id`),
+because a channel post carries no `from_id`. A channel entity has no
+`first_name`, so the persisted `sender_name` became the channel's **raw numeric
+identity** (`-100…`) — a chat/channel identity shown in the Sender field
+instead of the source message's sender. Nothing in `do_preview`,
+`query_save`, `format_preview` or `save_code` handling was involved; the row
+was always the requested one (the previous phase's owner + row-identity checks
+are still in place and untouched).
+
+### Bug #1 — fix (IMPLEMENTED)
+
+`backend/services/save_service.py`:
+
+- New `_sender_display_name(entity)`: `first_name last_name` → `username` →
+  `title` — the same precedence the AI conversation layer already uses
+  (`telegram_context._entity_name`). The `title` branch reads the **sender
+  entity**, never the chat.
+- `_resolve_sender(source_message)` now:
+  1. a channel-shaped sender (an entity with a `title`) + `post_author` → the
+     **signed author's name** (the person who actually posted);
+  2. otherwise the sender entity's own display name; and
+  3. only if none of that resolves → the sender's **own** numeric id
+     (`User <id>` / `Unknown`).
+- The origin chat title is **never** substituted for the sender; `sender_id`
+  stays the raw sender id, and `origin_chat_id`/`origin_msg_id` remain the
+  distinct origin-chat identity in the same row.
+
+Preview presentation (`format_preview`) was **not** changed to fake a correct
+value; it still renders the persisted `sender_name`.
+
+### Bug #2 — root cause (Issue 2): the send vocabulary pre-empted retrieval
+
+Source-proven by driving the real parser (`parse_command_intent`): every
+send request returned `Unsupported action: send` **before** the saved-item
+vocabulary was consulted, so the registered `retrieve_save` tool was never
+invoked:
+
+| Request | Before | After |
+|---|---|---|
+| `S0001 رو بفرست` | `unsupported` → `❌ Unsupported action: send` | `retrieve_save S0001` |
+| `بفرست S0001` | `unsupported` | `retrieve_save S0001` |
+| `سیو S0001 رو اینجا بفرست` | `unsupported` | `retrieve_save S0001` |
+| `send S0001 here` | `conversational` (model-dependent) | `retrieve_save S0001` |
+| reply to a `LifeOS S0001` message + `بفرست` | `unsupported` | `retrieve_save S0001` |
+| `اینجا بفرست` (no item reference) | `unsupported` | **unchanged** `unsupported` |
+| `اینو برای علی بفرست` (named recipient) | `unsupported` | **unchanged** `unsupported` |
+| `بنویس سلام` (text write) | `send_message` | **unchanged** `send_message` |
+
+The dispatch chain itself was already correct
+(`request.chat_id` → `Dispatcher._build_tool_context` →
+`ToolContext.extra["chat_id"]` → `RetrieveSaveTool` → `do_retrieve(target_chat)`
+→ `get_input_entity` → `forward_messages`); the request never reached it.
+
+### Bug #2 — fix (IMPLEMENTED)
+
+`backend/ai/actions.py` (`parse_command_intent`), two surgical additions:
+
+- `send_intent = send_pos or en_send`, captured **before** the existing
+  English "bare verb with no target" guard zeroes `en_send` (an explicit save
+  code is itself the object of the send).
+- A dedicated saved-item **retrieval** route, placed before the generic send
+  branch: when a send verb is present, no delete/save/text-write intent is
+  present, and the request carries an explicit save code (`_extract_save_code`)
+  **or** replies to a message whose text is exactly one save code
+  (`_extract_single_save_code`, the same validated helper the delete path
+  uses), it resolves to
+  `{"name": "retrieve_save", "arguments": {"save_code": …}}` with
+  `target="current_chat"`.
+
+Because it is an executable fast-path intent, it runs in
+`Dispatcher._try_local_fast_path` **before any provider round** — no prompt is
+built and no provider is called, so **the AI receives zero Telegram
+conversational context** (no replied text, no replied metadata, no chat
+history, no peer objects). The destination is never a tool argument: the tool
+schema is exactly `{"save_code"}` and the tool reads the chat from
+`context.extra["chat_id"]` (trusted runtime state).
+
+### Owner / security
+
+- Owner identity still comes from the trusted `ToolContext.owner_id`; no
+  AI-supplied value can select an owner.
+- A missing, foreign, or code-mismatched row stays indistinguishable from a
+  missing item (previous phase's checks untouched; re-asserted here).
+- No new authorization layer, no second executor, no direct Telethon/DB access
+  from the parser or the tool.
+
+### Intentionally unchanged
+
+- `retrieve_service.do_retrieve` semantics (`saved_chat_id`/`saved_msg_id` as
+  the source of the saved copy), the delete path (`delete_save`,
+  `delete_replied`, counted/semantic deletes), saved-item listing, save and
+  `list_saves` routing, the bounded request-scoped Telegram context, the
+  provider architecture, Taskloom, Supabase/schema, and
+  `DATABASE_ARCHITECTURE.md`.
+
+### Exact files changed
+
+| File | Role |
+|---|---|
+| `backend/services/save_service.py` | source-sender identity (`_sender_display_name`, `_resolve_sender`) |
+| `backend/ai/actions.py` | deterministic `retrieve_save` route (`send_intent` + the retrieval block) |
+| `tests/test_saved_item_sender_and_retrieve.py` | new focused regression suite (24 tests) |
+
+### Tests and validation (actually performed)
+
+| Run | Result |
+|---|---|
+| `tests/test_saved_item_sender_and_retrieve.py` | **24 passed** |
+| Adjacent (`test_saved_items_ai_management`, `test_capability_exposure_tools`, `test_retrieve_owner_isolation`, `test_new_tool_action_path`, `test_12_save_engine`, `test_19_ai_actions`, `test_10_tool_calls`) | **198 passed** |
+| Full suite (`pytest tests/ -q`) | **2834 passed, 24 skipped** (was 2810 + 24) |
+| `py_compile` (both changed modules + the new test file) | OK |
+| `git diff --check` | clean |
+| Diff scope | exactly the 3 files above (`git status --short`) |
+
+**Non-vacuous proof:** reverting the two source files in-tree made **14 of the
+24** new tests fail; restoring them made all 24 pass. The 10 that pass either
+way are the explicit "unchanged behavior" pins.
+
+### Live verification status
+
+**Live Telegram verification was NOT performed** — no Telegram session exists
+in this workspace. Every claim above is derived from the real
+parser → fast-path → `ToolExecutor` → tool → service chain with faked Telegram
+and DB boundaries.
+
+### Remaining limitations (honest)
+
+- A send request with **no item reference at all** (`اینجا بفرست`,
+  `این سیو رو اینجا بفرست`, `put this here`) cannot be resolved: the AI
+  receives no Telegram conversation context, so no destination or item is
+  guessed. It keeps the existing deterministic `unsupported` outcome (or the
+  model path for non-vocabulary phrasings). Saying the code, or replying to the
+  item's save-code message, is the deterministic route.
+- The stored `sender_name` of the *existing* live row from the incident was not
+  inspected (no live DB access), so whether that specific row is a channel
+  post or a no-sender message remains **NOT YET PROVEN**. New saves now resolve
+  the source sender correctly; already-stored rows keep their stored value.
+- Non-vocabulary retrieve verbs (`put`, `بازیابی`, `بیار`) stay on the model
+  path; they were not added to the deterministic vocabulary to avoid opening a
+  broad keyword surface.
+
+## Previous phase — Live bug fix: deterministic replied-save-code deletion + verified preview
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
