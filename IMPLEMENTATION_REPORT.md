@@ -148,9 +148,12 @@ visible until that item is saved again.
 
 | Item | Value |
 |---|---|
-| Implementation commit | `0bbf3a95031fff0a531e31ade459ecb3f2f92321` (code + focused tests) |
-| Report commit | this document's commit on `main` (see the delivery follow-up note) |
-| Remote `main` | verified after push (exact remote HEAD recorded in the follow-up note) |
+| Implementation commit (code + tests) | `0bbf3a95031fff0a531e31ade459ecb3f2f92321` |
+| Documentation commit (this report) | `decc9b63d56645b2497d84a17d408ad0b61e8cb5` |
+| Final commit | `decc9b63d56645b2497d84a17d408ad0b61e8cb5` |
+| Remote `main` verified | **YES** — `git rev-parse origin/main` = `decc9b63d56645b2497d84a17d408ad0b61e8cb5`, and `0bbf3a9` is an ancestor of it (`git merge-base --is-ancestor`). The delivery-note commit that carries this line is the subsequent `main` HEAD. |
+| Push | `f765465..decc9b6  main -> main` (no force, no rebase, no history rewrite) |
+| Working tree | clean apart from the pre-existing untracked `telegram-self-bot/` clone |
 
 ---
 
