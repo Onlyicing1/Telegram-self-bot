@@ -284,20 +284,48 @@ def _format_bytes(n: int | None) -> str:
     return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
+def _sender_display_name(entity) -> str:
+    """Display name of the entity Telegram reported as the SOURCE sender.
+
+    Same precedence the AI conversation layer uses for sender names
+    (``telegram_context._entity_name``): ``first_name last_name`` →
+    ``username`` → ``title``. The ``title`` branch is not a chat fallback —
+    a channel post carries no ``from_id``, so Telethon reports the CHANNEL
+    itself as the sender (``Message._finish_init``), and that channel's
+    ``title`` IS the sender's name. The origin chat's own title is never
+    substituted for a sender that could not be resolved.
+    """
+    first = getattr(entity, "first_name", "") or ""
+    last = getattr(entity, "last_name", "") or ""
+    name = f"{first} {last}".strip()
+    if name:
+        return name
+    return getattr(entity, "username", "") or getattr(entity, "title", "") or ""
+
+
 async def _resolve_sender(reply_msg) -> tuple[str, int]:
-    """Resolve the source message's sender name + id (best effort)."""
+    """Resolve the SOURCE message's sender name + id (best effort).
+
+    The name describes the sender of the saved message, never the chat it
+    came from: the previous implementation only handled user-shaped entities
+    and degraded to ``str(sender_id)``, so a channel-sourced save persisted
+    the channel's raw numeric identity as the "Sender" shown in previews.
+    """
     sender_id = getattr(reply_msg, "sender_id", None) or 0
-    sender_name = "Unknown"
     try:
         sender = await reply_msg.get_sender()
-        if sender:
-            parts = [
-                getattr(sender, "first_name", "") or "",
-                getattr(sender, "last_name", "") or "",
-            ]
-            sender_name = " ".join(p for p in parts if p).strip() or str(sender_id)
     except Exception:
-        pass
+        sender = None
+    sender_name = ""
+    if sender is not None and getattr(sender, "title", None):
+        # Channel-shaped sender: a signed post names the person who actually
+        # sent it, which is more specific than the channel itself.
+        sender_name = (getattr(reply_msg, "post_author", None) or "").strip()
+    if not sender_name:
+        sender_name = _sender_display_name(sender) if sender is not None else ""
+    if not sender_name:
+        # Last resort is the sender's OWN numeric id — never the chat title.
+        sender_name = f"User {sender_id}" if sender_id else "Unknown"
     return sender_name, sender_id
 
 

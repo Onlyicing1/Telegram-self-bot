@@ -1715,6 +1715,11 @@ def parse_command_intent(
     en_save, en_save_neg = _english_action(words, _EN_SAVE)
     en_send, _ = _english_action(words, _EN_SEND)
 
+    # A send verb is a send verb even when the English target/length guard
+    # below zeroes the generic ``en_send`` flag: an explicit save code is
+    # itself the object of the send ("send S0001 here").
+    send_intent = send_pos or en_send
+
     # A bare English verb with no target/count/reply is likely a question
     # ("what does save mean?") rather than a command.
     en_has_target = has_reply or is_this or is_last or count is not None or has_message_word
@@ -1738,6 +1743,32 @@ def parse_command_intent(
     link_url = _extract_telegram_link(text)
 
     write_pos = _write_text_present(words)
+
+    # Saved-item RETRIEVAL owns its target explicitly: an explicit save code
+    # in the owner's own message, or a replied-to message that is exactly one
+    # stored item's save-code message. Its only possible destination is the
+    # chat this request came from (``RetrieveSaveTool`` reads it from trusted
+    # runtime context; the model never chooses a chat), so it resolves
+    # deterministically instead of falling into the generic send vocabulary —
+    # live evidence: "S0001 رو بفرست" / "اینجا بفرست" / "سیو S0001 رو اینجا
+    # بفرست" were all answered with "❌ Unsupported action: send" without ever
+    # reaching the registered retrieve_save tool. A text-write keeps its
+    # existing precedence, and a send with NO item reference keeps its
+    # existing unsupported outcome (no destination is ever guessed).
+    if send_intent and not write_pos and not do_delete and not do_save:
+        retrieve_code = _extract_save_code(words)
+        if retrieve_code is None and has_reply:
+            retrieve_code = _extract_single_save_code(reply_text)
+        if retrieve_code:
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE,
+                action="retrieve_save",
+                target="current_chat",
+                save_code=retrieve_code,
+                tool_calls=[
+                    {"name": "retrieve_save", "arguments": {"save_code": retrieve_code}}
+                ],
+            )
 
     # Immediate text-write ("بنویس سلام", "write hello") resolves
     # deterministically to the registered send_message tool — the owner's
