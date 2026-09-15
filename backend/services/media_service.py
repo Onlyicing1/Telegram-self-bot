@@ -59,7 +59,25 @@ elements, archive entry bytes, extracted characters). A container whose
 signature contradicts its declared MIME, an encrypted PDF, or a payload that
 cannot be parsed is a HARD failure (``MediaError``) — never fabricated content —
 while a parseable container with no extractable text is reported honestly with
-empty content. No OCR is performed in this phase either.
+empty content.
+
+M1.3 scope: the OCR **boundary** for still images. Nothing about resolution,
+transfer, validation, cleanup, the zero-context rule or the fail-closed
+contract changes: an image is only ever the message the runtime already
+resolved, its payload's own signature must corroborate the declared MIME before
+any decode, its declared dimensions must fit a hard bitmap bound (so a small
+compressed payload can never be expanded into an unbounded bitmap), recognition
+runs off the event loop inside a finite timeout, the normalized text is capped
+by the same character ceiling every other extractor uses, and the temporary
+directory is removed on every exit path.
+
+Recognition itself is a seam (``OcrEngine``). This phase ships the BOUNDARY and
+provisions **no** engine: an image is therefore reported ``UNSUPPORTED``
+*without being transferred* until an engine is provisioned, so the project never
+silently acquires a heavy native stack, and no image is ever partially
+processed. Persian and English text are preserved unchanged by normalization;
+recognition QUALITY is a property of whatever engine is later provisioned and
+is deliberately not claimed here.
 """
 from __future__ import annotations
 
@@ -73,7 +91,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from backend.ai.media import MediaInfo, classify_message
 from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS
@@ -138,6 +156,32 @@ MAX_EXTRACTED_CHARS = DEFAULT_MAX_CONTEXT_TOKENS * 4
 MAX_PDF_PAGES = 50
 MAX_DOCX_TEXT_ELEMENTS = 5_000
 MAX_ARCHIVE_ENTRY_BYTES = 8 * 1024 * 1024
+
+#: M1.3 — still-image MIME types the OCR boundary may process. Only containers
+#: whose signature can be corroborated cheaply and deterministically are listed;
+#: every other type stays UNSUPPORTED (fail-closed), exactly as in M1/M1.2.
+OCR_IMAGE_MIME_TYPES = frozenset({
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/bmp", "image/gif",
+})
+
+#: M1.3 input bound for OCR. The transfer is already gated by the project's
+#: media size authority (``max_download_bytes``); this is the tighter ceiling
+#: applied in addition for images, and it is enforced BEFORE the transfer.
+MAX_OCR_INPUT_BYTES = 8 * 1024 * 1024
+
+#: M1.3 pre-decode guards. The declared dimensions are read straight from the
+#: container header, so a payload that would expand into an unbounded bitmap is
+#: refused before any decoder (or engine) sees it — the decompression-bomb bound.
+MAX_IMAGE_PIXELS = 12_000_000
+MAX_IMAGE_SIDE = 10_000
+
+#: M1.3 character ceiling for OCR text, shared with the other extractors so every
+#: path produces text bounded by the same project prompt budget.
+MAX_OCR_CHARS = MAX_EXTRACTED_CHARS
+
+#: M1.3 wall-clock bound for ONE recognition. Finite, well inside the media
+#: request's own envelope, and never applied to an unrelated AI request.
+OCR_TIMEOUT_S = 45.0
 
 #: Container signatures. MIME alone is never trusted for a safety-relevant
 #: parse: the actual container must corroborate the declared type.
@@ -371,6 +415,50 @@ def is_docx_mime(mime_type: str) -> bool:
     return str(mime_type or "").strip().lower() in DOCX_MIME_TYPES
 
 
+def is_image_mime(mime_type: str) -> bool:
+    """True for the still-image MIME types the OCR boundary may process (M1.3)."""
+    return str(mime_type or "").strip().lower() in OCR_IMAGE_MIME_TYPES
+
+
+class OcrEngine(Protocol):
+    """The OCR seam: ONE deterministic ``image bytes -> text`` callable.
+
+    The boundary owns everything around recognition — deterministic target
+    resolution, bounded transfer, payload validation, bounds, timeout, temporary
+    cleanup and normalization. An engine only turns already-validated image bytes
+    into text, so provisioning one is a deployment decision that cannot alter the
+    media contract. No engine is provisioned by default (see module docstring).
+    """
+
+    def recognize(self, image: bytes) -> str:
+        """Return the text found in ``image`` (empty when there is none)."""
+        ...
+
+
+_ocr_engine: "OcrEngine | None" = None
+
+
+def set_ocr_engine(engine: "OcrEngine | None") -> None:
+    """Provision (or clear) the process-wide OCR engine.
+
+    Nothing is provisioned by default, so an unprovisioned runtime reports images
+    as UNSUPPORTED *without transferring them* and never depends on a heavy
+    native stack it did not explicitly opt into.
+    """
+    global _ocr_engine
+    _ocr_engine = engine
+
+
+def get_ocr_engine() -> "OcrEngine | None":
+    """The provisioned OCR engine, or ``None`` when none is available."""
+    return _ocr_engine
+
+
+def ocr_available() -> bool:
+    """True when an OCR engine is provisioned on this runtime."""
+    return _ocr_engine is not None
+
+
 class _TextAccumulator:
     """Accumulate extracted chunks without ever exceeding the char ceiling."""
 
@@ -543,6 +631,224 @@ def _extract_docx_document(path: str, limit: int) -> tuple[str, bool, str]:
     return content, truncated, ""
 
 
+#: Container signatures for the OCR image formats. MIME alone is never trusted
+#: for a decode: the payload's own header must corroborate the declared type.
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_GIF_MAGICS = (b"GIF87a", b"GIF89a")
+_JPEG_SOF_MARKERS = frozenset(
+    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+)
+#: Upper bound for the JPEG marker walk, so a malformed header cannot be scanned
+#: without limit.
+_JPEG_SCAN_BYTES = 512 * 1024
+
+
+def _png_dimensions(data: bytes) -> "tuple[int, int] | None":
+    if len(data) < 24 or not data.startswith(_PNG_MAGIC) or data[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def _jpeg_dimensions(data: bytes) -> "tuple[int, int] | None":
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    index = 2
+    end = min(len(data), _JPEG_SCAN_BYTES)
+    while index + 3 < end:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in {0xFF, 0x01} or 0xD0 <= marker <= 0xD8:
+            index += 2
+            continue
+        if index + 4 > end:
+            return None
+        size = int.from_bytes(data[index + 2:index + 4], "big")
+        if size < 2:
+            return None
+        if marker in _JPEG_SOF_MARKERS:
+            if index + 9 > end:
+                return None
+            height = int.from_bytes(data[index + 5:index + 7], "big")
+            width = int.from_bytes(data[index + 7:index + 9], "big")
+            return width, height
+        index += 2 + size
+    return None
+
+
+def _gif_dimensions(data: bytes) -> "tuple[int, int] | None":
+    if len(data) < 10 or data[:6] not in _GIF_MAGICS:
+        return None
+    return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+
+
+def _webp_dimensions(data: bytes) -> "tuple[int, int] | None":
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk = data[12:16]
+    if chunk == b"VP8X":
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return width, height
+    if chunk == b"VP8 ":
+        if data[23:26] != b"\x9d\x01\x2a":
+            return None
+        width = int.from_bytes(data[26:28], "little") & 0x3FFF
+        height = int.from_bytes(data[28:30], "little") & 0x3FFF
+        return width, height
+    if chunk == b"VP8L":
+        if data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    return None
+
+
+def _bmp_dimensions(data: bytes) -> "tuple[int, int] | None":
+    if len(data) < 26 or data[:2] != b"BM":
+        return None
+    width = int.from_bytes(data[18:22], "little", signed=True)
+    height = int.from_bytes(data[22:26], "little", signed=True)
+    return abs(width), abs(height)
+
+
+_IMAGE_SIGNATURE_READERS = {
+    "image/png": _png_dimensions,
+    "image/jpeg": _jpeg_dimensions,
+    "image/jpg": _jpeg_dimensions,
+    "image/gif": _gif_dimensions,
+    "image/webp": _webp_dimensions,
+    "image/bmp": _bmp_dimensions,
+}
+
+
+def _validate_image_payload(data: bytes, mime_type: str) -> tuple[int, int]:
+    """Corroborate the declared MIME and bound the bitmap BEFORE any decode.
+
+    The payload's own container signature must match the declared MIME, so a
+    mislabelled file is refused instead of being handed to a decoder as if it
+    were an image. The declared dimensions are read from the header and checked
+    against hard bounds, so a small compressed payload can never be expanded
+    into an unbounded bitmap.
+
+    Raises:
+        MediaError: unsupported/unmatched container, invalid size, or a bitmap
+                     beyond the pixel or side bound.
+    """
+    value = str(mime_type or "").strip().lower()
+    reader = _IMAGE_SIGNATURE_READERS.get(value)
+    if reader is None:
+        raise MediaError(f"{value or 'the declared type'} is not a supported image format.")
+    dimensions = reader(data)
+    if dimensions is None:
+        raise MediaError("The file is not a readable image of the declared type.")
+    width, height = dimensions
+    if width <= 0 or height <= 0:
+        raise MediaError("The image declares an invalid size.")
+    if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE or width * height > MAX_IMAGE_PIXELS:
+        raise MediaError(
+            f"The image is {width}x{height} — exceeds the "
+            f"{MAX_IMAGE_PIXELS}-pixel OCR bound."
+        )
+    return width, height
+
+
+def _normalize_ocr_text(text: str) -> str:
+    """Deterministic OCR normalization that preserves reading order.
+
+    Line structure survives (paragraphs stay separated), horizontal whitespace
+    runs collapse to one space, blank-line runs collapse to one blank line, and
+    nothing else is rewritten: Persian/Arabic text, its ZWNJ (U+200C) and any
+    directional marks pass through untouched. No truncation happens here — the
+    caller applies the character ceiling.
+    """
+    if not text:
+        return ""
+    lines: list[str] = []
+    blank_run = 0
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = " ".join(raw_line.split())
+        if line:
+            blank_run = 0
+            lines.append(line)
+        else:
+            blank_run += 1
+            if blank_run == 1:
+                lines.append("")
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def _cap_text(text: str, limit: int) -> tuple[str, bool]:
+    """Cap ``text`` at ``limit`` characters, reporting truncation honestly."""
+    if limit <= 0:
+        return "", bool(text)
+    if len(text) <= limit:
+        return text, False
+    return text[: limit - 1] + "…", True
+
+
+async def _run_ocr(engine: OcrEngine, data: bytes, timeout_s: float) -> str:
+    """Run ONE recognition off the event loop, under a finite bound.
+
+    Recognition is CPU-bound, so it runs in a worker thread — the same
+    ``asyncio.to_thread`` pattern M1.2 uses for document parsing — and the
+    awaited result is wrapped in a finite timeout so a stalled engine fails the
+    analysis honestly instead of holding the request. A worker thread cannot be
+    interrupted cooperatively, which is why the bound is enforced on the awaited
+    result rather than assumed to stop the engine itself.
+    """
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(engine.recognize, data), timeout=timeout_s,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise MediaError(f"OCR did not finish within {timeout_s:g}s.") from exc
+    except MediaError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — engine boundary
+        raise MediaError(f"OCR failed: {type(exc).__name__}") from exc
+    return result if isinstance(result, str) else ""
+
+
+async def _extract_image_content(
+    path: str, mime_type: str, limit: int,
+) -> tuple[str, bool, str]:
+    """OCR ONE downloaded image, bounded at every step (M1.3).
+
+    Bounds, in order: the payload must be inside the OCR input bound, its
+    signature must corroborate the declared MIME, its declared dimensions must
+    fit the bitmap bound, recognition must finish inside the OCR timeout, and the
+    normalized text is capped at ``limit`` characters.
+    """
+    engine = _ocr_engine
+    if engine is None:
+        raise MediaError("No OCR engine is provisioned on this runtime.")
+
+    data = _read_document_bytes(path)
+    if not data:
+        return "", False, "The image carried no data to read."
+    if len(data) > MAX_OCR_INPUT_BYTES:
+        raise MediaError(
+            f"The image is {_format_bytes(len(data))} — exceeds the "
+            f"{_format_bytes(MAX_OCR_INPUT_BYTES)} OCR input limit."
+        )
+
+    _validate_image_payload(data, mime_type)
+    raw_text = await _run_ocr(engine, data, OCR_TIMEOUT_S)
+    text = _normalize_ocr_text(raw_text)
+    if not text:
+        return "", False, "No readable text was detected in the image."
+    capped, truncated = _cap_text(text, limit)
+    return capped, truncated, ""
+
+
 def _extract_content(path: str, mime_type: str, limit: int) -> tuple[str, bool, str]:
     """Extract text from ONE downloaded asset, bounded by ``limit`` characters.
 
@@ -679,12 +985,19 @@ async def analyze_media(
         )
         return analysis
 
-    if not is_extractable_mime(info.mime_type):
-        analysis = _unsupported(
-            info, message,
-            f"No local extraction capability for {info.media_type} "
-            f"({info.mime_type or 'unknown type'}) in this phase.",
-        )
+    ocr_candidate = is_image_mime(info.mime_type) and ocr_available()
+    if not is_extractable_mime(info.mime_type) and not ocr_candidate:
+        if is_image_mime(info.mime_type):
+            reason = (
+                f"OCR is not available for {info.media_type} "
+                f"({info.mime_type}) — no OCR engine is provisioned on this runtime."
+            )
+        else:
+            reason = (
+                f"No local extraction capability for {info.media_type} "
+                f"({info.mime_type or 'unknown type'}) in this phase."
+            )
+        analysis = _unsupported(info, message, reason)
         logger.info(
             "MEDIA_ANALYZE owner=%s type=%s mime=%s status=%s", owner_id,
             info.media_type, info.mime_type or "-", analysis.status,
@@ -692,6 +1005,11 @@ async def analyze_media(
         return analysis
 
     limit = size_limit_bytes if size_limit_bytes and size_limit_bytes > 0 else max_download_bytes()
+    if ocr_candidate:
+        # An image is additionally bounded by the OCR input bound, and the tighter
+        # of the two is applied BEFORE the transfer: an image OCR could never be
+        # allowed to read is never downloaded at all.
+        limit = min(limit, MAX_OCR_INPUT_BYTES)
     if info.file_size and info.file_size > limit:
         raise MediaError(
             f"Media is {_format_bytes(info.file_size)} — exceeds the "
@@ -734,9 +1052,14 @@ async def analyze_media(
         # Container parsing is CPU-bound over an already size-bounded file, so
         # it runs off the event loop; the temporary directory is still removed
         # on every exit path below.
-        content, truncated, empty_reason = await asyncio.to_thread(
-            _extract_content, path, info.mime_type, MAX_EXTRACTED_CHARS,
-        )
+        if ocr_candidate:
+            content, truncated, empty_reason = await _extract_image_content(
+                path, info.mime_type, MAX_OCR_CHARS,
+            )
+        else:
+            content, truncated, empty_reason = await asyncio.to_thread(
+                _extract_content, path, info.mime_type, MAX_EXTRACTED_CHARS,
+            )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

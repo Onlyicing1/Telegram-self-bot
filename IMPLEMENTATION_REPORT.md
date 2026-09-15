@@ -1,6 +1,230 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.2: bounded PDF/DOCX document extraction
+## Latest phase — Media Processing M1.3: the bounded OCR boundary for still images
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `916ec05` (origin/main — the M1.2 document-extraction delivery record) |
+| Implementation commit (code + tests) | _(recorded in the accompanying docs commit)_ |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Provider architecture impact | **none** (`media_ai_service.py` untouched — it still receives plain-string `as_context_text()`) |
+| Prompt architecture impact | **none** (no `PromptBuilder`, context-builder or `MEDIA_ANALYSIS_SYSTEM_PROMPT` change) |
+| Presentation / delivery impact | **none** (no AI message formatting, RTL, edit-in-place or delivery change) |
+| Dependency added | **none** (`backend/requirements.txt` unchanged; no OCR/ML/native stack added) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+| Live OCR recognition verification | **NOT performed** — this phase provisions **no engine**, so no recognition was executed against any real image |
+
+### The exact task
+
+Add **M1.3 — bounded OCR for image media** to the existing Media Processing
+boundary: a photo the runtime already resolved should be able to become bounded
+plain text through the existing `MediaAnalysis` contract, without a second
+download pipeline, without provider changes, and without Telegram or
+conversational context reaching the model.
+
+### The scoping decision that shaped this phase (measured, not assumed)
+
+The task named RapidOCR/PaddleOCR as primary candidates and Tesseract as a
+possible secondary. That premise was tested against the actual environment
+before any code was written, and it does not hold:
+
+| Measurement | Result |
+|---|---|
+| `rapidocr-onnxruntime` bundled models | only `ch_PP-OCRv4` det/rec/cls — **no Arabic/Persian model is shipped** |
+| Recognition charset (read from the model's ONNX metadata) | 6 623 classes; **0 real Arabic/Persian letters** (the 5 code points in the Arabic block are CJK punctuation lookalikes `﹑﹝﹞﹢﹗`) |
+| Peak RSS for **one** small English OCR | **548.7 MB** (baseline 15.2 MB) |
+| Wall time for **one** 420×120 px English OCR | **11.25 s** on this sandbox CPU |
+| Import with the dependency's own declared deps | `ImportError: libxcb.so.1` — `opencv-python` (non-headless, what rapidocr pins) does not load in a headless container |
+| Added on disk | onnxruntime 51 MB + cv2 72 MB + numpy 40 MB + PIL 6.6 MB |
+| Tesseract | a **system binary** — `INVESTIGATION.md` §10/§11 already proves it cannot arrive via `requirements.txt` |
+
+Against the project's own hard ceiling — `AI_MASTER_DESIGN.md` §28.2 (AI RAM
+**≤ 70 MB**) and §28.4 (process **≤ 512 MB**, "must never trigger an OOM kill";
+"if a feature cannot fit, the feature must be redesigned — not the budget") — a
+local onnxruntime OCR stack **cannot ship**: a single recognition already
+measures **548.7 MB**, i.e. on its own more than the whole process allowance.
+And even shipping it would still not deliver Persian, which is a required
+validation target. Since `requirements.txt` cannot supply Tesseract either,
+**no** named candidate satisfies the constraints.
+
+The owner therefore directed this phase to **boundary only, no new deps**: build
+the complete, tested OCR boundary and seam, provision **no** engine, and let
+recognition be an explicit deployment decision deferred to M1.4. Every probe
+package installed while establishing the evidence above was removed again, and
+the environment was returned to its prior state (verified: `requirements.txt`
+unchanged, probe packages absent, and the one dependency my cleanup had broken —
+`six`, needed by `python-dateutil` — reinstalled).
+
+### Exact behaviour implemented
+
+All of it lives in the existing single media authority,
+`backend/services/media_service.py`. `media_ai_service.py` was **not touched**.
+
+**The engine seam (new)** — `OcrEngine` (a `typing.Protocol` with one method,
+`recognize(image: bytes) -> str`), plus `set_ocr_engine` / `get_ocr_engine` /
+`ocr_available`. Nothing is provisioned by default. The seam is deliberately
+one method wide: the boundary owns resolution, transfer, validation, bounds,
+timeout, cleanup and normalization, so provisioning an engine cannot alter the
+media contract.
+
+**Fail-closed with no engine (new)** — an image whose MIME is OCR-able is
+extractable **only when an engine is provisioned**. With none provisioned (the
+shipped default) the asset is reported `UNSUPPORTED` with an explicit reason and
+is **never transferred** — the same fail-closed rule M1/M1.2 use for
+types they cannot process, so a phase never silently depends on a heavy native
+stack and nothing is partially processed.
+
+**Image routing (new)** — `is_image_mime` covers `image/jpeg`, `image/jpg`,
+`image/png`, `image/webp`, `image/bmp`, `image/gif`. `is_extractable_mime` was
+**deliberately left unchanged** (it still describes the dependency-free
+`text/*` + container extractors only), so the existing M1/M1.2 predicate and its
+tests are untouched; OCR images are gated by `is_image_mime` + `ocr_available`.
+This keeps the M1.2 test expectation `is_extractable_mime("image/jpeg") is False`
+valid and unchanged (recorded as a pinned test).
+
+**Container corroboration (new)** — MIME is never trusted for a decode. The
+payload's own signature must match the declared type, read by bounded,
+dependency-free header parsers (`_png_dimensions`, `_jpeg_dimensions`,
+`_gif_dimensions`, `_webp_dimensions` VP8X/VP8/VP8L, `_bmp_dimensions`). The JPEG
+marker walk is capped at 512 KB. A mismatch, an unreadable header or a
+nonsensical size is a **hard `MediaError`**, never a guess.
+
+**Pre-decode bitmap bound (new)** — the declared dimensions are read from the
+header and checked against `MAX_IMAGE_PIXELS` / `MAX_IMAGE_SIDE` **before any
+decoder sees the bytes**, so a few hundred bytes can never be expanded into an
+unbounded bitmap (decompression bomb).
+
+**Bounded recognition (new)** — `_run_ocr` runs `engine.recognize` through
+`asyncio.to_thread` (the same off-event-loop pattern M1.2 uses for document
+parsing) inside `asyncio.wait_for(..., OCR_TIMEOUT_S)`. A timeout, an engine
+exception, a non-string result and a cancelled request are each handled
+explicitly (`CancelledError` is always re-raised). A worker thread cannot be
+interrupted cooperatively, so the bound is enforced on the awaited result —
+stated plainly rather than implied.
+
+**Deterministic normalization (new)** — `_normalize_ocr_text` keeps line
+structure, collapses horizontal whitespace runs to one space, collapses
+blank-line runs to one blank line, and rewrites **nothing** else: Persian/Arabic
+text, its ZWNJ (U+200C) and directional marks pass through unchanged, in reading
+order. `_cap_text` then applies the character ceiling and reports truncation.
+
+**Honest outcomes** — an image with no readable text returns `EXTRACTED` with
+empty content and the reason `No readable text was detected in the image.` (so
+M1.1's existing `not has_content` branch answers deterministically and the LLM is
+**not** called merely to explain an empty result). A malformed/mismatched
+payload, an oversized input, an oversized bitmap, a timeout or an engine failure
+raise `MediaError`.
+
+**Unchanged, deliberately** — `MediaAnalysis` fields, `as_dict()`,
+`as_context_text()`, `resolve_media_message`, the bounded facade download, the
+per-operation temporary directory and its `finally: shutil.rmtree`, the
+zero-context rule, PDF/DOCX extraction and text extraction.
+
+### Bounds (hard module constants, not configurable)
+
+| Constant | Value | Where it is enforced |
+|---|---|---|
+| `MAX_OCR_INPUT_BYTES` | 8 MiB | **before the transfer** (the tighter of it and the Deep-Save size authority) and again on the payload |
+| `MAX_IMAGE_PIXELS` | 12 000 000 | pre-decode, from the container header |
+| `MAX_IMAGE_SIDE` | 10 000 px | pre-decode, from the container header |
+| `MAX_OCR_CHARS` | `MAX_EXTRACTED_CHARS` (16 000) | post-normalization, with honest `truncated` |
+| `OCR_TIMEOUT_S` | 45.0 s | the awaited recognition result |
+| `_JPEG_SCAN_BYTES` | 512 KiB | the JPEG marker walk |
+| transfer bound | unchanged (`MEDIA_DOWNLOAD_TIMEOUT_S` 120 s, size = Deep-Save limit) | the existing facade + service checks |
+
+The OCR input bound is deliberately **tighter** than the transfer bound and is
+applied first, so an image OCR could never be allowed to read is never
+downloaded at all.
+
+### Download / cleanup behaviour
+
+No new transfer path: OCR reuses the M1 bounded download through
+`backend/telegram_api.media` (`guarded_await`) and the existing per-operation
+temporary directory. Cleanup is unchanged and re-verified for the OCR path —
+the directory is removed on success, no-content, malformed input, engine
+failure, timeout and cancellation.
+
+### Context isolation
+
+Unchanged and re-asserted for OCR: the engine receives **only** the validated
+image bytes, `as_context_text()` still renders no caption, sender, chat id,
+message id or filename, and no OCR code calls a provider.
+
+### Persian coverage — what is and is not proven
+
+* **Proven (automated):** Persian text — including an explicit ZWNJ — passes
+  through validation, normalization, capping and `MediaAnalysis` **unchanged and
+  in reading order**, mixed Persian/English lines keep their order, and a
+  21 000-character Persian OCR result truncates to exactly 16 000 characters
+  with the same truncation semantics as every other extractor.
+* **NOT proven:** Persian *recognition quality*. This phase provisions no
+  engine, and the measured evidence above shows the available engines either
+  cannot read Persian at all or cannot fit the runtime budget. No claim about
+  recognition accuracy is made anywhere.
+
+### Tests actually run (this revision)
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_image_ocr.py -q` (new, 54 tests) | **54 passed** |
+| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_ai_integration.py tests/test_remediation_rc6_a123.py -q` | **136 passed** |
+| `pytest tests -q` (full suite) | **3 052 passed, 24 skipped, 0 failed** |
+| `py_compile` on both changed files | passed |
+| `git diff --check` | clean |
+
+The new suite uses **real** container fixtures built in-process (a complete
+`zlib`-encoded PNG, plus byte-accurate JPEG/GIF/WEBP/BMP headers) and the real
+`telethon.tl.types` media objects, so the existing classifier, validation,
+normalization, bounds, cleanup and loop-offload paths all run for real. Only the
+*engine* is scripted, because this phase ships none by design.
+
+**Non-vacuous (measured, not asserted).** Lifting a bound was shown to flip each
+test's outcome:
+
+| Probe | Real bounds | Bound lifted |
+|---|---|---|
+| 60 000×60 000 decompression bomb | `MediaError: … exceeds the 12000000-pixel OCR bound` | accepted (`OK`) |
+| 21 000-char Persian OCR result | 16 000 chars, `truncated=True` | 21 000 chars, `truncated=False` |
+
+### What was NOT done
+
+No engine provisioned; no new dependency; no `requirements.txt`, `render.yaml`
+or `Procfile` change; no `media_ai_service.py`, `ProviderManager`, provider
+adapter, `vision()`, prompt, context, session, memory, scheduler, Taskloom,
+delivery, presentation, Save or Supabase change; no second download pipeline, no
+cache, no polling, no new table or column, no SQL.
+
+### Deferred to M1.4 or later
+
+1. **Provisioning an OCR engine.** This is now a single decision at one seam
+   (`set_ocr_engine`). It needs either a runtime budget re-authorization
+   (§28.2/§28.4) or a genuinely lightweight engine, which the evidence above did
+   not find.
+2. **Persian recognition quality** for whichever engine is chosen, with real
+   Persian fixtures and a measured accuracy statement.
+3. STT, video/GIF frame sampling, native multimodal `vision()` — all still out
+   of reach for the reasons in `INVESTIGATION.md` §11.
+
+### Limitations / NOT YET PROVEN
+
+* No live Telegram/Telethon verification was performed (no live session here):
+  the resolve → bounded download → OCR → `MediaAnalysis` → provider path is
+  proven at code/test level only.
+* **No live OCR recognition was executed at all** — the boundary is proven, the
+  engine is intentionally absent. Until an engine is provisioned, an image
+  reply is answered with the deterministic `UNSUPPORTED` explanation rather
+  than OCR text.
+* The pre-decode pixel bound is a policy guard on **declared** header
+  dimensions; a decoder that lies about its own header is out of scope for a
+  header-only check (no decoder is invoked in this phase).
+* `asyncio.wait_for` bounds the *awaited* recognition result; a non-cooperative
+  engine's worker thread is not force-stopped.
+
+---
+
+## Previous phase — Media Processing M1.2: bounded PDF/DOCX document extraction
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
