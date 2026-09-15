@@ -104,8 +104,16 @@ class TelegramAPI:
         message: Any,
         file_path: str | None = None,
         progress_callback: Any = None,
+        timeout: float | None = None,
     ) -> str | bytes | None:
-        return await media.download_media(self._client, message, file_path, progress_callback)
+        """Download a message's media. Always bounded by a finite timeout.
+
+        ``timeout`` is a tighter caller-supplied bound; ``None`` uses the
+        module's media ceiling. The size limit remains the caller's job.
+        """
+        return await media.download_media(
+            self._client, message, file_path, progress_callback, timeout,
+        )
 
     # ── Entities ──
 
