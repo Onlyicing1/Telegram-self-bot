@@ -78,6 +78,20 @@ silently acquires a heavy native stack, and no image is ever partially
 processed. Persian and English text are preserved unchanged by normalization;
 recognition QUALITY is a property of whatever engine is later provisioned and
 is deliberately not claimed here.
+
+M1.4 scope: the same pattern for **Voice/Audio** — a bounded speech-to-text
+boundary. Resolution, transfer, validation, cleanup, the zero-context rule and
+the fail-closed contract are unchanged. The additions are the audio containers
+this boundary can both corroborate and bound using only the standard library,
+the channel/rate/duration guards enforced BEFORE any decode, the transcription
+timeout, and normalization into the same character ceiling. Transcription is a
+seam (``SttEngine``) and this phase likewise provisions **no** engine: Voice and
+Audio are reported ``UNSUPPORTED`` *without being transferred* until one is
+provisioned. The engine decision is deferred on measured evidence — every local
+candidate evaluated either could not be delivered by ``requirements.txt`` or
+measured far outside the project's documented resource budget. No transcript is
+ever fabricated, no hosted service is used, and no audio container whose
+duration cannot be determined is ever handed to an engine.
 """
 from __future__ import annotations
 
@@ -182,6 +196,44 @@ MAX_OCR_CHARS = MAX_EXTRACTED_CHARS
 #: M1.3 wall-clock bound for ONE recognition. Finite, well inside the media
 #: request's own envelope, and never applied to an unrelated AI request.
 OCR_TIMEOUT_S = 45.0
+
+#: M1.4 — audio MIME types the STT boundary may process. Only containers whose
+#: signature AND duration are cheaply and deterministically derivable with the
+#: standard library are listed. Every other audio container (MP3, M4A/MP4, WebM,
+#: AAC, AC3, ...) stays UNSUPPORTED and is never transferred, rather than being
+#: handed to an engine on a guessed duration.
+STT_AUDIO_MIME_TYPES = frozenset({
+    "audio/ogg", "audio/opus", "application/ogg",
+    "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
+    "audio/flac", "audio/x-flac",
+})
+
+#: M1.4 input bound for speech-to-text: tighter than the media size authority
+#: (50 MiB) and enforced BEFORE the transfer, exactly like the OCR input bound.
+#: Derivation: it must hold ``MAX_STT_DURATION_S`` of the largest stream this
+#: phase accepts uncompressed (16 kHz mono 16-bit PCM ≈ 32 KB/s → ≈ 9.6 MiB), so
+#: every compressed format fits with headroom while an oversized payload is
+#: refused before it is ever downloaded.
+MAX_STT_INPUT_BYTES = 20 * 1024 * 1024
+
+#: M1.4 decoded-stream bounds. Audio expands into a decoded PCM stream whose size
+#: the container's own declared duration, channels and rate predict, so all three
+#: are bounded BEFORE any decoder or engine sees the bytes.
+MAX_STT_DURATION_S = 300.0
+MAX_STT_CHANNELS = 2
+MAX_STT_SAMPLE_RATE = 48_000
+
+#: Bound for the container walk that derives the declared audio info, so a
+#: deliberately fragmented container cannot be walked without limit.
+_MAX_AUDIO_PAGES = 200_000
+
+#: M1.4 character ceiling for a transcript, shared with every other extractor so
+#: every path produces text bounded by the same project prompt budget.
+MAX_STT_CHARS = MAX_EXTRACTED_CHARS
+
+#: M1.4 wall-clock bound for ONE transcription. Finite, well inside the media
+#: request's own envelope, and never applied to an unrelated AI request.
+STT_TIMEOUT_S = 60.0
 
 #: Container signatures. MIME alone is never trusted for a safety-relevant
 #: parse: the actual container must corroborate the declared type.
@@ -457,6 +509,51 @@ def get_ocr_engine() -> "OcrEngine | None":
 def ocr_available() -> bool:
     """True when an OCR engine is provisioned on this runtime."""
     return _ocr_engine is not None
+
+
+def is_stt_mime(mime_type: str) -> bool:
+    """True for the audio MIME types the STT boundary may process (M1.4)."""
+    return str(mime_type or "").strip().lower() in STT_AUDIO_MIME_TYPES
+
+
+class SttEngine(Protocol):
+    """The STT seam: ONE deterministic ``audio bytes -> transcript`` callable.
+
+    The boundary owns everything around transcription — deterministic target
+    resolution, bounded transfer, container validation, the channel/rate/duration
+    guards, the timeout, temporary cleanup and normalization. An engine only turns
+    already-validated audio bytes into text, so provisioning one is a deployment
+    decision that cannot alter the media contract. No engine is provisioned by
+    default (see module docstring).
+    """
+
+    def transcribe(self, audio: bytes) -> str:
+        """Return the transcript of ``audio`` (empty when there is no speech)."""
+        ...
+
+
+_stt_engine: "SttEngine | None" = None
+
+
+def set_stt_engine(engine: "SttEngine | None") -> None:
+    """Provision (or clear) the process-wide speech-to-text engine.
+
+    Nothing is provisioned by default, so an unprovisioned runtime reports Voice
+    and Audio as UNSUPPORTED *without transferring them* and never depends on a
+    heavy native stack or a model artifact it did not explicitly opt into.
+    """
+    global _stt_engine
+    _stt_engine = engine
+
+
+def get_stt_engine() -> "SttEngine | None":
+    """The provisioned STT engine, or ``None`` when none is available."""
+    return _stt_engine
+
+
+def stt_available() -> bool:
+    """True when a speech-to-text engine is provisioned on this runtime."""
+    return _stt_engine is not None
 
 
 class _TextAccumulator:
@@ -754,8 +851,8 @@ def _validate_image_payload(data: bytes, mime_type: str) -> tuple[int, int]:
     return width, height
 
 
-def _normalize_ocr_text(text: str) -> str:
-    """Deterministic OCR normalization that preserves reading order.
+def _normalize_extracted_text(text: str) -> str:
+    """Deterministic normalization shared by every extractor (OCR and STT).
 
     Line structure survives (paragraphs stay separated), horizontal whitespace
     runs collapse to one space, blank-line runs collapse to one blank line, and
@@ -842,9 +939,241 @@ async def _extract_image_content(
 
     _validate_image_payload(data, mime_type)
     raw_text = await _run_ocr(engine, data, OCR_TIMEOUT_S)
-    text = _normalize_ocr_text(raw_text)
+    text = _normalize_extracted_text(raw_text)
     if not text:
         return "", False, "No readable text was detected in the image."
+    capped, truncated = _cap_text(text, limit)
+    return capped, truncated, ""
+
+
+#: Container signatures for the audio formats this boundary may process.
+_OGG_MAGIC = b"OggS"
+_WAV_RIFF = b"RIFF"
+_WAV_WAVE = b"WAVE"
+_FLAC_MAGIC = b"fLaC"
+_OPUS_HEADER = b"OpusHead"
+_VORBIS_HEADER = b"\x01vorbis"
+#: Opus granule positions are ALWAYS in 48 kHz units, whatever the input rate
+#: the stream declares, so the two must not be conflated when deriving duration.
+_OPUS_GRANULE_RATE = 48_000
+
+
+def _ogg_audio_info(data: bytes) -> "tuple[int, int, float] | None":
+    """``(channels, sample_rate, duration_s)`` from an OGG/Opus or OGG/Vorbis stream.
+
+    Walks OGG pages (bounded by page count, over an already size-bounded file),
+    reads the codec identification header of the first audio page and the final
+    granule position, which is the stream's exact sample count. Returns ``None``
+    for anything that is not a readable OGG stream.
+    """
+    total = len(data)
+    if total < 28 or data[:4] != _OGG_MAGIC or data[4] != 0:
+        return None
+    channels = 0
+    sample_rate = 0
+    granule_rate = 0
+    granule = 0
+    pages = 0
+    index = 0
+    while index + 27 <= total:
+        if data[index:index + 4] != _OGG_MAGIC or data[index + 4] != 0:
+            return None
+        pages += 1
+        if pages > _MAX_AUDIO_PAGES:
+            return None
+        page_granule = int.from_bytes(data[index + 6:index + 14], "little")
+        if page_granule > granule:
+            granule = page_granule
+        segment_count = data[index + 26]
+        payload = index + 27 + segment_count
+        if payload > total:
+            return None
+        if channels == 0:
+            if data[payload:payload + 8] == _OPUS_HEADER and payload + 19 <= total:
+                channels = data[payload + 9]
+                sample_rate = int.from_bytes(data[payload + 12:payload + 16], "little")
+                granule_rate = _OPUS_GRANULE_RATE
+            elif data[payload:payload + 7] == _VORBIS_HEADER and payload + 16 <= total:
+                channels = data[payload + 11]
+                sample_rate = int.from_bytes(data[payload + 12:payload + 16], "little")
+                granule_rate = sample_rate
+        index = payload + sum(data[index + 27:payload])
+    if channels <= 0 or sample_rate <= 0 or granule_rate <= 0:
+        return None
+    return channels, sample_rate, granule / granule_rate
+
+
+def _wav_audio_info(data: bytes) -> "tuple[int, int, float] | None":
+    """``(channels, sample_rate, duration_s)`` from a RIFF/WAVE stream.
+
+    Reads only the ``fmt `` and ``data`` chunk headers, so the walk is bounded by
+    the declared chunk sizes and never by the payload's contents.
+    """
+    total = len(data)
+    if total < 44 or data[:4] != _WAV_RIFF or data[8:12] != _WAV_WAVE:
+        return None
+    channels = 0
+    sample_rate = 0
+    byte_rate = 0
+    data_bytes = 0
+    index = 12
+    while index + 8 <= total:
+        chunk_id = data[index:index + 4]
+        chunk_size = int.from_bytes(data[index + 4:index + 8], "little")
+        body = index + 8
+        if chunk_id == b"fmt ":
+            if body + 16 > total:
+                return None
+            channels = int.from_bytes(data[body + 2:body + 4], "little")
+            sample_rate = int.from_bytes(data[body + 4:body + 8], "little")
+            byte_rate = int.from_bytes(data[body + 8:body + 12], "little")
+        elif chunk_id == b"data":
+            data_bytes = min(chunk_size, max(0, total - body))
+            break
+        index = body + chunk_size + (chunk_size % 2)
+    if channels <= 0 or sample_rate <= 0 or byte_rate <= 0:
+        return None
+    return channels, sample_rate, data_bytes / byte_rate
+
+
+def _flac_audio_info(data: bytes) -> "tuple[int, int, float] | None":
+    """``(channels, sample_rate, duration_s)`` from a FLAC stream.
+
+    STREAMINFO is always the first metadata block, so the walk is a fixed
+    34-byte read. A stream that does not declare a total sample count cannot be
+    bounded and therefore returns ``None`` (fail-closed at the call site).
+    """
+    if len(data) < 42 or data[:4] != _FLAC_MAGIC:
+        return None
+    if (data[4] & 0x7F) != 0 or int.from_bytes(data[5:8], "big") != 34:
+        return None
+    # STREAMINFO body starts at 8; its packed sample-rate/channels/total-samples
+    # field is 10 bytes into that body (after min/max block and min/max frame
+    # sizes), i.e. file offset 18.
+    bits = int.from_bytes(data[18:26], "big")
+    sample_rate = bits >> 44
+    channels = ((bits >> 41) & 0x07) + 1
+    total_samples = bits & ((1 << 36) - 1)
+    if sample_rate <= 0 or channels <= 0:
+        return None
+    # A total-sample count of 0 means "unknown": a VALID stream whose length the
+    # container does not declare. It is reported as a zero duration so the caller
+    # can refuse it for being unbounded rather than for being malformed.
+    return channels, sample_rate, (total_samples / sample_rate) if total_samples else 0.0
+
+
+_STT_SIGNATURE_READERS = {
+    "audio/ogg": _ogg_audio_info,
+    "audio/opus": _ogg_audio_info,
+    "application/ogg": _ogg_audio_info,
+    "audio/wav": _wav_audio_info,
+    "audio/x-wav": _wav_audio_info,
+    "audio/wave": _wav_audio_info,
+    "audio/vnd.wave": _wav_audio_info,
+    "audio/flac": _flac_audio_info,
+    "audio/x-flac": _flac_audio_info,
+}
+
+
+def _validate_audio_payload(data: bytes, mime_type: str) -> tuple[int, int, float]:
+    """Corroborate the declared MIME and bound the decoded stream BEFORE any decode.
+
+    The payload's own container signature must match the declared MIME, and the
+    stream it declares — channel count, sample rate and duration — must fit hard
+    bounds, so no container trick can ask an engine to chew on an unbounded
+    decoded stream. A stream whose duration cannot be determined is refused
+    rather than transcribed unbounded.
+
+    Raises:
+        MediaError: unsupported/unmatched container, invalid stream, a channel,
+                     rate or duration beyond its bound, or an unbounded stream.
+    """
+    value = str(mime_type or "").strip().lower()
+    reader = _STT_SIGNATURE_READERS.get(value)
+    if reader is None:
+        raise MediaError(f"{value or 'the declared type'} is not a supported audio format.")
+    info = reader(data)
+    if info is None:
+        raise MediaError("The file is not a readable audio stream of the declared type.")
+    channels, sample_rate, duration_s = info
+    if channels <= 0 or sample_rate <= 0:
+        raise MediaError("The audio declares an invalid stream.")
+    if channels > MAX_STT_CHANNELS:
+        raise MediaError(
+            f"The audio has {channels} channels — exceeds the "
+            f"{MAX_STT_CHANNELS}-channel speech-to-text bound."
+        )
+    if sample_rate > MAX_STT_SAMPLE_RATE:
+        raise MediaError(
+            f"The audio is {sample_rate} Hz — exceeds the "
+            f"{MAX_STT_SAMPLE_RATE} Hz speech-to-text bound."
+        )
+    if duration_s <= 0:
+        raise MediaError(
+            "The audio duration could not be determined, so speech-to-text "
+            "cannot be bounded."
+        )
+    if duration_s > MAX_STT_DURATION_S:
+        raise MediaError(
+            f"The audio is {duration_s:.0f}s — exceeds the "
+            f"{MAX_STT_DURATION_S:.0f}s speech-to-text bound."
+        )
+    return channels, sample_rate, duration_s
+
+
+async def _run_stt(engine: SttEngine, data: bytes, timeout_s: float) -> str:
+    """Run ONE transcription off the event loop, under a finite bound.
+
+    Transcription is CPU-bound, so it runs in a worker thread — the same
+    ``asyncio.to_thread`` pattern M1.2 uses for document parsing — and the
+    awaited result is wrapped in a finite timeout so a stalled engine fails the
+    analysis honestly instead of holding the request. A worker thread cannot be
+    interrupted cooperatively, so the bound is enforced on the awaited result
+    rather than assumed to stop the engine itself.
+    """
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(engine.transcribe, data), timeout=timeout_s,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise MediaError(f"Speech-to-text did not finish within {timeout_s:g}s.") from exc
+    except MediaError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — engine boundary
+        raise MediaError(f"Speech-to-text failed: {type(exc).__name__}") from exc
+    return result if isinstance(result, str) else ""
+
+
+async def _extract_audio_content(
+    path: str, mime_type: str, limit: int,
+) -> tuple[str, bool, str]:
+    """Transcribe ONE downloaded audio asset, bounded at every step (M1.4).
+
+    Bounds, in order: the payload must be inside the STT input bound, its
+    signature must corroborate the declared MIME, its declared channels, sample
+    rate and duration must fit their bounds, transcription must finish inside the
+    STT timeout, and the normalized transcript is capped at ``limit`` characters.
+    """
+    engine = _stt_engine
+    if engine is None:
+        raise MediaError("No speech-to-text engine is provisioned on this runtime.")
+
+    data = _read_document_bytes(path)
+    if not data:
+        return "", False, "The audio carried no data to read."
+    if len(data) > MAX_STT_INPUT_BYTES:
+        raise MediaError(
+            f"The audio is {_format_bytes(len(data))} — exceeds the "
+            f"{_format_bytes(MAX_STT_INPUT_BYTES)} speech-to-text input limit."
+        )
+
+    _validate_audio_payload(data, mime_type)
+    raw_text = await _run_stt(engine, data, STT_TIMEOUT_S)
+    text = _normalize_extracted_text(raw_text)
+    if not text:
+        return "", False, "No speech was detected in the audio."
     capped, truncated = _cap_text(text, limit)
     return capped, truncated, ""
 
@@ -986,11 +1315,17 @@ async def analyze_media(
         return analysis
 
     ocr_candidate = is_image_mime(info.mime_type) and ocr_available()
-    if not is_extractable_mime(info.mime_type) and not ocr_candidate:
+    stt_candidate = is_stt_mime(info.mime_type) and stt_available()
+    if not is_extractable_mime(info.mime_type) and not ocr_candidate and not stt_candidate:
         if is_image_mime(info.mime_type):
             reason = (
                 f"OCR is not available for {info.media_type} "
                 f"({info.mime_type}) — no OCR engine is provisioned on this runtime."
+            )
+        elif is_stt_mime(info.mime_type):
+            reason = (
+                f"Speech-to-text is not available for {info.media_type} "
+                f"({info.mime_type}) — no STT engine is provisioned on this runtime."
             )
         else:
             reason = (
@@ -1010,6 +1345,10 @@ async def analyze_media(
         # of the two is applied BEFORE the transfer: an image OCR could never be
         # allowed to read is never downloaded at all.
         limit = min(limit, MAX_OCR_INPUT_BYTES)
+    elif stt_candidate:
+        # Same rule for audio: the tighter of the two bounds is applied BEFORE the
+        # transfer, so audio STT could never be allowed to read is never fetched.
+        limit = min(limit, MAX_STT_INPUT_BYTES)
     if info.file_size and info.file_size > limit:
         raise MediaError(
             f"Media is {_format_bytes(info.file_size)} — exceeds the "
@@ -1055,6 +1394,10 @@ async def analyze_media(
         if ocr_candidate:
             content, truncated, empty_reason = await _extract_image_content(
                 path, info.mime_type, MAX_OCR_CHARS,
+            )
+        elif stt_candidate:
+            content, truncated, empty_reason = await _extract_audio_content(
+                path, info.mime_type, MAX_STT_CHARS,
             )
         else:
             content, truncated, empty_reason = await asyncio.to_thread(
