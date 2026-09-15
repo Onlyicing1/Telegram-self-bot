@@ -48,6 +48,8 @@ ACTION_NAMES = frozenset({
     "task_transition",
     "task_delete",
     "retrieve_save",
+    "preview_saved_item",
+    "delete_saved_item",
     "send",
     "clean_chat",
     "remember",
@@ -74,6 +76,8 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "task_transition",
     "task_delete",
     "retrieve_save",
+    "preview_saved_item",
+    "delete_saved_item",
 })
 
 # Read-only status/query actions: no target — the mapped tool reads the
@@ -265,13 +269,17 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             error="'fields' is only valid for the account_status action.",
         )
 
-    # ``save_code`` is only meaningful for retrieve_save. It is validated as
-    # a bounded string here; the canonical `S####` shape is enforced by the
-    # tool (the code travels verbatim, upper-cased at the service boundary).
-    if "save_code" in raw and action != "retrieve_save":
+    # ``save_code`` is only meaningful for the saved-item actions. It is
+    # validated as a bounded string here; the canonical `S####` shape is
+    # enforced by the tool (the code travels verbatim, upper-cased at the
+    # service boundary).
+    if "save_code" in raw and action not in _SAVE_ITEM_ACTIONS:
         return ActionParseResult(
             kind=KIND_INVALID,
-            error="'save_code' is only valid for the retrieve_save action.",
+            error=(
+                "'save_code' is only valid for the retrieve_save, "
+                "preview_saved_item and delete_saved_item actions."
+            ),
         )
 
     # ``task_id``/``expected_version``/``action`` status fields are only
@@ -300,8 +308,8 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     if action in ("task_inspect", "task_transition", "task_delete"):
         return _validate_task_lifecycle_action(action, raw)
 
-    if action == "retrieve_save":
-        return _validate_retrieve_save_action(raw)
+    if action in _SAVE_ITEM_ACTIONS:
+        return _validate_saved_item_action(action, raw)
 
     # Read-only status/query actions map directly to an existing tool. They
     # take no target; ``search_saved_items`` requires a query,
@@ -552,6 +560,9 @@ _TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 _TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 _SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
 
+# Actions that address ONE stored item by its save code.
+_SAVE_ITEM_ACTIONS = ("retrieve_save", "preview_saved_item", "delete_saved_item")
+
 
 def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
     """Validate one task_lifecycle action object.
@@ -630,19 +641,25 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
     )
 
 
-def _validate_retrieve_save_action(raw: dict[str, Any]) -> ActionParseResult:
-    """Validate one retrieve_save action object (exact-field-set rule)."""
+def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
+    """Validate one saved-item action object (exact-field-set rule).
+
+    ``retrieve_save``, ``preview_saved_item`` and ``delete_saved_item`` all
+    address one stored item through the same field set and the same code
+    validation; only the resolved target differs (re-sending happens in the
+    current chat, previewing/deleting addresses the item itself).
+    """
     unknown = sorted(set(raw) - {"action", "save_code"})
     if unknown:
         return ActionParseResult(
             kind=KIND_INVALID,
-            error=f"Unknown field(s) for retrieve_save: {', '.join(unknown)}",
+            error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
         )
     save_code = raw.get("save_code")
     if not isinstance(save_code, str):
         return ActionParseResult(
             kind=KIND_INVALID,
-            error="Missing or invalid 'save_code' for retrieve_save.",
+            error=f"Missing or invalid 'save_code' for {action}.",
         )
     normalized = save_code.strip().upper()
     if not normalized or not _SAVE_CODE_RE.match(normalized):
@@ -652,8 +669,8 @@ def _validate_retrieve_save_action(raw: dict[str, Any]) -> ActionParseResult:
         )
     return ActionParseResult(
         kind=KIND_EXECUTABLE,
-        action="retrieve_save",
-        target="current_chat",
+        action=action,
+        target="current_chat" if action == "retrieve_save" else "saved_item",
         save_code=normalized,
     )
 
@@ -666,6 +683,8 @@ def _default_target(action: str) -> str:
         return "replied_message"
     if action == "retrieve_save":
         return "current_chat"
+    if action in ("preview_saved_item", "delete_saved_item"):
+        return "saved_item"
     if action in ("task_list", "task_inspect", "task_transition", "task_delete"):
         return "schedule"
     return "recent_messages"
@@ -764,6 +783,15 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
 
     if action == "retrieve_save":
         return [{"name": "retrieve_save", "arguments": {"save_code": result.save_code}}]
+
+    if action == "preview_saved_item":
+        return [{"name": "preview_save", "arguments": {"save_code": result.save_code}}]
+
+    if action == "delete_saved_item":
+        # Saved-items management through the registered tool; the service
+        # boundary enforces owner scoping immediately before the DB row and
+        # the Saved Messages copy are removed.
+        return [{"name": "delete_save", "arguments": {"save_code": result.save_code}}]
 
     if action == "delete_messages":
         if target == "message_id":
@@ -1262,6 +1290,22 @@ def _has_save_mention(words: list[str]) -> bool:
     )
 
 
+# A save code is the existing short form (``db.client.get_next_save_code``:
+# ``S`` + alphanumerics). ``_tokenize`` lower-cases and digit-normalizes the
+# owner's text, so the code arrives as e.g. "s0001". At least one digit is
+# required so ordinary English words ("save", "saved", "semantic") can never
+# be read as an item code.
+_SAVE_CODE_TOKEN_RE = re.compile(r"^s[0-9a-z]{1,11}$")
+
+
+def _extract_save_code(words: list[str]) -> str | None:
+    """Extract the first explicit save-code token, canonicalized to upper case."""
+    for tok in words:
+        if _SAVE_CODE_TOKEN_RE.match(tok) and any(ch.isdigit() for ch in tok):
+            return tok.upper()
+    return None
+
+
 def _is_semantic_delete(words: list[str]) -> bool:
     """True when a delete request references a topic/context (semantic)."""
     for w in words:
@@ -1683,6 +1727,24 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
                     tool_calls=[{"name": "send_message", "arguments": {"text": text}}],
                 )
         return ActionParseResult(kind=KIND_UNSUPPORTED, action="send")
+
+    # Saved-item management is NOT message deletion. An explicit save code
+    # ("S0001") together with the owner's own save vocabulary addresses one
+    # stored item deterministically, so it must never fall through to the
+    # message-delete vocabulary. Live misroute this fixes: "سیو S0001 رو پاک
+    # کن" was answered with the message-deletion clarification ("Which
+    # message(s) should I delete?") instead of deleting the saved item.
+    saved_item_code = _extract_save_code(words)
+    if saved_item_code and do_delete and (save_mentioned or _has_save_mention(words)):
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action="delete_saved_item",
+            target="saved_item",
+            save_code=saved_item_code,
+            tool_calls=[
+                {"name": "delete_save", "arguments": {"save_code": saved_item_code}}
+            ],
+        )
 
     if do_delete and do_save:
         return ActionParseResult(

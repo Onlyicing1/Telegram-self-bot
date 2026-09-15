@@ -150,7 +150,11 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
         TaskTransitionTool,
         TaskDeleteTool,
     )
-    from backend.ai.tools.retrieve_save import RetrieveSaveTool
+    from backend.ai.tools.retrieve_save import (
+        RetrieveSaveTool,
+        PreviewSaveTool,
+        DeleteSaveTool,
+    )
     from backend.ai.tools.message import SendMessageTool
     from backend.ai.tools.memory import MemoryListTool, MemoryStoreTool
 
@@ -202,6 +206,8 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(TaskTransitionTool(context))
     registry.register(TaskDeleteTool(context))
     registry.register(RetrieveSaveTool(context))
+    registry.register(PreviewSaveTool(context))
+    registry.register(DeleteSaveTool(context))
     registry.register(TranslateHistoryTool(context))
     registry.register(SummarizeHistoryTool(context))
     registry.register(SendMessageTool(context))
