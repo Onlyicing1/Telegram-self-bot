@@ -377,11 +377,14 @@ async def test_downloadable_taxonomy_matches_the_existing_classifier(media_type,
 @pytest.mark.parametrize("mime,extractable", [
     ("text/plain", True), ("text/markdown", True), ("text/csv", True),
     ("application/json", True), ("application/x-sh", True),
+    ("application/pdf", True), ("application/x-pdf", True),
+    ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", True),
     ("image/jpeg", False), ("audio/ogg", False), ("video/mp4", False),
-    ("application/pdf", False), ("", False),
+    ("application/msword", False), ("application/vnd.ms-excel", False),
+    ("application/zip", False), ("", False),
 ])
 @pytest.mark.asyncio
-async def test_extractable_mime_covers_only_stdlib_text(mime, extractable):
+async def test_extractable_mime_covers_text_and_the_container_formats(mime, extractable):
     assert media_service.is_extractable_mime(mime) is extractable
 
 
@@ -408,8 +411,8 @@ async def test_assets_without_an_extractor_are_never_transferred():
             alt="x", stickerset=InputStickerSetEmpty())]),
         "Animation": _document_media("image/gif", [DocumentAttributeAnimated()]),
         "GIF": _document_media("image/gif", []),
-        "Document": _document_media("application/pdf", [
-            DocumentAttributeFilename(file_name="report.pdf")]),
+        "Document": _document_media("application/msword", [
+            DocumentAttributeFilename(file_name="report.doc")]),
     }
 
     for expected_type, media in cases.items():
@@ -539,8 +542,8 @@ async def test_model_facing_rendering_excludes_all_telegram_context():
 async def test_unsupported_rendering_states_the_reason_and_claims_no_content():
     client = _FakeClient(payload=b"x")
     analysis = await media_service.analyze_media(
-        client, OWNER, _FakeMessage(_document_media("application/pdf", [
-            DocumentAttributeFilename(file_name="report.pdf")]), caption=CAPTION)
+        client, OWNER, _FakeMessage(_document_media("application/msword", [
+            DocumentAttributeFilename(file_name="report.doc")]), caption=CAPTION)
     )
 
     rendered = analysis.as_context_text()

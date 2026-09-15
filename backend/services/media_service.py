@@ -47,14 +47,30 @@ library. Every other type is reported ``UNSUPPORTED`` WITHOUT being transferred
 — fail-closed, so a type this phase cannot turn into content is never partially
 processed. No OCR, speech-to-text, vision, PDF or video stack is claimed or
 required.
+
+M1.2 scope: the two container formats above are now extractable as well —
+**PDF** (text layer only, through ``pypdf``) and **DOCX** (through the standard
+library's ``zipfile`` + ``xml.etree.ElementTree``). Nothing else changed: the
+resolve/transfer/validate/cleanup/zero-context/fail-closed contracts are
+identical, DOCX is treated as an untrusted archive (only ``word/document.xml``
+is read, the archive is never unpacked to disk, and macros, embedded objects and
+external links are never opened), and every added bound is finite (pages, XML
+elements, archive entry bytes, extracted characters). A container whose
+signature contradicts its declared MIME, an encrypted PDF, or a payload that
+cannot be parsed is a HARD failure (``MediaError``) — never fabricated content —
+while a parseable container with no extractable text is reported honestly with
+empty content. No OCR is performed in this phase either.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import shutil
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -100,12 +116,36 @@ TEXT_MIME_TYPES = frozenset({
     "application/csv",
 })
 
+#: Container format MIMEs this phase can extract text from (M1.2). PDF needs the
+#: one added dependency (``pypdf``); DOCX needs only the standard library.
+PDF_MIME_TYPES = frozenset({"application/pdf", "application/x-pdf"})
+
+DOCX_MIME_TYPES = frozenset({
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-word.document.macroenabled.12",
+})
+
 #: Ceiling for the text this phase may extract from ONE asset, derived from the
 #: project's own prompt budget: ``prompt/budget.py`` documents ≈4 characters per
 #: token for English text and caps conversation context at
 #: ``DEFAULT_MAX_CONTEXT_TOKENS``, so normalized media text can never be larger
 #: than the context budget it would eventually have to fit inside.
 MAX_EXTRACTED_CHARS = DEFAULT_MAX_CONTEXT_TOKENS * 4
+
+#: Bounds for the container formats (M1.2). Each is finite and enforced at the
+#: point of use, so no document can walk unbounded pages or XML elements, read
+#: an unbounded archive entry, or grow past ``MAX_EXTRACTED_CHARS``.
+MAX_PDF_PAGES = 50
+MAX_DOCX_TEXT_ELEMENTS = 5_000
+MAX_ARCHIVE_ENTRY_BYTES = 8 * 1024 * 1024
+
+#: Container signatures. MIME alone is never trusted for a safety-relevant
+#: parse: the actual container must corroborate the declared type.
+_PDF_MAGIC = b"%PDF-"
+_PDF_HEADER_SCAN_BYTES = 1024
+_ZIP_MAGIC = b"PK\x03\x04"
+_DOCX_DOCUMENT_ENTRY = "word/document.xml"
+_WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 #: Fallback temp filename when Telegram's (untrusted) name is unusable.
 _FALLBACK_FILE_NAME = "media.bin"
@@ -216,11 +256,16 @@ def is_downloadable(media_type: str) -> bool:
 
 
 def is_extractable_mime(mime_type: str) -> bool:
-    """True when this phase can turn ``mime_type`` into text without new deps."""
+    """True when this phase can turn ``mime_type`` into text.
+
+    Text-shaped MIME types need no dependency at all; the two container formats
+    (M1.2) need ``pypdf`` for PDF and only the standard library for DOCX. A type
+    outside this set is never transferred.
+    """
     value = str(mime_type or "").strip().lower()
     if not value:
         return False
-    if value in TEXT_MIME_TYPES:
+    if value in TEXT_MIME_TYPES or value in PDF_MIME_TYPES or value in DOCX_MIME_TYPES:
         return True
     return value.startswith(TEXT_MIME_PREFIXES)
 
@@ -314,6 +359,203 @@ def _format_bytes(size: int) -> str:
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
+
+
+def is_pdf_mime(mime_type: str) -> bool:
+    """True for the PDF MIME types this boundary extracts (M1.2)."""
+    return str(mime_type or "").strip().lower() in PDF_MIME_TYPES
+
+
+def is_docx_mime(mime_type: str) -> bool:
+    """True for the OOXML wordprocessing MIME types this boundary extracts (M1.2)."""
+    return str(mime_type or "").strip().lower() in DOCX_MIME_TYPES
+
+
+class _TextAccumulator:
+    """Accumulate extracted chunks without ever exceeding the char ceiling."""
+
+    __slots__ = ("_parts", "_size", "_limit", "truncated")
+
+    def __init__(self, limit: int) -> None:
+        self._parts: list[str] = []
+        self._size = 0
+        self._limit = max(1, int(limit))
+        self.truncated = False
+
+    def add(self, chunk: str) -> bool:
+        """Append one chunk; returns False once the ceiling is reached."""
+        chunk = chunk or ""
+        if not chunk:
+            return True
+        separator = 1 if self._parts else 0
+        remaining = self._limit - self._size
+        if len(chunk) + separator > remaining:
+            tail = remaining - separator - 1
+            if tail > 0:
+                self._parts.append(chunk[:tail] + "…")
+                self._size = self._limit
+            self.truncated = True
+            return False
+        self._parts.append(chunk)
+        self._size += len(chunk) + separator
+        return True
+
+    def text(self) -> str:
+        return "\n".join(self._parts)
+
+
+def _read_document_bytes(path: str) -> bytes:
+    """Read a container file whole — it is already bounded by the size authority.
+
+    ``analyze_media`` refuses anything larger than the media size limit before
+    extraction, so this read is bounded by that established limit and never by
+    an unbounded stream. (The character ceiling bounds the extracted TEXT, which
+    is not the same quantity as the container's bytes.)
+    """
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _append_line(accumulator: _TextAccumulator, line: str) -> bool:
+    line = (line or "").strip()
+    if not line:
+        return True
+    return accumulator.add(line)
+
+
+def _extract_pdf_document(path: str, limit: int) -> tuple[str, bool, str]:
+    """PDF text layer, bounded by page count and extracted characters. No OCR.
+
+    Page order is preserved. An encrypted PDF, a payload without a real
+    ``%PDF-`` header, or an unparsable document raises ``MediaError`` — the
+    fail-closed contract for payloads that cannot be read honestly.
+    """
+    raw = _read_document_bytes(path)
+    if _PDF_MAGIC not in raw[:_PDF_HEADER_SCAN_BYTES]:
+        raise MediaError("The file is not a readable PDF (no %PDF- header).")
+
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:  # noqa: BLE001 — dependency boundary
+        raise MediaError("PDF extraction is not available on this runtime.") from exc
+
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        if bool(getattr(reader, "is_encrypted", False)):
+            try:
+                decrypted = reader.decrypt("")
+            except Exception:  # noqa: BLE001 — a refused decrypt is not a crash
+                decrypted = 0
+            if not decrypted:
+                raise MediaError("The PDF is encrypted and cannot be read.")
+    except MediaError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — parser boundary
+        raise MediaError(f"The PDF could not be read: {type(exc).__name__}") from exc
+
+    accumulator = _TextAccumulator(limit)
+    truncated = False
+    pages_read = 0
+    try:
+        for page in reader.pages:
+            if pages_read >= MAX_PDF_PAGES:
+                truncated = True
+                break
+            pages_read += 1
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:  # noqa: BLE001 — one bad page is not a bad document
+                page_text = ""
+            if not _append_line(accumulator, page_text):
+                break
+    except Exception as exc:  # noqa: BLE001 — parser boundary
+        if pages_read == 0:
+            raise MediaError(f"The PDF could not be read: {type(exc).__name__}") from exc
+        truncated = True
+
+    content = accumulator.text()
+    truncated = truncated or accumulator.truncated
+    if not content:
+        return "", truncated, "The PDF contains no extractable text layer."
+    return content, truncated, ""
+
+
+def _extract_docx_document(path: str, limit: int) -> tuple[str, bool, str]:
+    """DOCX paragraph text (including table cells), bounded and fail-closed.
+
+    The DOCX is an UNTRUSTED ZIP/XML container: only ``word/document.xml`` is
+    read, the archive is never unpacked to disk, no other entry (macros,
+    embeddings, external links) is ever opened, and a body declaring a DTD or an
+    entity is refused.
+    """
+    raw = _read_document_bytes(path)
+    if not raw.startswith(_ZIP_MAGIC):
+        raise MediaError("The file is not a readable DOCX container.")
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception as exc:  # noqa: BLE001 — malformed container
+        raise MediaError(f"The DOCX container could not be opened: {type(exc).__name__}") from exc
+
+    with archive:
+        try:
+            entry = archive.getinfo(_DOCX_DOCUMENT_ENTRY)
+        except KeyError as exc:
+            raise MediaError("The container is not a DOCX document.") from exc
+        if entry.file_size > MAX_ARCHIVE_ENTRY_BYTES:
+            raise MediaError("The document body exceeds the extraction bound.")
+        try:
+            with archive.open(entry) as handle:
+                xml_bytes = handle.read(MAX_ARCHIVE_ENTRY_BYTES + 1)
+        except Exception as exc:  # noqa: BLE001 — entry boundary
+            raise MediaError(
+                f"The document body could not be read: {type(exc).__name__}"
+            ) from exc
+
+    if len(xml_bytes) > MAX_ARCHIVE_ENTRY_BYTES:
+        raise MediaError("The document body exceeds the extraction bound.")
+
+    head = xml_bytes[:4096].upper()
+    if b"<!DOCTYPE" in head or b"<!ENTITY" in head:
+        raise MediaError("The document body declares an unsafe XML construct.")
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as exc:  # noqa: BLE001 — untrusted XML boundary
+        raise MediaError(f"The document body could not be parsed: {type(exc).__name__}") from exc
+
+    accumulator = _TextAccumulator(limit)
+    truncated = False
+    blocks = 0
+    for paragraph in root.iter(f"{_WORD_NS}p"):
+        if blocks >= MAX_DOCX_TEXT_ELEMENTS:
+            truncated = True
+            break
+        blocks += 1
+        line = "".join(node.text or "" for node in paragraph.iter(f"{_WORD_NS}t"))
+        if not _append_line(accumulator, line):
+            break
+
+    content = accumulator.text()
+    truncated = truncated or accumulator.truncated
+    if not content:
+        return "", truncated, "The DOCX document contains no extractable text."
+    return content, truncated, ""
+
+
+def _extract_content(path: str, mime_type: str, limit: int) -> tuple[str, bool, str]:
+    """Extract text from ONE downloaded asset, bounded by ``limit`` characters.
+
+    Returns ``(content, truncated, empty_reason)``, where ``empty_reason`` is
+    only used when ``content`` is empty. The text path is M1's, unchanged; the
+    container formats are M1.2 and fail closed through ``MediaError``.
+    """
+    if is_pdf_mime(mime_type):
+        return _extract_pdf_document(path, limit)
+    if is_docx_mime(mime_type):
+        return _extract_docx_document(path, limit)
+    content, truncated = _read_text(path, limit)
+    return content, truncated, "" if content else "The downloaded text asset was empty."
 
 
 def _unsupported(info: MediaInfo, message: Any, reason: str) -> MediaAnalysis:
@@ -489,7 +731,12 @@ async def analyze_media(
                 f"{_format_bytes(limit)} processing limit."
             )
 
-        content, truncated = _read_text(path, MAX_EXTRACTED_CHARS)
+        # Container parsing is CPU-bound over an already size-bounded file, so
+        # it runs off the event loop; the temporary directory is still removed
+        # on every exit path below.
+        content, truncated, empty_reason = await asyncio.to_thread(
+            _extract_content, path, info.mime_type, MAX_EXTRACTED_CHARS,
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -500,7 +747,7 @@ async def analyze_media(
         file_name=info.file_name,
         status=MediaStatus.EXTRACTED.value,
         content=content,
-        reason="" if content else "The downloaded text asset was empty.",
+        reason="" if content else (empty_reason or "The downloaded asset was empty."),
         caption=info.caption or "",
         source_chat_id=_coerce_int(getattr(message, "chat_id", 0)),
         source_message_id=_coerce_int(getattr(message, "id", 0)),
