@@ -1,6 +1,228 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Live fix: deadline-aware per-call provider timeout (large history)
+## Latest phase — Saved Items management through the AI tool layer
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `e3bdc246f2db71ad2d61e347b5fe49c8761fb78e` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone present) |
+| Implementation commit (code + tests) | `9bed311b18b3fbf87c5fe6f75dc6410809891c85` |
+| Database / Supabase impact | **none** (no migration, no schema, no SQL) |
+
+### The exact task
+
+Complete the *management* side of Saved Items for the AI: the operations that
+already existed in the self-bot but were not reachable through the existing
+`ToolRegistry` → `ToolExecutor` → service path. Not a Save rewrite, not a
+persistence phase, not a schema change, and no duplicate of an existing tool.
+
+### Source audit — the gap, proven from source
+
+Every operation the retrieve panels could already perform, and its AI exposure
+**before** this phase:
+
+| Operation | Existing service function | Existing UI path | AI tool before |
+|---|---|---|---|
+| Deep save (reply) | `save_service.execute_save` | Save panel → Deep Save | `save` |
+| Deep save (link) | `save_service.execute_link_save` | Save panel → link | `save_by_link` |
+| List recent saves | `discover_service.do_list` | List panel | `list_saves` |
+| Search saves | `discover_service.do_find` | List panel → Find | `search` |
+| Re-send an item | `retrieve_service.do_retrieve` | Retrieve → ⬇ Retrieve | `retrieve_save` |
+| Read item metadata | `retrieve_service.do_preview` | Retrieve → "Retrieve by Code" input | **missing** |
+| Delete an item | `retrieve_service.do_delete` | Retrieve → item → 🗑 Delete | **missing** |
+| Rename / Move an item | `retrieve_service.do_rename` / `do_move` | Retrieve → item → ✏ / 📂 | missing **and non-persisting** (see *Explicitly deferred*) |
+
+Two distinct defects, matching the audit categories:
+
+* **(C) not exposed through AI** — `do_preview` and `do_delete` had no registered
+tool, so the AI had no management capability for a saved item beyond re-sending it.
+* **(D) incorrectly routed** — `parse_command_intent` (`backend/ai/actions.py`)
+derived `do_delete` from `_DELETE_STEMS` alone. A phrase that also names a save
+code ("سیو S0001 رو پاک کن") therefore resolved through the *message*-delete
+vocabulary into an executable delete target or the clarification
+`"Which message(s) should I delete?"`. Because the dispatcher applies the
+deterministic result before parsing the model's own JSON action
+(`Dispatcher._apply_structured_action`), that clarification pre-empted the model's
+valid structured action — the saved item could not be deleted through the AI at all.
+
+No new abstraction was introduced: both missing operations already existed as
+exact functions in `backend/services/retrieve_service.py`, and the repository
+already has a precedent for a saved-item AI tool (`retrieve_save`).
+
+### What was implemented
+
+1. **Two thin tools** in `backend/ai/tools/retrieve_save.py`, delegating to the
+existing service functions — no retrieval, DB, or Telegram logic in the tools:
+
+| Tool | Service call | Permission |
+|---|---|---|
+| `preview_save` | `retrieve_service.do_preview(client, owner_id, save_code)` | `READ_ONLY` |
+| `delete_save` | `retrieve_service.do_delete(client, owner_id, save_code)` | `DANGEROUS` |
+
+   Both normalize the save code at the tool boundary exactly like `retrieve_save`
+   (`strip().upper()` + alnum check) and report failure honestly through
+   `result_from_service` ("❌ …"/"⚠️ …" → `success=False`).
+
+2. **Registration** — `create_default_registry` (`backend/ai/tools/registry.py`)
+registers both, so the existing `Dispatcher._build_tool_definitions` exposes them
+to every provider with no further wiring.
+
+3. **Action contract** — `backend/ai/actions.py` gains the two validated actions
+(`preview_saved_item`, `delete_saved_item`) alongside `retrieve_save`:
+the `save_code` field guard, the exact-field-set validator (now parameterized as
+`_validate_saved_item_action`, replacing the retrieve-only
+`_validate_retrieve_save_action` it generalizes), `resolve_tool_calls`, and
+`_default_target` (`saved_item`). This is the same model-JSON fallback path
+`retrieve_save` already used.
+
+4. **Prompt template** — `backend/ai/prompt/template.py` rule 8 lists the two new
+action names and two examples, so the documented JSON-action schema the model is
+given stays in sync with the validator.
+
+5. **One narrow deterministic route** — `parse_command_intent` now recognises a
+saved-item deletion when an **explicit save code** (`_extract_save_code`,
+`^s[0-9a-z]{1,11}$` **with at least one digit**, so words like "save"/"saved"/
+"semantic" can never qualify) appears together with the owner's own save
+vocabulary (`save_mentioned or _has_save_mention`) and a delete imperative. It
+returns the registered `delete_save` tool call directly, placed **before** the
+existing save+delete clarification so precedence for every other request is
+unchanged. No new keyword lists were added — only the existing save/delete
+detectors are reused.
+
+### Previous behaviour → new behaviour
+
+| Owner request | Before | After |
+|---|---|---|
+| `سیو S0001 رو پاک کن` / `delete saved item S0001` | message-deletion target or `"Which message(s) should I delete?"` | deterministic `delete_save` for `S0001` |
+| `مشخصات سیو S0001 چیه` | no capability (model had no tool) | provider selects `preview_save` |
+| `{"action":"delete_saved_item","save_code":"S1"}` | rejected (`Unknown action`) | validated → `delete_save` |
+| `{"action":"preview_saved_item","save_code":"S1"}` | rejected | validated → `preview_save` |
+| `سیوهامو پاک کن` (no code) | clarification / message delete | **unchanged** |
+| `۱۰ پیام آخر رو پاک کن`, `اینو سیو کن`, `لیست سیوها رو بده` | delete/save/list | **unchanged** (asserted) |
+
+### Deliberately unchanged (PROTECTED)
+
+* **Schema and persistence** — `saved_items` is untouched; no migration, column,
+table, RLS change, or Supabase call was added. Both tools use the pre-existing
+service functions, which use the existing `db_client` reads/deletes.
+* **`retrieve_service`** — no function added, changed, or removed.
+* **Existing Save tools** — `save`, `save_by_link`, `search`, `list_saves`,
+`retrieve_save` are byte-identical; their tests still pass unchanged.
+* **Message deletion** — the delete tool family is untouched, and a test asserts
+`delete_save` never invokes `delete_service.delete_verified_self_messages` or
+`do_del_self_filtered`, i.e. saved-item deletion is not the message-delete path.
+* **Owner scoping** — `context.owner_id` is the only owner identity; tool
+arguments can never supply one (tests pass a forged `owner_id` and assert it is
+ignored). The service re-checks `row.get("owner_id") != owner_id` before any
+Telegram side effect or DB write.
+* **Presentation / delivery, RuntimeSupervisor, providers, scheduler, history AI,
+GitHub/workflow files** — untouched.
+* `ListRecentMessagesTool` — untouched. Its contract is complete ID coverage for
+semantic delete; excluding the asking message there is a separate decision and
+remains as previously documented.
+
+### Explicitly deferred (NOT implemented — and why)
+
+**Rename / Move a saved item — known defect, NOT fixed in this phase.**
+`retrieve_service.do_rename` and `do_move` validate the item and then only write a
+`bot_logs` row: they never call the existing `db_client.update_save_field`, so
+`file_name` / `folder` are never persisted, while the functions return
+`"✅ Renamed to …"` / `"✅ Moved to …"`. The item's displayed name also comes from
+`media_type` (`retrieve_service._display_name`), not `file_name`. Exposing these as
+AI tools would surface a success that does not happen, and making them honest
+requires changing how an item is named/displayed — Save presentation, explicitly
+outside this phase. They were therefore **not** registered as tools. Status:
+**pre-existing defect, documented, NOT fixed, NOT HIDDEN.**
+
+### Database / Supabase impact
+
+**None.** No SQL was executed, no migration created, no table/column/RLS changed,
+and `DATABASE_ARCHITECTURE.md` was not modified.
+
+### Files changed
+
+| File | Status | Role |
+|---|---|---|
+| `backend/ai/tools/retrieve_save.py` | modified | adds `PreviewSaveTool` + `DeleteSaveTool` (thin wrappers over `retrieve_service.do_preview` / `do_delete`); module docstring updated |
+| `backend/ai/tools/registry.py` | modified | imports + registers both tools |
+| `backend/ai/actions.py` | modified | saved-item action names, shared validator, `save_code` guard, `resolve_tool_calls` mappings, `_default_target`, `_extract_save_code`, narrow deterministic route |
+| `backend/ai/prompt/template.py` | modified | rule 8 action vocabulary + examples for the two new actions |
+| `tests/test_saved_items_ai_management.py` | added | 22 focused tests (registration, executor chain, owner scoping, honest failures, action contract, deterministic routing, regression guards) |
+| `tests/test_tool_health_audit.py` | modified | `EXPECTED_TOOLS` gains `preview_save`/`delete_save`; registry count 41 → 43 |
+| `tests/test_capability_exposure_tools.py` | modified | registry count 41 → 43 |
+| `tests/test_memory_tools.py` | modified | registry count 41 → 43 |
+
+No other file changed — no handler, no service, no schema, no dashboard/UI, no
+runtime, no provider.
+
+### Tests actually run
+
+| Run | Result |
+|---|---|
+| Focused `tests/test_saved_items_ai_management.py` | **22 passed** |
+| Registry/contract group (`test_tool_health_audit`, `test_capability_exposure_tools`, `test_memory_tools`, focused) | **124 passed** |
+| Adjacent (`test_10_tool_calls`, `test_12_save_engine`, `test_14_tool_honesty_glass`, `test_19_ai_actions`, `test_25_fast_path`, `test_32_semantic_delete`, `test_new_tool_action_path`, `test_retrieve_owner_isolation`, `test_history_ai_tools`, `test_task_semantic_completeness`, `test_model_discovery`) | **369 passed** |
+| Full suite `pytest tests/ -q` | **2796 passed, 24 skipped** |
+| `py_compile` on all four changed modules + the new test file | OK |
+| `git diff --check` | clean |
+
+What the new tests prove (they drive the real `ToolRegistry` → `ToolExecutor`
+chain, not constants):
+
+* both tools are registered, provider-schema visible, and carry the intended
+permission levels (`delete_save` DANGEROUS and not confirmation-gated — the same
+contract as the existing deleters);
+* the executor path canonicalizes the code (`s0001` → `S0001`) and passes
+`context.owner_id`, **ignoring a forged `owner_id` in arguments**;
+* honest failure paths: missing code and malformed code never reach the service;
+a missing client is an honest failure for the delete and a non-issue for the
+DB-only preview; "❌ No item found" stays `success=False`; service exceptions are
+surfaced, never swallowed;
+* the module keeps its boundary — no Telethon, no `backend.db`, no Supabase call;
+* the action contract validates both new actions, rejects unknown fields and a
+missing/invalid code, still rejects `save_code` on unrelated actions, and leaves
+`retrieve_save` behaviour identical;
+* routing: `سیو S0001 رو پاک کن` (incl. Persian digits), `سیو S0001 رو حذف کن`,
+`آیتم ذخیره‌شده S0001 رو پاک کن` and `delete saved item S0001` all resolve to
+`delete_save`/`S0001`, while `سیوهامو پاک کن`, `این سیو رو پاک کن`,
+`delete my saved items` do **not**, and `۱۰ پیام آخر رو پاک کن`, `delete the last 3
+messages`, `اینو سیو کن`, `لیست سیوها را بده` and a topic query mentioning "سیو"
+keep their previous routing.
+
+### Live Telegram verification status
+
+**Not performed — no live Telegram session (and no live Supabase) exists in this
+workspace.** Every claim above is source-derived or comes from the test suite
+driving the real registry/executor/parser against a faked service boundary. The
+Supabase-backed `do_preview`/`do_delete` behaviour was not exercised against the
+live database, and no message was deleted in a real chat.
+
+### Remaining limitations
+
+1. **No live verification** — see above; the two new tools are proven at the
+service boundary, not end-to-end against Telegram/Supabase.
+2. **Rename/Move remain non-persisting** and unexposed to the AI (pre-existing
+defect, documented above).
+3. **A delete request without an explicit save code keeps its previous handling**
+(`این سیو رو پاک کن` still resolves through the existing message-delete/reply
+logic). That is deliberate: without a code the target is genuinely ambiguous, and
+the existing precedence is preserved rather than guessed.
+4. **Model-dependent selection** — `preview_save` (and `delete_save` for phrasings
+without a code) is reached by the model choosing the tool, either as a native tool
+call or as a validated JSON action. A provider that emits neither will not
+perform the operation; the deterministic code-based route is the guaranteed path.
+
+### Commit
+
+| Item | Value |
+|---|---|
+| Code + tests | `9bed311b18b3fbf87c5fe6f75dc6410809891c85` — *feat: expose saved-item preview and deletion to the AI tool layer* (8 files, +715/−23) |
+| This document | the follow-up documentation commit on `main` |
+
+---
+
+## Previous phase — Live fix: deadline-aware per-call provider timeout (large history)
 
 Starting HEAD: `57ccb273c4ade36ee8b14844b265d04297c56ad7`.
 
