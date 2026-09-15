@@ -1299,20 +1299,68 @@ def _has_save_mention(words: list[str]) -> bool:
     )
 
 
-# A save code is the existing short form (``db.client.get_next_save_code``:
-# ``S`` + alphanumerics). ``_tokenize`` lower-cases and digit-normalizes the
-# owner's text, so the code arrives as e.g. "s0001". At least one digit is
-# required so ordinary English words ("save", "saved", "semantic") can never
-# be read as an item code.
+# A save code is the existing short form produced by
+# ``db.client.get_next_save_code``: ``S`` + four characters drawn from
+# ``A-Z`` + ``0-9`` — a zero-padded sequential code ("S0001") or a random
+# alphanumeric one ("SAXCK"). ``_tokenize`` lower-cases and digit-normalizes
+# the owner's text, so a code arrives as e.g. "s0001".
+#
+# A digit-bearing token is always a code — no ordinary word contains a digit.
+# An all-letter code carries NO digit, so requiring one rejected codes the
+# generator really produces: live, "SAXCK" (reply to the item's preview
+# message → "send this") fell through to "Unsupported action: send". The
+# generator's random branch is exactly four characters, so an all-letter
+# token is accepted only in that exact shape AND only when the parser does
+# not already read it as an ordinary word (``_SAVE_CODE_STOP_WORDS``) —
+# "save"/"saved"/"semantic" and the preview's "size"/"sender" labels can
+# therefore never be taken for an item code.
 _SAVE_CODE_TOKEN_RE = re.compile(r"^s[0-9a-z]{1,11}$")
+_SAVE_CODE_RANDOM_TOKEN_RE = re.compile(r"^s[0-9a-z]{4}$")
+# The generator's canonical spelling, case included: every surface that
+# renders a code renders it upper-case (``**Sara** `SAXCK```, ``**Code:**
+# `S0001```), and ordinary prose never looks like it — a word starting with
+# a capital S ("Saved", "Size", "Sender", a sender name "Sarah") continues
+# in lower case. A replied-to message is therefore read with this exact
+# shape, so the bot's own field labels can never be taken for an item code.
+_SAVE_CODE_CANONICAL_RE = re.compile(r"(?<![A-Za-z0-9])S[A-Z0-9]{4}(?![A-Za-z0-9])")
 
 
-def _extract_save_code(words: list[str]) -> str | None:
-    """Extract the first explicit save-code token, canonicalized to upper case."""
-    for tok in words:
-        if _SAVE_CODE_TOKEN_RE.match(tok) and any(ch.isdigit() for ch in tok):
-            return tok.upper()
-    return None
+def _canonical_save_codes(text: str) -> set[str]:
+    """Save codes present in *text* in the generator's canonical form."""
+    return {m.group(0) for m in _SAVE_CODE_CANONICAL_RE.finditer(text or "")}
+
+
+def _is_save_code_token(tok: str) -> bool:
+    """True for a save code: digit-bearing, or the generator's random shape."""
+    if not _SAVE_CODE_TOKEN_RE.match(tok):
+        return False
+    if any(ch.isdigit() for ch in tok):
+        return True
+    return bool(_SAVE_CODE_RANDOM_TOKEN_RE.match(tok)) and tok not in _SAVE_CODE_STOP_WORDS
+
+
+def _extract_save_code(words: list[str], text: str = "") -> str | None:
+    """Extract the first explicit save-code token, canonicalized to upper case.
+
+    Digit-bearing codes keep their existing precedence (they are
+    unambiguous). An all-letter code has no such proof, so it is accepted
+    only in the generator's canonical upper-case form when *text* is given
+    (the owner's real request), and only as the single generator-shaped
+    candidate when it is not — a sentence is never guessed into an item
+    reference.
+    """
+    digit_hits = [
+        tok.upper()
+        for tok in words
+        if _is_save_code_token(tok) and any(ch.isdigit() for ch in tok)
+    ]
+    if digit_hits:
+        return digit_hits[0]
+    if text:
+        canonical = _canonical_save_codes(text)
+        return next(iter(canonical)) if len(canonical) == 1 else None
+    alpha_hits = {tok.upper() for tok in words if _is_save_code_token(tok)}
+    return next(iter(alpha_hits)) if len(alpha_hits) == 1 else None
 
 
 def _extract_single_save_code(text: str) -> str | None:
@@ -1321,18 +1369,24 @@ def _extract_single_save_code(text: str) -> str | None:
     Deterministic target resolution for a replied-to message: exactly one
     save code identifies exactly one stored item. Zero codes or several
     distinct codes yield ``None`` so the caller keeps the existing
-    message-deletion behavior instead of guessing. Codes are validated with
-    the same rules as the saved-item action layer (``_SAVE_CODE_TOKEN_RE``
-    shape + ``_SAVE_CODE_RE``); nothing here inspects conversation history.
+    message-deletion behavior instead of guessing. Digit-bearing codes are
+    read case-insensitively (no ordinary word contains a digit); an
+    all-letter code is read only in the generator's canonical upper-case
+    form. Codes are validated with the same rules as the saved-item action
+    layer (``_SAVE_CODE_TOKEN_RE`` shape + ``_SAVE_CODE_RE``); nothing here
+    inspects conversation history.
     """
     codes = {
         tok.upper()
         for tok in _tokenize(text or "")
         if _SAVE_CODE_TOKEN_RE.match(tok) and any(ch.isdigit() for ch in tok)
     }
+    codes |= _canonical_save_codes(text)
     codes = {c for c in codes if _SAVE_CODE_RE.match(c)}
-    if len(codes) == 1:
-        return next(iter(codes))
+    digit_codes = {c for c in codes if any(ch.isdigit() for ch in c)}
+    pool = digit_codes or codes
+    if len(pool) == 1:
+        return next(iter(pool))
     return None
 
 
@@ -1542,6 +1596,18 @@ _EN_EVENT_WORDS = frozenset({"when", "whenever"})
 # them directly because that request carries no recurring cadence word.
 _FA_CLOCK_WORDS = frozenset({"ساعت"})
 _EN_CLOCK_WORDS = frozenset({"am", "pm"})
+
+# Ordinary words that share the generator's all-letter save-code shape (see
+# ``_SAVE_CODE_RANDOM_TOKEN_RE``) and therefore can never be an item code:
+# the English command vocabulary the owner's own requests are read with.
+# "saved"/"saves"/"store"/"share"/"state" are exactly the tokens that would
+# otherwise be mistaken for one.
+_SAVE_CODE_STOP_WORDS = frozenset(
+    _EN_DELETE | _EN_SAVE | _EN_SEND | _EN_NEGATION | _EN_ANALYSIS
+    | _EN_SAVED_WORDS | _EN_LIST_SAVED_WORDS | _EN_ACTION_VERBS
+    | _PREVIEW_WORDS | _SAVE_LIST_WORDS | _STATUS_WORDS
+    | _SEMANTIC_QUERY_STOP_WORDS | _SEMANTIC_SEARCH_WORDS
+)
 
 
 def _is_event_intent(text: str, words: list[str]) -> bool:
@@ -1765,7 +1831,7 @@ def parse_command_intent(
     # existing precedence, and a send with NO item reference keeps its
     # existing unsupported outcome (no destination is ever guessed).
     if send_intent and not write_pos and not do_delete and not do_save:
-        retrieve_code = _extract_save_code(words)
+        retrieve_code = _extract_save_code(words, text)
         if retrieve_code is None and has_reply:
             retrieve_code = _extract_single_save_code(reply_text)
         if retrieve_code:
@@ -1788,7 +1854,7 @@ def parse_command_intent(
     # listing — the requested row was never read). A delete/save/send keeps
     # its existing precedence, and a request with NO explicit code stays
     # exactly where it was (the provider owns conversational previews).
-    preview_code = _extract_save_code(words)
+    preview_code = _extract_save_code(words, text)
     if (
         preview_code
         and not do_delete
@@ -1835,7 +1901,7 @@ def parse_command_intent(
     # message-delete vocabulary. Live misroute this fixes: "سیو S0001 رو پاک
     # کن" was answered with the message-deletion clarification ("Which
     # message(s) should I delete?") instead of deleting the saved item.
-    saved_item_code = _extract_save_code(words)
+    saved_item_code = _extract_save_code(words, text)
     if saved_item_code and do_delete and (save_mentioned or _has_save_mention(words)):
         return ActionParseResult(
             kind=KIND_EXECUTABLE,

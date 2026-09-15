@@ -617,11 +617,26 @@ def test_several_save_codes_in_the_replied_message_never_pick_one():
     assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
 
 
-def test_a_code_shaped_token_without_a_digit_is_not_a_save_code():
-    """Documented bound of the existing extraction rule: codes need a digit."""
+def test_an_all_letter_code_in_the_generator_shape_resolves():
+    """Corrected bound: a code does NOT need a digit.
+
+    ``db.client.get_next_save_code`` emits ``S`` + four characters from
+    ``A-Z`` + ``0-9``, so an all-letter code is a code the generator really
+    produces and a replied save-code message must resolve to it.
+    """
     from backend.ai.actions import parse_command_intent
 
     r = parse_command_intent("delete this", has_reply=True, reply_text="**LifeOS** `SABCD`")
+    assert r.action == "delete_saved_item"
+    assert r.save_code == "SABCD"
+    assert r.tool_calls == [{"name": "delete_save", "arguments": {"save_code": "SABCD"}}]
+
+
+def test_a_code_shaped_word_outside_the_generator_shape_is_not_a_save_code():
+    """The generator shape is exactly ``S`` + 4 characters — nothing else."""
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent("delete this", has_reply=True, reply_text="**LifeOS** `SABCDE`")
     assert r.action == "delete_messages"
     assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
 
