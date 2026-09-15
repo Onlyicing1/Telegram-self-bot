@@ -1,6 +1,165 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.1: the normalized media analysis reaches the selected LLM
+## Latest phase — Media Processing M1.2: bounded PDF/DOCX document extraction
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `adba138` (origin/main — the M1.1 media-analysis integration delivery record) |
+| Implementation commit (code + tests) | `6a746931411826d49bb08909207ee64d14a7fb18` |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL; media processing is read-only and persists nothing) |
+| Provider architecture impact | **none** (no `ProviderManager`, adapter, capability, `vision()`, selection or fallback change) |
+| Prompt architecture impact | **none** (no `PromptBuilder`, context-builder or `MEDIA_ANALYSIS_SYSTEM_PROMPT` change) |
+| Presentation / delivery impact | **none** (no AI message formatting, RTL, edit-in-place or delivery change) |
+| Dependency added | `pypdf==6.18.1` (pure-Python PDF text layer; no OCR/ML/service stack) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+
+### The exact task
+
+Extend the **existing** M1 media boundary so a supported **document** reply can be
+converted into bounded plain text and returned through the **existing**
+`MediaAnalysis` contract — without a second download/extraction pipeline,
+without touching the provider layer, and without OCR, STT, vision, video,
+spreadsheet, presentation or archive support.
+
+### Exact behaviour implemented
+
+**Capability set (one classifier, extended by two container formats)**
+`media_service.is_extractable_mime()` still decides what may be transferred, and
+it now covers `PDF_MIME_TYPES` (`application/pdf`, `application/x-pdf`) and
+`DOCX_MIME_TYPES` (the OOXML wordprocessing type and its macro-enabled variant)
+in addition to the M1 text-shaped types. Everything outside that set keeps the
+M1 behaviour exactly: reported `UNSUPPORTED` and **never transferred** — so
+legacy `.doc`, `.xlsx`, `.pptx`, archives and images still cost zero bytes.
+
+**Extraction dispatch**
+`analyze_media` now calls one internal `_extract_content(path, mime_type, limit)`
+instead of reading text directly. It returns `(content, truncated, empty_reason)`
+and dispatches: text-shaped → M1's `_read_text` (byte-for-byte unchanged), PDF →
+`_extract_pdf_document`, DOCX → `_extract_docx_document`. The parse runs through
+`asyncio.to_thread`, so a CPU-bound `pypdf`/XML parse cannot stall the event loop
+(the temporary directory is still removed on every exit path). The public
+result type is untouched: same `MediaAnalysis` fields, same `as_dict()`, same
+`as_context_text()`.
+
+**Bounds (hard module constants, not configurable)**
+
+| Bound | Value | Enforced where |
+|---|---|---|
+| `MAX_EXTRACTED_CHARS` | **existing** `DEFAULT_MAX_CONTEXT_TOKENS * 4` (16,000) | `_TextAccumulator` truncates every appended chunk |
+| `MAX_PDF_PAGES` | 50 | lazy `reader.pages` walk stops at the bound |
+| `MAX_DOCX_TEXT_ELEMENTS` | 5,000 paragraphs | `word/document.xml` walk stops at the bound |
+| `MAX_ARCHIVE_ENTRY_BYTES` | 8 MiB | `word/document.xml` declared size **and** bounded read |
+| transfer size | existing `settings_service.max_deep_save_mb()` (default 50 MB) | declared-size check + post-transfer size check (M1, unchanged) |
+
+The character ceiling is M1's own constant, reused as-is; no new global media
+size limit was introduced. Container files are read whole only **after** the
+established size limit has already refused anything larger, so no read is
+unbounded.
+
+**Container signature validation (MIME is never trusted alone)**
+A payload declared `application/pdf` must actually contain `%PDF-` within its
+first 1 KiB, and a payload declared as DOCX must actually start with the ZIP
+signature **and** contain a `word/document.xml` entry. Anything else is a hard
+`MediaError`.
+
+**DOCX as an UNTRUSTED archive**
+Only `word/document.xml` is read. The archive is never unpacked to disk
+(`extract`/`extractall` are never called), no other entry is opened (macros,
+`word/embeddings/*`, `word/vbaProject.bin`, external links are inert), a
+traversal-named entry can have no effect, and a document body declaring
+`<!DOCTYPE` or `<!ENTITY` is refused. Paragraph text is read in document order
+through `w:p`/`w:t`, which includes table-cell paragraphs.
+
+**PDF (text layer only, no OCR)**
+Page order is preserved. An empty-page/scanned PDF yields empty content with the
+honest reason `The PDF contains no extractable text layer.`; an encrypted PDF
+(no empty-password access) and an unparsable document raise `MediaError`.
+
+**Honest outcomes, never fabricated content**
+A parseable container with no extractable text keeps status `EXTRACTED` with
+empty `content` and a reason — so `has_content` is False and the existing M1.1
+layer answers with its deterministic explanation instead of calling a provider.
+A malformed, encrypted or signature-contradicting payload raises `MediaError`,
+which M1.1 already turns into the same honest explanation.
+
+### Why the existing M1.1 path already works for documents (no change needed)
+
+`backend/services/media_ai_service.py` was **not modified**: it consumes
+`analyze_media` + `MediaAnalysis.as_context_text()` and already handles the
+`not analysis.has_content` case. Because M1.2 only enlarges what the boundary
+can extract, a PDF/DOCX reply now reaches the selected LLM as ordinary
+plain-string input through the unchanged M1.1 pipeline
+(`[system] MEDIA_ANALYSIS_SYSTEM_PROMPT` + `[user] request + as_context_text()`),
+with no provider-specific logic and no Telegram conversation context: the
+model-facing rendering still contains no caption, sender, chat id, message id
+or filename.
+
+### Tests actually run
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_document_extraction.py -q` (new, M1.2) | **23 passed** |
+| `pytest tests/test_media_processing.py tests/test_media_ai_integration.py -q` (M1 + M1.1) | **98 passed** |
+| `pytest tests -q` (full suite) | **2998 passed, 24 skipped, 3 warnings** |
+| `py_compile` for `backend/services/media_service.py` and the two test files | **passed** |
+| `git diff --check` | **clean** |
+
+The M1.2 fixtures are **real container bytes** built in-process (a hand-built,
+valid multi-page PDF; real DOCX ZIPs; a real `pypdf`-encrypted PDF), so `pypdf`,
+`zipfile` and ElementTree all run for real — only the Telegram boundary is
+faked. Non-vacuous guards: removing the PDF page bound fails
+`test_pdf_page_bound_is_enforced`; removing the character ceiling fails
+`test_pdf_character_ceiling_is_enforced` / `test_docx_character_ceiling_is_enforced`;
+removing the DOCX element bound fails `test_docx_element_bound_is_enforced`;
+turning DOCX handling into an unrestricted unpack fails
+`test_docx_archive_is_never_unpacked_to_disk` and
+`test_docx_unrelated_and_traversal_entries_are_never_read`; trusting MIME over
+the container fails `test_pdf_mime_without_a_pdf_header_fails_closed`,
+`test_docx_mime_without_a_zip_container_fails_closed` and
+`test_zip_without_document_xml_is_not_a_docx`; exposing Telegram metadata fails
+`test_document_context_text_carries_no_telegram_metadata`.
+
+Three **existing** M1 expectations were updated because the capability genuinely
+changed (and were not weakened): `is_extractable_mime` now reports `True` for the
+PDF/DOCX MIMEs, the "must not be transferred" case list uses a legacy
+`application/msword` document instead of a PDF, and the unsupported-rendering
+test does the same. The M1 and M1.1 suites pass unmodified otherwise.
+
+### What was NOT done (out of scope for this phase)
+
+- No OCR, image/vision, speech-to-text, video, spreadsheet (XLSX), presentation
+  (PPTX) or archive (ZIP) extraction; a type outside the capability set is still
+  never transferred.
+- No DOCX headers/footers/footnotes/endnotes/comments or field codes; only
+  `word/document.xml` body paragraphs (including table cells, as flat text).
+- No multi-column reflow, no per-page attribution, no summarization, no model
+  call inside the media boundary.
+- No new database column, cache, scheduler, or second media pipeline.
+
+### Limitations
+
+- PDF text-layer only: a scanned PDF yields no content (reported honestly, not
+  summarized or OCR'd).
+- The PDF `%PDF-` header must appear within the first 1 KiB; a PDF with
+  arbitrary leading junk is refused rather than guessed at.
+- `MAX_DOCX_TEXT_ELEMENTS` counts paragraphs, including empty ones.
+- Extraction is synchronous inside a worker thread per request; nothing is
+  pooled or cached, so a burst of large documents still costs one parse each.
+
+### Live verification required (NOT performed here)
+
+No live Telegram session, Supabase instance or Render deployment is available in
+this workspace, so **no real Telegram document was transferred and no real-world
+PDF/DOCX was parsed**. Still to be confirmed live: reply to a real PDF and a real
+DOCX with an AI request and confirm the answer uses the document's text; reply
+to a scanned PDF and confirm the honest "no extractable text layer" explanation;
+reply to a legacy `.doc`/`.xlsx` and confirm the unsupported explanation without
+a transfer; and confirm a subsequent process restart changes nothing (this phase
+persists nothing).
+
+## Previous phase — Media Processing M1.1: the normalized media analysis reaches the selected LLM
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
