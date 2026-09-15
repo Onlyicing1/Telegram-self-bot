@@ -1306,6 +1306,27 @@ def _extract_save_code(words: list[str]) -> str | None:
     return None
 
 
+def _extract_single_save_code(text: str) -> str | None:
+    """Return the ONE canonical save code structurally present in *text*.
+
+    Deterministic target resolution for a replied-to message: exactly one
+    save code identifies exactly one stored item. Zero codes or several
+    distinct codes yield ``None`` so the caller keeps the existing
+    message-deletion behavior instead of guessing. Codes are validated with
+    the same rules as the saved-item action layer (``_SAVE_CODE_TOKEN_RE``
+    shape + ``_SAVE_CODE_RE``); nothing here inspects conversation history.
+    """
+    codes = {
+        tok.upper()
+        for tok in _tokenize(text or "")
+        if _SAVE_CODE_TOKEN_RE.match(tok) and any(ch.isdigit() for ch in tok)
+    }
+    codes = {c for c in codes if _SAVE_CODE_RE.match(c)}
+    if len(codes) == 1:
+        return next(iter(codes))
+    return None
+
+
 def _is_semantic_delete(words: list[str]) -> bool:
     """True when a delete request references a topic/context (semantic)."""
     for w in words:
@@ -1623,13 +1644,21 @@ def _is_scheduling_intent(words: list[str], *, require_action_verb: bool = True)
 
 
 
-def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseResult:
+def parse_command_intent(
+    text: str, *, has_reply: bool = True, reply_text: str = ""
+) -> ActionParseResult:
     """Deterministically parse a Persian/English executable command.
 
     Called when the model returned prose (no structured action). It never
     trusts the model's prose: it reads the original user message and resolves
     the target from the reply context. Only the narrow command vocabulary is
     recognized — everything else is conversational.
+
+    ``reply_text`` is the TRUSTED replied-to message text supplied by the
+    runtime (never by the model). It is used only for deterministic target
+    resolution — "delete this" addressing a stored item's save-code message
+    resolves to the existing saved-item deletion instead of the model's
+    guess. It never widens the command vocabulary and never reaches a prompt.
     """
     if not isinstance(text, str) or not text.strip():
         return ActionParseResult(kind=KIND_CONVERSATIONAL)
@@ -1916,6 +1945,24 @@ def parse_command_intent(text: str, *, has_reply: bool = True) -> ActionParseRes
             )
         if is_this:
             if has_reply:
+                # Deterministic saved-item resolution. When the replied-to
+                # message is a stored item's save-code message, the owner's
+                # "delete this" addresses the ITEM, not the Telegram message
+                # carrying the code. Resolved HERE, before any provider round,
+                # so the replied content is never handed to the model and the
+                # decision is never the model's. Live misroute this fixes:
+                # "delete this" on a save-code message deleted the message.
+                replied_code = _extract_single_save_code(reply_text)
+                if replied_code:
+                    return ActionParseResult(
+                        kind=KIND_EXECUTABLE,
+                        action="delete_saved_item",
+                        target="saved_item",
+                        save_code=replied_code,
+                        tool_calls=[
+                            {"name": "delete_save", "arguments": {"save_code": replied_code}}
+                        ],
+                    )
                 return ActionParseResult(
                     kind=KIND_EXECUTABLE,
                     action="delete_messages",

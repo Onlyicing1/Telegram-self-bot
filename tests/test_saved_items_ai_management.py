@@ -459,3 +459,270 @@ def test_ordinary_words_are_never_read_as_save_codes():
 
     assert _extract_save_code(["save", "saved", "semantic", "s4h"]) == "S4H"
     assert _extract_save_code(["save", "saved", "semantic"]) is None
+
+
+# ── BUG #1: preview must return the REQUESTED item's own metadata ───────────
+#
+# ``do_preview`` used to return whatever row ``query_save`` handed back: the
+# lookup is code-only (no owner predicate) and the result was never verified
+# against the authenticated owner or against the requested code. A preview
+# could therefore present another owner's item — or another item's metadata
+# under this code — as the requested saved item.
+
+_OWNED_ROW = {
+    "id": 12,
+    "save_code": "S0001",
+    "owner_id": OWNER,
+    "media_type": "Photo",
+    "mime_type": "image/jpeg",
+    "file_size": 173_800,
+    "sender_name": "Owner Name",
+    "created_at": "2026-09-15T10:08:00+00:00",
+    "origin_chat_id": -100999,
+    "origin_msg_id": 4321,
+}
+_FOREIGN_ROW = {**_OWNED_ROW, "owner_id": OWNER + 1, "sender_name": "Someone Else"}
+_OTHER_CODE_ROW = {**_OWNED_ROW, "save_code": "S0009", "sender_name": "Other Item"}
+
+
+@pytest.mark.asyncio
+async def test_preview_returns_the_metadata_of_the_exact_requested_code():
+    from backend.db import client as db_client
+    from backend.services import retrieve_service
+
+    with patch.object(db_client, "query_save", AsyncMock(return_value=dict(_OWNED_ROW))):
+        text = await retrieve_service.do_preview(None, OWNER, "s0001")
+
+    assert "`S0001`" in text
+    assert "**Sender** Owner Name" in text
+    assert "**Size** 169.7 KB" in text
+    assert "**Format** `image/jpeg`" in text
+
+
+@pytest.mark.asyncio
+async def test_preview_never_reveals_another_owners_item():
+    """A foreign row is reported exactly like a missing one — and not logged."""
+    from backend.db import client as db_client
+    from backend.services import retrieve_service
+
+    log = AsyncMock()
+    with (
+        patch.object(db_client, "query_save", AsyncMock(return_value=dict(_FOREIGN_ROW))),
+        patch.object(db_client, "log", log),
+    ):
+        text = await retrieve_service.do_preview(None, OWNER, "S0001")
+
+    assert text == "❌ No item found for `S0001`"
+    assert "Someone Else" not in text
+    log.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preview_refuses_a_row_whose_code_is_not_the_requested_code():
+    """Metadata is never presented under a code it does not belong to."""
+    from backend.db import client as db_client
+    from backend.services import retrieve_service
+
+    with patch.object(db_client, "query_save", AsyncMock(return_value=dict(_OTHER_CODE_ROW))):
+        text = await retrieve_service.do_preview(None, OWNER, "S0001")
+
+    assert text == "❌ No item found for `S0001`"
+    assert "Other Item" not in text
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_missing_item_stays_honest():
+    from backend.db import client as db_client
+    from backend.services import retrieve_service
+
+    with patch.object(db_client, "query_save", AsyncMock(return_value=None)):
+        text = await retrieve_service.do_preview(None, OWNER, "S9999")
+
+    assert text == "❌ No item found for `S9999`"
+
+
+@pytest.mark.asyncio
+async def test_preview_tool_queries_the_canonical_code_with_the_trusted_owner():
+    """action → tool → service → query: the code survives, the owner does not.
+
+    The model's lower-cased echo is canonicalized at the tool boundary and a
+    forged ``owner_id`` argument is ignored: the DB lookup is driven by the
+    context owner.
+    """
+    from backend.db import client as db_client
+
+    registry, ctx, executor = make_chain()
+    spy = AsyncMock(return_value=dict(_OWNED_ROW))
+    with patch.object(db_client, "query_save", spy):
+        result = await run_tool(
+            executor, ctx, "preview_save",
+            {"save_code": "s0001", "owner_id": OWNER + 5000},
+        )
+
+    spy.assert_awaited_once_with("S0001")
+    assert result.success is True
+    assert "`S0001`" in result.message
+    assert "**Sender** Owner Name" in result.message
+
+
+# ── BUG #2: "delete this" on a save-code reply deletes the SAVED ITEM ───────
+#
+# A replied-to save-code message used to be treated as a generic Telegram
+# message target, so ``delete this`` deleted the (bot) message carrying the
+# code instead of the stored item. Resolution is deterministic and happens
+# before any provider round — the replied content is never handed to the
+# model and the decision is never the model's.
+
+_CONFIRMATION = "✅ **Saved Successfully**\n\n**Code:** `S0001`\n**Type:** Photo"
+_METADATA_BLOCK = "**LifeOS** `S0007`\n**Saved** 2026-09-15 10:08"
+
+
+def test_delete_this_on_a_save_code_reply_deletes_the_saved_item():
+    from backend.ai.actions import parse_command_intent
+
+    for text in ("delete this", "delete it", "اینو پاک کن", "این پیام رو پاک کن"):
+        r = parse_command_intent(text, has_reply=True, reply_text=_CONFIRMATION)
+        assert r.kind == "executable", text
+        assert r.action == "delete_saved_item", text
+        assert r.target == "saved_item", text
+        assert r.save_code == "S0001", text
+        assert r.tool_calls == [{"name": "delete_save", "arguments": {"save_code": "S0001"}}]
+
+
+def test_a_metadata_block_reply_resolves_to_its_own_code():
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent("delete this", has_reply=True, reply_text=_METADATA_BLOCK)
+    assert r.action == "delete_saved_item"
+    assert r.save_code == "S0007"
+
+
+def test_delete_this_on_an_ordinary_reply_keeps_message_deletion():
+    from backend.ai.actions import parse_command_intent
+
+    for reply in ("salam, how are you?", "just a photo caption", ""):
+        r = parse_command_intent("delete this", has_reply=True, reply_text=reply)
+        assert r.action == "delete_messages", reply
+        assert r.target == "replied_message", reply
+        assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}], reply
+
+
+def test_several_save_codes_in_the_replied_message_never_pick_one():
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent(
+        "delete this", has_reply=True, reply_text="codes S0001 and S0002 are close",
+    )
+    assert r.action == "delete_messages"
+    assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
+
+
+def test_a_code_shaped_token_without_a_digit_is_not_a_save_code():
+    """Documented bound of the existing extraction rule: codes need a digit."""
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent("delete this", has_reply=True, reply_text="**LifeOS** `SABCD`")
+    assert r.action == "delete_messages"
+    assert r.tool_calls == [{"name": "delete_replied", "arguments": {}}]
+
+
+def test_an_explicit_save_code_still_wins_over_the_replied_message():
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent("سیو S0001 رو پاک کن", has_reply=True, reply_text=_METADATA_BLOCK)
+    assert r.action == "delete_saved_item"
+    assert r.save_code == "S0001"
+
+
+def test_the_resolved_call_carries_only_the_save_code():
+    """Nothing from the replied message travels into the execution layer."""
+    import json
+
+    from backend.ai.actions import parse_command_intent
+
+    r = parse_command_intent("delete this", has_reply=True, reply_text=_CONFIRMATION)
+    serialized = json.dumps(r.tool_calls)
+    assert serialized == '[{"name": "delete_save", "arguments": {"save_code": "S0001"}}]'
+    assert "Saved Successfully" not in serialized
+    assert "Photo" not in serialized
+
+
+def test_other_intents_are_unaffected_by_a_save_code_reply():
+    from backend.ai.actions import parse_command_intent
+
+    save = parse_command_intent("اینو سیو کن", has_reply=True, reply_text=_CONFIRMATION)
+    assert save.tool_calls == [{"name": "save", "arguments": {}}]
+
+    counted = parse_command_intent("۳ پیام آخر رو پاک کن", has_reply=True, reply_text=_CONFIRMATION)
+    assert counted.tool_calls[0]["name"] == "delete"
+
+    semantic = parse_command_intent(
+        "پیام‌های مربوط به قرارداد رو پاک کن", has_reply=True, reply_text=_CONFIRMATION,
+    )
+    assert semantic.action == "delete_messages"
+    assert semantic.tool_calls[0]["name"] == "delete"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_resolves_the_reply_save_code_before_any_provider_round():
+    """The whole point: the AI is not consulted, and never sees the reply.
+
+    Drives the REAL dispatcher dispatch: the deterministic fast path resolves
+    ``delete this`` + a save-code reply to the existing ``delete_save`` tool
+    and executes it through the same ToolExecutor the provider loop uses. The
+    prompt builder is never invoked and the provider is never called, so no
+    replied content can reach a model.
+    """
+    from backend.ai.conversation.context_builder import ReplyContext
+    from backend.ai.engine.dispatcher import Dispatcher
+    from backend.ai.engine.hooks import NOOP_HOOKS
+    from backend.ai.engine.metrics import EngineMetrics
+    from backend.ai.session.request import AIRequest
+    from backend.ai.tools.executor import ToolExecutionResult
+
+    mock_te = MagicMock()
+    mock_te.execute_calls = AsyncMock(return_value=[
+        ToolExecutionResult(
+            tool_name="delete_save", success=True,
+            message="✅ Deleted `S0001`", data={"save_code": "S0001"},
+        ),
+    ])
+    mock_te._context = MagicMock()
+    mock_te._context.extra = {}
+    mock_te._context.telegram = None
+    mock_te._context.tz_str = "UTC"
+    mock_te._context.client = None
+
+    mock_pm = MagicMock()
+    mock_pm.get_active_name.return_value = "test"
+    mock_pm.get_active.return_value.config.model = "m"
+    mock_pm.get_active.return_value.health.return_value = {"healthy": True}
+    mock_pm.get_active.return_value.chat = AsyncMock()
+
+    mock_conv = MagicMock()
+    mock_sess = MagicMock()
+    mock_sess.session_id = "s"
+    mock_sess.owner_id = OWNER
+    mock_sess.active_provider = "test"
+    mock_conv.get_session.return_value = mock_sess
+    mock_conv.restore_history = AsyncMock()
+    mock_conv.get_history.return_value = []
+
+    mock_pb = MagicMock()
+    d = Dispatcher(mock_conv, mock_pb, mock_pm, NOOP_HOOKS, EngineMetrics(), tool_executor=mock_te)
+
+    result = await d.dispatch(AIRequest(
+        session_id="s", message_id=57494, owner_id=OWNER, user_message="delete this",
+        chat_id=CHAT,
+        reply_context=ReplyContext(
+            exists=True, message_id=57495, chat_id=CHAT, sender_id=OWNER,
+            text_preview=_CONFIRMATION,
+        ),
+    ))
+
+    calls = mock_te.execute_calls.await_args.args[0]
+    assert calls == [{"name": "delete_save", "arguments": {"save_code": "S0001"}}]
+    assert result.success is True and "Deleted" in result.response
+    # No provider round and no prompt build: the model received nothing.
+    mock_pm.get_active.return_value.chat.assert_not_awaited()
+    mock_pb.build.assert_not_called()

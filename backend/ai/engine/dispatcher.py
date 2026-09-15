@@ -1212,6 +1212,19 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI usage persistence schedule failed: %r", exc)
 
+    @staticmethod
+    def _reply_text(request: AIRequest) -> str:
+        """Trusted replied-to message text for deterministic target resolution.
+
+        Sourced from the runtime's own reply metadata (never model output) and
+        consumed ONLY by ``parse_command_intent`` — it is never added to the
+        AI request, the prompt, or any model-visible field.
+        """
+        ctx = request.reply_context
+        if ctx is None or not ctx.exists:
+            return ""
+        return ctx.text_preview or ""
+
     def _build_tool_context(self, request: AIRequest) -> ToolContext:
         """Build a per-request ToolContext from the executor's base context.
 
@@ -1242,6 +1255,7 @@ class Dispatcher:
             deterministic = parse_command_intent(
                 request.user_message,
                 has_reply=bool(request.reply_context and request.reply_context.exists),
+                reply_text=self._reply_text(request),
             )
             if deterministic.action == "create_task" and deterministic.kind == "executable":
                 candidate = self._build_deterministic_task_candidate(
@@ -1482,7 +1496,9 @@ class Dispatcher:
             return None
 
         has_reply = bool(request.reply_context and request.reply_context.exists)
-        result = parse_command_intent(request.user_message, has_reply=has_reply)
+        result = parse_command_intent(
+            request.user_message, has_reply=has_reply, reply_text=self._reply_text(request)
+        )
 
         if result.kind == "conversational":
             return None
@@ -1703,7 +1719,9 @@ class Dispatcher:
         # vocabulary. It resolves targets from the reply context — it never
         # depends on the model emitting JSON or a native tool call.
         has_reply = bool(request.reply_context and request.reply_context.exists)
-        result = parse_command_intent(request.user_message, has_reply=has_reply)
+        result = parse_command_intent(
+            request.user_message, has_reply=has_reply, reply_text=self._reply_text(request)
+        )
 
         if result.kind == "conversational":
             # No deterministic command match — try the model's own JSON output.

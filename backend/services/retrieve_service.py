@@ -106,6 +106,16 @@ async def do_preview(self_client, owner_id: int, save_code: str) -> str:
         return f"❌ DB error: {exc}"
     if not row:
         return f"❌ No item found for `{save_code}`"
+    # Owner isolation + row identity, identical to do_retrieve/do_delete:
+    # ``query_save`` is a code-only lookup (the DB layer adds no owner
+    # predicate), so an unverified row could belong to another owner — or, if
+    # the lookup ever handed back a different row, present another item's
+    # metadata under this code. Both are reported with the same not-found
+    # wording, so a foreign item is never distinguishable from a missing one.
+    if row.get("owner_id") != owner_id:
+        return f"❌ No item found for `{save_code}`"
+    if str(row.get("save_code") or "").upper() != save_code:
+        return f"❌ No item found for `{save_code}`"
     await db_client.log(owner_id, "INFO", f"Preview {save_code}", {"save_code": save_code})
     return format_preview(row)
 
