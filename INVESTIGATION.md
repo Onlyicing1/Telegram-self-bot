@@ -1,524 +1,743 @@
-# Telegram History Access — Architectural Investigation
+# Media Processing — Architectural Investigation
 
 > **Investigation only — nothing was implemented.** This document reports the
-> source-backed findings of the reusable-Telegram-history investigation. It
-> replaces the previous `INVESTIGATION.md` entirely; no earlier content is
-> preserved, merged, or appended. No production code, tests,
-> `IMPLEMENTATION_REPORT.md`, schema, migrations, configuration, presentation,
-> delivery logic, or context-retrieval logic was modified. No `HistoryService`,
-> cache, scheduler, client, or polling loop was created.
+> source-backed findings of the Media Processing investigation. It **replaces
+> the previous `INVESTIGATION.md` entirely**; no earlier content (including the
+> Telegram-history investigation) is preserved, merged, appended, or referenced
+> as a historical section. No production code, tests,
+> `IMPLEMENTATION_REPORT.md`, schema, migrations, configuration, dependency,
+> presentation, delivery, context-retrieval, Save/Saved-Items, provider or
+> runtime file was modified. No media processor, service, handler, tool,
+> package, table, scheduler, client or loop was created.
+
+## 1. Investigation Metadata
 
 | Item | Value |
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Revision audited | `73bbda6` (`feat: add durable invisible AI provenance to AI answers`) |
-| Question | Where should reusable, arbitrary-N Telegram history retrieval live, so that "translate/summarize the last N messages" is possible without dumping N messages into one prompt? |
-| Verdict | **No reusable history layer exists today.** Two independent, non-overlapping, non-extensible readers exist; the correct boundary is a narrow services-layer history capability over the already-existing `backend/telegram_api` facade, with provenance eligibility owned there — **not** in individual AI tools, and **not** by enlarging the bounded conversational snapshot. |
-| Changes made | only this document |
+| Audited HEAD | `893d3f439f5a5a266a302ef5a2b4721f0ab144d1` (short `893d3f4`, `docs: record the all-letter save-code grammar fix`) |
+| Investigation date | 2026-09-15 |
+| Status | **Investigation only. No implementation was performed during this investigation.** |
+| Scope | Whether, and at which existing architectural boundary, a controlled Media Processing layer can be added upstream of the owner's currently selected LLM provider — without changing that provider, and without leaking Telegram/conversational context to the model. |
+| Question | How can Telegram media (photo, voice, audio, document, video, sticker, GIF) be resolved, downloaded, validated and normalized into a controlled representation that the **currently selected** chat provider consumes as ordinary input? |
+| Verdict | **GO WITH REQUIRED PREWORK.** No multimodal input path is wired today (`vision()` is declared-but-dead across every adapter), and both existing media-download paths are unbounded. A provider-independent, text-normalized media capability at the services layer is required first; true native image/audio understanding would require a provider-interface change and is therefore out of M1. |
+| Files changed by this investigation | only `INVESTIGATION.md` |
+| Classification labels | **[CURRENT]** implemented behavior verified in source at `893d3f4` · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision |
 
-Every claim below is labelled as one of:
-
-- **[CURRENT]** — implemented behavior verified in source at `73bbda6`.
-- **[FINDING]** — a conclusion derived from that source, with the evidence cited.
-- **[RECOMMENDED]** — a future implementation proposal. **Nothing in this
-  section is implemented.**
-
----
-
-## 1. Scope and method
-
-The investigation answers one architectural question: given a request such as
-*"translate the last 500 messages"* or *"summarize the last 1000 messages"*,
-which existing layer should own Telegram history retrieval, and how do the
-bounded conversational context and that layer relate?
-
-Method: read-only source tracing from the AI trigger handler outward to
-Telethon, plus the `telegram_api` facade, the services layer, the dispatcher,
-the token-budget module, and the existing tests. No repository-wide search was
-performed beyond targeted `grep` for the reader/history entry points named in
-the task. No live Telegram, Supabase, or Render access was used.
+Evidence-strength tags used inline where a claim is not directly readable in
+source: **VERIFIED FROM SOURCE**, **INFERENCE FROM SOURCE**, **UNKNOWN /
+REQUIRES IMPLEMENTATION DECISION**.
 
 ---
 
-## 2. Current Telegram context architecture
+## 2. Investigation Method
 
-**[CURRENT]** The bounded surrounding-context snapshot is built exactly once per
-AI request and threaded forward as data:
+Read-only tracing from the Telegram activation handler outward to Telethon and
+back through the provider mesh, plus the services, prompt, context, tool and
+configuration layers. Areas inspected (all at `893d3f4`, all read-only):
 
-```
-Telegram NewMessage (outgoing, owner)
-  └─ backend/bot/handlers/ai_unified.py::_execute_ai
-       request_chat_id    = event.chat_id
-       request_message_id = event.message.id
-       └─ _load_telegram_chat_context(...)            ai_unified.py:539
-            └─ fetch_telegram_chat_context(...)       telegram_context.py:394   ← the ONLY I/O
-                 ├─ _read_window(...)                 telegram_context.py:339
-                 │    client.iter_messages(chat_id, limit=MAX_CONTEXT_MESSAGES,
-                 │                          max_id=message_id)   :346
-                 ├─ _resolve_sender_names(...)        (≤ MAX_SENDER_RESOLVES lookups)
-                 └─ build_chat_context(...)           telegram_context.py:261   ← PURE
-                      └─ _to_record(...)              telegram_context.py:223
-       └─ AIRequest(telegram_context=snapshot)        ai_unified.py:668
-            └─ engine.execute(request)                bounded by asyncio.wait_for(
-                                                       _AI_TIMEOUT = 60.0)  ai_unified.py:62, :687
-                 └─ ContextBuilder                        backend/ai/conversation/context_builder.py
-                      telegram_chat=snapshot              context_builder.py:203, :238, :290
-                      └─ PromptBuilder                    backend/ai/prompt/builder.py
-                           if ctx.telegram_chat.is_empty: ...   builder.py:276
-                           telegram_block = ctx.telegram_chat.render()  builder.py:289, :409
-                           → `[Telegram Chat Context]`
-```
-
-Supporting facts, verified:
-
-| Fact | Evidence |
+| Area | Files inspected |
 |---|---|
-| The snapshot is a **frozen value object**, never persisted, never merged into AI history | `TelegramChatContext` (`telegram_context.py`), module docstring rules |
-| Exactly one Telegram read per request | `fetch_telegram_chat_context` → single `_read_window` call (`:339`–`:346`) |
-| `build_chat_context` performs **no I/O** | signature + docstring (`telegram_context.py:261`); asserted by `tests/test_telegram_chat_context.py::test_prompt_builder_only_formats_the_already_built_snapshot` |
-| `AIRequest.telegram_context` is typed as this snapshot | `backend/ai/session/request.py:36`, `:66` |
-| The whole AI turn, including the prompt round and tool rounds, sits inside one `_AI_TIMEOUT = 60.0` | `ai_unified.py:62`, `:619`, `:687` |
+| Activation / request construction | `backend/bot/handlers/ai_unified.py` (1011 lines, full) |
+| Request object | `backend/ai/session/request.py` |
+| Execution | `backend/ai/engine/dispatcher.py` (2223 lines, targeted windows around `dispatch`, `_provider_chat`, `_build_tool_context`, `_try_local_fast_path`, `_read_results_authoritative`, `_build_messages`, `_build_continuation_messages`, `_build_context`), `backend/ai/engine/engine.py` |
+| Providers | `backend/ai/providers/base/{contract,capabilities,config}.py`, `backend/ai/providers/{openai_compat,openai,gemini,dummy}.py`, `backend/ai/providers/manager/manager.py` |
+| Media | `backend/ai/media.py`, `backend/telegram_api/{__init__,api,media,messages,_helpers,exceptions}.py` |
+| Context / prompt | `backend/ai/conversation/telegram_context.py`, `backend/ai/conversation/context_builder.py`, `backend/ai/context/provenance.py`, `backend/ai/context/reply_resolver.py`, `backend/ai/prompt/{builder,budget,serializer,template}.py` |
+| Tools / services | `backend/ai/tools/{base,context,registry,executor,save,history_ai}.py`, `backend/services/save_service.py`, `backend/services/history_service.py`, `backend/services/history_ai_service.py`, `backend/services/settings_service.py`, `backend/services/delete_service.py` |
+| Limits / wiring | `backend/helper/rpc_timeout.py`, `backend/runtime/operation_watchdog.py`, `backend/ai/tools/delivery.py` |
+| Runtime / deps | `requirements.txt`, `render.yaml`, `Procfile`, installed venv package list |
+| Design docs | `AI_MASTER_DESIGN.md` §18 (Non Goals), §20 (Future Ideas), §28 (Resource Budget), §29 (Deterministic Runtime Rules) |
 
-**[FINDING]** The snapshot is request-scoped enrichment, not a history API. Its
-selection logic is deliberately a single `iter_messages` window anchored on the
-triggering message id (`max_id=message_id`), with "never invent future context"
-and "newest N win" semantics.
+Method notes: no live Telegram, Supabase, Render or network access was used; no
+package was installed; no test was executed (no code changed, so there was
+nothing to test). Where a conclusion depends on a symbol's presence rather than
+on executed behavior, that is stated as **[FINDING]** with the exact symbol and
+file cited. Repository-wide greps were targeted (`vision`, `download_media`,
+`supports_images`, `classify_message`, `ffmpeg`, OCR/STT/multimodal keywords),
+not exhaustive.
 
 ---
 
-## 3. Current Telegram history readers
+## 3. Current AI Execution Pipeline
 
-**[CURRENT]** There are **two** end-user-facing conversation readers plus one
-typed facade and one bounded scan helper. They do not share code.
+**[CURRENT]** The real flow, with exact symbols. Async/sync and context payload
+are stated for every stage because they determine where media can enter.
 
-| # | Reader | Location | Retrieval | Output | Provenance-aware? |
+```
+Telegram outgoing message (owner's own account)
+  └─ ai_unified.py::register.ai_unified_handler            ai_unified.py:920   @client.on(events.NewMessage(outgoing=True))
+       ├─ is_owner(event, owner_id)                        → non-owner: return
+       ├─ raw_text = event.raw_text or ""                  ai_unified.py:924
+       ├─ if not raw_text: return                          ai_unified.py:925   ← blocks caption-less media
+       ├─ if raw_text.startswith("."): return
+       ├─ _load_triggers(owner_id) → match_trigger(...)     (TTL-cached ai_config row)
+       ├─ reply-to-AI sniff: event.get_reply_message()
+       │    + reply_resolver.get_resolver().resolve(id)    ai_unified.py:~955
+       ├─ _extract_reply_context(...)                      ai_unified.py:425   async
+       │    ├─ classify_message(reply_msg) → MediaInfo      ai_unified.py:459, media.py:70
+       │    ├─ reply_msg.get_sender() / get_chat()          (parallel, best-effort)
+       │    └─ ReplyContext(..., media_type, text_preview[:200], ai_content from resolver)
+       └─ _execute_ai(event, owner_id, user_message, ...)   ai_unified.py:581   async
+            ├─ semaphore gate: asyncio.wait_for(sem.acquire(), timeout=_AI_TIMEOUT=60.0)   ai_unified.py:62, :619
+            ├─ event.edit("Thinking…")
+            ├─ _restore_config(owner_id, config)            engine.apply_persisted_config
+            ├─ _load_telegram_chat_context(...)             ai_unified.py:548
+            │    └─ telegram_context.fetch_telegram_chat_context(...)   ← bounded 10-message window (3s)
+            ├─ AIRequest(session_id, user_message, owner_id, chat_id, message_id,
+            │            reply_context, telegram_context, timezone, request_id,
+            │            timeout_s=_AI_EXECUTE_TIMEOUT=240.0)              ai_unified.py:71
+            ├─ engine.execute(request, status_callback)     engine.py::Engine.execute
+            │    └─ Dispatcher.dispatch(request, ...)       dispatcher.py:204
+            │         1 conversation runtime: add_user_message
+            │         2 _try_local_fast_path(...)           dispatcher.py:1479   deterministic, NO provider round
+            │              └─ parse_command_intent(text, has_reply, reply_text)  actions.py:1722
+            │         3 _build_context(request, session)    dispatcher.py:2009   ContextBuilder + MemoryManager
+            │         4 PromptBuilder.build(context, tool_block)  prompt/builder.py
+            │         5 _build_messages(package)            dispatcher.py:1952   plain {role, content:str} dicts
+            │         6 _provider_chat(...)                 dispatcher.py:245
+            │              └─ self._provider_manager.chat(messages, **kwargs)    dispatcher.py:274
+            │                   └─ ProviderManager.chat(...)                     manager.py:103
+            │                        └─ _attempt_with_retry → provider.chat(...)  openai_compat.py:65 / gemini.py
+            │         7 tool loop (_build_continuation_messages)  dispatcher.py:1967, MAX_TOOL_ROUNDS=3 (dispatcher.py:58)
+            │              └─ ToolExecutor.execute_calls → tool.execute()        executor.py
+            └─ deliver_response(event, display_prompt, response_text, show_question)   ai_unified.py:798
+            └─ reply_resolver.register(...)                 (associates the delivered message with the AI reply)
+```
+
+**[VERIFIED FROM SOURCE]** Stage-by-stage contracts:
+
+| Stage | Symbol | In → Out | Async | Understands media | Model-visible Telegram context |
 |---|---|---|---|---|---|
-| 1 | Bounded surrounding window | `backend/ai/conversation/telegram_context.py::_read_window` (`:339`) → `build_chat_context` (`:261`) | `client.iter_messages(chat_id, limit=10, max_id=anchor)` | `TelegramChatContext` (frozen records) | **Yes** — `has_ai_provenance_marker` filter (`:305`) + `strip_ai_provenance_marker` (`:231`) |
-| 2 | Recent-message listing tool | `backend/ai/tools/semantic.py::ListRecentMessagesTool.execute` (`:87`, `:142`) | `client.iter_messages(chat_id, limit=limit)` (`:165`), reversed to chronological | `ToolResult.data.messages` = list of dicts | **No** |
-| 3 | Typed Telegram facade | `backend/telegram_api/messages.py::iter_messages` (`:144`), `search_messages` (`:172`), `get_messages` (`:95`); exposed on `telegram_api/api.py` (`:71`, `:82`, `:91`) | `client.iter_messages(...)` + `serialize_message` | serialized dicts (`limit` default 100; supports `from_user`, `min_id`) | **No** |
-| 4 | Bounded scan helper (services) | `backend/services/delete_service.py::_iter_messages_bounded` (`:43`) | `client.iter_messages` with `rpc_await(..., timeout=5.0)` **per page/RPC** | raw Telethon messages (internal) | **No** (uses ownership, not provenance) |
+| Activation | `ai_unified_handler` :920 | event → gated call | async | no | no |
+| Reply extraction | `_extract_reply_context` :425 | `Message` → `ReplyContext` | async | **label only** (`media_type`) | **yes** (see §7) |
+| Window | `fetch_telegram_chat_context` (`telegram_context.py`) | chat+anchor → `TelegramChatContext` | async | label only (`_media_type`) | **yes** (10 messages) |
+| Request | `AIRequest` (`session/request.py`) | frozen dataclass | — | no | fields exist for both |
+| Fast path | `_try_local_fast_path` :1479 + `parse_command_intent` (`actions.py:1722`) | **text only** → tool calls | async | **no — pure text parser, zero media vocabulary** | reply text only |
+| Prompt | `PromptBuilder.build` (`prompt/builder.py`) | context → `PromptPackage` | sync | no | renders reply + window |
+| Assembly | `_build_messages` :1952 | package → `list[{"role","content":str}]` | sync | no | — |
+| Provider call | `_provider_chat` :245 → `ProviderManager.chat` :103 | messages → `ProviderResponse` | async | **no** | — |
+| Tool loop | `_build_continuation_messages` :1967 | tool_calls → results | async | no | tool JSON only |
+| Delivery | `deliver_response` (`delivery.py`) | text → edited/split messages | async | no | — |
 
-**[FINDING] All four are independent implementations.** Reader 1 does not use
-the facade (it calls the Telethon client directly); reader 2 does not use the
-facade either; reader 3 is a thin serializer used by some tools
-(`backend/ai/tools/delete.py`, `backend/ai/tools/context.py`) but **not** by
-either conversation reader; reader 4 is the only one with per-RPC timeouts.
+**[FINDING]** Two and only two seams exist where a media capability can enter:
+(a) the deterministic fast path (`parse_command_intent` + `_try_local_fast_path`,
+which runs before any provider round and is where the existing saved-item
+retrieve/preview/delete routes live); and (b) a registered tool executed by the
+provider tool loop (where `translate_history` / `summarize_history` live).
+`parse_command_intent` reads **text only** — it cannot see media — so a
+deterministic media route must receive the media signal from the request scope
+(`AIRequest.reply_context.media_type`, already available to
+`Dispatcher._build_tool_context` at `dispatcher.py:1233`) rather than from the
+user's text.
 
-Additional raw history touch points exist for single-message fetches, not
-conversation history: `backend/ai/tools/delete.py:345`, `:553`;
-`backend/ai/tools/save.py:108`; `backend/bot/handlers/delete.py:158`, `:233`;
-`backend/bot/handlers/save.py:104`; `backend/bot/handlers/misc.py:473`, `:512`,
-`:561`; `backend/helper/target_context.py:41`;
-`backend/services/database_service.py:54`; `backend/services/save_service.py:506`.
-
-**[FINDING] No shared conversation-history layer exists.** There is no
-`HistoryService`, no history repository, no message-normalization utility, and
-no pagination abstraction anywhere in `backend/`. The only reusable primitives
-that exist are the `telegram_api` serializer and the bounded-iteration pattern
-in `delete_service`.
+**[FINDING]** Prompt assembly is text-only end to end. `_build_messages`
+(`dispatcher.py:1952`) emits `{"role": "system"|"user", "content": <str>}` and
+`OpenAICompatProvider.chat` (`openai_compat.py:65`) places that list directly into
+`payload["messages"]`. No content-part, attachment, image-URL or base64 shape
+exists anywhere in the pipeline.
 
 ---
 
-## 4. Current limits, and why the bounded context cannot serve N = 500/1000
+## 4. Current Media Capabilities
 
-**[CURRENT]** Hard constants, none user-configurable:
+**[CURRENT]** The only media machinery in the repository:
 
-### 4.1 Bounded surrounding context — `backend/ai/conversation/telegram_context.py`
-
-| Constant | Value | Meaning |
+| Capability | Location | Class |
 |---|---|---|
-| `MAX_CONTEXT_MESSAGES` | `10` (`:58`) | surrounding messages per request |
-| `MAX_MESSAGE_CHARS` | `200` (`:61`) | per-message truncation, `…` suffix |
-| `MAX_TOTAL_CHARS` | `1500` (`:64`) | total text across the block; oldest dropped first |
-| `MAX_SENDER_RESOLVES` | `4` (`:67`) | display-name lookups per request |
-| `FETCH_TIMEOUT_S` | `3.0` (`:70`) | wall-clock bound for the whole read; any failure degrades to an **empty** context |
+| Media **classifier** — pure attribute inspection, no I/O | `backend/ai/media.py::classify_message` → `MediaInfo` (`media.py:70`) | reusable as-is |
+| Classifier consumers | `ai_unified.py:459` (`_extract_reply_context`), `telegram_context.py` `_media_type` | reusable as-is |
+| Media **download** over the typed facade | `backend/telegram_api/media.py::download_media` (`media.py:18`) → raw `client.download_media` | incomplete/unsafe — **no timeout, no size check, no type validation** |
+| Deep Save download → validate → re-upload | `backend/services/save_service.py::execute_save` (`save_service.py:392`–`465`) | reusable **pattern**, not the code |
+| MIME→media-type map, extension map, byte formatter | `save_service.detect_media_type`, `_MIME_EXT`, `_format_bytes` | reusable as-is |
+| Filename extraction / generated names | `save_service.extract_file_name`, `generate_filename` | reusable as-is |
+| Serialized message media facts | `telegram_api/_helpers.py::serialize_message` | **`has_media: bool` only** — no mime/size/type reach facade dicts |
+| Upload attribute preservation | `save_service._upload_kwargs_for_media` | unrelated to analysis |
+| Content extraction (OCR, STT, PDF, frames) | — | **absent** |
+| Media analysis | — | **absent** |
+| Media → LLM delivery | — | **absent** |
 
-### 4.2 Recent-message tool — `backend/ai/tools/semantic.py`
+Per media type, distinguishing detection / metadata / download / extraction /
+analysis / current LLM delivery:
 
-| Limit | Value | Evidence |
+| Type | Detection | Metadata classification | Download | Content extraction | Analysis | Reaches the selected LLM |
+|---|---|---|---|---|---|---|
+| **Photo** | `MessageMediaPhoto` (`media.py`) → `"Photo"`, forced `image/jpeg`, size from `photo.sizes[-1].size` | `MediaInfo.media_type/mime_type/file_size` | only via Deep Save (`save_service.py:439`) | none | none | **no** — only the label `"Photo"` reaches `ReplyContext.media_type` (`ai_unified.py:459`) |
+| **Voice** | `DocumentAttributeAudio.voice=True` → `"Voice"` | mime, size, filename | only via Deep Save | none (no STT) | none | **no** — label only |
+| **Audio** | `DocumentAttributeAudio.voice=False` → `"Audio"` | mime, size, filename | only via Deep Save | none | none | **no** — label only |
+| **Document** | `MessageMediaDocument` fallback → `"Document"` | mime, size, filename (`DocumentAttributeFilename`) | only via Deep Save | none (no PDF/DOCX/zip reader) | none | **no** — label only |
+| **Video** | `DocumentAttributeVideo` → `"Video"` | mime, size, filename | only via Deep Save | none (no ffmpeg, no frame sampler) | none | **no** — label only |
+| **Sticker** | `DocumentAttributeSticker` → `"Sticker"` (WEBP/TGS) | mime, size | only via Deep Save | none (no WEBP/TGS decoder) | none | **no** — label only |
+| **Animation/GIF** | `DocumentAttributeAnimated` → `"Animation"`; `mime=="image/gif"` → `"GIF"` | mime, size, filename | only via Deep Save | none | none | **no** — label only |
+| **WebPage** | `MessageMediaWebPage` → `"WebPage"`, `text/html` (`media.py`) | type + mime | never | never | none | label only |
+| Contact / Poll / Location | `MessageMediaContact` / `Poll` / `Geo` | type only | never | never | none | label only |
+
+**[FINDING]** Media is therefore *detected and labelled* everywhere, and
+*downloaded* only by Deep Save — where the bytes exist solely to be re-uploaded.
+No media byte ever reaches a provider, and no media capability exists in
+`backend/ai/`.
+
+---
+
+## 5. Telegram Media Download Boundary
+
+**[CURRENT]** Exactly two code paths can download media, and **both are
+unbounded**:
+
+1. **`backend/services/save_service.py:439`** — `await client.download_media(reply_msg, file=tmp_path)`
+   (raw Telethon call; no `rpc_await`, no `guarded_await`, no timeout).
+2. **`backend/telegram_api/media.py:32`** — the same call inside the typed facade
+   wrapper; catches exceptions into `TelegramAPIError` but imposes **no timeout**.
+   (Contrast: `telegram_api/messages.py` wraps every short call in
+   `guarded_await(..., timeout=_SHORT_CALL_TIMEOUT = 30.0)`; the media module does
+   not.)
+
+Analysis of the existing boundary:
+
+| Property | Current state | Evidence |
 |---|---|---|
-| `_DEFAULT_CANDIDATES` | `50` | `:32` (default when `limit` is absent) |
-| `_MAX_CANDIDATES` | `100` | `:31`; enforced `max(1, min(limit, _MAX_CANDIDATES))` in `execute` (`:142`) and declared as `"maximum": 100` in `parameters` |
-| Per-message text | unbounded previews (`text` field) | `execute` builds `data.messages` dicts |
-| No timeout wrapper | — | `execute` iterates directly (`:165`) |
+| Download function | `client.download_media(msg, file=path)` (save path) / `TelegramAPI.download_media(message, file_path, progress_callback)` (facade) | `save_service.py:439`; `telegram_api/media.py:18`; `telegram_api/api.py:102` |
+| Timeout | **none on either path** | `telegram_api/media.py` has no bounded await; `save_service.py:439` calls the client directly |
+| File-size limit | checked **before** download against Telegram's declared size: `settings_service.max_deep_save_mb()` — default **50 MB**, validated range 1..500 | `save_service.py:396`–`399`; `settings_service.py:69`, `:113`, `:281` |
+| Post-download validation | `os.path.exists(tmp_path)` and `getsize > 0` only | `save_service.py:445`–`451` |
+| MIME / type validation | **none** — the MIME type is whatever Telegram declares; the filename is Telegram-supplied and used only as the temp filename (`os.path.basename`) | `save_service.py` `_extract_source_media`, `generate_filename` |
+| Temporary storage | `tempfile.mkdtemp(prefix="lifeos_dl_")` — OS temp dir, not configurable, per-operation | `save_service.py:435` |
+| Cleanup | `shutil.rmtree(tmp_dir, ignore_errors=True)` in `finally` (every exit path) | `save_service.py:465` |
+| Event-loop behavior | non-blocking: `download_media` is awaited on the async Telethon client and streams to a path. Handing it a `BytesIO` would materialize the whole file in RAM — so a bounded path must stay file-based | `save_service.py:439`; `telegram_api/media.py:24` |
+| Error handling | save path catches broad `Exception` and returns an honest `"❌ Deep Save failed: …"` string (services never raise); facade raises `TelegramAPIError` / `TelegramTimeoutError` | `save_service.py:441`, `:455`; `telegram_api/exceptions.py` |
+| FloodWait | **no** FloodWait handling in either media path (the facade docstring in `telegram_api/__init__.py` claims FloodWait handling, but no media code implements it) | `telegram_api/media.py` |
 
-### 4.3 Typed facade — `backend/telegram_api/messages.py`
+**[FINDING]** The only reusable safety primitives are the *pattern* (size
+pre-check → download to a `mkdtemp` dir → validate → `finally: rmtree`) and the
+existing bounded-await helpers `backend/helper/rpc_timeout.py::rpc_await` and
+`backend/runtime/operation_watchdog.py::guarded_await`. What is **missing** is a
+download that is itself bounded by one of them.
 
-| Limit | Value |
+---
+
+## 6. Current Provider Interface
+
+**[CURRENT] The provider interface is TEXT-ONLY in practice.** The abstract
+contract declares an image seam, but no adapter implements it and nothing calls
+it.
+
+| Layer | Symbol | Actual accepted input | Verdict |
+|---|---|---|---|
+| Abstract contract | `BaseProvider.chat(messages, **kwargs)` — `contract.py:102` | `list[dict[str, Any]]` (role/content) | **text** |
+| Abstract contract | `BaseProvider.vision(messages, images: list[bytes])` — `contract.py:104` | declared `images: list[bytes]`; the **default body returns `NOT_IMPLEMENTED`** | declared, **not implemented** |
+| Capabilities object | `ProviderCapabilities.supports_images` — `providers/base/capabilities.py:21` | a boolean flag | declared **and consumed nowhere** |
+| OpenAI-compatible base | `OpenAICompatProvider.chat` — `openai_compat.py:65` | plain messages; handles `tools`, `response_format`; **no content parts, no attachments** | **text** |
+| OpenAI-compatible base | `OpenAICompatProvider.vision` — `openai_compat.py:253` | returns `NOT_IMPLEMENTED` unconditionally, even though `capabilities.supports_images=True` (`openai_compat.py:40`) | declared, **not implemented** |
+| Gemini | `GeminiProvider` — `gemini.py:36` declares `supports_images=True`; **defines no `vision`** | inherits the `NOT_IMPLEMENTED` default | declared, **not implemented** |
+| OpenAI | `backend/ai/providers/openai.py:33` declares `supports_images=True` | inherits `OpenAICompatProvider.vision` → `NOT_IMPLEMENTED` | declared, **not implemented** |
+| Dummy | `providers/dummy/provider.py:54` | `supports_images=False` | text |
+| Manager | `ProviderManager.vision(messages, images, **kwargs)` — `manager.py:308` | `def` (**synchronous**) calls `provider.vision(...)`; for the OpenAI-compatible adapters that attribute is `async def`, so the call yields a coroutine, attribute access on it raises, the broad `except` swallows it and returns `_fallback_vision` (`manager.py:1108`) → `"no healthy vision provider"` | latent defect + **never called** |
+| Manager routing | `ProviderManager.vision` uses `_get_healthy_provider()` (`manager.py:563`) — **it ignores the owner's active-provider ordering** that `chat` honors | text: image/audio/binary/file/URL input | — |
+| Call sites | `grep -rn "\.vision("` across `backend/` finds **zero** production call sites (only the definition, the manager, and `_fallback_vision`) | — | **dead path** |
+
+**[VERIFIED FROM SOURCE]** Input capabilities per category:
+text **yes**; images/multimodal **no** (declared flag only); file input **no**;
+audio **no**; binary/base64 **no**; URL/reference **no**; provider-specific
+content blocks **no** — every adapter sends `{"model", "messages", "temperature",
+"max_tokens"}` with string content (`openai_compat.py:75`–`100`).
+
+**[FINDING] Answer to the provider-independence requirement.** Because the
+`vision()` seam is dead, unimplemented, and (in the manager) not even wired to
+the active-provider ordering, **media cannot be handed to a provider as media
+today.** The only route that both (a) lets the owner keep *any* currently
+selected provider and (b) keeps the selected provider unchanged is to
+**normalize media into text upstream** and send it through the ordinary
+`ProviderManager.chat(...)` path. That path already honors active-provider-first
+ordering, model-level candidate failover, retry classification and cooldown
+(`manager.py:103` onward). An existing precedent proves a service layer may do
+exactly this: `backend/services/history_ai_service.py:453`
+(`manager.chat(messages, tools=[])`) reaches the mesh through
+`ToolContext.extra["provider_manager"]`, which `Dispatcher._build_tool_context`
+(`dispatcher.py:1233`) sets from the live engine.
+
+---
+
+## 7. Context / Privacy Boundary
+
+### 7.1 Every current injection path into the model
+
+**[CURRENT]** These fields are attached to an AI request and rendered into the
+prompt. Each is a candidate leak vector for a media request.
+
+| # | What enters | Field / symbol | Added by | Rendered where |
+|---|---|---|---|---|
+| 1 | Owner's text after the trigger | `AIRequest.user_message` | `_execute_ai` (`ai_unified.py:581`) | `PromptBuilder._render_user_message` |
+| 2 | Replied message: sender id + name, chat id + title, `media_type`, **200-char `text_preview`**, timestamp | `AIRequest.reply_context` (`ReplyContext`) | `_extract_reply_context` (`ai_unified.py:425`, `:459`) | `PromptBuilder._render_conversation_state` → `[Reply Context]` |
+| 3 | For a replied message registered as an AI answer: the **full untruncated AI response** + provider/model/session | `ReplyContext.ai_content` etc. | `_extract_reply_context` via `reply_resolver.get_resolver().resolve(...)` | `[Reply to AI Message]` |
+| 4 | Up to **10 real surrounding Telegram messages** (sender name, local `HH:MM`, per-message 200-char text, media label, ≤1500 chars total, ≤4 sender resolutions, 3 s bound) | `AIRequest.telegram_context` (`TelegramChatContext`) | `_load_telegram_chat_context` (`ai_unified.py:548`) → `fetch_telegram_chat_context` | `[Telegram Chat Context]` via `ctx.telegram_chat.render()` |
+| 5 | AI session turns | `ConversationContext.history` | `Dispatcher._build_context` (`dispatcher.py:2009`) | `[History] (n entries)` |
+| 6 | Retrieved memories | `ConversationContext.memory` | `MemoryManager.retrieve_for_prompt` | `[Memory]` |
+| 7 | Tool schemas + last tool result | `ConversationContext.tool` | dispatcher | `[Tool Context]` / `[Tool Results]` |
+| 8 | Request-scoped runtime keys: `chat_id`, `request_message_id`, `request_text`, `request_id`, `request_timeout_s`, `provider_manager`, `reply_msg{message_id, sender_id, sender_name, chat_id, chat_title, media_type, text_preview, timestamp}` | `ToolContext.extra` | `Dispatcher._build_tool_context` (`dispatcher.py:1233`) | **tool-visible only** (not a model message) |
+
+**[FINDING] The precise leak vector for media.** Items 2 and 4 are attached
+**unconditionally** inside `_execute_ai` for every reply-shaped request
+(`ai_unified.py:581`–`640`). Because the current flow can only reach media
+through a reply target — `_extract_reply_context` errors with `"No replied
+message found. Reply to a message first."` when there is none
+(`ai_unified.py:425` region) — a media request is *by construction* a reply, so
+the replied message's 200-char preview **and** up to 10 unrelated surrounding
+Telegram messages would travel in the same prompt as the media. Nothing in the
+current code gates them.
+
+**[CURRENT] Existing provenance discipline (must be preserved, not duplicated).**
+`backend/ai/context/provenance.py::AI_PROVENANCE_MARKER` (`U+2061\u2062\u2063\u2064`)
+is the only trusted authorship signal; `has_ai_provenance_marker` /
+`strip_ai_provenance_marker` are the single authority. It is enforced in
+`telegram_context.build_chat_context` and in `services/history_service.py`.
+`sender_id == owner_id` and `out=True` are explicitly **not** provenance
+(`telegram_context.py` module docstring). A media layer must not add a second
+predicate or regex.
+
+### 7.2 The required future boundary (hard architectural rule)
+
+> **This section states a requirement. It is NOT implemented. Nothing in the
+> current source satisfies it for media.**
+
+The model must receive **only**:
+
+1. the user's explicit request text (the text they actually typed), and
+2. a controlled, normalized media representation produced by the application
+   (e.g. extracted/OCR text, a speech transcript, a document extract, bounded
+   visual analysis or frame descriptions, normalized metadata as *data trusted
+   by the application* — not as instructions).
+
+The model must **not** receive: raw Telegram messages; replied-message text;
+previous chat messages or Telegram history; sender information; chat
+information; message IDs as conversational context; arbitrary Telegram metadata;
+`reply_context`; `telegram_context`; or any inferred conversational context.
+
+Deterministic Telegram-side resolution (which message, which chat, which
+attachment) happens **outside** the AI, in trusted runtime code, exactly the way
+the saved-item retrieve/preview/delete routes already resolve a save code from
+the request scope before the model is consulted.
+
+**[FINDING]** Satisfying this rule for media means the media path must **not**
+reuse `AIRequest.reply_context` / `AIRequest.telegram_context` for its model
+call. Two source-supported ways exist: (a) gate those two fields off for
+media-only requests, or (b) build the media call's own message list inside the
+media service instead of reusing `Dispatcher._build_messages`
+(`dispatcher.py:1952`). Option (b) requires no change to the ordinary AI request
+shape at all and is the smaller change. **[INFERENCE FROM SOURCE]**
+
+---
+
+## 8. Tool / Service Architecture
+
+**[FINDING]** Media Processing belongs at **a services-layer capability invoked
+by a thin registered tool**, with deterministic resolution performed in the
+runtime scope (not by the model). Evidence:
+
+| Evidence | Source |
 |---|---|
-| `iter_messages` default `limit` | `100` (`:147`) |
-| Range support | `from_user`, `min_id` only (`:148`–`:156`); **no** `max_id`, no offset/range pair |
-| Timeout | none inside the function; `asyncio.TimeoutError` is only translated to `TelegramTimeoutError` if a caller already bounded it |
+| "No feature may bypass the Tool Layer. The AI Core talks to the runtime exclusively through tools. No AI module may import Telethon, Supabase, or runtime internals directly." | `AI_MASTER_DESIGN.md` §29.4(27) |
+| One execution authority: the executor is "the SOLE component that calls `tool.execute()`"; the deterministic fast path routes through it too | `ai/tools/executor.py` module docstring; `dispatcher.py:1479` `_try_local_fast_path` → `execute_calls` |
+| Long-running exemption already exists for media-adjacent work | `ToolExecutor._execute_single` skips `TOOL_TIMEOUT_SECONDS = 10` when `tool.long_running`; precedent `SaveTool` / `SaveByLinkTool` (`ai/tools/save.py`) and `TranslateHistoryTool` / `SummarizeHistoryTool` |
+| A **service** may legitimately call the provider mesh with a self-built message list | `services/history_ai_service.py:453` `manager.chat(messages, tools=[])`, reached through `ToolContext.extra["provider_manager"]` set at `dispatcher.py:1233` |
+| Same pattern twice more | `ai/task_interpreter.py:570`, `ai/task_execution.py:167` |
+| The established shape for a bounded new capability (facade-only Telegram access, `rpc_await` per call, dedicated error type, central provenance, no provider/prompt knowledge) | `services/history_service.py` (`HistoryError`, `MAX_HISTORY_MESSAGES = 1000`, `HISTORY_RPC_TIMEOUT_S = 5.0`, `_fetch_page` → `rpc_await`) |
+| Media-relevant Telegram facts already reach a tool deterministically | `ToolContext.extra["reply_msg"]["media_type"]` and `["chat_id"]` / `["request_message_id"]` — `dispatcher.py:1233` |
 
-### 4.4 Bounded scan precedent — `backend/services/delete_service.py`
+**[FINDING]** Options assessed against that source:
 
-| Constant | Value | Evidence |
-|---|---|---|
-| `_MAX_DELETE_SCAN_MESSAGES` | `1000` (`:23`) | proves the codebase already scans 1000 messages — **bounded per RPC, not per request** |
-| `_DELETE_RPC_TIMEOUT_SECONDS` | `5.0` (`:25`) | applied to **every** iteration step via `rpc_await` (`:51`–`:54`) |
+- **Before the Dispatcher (pre-provider preprocessing):** not chosen. It would
+  require new plumbing on the ordinary request object (a new `AIRequest` field
+  or `metadata` key) and would put media work in the path of every request —
+  contradicting the narrow-boundary precedent that explicit requests use a
+  dedicated capability.
+- **Inside an AI tool only:** insufficient by itself — a tool cannot download
+  media without a bounded primitive, and cannot do LLM work without the service
+  and provider-manager plumbing that `history_ai_service` already demonstrates.
+- **Deterministic resolution + thin tool + service (chosen):** matches the
+  existing fast-path/tool split, keeps the single execution authority, and
+  satisfies the provider-independence and zero-context rules simultaneously.
 
-### 4.5 Prompt/token limits — `backend/ai/prompt/budget.py`
+**[RECOMMENDED]** The intended layering (nothing implemented):
 
-| Cap | Value | Line |
-|---|---|---|
-| `DEFAULT_MAX_TOTAL_TOKENS` | `8500` | `:25` |
-| `DEFAULT_MAX_OUTPUT_TOKENS` | `1000` | `:26` |
-| `DEFAULT_MAX_SYSTEM_TOKENS` | `2000` | `:27` |
-| `DEFAULT_MAX_CONTEXT_TOKENS` | `4000` | `:28` |
-| `DEFAULT_MAX_MEMORY_TOKENS` | `1000` | `:29` |
-| `DEFAULT_MAX_TOOL_RESULT_TOKENS` | `1500` | `:31` — **declared and re-exported, never applied anywhere** (only hits: `budget.py:31`, `prompt/__init__.py:85`, `:132`) |
-| Estimation rule | 1 token ≈ 4 English chars, ≈ 2 non-English chars | `estimate_tokens` |
+```
+Telegram media (reply target)
+  → deterministic runtime resolution (request scope, no model)
+  → NEW services-layer media capability   (bounded download → validate → resolve → normalize)
+  → controlled normalized representation (text/structured data)
+  → thin registered AI tool
+  → existing ProviderManager.chat(...)  ← the owner's SELECTED provider, unchanged
+  → ToolResult → existing delivery
+```
 
-### 4.6 Execution-model limits
-
-| Limit | Value | Evidence |
-|---|---|---|
-| `MAX_TOOL_ROUNDS` | `3` | `backend/ai/engine/dispatcher.py:58`, loop at `:704` |
-| Whole AI turn | `_AI_TIMEOUT = 60.0` s | `ai_unified.py:62`, `:687` |
-| Tool results injected verbatim into the continuation round | JSON `{tool, success, message, data, error}` | `Dispatcher._build_continuation_messages` (`:1933`–`:1973`) |
-| Deterministic listing renderer | `_summarize_tool_results` (`:1794`) → `_render_message_list` (`:1821`) | uses `data.messages` (`:1813`–`:1815`) |
-
-**[FINDING] Why the bounded context cannot be raised to 500/1000.** The snapshot
-is not merely capped by a constant; it is *designed* as a proximate, anchored
-window and every downstream layer assumes that:
-
-1. **Selection semantics are anchor-bound** — `max_id=message_id`
-   (`telegram_context.py:346`) with "never invent future context". A 1000-message
-   history request is a *range* request, not "the messages just before the
-   trigger", so it is a different query, not a bigger window.
-2. **Truncation is lossy by design** — 200 chars/message + 1500 chars total
-   (`:61`, `:64`). Translating a 1000-message range at 200 chars/message would
-   silently drop most of the content; translation must not be lossy.
-3. **The read is a single 3.0 s window** (`:70`) — a 1000-message fetch cannot
-   honestly fit that budget, and its failure mode is *silent empty context*
-   (`fetch_telegram_chat_context` returns `EMPTY_CHAT_CONTEXT` on any error or
-   timeout). Silent emptiness is acceptable for optional enrichment and
-   dangerous for an explicit user request.
-4. **Everything lands in one prompt** — `PromptBuilder` renders the snapshot into
-   one `[Telegram Chat Context]` block (`builder.py:289`) inside the same turn
-   that is capped at ~8 500 input tokens / 4 000 context tokens and a 60 s wall
-   clock. 1000 messages at ~50 chars each already exceed the total prompt budget;
-   mixed Persian/English at 2–4 chars/token makes it far worse.
-5. **The value object is frozen and request-scoped** — it deliberately carries no
-   pagination cursor, no date range, no ordering contract beyond "chronological",
-   and no chunk state, which are exactly the fields a large-range operation needs.
-
-**Conclusion:** raising `MAX_CONTEXT_MESSAGES` would degrade ordinary requests
-(more irrelevant context, more truncation loss, higher fetch-failure odds) while
-still not producing a valid 500/1000-message operation. The two capabilities are
-architecturally distinct.
-
-**[FINDING] The separation already exists conceptually in the source**, even
-though the large-history side is unimplemented:
-
-- `telegram_context.py` documents itself as "the bounded surrounding-message
-  snapshot … request-scoped … never persisted" and explicitly distinguishes
-  itself from `HistoryManager` / `ConversationContext.history` (the AI session's
-  own turns) and `ReplyContext` (the replied-to message). It is *not* a Telegram
-  history API.
-- `ListRecentMessagesTool` is documented as "a bounded window of the REAL recent
-  Telegram messages … the first step of semantic delete" — a tool-scoped preview,
-  and its `limit` schema is capped at 100.
-- `delete_service._iter_messages_bounded` (`_MAX_DELETE_SCAN_MESSAGES = 1000`)
-  demonstrates the existing pattern for large history work: iterate in the
-  services layer, bound each RPC, keep raw message objects, and never put the
-  result into a prompt.
+The AI must never receive unrestricted Telegram RPC, filesystem, shell, HTTP or
+SQL access; every media processor stays under explicit application control.
 
 ---
 
-## 5. Where the two paths diverge (root cause of the observed gap)
+## 9. Timeout / Resource Limits
 
-**[CURRENT]/[FINDING]** The surrounding-context path filters AI output; the
-tool-rendering path does not:
+**[CURRENT]** Exact existing limits that a media path must respect:
 
-```
-path A (surrounding context)                     path B (list_recent_messages)
-telegram_context._read_window                    semantic.ListRecentMessagesTool.execute
-  → build_chat_context                                   → raw dicts incl. marked text
-      drop if has_ai_provenance_marker (:305)             (no marker check)
-      strip marker in _to_record (:231)                   → Dispatcher._summarize_tool_results
-  → prompt: marker-free                                    → _render_message_list (:1821)
-                                                             text reproduced verbatim (marker invisible)
-                                                           → _build_continuation_messages JSON (tool role)
-                                                             data.message JSON → provider
-```
-
-**[FINDING]** The divergence is therefore not "a missing marker check in a
-tool". It is that the provenance *invariant* ("marker text never reaches the
-model; AI output is not surrounding human conversation") is enforced only inside
-`telegram_context`, while the tool-result → model chokepoint
-(`Dispatcher._build_continuation_messages`, `dispatcher.py:1933`) and the
-deterministic renderer (`_render_message_list`, `:1821`) inject tool `data`
-verbatim.
-
-**[CURRENT] Provenance today is one deterministic pair of helpers plus one
-in-process registry:**
-
-| Piece | Location | Role |
+| Boundary | Value | Source |
 |---|---|---|
-| `AI_PROVENANCE_MARKER = "\u2061\u2062\u2063\u2064"` | `backend/ai/context/provenance.py:40` | the single authoritative marker literal |
-| `has_ai_provenance_marker` / `strip_ai_provenance_marker` / `apply_ai_provenance_marker` | `provenance.py:43`, `:53`, `:64` | substring detection / removal / idempotent append |
-| Applied only to the final successful presentation | `backend/ai/tools/delivery.py::apply_presentation_provenance` (`:440`), called from `deliver_response` (`:686`, `:721`) | durable half |
-| Read by the bounded collector | `telegram_context.py:305` (drop), `:231` (strip) | exclusion + sanitization |
-| `ReplyResolver` | `backend/ai/context/reply_resolver.py` | in-process, RAM-only, LRU-capped mapping of Telegram msg id → AI content — still an in-process optimization, not durable storage |
+| AI slot acquisition | 60 s | `ai_unified.py:62` `_AI_TIMEOUT` |
+| **AI execution envelope** | **240 s** | `ai_unified.py:71` `_AI_EXECUTE_TIMEOUT` → `AIRequest.timeout_s`, enforced by `asyncio.wait_for(engine.execute(...))` |
+| AI request concurrency | 4 | `ai_unified.py:72` `_AI_MAX_CONCURRENCY` (semaphore) |
+| Handler RPC helper | 30 s | `ai_unified.py:73` `_RPC_T` |
+| Tool rounds per request | 3 | `dispatcher.py:58` `MAX_TOOL_ROUNDS` |
+| Tools per turn | 5 | `ai/tools/executor.py` `MAX_TOOLS_PER_TURN` |
+| Generic tool timeout | 10 s (exempt when `tool.long_running`) | `ai/tools/executor.py` `TOOL_TIMEOUT_SECONDS` |
+| Provider HTTP | 30 s, 3 retries | `providers/base/config.py` `ProviderConfig.timeout`, `retry_count` |
+| Facade short calls | 30 s | `telegram_api/messages.py` `_SHORT_CALL_TIMEOUT` |
+| History page fetch | 5 s | `services/history_service.py` `HISTORY_RPC_TIMEOUT_S` |
+| Bounded Telegram snapshot | 3 s | `conversation/telegram_context.py` `FETCH_TIMEOUT_S` |
+| **Media download** | **none** | both paths (§5) |
+| Media size | 50 MB default, 1..500 configurable | `services/settings_service.py:69`, `:113` |
+| Bounded large scan precedent | 1000 messages | `services/delete_service.py` `_MAX_DELETE_SCAN_MESSAGES`; `services/history_service.py` `MAX_HISTORY_MESSAGES` |
+| History AI operation budget (pacing/deadline math precedent) | `DEFAULT_ENVELOPE_S = 240`, `MAP_CONCURRENCY = 2`, `MAX_CALL_SPACING_S = 5.0`, `ASSUMED_CALL_LATENCY_S = 30`, `call_timeout = min(safety ceiling, time left)` | `services/history_ai_service.py` |
+| Prompt budget | 8500 tokens total / 1000 output | `ai/prompt/budget.py` `DEFAULT_MAX_TOTAL_TOKENS`, `DEFAULT_MAX_OUTPUT_TOKENS`; `AI_MASTER_DESIGN.md` §28.6 |
+| Process | 512 MB RAM, 0.1 shared vCPU | `AI_MASTER_DESIGN.md` §28.4 |
+| AI Telegram reads | ≤ 60 calls/hour (budget, not enforced) | `AI_MASTER_DESIGN.md` §28.3 |
 
-`backend/ai/context/__init__.py` re-exports the marker helpers, so a shared layer
-can consume them without importing `telegram_context`.
+**[INFERENCE FROM SOURCE]** Per media type: **Photo / small document / short
+voice** fit the existing 240 s envelope comfortably once the download itself is
+bounded. **Voice/audio content analysis** is blocked by the absence of any
+speech-to-text capability (§10), not by timeouts. **Video** is the worst case on
+every axis — a 50 MB download with no extraction tool, no frame sampler and no
+ffmpeg, inside a 240 s envelope shared with the LLM call. **Sticker/GIF**
+bytes are obtainable but nothing can decode WEBP/TGS.
 
 ---
 
-## 6. Correct architectural boundary
+## 10. Dependencies / Runtime Constraints
 
-### 6.1 Answers to the required determinations
+**[CURRENT]**
 
-**A. Is there already a shared history/context layer that should own provenance
-eligibility? — [FINDING] No.** §3 proves there is no history layer; §2 proves the
-snapshot is the only context layer and that it is bounded and anchor-scoped.
+- `requirements.txt`: `telethon==1.34.0`, `fastapi==0.111.0`,
+  `uvicorn[standard]==0.29.0`, `supabase==2.4.2`, `aiofiles==23.2.1`,
+  `httpx==0.27.0`, `tzdata==2026.3`. Nothing else.
+- Installed venv confirms no image/audio/video/OCR/document library is present
+  (no Pillow, numpy, opencv, pytesseract, whisper, pypdf, python-magic).
+- A target grep (`ffmpeg|pytesseract|import PIL|whisper|opencv|pypdf`) over
+  `backend/` returns **no** matches (only unrelated words such as "magic
+  numbers" in a docstring and "whisper" inside an unrelated Ghost-Room string).
+- Python **3.11.7** (`render.yaml` `PYTHON_VERSION`), deployed via
+  `render.yaml` (`type: web`, `startCommand: python -m backend.main`,
+  `healthCheckPath: /health`) and `Procfile` (`web: python -m backend.main`).
+- **[INFERENCE FROM SOURCE]** The deploy target is a Python web service on
+  Render, so Python dependencies can be added through `requirements.txt`;
+  however `AI_MASTER_DESIGN.md` §28.4 caps the whole process at 512 MB / 0.1
+  shared vCPU, which rules out heavy native stacks.
+- **[FINDING]** `ffmpeg` and `tesseract` are **system binaries** —
+  `requirements.txt` cannot provide them. Any capability requiring them is
+  therefore not deliverable by dependency declaration alone.
+- **[CURRENT] Documented non-goals that a media phase would contradict:**
+  `AI_MASTER_DESIGN.md` §18(4) "Voice/audio input. The AI does not process voice
+  messages as input." and §18(5) "Image understanding. The AI does not analyze
+  images."; §20.1 sketches vision only as a future idea. **[FINDING]** A media
+  phase must update these non-goals in the same commit that changes the behavior.
 
-**B. (n/a — no such layer exists.)**
+**Research context (not re-verified here, not permission to implement):** a
+separate web-research phase established the provider-independent strategy
+(local/open-source processing as the durable baseline, hosted permanently-free
+services as optional specialist/fallback routes, media normalized *upstream* of
+the selected LLM, no account/key farming or quota abuse, strictly *permanent*
+free tiers only). **[UNKNOWN]** Nothing in the source confirms any specific
+provider's free tier, and no such claim may be treated as verified by this
+document.
 
-**C. Where does the responsibility belong? [RECOMMENDED]** Two distinct answers,
-because eligibility and retrieval are different concerns:
+---
 
-| Concern | Owner | Why |
+## 11. Verified Blockers
+
+Only blockers proven by source are listed.
+
+1. **No working multimodal route exists.** `BaseProvider.vision` returns
+   `NOT_IMPLEMENTED` (`contract.py:104`); `OpenAICompatProvider.vision` returns
+   `NOT_IMPLEMENTED` despite `supports_images=True` (`openai_compat.py:253`,
+   `:40`); `GeminiProvider` declares `supports_images=True` (`gemini.py:36`) and
+   defines **no** `vision`; `grep -rn "\.vision("` finds **no** production call
+   site. Therefore media bytes **cannot** reach any model today. *(True image/
+   audio understanding requires implementing `vision()` per adapter — a
+   provider-abstraction change the handoff explicitly limits.)*
+2. **`ProviderManager.vision` is broken and off-policy anyway.** It is
+   synchronous (`manager.py:308`) while the adapters' `vision` is `async def`
+   (`openai_compat.py:253`), so it receives a coroutine and falls into
+   `_fallback_vision` (`manager.py:1108`); and it selects via
+   `_get_healthy_provider()` (`manager.py:563`), **ignoring the owner's active
+   provider**, which would violate the "do not switch the user's provider"
+   requirement. It must not be used.
+3. **Every media download is unbounded.** `save_service.py:439` and
+   `telegram_api/media.py:32` impose no timeout; a stalled transfer can hold the
+   operation indefinitely.
+4. **Media-only messages cannot activate the AI.** `ai_unified_handler` returns
+   when `raw_text` is empty (`ai_unified.py:924`–`925`), so a caption-less photo
+   starts no request; and the reply path requires an existing reply
+   (`_extract_reply_context`, `ai_unified.py:425` region). *Requires a product
+   decision, not a code discovery.*
+5. **No extraction dependencies.** No OCR, STT, document, image or video
+   library is declared or installed; no ffmpeg/tesseract binary can arrive via
+   `requirements.txt`.
+6. **The facade's message dicts carry `has_media` only** — no mime, size, or
+   type. Media metadata for analysis must come from Telethon objects
+   (`classify_message`) or a new facade primitive, never from
+   `serialize_message` (`telegram_api/_helpers.py`).
+7. **Telegram/conversational context is injected by default.** `reply_context`
+   and the 10-message window are attached unconditionally for any reply-shaped
+   request (`ai_unified.py:581` onward), which is exactly the shape a media
+   request takes (§7.1).
+
+---
+
+## 12. Implementation Readiness
+
+### Verdict: **GO WITH REQUIRED PREWORK**
+
+Why:
+
+- **GO** — the seams are real and singular: one activation handler, one request
+  object, one dispatcher, one provider mesh, one tool-execution authority, one
+  existing precedent (`history_service` + `history_ai_service` + thin tool +
+  `extra["provider_manager"].chat`) for a bounded services-layer capability that
+  performs its own LLM call through the selected provider. Media detection
+  already exists (`ai/media.py::classify_message`) and media-relevant Telethon
+  facts already reach the request scope (`ToolContext.extra["reply_msg"]`).
+- **REQUIRED PREWORK** — three things must land *before* any media capability is
+  useful: (1) a **bounded** download primitive (blocker 3); (2) a decision on
+  the media-only activation path (blocker 4); (3) the normalized-representation
+  contract and the explicit gating of `reply_context` / `telegram_context` for
+  media calls (blocker 7), because the text-normalized route is the only one
+  that satisfies provider-independence today.
+- **NOT BLOCKED** — nothing requires a second client, scheduler, executor,
+  provider abstraction, table or background loop.
+
+**Explicitly out of reach for M1:** native image/audio/video understanding
+(blocker 1), speech-to-text, OCR, document parsing, frame extraction (blockers
+1, 5).
+
+---
+
+## 13. Exact Minimal Implementation Surface
+
+**[RECOMMENDED]** — expected to require changes in the implementation phase.
+Files listed here are those the analysis *proves* must change or be created;
+everything inspected but not required is excluded and named in §14.
+
+**Likely runtime files**
+
+| File | Why it must change | Confidence |
 |---|---|---|
-| History **retrieval + normalization + pagination + range semantics + media metadata + message-ID preservation** | a new narrow module in the **services layer** (`backend/services/`), built over the existing `backend/telegram_api/messages.py` facade and the existing `rpc_await`-style per-RPC bounding (`backend/helper/rpc_timeout.py:20`; pattern already used by `delete_service.py:43`) | `AGENTS.md §13.3` (services own business logic, tools are thin wrappers); the facade and the bounded-RPC pattern already exist, so this **extends** an established pattern rather than inventing a new subsystem |
-| History **provenance eligibility** (is this message AI output?) | the `backend/ai/context/provenance.py` helpers, consumed by whichever layer materializes history for the model | it is the single authoritative durable signal; re-implementing it per tool would create N definitions of the same predicate |
+| `backend/services/media_service.py` | **new** — the bounded capability: download via the facade under a timeout, size/type validation, media resolution, normalized representation, and the LLM call through the request-scoped provider manager | required |
+| `backend/telegram_api/media.py` | **required for safety** — the download must be bounded (`rpc_await` / `guarded_await`) and size-guarded; today it is unbounded (blocker 3) | required |
+| `backend/ai/tools/media.py` | **new** — thin tool over the service; no Telegram retrieval or provider logic inside it | required |
+| `backend/ai/tools/registry.py` | register the new tool in `create_default_registry` | required |
+| `backend/ai/media.py` | only if the normalized record needs more than `classify_message` yields (today: type, mime, size, filename, caption, text) | conditional |
+| `backend/ai/actions.py` | only if an unambiguous media phrasing is defined; must not widen the existing command vocabulary | conditional |
+| `backend/ai/engine/dispatcher.py` | only if a media-only route needs a new `ToolContext.extra` key (`chat_id`, `request_message_id`, `provider_manager`, `reply_msg` already exist) or a fast-path guard | conditional |
+| `backend/bot/handlers/ai_unified.py` | only if caption-less media must activate the AI (blocker 4) — otherwise untouched | conditional |
+| `backend/services/settings_service.py` | only if per-type size limits are introduced; the existing 50 MB setting may suffice | conditional |
+| `AI_MASTER_DESIGN.md` | §18(4)/(5) media non-goals would need updating in the same commit as any behavior change | conditional |
 
-**D. Why a marker check directly inside `ListRecentMessagesTool` would violate the
-current architecture — [FINDING] three source-grounded reasons:**
+**Likely test files**
 
-1. **The tool's own contract requires complete ID coverage.**
-   `ListRecentMessagesTool` is documented (`semantic.py:88`–`:94`, `:106`–`:113`)
-   as the first step of semantic delete: *"then call `delete_messages_by_ids` with
-   only the IDs you saw here. Never invent IDs."* Dropping AI-marked messages
-   would make them **undeletable**, because `DeleteMessagesByIdsTool` can only
-   act on IDs the listing revealed. Filtering here breaks a documented contract.
-2. **It is exactly the per-tool ad-hoc filtering the constraint forbids**, and it
-   would have to be duplicated in every future reader (translate, summarize,
-   search, export), each with its own definition of eligibility.
-3. **The architecture already has a chokepoint.** The tool-result → model path is
-   `Dispatcher._summarize_tool_results` / `_render_message_list` /
-   `_build_continuation_messages` — the tool-path equivalent of
-   `telegram_context._to_record`. Enforcing marker sanitization there matches the
-   existing design instead of scattering it.
-
-**E. Is a new abstraction justified? — [FINDING] Partially: retrieval, yes;
-provenance, no.** The source proves *no* existing layer can perform
-arbitrary-N, range-aware, lossless retrieval (readers 1–4 in §3 are each
-unsuitable: 1 is bounded/anchor/lossy, 2 is capped at 100 and contractually
-raw-for-delete, 3 has no `max_id`/range and no timeout, 4 is delete-specific).
-Provenance, by contrast, already has a correct abstraction
-(`backend/ai/context/provenance.py`) and must be **reused**, not reinvented.
-
-### 6.2 Why the alternative locations are wrong
-
-| Candidate | Verdict | Reason (source) |
-|---|---|---|
-| Enlarge `MAX_CONTEXT_MESSAGES` | **wrong** | §4 — anchor semantics, lossy truncation, 3 s single-shot read with silent-empty failure, single-prompt budget, frozen request-scoped object |
-| Proliferate the marker check into every tool | **wrong** | breaks `ListRecentMessagesTool`'s delete-ID contract; duplicates a predicate that already has one authoritative home; contradicts `AGENTS.md §13.3` |
-| Put history retrieval inside the AI tool itself | **wrong** | the tool would own Telegram retrieval policy (pagination, timeouts, ordering, media), which the task and `AGENTS.md` both place in the services layer |
-| Add a second Telegram client / update loop / scheduler | **not needed** | `RuntimeSupervisor` is the single connection authority; the existing `client` is already reachable through `ToolContext` and the `telegram_api` facade |
-| Persist history in Supabase | **not needed / forbidden** | the requirement is retrieval of Telegram history, which is already durable in Telegram; no schema change is justified |
-
----
-
-## 7. [RECOMMENDED] Relationship between the bounded context and large-history operations
-
-Bounded context stays exactly as it is: one request-scoped, anchored, 10-message,
-3 s snapshot, provenance-filtered. Large-history retrieval is a **separate,
-explicitly requested operation** that:
-
-1. is never placed into `AIRequest.telegram_context` and never rendered into the
-   `[Telegram Chat Context]` block;
-2. returns a **normalized message collection** (id, sender, date, text/caption,
-   media metadata, provenance flag) instead of a prompt string;
-3. is consumed by an AI tool as *data*, then reduced (translated/summarized)
-   **outside** the prompt-sized path — chunked, processed, and aggregated — so
-   the model only ever sees bounded slices.
-
-**[RECOMMENDED] Data flow — "translate the last N messages"**
-
-```
-user request ("translate the last 500 messages")
- → AI tool (thin) parses N / range from arguments
- → history retrieval (services layer) over telegram_api facade:
-      chronological fetch, per-RPC bounded, ID-preserving, provenance-labelled
- → eligibility policy applied once, centrally (provenance helpers)
- → chunk into prompt-sized slices (respect MAX_TOTAL_TOKENS / context cap)
- → per-chunk translation through the existing provider path (ProviderManager)
- → reassemble in original message order, one translated block per source message
- → deliver (unchanged presentation path)
-```
-
-**[RECOMMENDED] Data flow — "summarize the last N messages"**
-
-```
-user request ("summarize the last 1000 messages")
- → same retrieval + eligibility + chunking
- → map step: per-chunk extraction/summary (bounded, provider round per chunk)
- → reduce step: aggregate the chunk summaries into the final answer
- → deliver
-```
-
-**[FINDING]** Neither flow exists today: there is **no translation tool/service**
-and **no summarization tool/service** (§8). The dispatcher's bounds
-(`MAX_TOOL_ROUNDS = 3`, `_AI_TIMEOUT = 60.0`) mean a 1000-message map/reduce
-cannot honestly run inside one tool invocation as currently structured; the
-source supports bounded per-slice work, not an unbounded in-turn loop.
-
----
-
-## 8. Existing translation and summarization capabilities
-
-**[CURRENT] Translation: none.** Every repository hit for `translate` /
-`translation` is unrelated: a dispatcher comment about translating tool schemas
-(`backend/ai/engine/dispatcher.py:350`), digit translation
-(`backend/ai/persian.py:25`, `backend/ai/task_candidate.py:50`), and prompt text
-instructing the model *not* to translate tool values / user instructions
-(`backend/ai/prompt/template.py:88`, `backend/ai/task_interpreter.py:97`, `:452`).
-There is no translation tool, service, provider configuration, or test. The model
-can translate ad hoc because it is an LLM, but no architecture receives a batch
-of Telegram messages for translation, and no message-boundary or order
-preservation exists.
-
-**[CURRENT] Summarization of Telegram content: none.** Hits are unrelated:
-`UsageSummary` aggregation (`backend/ai/database/usage_reader.py`), the explicit
-statement that `HistoryManager` has "no summaries" (`history.py:5`, `:45`), a
-config comment about a history budget (`backend/ai/config/defaults.py:15`), and
-the dispatcher's `_summarize_tool_results` — which is **deterministic string
-assembly of tool results**, not model summarization (`dispatcher.py:1794`).
-
-**[FINDING]** Therefore both target capabilities need the same missing
-prerequisite first: a reusable history retrieval + normalization layer. Neither
-needs a new provider, executor, or scheduler.
-
----
-
-## 9. Chunking, pagination, token limits, hierarchical processing
-
-**[CURRENT]** What the architecture already provides:
-
-| Primitive | Location | Reusable for large history? |
-|---|---|---|
-| Per-RPC timeout wrapper | `backend/helper/rpc_timeout.py::rpc_await` (`:20`) | **Yes** — the right building block for long fetches |
-| Generic bounded await with diagnostics | `backend/runtime/operation_watchdog.py::guarded_await` (`:81`) | **Yes** |
-| Bounded iteration over history | `backend/services/delete_service.py::_iter_messages_bounded` (`:43`) | **Yes as a pattern** (delete-specific today) |
-| Serialized message dicts | `backend/telegram_api/messages.py::serialize_message` (used by `iter_messages` `:144`) | **Yes** — already the facade's output shape |
-| Token estimation + caps | `backend/ai/prompt/budget.py` (`estimate_tokens`, caps `:25`–`:31`) | **Yes** for slice sizing; note `DEFAULT_MAX_TOOL_RESULT_TOKENS` is currently unused |
-| Provider round abstraction | `ProviderManager` via `Dispatcher` | **Yes** — map/reduce steps are ordinary provider rounds |
-| Tool timeouts / long-running exemption | `ToolExecutor` (`long_running=True` skips the generic 10 s tool timeout) | available, but **not** a substitute for an honest multi-step design |
-
-**[FINDING]** Missing pieces for correct chunking: no `max_id`/range pair in the
-facade (`iter_messages` supports only `from_user`/`min_id`, `messages.py:148`),
-no chunk state, no aggregation stage, no per-operation progress/failure contract
-for partially completed ranges. `DEFAULT_MAX_TOOL_RESULT_TOKENS = 1500` is
-declared and exported but never enforced anywhere — a large history result
-injected into a prompt would not be capped by it today.
-
----
-
-## 10. [RECOMMENDED] Minimum future change set (not implemented)
-
-| File | Likely change |
+| File | Content |
 |---|---|
-| `backend/services/history_service.py` *(new)* | the narrow retrieval/normalization capability: chronological fetch over `telegram_api`, range/count semantics, per-RPC bounding via `rpc_await`, ID + media + provenance-labelled normalized records, explicit failure contract |
-| `backend/ai/context/provenance.py` | **no change expected** — consumed as-is; it is already the single authoritative eligibility predicate |
-| `backend/helpers`/`telegram_api/messages.py` | possible addition of a `max_id`/range parameter to `iter_messages` (facade currently lacks it) |
-| `backend/ai/tools/registry.py` | register thin translate/summarize history tools (thin wrappers only) |
-| `backend/ai/tools/<translate|summarize>.py` *(new)* | tool wrappers that parse N/range, call the service, chunk, and drive the provider rounds — no Telegram policy inside |
-| `backend/ai/engine/dispatcher.py` | only if the aggregation path needs an explicit multi-step contract; `_build_continuation_messages` (`:1933`) / `_render_message_list` (`:1821`) are the chokepoint for marker sanitization of any tool result that can carry message text |
-| `backend/ai/conversation/telegram_context.py` | **no change expected** — stays bounded |
-| Tests | extend `tests/test_telegram_chat_context.py` (bounded behavior unchanged) and add focused history-service/tool tests |
+| `tests/test_<media>.py` (**new**) | bounded download (timeout enforced), size refusal, non-empty validation, temp cleanup, normalized-record shape, media-type resolution per type, tool registration, and **no Telegram context in the media call's message list** |
 
-**Must not be touched:** `RuntimeSupervisor` and the single Telegram client,
-`Taskloom`/`backend/ai/task_scheduler.py`, `ToolExecutor` architecture,
-provider architecture, Supabase (`backend/db/`, `supabase/migrations/`),
-`DATABASE_ARCHITECTURE.md`, delivery/presentation (`backend/ai/tools/delivery.py`
-visual paths), and `backend/ai/conversation/history.py`.
+**Likely configuration / dependency files**
 
-**[RECOMMENDED] Required tests for any future implementation:** count semantics
-(exactly N, N > available, N = 0/negative); range semantics with `min_id`/`max_id`
-and inclusive/exclusive boundaries; strict chronological ordering after
-pagination; message-ID preservation; per-message text integrity (no lossy 200-char
-truncation); provenance exclusion and marker stripping on the history path;
-marker sanitization at the tool-result → model chokepoint; media metadata
-labelling without downloads; per-RPC timeout/failure behavior (partial range →
-explicit honest failure, never a silent empty result); no duplicate reads;
-concurrency safety for two simultaneous history requests; bounded prompt size per
-chunk; ordering preserved in translated/summarized output; and regression tests
-proving the bounded surrounding context and the visible presentation are
-unchanged.
-
----
-
-## 11. Risks and safeguards
-
-| Risk | Evidence / mitigation (source) |
+| File | Note |
 |---|---|
-| Token/context overflow | caps in `prompt/budget.py:25`–`:31`; `DEFAULT_MAX_TOOL_RESULT_TOKENS` is **not enforced today**, so chunking must size slices explicitly |
-| Telegram API cost/latency | `_read_window` today is 10 messages / 3.0 s (`telegram_context.py:58`, `:70`); 1000 messages is ~100× the RPC count — per-RPC bounding (`rpc_await`, `delete_service.py:51`) is the existing answer |
-| Memory on large N | `delete_service` already scans up to 1000 messages (`_MAX_DELETE_SCAN_MESSAGES = 1000`, `:23`) without accumulating normalized records; a history layer must stream/chunk rather than materialize 1000 fully-normalized records at once if N grows |
-| Whole-turn timeout | `_AI_TIMEOUT = 60.0` (`ai_unified.py:62`) bounds the request; a large map/reduce cannot fit one turn as currently structured |
-| Tool-round exhaustion | `MAX_TOOL_ROUNDS = 3` (`dispatcher.py:58`) — multi-step aggregation must not rely on the model chaining many rounds |
-| Duplicate Telegram reads | currently one read per request (`telegram_context.py:339`); a history fetch plus the surrounding snapshot for the same turn would double-read — the design must not re-read the same window |
-| Concurrent large requests | no queueing exists for history; `asyncio` semaphore guarding exists only for AI requests (`ai_unified.py:619`) |
-| Ordering errors | `build_chat_context` sorts by id (`telegram_context.py:261` region); `ListRecentMessagesTool` manually reverses (`semantic.py:168`) — pagination must sort explicitly, not trust Telethon order |
-| Message-ID loss | `_render_message_list` prints `[id]` (`dispatcher.py:1830`) and the delete contract depends on it; normalized history must keep ids |
-| Media handling | context never downloads media (`TelegramContextMessage.media_type` label only); history must do the same |
-| Provenance handling | one authoritative helper set (`provenance.py:40`–`:74`); never re-implement or regex |
-| AI-generated messages accidentally included | the durable marker is the only trusted signal (`telegram_context.py:305`); `sender_id`/`out` are explicitly not provenance |
-| Very large N requested by the user | requires an explicit cap + honest "requested N, retrieved M" reporting; no such contract exists today |
-| Failure halfway through a multi-chunk operation | `fetch_telegram_chat_context` degrades to *silent empty* (`EMPTY_CHAT_CONTEXT`) — acceptable for enrichment, unacceptable for an explicit request; a history layer needs an explicit error contract |
-| Visible presentation | unchanged by any of the above; delivery is untouched (`delivery.py:422`, `:440`, `:686`) |
+| `requirements.txt` | only if a *pure-lightweight* dependency is genuinely required; `ffmpeg` / `tesseract` cannot be supplied this way (§10) |
+| `render.yaml` / `Procfile` | **no change expected** — no new process, service or worker |
 
 ---
 
-## 12. Open questions the source cannot answer
+## 14. Files / Systems That Must Remain Untouched
 
-1. Whether a future map/reduce summarization should run inside one AI turn
-   (subject to `MAX_TOOL_ROUNDS = 3` / 60 s) or as a durable Taskloom task — no
-   source states the intended pattern.
-2. Whether `DEFAULT_MAX_TOOL_RESULT_TOKENS = 1500` was intended to be enforced and
-   was simply never wired; it is declared and exported but referenced nowhere.
-3. Whether the unspecified product policy should also exclude AI-provenance
-   messages from *explicit* history listings (`list_recent_messages`), given that
-   the same tool is the ID source for deletion — the source proves the trade-off
-   but not the decision.
-4. Whether per-message translation should preserve message boundaries (one
-   translated line per source message) or translate a merged block; only the
-   former preserves the ID/ordering contract that delete and review rely on.
-5. Whether the facade should grow `max_id`/range support, or whether the history
-   layer should page with `min_id` only.
-6. What the intended upper bound on N is (the only existing number is
-   `_MAX_DELETE_SCAN_MESSAGES = 1000`).
+Protect explicitly (these are outside the media boundary and were only inspected):
+
+- **Save / Saved Items** — `backend/services/save_service.py`, `retrieve_service.py`, `backend/ai/tools/save.py`, `retrieve_save.py`, `backend/bot/handlers/{save,retrieve}.py`, `backend/db/client.py`. Save/Deep Save is completed and must not be altered; its download pattern is a *reference*, not a target.
+- **RuntimeSupervisor** — `backend/runtime/*` (supervisor, heartbeat, keepalive, failsafe, task_guard, operation_watchdog's semantics). No second supervisor, client, loop, or recovery authority.
+- **Provider selection / fallback architecture** — `backend/ai/providers/**` and `providers/manager/**`. **Unless** a minimal interface extension is proven necessary, the selection, scoring, retry, cooldown and fallback semantics stay byte-identical. This document's verdict is that no such extension is needed for M1 (§6, §12).
+- **History AI** — `backend/services/history_service.py`, `history_ai_service.py`, `backend/ai/tools/history_ai.py`.
+- **Task system / Taskloom** — `backend/ai/task_*.py`, `backend/bot/handlers/task*.py`, `task_scheduler.py`, `task_execution.py`.
+- **Supabase / schema** — `supabase/**`, `sql/**`, `DATABASE_ARCHITECTURE.md`. No table, column, migration, RLS or SQL change is required by anything in this document.
+- **Bounded conversational snapshot** — `backend/ai/conversation/telegram_context.py`. Its bounds (10 messages / 200 chars / 1500 total / 4 sender resolves / 3 s) must **not** be enlarged to serve media.
+- **Unrelated handlers / features** — `backend/bot/handlers/*` (bio, username, delete, discover, database, misc, ghost, taskloom), `backend/helper/**` (panels/presentation), `backend/ai/tools/delivery.py`, `backend/profile/**`, `backend/bio/**`, `backend/username/**`.
+- **Provenance authority** — `backend/ai/context/provenance.py`. Reuse the helpers; never add a second predicate, regex, or marker check.
 
 ---
 
-## 13. Validation status
+## 15. Recommended M1 Scope
+
+**[RECOMMENDED]** — the smallest sensible first phase, derived from §6/§11/§12.
+
+**M1 delivers**
+
+1. **One bounded media primitive** — a download through the existing
+   `backend/telegram_api` facade, wrapped in the existing bounded-await helper
+   (`rpc_await` or `guarded_await`), enforcing the existing
+   `settings_service.max_deep_save_mb()` limit before download, writing to a
+   `tempfile.mkdtemp` directory, validating existence + non-empty afterwards,
+   and removing the directory in a `finally` block (the Deep Save pattern).
+2. **One new services-layer capability** (`backend/services/media_service.py`),
+   structured after `services/history_service.py`: facade-only Telegram access,
+   bounded RPC, a dedicated error type, no Telethon objects escaping, and **no
+   prompt/provider knowledge beyond one `ProviderManager.chat(...)` call**.
+3. **One normalized representation** — media type, mime, size, filename,
+   caption, source chat/message ids, and a text/structured payload that the
+   application (not the model) treats as data. Never raw bytes to the model.
+4. **One thin registered tool**, and the LLM step performed inside the service
+   through `ToolContext.extra["provider_manager"].chat(...)` — the
+   `history_ai_service` precedent. **Never** `ProviderManager.vision`.
+5. **Explicit zero-context enforcement** for the media call: the message list is
+   built by the media capability (or the request's `reply_context` /
+   `telegram_context` are gated off for media requests) so no Telegram
+   conversation reaches the model.
+6. **Deterministic resolution first**: the reply target and its media are
+   resolved from the request scope before any model is consulted; only the
+   validated media reference and the user's own request text travel forward.
+
+**M1 media coverage** — supported: Photo (metadata + caption/text normalization;
+the LLM works on text), Document/Text, Audio/Voice **metadata only**,
+Sticker/Animation **labels only**.
+
+**M1 explicitly deferred** — native vision on image bytes; speech-to-text;
+OCR; document parsing; video content analysis or frame sampling;
+sticker/TGS decoding. Each is deferred because of a source-proven blocker
+(§11), not because of preference.
+
+**Not in M1 under any framing** — a second Telegram client, a second AI engine,
+a second tool executor, a scheduler, a background worker, a new table, a
+provider-interface change, or any Save/Saved-Items change.
+
+---
+
+## 16. Risks and Unknowns
+
+**VERIFIED FROM SOURCE** (readable in the cited file)
+
+- `vision()` is declared in `BaseProvider` and **implemented nowhere**;
+  `grep -rn "\.vision("` finds no production caller (§6).
+- `ProviderManager.vision` is `def` while the adapters' `vision` is `async def`,
+  and it selects through `_get_healthy_provider()` rather than the active
+  provider (`manager.py:308`, `:563`, `openai_compat.py:253`).
+- Both media-download paths are unbounded (`save_service.py:439`,
+  `telegram_api/media.py:32`).
+- Prompt/message assembly is text-only (`dispatcher.py:1952`,
+  `openai_compat.py:65`–`100`).
+- `reply_context` and `telegram_context` are attached unconditionally for
+  reply-shaped requests (`ai_unified.py:581` onward) and rendered into the prompt
+  (`prompt/builder.py::_render_conversation_state`).
+- `ai_unified_handler` returns on empty `raw_text` (`ai_unified.py:924`–`925`).
+- Limits and their exact values (§9), and the absent dependencies (§10).
+- `history_ai_service.py:453` is a real, working precedent for a service calling
+  `manager.chat(...)` through the request-scoped provider manager.
+
+**INFERENCE FROM SOURCE**
+
+- That a text-normalized media route is the **only** provider-independent route
+  available today (§6) — it follows from the dead `vision()` seam plus the
+  active-provider-ordering requirement, but it was not executed.
+- That gating `reply_context`/`telegram_context` off for media requests, or
+  building the media call's own message list, is the minimal way to satisfy the
+  zero-context rule (§7.2).
+- Per-type envelope feasibility (Photo/document/voice likely; video likely not)
+  and the exact M1 file surface (§9, §13).
+- That a pure-Python/lightweight dependency would be practical on Render
+  (§10), and that ffmpeg/tesseract cannot be delivered by `requirements.txt`.
+
+**UNKNOWN / REQUIRES IMPLEMENTATION DECISION**
+
+1. Whether a caption-less media message should activate the AI at all, and with
+   what prompt (blocker 4) — a product decision with no source answer.
+2. Whether the bounded 10-message Telegram window should be *included* or
+   *excluded* for media requests. The handoff rule excludes it; the current
+   source includes it for every reply-shaped request. The decision must be made
+   explicitly and documented.
+3. Where the owner-facing result is presented, and whether it reuses the
+   existing status/verbatim-read presentation (`_STATUS_LABELS`,
+   `_VERBATIM_READ_TOOLS`) or a new label.
+4. Which media types M1 must *actually* answer (vs. label), and whether an
+   LLM-only analysis of a text normalization is sufficient for the owner's
+   intent for photos.
+5. Whether a normalized representation is persisted anywhere. No storage path is
+   proposed here; any persistence would touch Supabase and is therefore out of
+   scope for M1.
+6. Real Telegram download latency and memory for a 50 MB asset inside the 240 s
+   envelope — **not measured** (no live access in this investigation).
+7. Whether any hosted permanently-free processing service is genuinely required
+   for M1. The research phase proposed them as optional specialist/fallback
+   routes; no source evidence here establishes a need.
+
+---
+
+## 17. Investigation Conclusion
+
+**[CURRENT]** The repository is architecturally **ready for a bounded,
+provider-independent, text-normalized media layer** and **not** ready for native
+multimodal input. There is exactly one AI entry handler, one request object, one
+dispatcher, one provider mesh and one tool-execution authority; media *detection*
+already exists (`backend/ai/media.py::classify_message`) and media-relevant
+Telethon facts already reach the request scope
+(`Dispatcher._build_tool_context` → `ToolContext.extra["reply_msg"]`). The one
+existing large-capability precedent (`services/history_service.py` +
+`history_ai_service.py` + a thin tool + `extra["provider_manager"].chat(...)`)
+demonstrates precisely how a services-layer capability performs its own LLM call
+through the owner's **selected** provider.
+
+**[FINDING]** Three things stand between the current state and a usable media
+capability: media downloads are unbounded on both existing paths; image/audio
+`vision()` support is declared but implemented nowhere and uncalled (and the
+manager's `vision` is both broken and off-policy); and Telegram
+reply/window context is injected into the model by default for exactly the
+request shape a media request takes.
+
+**[RECOMMENDED]** The correct M1 boundary is therefore: **deterministic
+Telegram-side resolution outside the AI → a new bounded services-layer media
+capability over the existing `backend/telegram_api` facade → a controlled
+normalized representation → a thin registered tool → the existing
+`ProviderManager.chat` path**, so the owner's selected chat provider and its
+routing, retry and fallback semantics are untouched, and the model receives only
+the owner's explicit request plus application-prepared media data — never
+Telegram conversation.
+
+**Verdict: GO WITH REQUIRED PREWORK** (§12). No implementation was performed.
+
+---
+
+## Validation Status
 
 | Item | Status |
 |---|---|
 | Scope honored | only `INVESTIGATION.md` modified |
-| Production code / tests / `IMPLEMENTATION_REPORT.md` / schema / migrations / config / `DATABASE_ARCHITECTURE.md` | **untouched** |
-| Implementation performed | **none** (investigation + documentation only) |
-| New abstraction created | **none** — the `history_service.py` module is a recommendation, not a file |
-| Evidence | every claim cites an exact path + symbol/line (§2–§9) |
-| `git status` | only `INVESTIGATION.md` changed |
+| Previous (Telegram-history) investigation | **fully replaced** — not preserved, appended, merged, or referenced as current |
+| Production code / tests / dependencies / configuration | **untouched** |
+| Supabase / schema / migrations / `DATABASE_ARCHITECTURE.md` / Save | **untouched** |
+| Provider architecture | **untouched** |
+| Implementation performed | **none** — investigation + documentation only |
+| New abstraction created | **none** — every `media_service.py` / tool / registry entry named in §13 is a recommendation, not a file |
+| Evidence | every material claim cites an exact path + symbol/line (§3–§10) |
 | Tests run | none — no code changed |
 | Live Telegram / Supabase / Render verification | **not performed** (out of scope) |
+| Fabricated commits / pushes | none claimed |
 
-**Proven from source:** the two-reader architecture and its exact call paths and
-bounds (§2–§4); the absence of any shared history layer, translation service, or
-summarization service (§3, §8); the provenance mechanism and its single
-enforcement point in `telegram_context` (§5); the tool-result chokepoint that
-bypasses marker sanitization (§5); the execution/token limits that make a
-single-prompt 1000-message operation infeasible (§4.5–§4.6, §9).
+**Proven from source:** the text-only prompt and provider path and its exact
+seams (§3, §6); the media detection/metadata/download inventory per type (§4);
+the unbounded download boundary and the existing size/temp/cleanup controls
+(§5); the dead `vision()` seam and the manager's inactive-provider selection
+(§6); every context-injection path into the model and the unconditional
+attachment for reply-shaped requests (§7.1); the services-layer precedent that
+performs its own provider call through the *selected* provider (§6, §8); the
+exact limit values (§9); and the absence of OCR/STT/document/video dependencies
+and system binaries (§10).
 
-**Not proven / not measured:** real Telegram latency, RPC cost, and memory for
-N = 500/1000 (no live access); whether `_AI_TIMEOUT = 60.0` can be met by any
-particular map/reduce design; and the product decisions listed in §12.
+**Not proven / not measured:** real Telegram latency, memory and RPC cost for a
+50 MB asset inside the 240 s envelope; whether any particular normalization
+quality suffices for the owner's intent; and the product decisions listed in
+§16.
 
 ---
 
