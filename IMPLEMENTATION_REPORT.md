@@ -1,6 +1,244 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Saved Items management through the AI tool layer
+## Latest phase — Live bug fix: deterministic replied-save-code deletion + verified preview
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `586155fc1e7d9110435dd0a05fe2f65d649f2186` (clean tree; only the pre-existing untracked `telegram-self-bot/` clone present) |
+| Implementation commit (code + tests) | `4ea124a5bde25ef6c1e2e68ea5d2d70c6580d033` |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+
+### The exact task
+
+Two bugs reported from live Telegram usage of the Saved Items management path:
+
+1. A preview request returned metadata that did not belong to the requested item
+   (including an incorrect sender name).
+2. `delete this` **replying to a message that carries a Saved Item save code**
+   deleted the replied Telegram message instead of the saved item.
+
+Both were fixed at the deterministic runtime boundary — the AI is never
+consulted for the target, and no replied/conversational content was added to
+any AI-visible input in this phase.
+
+### Bug #1 — preview returned unverified metadata
+
+#### Exact value trace (source)
+
+```
+user-visible save code
+  → PreviewSaveTool.execute            backend/ai/tools/retrieve_save.py
+      save_code = arguments["save_code"].strip().upper()
+  → retrieve_service.do_preview        backend/services/retrieve_service.py
+      save_code.upper().strip()
+  → db_client.query_save(save_code)    backend/db/client.py::_query_save_sync
+      SELECT * FROM saved_items WHERE save_code = code  (NO owner predicate)
+  → format_preview(row)                backend/services/retrieve_service.py
+      Sender = row["sender_name"]   (persisted at save time by
+       save_service.execute_save → _resolve_sender(source message))
+```
+
+#### Root cause (source-proven)
+
+`do_preview` was the only saved-item operation that neither constrained the
+lookup by owner nor verified the fetched row:
+
+- `db_client.query_save` is **code-only** — `_query_save_sync` selects `*`
+  `WHERE save_code = code` with no owner filter and no limit to the requesting
+  owner's rows.
+- `retrieve_service.do_preview` returned that row **unverified**, while
+  `do_retrieve`, `do_delete`, `do_rename` and `do_move` all verify
+  `row["owner_id"] == owner_id` before any side effect.
+- `format_preview(row)` then renders the row verbatim — including `Sender`
+  from the stored `sender_name` — under the requested code's header.
+
+Consequence: any code reaching the tool resolves to *whatever row carries that
+code*, and metadata for a row that is not the requesting owner's item — or a
+row whose `save_code` differs from the requested code — is presented as the
+requested item. That is the only structural way "unrelated metadata, including
+an incorrect sender" can enter the preview path.
+
+**Status of the sender field itself:** the displayed sender always comes from
+the row persisted at save time (`execute_save` → `_resolve_sender` on the
+source message). Whether the live row's `sender_name` was itself mis-resolved
+at save time **cannot be proven from source** — it is NOT YET PROVEN. The fix
+below guarantees a preview can no longer present metadata of a row that is not
+the requesting owner's item for the exact requested code. Live diagnosis if it
+recurs: compare the preview output against the row's
+`origin_chat_id` / `origin_msg_id` / `sender_id`.
+
+#### The fix
+
+`backend/services/retrieve_service.py::do_preview` now enforces, before any
+logging and before rendering:
+
+```
+row exists  AND  row["owner_id"] == authenticated owner_id
+              AND  row["save_code"] == requested code
+```
+
+Both failures return the same `❌ No item found for \`CODE\`` wording as the
+sibling operations, so a foreign/mismatched item is indistinguishable from a
+missing one. The owner identity always comes from the trusted runtime context
+(`context.owner_id` inside `PreviewSaveTool` — an `owner_id` tool argument is
+ignored, and a test proves the forged value never reaches the lookup).
+
+### Bug #2 — "delete this" on a save-code reply deleted the Telegram message
+
+#### Exact value trace (source)
+
+```
+"delete this" (+ reply)                backend/bot/handlers/ai_unified.py
+  → AIRequest.reply_context            (trusted runtime reply metadata)
+  → Dispatcher._try_local_fast_path    backend/ai/engine/dispatcher.py
+  → parse_command_intent(...)          backend/ai/actions.py
+      delete branch → is_this + has_reply
+      → delete_messages / replied_message → delete_replied
+  → DeleteTool → delete_service        deleted the replied MESSAGE
+```
+
+Measured before the fix: `parse_command_intent("delete this", has_reply=True)`
+→ `delete_messages` / target `replied_message` /
+`[{"name": "delete_replied", "arguments": {}}]`. The replied message's text was
+never inspected, so a bot message carrying a Save Item's code was treated as a
+generic Telegram message target and deleted.
+
+#### The fix — deterministic resolution before the AI
+
+1. `backend/ai/actions.py::_extract_single_save_code(text)` — a pure, structural
+   extractor over the replied text: exactly **one** canonical save code
+   (validated with the same `_SAVE_CODE_TOKEN_RE` shape + `_SAVE_CODE_RE` rules
+   the saved-item action layer already uses) → that code; zero or several
+   distinct codes → `None` (never a guess).
+2. `parse_command_intent(text, *, has_reply=True, reply_text="")` — in the
+   `is_this + has_reply` delete branch, a single replied save code resolves to
+   the existing `delete_saved_item` → `delete_save` execution path.
+3. `backend/ai/engine/dispatcher.py::_reply_text(request)` — the trusted
+   replied text (`request.reply_context.text_preview`, runtime-sourced, never
+   model output) is passed into the parser at all three call sites (fast path,
+   structured-action path, tool-context build).
+
+Resolution flow for the reported case:
+
+```
+replied save-code message
+  → runtime reply metadata (text_preview)         (trusted, runtime)
+  → _extract_single_save_code                     (exactly one code required)
+  → ActionParseResult(delete_saved_item, save_code)
+  → TOOL EXECUTOR → retrieve_service.do_delete    (owner-scoped, same as panel)
+  → "✅ Deleted `S0001`"
+```
+
+`"delete this"` + ordinary replied message → **unchanged** `delete_replied`
+message deletion. Explicit `سیو S0001 رو پاک کن` → **unchanged** explicit-code
+deletion (takes precedence). Semantic/count deletes, save intents, list/search
+intents → **unchanged** (measured, asserted).
+
+#### AI ZERO-CONTEXT statement
+
+For the two fixed behaviors the AI model receives **zero** replied or
+conversational content:
+
+- The resolution runs in `_try_local_fast_path`, which executes **before any
+  provider round** and before the prompt builder. When it fires, the prompt is
+  never built and the provider is never called — proven by a dispatcher-level
+  test asserting `prompt build not called` and `provider chat not awaited`.
+- Nothing new was added to `AIRequest`, `ToolContext.extra`, the prompt, or
+  any model-visible field. The resolved tool call carries only
+  `{"save_code": "S0001"}`.
+- Scope note: the pre-existing reply-context plumbing (the reply block the
+  prompt builder already renders, and the execution-only `extra["reply_msg"]`
+  metadata the tools consume) predates this phase and was **not touched** —
+  removing it would be an unrelated behavioral change to reply-to-AI and
+  save-by-reply features.
+
+### Owner / security behaviour
+
+- Owner identity always comes from trusted runtime context; a forged
+  `owner_id` tool argument is ignored (tested).
+- Preview and delete keep the service-layer not-found wording for
+  missing/foreign items — a foreign item is never distinguishable from a
+  missing one, and never logged.
+- No new authorization layer; the existing service checks are reused.
+- The AI never accesses Telegram or Supabase; execution stays on
+  `ToolExecutor → retrieve_service → db_client`.
+
+### Files changed
+
+| File | Role |
+|---|---|
+| `backend/services/retrieve_service.py` | `do_preview` now enforces owner + row-identity before rendering (Bug #1) |
+| `backend/ai/actions.py` | `_extract_single_save_code`; `parse_command_intent(..., reply_text=...)`; deterministic `delete_saved_item` reroute in the replied-message delete branch (Bug #2) |
+| `backend/ai/engine/dispatcher.py` | `Dispatcher._reply_text(request)`; all three `parse_command_intent` call sites pass the trusted replied text |
+| `tests/test_saved_items_ai_management.py` | +14 focused tests (22 → 36) |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+Untouched: `backend/ai/tools/retrieve_save.py` (both tools already forwarded the
+canonical code and the trusted owner), `save_service`, `delete_service`,
+`history_service`, `telegram_context.py`, the bounded request-scoped context,
+providers, RuntimeSupervisor, Taskloom, the panel/UI handlers, the prompt
+builder, `DATABASE_ARCHITECTURE.md`, and the Supabase schema/RLS.
+
+### Tests actually run
+
+| Run | Result |
+|---|---|
+| `tests/test_saved_items_ai_management.py` (36: 22 existing + 14 new) | **36 passed** |
+| Adjacent group (actions, tool calls, context architecture, Telegram context, end-to-end/AI flow, reply-to-AI) | **174 passed** |
+| Full suite `tests/ -q` | **2810 passed, 24 skipped** (was 2796 + 24 before; +14 = 2810) |
+| `py_compile` on the 4 changed Python files | OK (no syntax output) |
+| `git diff --check` | clean |
+
+**Non-vacuous proof:** the full fix was reverted in the working tree
+(`git apply -R` of the exact diff) and the new tests re-run: **11 failed**
+against the pre-fix code (foreign-row preview, mismatched-code preview,
+reply-to-save-code resolution, dispatcher zero-provider-round proof), then the
+fix was re-applied and all 36 passed. The pre-fix parser also provably returned
+`delete_replied` for `delete this` + reply (measured before editing).
+
+### Live Telegram verification status
+
+**NOT performed** — no live Telegram session in this workspace. All evidence is
+source + suite: the real parser, dispatcher and service boundaries driven with
+a faked `db_client.query_save` / telethon-shaped client. The live reproduction
+of Bug #1's exact wrong-sender value (the stored `sender_name`) remains
+**NOT YET PROVEN**.
+
+### Manual live tests (for the owner)
+
+1. Primary — reply to the save-confirmation / `**LifeOS** \`S0001\`` message and
+   send `delete this`: the item must be deleted (`✅ Deleted \`S0001\``) and the
+   replied bot message must remain. Trace: `AI_EXEC_TRACE`
+   `stage=intent_resolved intent=delete_saved_item` →
+   `stage=tool_execute tools=['delete_save']` →
+   `stage=telegram_response success=true` — **no** `provider_call_started`.
+2. Control — reply to an ordinary message and send `delete this`: the message
+   must be deleted (`delete_replied`), tracing the same stage sequence with
+   `intent=delete_messages`.
+3. Control — `سیو S0001 رو پاک کن` (no reply): unchanged explicit-code item
+   deletion.
+4. Preview — `مشخصات سیو S0001 رو بده`: output must carry `**Sender**` exactly
+   from the row whose `save_code` is `S0001`.
+
+### Remaining limitations
+
+- The replied-text basis is the existing runtime preview
+  (`text_preview`, first 200 chars of the replied message). All canonical
+  save-code messages this bot emits (save confirmation, `**LifeOS**` metadata
+  block, `format_preview`) put the code inside that window; a replied message
+  with a code beyond 200 chars still falls back to message deletion (existing
+  behavior, never a guess).
+- `_extract_single_save_code` keeps the existing extraction rule's digit
+  requirement: a random fallback code with no digit (e.g. `SABCD`) is not
+  treated as a save code (tested and documented).
+- Bug #1's stored `sender_name` value could not be verified against the live
+  row; the owner checks now make any wrong-row presentation impossible, and
+  the live row diagnosis is described above.
+- Live Telegram behavior remains **NOT YET PROVEN**.
+
+## Previous phase — Saved Items management through the AI tool layer
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
