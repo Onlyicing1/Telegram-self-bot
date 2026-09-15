@@ -1,6 +1,308 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.3: the bounded OCR boundary for still images
+## Latest phase — Media Processing M1.4: the bounded speech-to-text boundary for Voice/Audio
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `83306a5` (origin/main — the M1.3 OCR boundary delivery record) |
+| Implementation commit (code + tests) | `f08d08f36d11e3a4ab8bea9f5821c6519c1243bd` |
+| Files changed | `backend/services/media_service.py` (+347 / −4, M1.4 additions only) · `tests/test_media_stt.py` (new, 962 lines) |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Provider architecture impact | **none** (`media_ai_service.py` untouched — still plain-string `as_context_text()`, still `ProviderManager.chat`, `vision()` still dead) |
+| Prompt architecture impact | **none** (no `PromptBuilder`, context builder or `MEDIA_ANALYSIS_SYSTEM_PROMPT` change) |
+| Presentation / delivery impact | **none** (no AI message formatting, RTL, edit-in-place or delivery change) |
+| Dependency added | **none** (`backend/requirements.txt`, `render.yaml` and `Procfile` unchanged; `pypdf` remains the only added dependency, from M1.2) |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+| Live STT recognition verification | **NOT performed, and NOT POSSIBLE as delivered** — this phase provisions **no** engine, so no speech was ever transcribed; Persian recognition quality remains **unproven** |
+
+### The exact task
+
+Add **M1.4 — bounded speech-to-text for Voice/Audio media** to the existing
+Media Processing boundary: a voice note or audio file the runtime already
+resolved must be able to become bounded plain text through the existing
+`MediaAnalysis` contract — deterministically resolved, bounded-transfer,
+validated, bounded-transcribed, normalized — with no second download pipeline,
+no provider change, and no Telegram or conversational context reaching the
+model.
+
+### Placement in the phase chain
+
+M1.1–M1.3 are unchanged and still valid: the `MediaAnalysis` foundation, the
+M1.1 provider-neutral plain-string path inside `media_ai_service.py`, the M1.2
+PDF/DOCX extraction and the M1.3 OCR *boundary* all keep behaving exactly as
+their own report sections record. M1.4 adds the fourth extractor to the same
+single authority and nothing else.
+
+### The engine decision (measured, not assumed)
+
+The task instructed me not to choose an engine from memory. Every candidate was
+measured against the actual environment before a line was written:
+
+| Measurement (performed here) | Result |
+|---|---|
+| `vosk` 0.3.45 wheel (manylinux, the lightest candidate) | **7.2 MB** |
+| Vosk model artifacts — **not declarable in `requirements.txt`** (served from alphacephei.com, runtime `Content-Length`) | small-en **39.3 MB** · **small-fa 59.3 MB** · fa **1 078.4 MB** |
+| `import vosk` peak RSS | **31.7 MB** (baseline 8.5 MB) |
+| `vosk.Model()` — the *smallest* English model actually loaded and used | **150.0 MB** peak RSS |
+| + one 5 s decode | **163.8 MB** peak RSS |
+| `faster-whisper` | 1.1 MB python wheel, plus `ctranslate2` **37.6 MB**, `av` **37.6 MB** (its decoder) or `onnxruntime` **22.5 MB**, plus an external model from Hugging Face |
+| `openai-whisper` | requires `torch` — cp311-linux wheel **528.9 MB** (installed footprint ≈ 2.5 GB) |
+| `sherpa-onnx` | 11.7 MB wheel + `onnxruntime` **22.5 MB** + an external model |
+| `pocketsphinx` | 27.8 MB; **no Persian acoustic model exists** for it |
+| `SpeechRecognition` | 31.3 MB; its engines are PocketSphinx and/or a **hosted API** (out of policy) |
+| `ffmpeg` / `ffprobe` binaries, `libavformat` / `libswresample` shared libs | **absent** from the runtime |
+
+The decisive points:
+
+1. **The project's dependency mechanism cannot deliver an STT engine.** An STT
+   engine is a wheel *plus a multi-tens-of-MB (or GB) language model*. Only the
+   wheel can be pinned in `requirements.txt`; the model cannot. The smallest
+   Persian model alone is **59.3 MB** of external artifact — more than the
+   entire documented AI RAM budget, before any code runs.
+2. **The lightest candidate already breaks the project's own ceiling.**
+   `AI_MASTER_DESIGN.md` §28.2 caps the AI layer at **≤ 70 MB** RAM and §28.4
+   caps the whole process at **≤ 512 MB / 0.1 shared vCPU**, with the explicit
+   rule that "if a feature cannot fit, the feature must be redesigned — not the
+   budget". Loading *one* 39.3 MB Vosk model measured **150.0 MB** — more than
+   twice the AI budget, and it stays resident. Every other candidate is larger.
+3. **Telegram Voice cannot even be fed to the lightest engine.** Voice notes
+   are OGG/Opus (`classify_message` → `DocumentAttributeAudio(voice=True)`);
+   Vosk consumes 16 kHz mono PCM, so a decoder/converter would be required,
+   and neither `ffmpeg` nor `libavformat`/`libswresample` exists on the runtime.
+   `faster-whisper` would work around that only by adding the `av` wheel
+   (another 37.6 MB of native FFmpeg libraries).
+
+Against (1) + (2) + (3), **no candidate satisfies the runtime, dependency,
+Persian and resource constraints simultaneously** — the identical outcome M1.3
+measured for OCR. This phase therefore **stops at the engine boundary**: the
+complete, tested STT boundary and seam are implemented, **no** dependency is
+added, **no** engine is provisioned, **no** hosted STT service is used, and no
+transcript is ever fabricated. All measurement artifacts were removed again and
+the environment was restored (verified: `requirements.txt` unchanged, no
+`vosk`/`whisper`/`ctranslate2` present in the venv, probe directory deleted).
+
+### Exact behaviour implemented
+
+All of it lives in the existing single media authority,
+`backend/services/media_service.py`. `media_ai_service.py` was **not touched**.
+
+**The engine seam (new)** — `SttEngine` (a `typing.Protocol` with one method,
+`transcribe(audio: bytes) -> str`), plus `set_stt_engine` / `get_stt_engine` /
+`stt_available`. Nothing is provisioned by default. The seam is deliberately one
+method wide: the boundary owns resolution, transfer, validation, bounds,
+timeout, cleanup and normalization, so provisioning an engine cannot alter the
+media contract.
+
+**Audio routing (new)** — `is_stt_mime` covers the containers this boundary can
+both corroborate and bound. A Voice/Audio asset is extractable **only when an
+engine is provisioned**: with none (the shipped default) it is reported
+`UNSUPPORTED` with an explicit reason and is **never transferred**. `is_extractable_mime`
+was **deliberately left unchanged** (it still describes only the dependency-free
+`text/*` + PDF/DOCX extractors), so OCR/audio are gated by their own predicate +
+availability check and the M1/M1.2/M1.3 expectations stay valid.
+
+**Container corroboration (new)** — MIME is never trusted. The payload's own
+signature must match the declared type, read by bounded, dependency-free
+parsers: `_ogg_audio_info` (OGG page walk, Opus/Vorbis identification header,
+final granule position), `_wav_audio_info` (RIFF `fmt `/`data` chunk walk) and
+`_flac_audio_info` (the fixed 34-byte STREAMINFO block). A mismatch, an
+unreadable header or a nonsense stream is a **hard `MediaError`**.
+
+**Pre-decode resource guards (new)** — the declared **duration, channel count
+and sample rate** are derived from the container itself and checked against hard
+bounds **before any decoder or engine sees the bytes**, so no container trick can
+ask an engine to chew on an unbounded decoded PCM stream. A stream whose duration
+is not declared (e.g. a FLAC with `total_samples = 0`) is **refused** rather than
+transcribed unbounded. The OGG page walk is itself bounded (`_MAX_AUDIO_PAGES`).
+
+**Bounded transcription (new)** — `_run_stt` runs `engine.transcribe` through
+`asyncio.to_thread` (the same off-event-loop pattern M1.2/M1.3 use) inside
+`asyncio.wait_for(..., STT_TIMEOUT_S)`. A timeout, an engine exception, a
+non-string result and a cancelled request are each handled explicitly
+(`CancelledError` is always re-raised). A worker thread cannot be interrupted
+cooperatively, so the bound is enforced on the awaited result — stated plainly
+rather than implied.
+
+**Deterministic normalization (new, shared)** — `_normalize_ocr_text` was
+renamed to `_normalize_extracted_text` (same body, no behaviour change) so OCR
+and STT share one normalizer: line structure survives, horizontal whitespace
+runs collapse to one space, blank-line runs collapse to one blank line, and
+**nothing** else is rewritten — Persian/Arabic text, its ZWNJ (U+200C) and
+directional marks pass through unchanged, in reading order. `_cap_text` then
+applies the character ceiling and reports truncation honestly.
+
+**Honest outcomes** — a voice note with no speech returns `EXTRACTED` with empty
+content and the reason `No speech was detected in the audio.`, so M1.1's existing
+`not has_content` branch answers deterministically and **the LLM is never called
+merely to explain an empty transcript or a failure**. A malformed/mismatched
+container, an over-bound stream, an oversized input, a timeout and an engine
+failure all raise `MediaError`.
+
+**Unchanged, deliberately** — `MediaAnalysis` fields, `as_dict()`,
+`as_context_text()`, `resolve_media_message`, the bounded facade download, the
+per-operation temporary directory and its `finally: shutil.rmtree`, the
+zero-context rule, PDF/DOCX extraction, text extraction and the OCR path.
+
+### Supported audio formats/types (this phase)
+
+`STT_AUDIO_MIME_TYPES` — `audio/ogg`, `audio/opus`, `application/ogg`,
+`audio/wav`, `audio/x-wav`, `audio/wave`, `audio/vnd.wave`, `audio/flac`,
+`audio/x-flac`. Each must have a readable signature of its declared type.
+Everything else (**MP3, M4A/MP4, WebM, AAC, AC3, …**) stays `UNSUPPORTED` and is
+never transferred: a container whose duration cannot be derived cheaply and
+deterministically is never handed to an engine on a guessed duration. Telegram
+Voice (OGG/Opus) is both classified as `Voice` and inside this set.
+
+### All hard resource limits (module constants, not configurable)
+
+| Constant | Value | Where it is enforced |
+|---|---|---|
+| `MAX_STT_INPUT_BYTES` | 20 MiB | **before the transfer** (the tighter of it and the Deep-Save size authority) and again on the payload |
+| `MAX_STT_DURATION_S` | 300.0 s | pre-decode, from the container's own declared duration |
+| `MAX_STT_CHANNELS` | 2 | pre-decode, from the container header |
+| `MAX_STT_SAMPLE_RATE` | 48 000 Hz | pre-decode, from the container header |
+| `_MAX_AUDIO_PAGES` | 200 000 pages | the OGG page walk |
+| `MAX_STT_CHARS` | `MAX_EXTRACTED_CHARS` (16 000) | post-normalization, with honest `truncated` |
+| `STT_TIMEOUT_S` | 60.0 s | the awaited transcription result |
+| temporary storage | ≤ the STT input bound (one file, one temp dir; nothing else is ever written — the boundary decodes nothing to disk) | the existing per-operation temp dir |
+| transfer bound | unchanged (`MEDIA_DOWNLOAD_TIMEOUT_S` 120 s, size = Deep-Save limit) | the existing facade + service checks |
+
+The STT input bound is derived from the project's own numbers: 300 s of the
+largest stream this phase accepts uncompressed (16 kHz mono 16-bit PCM
+≈ 32 KB/s ≈ 9.6 MiB) fits inside 20 MiB with headroom, while an oversized payload
+is refused **before it is ever downloaded**. It is deliberately tighter than the
+transfer bound and applied first.
+
+### Timeout behaviour
+
+One finite wall-clock bound (`STT_TIMEOUT_S`, 60 s) covers the awaited
+transcription, well inside the media request's own 240 s envelope, and is
+reached only after transfer and pre-decode validation have already passed. A
+timeout becomes a `MediaError` (`Speech-to-text did not finish within 60s.`), is
+reported honestly to the owner, and **never** triggers a provider call.
+`asyncio.wait_for` bounds the awaited result; it does not stop a non-cooperative
+engine's worker thread — documented rather than implied.
+
+### Cleanup guarantees
+
+No new transfer path and no new temporary artifact: M1.4 reuses the M1 bounded
+download through `backend/telegram_api.media` (`guarded_await`) and the existing
+per-operation temporary directory, removed in a `finally`. Cleanup is
+re-verified for the STT path on success, empty transcript, unsupported media,
+malformed input, container mismatch, over-bound input, engine failure, timeout
+and cancellation. Nothing is cached, persisted or written anywhere else, so no
+raw audio bytes and no transcript ever reach Supabase, Save/Saved Items or any
+other store.
+
+### Persian support status
+
+* **Proven (automated):** Persian text — including an explicit ZWNJ — passes
+  through validation, normalization, capping and `MediaAnalysis` **unchanged and
+  in reading order**; mixed Persian/English lines keep their order; a Persian
+  transcript over the ceiling truncates to exactly 16 000 characters with the
+  same semantics as every other extractor.
+* **NOT proven:** Persian *recognition quality*. No engine is provisioned, and
+  the measured evidence above shows the available engines either cannot read
+  Persian at all (`pocketsphinx`) or cannot fit the runtime budget. No claim
+  about Persian speech-recognition accuracy is made anywhere in this phase.
+
+### MediaAnalysis integration
+
+No contract change. Voice/Audio flows through the same pipeline every other
+media type already uses: with no engine the analysis is `UNSUPPORTED` with a
+reason and `has_content is False`, so `media_ai_service.answer_media_request`
+returns its existing deterministic explanation and **never calls the provider**;
+with an engine provisioned it is `EXTRACTED` with the normalized transcript and
+the existing M1.1 path sends `request_text` + `as_context_text()` to the
+currently selected provider as plain strings.
+
+### AI context-isolation verification
+
+Re-asserted for audio: the engine receives **only** the validated audio bytes
+(the test asserts `engine.calls == [payload]`), `as_context_text()` still renders
+no caption, sender, chat id, message id or filename, and no STT code imports or
+calls `ProviderManager`, a provider adapter, `PromptBuilder` or an LLM. The
+module-level dependency check confirms `media_service` pulls in no non-stdlib
+module at import time (`pypdf` is imported lazily inside the PDF path only).
+
+### Tests actually run (this revision)
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_stt.py -q` (new, 64 tests) | **64 passed** (4.50 s) |
+| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_image_ocr.py tests/test_media_ai_integration.py -q` | **175 passed** |
+| `pytest tests -q` (full suite) | **3 116 passed, 24 skipped, 0 failed** |
+| `py_compile` on both changed files | passed |
+| `git diff --check` | clean |
+
+The new suite uses **real** audio container fixtures built in-process with the
+standard library (a genuine RIFF/WAVE stream written by `wave`, plus
+byte-accurate OGG/Opus, OGG/Vorbis and FLAC containers) and the real
+`telethon.tl.types` objects, so the existing classifier, validation, duration
+derivation, bounds, cleanup and loop-offload paths all run for real. Only the
+*engine* is scripted, because this phase ships none by design. The 22 required
+coverage areas (Voice, Audio, Persian, English, mixed, no-speech, malformed
+payload, MIME/container mismatch, input bound, duration/channel/rate bounds,
+character ceiling, timeout, engine failure, cancellation, temp cleanup on every
+path, event-loop non-blocking, zero-context rendering, unsupported types,
+Photo/OCR unchanged, PDF/DOCX regression, media-AI regression, media regression)
+are all present.
+
+**Non-vacuous (measured, not asserted).** Lifting each bound was shown to flip
+its guard's outcome:
+
+| Probe | Real bound | Bound lifted |
+|---|---|---|
+| 330 s Opus stream | `MediaError: The audio is 330s — exceeds the 300s speech-to-text bound.` | accepted (`(1, 48000, 330.0)`) |
+| WAV bytes declared `audio/ogg` | `MediaError: The file is not a readable audio stream of the declared type.` | accepted |
+| 3-channel WAV | `MediaError: The audio has 3 channels — exceeds the 2-channel speech-to-text bound.` | accepted (`(3, 16000, 0.2)`) |
+| FLAC with `total_samples = 0` | `MediaError: The audio duration could not be determined…` | accepted |
+
+### What was NOT done
+
+No engine provisioned; no new dependency; no `requirements.txt`, `render.yaml` or
+`Procfile` change; no `media_ai_service.py`, `ProviderManager`, provider adapter,
+`vision()`, prompt, context builder, session, memory, scheduler, Taskloom,
+delivery, presentation, Save or Supabase change; no second download pipeline, no
+second MediaAnalysis type, no cache, no polling, no background executor, no new
+table or column, no SQL.
+
+### Deferred (explicitly)
+
+1. **Provisioning an STT engine and its model.** This is now a single decision
+   at one seam (`set_stt_engine`). It requires either a runtime budget
+   re-authorization (§28.2/§28.4) or a genuinely lightweight engine plus a
+   `requirements.txt`-deliverable Persian model, which the measurements above
+   did not find — and, for OGG/Opus Voice notes, a decoder the runtime does not
+   currently have.
+2. **Real Persian and English transcription quality** for whichever engine is
+   chosen, measured against real speech fixtures.
+3. **M1.5 — Video/GIF frame sampling** is the next phase; video and GIF stay
+   `UNSUPPORTED` here. Native multimodal `vision()`, OCR engine provisioning and
+   spreadsheet/presentation/archive extraction all remain out of reach for the
+   reasons in `INVESTIGATION.md` §11.
+
+### Limitations / NOT YET PROVEN
+
+* **No engine is provisioned, so no speech recognition happens at all.** A
+  Voice/Audio reply is answered with the deterministic `UNSUPPORTED`
+  explanation, not with a transcript. Live STT recognition is **NOT PERFORMED**
+  and is **not claimed**.
+* No live Telegram/Telethon verification was performed (no live session here):
+  the resolve → bounded download → validate → transcribe → `MediaAnalysis` →
+  provider path is proven at code/test level only.
+* The transcription timeout bounds the *awaited* result; a non-cooperative
+  engine's worker thread is not force-stopped.
+* Duration is derived from the container's own declaration. It is therefore a
+  policy bound on *declared* audio, not a proof about the decoder's output; no
+decoder is invoked in this phase.
+* Persian recognition quality remains **unproven** (see above).
+
+---
+
+## Previous phase — Media Processing M1.3: the bounded OCR boundary for still images
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
