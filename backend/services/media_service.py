@@ -14,6 +14,9 @@ Layering (mirrors ``backend/services/history_service.py``):
     transfer is the facade's bounded ``download_media`` (``guarded_await``);
     this module never imports Telethon and never calls the client's download
     directly.
+  * The media TARGET is resolved by :func:`resolve_media_message` from the
+    runtime's own chat/message ids — one bounded fetch, no search, no fallback
+    to another message.
   * Media TYPE detection is NOT re-implemented: ``backend/ai/media.py::
     classify_message`` stays the single classifier, and its taxonomy decides
     which assets this boundary may touch.
@@ -58,6 +61,7 @@ from typing import Any
 
 from backend.ai.media import MediaInfo, classify_message
 from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS
+from backend.runtime.operation_watchdog import guarded_await
 from backend.services import settings_service
 from backend.telegram_api import media as telegram_media
 from backend.telegram_api.exceptions import TelegramAPIError
@@ -66,6 +70,11 @@ logger = logging.getLogger(__name__)
 
 #: The one authority for the transfer's time bound (the facade's ceiling).
 MEDIA_DOWNLOAD_TIMEOUT_S = telegram_media.MEDIA_DOWNLOAD_TIMEOUT_S
+
+#: Bounded timeout for resolving ONE message by id. A single-message fetch is a
+#: short RPC (the same order as the facade's 30s short-call bound), not a
+#: transfer, so it gets its own finite ceiling.
+MEDIA_RESOLVE_TIMEOUT_S = 30.0
 
 #: Media types this boundary may TRANSFER. The taxonomy is the existing
 #: classifier's (``backend/ai/media.py``); ``WebPage``/``Contact``/``Poll``/
@@ -235,15 +244,19 @@ def download_timeout(timeout_s: Any = None) -> float:
     Mirrors the history AI service's use of the caller's own envelope: a
     tighter caller stays tighter, and no caller can remove the bound.
     """
+    return _bounded(timeout_s, MEDIA_DOWNLOAD_TIMEOUT_S)
+
+
+def _bounded(timeout_s: Any, ceiling: float) -> float:
     if timeout_s is None:
-        return MEDIA_DOWNLOAD_TIMEOUT_S
+        return ceiling
     try:
         value = float(timeout_s)
     except (TypeError, ValueError):
-        return MEDIA_DOWNLOAD_TIMEOUT_S
+        return ceiling
     if value <= 0:
-        return MEDIA_DOWNLOAD_TIMEOUT_S
-    return min(value, MEDIA_DOWNLOAD_TIMEOUT_S)
+        return ceiling
+    return min(value, ceiling)
 
 
 def _resolve_client(source: Any) -> Any:
@@ -309,7 +322,7 @@ def _unsupported(info: MediaInfo, message: Any, reason: str) -> MediaAnalysis:
         mime_type=info.mime_type,
         file_size=0,
         file_name=info.file_name,
-        status=MediaStatus.UNSUPPORTED,
+        status=MediaStatus.UNSUPPORTED.value,
         reason=reason,
         caption=info.caption or "",
         source_chat_id=_coerce_int(getattr(message, "chat_id", 0)),
@@ -322,6 +335,58 @@ def _coerce_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+async def resolve_media_message(
+    source: Any,
+    *,
+    chat_id: Any,
+    message_id: Any,
+    timeout_s: Any = None,
+) -> Any:
+    """Fetch the ONE message the TRUSTED RUNTIME identified, by its own ids.
+
+    Resolution is deterministic and lives outside the model: ``chat_id`` and
+    ``message_id`` come from the request scope (the replied-to message, or the
+    triggering message itself), never from model output, text, recency, sender
+    or history. Nothing here searches for a message, and nothing falls back to
+    another one — unreadable ids produce an honest ``MediaError``.
+
+    The fetched object stays inside this boundary: it is consumed by
+    :func:`analyze_media` and is never returned to an AI layer, a prompt or a
+    provider.
+    """
+    client = _resolve_client(source)
+    target_chat = _coerce_int(chat_id)
+    target_message = _coerce_int(message_id)
+    if not target_chat:
+        raise MediaError("A concrete chat id is required to resolve media.")
+    if not target_message:
+        raise MediaError("A concrete message id is required to resolve media.")
+
+    bound = _bounded(timeout_s, MEDIA_RESOLVE_TIMEOUT_S)
+    try:
+        message = await guarded_await(
+            client.get_messages(target_chat, ids=target_message),
+            name="media:get_messages",
+            timeout=bound,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        logger.warning("MEDIA_RESOLVE_FAILED chat_id=%s message_id=%s error=timeout",
+                       target_chat, target_message)
+        raise MediaError(
+            f"Resolving the media message timed out after {bound:g}s."
+        ) from exc
+    except Exception as exc:
+        logger.warning("MEDIA_RESOLVE_FAILED chat_id=%s message_id=%s error=%s",
+                       target_chat, target_message, type(exc).__name__)
+        raise MediaError(f"Resolving the media message failed: {exc}") from exc
+
+    if message is None:
+        raise MediaError("The media message could not be found.")
+    return message
 
 
 async def analyze_media(
@@ -433,7 +498,7 @@ async def analyze_media(
         mime_type=info.mime_type,
         file_size=size,
         file_name=info.file_name,
-        status=MediaStatus.EXTRACTED,
+        status=MediaStatus.EXTRACTED.value,
         content=content,
         reason="" if content else "The downloaded text asset was empty.",
         caption=info.caption or "",

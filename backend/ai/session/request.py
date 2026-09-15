@@ -28,6 +28,11 @@ Fields (from AI_MASTER_DESIGN.md §25):
   timeout_s:     The caller's wall-clock envelope for this request. Long-running
                  tools derive their own internal budget from it instead of
                  hardcoding a second, easily-contradicted limit.
+  request_media_type: Classifier label of the media attached to the TRIGGERING
+                 message itself (empty when it carries none). It only tells the
+                 runtime that this request has a media target; the target is
+                 resolved from the request's own chat/message ids and is never
+                 rendered into a prompt.
 """
 from __future__ import annotations
 
@@ -59,6 +64,10 @@ class AIRequest:
         metadata:       Arbitrary extra metadata for future use.
         allow_tools:    Whether this request may expose or execute AI tools.
         timeout_s:      Wall-clock envelope the caller allows this request.
+        request_media_type: Classifier label of media on the triggering message
+                        itself, or empty. Determines WHETHER this request has a
+                        media target; the target itself is resolved from the
+                        request's own ids and is never model-visible.
     """
 
     session_id: str
@@ -76,3 +85,4 @@ class AIRequest:
     request_id: str = ""
     allow_tools: bool = True
     timeout_s: float = 60.0
+    request_media_type: str = ""

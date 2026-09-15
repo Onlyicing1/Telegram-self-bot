@@ -426,6 +426,21 @@ class Dispatcher:
             if fast is not None:
                 return fast
 
+        # ── Deterministic media request (BEFORE any prompt construction) ──
+        # A media target is resolved from the runtime's own identifiers — the
+        # replied-to message, or the triggering message itself — so WHICH media
+        # is processed is never a model decision. The answer is produced by
+        # ``services/media_ai_service`` from its own two-input message list, so
+        # a media request never reaches the prompt/context builders and can
+        # therefore never carry reply context, the Telegram window or the AI
+        # session history to the model.
+        if tools_allowed:
+            media = await self._try_media_analysis(
+                request, rid, status_callback, start, metadata,
+            )
+            if media is not None:
+                return media
+
         # ── Stage 2: Prompt Builder ──
         try:
             _stage("PROMPT_BUILD")
@@ -1637,6 +1652,126 @@ class Dispatcher:
             action=result.action, kind=result.kind, target=result.target,
         )
 
+    def _telegram_source(self) -> Any:
+        """The Telegram source the media boundary reads through (facade first)."""
+        executor = self._tool_executor
+        base = getattr(executor, "_context", None) if executor is not None else None
+        return getattr(base, "telegram", None) or getattr(base, "client", None)
+
+    def _media_target(self, request: AIRequest) -> tuple[Any, Any] | None:
+        """The media message this request is deterministically about, or None.
+
+        Only the runtime's OWN identifiers are consulted, in this fixed order:
+        the replied-to message (the owner addressed it explicitly), then the
+        triggering message itself. Nothing else can select a media target — no
+        recency, no sender, no caption or text matching and no history search —
+        so a model can never choose which Telegram media is processed. A media
+        type this boundary cannot transfer (WebPage/Contact/Poll/Location/
+        Unknown) never resolves, so those requests keep their existing
+        conversational behavior exactly.
+        """
+        # Imported lazily: the media services import ``backend.ai.media``
+        # (the single classifier), whose package initializer loads this
+        # module, so a module-level import here would close an import cycle.
+        from backend.services import media_service
+
+        replied = request.reply_context
+        if replied is not None and replied.exists and media_service.is_downloadable(replied.media_type):
+            chat_id = replied.chat_id or request.chat_id
+            if chat_id and replied.message_id:
+                return chat_id, replied.message_id
+        if media_service.is_downloadable(request.request_media_type):
+            if request.chat_id and request.message_id:
+                return request.chat_id, request.message_id
+        return None
+
+    async def _try_media_analysis(
+        self,
+        request: AIRequest,
+        rid: str,
+        status_callback: Callable[[str], Awaitable[None]] | None,
+        start: float,
+        metadata: dict[str, Any],
+    ) -> EngineResult | None:
+        """Answer an owner media request through the controlled media boundary.
+
+        Runs AFTER the deterministic command fast path (so "delete this" on a
+        media reply still deletes the message, and save/preview/retrieve keep
+        their precedence) and BEFORE any prompt/context construction: the
+        answer comes from ``services/media_ai_service``'s own two-input message
+        list (the owner's authored request + the normalized media text), so no
+        reply context, Telegram window, AI session history or memory can reach
+        the model for a media request.
+        """
+        from backend.services import media_ai_service
+        from backend.services.media_service import MediaError
+
+        target = self._media_target(request)
+        if target is None:
+            return None
+
+        source = self._telegram_source()
+        if source is None:
+            return self._build_fast_path_result(
+                request, rid, start, metadata, success=False,
+                text="\u274c I can't read this media: no Telegram connection is available.",
+                action="media_analysis", kind="executable", target="media",
+            )
+
+        try:
+            from backend.ai import diagnostics as ai_diag
+            ai_diag.set_stage(rid, "MEDIA_ANALYSIS")
+        except Exception:  # noqa: BLE001 — diagnostics never break a request
+            pass
+        if status_callback is not None:
+            try:
+                await status_callback("\U0001f4c4 Reading media...")
+            except Exception as exc:
+                logger.debug("Dispatcher: media status callback failed: %s", exc)
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=media_request target=%s",
+            rid or "-",
+            "replied" if (request.reply_context and request.reply_context.exists) else "attached",
+        )
+
+        try:
+            answer = await media_ai_service.answer_media_request(
+                source,
+                request.owner_id,
+                chat_id=target[0],
+                message_id=target[1],
+                request_text=request.user_message,
+                provider_manager=self._provider_manager,
+                request_id=rid,
+                timeout_s=request.timeout_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except MediaError as exc:
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=media_failed error=%s",
+                rid or "-", type(exc).__name__,
+            )
+            return self._build_fast_path_result(
+                request, rid, start, metadata, success=False,
+                text=f"\u274c Media processing failed: {exc}",
+                action="media_analysis", kind="executable", target="media",
+            )
+
+        try:
+            from backend.ai import diagnostics as ai_diag
+            ai_diag.mark_success("MEDIA_ANALYSIS")
+        except Exception:  # noqa: BLE001
+            pass
+        metadata["media_status"] = answer.status
+        return self._build_fast_path_result(
+            request, rid, start, metadata, success=True, text=answer.text,
+            action="media_analysis", kind="executable", target="media",
+            provider=answer.provider or "local",
+            model=answer.model or "deterministic",
+            fallback_used=answer.fallback_used,
+        )
+
     def _build_fast_path_result(
         self,
         request: AIRequest,
@@ -1649,6 +1784,9 @@ class Dispatcher:
         action: str,
         kind: str,
         target: str,
+        provider: str = "local",
+        model: str = "deterministic",
+        fallback_used: bool = False,
     ) -> EngineResult:
         """Build the EngineResult for a locally-resolved fast-path intent."""
         latency = time.perf_counter() - start
@@ -1656,7 +1794,7 @@ class Dispatcher:
         meta["finish_state"] = "local_fast_path"
         meta["token_source"] = "unavailable"
         meta["retry_count"] = 0
-        meta["fallback_used"] = False
+        meta["fallback_used"] = fallback_used
         meta["tool_call_count"] = len(meta.get("tool_results") or [])
         meta["context_tokens"] = 0
         # Same shape as the provider structured-action path so diagnostics
@@ -1668,8 +1806,8 @@ class Dispatcher:
         )
         result = EngineResult(
             success=success,
-            provider="local",
-            model="deterministic",
+            provider=provider,
+            model=model,
             latency=latency,
             prompt_tokens=0,
             completion_tokens=0,
@@ -1682,7 +1820,7 @@ class Dispatcher:
         safe_call(self._hooks, "after_response", result)
         self._metrics.record(
             success=success,
-            provider="local",
+            provider=provider,
             owner_id=request.owner_id,
             latency=latency,
             prompt_chars=len(request.user_message or ""),

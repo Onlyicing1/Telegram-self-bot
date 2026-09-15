@@ -578,9 +578,28 @@ async def _load_telegram_chat_context(client, chat_id, message_id, reply_context
     return snapshot
 
 
+async def _media_type_of(message: Any) -> str:
+    """The media label of the TRIGGERING message itself, or empty.
+
+    Pure attribute inspection through the existing classifier — no download, no
+    fetch, no network. It only tells the runtime that this request HAS a media
+    target; the target itself is resolved from the request's own chat/message
+    ids, never from text and never by the model.
+    """
+    if message is None:
+        return ""
+    try:
+        from backend.ai.media import classify_message
+        info = classify_message(message)
+    except Exception as exc:  # noqa: BLE001 — classification never breaks a request
+        logger.debug("AI handler: media classification failed: %s", exc)
+        return ""
+    return info.media_type if info.has_media else ""
+
+
 async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                       tz_str: str, reply_context=None, client=None,
-                      config: dict | None = None) -> None:
+                      config: dict | None = None, request_media_type: str = "") -> None:
     """Execute the AI pipeline and deliver the result via centralized delivery.
 
     ``trigger_word`` identifies the activation that started the request; the
@@ -678,6 +697,7 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
             timezone=tz_str,
             request_id=rid,
             timeout_s=_AI_EXECUTE_TIMEOUT,
+            request_media_type=request_media_type,
         )
 
         async def _status_callback(status: str) -> None:
@@ -1005,7 +1025,13 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         trace("AI_TRIGGER_MATCHED", trigger=trigger_label, mode="trigger")
+        # An owner-authored request on a message that CARRIES media (e.g. a file
+        # with the caption "این رو خلاصه کن") is a deterministic media request:
+        # the triggering message is the target. A caption-less media message
+        # never reaches here — the empty ``raw_text`` guard above returns first,
+        # exactly as before.
         await _execute_ai(
             event, owner_id, user_text, trigger_label, tz_str,
             client=client, config=config_snapshot,
+            request_media_type=await _media_type_of(getattr(event, "message", None)),
         )

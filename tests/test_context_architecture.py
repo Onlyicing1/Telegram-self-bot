@@ -236,6 +236,12 @@ async def test_reply_to_ai_message_keeps_full_untruncated_content():
 
 @pytest.mark.asyncio
 async def test_reply_to_non_ai_message_remains_distinguishable():
+    # The replied-to message carries no asset the media boundary may transfer
+    # (WebPage is a label, not a downloadable media type), so this stays an
+    # ordinary conversational reply and keeps its full reply context. A reply
+    # to a message that DOES carry a processable asset is a deterministic media
+    # request instead and is answered without any Telegram context — see
+    # tests/test_media_ai_integration.py.
     payloads: list[list[dict[str, Any]]] = []
     engine = _engine(payloads)
 
@@ -243,7 +249,7 @@ async def test_reply_to_non_ai_message_remains_distinguishable():
         engine, owner_id=841005, user_message="summarize this",
         reply_context=ReplyContext(
             exists=True, message_id=901, sender_id=2, sender_name="Design Channel",
-            chat_id=CHAT, chat_title="Design Inspiration", media_type="Photo",
+            chat_id=CHAT, chat_title="Design Inspiration", media_type="WebPage",
             text_preview="A long article about quantum computing.",
             timestamp="2026-01-01T10:00:00+00:00",
         ),
@@ -254,7 +260,7 @@ async def test_reply_to_non_ai_message_remains_distinguishable():
     assert "[Reply to AI Message]" not in text
     assert "Sender: Design Channel" in text
     assert "Text: A long article about quantum computing." in text
-    assert "Media: Photo" in text
+    assert "Media: WebPage" in text
 
 
 @pytest.mark.asyncio
