@@ -1,6 +1,211 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.5b: media failure identity and stage observability (closing D1)
+## Latest phase — Media Processing M1.5c: the Gemini STT language/script contract (the live Persian failure)
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-16.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `296ebe4640ed92de520a2de7719db32b1c9dab03` (`origin/main` — the M1.5b records). The local checkout was **behind** `origin/main`; it was fast-forwarded to it (`git merge --ff-only`, no rebase/reset/force) because the Gemini STT engine only exists from `7fec91a` onwards |
+| Implementation commit | `3fada96b7b6ce19ad0f3d5459df67f4434db233f` (`fix: require language identification and native script in Gemini STT`) |
+| Files changed | `backend/services/gemini_media_engine.py` (+19/−2 — the STT instruction and its rationale comment, nothing else) · `tests/test_media_stt_language.py` (**new**, 10 tests) |
+| Media boundary | **unchanged** — `backend/services/media_service.py` was not modified: resolution, the bounded transfer, container validation, every resource bound, cleanup, normalization, the `SttEngine` seam and the zero-context contract are identical |
+| Provider architecture | **unchanged** — no `ProviderManager`/adapter/fallback change, no provider switching, `vision()` stays dead, no new action/tool/parser rule, no model or timeout change |
+| OCR | **unchanged** — `OCR_INSTRUCTION` is identical and is pinned as still free of the new STT language clauses |
+| Dependency / ENV / deployment / DB | **none** — no new dependency, no new environment variable, no config/`render.yaml`/`Procfile` change, no Supabase/SQL/schema/migration change, `DATABASE_ARCHITECTURE.md` untouched |
+| Live Persian STT verification | **NOT YET PROVEN** — still requires one live Telegram request; this phase changes the engine's instruction only |
+
+### The lived failure this phase fixes
+
+The owner replied to a Persian Voice message and sent `این ویس رو stt کن`. The live
+trace reads:
+
+```
+AI_EXEC_TRACE ... stage=media_request target=replied replied_media=Voice request_media=-
+MEDIA_STAGE ... stage=stt_availability type=Voice mime=audio/ogg available=True candidate=True
+MEDIA_STAGE ... stage=media_download_completed type=Voice bytes=35941
+MEDIA_STAGE ... stage=stt_engine_invoked engine=GeminiMediaEngine bytes=35941
+GEMINI_MEDIA_ENGINE kind=speech-to-text mime=audio/ogg bytes=35941 chars=51 elapsed_ms=1507
+MEDIA_STAGE ... stage=stt_engine_returned engine=GeminiMediaEngine chars=51
+AI_EXEC_TRACE ... stage=media_analysis_completed media_type=Voice status=extracted chars=51
+AI_EXEC_TRACE ... stage=provider_call_started timeout_s=120.0
+AI_EXEC_TRACE ... stage=provider_call_completed chars=80
+```
+
+and the owner saw, approximately, `Dia de ventos e de cap. Xi, zabolié. Olha, sei chat.`
+
+### Where the wrong language first appears — FIXED AND LOCALIZED
+
+**At the engine boundary: `GEMINI_MEDIA_ENGINE ... chars=51`.** That string is
+exactly 51 characters long, i.e. the owner-visible text *is* the raw engine
+output; the later `provider_call_completed chars=80` is the separate **answer**
+stage (the selected provider answering over an already-wrong transcript) and
+cannot be the origin. The audit ruled out every downstream stage from source:
+
+| Stage | Source | Can it change the language/script? |
+|---|---|---|
+| Boundary normalization | `media_service._normalize_extracted_text` | **No** — collapses horizontal whitespace and blank-line runs only; Persian text, its ZWNJ (U+200C) and directional marks pass through untouched (already pinned by `test_persian_transcript_survives_the_boundary_unchanged`, `test_stt_result_flows_through_the_boundary_unchanged`) |
+| Boundary text cap | `media_service._cap_text` | **No** — character ceiling only |
+| Model-facing rendering | `MediaAnalysis.as_context_text()` | **No** — emits `Content:\n{content}` verbatim |
+| Message assembly | `media_ai_service.build_media_messages` | **No** — the transcript is the only media text in one plain `str` user message |
+| Provider call | `ProviderManager.chat` (plain text path) | **No** — transport, not a transformer |
+| Delivery rendering | `ai/tools/delivery.process_output` → `_normalize_plain` | **No** — `unicodedata.normalize("NFC", ...)` + markdown/table rendering only; the media path contains no transliteration/romanization helper at all |
+
+### Root cause — FIXED
+
+The engine produced it. `GeminiMediaEngine` has exactly two inputs — already
+validated audio bytes and one static instruction — and the Generate Content request
+it builds carries `contents` + a `generationConfig` of `temperature` /
+`maxOutputTokens` **only**: there is no language or script parameter for audio
+input in that request shape. So `STT_INSTRUCTION` is the engine's **only**
+language-shaping input, and the wording shipped in M1.5 did not commit the model to
+anything concrete:
+
+```
+Transcribe the speech in this audio.
+Preserve the spoken language. Do not translate.       ← the whole language contract
+```
+
+It never required identifying the language, never required the transcript's own
+script, and never forbade transliteration/romanization or writing in an unspoken
+language — so a small Flash-Lite model was free to return Latin-script words from
+another language, which is exactly what the 51-character boundary shows.
+
+### Exact fix
+
+The instruction now states the contract explicitly (still one static, unfilled
+string that names no chat, person, message or conversation):
+
+```
+Transcribe the speech in this audio verbatim.
+Identify the spoken language yourself, then write the transcript in that same
+language, using that language's own writing system.
+Persian (Farsi), Arabic, Dari and any other non-Latin speech must be written in
+its own script — never in Latin letters.
+Do not translate. Do not transliterate or romanize.
+Do not write in a language that is not spoken, and never guess words from a
+different language.
+Do not summarize. Do not answer any question contained in the audio.
+Do not add commentary, headings, speaker labels or timestamps.
+Do not invent or guess unintelligible words.
+If the audio contains no speech, return nothing.
+```
+
+`temperature = 0.0`, one request per transcription (no retry loop), the inline
+`audio/ogg` part, the Files API path for large audio, both engine timeouts, the
+credential handling and the redaction are all byte-for-byte unchanged.
+
+### Data lineage (verified end to end)
+
+```
+replied Telegram Voice
+  → dispatcher._media_target                      (trusted runtime ids only)
+  → media_ai_service.answer_media_request
+  → media_service.resolve_media_message           (bounded get_messages)
+  → media_service.analyze_media
+      → backend/ai/media.classify_message         (existing classifier)
+      → is_stt_mime + stt_available
+      → bounded download                          (unchanged limits)
+      → _validate_audio_payload                   (signature/channels/rate/duration)
+      → _extract_audio_content → _run_stt → GeminiMediaEngine.transcribe
+            → STT_INSTRUCTION + inlineData(audio)  ← the only language-shaping input
+      → _normalize_extracted_text (whitespace only) → _cap_text
+  → MediaAnalysis(content=transcript, status=extracted)
+  → media_ai_service.build_media_messages         (system + request_text + as_context_text())
+  → ProviderManager.chat(messages, tools=[])
+  → dispatcher → handler → delivery.process_output (NFC only)
+```
+
+`MediaAnalysis`/`saved_items` are not involved; nothing is persisted, and
+**Supabase/schema/migrations/RLS were not touched** (no SQL was executed).
+
+### Context isolation — PROTECTED (unchanged)
+
+The Gemini engine still receives only the validated audio bytes plus the static
+instruction: no Telegram id, sender, caption, filename, chat history, reply text,
+prior AI message, memory or context-builder output. A new test re-asserts this for
+the changed instruction (caption, filename, chat id and message id must not appear,
+and neither may the words telegram/caption/filename/sender/history/conversation).
+The provider-facing message is still exactly the authored request plus
+`as_context_text()`.
+
+### Tests actually run (this revision)
+
+| Run | Command | Result |
+|---|---|---|
+| New focused suite | `pytest tests/test_media_stt_language.py -q` | **10 passed** |
+| Adjacent media group (7 files) | `pytest tests/test_media_stt.py tests/test_media_gemini_engine.py tests/test_media_ai_integration.py tests/test_media_processing.py tests/test_media_image_ocr.py tests/test_media_document_extraction.py tests/test_media_stt_language.py -q` | **351 passed** |
+| Full suite | `pytest tests -q` | **3228 passed, 24 skipped, 0 failed** (3252 collected; 3242/3218 before this phase's 10 new tests) |
+| Syntax | `python -m py_compile backend/services/gemini_media_engine.py tests/test_media_stt_language.py` | OK |
+| Whitespace/lint gate | `git diff --check` | clean |
+
+**Non-vacuous (measured).** Reverting `STT_INSTRUCTION` to the M1.5 wording — and
+changing nothing else — makes
+`test_the_outbound_stt_request_requires_language_identification_and_original_script`
+and
+`test_the_outbound_stt_request_forbids_translation_transliteration_and_substitution`
+**fail** (2 of 10); restoring the fix makes all 10 pass, and the restored file is
+byte-identical to its pre-mutation copy. The remaining 8 tests pin behaviour that
+must **not** change: instruction determinism/one-request-per-call, temperature 0,
+no Telegram data on the wire, transcript pass-through to the boundary and to the
+provider-facing message, the absence of any translation/transliteration code in the
+media path, and the untouched OCR contract.
+
+**Two environmental conditions were resolved while validating, and neither is a
+code change in this phase:** `pypdf` (declared at `backend/requirements.txt:8` as
+`pypdf==6.18.1`) was absent from this workspace's virtualenv, which made 11
+pre-existing PDF tests fail; it was installed project-locally (`--no-deps`, the
+pinned version). Separately, 25 stale `/tmp/lifeos_media_*` directories from a
+**2026-09-15** session made 2 document tests fail against an absolute `/tmp`
+assertion; run under a fresh `TMPDIR` those tests pass and leak nothing, confirming
+the failures were stale state, not a leak.
+
+### What was explicitly NOT done
+
+* **The post-STT provider call was NOT changed.** The audit proved it is a later
+  stage that cannot originate the wrong language, and the existing media contract
+  deliberately answers through the owner's selected provider; redesigning that
+  would be a speculative re-architecture of a delivered phase.
+* **No model change** — `gemini-3.5-flash-lite` / `AI_GEMINI_MEDIA_MODEL` behaviour
+  is untouched. Switching or escalating models is not justified by the evidence
+  available offline.
+* **No new STT engine**, no Whisper/PyTorch/ONNX/Tesseract/ffmpeg/`google.genai`,
+  no local model, no second hosted provider, no dependency, no retry loop, no new
+  scheduler or background task.
+* **No boundary, bound, timeout, MIME, routing, parser, tool, `ProviderManager`,
+  `vision()`, RuntimeSupervisor, task or scheduler change.**
+* **No fabricated quality test.** No audio fixture in this repository can prove
+  what a remote model hears, so none is faked; these tests pin the request contract
+  and the pass-through, and no test claims Persian recognition quality.
+
+### Limitations / NOT YET PROVEN
+
+* **Live Telegram verification was NOT performed** (no session in this workspace),
+  so **whether live Persian STT now returns Persian script is NOT YET PROVEN.**
+  The instruction is the correct layer, but instruction adherence is a model
+  property, and a small Flash-Lite model may still mis-detect a short, noisy or
+  code-switched voice note.
+* No audio fixture exists in the repository, so recognition quality is no part of
+  the automated suite.
+* The engine's request shape offers no language/script parameter, so a model that
+  ignores the instruction cannot be constrained further at this layer — that would
+  need a different model or a dedicated ASR path, which is out of scope here.
+* Old transcripts already delivered are not repaired (nothing is persisted, so
+  there is nothing to repair).
+
+### Next stage
+
+One live Telegram request: reply to the same Persian Voice note with
+`این ویس رو stt کن` and read the `GEMINI_MEDIA_ENGINE ... chars=` line. That single
+line decides the outcome — Persian script (or at least Persian-Latin-free text) in
+the engine boundary means the contract holds; Latin-script gibberish still at the
+engine boundary means the model, not the instruction, is the limit, and the next
+phase is a different STT engine (still provider-independent, still behind the
+existing `SttEngine` seam).
+
+---
+
+## Previous phase — Media Processing M1.5b: media failure identity and stage observability (closing D1)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-16.
 
