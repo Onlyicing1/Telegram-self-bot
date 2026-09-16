@@ -24,13 +24,14 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Audited HEAD | `801f8dbe61a3185d1eb8d87aa35ede12ff75166b` (short `801f8db`, `docs: record the Gemini STT language-contract fix`) |
+| Audited HEAD | `801f8dbe61a3185d1eb8d87aa35ede12ff75166b` (short `801f8db`, `docs: record the Gemini STT language-contract fix`) — the **source** revision every code citation in this document was read at; the two later commits on this branch (`3edb3c0`, `7bf2d1f`) changed **only this document**, so no cited source line has moved and §18 is current at the branch HEAD as well |
 | Investigation date | 2026-09-16 |
 | Status | **Investigation only. No code was changed while producing this document.** |
 | Scope | (a) At which existing architectural boundary a controlled Media Processing layer sits upstream of the owner's **currently selected** LLM provider — without changing that provider and without leaking Telegram/conversational context to the model; and (b) **the verified source lineage of the STT text the owner reads in Telegram** for a replied Voice note (§18). |
 | Question | How is Telegram media (photo, voice, audio, document, video, sticker, GIF) resolved, downloaded, validated and normalized into a controlled representation that the **currently selected** chat provider consumes as ordinary input — and which stage of that chain produces the text the owner actually sees? |
 | Media-layer verdict | The verdict at `893d3f4` was **GO WITH REQUIRED PREWORK**; that prework has since **landed** (§11, §13, §15). No native multimodal provider path is wired — `vision()` is still declared-but-unreachable across every adapter (§6) — so media is normalized to **text upstream** instead, on a provider-neutral path. |
 | STT-lineage verdict | **RESOLVED FOR THE WRAPPER; ONE RUNTIME GAP REMAINS** (§18.8): the owner-visible text is **neither** the engine transcript **nor** locally formatted — it is a **second model's output**. The exact value the STT engine returned on the Persian live run is still **not provable from source**. |
+| Superseded published inference | The M1.5c record in `IMPLEMENTATION_REPORT.md` reads the same live trace as proof that "the owner-visible text *is* the raw engine output", on the strength of the `chars=51` measured at stage B. §18 supersedes that reading: the value the owner receives is **stage E**, which the same trace reports as `provider_call_completed chars=80`, and no stage records E's content (§18.6) — so the 51-character measurement bounds the **transcript**, not the delivered text, and no recorded trace observes the delivered value at that length. That conclusion is recorded as superseded by §18.8; `IMPLEMENTATION_REPORT.md` is outside this delivery's scope and is unchanged. |
 | Files changed by this investigation | only `INVESTIGATION.md` |
 | Classification labels | **[CURRENT]** implemented behavior verified in source at the audited HEAD (`801f8db`) · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision |
 
