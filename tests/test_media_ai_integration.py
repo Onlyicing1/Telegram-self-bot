@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import io
+import logging
+import wave
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telethon.tl.types import (
     Document,
+    DocumentAttributeAudio,
     DocumentAttributeFilename,
     DocumentAttributeVideo,
     MessageMediaDocument,
@@ -62,7 +66,14 @@ from backend.ai.tools.context import ToolContext
 from backend.ai.tools.executor import ToolExecutor
 from backend.ai.tools.registry import create_default_registry
 from backend.services import media_ai_service, media_service
-from backend.services.media_service import MediaAnalysis, MediaStatus
+from backend.services.media_service import (
+    MEDIA_FAILURE_TYPE,
+    MEDIA_STAGE_ANALYSIS,
+    MEDIA_STAGE_RESOLUTION,
+    MEDIA_STAGE_STT_ENGINE,
+    MediaAnalysis,
+    MediaStatus,
+)
 from backend.telegram_api.api import TelegramAPI
 
 OWNER = 7770001
@@ -868,3 +879,294 @@ def test_the_classifier_taxonomy_decides_which_replies_are_media_requests():
     assert media_service.is_downloadable("Document") is True
     assert media_service.is_downloadable("WebPage") is False
     assert media_service.is_downloadable("Location") is False
+
+
+# ── 7. Failure identity: a media failure names its own leg ──
+#
+# A live Voice request once reached the owner as one generic provider sentence,
+# so neither the log nor the reply said which leg had failed. These pin the
+# identity that now travels from the media boundary to the owner-facing notice,
+# and the stage traces that make the next live request conclusive. They do NOT
+# claim a cause for that live failure — it remains unproven until it is re-run.
+
+
+@pytest.fixture(autouse=True)
+def _no_provisioned_engine_leaks_between_tests():
+    previous = media_service.get_stt_engine()
+    media_service.set_stt_engine(None)
+    yield
+    media_service.set_stt_engine(previous)
+
+
+class _FailingEngine:
+    """A provisioned STT engine whose own failure is the leg under test."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls: list[bytes] = []
+
+    def transcribe(self, audio: bytes) -> str:
+        self.calls.append(audio)
+        raise self.error
+
+
+class _FixedEngine:
+    """A provisioned STT engine returning a scripted transcript."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.calls: list[bytes] = []
+
+    def transcribe(self, audio: bytes) -> str:
+        self.calls.append(audio)
+        return self.text
+
+
+def _wav(duration_s: float = 1.0, *, sample_rate: int = 16_000) -> bytes:
+    buffer = io.BytesIO()
+    handle = wave.open(buffer, "wb")
+    handle.setnchannels(1)
+    handle.setsampwidth(2)
+    handle.setframerate(sample_rate)
+    handle.writeframes(b"\x00\x00" * int(duration_s * sample_rate))
+    handle.close()
+    return buffer.getvalue()
+
+
+def _voice(payload: bytes, mid: int = REPLY_ID, chat_id: int = CHAT) -> _FakeMessage:
+    """A real ``Voice`` document declaring ``payload``'s size and WAVE type."""
+    return _FakeMessage(
+        MessageMediaDocument(document=Document(
+            id=4, access_hash=4, file_reference=b"", date=None, mime_type="audio/wav",
+            size=len(payload), dc_id=1,
+            attributes=[DocumentAttributeAudio(duration=1, voice=True)],
+        )),
+        caption=CAPTION, mid=mid, chat_id=chat_id,
+    )
+
+
+def _voice_client() -> _FakeClient:
+    """A scripted client resolving and transferring a genuinely valid voice note."""
+    payload = _wav()
+    return _FakeClient(message=_voice(payload), payload=payload)
+
+
+def _media_trace_lines(caplog: Any) -> str:
+    """Only the media lines: the boundary's MEDIA_STAGE lines and the media route."""
+    lines = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if "MEDIA_STAGE" in message or ("AI_EXEC_TRACE" in message and "stage=media" in message):
+            lines.append(message)
+    return "\n".join(lines)
+
+
+async def _dispatch_voice_failure(*, client: _FakeClient) -> Any:
+    provider = _ScriptedProvider("SHOULD-NOT-RUN")
+    dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
+    result = await dispatcher.dispatch(
+        _request(reply_context=_reply_context(media_type="Voice"))
+    )
+    assert provider.prompts == [], "a failed media request must not reach the provider"
+    return result
+
+
+@pytest.mark.asyncio
+async def test_a_media_failure_keeps_a_media_identity_instead_of_a_provider_one():
+    result = await _dispatch_voice_failure(client=_FakeClient(message=None))
+
+    assert result.success is False
+    assert result.metadata["failure_type"] == MEDIA_FAILURE_TYPE
+    assert result.metadata["media_failure_stage"] == MEDIA_STAGE_RESOLUTION
+    assert "could not be found" in result.metadata["media_failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_resolution_and_transcription_failures_land_on_different_stages():
+    resolution = await _dispatch_voice_failure(client=_FakeClient(message=None))
+
+    engine = _FailingEngine(RuntimeError("engine exploded"))
+    media_service.set_stt_engine(engine)
+    transcription = await _dispatch_voice_failure(client=_voice_client())
+
+    assert resolution.metadata["media_failure_stage"] == MEDIA_STAGE_RESOLUTION
+    assert transcription.metadata["media_failure_stage"] == MEDIA_STAGE_STT_ENGINE
+    assert engine.calls, "the boundary must really invoke the provisioned engine"
+    assert "Speech-to-text failed" in transcription.metadata["media_failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_stage_with_no_deeper_attribution_falls_back_to_the_analysis_leg():
+    # A failure the boundary cannot attribute (here: a resolution that succeeds and
+    # an analysis that raises without a stage) is still a MEDIA failure — never a
+    # provider one — so it keeps an identity instead of collapsing.
+    async def _bare_failure(*args: Any, **kwargs: Any) -> Any:
+        raise media_service.MediaError("analysis refused the payload")
+
+    original = media_service.analyze_media
+    media_service.analyze_media = _bare_failure
+    try:
+        result = await _dispatch_voice_failure(client=_voice_client())
+    finally:
+        media_service.analyze_media = original
+
+    assert result.metadata["failure_type"] == MEDIA_FAILURE_TYPE
+    assert result.metadata["media_failure_stage"] == MEDIA_STAGE_ANALYSIS
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_exception_on_the_media_route_keeps_a_media_identity():
+    # Anything escaping the media boundary used to reach the handler's generic
+    # catch-all and be reported to the owner as an unavailable PROVIDER.
+    async def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise TypeError("boom")
+
+    original = media_ai_service.answer_media_request
+    media_ai_service.answer_media_request = _explode
+    try:
+        result = await _dispatch_voice_failure(client=_voice_client())
+    finally:
+        media_ai_service.answer_media_request = original
+
+    assert result.success is False
+    assert result.metadata["failure_type"] == MEDIA_FAILURE_TYPE
+    assert result.metadata["media_failure_stage"] == MEDIA_STAGE_ANALYSIS
+    assert result.metadata["media_failure_reason"] == "TypeError"
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_failure_is_surfaced_as_a_media_failure_not_a_provider_one(caplog):
+    from backend.bot.handlers.ai_unified import _failure_notice
+
+    media_service.set_stt_engine(_FailingEngine(RuntimeError("engine exploded")))
+    with caplog.at_level(logging.INFO):
+        result = await _dispatch_voice_failure(client=_voice_client())
+
+    notice = _failure_notice(result)
+    assert "Couldn't process this media" in notice
+    assert MEDIA_STAGE_STT_ENGINE in notice
+    assert "Speech-to-text failed: RuntimeError" in notice
+    assert "temporarily unavailable" not in notice
+
+    # The engine's own detail stays in the LOG — the notice stays bounded.
+    traces = _media_trace_lines(caplog)
+    assert "error=RuntimeError reason=engine exploded" in traces
+
+
+def test_an_unrelated_provider_failure_keeps_its_existing_notice():
+    from types import SimpleNamespace
+
+    from backend.bot.handlers.ai_unified import _failure_notice
+
+    result = SimpleNamespace(
+        metadata={"failure_type": "rate_limited", "retry_count": 1, "fallback_used": False},
+        errors=["the provider reported rate_limited"],
+        response="",
+    )
+
+    notice = _failure_notice(result)
+    assert "Couldn't get a response" in notice
+    assert "Rate limited" in notice
+    assert "Couldn't process this media" not in notice
+
+
+@pytest.mark.asyncio
+async def test_an_unprovisioned_engine_is_honest_and_traced_as_unavailable(caplog):
+    provider = _ScriptedProvider("SHOULD-NOT-RUN")
+    client = _voice_client()
+    dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
+
+    with caplog.at_level(logging.INFO):
+        result = await dispatcher.dispatch(
+            _request(reply_context=_reply_context(media_type="Voice"))
+        )
+
+    assert result.success is True
+    assert result.metadata["media_status"] == MediaStatus.UNSUPPORTED
+    assert "download_media" not in client.ops()
+    traces = _media_trace_lines(caplog)
+    assert "stage=stt_availability" in traces and "available=False" in traces
+    assert "media_failure" not in traces
+
+
+@pytest.mark.asyncio
+async def test_an_empty_transcript_is_an_honest_answer_not_a_failure(caplog):
+    media_service.set_stt_engine(_FixedEngine(""))
+    provider = _ScriptedProvider("SHOULD-NOT-RUN")
+    client = _voice_client()
+    dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
+
+    with caplog.at_level(logging.INFO):
+        result = await dispatcher.dispatch(
+            _request(reply_context=_reply_context(media_type="Voice"))
+        )
+
+    assert result.success is True
+    assert "failure_type" not in result.metadata
+    assert result.metadata["media_status"] == MediaStatus.EXTRACTED
+    assert provider.prompts == []
+    traces = _media_trace_lines(caplog)
+    assert "stage=stt_engine_returned" in traces and "chars=0" in traces
+    assert "stage=media_no_content" in traces
+    assert "stt_engine_failed" not in traces
+
+
+@pytest.mark.asyncio
+async def test_a_successful_transcription_traces_its_own_completion(caplog):
+    spoken = "the spoken text"
+    media_service.set_stt_engine(_FixedEngine(spoken))
+    provider = _ScriptedProvider("SUMMARY")
+    client = _voice_client()
+    dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
+
+    with caplog.at_level(logging.INFO):
+        result = await dispatcher.dispatch(
+            _request(reply_context=_reply_context(media_type="Voice"))
+        )
+
+    assert result.success is True
+    assert result.metadata["media_status"] == MediaStatus.EXTRACTED
+    assert provider.prompts, "a successful transcription still reaches the provider"
+    traces = _media_trace_lines(caplog)
+    assert "stage=stt_engine_invoked" in traces
+    assert "stage=stt_engine_returned" in traces and f"chars={len(spoken)}" in traces
+    assert "stage=media_completed" in traces
+    assert "stage=media_failed" not in traces
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_never_enters_the_media_path_says_so(caplog):
+    provider = _ScriptedProvider("normal answer")
+    dispatcher, _ = _dispatcher(_manager(provider), _TrapClient())
+
+    with caplog.at_level(logging.INFO):
+        result = await dispatcher.dispatch(_request())
+
+    assert result.success is True
+    traces = _media_trace_lines(caplog)
+    assert "stage=media_route_skipped" in traces
+    assert "replied_media=- request_media=-" in traces
+    assert "stage=media_request" not in traces
+
+
+@pytest.mark.asyncio
+async def test_media_traces_carry_no_payload_caption_or_telegram_identifier(caplog):
+    media_service.set_stt_engine(_FailingEngine(RuntimeError("engine exploded")))
+    provider = _ScriptedProvider("SHOULD-NOT-RUN")
+    client = _voice_client()
+    dispatcher, _ = _dispatcher(_manager(provider), client, fail_prompt_build=True)
+
+    with caplog.at_level(logging.INFO):
+        await dispatcher.dispatch(
+            _request(reply_context=_reply_context(media_type="Voice"))
+        )
+
+    traces = _media_trace_lines(caplog)
+    assert traces, "the media path must trace its stages"
+    assert CAPTION not in traces
+    assert REPLY_PREVIEW not in traces
+    assert REPLY_SENDER not in traces
+    assert REPLY_TITLE not in traces
+    assert str(CHAT) not in traces
+    assert str(REPLY_ID) not in traces
+    assert "\x00" not in traces

@@ -45,6 +45,10 @@ _FAILURE_REASONS: dict[str, str] = {
     "request": "Invalid request",
     "blocked": "Blocked",
     "internal": "System error",
+    # The media path's own failure identity (media_service.MEDIA_FAILURE_TYPE):
+    # the AI surfaces must label a media failure as one instead of reporting it
+    # as an unavailable provider.
+    "media": "Media failed",
 }
 
 

@@ -35,7 +35,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.services import media_service
-from backend.services.media_service import MediaAnalysis, MediaError
+from backend.services.media_service import (
+    MEDIA_STAGE_ANALYSIS,
+    MEDIA_STAGE_PROVIDER,
+    MEDIA_STAGE_RESOLUTION,
+    MediaAnalysis,
+    MediaError,
+    bounded_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +134,23 @@ def _trace(request_id: str, stage: str, **fields: Any) -> None:
     )
 
 
+def _failure_stage(exc: MediaError, default: str) -> str:
+    """The media failure's OWN stage, defaulted to the leg that caught it.
+
+    The deeper layers attribute the precise leg (download, validation, the STT
+    engine, the boundary's own timeout); this boundary only fills in the leg it
+    owns, so a failure never reaches the handler without an identity attached.
+    """
+    stage = str(getattr(exc, "stage", "") or "")
+    if stage:
+        return stage
+    try:
+        exc.stage = default
+    except Exception:  # noqa: BLE001 — an exotic exception type keeps the default
+        pass
+    return default
+
+
 def _failure_reason(response: Any) -> str:
     metadata = getattr(response, "metadata", None) or {}
     if metadata.get("reason"):
@@ -154,18 +178,30 @@ async def _provider_call(
         raise
     except asyncio.TimeoutError as exc:
         _trace(request_id, "provider_call_failed", error="timeout")
-        raise MediaError(f"the AI provider did not respond within {timeout:g}s") from exc
+        raise MediaError(
+            f"the AI provider did not respond within {timeout:g}s",
+            stage=MEDIA_STAGE_PROVIDER,
+        ) from exc
     except Exception as exc:  # noqa: BLE001 — provider mesh boundary
         _trace(request_id, "provider_call_failed", error=type(exc).__name__)
-        raise MediaError(f"the AI provider call failed: {type(exc).__name__}: {exc}") from exc
+        raise MediaError(
+            f"the AI provider call failed: {type(exc).__name__}: {exc}",
+            stage=MEDIA_STAGE_PROVIDER,
+        ) from exc
     if not getattr(response, "success", False):
         reason = _failure_reason(response)
         _trace(request_id, "provider_call_failed", error=reason)
-        raise MediaError(f"the AI provider failed ({reason})")
+        raise MediaError(
+            f"the AI provider failed ({reason})",
+            stage=MEDIA_STAGE_PROVIDER,
+        )
     text = str(getattr(response, "text", "") or "").strip()
     if not text:
         _trace(request_id, "provider_call_failed", error="empty_response")
-        raise MediaError("the AI provider returned an empty response")
+        raise MediaError(
+            "the AI provider returned an empty response",
+            stage=MEDIA_STAGE_PROVIDER,
+        )
     _trace(request_id, "provider_call_completed", chars=len(text))
     return response
 
@@ -208,37 +244,61 @@ async def answer_media_request(
     try:
         message = await media_service.resolve_media_message(
             source, chat_id=chat_id, message_id=message_id, timeout_s=timeout_s,
+            request_id=request_id,
         )
-    except MediaError:
-        _trace(request_id, "media_resolution_failed")
+    except MediaError as exc:
+        # The leg is preserved as the failure's own identity, with its bounded
+        # sanitized reason, so the log AND the owner-facing notice both report
+        # WHERE the media request died instead of one generic sentence.
+        _trace(
+            request_id, "media_resolution_failed",
+            media_stage=_failure_stage(exc, MEDIA_STAGE_RESOLUTION),
+            reason=bounded_reason(exc),
+        )
         raise
     _trace(request_id, "media_resolution_completed")
 
     _trace(request_id, "media_analysis_started")
     try:
         analysis = await media_service.analyze_media(
-            source, owner_id, message, timeout_s=timeout_s,
+            source, owner_id, message, timeout_s=timeout_s, request_id=request_id,
         )
-    except MediaError:
-        _trace(request_id, "media_analysis_failed")
+    except MediaError as exc:
+        _trace(
+            request_id, "media_analysis_failed",
+            media_stage=_failure_stage(exc, MEDIA_STAGE_ANALYSIS),
+            reason=bounded_reason(exc),
+        )
         raise
     _trace(
         request_id, "media_analysis_completed",
         media_type=analysis.media_type or "-", status=analysis.status,
+        chars=len(analysis.content or ""), truncated=analysis.truncated,
     )
 
     # No fabricated content, no provider round, no reason to send anything the
-    # application could not read: the owner gets the honest state instead.
+    # application could not read: the owner gets the honest state instead. An
+    # EXTRACTED analysis with no content is an EMPTY extraction (no readable text
+    # / no speech) — traced as such, never confused with an engine failure.
     if not analysis.has_content:
+        _trace(
+            request_id, "media_no_content",
+            media_type=analysis.media_type or "-", status=analysis.status,
+            reason=bounded_reason(analysis.reason),
+        )
         return MediaAnswer(text=unsupported_text(analysis), status=str(analysis.status))
 
     if provider_manager is None:
-        raise MediaError("no AI provider manager is available for this request")
+        raise MediaError(
+            "no AI provider manager is available for this request",
+            stage=MEDIA_STAGE_PROVIDER,
+        )
 
     timeout = media_call_timeout(timeout_s)
     if timeout < MIN_PROVIDER_CALL_TIMEOUT_S:
         raise MediaError(
-            "the request's time budget ran out before the media could be analyzed"
+            "the request's time budget ran out before the media could be analyzed",
+            stage=MEDIA_STAGE_PROVIDER,
         )
 
     messages = build_media_messages(request_text, analysis)

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import os
 import tempfile
 import threading
@@ -719,6 +720,155 @@ async def test_missing_download_is_refused_before_transcription():
         await media_service.analyze_media(client, OWNER, message)
 
     assert engine.calls == []
+
+
+# ── 7b. Failure identity: which LEG failed ──
+#
+# A live Voice request once reached the owner as one generic provider sentence,
+# so the leg that actually failed was unrecoverable afterwards. These pin the
+# identity that now travels with a media failure — the raised ``MediaError``'s
+# stage plus its bounded reason, and one trace line per STT leg. They do NOT
+# assert which leg that live failure hit; that needs the next live request.
+
+
+def _stt_traces(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "MEDIA_STAGE" in record.getMessage()
+    ]
+
+
+def test_bounded_reason_collapses_whitespace_and_caps_the_diagnostic():
+    assert media_service.bounded_reason(MediaError("a\n  b\tc")) == "a b c"
+    assert len(media_service.bounded_reason(MediaError("x" * 500))) == 200
+    assert media_service.bounded_reason(MediaError("")) == "MediaError"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_engine_is_traced_as_unavailable_and_transfers_nothing(caplog):
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with caplog.at_level(logging.INFO, logger="backend.services.media_service"):
+        analysis = await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    assert analysis.status == MediaStatus.UNSUPPORTED
+    traces = "\n".join(_stt_traces(caplog))
+    assert "stage=stt_availability" in traces
+    assert "available=False" in traces and "candidate=False" in traces
+    assert client.calls == [], "an unavailable engine must never start a transfer"
+
+
+@pytest.mark.asyncio
+async def test_a_vanished_engine_fails_on_the_availability_leg(monkeypatch):
+    # Availability is decided when the message is classified and consumed when the
+    # audio is transcribed; that gap is exactly where a provisioning failure would
+    # hide, so the leg is attributed instead of collapsing into a generic stage.
+    monkeypatch.setattr(media_service, "stt_available", lambda: True)
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with pytest.raises(MediaError) as error:
+        await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    assert error.value.stage == media_service.MEDIA_STAGE_STT_UNAVAILABLE
+    assert "No speech-to-text engine" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_an_engine_failure_keeps_the_engine_stage_and_the_engines_reason():
+    engine = _ScriptedEngine(error=MediaError("the remote engine rejected the audio (HTTP 429)"))
+    media_service.set_stt_engine(engine)
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with pytest.raises(MediaError) as error:
+        await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    assert error.value.stage == media_service.MEDIA_STAGE_STT_ENGINE
+    assert "HTTP 429" in str(error.value), "the engine's own reason must survive"
+    assert engine.calls == [payload], "the engine's failure must be a real invocation"
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_engine_error_is_attributed_to_the_engine_too():
+    media_service.set_stt_engine(_ScriptedEngine(error=RuntimeError("engine exploded")))
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with pytest.raises(MediaError) as error:
+        await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    assert error.value.stage == media_service.MEDIA_STAGE_STT_ENGINE
+    assert "RuntimeError" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_the_boundary_timeout_is_a_different_leg_from_an_engine_failure(monkeypatch):
+    monkeypatch.setattr(media_service, "STT_TIMEOUT_S", 0.02)
+    media_service.set_stt_engine(_ScriptedEngine("late", delay=0.4))
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with pytest.raises(MediaError) as error:
+        await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    assert error.value.stage == media_service.MEDIA_STAGE_STT_TIMEOUT
+    assert error.value.stage != media_service.MEDIA_STAGE_STT_ENGINE
+
+
+@pytest.mark.asyncio
+async def test_a_container_refusal_is_attributed_before_the_engine_runs():
+    engine = _ScriptedEngine("never reached")
+    media_service.set_stt_engine(engine)
+    client = _FakeClient(payload=b"plainly not an ogg stream")
+
+    with pytest.raises(MediaError) as error:
+        await media_service.analyze_media(client, OWNER, _voice_message(b"x" * 31))
+
+    assert error.value.stage == media_service.MEDIA_STAGE_VALIDATION
+    assert engine.calls == [], "validation is refused before any engine call"
+
+
+@pytest.mark.asyncio
+async def test_the_success_stages_are_traced_and_an_empty_transcript_is_not_a_failure(caplog):
+    engine = _ScriptedEngine("")
+    media_service.set_stt_engine(engine)
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with caplog.at_level(logging.INFO, logger="backend.services.media_service"):
+        analysis = await media_service.analyze_media(client, OWNER, _voice_message(payload))
+
+    traces = "\n".join(_stt_traces(caplog))
+    assert "stage=stt_availability" in traces and "available=True" in traces
+    assert "stage=stt_engine_invoked" in traces
+    assert "stage=stt_engine_returned" in traces and "chars=0" in traces
+    assert "stt_engine_failed" not in traces and "stt_timeout" not in traces
+    assert engine.calls == [payload]
+    assert analysis.status == MediaStatus.EXTRACTED
+    assert analysis.content == ""
+    assert "no speech" in analysis.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_transcript_is_never_written_to_the_trace_only_its_size(caplog):
+    secret = "transcript-that-must-not-be-logged-LEAK"
+    media_service.set_stt_engine(_ScriptedEngine(secret))
+    payload = _ogg_opus(2.0)
+    client = _FakeClient(payload=payload)
+
+    with caplog.at_level(logging.INFO, logger="backend.services.media_service"):
+        analysis = await media_service.analyze_media(
+            client, OWNER, _voice_message(payload), request_id="audit-request",
+        )
+
+    assert analysis.content == secret
+    emitted = "\n".join(_stt_traces(caplog))
+    assert f"chars={len(secret)}" in emitted
+    assert secret not in emitted
+    assert "request_id=audit-request" in emitted
 
 
 # ── 8. Execution model: off the event loop, bounded cleanup ──

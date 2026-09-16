@@ -249,7 +249,20 @@ _MAX_FILE_NAME_CHARS = 120
 
 
 class MediaError(Exception):
-    """Raised when media cannot be resolved, transferred or validated honestly."""
+    """Raised when media cannot be resolved, transferred or validated honestly.
+
+    ``stage`` optionally names the INTERNAL stage this failure happened in (see
+    the ``MEDIA_STAGE_*`` tokens). It is what keeps a media failure diagnosable
+    on its way to the handler: the dispatcher stamps it on the failure result so
+    the owner-facing notice reports the failing LEG instead of collapsing every
+    media failure into one generic provider message. It is a closed token or a
+    bounded reason's stage — never a payload, a credential or Telegram metadata —
+    and an empty stage is valid: the caller that knows the leg attributes it.
+    """
+
+    def __init__(self, message: str, *, stage: str = "") -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 class MediaStatus(str, Enum):
@@ -344,6 +357,59 @@ class MediaAnalysis:
             if self.truncated:
                 parts.append("(content truncated at the processing limit)")
         return "\n".join(parts)
+
+
+#: The internal failure identity of the media path. The dispatcher stamps it on
+#: a media failure result so the handler can render the media reason (stage +
+#: bounded detail) instead of a generic provider message.
+MEDIA_FAILURE_TYPE = "media"
+
+#: The closed set of media failure stages — one token per leg of the existing
+#: media path, so ONE live request is enough to tell which leg failed: the
+#: runtime's Telegram source, target selection, bounded message resolution, the
+#: bounded transfer, payload validation, STT availability, the engine call, the
+#: boundary's own transcription timeout, the analysis as a whole (the default
+#: when no deeper leg claimed the failure) and the post-analysis provider call.
+MEDIA_STAGE_SOURCE = "media_source"
+MEDIA_STAGE_TARGET = "media_target"
+MEDIA_STAGE_RESOLUTION = "media_resolution"
+MEDIA_STAGE_DOWNLOAD = "media_download"
+MEDIA_STAGE_VALIDATION = "media_validation"
+MEDIA_STAGE_STT_UNAVAILABLE = "media_stt_unavailable"
+MEDIA_STAGE_STT_ENGINE = "media_stt_engine"
+MEDIA_STAGE_STT_TIMEOUT = "media_stt_timeout"
+MEDIA_STAGE_ANALYSIS = "media_analysis"
+MEDIA_STAGE_PROVIDER = "media_provider"
+
+
+def bounded_reason(error: Any, limit: int = 200) -> str:
+    """A bounded, single-line diagnostic reason for ``error`` (never a payload).
+
+    Media failures carry their own sanitized message — the Gemini engine redacts
+    the credential and bounds the provider detail — so the message IS the safe
+    diagnostic. It is collapsed and capped here so no log line, failure result
+    or owner-facing notice can grow without bound.
+    """
+    text = " ".join(str(error or "").split())[:limit]
+    return text or type(error).__name__
+
+
+def _stage_trace(
+    stage: str, *, request_id: str = "", level: int = logging.INFO, **fields: Any,
+) -> None:
+    """Emit ONE media-stage trace line, in the project's existing trace shape.
+
+    Same ``key=value`` convention as the AI execution traces, so one request can
+    be followed stage by stage with the request id the AI layer already owns.
+    Fields are expected to be closed tokens, labels, counts or bounded reasons —
+    never media bytes, credentials or Telegram identifiers.
+    """
+    extra = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.log(
+        level,
+        "MEDIA_STAGE request_id=%s stage=%s%s",
+        request_id or "-", stage, f" {extra}" if extra else "",
+    )
 
 
 def is_downloadable(media_type: str) -> bool:
@@ -1121,7 +1187,9 @@ def _validate_audio_payload(data: bytes, mime_type: str) -> tuple[int, int, floa
     return channels, sample_rate, duration_s
 
 
-async def _run_stt(engine: SttEngine, data: bytes, timeout_s: float) -> str:
+async def _run_stt(
+    engine: SttEngine, data: bytes, timeout_s: float, request_id: str = "",
+) -> str:
     """Run ONE transcription off the event loop, under a finite bound.
 
     Transcription is CPU-bound, so it runs in a worker thread — the same
@@ -1130,6 +1198,11 @@ async def _run_stt(engine: SttEngine, data: bytes, timeout_s: float) -> str:
     analysis honestly instead of holding the request. A worker thread cannot be
     interrupted cooperatively, so the bound is enforced on the awaited result
     rather than assumed to stop the engine itself.
+
+    Every exit path carries an internal stage: the boundary's own timeout and the
+    engine's own failure are distinct legs, and the engine's message (which names
+    the remote service and its HTTP status) is preserved as the bounded reason —
+    it is what makes the next live failure diagnostic instead of generic.
     """
     try:
         result = await asyncio.wait_for(
@@ -1138,16 +1211,37 @@ async def _run_stt(engine: SttEngine, data: bytes, timeout_s: float) -> str:
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
-        raise MediaError(f"Speech-to-text did not finish within {timeout_s:g}s.") from exc
-    except MediaError:
+        _stage_trace(
+            "stt_timeout", request_id=request_id, level=logging.WARNING,
+            error="TimeoutError",
+            reason=bounded_reason(f"speech-to-text did not finish within {timeout_s:g}s"),
+        )
+        raise MediaError(
+            f"Speech-to-text did not finish within {timeout_s:g}s.",
+            stage=MEDIA_STAGE_STT_TIMEOUT,
+        ) from exc
+    except MediaError as exc:
+        if not getattr(exc, "stage", ""):
+            exc.stage = MEDIA_STAGE_STT_ENGINE
+        _stage_trace(
+            "stt_engine_failed", request_id=request_id, level=logging.WARNING,
+            error=type(exc).__name__, reason=bounded_reason(exc),
+        )
         raise
     except Exception as exc:  # noqa: BLE001 — engine boundary
-        raise MediaError(f"Speech-to-text failed: {type(exc).__name__}") from exc
+        _stage_trace(
+            "stt_engine_failed", request_id=request_id, level=logging.WARNING,
+            error=type(exc).__name__, reason=bounded_reason(exc),
+        )
+        raise MediaError(
+            f"Speech-to-text failed: {type(exc).__name__}",
+            stage=MEDIA_STAGE_STT_ENGINE,
+        ) from exc
     return result if isinstance(result, str) else ""
 
 
 async def _extract_audio_content(
-    path: str, mime_type: str, limit: int,
+    path: str, mime_type: str, limit: int, request_id: str = "",
 ) -> tuple[str, bool, str]:
     """Transcribe ONE downloaded audio asset, bounded at every step (M1.4).
 
@@ -1155,10 +1249,21 @@ async def _extract_audio_content(
     signature must corroborate the declared MIME, its declared channels, sample
     rate and duration must fit their bounds, transcription must finish inside the
     STT timeout, and the normalized transcript is capped at ``limit`` characters.
+
+    The STT stages are traced individually — engine availability, engine
+    invocation, the engine's return (with its character count, so an EMPTY
+    transcript is distinguishable from a failure) and the engine's failure (with
+    its bounded reason) — so a live request identifies its leg without guessing.
     """
     engine = _stt_engine
     if engine is None:
-        raise MediaError("No speech-to-text engine is provisioned on this runtime.")
+        _stage_trace(
+            "stt_engine_unavailable", request_id=request_id, level=logging.WARNING,
+        )
+        raise MediaError(
+            "No speech-to-text engine is provisioned on this runtime.",
+            stage=MEDIA_STAGE_STT_UNAVAILABLE,
+        )
 
     data = _read_document_bytes(path)
     if not data:
@@ -1166,12 +1271,29 @@ async def _extract_audio_content(
     if len(data) > MAX_STT_INPUT_BYTES:
         raise MediaError(
             f"The audio is {_format_bytes(len(data))} — exceeds the "
-            f"{_format_bytes(MAX_STT_INPUT_BYTES)} speech-to-text input limit."
+            f"{_format_bytes(MAX_STT_INPUT_BYTES)} speech-to-text input limit.",
+            stage=MEDIA_STAGE_VALIDATION,
         )
 
-    _validate_audio_payload(data, mime_type)
-    raw_text = await _run_stt(engine, data, STT_TIMEOUT_S)
+    try:
+        _validate_audio_payload(data, mime_type)
+    except MediaError as exc:
+        # The validation leg refuses the container before any engine is invoked;
+        # the refined message is preserved and only the stage is attributed.
+        if not getattr(exc, "stage", ""):
+            exc.stage = MEDIA_STAGE_VALIDATION
+        raise
+
+    _stage_trace(
+        "stt_engine_invoked", request_id=request_id,
+        engine=type(engine).__name__, bytes=len(data),
+    )
+    raw_text = await _run_stt(engine, data, STT_TIMEOUT_S, request_id=request_id)
     text = _normalize_extracted_text(raw_text)
+    _stage_trace(
+        "stt_engine_returned", request_id=request_id,
+        engine=type(engine).__name__, chars=len(text),
+    )
     if not text:
         return "", False, "No speech was detected in the audio."
     capped, truncated = _cap_text(text, limit)
@@ -1220,6 +1342,7 @@ async def resolve_media_message(
     chat_id: Any,
     message_id: Any,
     timeout_s: Any = None,
+    request_id: str = "",
 ) -> Any:
     """Fetch the ONE message the TRUSTED RUNTIME identified, by its own ids.
 
@@ -1229,17 +1352,27 @@ async def resolve_media_message(
     or history. Nothing here searches for a message, and nothing falls back to
     another one — unreadable ids produce an honest ``MediaError``.
 
+    ``request_id`` is trace correlation only (the AI layer's request id); it
+    never participates in target selection and is never sent anywhere.
+
     The fetched object stays inside this boundary: it is consumed by
     :func:`analyze_media` and is never returned to an AI layer, a prompt or a
     provider.
     """
+    _stage_trace("media_resolution_started", request_id=request_id, timeout_s=f"{_bounded(timeout_s, MEDIA_RESOLVE_TIMEOUT_S):g}")
     client = _resolve_client(source)
     target_chat = _coerce_int(chat_id)
     target_message = _coerce_int(message_id)
     if not target_chat:
-        raise MediaError("A concrete chat id is required to resolve media.")
+        raise MediaError(
+            "A concrete chat id is required to resolve media.",
+            stage=MEDIA_STAGE_RESOLUTION,
+        )
     if not target_message:
-        raise MediaError("A concrete message id is required to resolve media.")
+        raise MediaError(
+            "A concrete message id is required to resolve media.",
+            stage=MEDIA_STAGE_RESOLUTION,
+        )
 
     bound = _bounded(timeout_s, MEDIA_RESOLVE_TIMEOUT_S)
     try:
@@ -1254,15 +1387,23 @@ async def resolve_media_message(
         logger.warning("MEDIA_RESOLVE_FAILED chat_id=%s message_id=%s error=timeout",
                        target_chat, target_message)
         raise MediaError(
-            f"Resolving the media message timed out after {bound:g}s."
+            f"Resolving the media message timed out after {bound:g}s.",
+            stage=MEDIA_STAGE_RESOLUTION,
         ) from exc
     except Exception as exc:
         logger.warning("MEDIA_RESOLVE_FAILED chat_id=%s message_id=%s error=%s",
                        target_chat, target_message, type(exc).__name__)
-        raise MediaError(f"Resolving the media message failed: {exc}") from exc
+        raise MediaError(
+            f"Resolving the media message failed: {exc}",
+            stage=MEDIA_STAGE_RESOLUTION,
+        ) from exc
 
     if message is None:
-        raise MediaError("The media message could not be found.")
+        raise MediaError(
+            "The media message could not be found.",
+            stage=MEDIA_STAGE_RESOLUTION,
+        )
+    _stage_trace("media_resolution_completed", request_id=request_id)
     return message
 
 
@@ -1273,6 +1414,7 @@ async def analyze_media(
     *,
     timeout_s: Any = None,
     size_limit_bytes: int | None = None,
+    request_id: str = "",
 ) -> MediaAnalysis:
     """Resolve, transfer, validate and normalize ONE media message.
 
@@ -1286,6 +1428,8 @@ async def analyze_media(
         timeout_s:         Optional tighter bound for the transfer.
         size_limit_bytes:  Optional tighter size limit (defaults to the
                            project's media limit).
+        request_id:        Trace correlation only (the AI layer's request id);
+                           it never selects, resolves or transfers anything.
 
     Returns:
         A ``MediaAnalysis`` that either carries extracted text or states
@@ -1297,11 +1441,17 @@ async def analyze_media(
         asyncio.CancelledError: re-raised unchanged (after cleanup).
     """
     if message is None:
-        raise MediaError("No media message was resolved for this request.")
+        raise MediaError(
+            "No media message was resolved for this request.",
+            stage=MEDIA_STAGE_TARGET,
+        )
 
     info = classify_message(message)
     if not info.has_media:
-        raise MediaError("The resolved message carries no media.")
+        raise MediaError(
+            "The resolved message carries no media.",
+            stage=MEDIA_STAGE_TARGET,
+        )
 
     if not is_downloadable(info.media_type):
         analysis = _unsupported(
@@ -1316,6 +1466,13 @@ async def analyze_media(
 
     ocr_candidate = is_image_mime(info.mime_type) and ocr_available()
     stt_candidate = is_stt_mime(info.mime_type) and stt_available()
+    if is_stt_mime(info.mime_type):
+        # The single line that answers "was STT even available for this asset?" —
+        # a missing engine is otherwise only visible as an UNSUPPORTED outcome.
+        _stage_trace(
+            "stt_availability", request_id=request_id, type=info.media_type,
+            mime=info.mime_type, available=stt_available(), candidate=stt_candidate,
+        )
     if not is_extractable_mime(info.mime_type) and not ocr_candidate and not stt_candidate:
         if is_image_mime(info.mime_type):
             reason = (
@@ -1352,11 +1509,16 @@ async def analyze_media(
     if info.file_size and info.file_size > limit:
         raise MediaError(
             f"Media is {_format_bytes(info.file_size)} — exceeds the "
-            f"{_format_bytes(limit)} processing limit."
+            f"{_format_bytes(limit)} processing limit.",
+            stage=MEDIA_STAGE_VALIDATION,
         )
 
     client = _resolve_client(source)
     bound = download_timeout(timeout_s)
+    _stage_trace(
+        "media_download_started", request_id=request_id, type=info.media_type,
+        declared_bytes=info.file_size or "-", timeout_s=f"{bound:g}",
+    )
     tmp_dir = tempfile.mkdtemp(prefix="lifeos_media_")
     try:
         destination = _safe_temp_path(tmp_dir, info.file_name)
@@ -1371,22 +1533,39 @@ async def analyze_media(
                 "MEDIA_DOWNLOAD_FAILED owner=%s type=%s error=%s",
                 owner_id, info.media_type, type(exc).__name__,
             )
-            raise MediaError(f"Media download failed: {exc}") from exc
+            raise MediaError(
+                f"Media download failed: {exc}",
+                stage=MEDIA_STAGE_DOWNLOAD,
+            ) from exc
 
         if result is None:
-            raise MediaError("Telegram returned no media for the resolved message.")
+            raise MediaError(
+                "Telegram returned no media for the resolved message.",
+                stage=MEDIA_STAGE_DOWNLOAD,
+            )
 
         path = result if isinstance(result, str) and os.path.exists(result) else destination
         if not os.path.exists(path):
-            raise MediaError("Downloaded media is missing.")
+            raise MediaError(
+                "Downloaded media is missing.",
+                stage=MEDIA_STAGE_DOWNLOAD,
+            )
         size = os.path.getsize(path)
         if size == 0:
-            raise MediaError("Downloaded media is empty.")
+            raise MediaError(
+                "Downloaded media is empty.",
+                stage=MEDIA_STAGE_DOWNLOAD,
+            )
         if size > limit:
             raise MediaError(
                 f"Downloaded media is {_format_bytes(size)} — exceeds the "
-                f"{_format_bytes(limit)} processing limit."
+                f"{_format_bytes(limit)} processing limit.",
+                stage=MEDIA_STAGE_DOWNLOAD,
             )
+        _stage_trace(
+            "media_download_completed", request_id=request_id,
+            type=info.media_type, bytes=size,
+        )
 
         # Container parsing is CPU-bound over an already size-bounded file, so
         # it runs off the event loop; the temporary directory is still removed
@@ -1397,7 +1576,7 @@ async def analyze_media(
             )
         elif stt_candidate:
             content, truncated, empty_reason = await _extract_audio_content(
-                path, info.mime_type, MAX_STT_CHARS,
+                path, info.mime_type, MAX_STT_CHARS, request_id=request_id,
             )
         else:
             content, truncated, empty_reason = await asyncio.to_thread(

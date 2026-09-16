@@ -335,19 +335,43 @@ def _format_failure(user_message: str, notice: str, show_question: bool) -> str:
     return format_failure(user_message, notice, show_question)
 
 
+def _media_failure_notice(metadata: dict, raw: str) -> str:
+    """Honest notice for a MEDIA failure: the failing leg and its bounded reason.
+
+    The media path reports its OWN failure identity (``media_failure_stage`` plus
+    an already-sanitized ``media_failure_reason``), so the owner is told which leg
+    failed instead of receiving the generic provider sentence — the collapse that
+    made a live media/STT failure indistinguishable from an unrelated provider
+    outage. No credential, media payload or Telegram identifier can appear here:
+    the media layers never place one in the reason.
+    """
+    from backend.services.media_service import bounded_reason
+
+    stage = str(metadata.get("media_failure_stage") or "").strip() or "media"
+    reason = str(metadata.get("media_failure_reason") or "").strip() or bounded_reason(raw)
+    return "\n".join(["✕ Couldn't process this media", f"{stage}: {reason}"])
+
+
 def _failure_notice(result) -> str:
     """Compact, human notice for a failed AI execution.
 
     Reads ONLY the dispatcher's normalized metadata — never raw provider
     errors, HTTP codes, or tracebacks. Each line answers one question:
     what happened, why, and whether recovery was attempted.
+
+    A media failure is answered from its own identity (stage + bounded reason):
+    collapsing it into the generic provider sentence is exactly what hid the
+    failing media leg from both the logs and the owner.
     """
     from backend.ai.engine.telemetry import humanize_failure
+    from backend.services.media_service import MEDIA_FAILURE_TYPE
 
     metadata = getattr(result, "metadata", None) or {}
     errors = getattr(result, "errors", None) or []
     raw = str(errors[-1]) if errors else str(getattr(result, "response", "") or "")
     ftype = str(metadata.get("failure_type", "") or "")
+    if ftype == MEDIA_FAILURE_TYPE:
+        return _media_failure_notice(metadata, raw)
     if not ftype:
         return _humanize_error(raw)
     reason = humanize_failure(ftype, raw)

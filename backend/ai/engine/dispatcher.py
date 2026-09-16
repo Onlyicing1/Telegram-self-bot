@@ -1704,14 +1704,41 @@ class Dispatcher:
         the model for a media request.
         """
         from backend.services import media_ai_service
-        from backend.services.media_service import MediaError
+        from backend.services.media_service import (
+            MEDIA_FAILURE_TYPE,
+            MEDIA_STAGE_ANALYSIS,
+            MEDIA_STAGE_SOURCE,
+            MediaError,
+            bounded_reason,
+        )
+
+        replied_media = (
+            getattr(getattr(request, "reply_context", None), "media_type", "") or "-"
+        )
+        request_media = getattr(request, "request_media_type", "") or "-"
 
         target = self._media_target(request)
         if target is None:
+            # "This request never entered the media path" must be a POSITIVE
+            # trace — an absent trace is not evidence. Only classifier labels
+            # travel here: never a chat id, a message id or any content.
+            logger.info(
+                "AI_EXEC_TRACE request_id=%s stage=media_route_skipped "
+                "replied_media=%s request_media=%s",
+                rid or "-", replied_media, request_media,
+            )
             return None
 
         source = self._telegram_source()
         if source is None:
+            metadata["failure_type"] = MEDIA_FAILURE_TYPE
+            metadata["media_failure_stage"] = MEDIA_STAGE_SOURCE
+            metadata["media_failure_reason"] = "no Telegram connection is available"
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=media_failed media_stage=%s "
+                "error=no_telegram_source reason=%s",
+                rid or "-", MEDIA_STAGE_SOURCE, metadata["media_failure_reason"],
+            )
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=False,
                 text="\u274c I can't read this media: no Telegram connection is available.",
@@ -1729,9 +1756,11 @@ class Dispatcher:
             except Exception as exc:
                 logger.debug("Dispatcher: media status callback failed: %s", exc)
         logger.info(
-            "AI_EXEC_TRACE request_id=%s stage=media_request target=%s",
+            "AI_EXEC_TRACE request_id=%s stage=media_request target=%s "
+            "replied_media=%s request_media=%s",
             rid or "-",
             "replied" if (request.reply_context and request.reply_context.exists) else "attached",
+            replied_media, request_media,
         )
 
         try:
@@ -1748,13 +1777,43 @@ class Dispatcher:
         except asyncio.CancelledError:
             raise
         except MediaError as exc:
+            # The media path keeps its OWN failure identity: the stage the failure
+            # happened in plus its bounded, already-sanitized reason. Without it the
+            # owner-facing notice could only collapse into a generic provider
+            # sentence, and the leg that actually failed would be lost.
+            media_stage = getattr(exc, "stage", "") or MEDIA_STAGE_ANALYSIS
+            reason = bounded_reason(exc)
+            metadata["failure_type"] = MEDIA_FAILURE_TYPE
+            metadata["media_failure_stage"] = media_stage
+            metadata["media_failure_reason"] = reason
             logger.warning(
-                "AI_EXEC_TRACE request_id=%s stage=media_failed error=%s",
-                rid or "-", type(exc).__name__,
+                "AI_EXEC_TRACE request_id=%s stage=media_failed media_stage=%s "
+                "error=%s reason=%s",
+                rid or "-", media_stage, type(exc).__name__, reason,
             )
             return self._build_fast_path_result(
                 request, rid, start, metadata, success=False,
-                text=f"\u274c Media processing failed: {exc}",
+                text=f"\u274c Media processing failed: {reason}",
+                action="media_analysis", kind="executable", target="media",
+            )
+        except Exception as exc:  # noqa: BLE001 — the media route keeps its identity
+            # An unexpected exception used to escape to the handler's generic
+            # catch-all and reach the owner as an unavailable PROVIDER — the same
+            # collapse as the MediaError case above. The route stays a media
+            # failure: only the class name travels to the owner, the bounded
+            # detail stays in the log.
+            reason = type(exc).__name__
+            metadata["failure_type"] = MEDIA_FAILURE_TYPE
+            metadata["media_failure_stage"] = MEDIA_STAGE_ANALYSIS
+            metadata["media_failure_reason"] = reason
+            logger.warning(
+                "AI_EXEC_TRACE request_id=%s stage=media_failed media_stage=%s "
+                "error=%s reason=%s",
+                rid or "-", MEDIA_STAGE_ANALYSIS, reason, bounded_reason(exc),
+            )
+            return self._build_fast_path_result(
+                request, rid, start, metadata, success=False,
+                text=f"\u274c Media processing failed: {reason}",
                 action="media_analysis", kind="executable", target="media",
             )
 
@@ -1764,6 +1823,10 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             pass
         metadata["media_status"] = answer.status
+        logger.info(
+            "AI_EXEC_TRACE request_id=%s stage=media_completed status=%s chars=%d",
+            rid or "-", answer.status or "-", len(answer.text or ""),
+        )
         return self._build_fast_path_result(
             request, rid, start, metadata, success=True, text=answer.text,
             action="media_analysis", kind="executable", target="media",
