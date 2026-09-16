@@ -176,6 +176,7 @@ class RuntimeSupervisor:
         mark_started()
 
         settings_service.load_all()
+        self._provision_media_engines()
 
         self._transition(RuntimeState.CONNECTING)
         await self._build_and_register()
@@ -261,6 +262,33 @@ class RuntimeSupervisor:
         except Exception as exc:
             trace_exception("AI_CONFIG_APPLY_BOOT_FAILED", exc)
             logger.warning("AI config boot restore failed: %s", exc)
+
+    def _provision_media_engines(self) -> None:
+        """Provision the OPTIONAL OCR/STT engines behind the media boundary.
+
+        The media boundary (``backend/services/media_service.py``) ships with no
+        engine: images and audio fail closed until one is provisioned. The Gemini
+        engines are built here from the same ENV configuration the provider layer
+        already uses, so the supervisor stays the single startup authority for
+        engine wiring and no media path can construct its own engine. A missing
+        credential is an expected, harmless state (the boundary keeps failing
+        closed), and nothing here can fail startup.
+        """
+        try:
+            from backend.services.gemini_media_engine import provision_gemini_media_engines
+            status = provision_gemini_media_engines()
+            trace(
+                "MEDIA_ENGINES_PROVISIONED",
+                configured=status.get("configured"),
+                model=status.get("model") or "-",
+            )
+            logger.info(
+                "Media engines provisioned (configured=%s, model=%s)",
+                status.get("configured"), status.get("model") or "-",
+            )
+        except Exception as exc:  # noqa: BLE001 — engine wiring is never fatal
+            trace_exception("MEDIA_ENGINES_PROVISION_FAILED", exc)
+            logger.warning("Media engine provisioning failed: %s", exc)
 
     def _wire_ai_tools(self) -> None:
         try:
