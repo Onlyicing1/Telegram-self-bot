@@ -1,6 +1,178 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.5: the existing OCR/STT seams provisioned with Google Gemini
+## Latest phase — Media Processing M1.5b: media failure identity and stage observability (closing D1)
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-16.
+
+> **This phase is observability and honest failure-surfacing ONLY. It is NOT an
+> STT fix and it does not claim one.** The live Voice/STT failure of 2026-09-15 is
+> still **unresolved**, and its root cause is still **NOT identified** in the sense
+> of a proven failing leg: what this phase removes is the *evidence loss* that made
+> the leg unrecoverable. The immediate next step is one live request.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `a6370da0ae1859e2cfd11eb49701469c5425ba04` (`origin/main` — the M1.5 delivery record) |
+| Implementation commit | `5814fe82ffc4b96164f3995a7db5ce7bb470be5c` (`feat: keep a media failure's own identity and trace every media stage`) |
+| Scope | the audit's branch-independent item B: media failure identity + stage traces (D1) |
+| Files changed | `backend/services/media_service.py` · `backend/services/media_ai_service.py` · `backend/ai/engine/dispatcher.py` · `backend/ai/engine/telemetry.py` · `backend/bot/handlers/ai_unified.py` · `tests/test_media_stt.py` · `tests/test_media_ai_integration.py` |
+| Media boundary behaviour | **unchanged** — deterministic target resolution, the bounded transfer, payload validation, every resource bound, temporary-file cleanup, normalization and the fail-closed contract are untouched |
+| Gemini engine | **untouched** — `backend/services/gemini_media_engine.py` was not proven defective and was not modified |
+| Dependency / ENV / deployment / DB | **none** — no new dependency, no new environment variable, no config or `render.yaml`/`Procfile` change, no Supabase/SQL/schema change |
+| Semantic action / routing | **none added** — no new AI action, no regex/keyword phrase list, no parser change, no timeout/MIME/model change, no `ProviderManager.vision()` |
+| Live Telegram/Gemini verification | **still pending** — one live request is now required to identify the failing leg |
+
+### The live failure this phase is designed to make conclusive
+
+The owner replied to a Telegram voice message and sent `این ویس رو stt کن`; the bot
+answered `AI is temporarily unavailable. Please try again shortly.` and the Render
+excerpt contained no Gemini/STT line at all (only an unrelated Taskloom
+`ReadError [Errno 11]`). The preceding read-only audit established, from source:
+
+* `"AI is temporarily unavailable. Please try again shortly."` has exactly **one**
+emitter — the handler's generic error path — and a normal provider failure can
+never produce it: a provider failure is always stamped with its own
+`failure_type`. The media route's two failure results were the only
+`success=False` results carrying **no** failure identity, so a media/STT failure and
+an unrelated provider outage were indistinguishable in the log *and* to the owner.
+* The media route **was** reachable for that phrasing (the deterministic parser
+classifies `این ویس رو stt کن` as conversational, so it falls through to the media
+route), and the replied-to Voice message **was** propagated as the target. Neither
+target resolution nor routing is implicated.
+* The failing leg itself was **undetermined**: five candidates survived (reply
+fetch, download, the Gemini STT request, the post-STT provider call, or an
+unexpected exception escaping the media call site), and the boundary logged
+**only on success** while the dispatcher logged only the exception class name.
+
+### What was implemented
+
+**1. A media failure identity that survives to the user boundary.**
+`MEDIA_FAILURE_TYPE = "media"` plus a closed set of stage tokens
+(`MEDIA_STAGE_SOURCE`, `_TARGET`, `_RESOLUTION`, `_DOWNLOAD`, `_VALIDATION`,
+`_STT_UNAVAILABLE`, `_STT_ENGINE`, `_STT_TIMEOUT`, `_ANALYSIS`, `_PROVIDER`) live in
+`media_service.py`. `MediaError` now carries an optional `stage`, attributed at the
+point of failure (resolution, download, validation, engine availability, the engine
+call, the boundary's own timeout) and defaulted by the boundary to its own leg.
+The dispatcher stamps `failure_type="media"` + `media_failure_stage` +
+`media_failure_reason` (bounded, already-sanitized) onto the failure result, so the
+identity reaches the handler **instead of collapsing** into the generic sentence;
+`telemetry._FAILURE_REASONS` gained the matching `media` label so no AI surface can
+render a media failure as an unavailable provider.
+
+**2. A guard on the media call site.** A non-`MediaError` exception used to escape
+the media route into the handler's catch-all and reach the owner as an unavailable
+provider. It is now logged with its bounded detail and reported as a media failure
+(`media_analysis` stage). The exception is not swallowed into success.
+
+**3. One trace line per media stage** (existing `key=value` trace convention, the
+request id the AI layer already owns): `media_route_skipped` (media never engaged
+for this request — a *positive* trace, because an absent line is not evidence),
+`media_request`, `media_resolution_started/completed`, `stt_availability`
+(`available=` / `candidate=` — the single line that answers "was STT even
+provisioned for this asset?"), `media_download_started/completed`,
+`stt_engine_invoked`, `stt_engine_returned` (`chars=` — an **empty** transcript is
+visibly different from a failure), `stt_engine_failed` / `stt_timeout` (with the
+bounded reason), `media_no_content`, `media_completed`, `media_failed`
+(`media_stage=` + reason) and `provider_call_failed`.
+
+**4. Honest, bounded disclosure.** Stage traces carry only closed tokens, labels,
+counts, byte sizes and bounded reasons — never media bytes, a caption, a chat id, a
+message id or a transcript (the transcript's size is logged, its text is not). The
+owner-facing notice for a media failure is now `✕ Couldn't process this media` plus
+`<stage>: <bounded reason>`; unexpected exception messages stay class-name-only in
+the notice and full-detail in the log. An unrelated provider failure keeps its
+existing notice and vocabulary.
+
+### Which D1 branches are now distinguishable from one log
+
+| # | Branch | Positive evidence now emitted |
+|---|---|---|
+| 1 | request never entered the media path | `stage=media_route_skipped` (+ the reply/attached classifier labels) |
+| 2 | media target resolution failed | `media_resolution_failed` / `media_failed media_stage=media_resolution` |
+| 3 | media analysis started but failed | `media_analysis_failed` + `media_failed media_stage=media_<leg>` |
+| 4 | STT availability/provisioning missing | `stt_availability available=False candidate=False`, or `media_stage=media_stt_unavailable` |
+| 5 | `SttEngine` invocation failed | `stt_engine_failed` / `stt_timeout` + `media_stage=media_stt_engine` or `media_stt_timeout` |
+| 6 | `GeminiMediaEngine` invoked and failed | `stt_engine_invoked` **followed by** `stt_engine_failed reason=…` (the engine's own sanitized message, e.g. an HTTP status) |
+| 7 | Gemini returned an empty transcription | `stt_engine_returned chars=0`, `media_no_content`, `success=True`, no provider round |
+| 8 | transcription succeeded but downstream handling failed | `stt_engine_returned chars=N` then `provider_call_failed` / `media_stage=media_provider` |
+| 9 | an unrelated AI/provider failure | no media trace at all; the provider's own `failure_type` and notice are unchanged |
+
+### Tests actually run (this revision)
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_stt.py -q` | **73 passed** (4.96 s) — 64 pre-existing + **9 new** stage/identity tests |
+| `pytest tests/test_media_ai_integration.py -q` | **43 passed** (0.44 s) — 32 pre-existing + **11 new** identity/trace tests |
+| `pytest tests -q` (full suite) | **3 218 passed, 24 skipped, 0 failed** (110.0 s) — the 3 198/24 baseline plus the 20 new tests, no regression |
+| `python -m py_compile` on all seven changed files | **passed** |
+| `git diff --check` | **clean** |
+
+The new tests pin: a media failure keeps a media identity (and never a provider
+one); resolution vs validation vs engine vs timeout vs availability land on
+different stages; an engine exception is distinguishable from an empty transcript;
+an unexpected exception on the media route keeps a media identity; each reached
+stage emits its own trace and a media route that is skipped says so; a successful
+transcription traces its completion; an unrelated provider failure keeps its
+existing notice; bounded reasons collapse whitespace and cap at 200 chars; and
+media traces contain no caption, reply preview, sender, chat title, chat id,
+message id or payload byte.
+
+**No test was weakened and no unrelated test was modified.** The clock-dependent
+`tests/test_40_usage_read_side.py::test_daily_usage_read` failure recorded in the
+M1.5 revision did **not** reproduce here (this run was at 08:48 UTC, outside the
+00:00–02:00 UTC window that makes "26 hours ago" span two calendar days); it remains
+pre-existing and unrelated.
+
+### What was explicitly NOT done
+
+No semantic media/STT action was added; no regex or keyword phrase list; the proven
+`…بنویس` deterministic-parser misroute was **not** changed; nothing in
+`gemini_media_engine.py`, the STT MIME set, any timeout, any model name or the media
+bounds was touched; no routing/selection change; no second STT service, downloader
+or provider path; no `vision()`; no dependency, ENV, deployment or database change;
+no change to target resolution. `backend/services/media_service.py`'s externally
+observable behaviour (resolution order, transfer, validation, limits, cleanup,
+`MediaAnalysis` shape, fail-closed `UNSUPPORTED`) is unchanged.
+
+### Limitations / NOT YET PROVEN
+
+1. **The 2026-09-15 live failure's leg is still unidentified** — this phase makes the
+   next attempt conclusive, it does not itself know the answer. Only a live request
+   can name it.
+2. **The generic sentence is still emitted for a truly unhandled exception outside the
+   media route** (the handler's outer catch-all). Inside the media route that case is
+   now attributed; outside it, existing behaviour is preserved deliberately.
+3. Logs are still the only place the failing leg is *recorded*; there is no new
+   persistent diagnostics surface (no schema change was authorised).
+4. The owner-facing media notice now names the stage and reason — this is a deliberate
+   change from the single generic sentence, and it is a disclosure decision, not an STT
+   fix.
+
+### Next stage
+
+**M1.6a — one live Telegram request.** Reply to a voice message and send
+`این ویس رو stt کن` once on the deployed revision, then read the media traces: they
+now state whether the route was entered, which leg failed and why. Only after that
+should any fix be written (and if the leg turns out to be Gemini-side, the fix is in
+`gemini_media_engine.py` or the surrounding config — not in routing). Then the
+unchanged M1.6b item: Video/Animation/GIF frame sampling still needs either a
+lightweight `requirements.txt`-deliverable decoder or a resource-budget
+re-authorisation.
+
+### Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `a6370da0ae1859e2cfd11eb49701469c5425ba04` (`origin/main`) |
+| Implementation commit (code + tests) | `5814fe82ffc4b96164f3995a7db5ce7bb470be5c` — *feat: keep a media failure's own identity and trace every media stage* |
+| This current-state report | the docs commit that follows `5814fe8` on `main`; delivered without rebase and without force-push |
+| Remote verification | `git push origin main` (no force, no rebase), then `git rev-parse origin/main` compared against local `HEAD` |
+| Working tree after delivery | clean |
+| Database / Supabase | untouched |
+
+---
+
+## Previous phase — Media Processing M1.5: the existing OCR/STT seams provisioned with Google Gemini
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-16.
 
