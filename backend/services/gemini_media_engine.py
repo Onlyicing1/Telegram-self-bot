@@ -102,9 +102,26 @@ OCR_INSTRUCTION = (
 )
 
 #: The ONLY instruction sent for speech-to-text, under the same rule.
+#:
+#: The language contract is stated EXPLICITLY because the Generate Content request
+#: carries no language parameter for audio input: this instruction is the engine's
+#: only language-shaping input. Live evidence for why the earlier, weaker wording
+#: ("Preserve the spoken language. Do not translate.") was not sufficient: a
+#: Persian Voice note came back as Latin-script gibberish straight from the engine
+#: (``GEMINI_MEDIA_ENGINE ... chars=51``), i.e. the model never committed to the
+#: spoken language or to its script. So the instruction now requires identifying
+#: the language, transcribing verbatim in it, writing it in its OWN script, and
+#: forbids translation, transliteration/romanization and substituting another
+#: language. It stays static and names no chat, person, message or conversation.
 STT_INSTRUCTION = (
-    "Transcribe the speech in this audio.\n"
-    "Preserve the spoken language. Do not translate.\n"
+    "Transcribe the speech in this audio verbatim.\n"
+    "Identify the spoken language yourself, then write the transcript in that same "
+    "language, using that language's own writing system.\n"
+    "Persian (Farsi), Arabic, Dari and any other non-Latin speech must be written in "
+    "its own script — never in Latin letters.\n"
+    "Do not translate. Do not transliterate or romanize.\n"
+    "Do not write in a language that is not spoken, and never guess words from a "
+    "different language.\n"
     "Do not summarize. Do not answer any question contained in the audio.\n"
     "Do not add commentary, headings, speaker labels or timestamps.\n"
     "Do not invent or guess unintelligible words.\n"
