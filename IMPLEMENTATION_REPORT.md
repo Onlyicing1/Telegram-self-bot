@@ -1,6 +1,283 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.4: the bounded speech-to-text boundary for Voice/Audio
+## Latest phase — Media Processing M1.5: the existing OCR/STT seams provisioned with Google Gemini
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-16.
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `9be06a79033831ddd4d2d4dd5e07ea2cbc7622f2` (origin/main — the M1.3 delivery/verification record) |
+| Implementation commit (code + tests) | `7fec91adc29eb4aa0d65260016f6156fe5a0092e` — *feat: provision the existing OCR/STT media seams with Google Gemini* |
+| Files changed | `backend/services/gemini_media_engine.py` (**new**, 644 lines) · `backend/runtime/supervisor.py` (+28, the provisioning hook only) · `tests/test_media_gemini_engine.py` (**new**, 1 415 lines / 82 tests) |
+| Database / Supabase impact | **none** (no migration, no schema, no column, no RLS, no SQL) |
+| Media boundary impact | **none by design** — `backend/services/media_service.py` is untouched: the `OcrEngine`/`SttEngine` seams it already declared are now *provisioned*, which is the exact single decision M1.3/M1.4 deferred |
+| Provider architecture impact | **none** — `ProviderManager`, the registry, the factory, every provider adapter, `media_ai_service.py` and the prompt/context builders are untouched; no second provider-selection system and no second retry/fallback system was added; `ProviderManager.vision()` is still never called by application code |
+| Dependency added | **none** — `backend/requirements.txt`, `render.yaml` and `Procfile` are unchanged; the engine uses the `httpx` stack (0.27.0) the provider adapters already depend on |
+| Live Telegram verification | **NOT performed** (no live session in this workspace) |
+| Live Gemini API verification | **NOT performed — see “Live API verification status” below; no client was told otherwise and none was mocked into looking live** |
+
+### The exact task
+
+Connect the two engine seams the media boundary already declares — `OcrEngine`
+(still images) and `SttEngine` (Voice/Audio) — to Google Gemini, reusing the
+current repository architecture and its existing boundaries. M1.3/M1.4
+deliberately stopped at the seams because no OCR/STT engine was provisionable on
+the runtime; this phase is exactly the provisioning decision, and nothing more.
+
+No media pipeline, download path, provider boundary, tool layer, task layer, panel
+or schema was redesigned or added. The boundary still owns deterministic target
+resolution, the bounded transfer, payload validation, every resource bound, the
+temporary-file cleanup, normalization and the fail-closed contract.
+
+### Design actually implemented
+
+**One synchronous engine, two seams.** `GeminiMediaEngine`
+(`backend/services/gemini_media_engine.py`) implements `recognize(image)` and
+`transcribe(audio)` and is provisioned to **both** seams by one call
+(`provision_gemini_media_engines()` → `media_service.set_ocr_engine` +
+`set_stt_engine`). It is deliberately synchronous because the boundary already
+offloads engines with `asyncio.to_thread`; the engine therefore never touches the
+event loop and the boundary stays the single timeout authority. Its whole state is
+`_api_key`, `_model`, `_key_env_var` (pinned by a test), so provisioning one
+cannot change the media contract.
+
+**One API dialect, already present in the repository.** The engine speaks the
+documented Generate Content API — `POST {base}/models/{model}:generateContent`
+with `contents[].parts[]` — which is the same base URL, the same request shape and
+the same camelCase field names the existing Gemini adapter
+(`backend/ai/providers/gemini.py`) already sends. The credential travels in the
+`x-goog-api-key` **header**, never in the URL, so no log line, error string or
+URL-based leak can echo it. No SDK was added: the request is one `httpx.Client`
+call, the same stack the adapters use.
+
+**Deterministic, minimal request.** Each operation sends exactly two parts: the
+fixed instruction for that operation and the payload itself
+(`inlineData: {mimeType, data}` with base64 of the validated bytes). Sampling is
+`temperature: 0.0`; `maxOutputTokens` is a finite 8 192; there is **one** request
+per operation, no tool declarations, no system prompt, no history, no retry loop.
+The whole request body was asserted byte-for-byte in tests (two parts, exact
+instruction, base64 that decodes to the payload the boundary handed over).
+
+**Private/zero-context by construction.** The engine never sees a Telegram
+object, caption, filename, sender, chat id, message id, reply text, session,
+memory or prompt-builder output — it only ever sees the bytes the boundary
+already validated. Tests assert the sent bodies contain neither the caption, the
+filename, the chat id, the message id nor the words `caption`/`filename`/`sender`,
+and that the only text transmitted is the two static instructions.
+
+**MIME handling without a new seam parameter.** The seam is one argument wide
+(`bytes`), so the engine derives the MIME type from the payload's own container
+signature — a container the boundary has already corroborated against the
+declared Telegram MIME type. The mapping only normalises aliases onto the MIME
+types Gemini documents (`image/jpg → image/jpeg`, `audio/opus`/`application/ogg →
+`audio/ogg`, `audio/x-wav|wave|vnd.wave → audio/wav`, `audio/x-flac → audio/flac`).
+The supported list was **not** broadened (no MP3/M4A/WebM/AAC is accepted — the
+boundary's STT MIME set is unchanged) and no MIME is invented: a container Gemini
+does not document (BMP, GIF) is refused **deterministically, before any request**,
+with an explicit `MediaError`.
+
+**Failure contract reused, not duplicated.** Every external outcome is mapped onto
+the existing boundary error type: `MediaError` for authentication (401/403), rate
+limits (429), rejected requests (400), unknown model (404), server unavailability
+(5xx), HTTP timeouts, transport failures, unreadable/malformed responses, blocked
+responses and refusals — with a short sanitized provider detail whose copy of the
+API key is redacted to `***` (a test asserts the raw detail really did contain the
+key and the raised message does not). Genuinely empty output (no text on the
+image, no speech) returns the empty string, which the boundary reports honestly as
+`EXTRACTED` with empty content and its existing reason — no content is ever
+fabricated, and the LLM is still never called to explain an empty result.
+
+**Audio past the inline budget uses the documented Files API flow.** A payload at
+or below 15 MiB is sent inline. Above that — possible because the boundary's
+existing `MAX_STT_INPUT_BYTES` is 20 MiB and base64 inflates by ≈4/3 — the engine
+performs the documented resumable upload (`upload/v1beta/files` start → one
+`upload, finalize` request carrying the bytes) and references the returned file URI
+with `fileData`. The remote file is **deleted in a `finally` block** (verified on
+success *and* on generation failure), a failed delete is logged and never masks the
+result because the API also auto-expires uploads, and the display name is the fixed
+non-identifying string `lifeos-media` — a Telegram filename is never uploaded.
+
+**Configuration reuses the existing conventions only.** Credential:
+`AI_GEMINI_API_KEY`, falling back to `GEMINI_API_KEY` — the exact names/two-tier
+pattern `backend/ai/providers/factory.py` and `backend/ai/discovery.py` already
+declare for Gemini. Model: the new optional `AI_GEMINI_MEDIA_MODEL`, falling back
+to the existing `AI_GEMINI_MODEL`, falling back to the default constant; the
+resolved value is passed through the project's existing `resolve_model()`
+deprecation map (so a retired model can never poison a request). No key is
+hardcoded, nothing is persisted, and a missing credential is a **value, not an
+exception**: both seams are left unprovisioned, the boundary keeps failing closed
+exactly as M1.3/M1.4 record, and startup is unaffected. Provisioning performs no
+network I/O at all (asserted with a transport that would raise if touched).
+
+**Wired once, from the runtime supervisor.** `RuntimeSupervisor.start()` calls the
+new `_provision_media_engines()` hook (trace + log, never fatal), next to the
+existing `_wire_ai_tools` / `_apply_ai_config_at_boot` wiring. A structural test
+proves `provision_gemini_media_engines` is referenced from exactly two files — its
+own definition and `runtime/supervisor.py` — so no media path can construct its
+own engine, and the supervisor remains the single startup authority.
+
+### Selected model and API, and why
+
+| Decision | Value | Why |
+|---|---|---|
+| API | Generate Content (`POST /v1beta/models/{model}:generateContent`, `x-goog-api-key` header) | It is the dialect the repository's Gemini adapter already speaks (one API style in the project), it is still documented, and its response shape (`candidates[].content.parts[].text`) needs no new parser or SDK. |
+| Default media model | `gemini-3.5-flash-lite` (`DEFAULT_MEDIA_MODEL`) | The smallest **current** Gemini model that accepts both image *and* audio input — which one engine serving two seams requires — and it is listed with a **free tier**. |
+| Dedicated transcription model | **not used** | The task warned not to assume a transcription model is free/available; a single multimodal Flash-Lite model satisfies both contracts with one configurable value instead of two models and two request shapes. |
+| Inline vs Files API | inline ≤ 15 MiB, Files API above | Keeps the existing 20 MiB STT bound honest under both documented inline limits (20 MB in the audio guide, 100 MB on the Files API page) instead of narrowing the bound. |
+
+**Verified against the current official documentation on 2026-09-16**
+(`ai.google.dev/gemini-api/docs/{audio,generate-content/audio,image-understanding,files,models,pricing}`,
+plus the Google Cloud audio-understanding model/MIME table):
+
+* image input is supported for PNG/JPEG/WEBP (+HEIC/HEIF); audio input is
+documented for `audio/wav`, `audio/ogg`, `audio/flac` (among others) — the three
+container families this boundary accepts and validates;
+* `gemini-3.5-flash-lite` appears in the audio-capable model list and its pricing
+row prices **text/image/video/audio** input, i.e. it is genuinely multimodal;
+* its pricing row lists the free tier as **free of charge** for input and output,
+with paid input at $0.30 / 1M tokens;
+* the Files API flow (resumable start/finalize, `fileData.fileUri`, `DELETE`,
+*48-hour* automatic expiry) and the `x-goog-api-key` header are the documented
+ones used here.
+
+**Not claimed:** that the free tier is sufficient for this project's volume, or
+that any quota/rate limit was measured — the free-tier statement above is a
+documentation fact, not a measurement. No paid-only model is required by this
+implementation, since the default is free-tier listed and the model is
+configurable.
+
+### Live API verification status
+
+**No live Gemini API call was made. A real smoke test was NOT performed.**
+
+* No Gemini credential was available to this workspace: none was supplied, and this
+environment blocks environment inspection, so credential presence could not even be
+read (the attempt returned the platform's env-access denial). Nothing was
+fabricated to look verified, and no mock response is presented as a live result.
+* Therefore: the integration is **code-tested only**. Gemini connectivity,
+Persian/Arabic recognition quality, Opus decoding, real quota/free-tier behaviour
+and end-to-end latency remain **unverified**.
+* To complete it, the owner only has to set `AI_GEMINI_API_KEY` (the key the
+project already declares for Gemini) — no other configuration is required for the
+default model — and then reply to one image and one voice note; a controlled
+smoke test would use a deterministic fixture (e.g. a generated PNG with known text)
+and never private user media.
+
+### Tests actually run (this revision)
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_media_gemini_engine.py -q` (new, 82 tests) | **82 passed** (0.63 s) |
+| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_image_ocr.py tests/test_media_stt.py tests/test_media_ai_integration.py tests/test_media_gemini_engine.py -q` | **321 passed** (36.9 s) |
+| `pytest tests/test_17_providers.py tests/test_23_provider_mesh.py tests/test_11_runtime_wiring.py tests/test_retry.py` (provider/wiring regression) | **passed** (included in the 321 above) |
+| `pytest tests -q` (full suite) | **3 197 passed, 24 skipped, 1 failed** (108.7 s) — the single failure is the pre-existing, clock-dependent `tests/test_40_usage_read_side.py::test_daily_usage_read`, unrelated to this change (see below) |
+| `python -m compileall` on `backend` + `tests` | **passed** |
+| `git diff --check` | **clean** |
+
+**The one full-suite failure is pre-existing and time-dependent, not a regression.**
+`test_daily_usage_read` inserts a usage row **26 hours** old and asserts it belongs
+to *yesterday*; run between 00:00 and 02:00 UTC, 26 hours back is **two calendar
+days** ago, so the assertion fails. Measured here (01:08 UTC): `clock 01:08 UTC →
+yesterday total = 0`, `clock 12:08 UTC → yesterday total = 40` — the same code, the
+same rows, only the wall clock differs. The test's modules
+(`backend/ai/database/usage_reader.py`) are untouched by this change, no test was
+weakened to accommodate it, and it was deliberately **not** modified (out of scope).
+
+**Coverage of the new suite (all with a scripted `httpx` transport — no key, no
+network):** OCR success (English + Persian with ZWNJ), multi-part text ordering,
+empty/no-text, whitespace-only, malformed JSON, non-JSON, `promptFeedback` block,
+`SAFETY` finish reason, 401/403/429/404/500/400, key redaction, HTTP timeout,
+transport failure, temp-directory cleanup on failure; MIME propagation for
+PNG/JPEG/`image/jpg`/WEBP plus deterministic refusal of GIF/BMP with **zero**
+requests; container/MIME contradiction, oversized bitmap and past-input-bound
+images never reaching Gemini; STT success, empty transcript, malformed/non-JSON,
+401/403/429/500/400, timeout, transcript ceiling; all nine supported audio MIME
+aliases; duration and channel bounds refused before Gemini; unsupported audio
+never transferred; the Files API path (start → finalize bytes → `fileData` →
+`DELETE`), cleanup on generation failure, failed-delete tolerance, upload failure
+attempted exactly once; `MAX_TOKENS` truncation traced; no-Telegram-metadata and
+static-instruction assertions; engine bound constants strictly inside the
+boundary's; one-engine/two-seams provisioning, model resolution order, deprecation
+mapping, missing/blank credential fail-closed, supervisor hook + single wiring
+point, and structural checks (no provider/prompt/vision reference, no heavy
+dependency, no-coroutine engine, `__slots__` pinned).
+
+**Non-vacuous (measured at runtime, no source file modified):**
+
+| Probe | As implemented | Guard lifted |
+|---|---|---|
+| GIF payload | `MediaError: Gemini does not accept image/gif media for extraction on this runtime.` · requests=0 | image returned · requests=1 |
+| 401 whose detail echoes the key | raised message `Gemini rejected the configured API key (HTTP 401). (API key not valid: ***)` — key absent | raw detail contains the key |
+| 500 on transcription | `MediaError: Gemini is unavailable right now (HTTP 500).` · attempts=1 (no retry loop) | — |
+| Inline budget set to 0 | tiny WAV takes the upload path and fails on the missing upload URL (`Gemini did not return an upload URL.`) | inline path |
+
+### What was explicitly NOT done
+
+No new dependency, SDK or local model (no torch/whisper/onnxruntime/tesseract/
+ffmpeg, no weights, no background worker, no queue, no ffmpeg); no change to
+`backend/services/media_service.py`, `media_ai_service.py`, `ProviderManager`,
+any provider adapter, `vision()`, the prompt/context builders, the dispatcher, the
+tool layer, Taskloom, panels, delivery or presentation; no new environment variable
+beyond the optional model override; no database/Supabase/SQL change; no second
+download path; no second provider-selection or retry system; no unrelated test
+modified and no existing test weakened. `backend/requirements.txt`, `render.yaml`
+and `Procfile` are byte-identical to the previous revision.
+
+### Limitations / NOT YET PROVEN
+
+1. **No live Gemini call** — the whole integration is proven against a scripted HTTP
+   boundary only (see above).
+2. **OCR of BMP and GIF is refused deterministically.** The boundary still accepts
+   those image containers, but Gemini does not document them for image input, so the
+   engine refuses before sending. A transcode-free path does not exist without a
+   decoder dependency, which this project does not have.
+3. **Opus-in-OGG is unverified.** Telegram Voice declares `audio/ogg` (documented by
+   Gemini) but the codec inside is Opus, which the documentation's audio MIME list
+   does not name explicitly. The engine sends the true, corroborated container MIME;
+   whether Gemini decodes Opus voice notes can only be confirmed by a live call.
+4. **Recognition quality is unproven**, in particular Persian/Arabic — no fixture was
+   ever transcribed by the real model. Normalization/ordering for Persian is proven;
+   accuracy is not claimed.
+5. **The engine's timeout bounds the awaited HTTP call only.** With the Files API flow,
+   upload + generation share one deadline, but each step is itself a separate bounded
+   request; the boundary's outer `asyncio.wait_for` still owns the total.
+6. **A `MAX_TOKENS` truncation is traced, not surfaced** as the analysis' `truncated`
+   flag (that flag belongs to the boundary's character ceiling). The text returned is
+   real but may be incomplete, and the log line says so.
+7. **Free-tier / quota behaviour is a documentation fact only** — no rate limit or quota
+   was measured, and a busy account can still be rate-limited (mapped to a controlled
+   `MediaError`).
+8. No live Telegram verification (no live session here): resolve → bounded download →
+   validate → Gemini → `MediaAnalysis` → provider is proven in-process only.
+
+### Next stage
+
+**M1.6 — live verification of M1.5, then Video/GIF frame sampling (unchanged
+reasoning).** Concretely: (a) with a credential present, run the controlled live
+smoke test (one generated PNG with known text, one generated WAV/OGG fixture) and
+record real Persian/English OCR and STT quality, then remove the deliberate
+“unverified” status from this report; (b) `Video`/`Animation`/`GIF` remain
+`UNSUPPORTED` and still require a decoder the runtime does not have, so any frame
+sampling phase must either add a genuinely lightweight, `requirements.txt`-
+deliverable decoder or re-authorise the resource budget — the same wall M1.3/M1.4
+hit. `ProviderManager.vision()` still stays dead: media answers continue to travel
+as plain strings through the existing `media_ai_service` → `ProviderManager.chat`
+path.
+
+### Delivery
+
+| Item | Value |
+|---|---|
+| Starting HEAD | `9be06a79033831ddd4d2d4dd5e07ea2cbc7622f2` (origin/main) |
+| Implementation commit (code + tests) | `7fec91adc29eb4aa0d65260016f6156fe5a0092e` |
+| This current-state report | delivered in the child commit of `7fec91a` on `main`; both commits are the ones verified against `origin/main` (see the final delivery verification in the assistant's report for this stage) |
+| Remote verification | `git push origin main` (no force, no rebase) then `git ls-remote origin refs/heads/main` + `git merge-base --is-ancestor 7fec91a origin/main` |
+| Working tree after delivery | clean |
+| Database / Supabase | untouched |
+
+---
+
+## Previous phase — Media Processing M1.4: the bounded speech-to-text boundary for Voice/Audio
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · implementation date 2026-09-15.
 
