@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,48 +76,84 @@ MEDIA_ANALYSIS_SYSTEM_PROMPT = (
 # extracted transcript itself — no second model, no provider round. The match
 # is intentionally narrow (high confidence, deterministic) so analytical asks
 # ("what does it say", summaries, analysis) keep the full LLM path.
-#: Latin-script verbs that mean transcription. Deliberately excludes "read",
-#: "listen", "understand", "say", "analyze", "translate", ... — those asks
-#: are about the media, not its verbatim text.
-_STT_VERBS = ("transcribe", "transcript", "stt", "speech to text")
-#: Persian equivalents of the same ask, matched as substrings so ordinary
-#: object/politeness words around them (این رو, ویس رو, ...) keep matching.
-#: \u0645\u062a\u0646\u0628\u062e\u0648\u0646 and \u0645\u062a\u0646\u0628\u06a9\u0646 mean "write down the text (for me)" — the
-#: everyday Persian phrasing of a transcription request.
-_STT_FA = (
-    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u067e",                      # transcript/transcription (loanword)
-    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u0646\u06af",                        # transliteration of "transcribing"
-    "\u0633\u06cc\u200c\u062a\u06cc\u200c\u06cc",                            # Persian spelling-out of "STT"
-    "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc",                          # transcription (formal Persian)
-    "\u0645\u062a\u0646\u200c\u0628\u062e\u0648\u0646",                            # "write the text out" (colloquial)
-    "\u0645\u062a\u0646\u200c\u0628\u06a9\u0646",                              # "make the text" (colloquial)
-)
+#: The FINITE set of supported STT intent forms — one entry per accepted
+#: form: a whole-word English form or a Persian phrase. The set is closed on
+#: purpose: new phrasings are ADDED here with evidence, never guessed.
+#: Deliberately absent: "read", "listen", "understand", "say", "analyze",
+#: "translate", "summarize", ... — those asks are about the media, not its
+#: verbatim text.
+#:
+#: "sst" is an explicit supported alias of "stt" (the common transposition
+#: typo owners actually type), NOT fuzzy matching: it is its own listed form,
+#: matched by the same whole-word rule, and it triggers no other correction.
+_STT_FORMS = frozenset({
+    "stt", "sst", "transcribe", "transcript", "speech to text",
+    # Persian equivalents of the same ask (see _STT_PERSIAN_FORMS): the
+    # loanwords ترانشریپ/ترانشرینگ, the Persian spelling-out of the STT
+    # acronym, formal پیاداداری, and the colloquial متن‌بخون/متن‌بکن.
+    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u067e",
+    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u0646\u06af",
+    "\u0633\u06cc\u200c\u062a\u06cc\u200c\u06cc",
+    "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc",
+    "\u0645\u062a\u0646\u200c\u0628\u062e\u0648\u0646",
+    "\u0645\u062a\u0646\u200c\u0628\u06a9\u0646",
+})
+#: The Persian forms are matched as verbatim substrings of the lowercased
+#: request, like the repo's Persian command matching: Persian affixes and ZWNJ
+#: compounds (این رو, متنش) are part of the same written word, so whole-token
+#: matching would not see them. English forms are matched as WHOLE
+#: whitespace-separated tokens, in the explicit-token style of the
+#: deterministic command parsers — never regex, never fuzzy.
+_STT_PERSIAN_FORMS = frozenset({
+    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u067e", "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u0646\u06af", "\u0633\u06cc\u200c\u062a\u06cc\u200c\u06cc",
+    "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc", "\u0645\u062a\u0646\u200c\u0628\u062e\u0648\u0646", "\u0645\u062a\u0646\u200c\u0628\u06a9\u0646",
+})
+#: \u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc also names a transcription AS A THING (a long message quoting
+#: one), so it is honored only for request-sized texts.
+_STT_FORMAL_FA = "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc"
+_STT_FORMAL_MAX_CHARS = 120
+#: English single-word forms, matched only as WHOLE tokens.
+_STT_ENGLISH_WORDS = frozenset({"stt", "sst", "transcribe", "transcript"})
+#: English multi-word phrase, matched on the token-joined text so whitespace
+#: runs cannot split it.
+_STT_ENGLISH_PHRASE = "speech to text"
 
 
 def is_direct_stt_request(request_text: str) -> bool:
     """High-confidence, deterministic detection of an explicit transcription ask.
 
-    Matches only requests whose wording IS the transcription instruction (with
-    ordinary politeness/object words around it): ``transcribe``/``transcript``/
-    ``stt``/``speech to text`` in Latin script, or the Persian
-    transcription/transcribing words, a Persian spelling-out of the STT
-    acronym, or \u0645\u062a\u0646\u0628\u062e\u0648\u0646/\u0645\u062a\u0646\u0628\u06a9\u0646. Analytical asks — what does it say,
-    what is it about, summarize it, analyze it — never match, so they keep the
-    second-LLM path. \u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc alone also names a transcription AS A THING
-    (e.g. a long message quoting one), so it is honored only for request-sized
-    texts.
+    The classifier is an explicit finite-form match over the lowercased
+    request, in the same explicit-token spirit as the repository's command
+    parsing — no regex, no fuzzy matching, no similarity scoring:
+
+    - an English form (``stt``, ``sst``, ``transcribe``, ``transcript``) must
+      appear as a WHOLE token — ``stt`` never matches inside another word;
+    - the multi-word English phrase ``speech to text`` is matched on the
+      token-joined text so whitespace runs cannot split it;
+    - a Persian form (``\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u067e``, ``\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc``,
+      ``\u0645\u062a\u0646\u0628\u062e\u0648\u0646``, ...) matches as a verbatim substring, because
+      Persian affix/ZWNJ compounding makes separate tokens of one written
+      word;
+    - ``sst`` is a listed alias of ``stt`` (the common transposition typo),
+      matched by the same whole-word rule — no general typo correction exists.
+
+    Analytical asks — what does it say, what is it about, summarize it,
+    analyze it — never match, so they keep the second-LLM path.
     """
     text = (request_text or "").strip().lower()
     if not text:
         return False
-    for token in _STT_VERBS:
-        if re.search(rf"\b{re.escape(token)}\b", text):
-            return True
-    for token in _STT_FA:
-        if token in text:
-            if token == "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc" and len(text) > 120:
+    for form in _STT_PERSIAN_FORMS:
+        if form in text:
+            if form == _STT_FORMAL_FA and len(text) > _STT_FORMAL_MAX_CHARS:
                 continue
             return True
+    tokens = text.split()
+    for token in tokens:
+        if token in _STT_ENGLISH_WORDS:
+            return True
+    if _STT_ENGLISH_PHRASE in " ".join(tokens):
+        return True
     return False
 
 

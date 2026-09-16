@@ -62,6 +62,9 @@ REQUEST_ID = 58101
 #: A Latin transcript: distinctive, script-unambiguous, and proof the answer is
 #: the engine's own text rather than a model's paraphrase of it.
 TRANSCRIPT = "Dia de ventos e de cap. Xi, zabolié. Olha, sei chat."
+#: The live typo variant: "SST" must follow the exact same direct path as
+#: "STT" — a listed alias, not a fuzzy match.
+DEFAULT_REQUEST = "این رو stt کن"
 
 
 class _FakeMessage:
@@ -203,7 +206,7 @@ def _reply_context(**overrides: Any) -> ReplyContext:
 def _request(**overrides: Any) -> AIRequest:
     values: dict[str, Any] = {
         "session_id": "s",
-        "user_message": "این رو stt کن",
+        "user_message": DEFAULT_REQUEST,
         "owner_id": OWNER,
         "chat_id": CHAT,
         "message_id": REQUEST_ID,
@@ -275,19 +278,66 @@ def _provisioned_engine():
 
 
 @pytest.mark.parametrize("text", [
+    "این رو STT کن",
+    "این رو SST کن",
     "این رو stt کن",
     "این ویس رو stt کن",
     "stt",
+    "sst",
+    "SST",
     "STT کن",
     "transcribe this",
+    "transcript this",
     "transcribe the voice",
     "please transcribe the voice note",
+    "speech to text",
     "این رو ترانشریپ کن",
     "متن ویس رو پیاداداری کن",
     "این ویس رو متن‌بخون",
 ])
 def test_explicit_stt_requests_are_direct(text: str):
     assert media_ai_service.is_direct_stt_request(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    # the STT acronym must never match inside another word — and neither may
+    # the alias, which is a listed form, not a prefix rule
+    "testing",
+    "distinct",
+    "sstt",
+    "sttc",
+    # transcript-as-verb is whole-word: inflected forms are different words
+    "transcribed",
+    "transcripts",
+    # no general typo correction exists — only the listed "sst" alias
+    "trnascribe",
+])
+def test_partial_and_unlisted_words_are_not_direct(text: str):
+    assert media_ai_service.is_direct_stt_request(text) is False
+
+
+def test_the_intent_inventory_is_finite_and_covers_the_alias():
+    # The supported forms are an explicit closed set; "sst" is a listed alias
+    # of "stt" and the Persian forms are part of the same inventory.
+    assert media_ai_service._STT_FORMS == (
+        media_ai_service._STT_PERSIAN_FORMS
+        | media_ai_service._STT_ENGLISH_WORDS
+        | {media_ai_service._STT_ENGLISH_PHRASE}
+    )
+    assert {"stt", "sst"} <= media_ai_service._STT_ENGLISH_WORDS
+
+
+def test_the_classifier_uses_no_regex():
+    # The classifier must be explicit token/phrase matching: no re module in
+    # the classifier's own module and no re use anywhere in its source.
+    import inspect
+    import re as _re
+
+    assert "re" not in {
+        name for name, _ in inspect.getmembers(media_ai_service, inspect.ismodule)
+    }
+    source = inspect.getsource(media_ai_service.is_direct_stt_request)
+    assert not _re.search(r"\bre\.", source)
 
 
 @pytest.mark.parametrize("text", [
@@ -314,12 +364,14 @@ def test_empty_and_none_requests_are_not_direct():
 
 
 @pytest.mark.asyncio
-async def test_direct_stt_returns_the_transcript_without_a_provider_round():
+@pytest.mark.parametrize("request_text", ["این رو stt کن", "این رو SST کن"])
+async def test_direct_stt_returns_the_transcript_without_a_provider_round(request_text: str):
     provider = _ScriptedProvider()
     client = _voice_client()
     dispatcher = _dispatcher(_manager(provider), client)
 
     result = await dispatcher.dispatch(_request(
+        user_message=request_text,
         reply_context=_reply_context(),
     ))
 
