@@ -168,8 +168,8 @@ and never private user media.
 | Command | Result |
 |---|---|
 | `pytest tests/test_media_gemini_engine.py -q` (new, 82 tests) | **82 passed** (0.63 s) |
-| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_image_ocr.py tests/test_media_stt.py tests/test_media_ai_integration.py tests/test_media_gemini_engine.py -q` | **321 passed** (36.9 s) |
-| `pytest tests/test_17_providers.py tests/test_23_provider_mesh.py tests/test_11_runtime_wiring.py tests/test_retry.py` (provider/wiring regression) | **passed** (included in the 321 above) |
+| `pytest tests/test_media_processing.py tests/test_media_document_extraction.py tests/test_media_image_ocr.py tests/test_media_stt.py tests/test_media_ai_integration.py tests/test_media_gemini_engine.py -q` | **321 passed** (36.9 s) — the 239 existing media tests plus the 82 new ones |
+| `pytest tests/test_17_providers.py tests/test_23_provider_mesh.py tests/test_11_runtime_wiring.py tests/test_retry.py -q` (provider mesh, runtime wiring, retry policy regression) | **82 passed** (13.5 s) |
 | `pytest tests -q` (full suite) | **3 197 passed, 24 skipped, 1 failed** (108.7 s) — the single failure is the pre-existing, clock-dependent `tests/test_40_usage_read_side.py::test_daily_usage_read`, unrelated to this change (see below) |
 | `python -m compileall` on `backend` + `tests` | **passed** |
 | `git diff --check` | **clean** |
@@ -270,7 +270,7 @@ path.
 |---|---|
 | Starting HEAD | `9be06a79033831ddd4d2d4dd5e07ea2cbc7622f2` (origin/main) |
 | Implementation commit (code + tests) | `7fec91adc29eb4aa0d65260016f6156fe5a0092e` |
-| This current-state report | delivered in the child commit of `7fec91a` on `main`; both commits are the ones verified against `origin/main` (see the final delivery verification in the assistant's report for this stage) |
+| This current-state report | delivered on `main` in the docs commit(s) that follow the implementation commit `7fec91a`; every one of them is an ancestor of `origin/main` (verified with `git ls-remote` + `git merge-base --is-ancestor`) |
 | Remote verification | `git push origin main` (no force, no rebase) then `git ls-remote origin refs/heads/main` + `git merge-base --is-ancestor 7fec91a origin/main` |
 | Working tree after delivery | clean |
 | Database / Supabase | untouched |
