@@ -1,14 +1,22 @@
 # Media Processing — Architectural Investigation
 
-> **Investigation only — nothing was implemented.** This document reports the
-> source-backed findings of the Media Processing investigation. It **replaces
-> the previous `INVESTIGATION.md` entirely**; no earlier content (including the
-> Telegram-history investigation) is preserved, merged, appended, or referenced
-> as a historical section. No production code, tests,
+> **Investigation only — no code is changed by this document.** This is the
+> canonical current-state investigation for the Media Processing layer **and for
+> the source lineage of the STT text the owner reads in Telegram** (§18). It
+> **replaces the previous `INVESTIGATION.md` entirely**; no earlier content
+> (including the Telegram-history investigation) is preserved, merged, appended,
+> or referenced as a historical section. Producing this document modified
+> **only** `INVESTIGATION.md` — no production code, tests,
 > `IMPLEMENTATION_REPORT.md`, schema, migrations, configuration, dependency,
 > presentation, delivery, context-retrieval, Save/Saved-Items, provider or
-> runtime file was modified. No media processor, service, handler, tool,
-> package, table, scheduler, client or loop was created.
+> runtime file.
+>
+> The media capability this document originally specified as *required prework*
+> has since **landed** in the current tree (§4, §5, §8, §13, §15): the bounded
+> download, the `backend/services/media_service.py` boundary, the Gemini OCR/STT
+> engines and the `backend/services/media_ai_service.py` model step. The newest
+> verification recorded here is the **STT UI-text lineage** (§18): which stage
+> actually produces the transcription text shown to the owner.
 
 ## 1. Investigation Metadata
 
@@ -16,18 +24,21 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Audited HEAD | `893d3f439f5a5a266a302ef5a2b4721f0ab144d1` (short `893d3f4`, `docs: record the all-letter save-code grammar fix`) |
-| Investigation date | 2026-09-15 |
-| Status | **Investigation only. No implementation was performed during this investigation.** |
-| Scope | Whether, and at which existing architectural boundary, a controlled Media Processing layer can be added upstream of the owner's currently selected LLM provider — without changing that provider, and without leaking Telegram/conversational context to the model. |
-| Question | How can Telegram media (photo, voice, audio, document, video, sticker, GIF) be resolved, downloaded, validated and normalized into a controlled representation that the **currently selected** chat provider consumes as ordinary input? |
-| Verdict | **GO WITH REQUIRED PREWORK.** No multimodal input path is wired today (`vision()` is declared-but-dead across every adapter), and both existing media-download paths are unbounded. A provider-independent, text-normalized media capability at the services layer is required first; true native image/audio understanding would require a provider-interface change and is therefore out of M1. |
+| Audited HEAD | `801f8dbe61a3185d1eb8d87aa35ede12ff75166b` (short `801f8db`, `docs: record the Gemini STT language-contract fix`) |
+| Investigation date | 2026-09-16 |
+| Status | **Investigation only. No code was changed while producing this document.** |
+| Scope | (a) At which existing architectural boundary a controlled Media Processing layer sits upstream of the owner's **currently selected** LLM provider — without changing that provider and without leaking Telegram/conversational context to the model; and (b) **the verified source lineage of the STT text the owner reads in Telegram** for a replied Voice note (§18). |
+| Question | How is Telegram media (photo, voice, audio, document, video, sticker, GIF) resolved, downloaded, validated and normalized into a controlled representation that the **currently selected** chat provider consumes as ordinary input — and which stage of that chain produces the text the owner actually sees? |
+| Media-layer verdict | The verdict at `893d3f4` was **GO WITH REQUIRED PREWORK**; that prework has since **landed** (§11, §13, §15). No native multimodal provider path is wired — `vision()` is still declared-but-unreachable across every adapter (§6) — so media is normalized to **text upstream** instead, on a provider-neutral path. |
+| STT-lineage verdict | **RESOLVED FOR THE WRAPPER; ONE RUNTIME GAP REMAINS** (§18.8): the owner-visible text is **neither** the engine transcript **nor** locally formatted — it is a **second model's output**. The exact value the STT engine returned on the Persian live run is still **not provable from source**. |
 | Files changed by this investigation | only `INVESTIGATION.md` |
-| Classification labels | **[CURRENT]** implemented behavior verified in source at `893d3f4` · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision |
+| Classification labels | **[CURRENT]** implemented behavior verified in source at the audited HEAD (`801f8db`) · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision |
 
 Evidence-strength tags used inline where a claim is not directly readable in
 source: **VERIFIED FROM SOURCE**, **INFERENCE FROM SOURCE**, **UNKNOWN /
-REQUIRES IMPLEMENTATION DECISION**.
+REQUIRES IMPLEMENTATION DECISION**. §18 uses the equivalent canonical triple
+**PROVEN FROM SOURCE** / **INFERRED FROM CONTROL FLOW** / **NOT PROVABLE WITHOUT
+LIVE TRACE**.
 
 ---
 
@@ -35,7 +46,7 @@ REQUIRES IMPLEMENTATION DECISION**.
 
 Read-only tracing from the Telegram activation handler outward to Telethon and
 back through the provider mesh, plus the services, prompt, context, tool and
-configuration layers. Areas inspected (all at `893d3f4`, all read-only):
+configuration layers. Areas inspected (all at the audited HEAD, all read-only):
 
 | Area | Files inspected |
 |---|---|
@@ -49,14 +60,24 @@ configuration layers. Areas inspected (all at `893d3f4`, all read-only):
 | Limits / wiring | `backend/helper/rpc_timeout.py`, `backend/runtime/operation_watchdog.py`, `backend/ai/tools/delivery.py` |
 | Runtime / deps | `requirements.txt`, `render.yaml`, `Procfile`, installed venv package list |
 | Design docs | `AI_MASTER_DESIGN.md` §18 (Non Goals), §20 (Future Ideas), §28 (Resource Budget), §29 (Deterministic Runtime Rules) |
+| **STT UI-text lineage (this audit)** | `backend/services/gemini_media_engine.py`, `backend/services/media_service.py`, `backend/services/media_ai_service.py`, `backend/ai/engine/dispatcher.py` (`_media_target`, `_try_media_analysis`, `_build_fast_path_result`), `backend/ai/tools/delivery.py` (full), `backend/ai/context/provenance.py`, `backend/ai/media.py`, `backend/ai/session/request.py`, `backend/bot/handlers/ai_unified.py` (`_extract_reply_context`, `_execute_ai`, the delivery call), the media test files, and the provider layer (grep for any script rewriting) |
 
 Method notes: no live Telegram, Supabase, Render or network access was used; no
-package was installed; no test was executed (no code changed, so there was
-nothing to test). Where a conclusion depends on a symbol's presence rather than
-on executed behavior, that is stated as **[FINDING]** with the exact symbol and
-file cited. Repository-wide greps were targeted (`vision`, `download_media`,
-`supports_images`, `classify_message`, `ffmpeg`, OCR/STT/multimodal keywords),
-not exhaustive.
+package was installed by this work; no test was executed while producing this
+document. Where a conclusion depends on a symbol's presence rather than on
+executed behavior, that is stated as **[FINDING]** with the exact symbol and file
+cited. Repository-wide greps were targeted (`vision`, `download_media`,
+`supports_images`, `classify_message`, `ffmpeg`, OCR/STT/multimodal keywords) —
+**except the two that decide §18, which were exhaustive over the tracked tree**:
+the owner-visible wrapper phrase (`محتوای صوتی` / `ارسالی` → zero hits in any
+code file; the only hit in the whole tracked tree is this document's own §2
+method note) and the guillemet pair `«`/`»` (hits only in unrelated modules and
+their tests: `ai/confirmation.py`, `ai/preparation_policy.py`,
+`services/ghost_seen_v2.py`, `tests/test_63_ghost_seen_v2_stage8.py`,
+`tests/test_preparation_policy_source.py`, `tests/test_confirmation_roundtrip.py`;
+none of them executes on the media path). No runtime value could be observed: this environment has
+no Telegram session, no provider credential and no live traffic, which is why
+§18 ends with an explicit runtime gap rather than a conclusion.
 
 ---
 
@@ -148,71 +169,83 @@ exists anywhere in the pipeline.
 |---|---|---|
 | Media **classifier** — pure attribute inspection, no I/O | `backend/ai/media.py::classify_message` → `MediaInfo` (`media.py:70`) | reusable as-is |
 | Classifier consumers | `ai_unified.py:459` (`_extract_reply_context`), `telegram_context.py` `_media_type` | reusable as-is |
-| Media **download** over the typed facade | `backend/telegram_api/media.py::download_media` (`media.py:18`) → raw `client.download_media` | incomplete/unsafe — **no timeout, no size check, no type validation** |
-| Deep Save download → validate → re-upload | `backend/services/save_service.py::execute_save` (`save_service.py:392`–`465`) | reusable **pattern**, not the code |
+| Media **download** over the typed facade | `backend/telegram_api/media.py::download_media` → `guarded_await(client.download_media(...))` | **bounded** — `MEDIA_DOWNLOAD_TIMEOUT_S = 120.0`, caller may only tighten (`_effective_timeout`), `TelegramTimeoutError` on expiry; size is the caller's responsibility |
+| **Media boundary** — deterministic resolve → bounded transfer → validate → extract → normalize → cleanup | `backend/services/media_service.py` (`resolve_media_message`, `analyze_media`) | **the single media-processing boundary** |
+| Content extraction (OCR / STT / text, PDF, DOCX) | `media_service._extract_image_content`, `_extract_audio_content`, `_extract_content`; engines `backend/services/gemini_media_engine.py::GeminiMediaEngine.recognize` / `.transcribe` | present — image→OCR and audio→STT **only when an engine is provisioned**; text / PDF (`pypdf`) / DOCX (stdlib XML) otherwise |
+| Media analysis record — provider-independent, Telethon-free | `media_service.MediaAnalysis` + `MediaAnalysis.as_context_text()` | present — the model-facing surface |
+| Media → LLM delivery | `backend/services/media_ai_service.py::build_media_messages` / `answer_media_request` → `ProviderManager.chat(messages, tools=[])` | present — provider-neutral, plain-string path |
+| Engine provisioning, optional and fail-closed | `gemini_media_engine.provision_gemini_media_engines()` ← `backend/runtime/supervisor.py:278` | present — an unconfigured runtime leaves both seams empty and media keeps failing closed |
+| Deep Save download → validate → re-upload | `backend/services/save_service.py::execute_save` | unchanged and protected (§14); its own `client.download_media` call is **still unbounded** (§5) |
 | MIME→media-type map, extension map, byte formatter | `save_service.detect_media_type`, `_MIME_EXT`, `_format_bytes` | reusable as-is |
 | Filename extraction / generated names | `save_service.extract_file_name`, `generate_filename` | reusable as-is |
-| Serialized message media facts | `telegram_api/_helpers.py::serialize_message` | **`has_media: bool` only** — no mime/size/type reach facade dicts |
+| Serialized message media facts | `telegram_api/_helpers.py::serialize_message` (`has_media` at `:89`) | **`has_media: bool` only** — no mime/size/type reach facade dicts; the media boundary reads Telethon objects via `classify_message` instead |
 | Upload attribute preservation | `save_service._upload_kwargs_for_media` | unrelated to analysis |
-| Content extraction (OCR, STT, PDF, frames) | — | **absent** |
-| Media analysis | — | **absent** |
-| Media → LLM delivery | — | **absent** |
 
 Per media type, distinguishing detection / metadata / download / extraction /
 analysis / current LLM delivery:
 
 | Type | Detection | Metadata classification | Download | Content extraction | Analysis | Reaches the selected LLM |
 |---|---|---|---|---|---|---|
-| **Photo** | `MessageMediaPhoto` (`media.py`) → `"Photo"`, forced `image/jpeg`, size from `photo.sizes[-1].size` | `MediaInfo.media_type/mime_type/file_size` | only via Deep Save (`save_service.py:439`) | none | none | **no** — only the label `"Photo"` reaches `ReplyContext.media_type` (`ai_unified.py:459`) |
-| **Voice** | `DocumentAttributeAudio.voice=True` → `"Voice"` | mime, size, filename | only via Deep Save | none (no STT) | none | **no** — label only |
-| **Audio** | `DocumentAttributeAudio.voice=False` → `"Audio"` | mime, size, filename | only via Deep Save | none | none | **no** — label only |
-| **Document** | `MessageMediaDocument` fallback → `"Document"` | mime, size, filename (`DocumentAttributeFilename`) | only via Deep Save | none (no PDF/DOCX/zip reader) | none | **no** — label only |
-| **Video** | `DocumentAttributeVideo` → `"Video"` | mime, size, filename | only via Deep Save | none (no ffmpeg, no frame sampler) | none | **no** — label only |
-| **Sticker** | `DocumentAttributeSticker` → `"Sticker"` (WEBP/TGS) | mime, size | only via Deep Save | none (no WEBP/TGS decoder) | none | **no** — label only |
-| **Animation/GIF** | `DocumentAttributeAnimated` → `"Animation"`; `mime=="image/gif"` → `"GIF"` | mime, size, filename | only via Deep Save | none | none | **no** — label only |
-| **WebPage** | `MessageMediaWebPage` → `"WebPage"`, `text/html` (`media.py`) | type + mime | never | never | none | label only |
-| Contact / Poll / Location | `MessageMediaContact` / `Poll` / `Geo` | type only | never | never | none | label only |
+| **Photo** | `MessageMediaPhoto` (`media.py`) → `"Photo"`, forced `image/jpeg`, size from `photo.sizes[-1].size` | `MediaInfo.media_type/mime_type/file_size` | media boundary, bounded | OCR text when the OCR engine is provisioned; otherwise honest `UNSUPPORTED` | `MediaAnalysis` | **yes — as text** via `as_context_text()`; never as image bytes |
+| **Voice** | `DocumentAttributeAudio.voice=True` → `"Voice"` | mime, size, filename | media boundary, bounded | STT transcript when the STT engine is provisioned; otherwise `UNSUPPORTED` | `MediaAnalysis` | **yes — as text** (§18) |
+| **Audio** | `DocumentAttributeAudio.voice=False` → `"Audio"` | mime, size, filename | media boundary, bounded | same STT seam as Voice | `MediaAnalysis` | **yes — as text** |
+| **Document** | `MessageMediaDocument` fallback → `"Document"` | mime, size, filename (`DocumentAttributeFilename`) | media boundary, bounded | text for `text/*` and text-shaped MIME; PDF via `pypdf`; DOCX via stdlib XML; other containers `UNSUPPORTED` | `MediaAnalysis` | **yes — as text** when extractable |
+| **Video** | `DocumentAttributeVideo` → `"Video"` | mime, size, filename | media boundary, bounded | none — no ffmpeg, no frame sampler, no STT on the container | honest `UNSUPPORTED` | **no** — deterministic unsupported answer |
+| **Sticker** | `DocumentAttributeSticker` → `"Sticker"` (WEBP/TGS) | mime, size | media boundary, bounded | none — no WEBP/TGS decoder | honest `UNSUPPORTED` | **no** — deterministic unsupported answer |
+| **Animation/GIF** | `DocumentAttributeAnimated` → `"Animation"`; `mime=="image/gif"` → `"GIF"` | mime, size, filename | media boundary, bounded | none | honest `UNSUPPORTED` | **no** — deterministic unsupported answer |
+| **WebPage** | `MessageMediaWebPage` → `"WebPage"`, `text/html` (`media.py`) | type + mime | **never** — not in `DOWNLOADABLE_MEDIA_TYPES` | never | none | label only; the media route does not resolve it |
+| Contact / Poll / Location | `MessageMediaContact` / `Poll` / `Geo` | type only | **never** — not in `DOWNLOADABLE_MEDIA_TYPES` | never | none | label only; the media route does not resolve it |
 
-**[FINDING]** Media is therefore *detected and labelled* everywhere, and
-*downloaded* only by Deep Save — where the bytes exist solely to be re-uploaded.
-No media byte ever reaches a provider, and no media capability exists in
-`backend/ai/`.
+**[FINDING]** Media is *detected and labelled* everywhere (`classify_message`),
+and a deterministically resolved target is now *transferred and normalized* by
+the `media_service` boundary — whose transferable taxonomy is exactly
+`DOWNLOADABLE_MEDIA_TYPES = {Photo, Voice, Audio, Document, Video, Sticker,
+Animation, GIF}` (`media_service.py:131`), with `WebPage`/`Contact`/`Poll`/
+`Location`/`Unknown` never fetched. **No media byte ever reaches a provider**:
+the only media-derived value that enters a model message is text produced by
+`MediaAnalysis.as_context_text()` (§18.6, stage C→D). A type with no engine or
+extractor is not transferred at all and yields an honest `UNSUPPORTED` result.
 
 ---
 
 ## 5. Telegram Media Download Boundary
 
-**[CURRENT]** Exactly two code paths can download media, and **both are
-unbounded**:
+**[CURRENT]** Two code paths can download media. **The media boundary's path is
+bounded; Deep Save's own path is not** (and Deep Save is protected scope, §14):
 
-1. **`backend/services/save_service.py:439`** — `await client.download_media(reply_msg, file=tmp_path)`
-   (raw Telethon call; no `rpc_await`, no `guarded_await`, no timeout).
-2. **`backend/telegram_api/media.py:32`** — the same call inside the typed facade
-   wrapper; catches exceptions into `TelegramAPIError` but imposes **no timeout**.
-   (Contrast: `telegram_api/messages.py` wraps every short call in
-   `guarded_await(..., timeout=_SHORT_CALL_TIMEOUT = 30.0)`; the media module does
-   not.)
+1. **`backend/telegram_api/media.py::download_media`** — the client call is now
+   wrapped in `guarded_await(..., timeout=_effective_timeout(timeout))`, whose
+   module ceiling is `MEDIA_DOWNLOAD_TIMEOUT_S = 120.0`. A caller can only ask for
+   **less** (`min(value, ceiling)`, fail-closed on a non-positive or unparsable
+   value), and expiry logs `TELEGRAM_MEDIA_TIMEOUT` and raises
+   `TelegramTimeoutError`. This is the one primitive the media boundary uses, and
+   `media_service.MEDIA_DOWNLOAD_TIMEOUT_S` (`media_service.py:120`) **is that
+   same constant** — not a second, contradictable bound.
+2. **`backend/services/save_service.py:439`** — Deep Save still calls
+   `await client.download_media(reply_msg, file=tmp_path)` **directly**: no
+   `rpc_await`, no `guarded_await`, no timeout. The media phase did not change it.
 
 Analysis of the existing boundary:
 
 | Property | Current state | Evidence |
 |---|---|---|
-| Download function | `client.download_media(msg, file=path)` (save path) / `TelegramAPI.download_media(message, file_path, progress_callback)` (facade) | `save_service.py:439`; `telegram_api/media.py:18`; `telegram_api/api.py:102` |
-| Timeout | **none on either path** | `telegram_api/media.py` has no bounded await; `save_service.py:439` calls the client directly |
-| File-size limit | checked **before** download against Telegram's declared size: `settings_service.max_deep_save_mb()` — default **50 MB**, validated range 1..500 | `save_service.py:396`–`399`; `settings_service.py:69`, `:113`, `:281` |
-| Post-download validation | `os.path.exists(tmp_path)` and `getsize > 0` only | `save_service.py:445`–`451` |
-| MIME / type validation | **none** — the MIME type is whatever Telegram declares; the filename is Telegram-supplied and used only as the temp filename (`os.path.basename`) | `save_service.py` `_extract_source_media`, `generate_filename` |
-| Temporary storage | `tempfile.mkdtemp(prefix="lifeos_dl_")` — OS temp dir, not configurable, per-operation | `save_service.py:435` |
-| Cleanup | `shutil.rmtree(tmp_dir, ignore_errors=True)` in `finally` (every exit path) | `save_service.py:465` |
-| Event-loop behavior | non-blocking: `download_media` is awaited on the async Telethon client and streams to a path. Handing it a `BytesIO` would materialize the whole file in RAM — so a bounded path must stay file-based | `save_service.py:439`; `telegram_api/media.py:24` |
-| Error handling | save path catches broad `Exception` and returns an honest `"❌ Deep Save failed: …"` string (services never raise); facade raises `TelegramAPIError` / `TelegramTimeoutError` | `save_service.py:441`, `:455`; `telegram_api/exceptions.py` |
+| Download function | media boundary: `TelegramAPI.download_media` → `guarded_await(client.download_media(...))`. Deep Save: raw `client.download_media(msg, file=path)` | `telegram_api/media.py`; `save_service.py:439`; `telegram_api/api.py` |
+| Timeout | media boundary **120 s ceiling** (`MEDIA_DOWNLOAD_TIMEOUT_S`), caller-tightenable, `TelegramTimeoutError` on expiry. Deep Save: **none** | `telegram_api/media.py` (`_effective_timeout`); `media_service.py:120`, `:454`; `save_service.py:439` |
+| File-size limit | media boundary: declared size checked against `media_service.max_download_bytes()` = **the existing** `settings_service.max_deep_save_mb()` (default **50 MB**, validated range 1..500) **before** transfer, and the actual transferred size re-checked against it afterwards. Deep Save: declared-size pre-check only | `media_service.max_download_bytes`; `settings_service.py:69`, `:113`, `:281`; `save_service.py:396`–`399` |
+| Post-download validation | media boundary: the returned path must exist, be non-empty and be within the size bound; Deep Save: `os.path.exists(tmp_path)` and `getsize > 0` only | `save_service.py:445`–`451` |
+| MIME / type validation | media boundary: an extractability gate before transfer (`is_extractable_mime` / image / STT MIME sets) and container-signature corroboration before an engine runs (`_validate_audio_payload`). Deep Save: **none** — the MIME is whatever Telegram declares, and the filename is used only as the temp filename | `media_service.py` (`is_extractable_mime`, `is_image_mime`, `is_stt_mime`, `_validate_audio_payload`); `save_service.py` `_extract_source_media` |
+| Temporary storage | media boundary: `tempfile.mkdtemp(prefix="lifeos_media_")` (`media_service.py:1522`); Deep Save: `tempfile.mkdtemp(prefix="lifeos_dl_")` — OS temp dir, not configurable, per-operation | `media_service.py:1522`; `save_service.py:435` |
+| Cleanup | **both** remove the directory on every exit path: `shutil.rmtree(tmp_dir, ignore_errors=True)` in `finally` (media boundary `media_service.py:1586`) | `media_service.py:1586`; `save_service.py:465` |
+| Event-loop behavior | non-blocking: `download_media` is awaited on the async Telethon client and streams to a path; CPU-bound extraction runs through `asyncio.to_thread` under a finite timeout | `media_service.py` `_run_ocr` / `_run_stt`; `save_service.py:439` |
+| Error handling | media boundary raises `MediaError` carrying its failing **stage** (`MEDIA_STAGE_*`), surfaced by the dispatcher as a media failure identity; facade raises `TelegramAPIError` / `TelegramTimeoutError`; Deep Save catches broad `Exception` and returns an honest `"❌ Deep Save failed: …"` string | `media_service.py`; `dispatcher.py::_try_media_analysis`; `save_service.py:441`, `:455` |
 | FloodWait | **no** FloodWait handling in either media path (the facade docstring in `telegram_api/__init__.py` claims FloodWait handling, but no media code implements it) | `telegram_api/media.py` |
 
-**[FINDING]** The only reusable safety primitives are the *pattern* (size
-pre-check → download to a `mkdtemp` dir → validate → `finally: rmtree`) and the
-existing bounded-await helpers `backend/helper/rpc_timeout.py::rpc_await` and
-`backend/runtime/operation_watchdog.py::guarded_await`. What is **missing** is a
-download that is itself bounded by one of them.
+**[FINDING]** The bounded-download gap this document originally recorded is
+**closed for the media boundary**: the facade download is itself bounded by
+`backend/runtime/operation_watchdog.py::guarded_await` (`media_service` and
+`telegram_api/messages.py` share that primitive; `helper/rpc_timeout.py::rpc_await`
+remains available). What is **still missing** is a bound on Deep Save's own
+direct call — deliberately left unchanged, because Deep Save is protected scope.
 
 ---
 
@@ -256,6 +289,15 @@ exactly this: `backend/services/history_ai_service.py:453`
 `ToolContext.extra["provider_manager"]`, which `Dispatcher._build_tool_context`
 (`dispatcher.py:1233`) sets from the live engine.
 
+**[CURRENT] The media layer ships exactly that route** (§18.6, stage D→E):
+`backend/services/media_ai_service.py::_provider_call` calls
+`await manager.chat(messages, tools=[])` with a message list it builds itself, so
+the owner's selected chat provider — with its candidate ordering, retry
+classification and cooldown — is untouched. `ProviderManager.vision` is **still
+never called** (`grep -rn "\.vision("` over `backend/` finds no production caller)
+and no adapter gained a `vision` implementation: media still reaches a model **as
+text only**.
+
 ---
 
 ## 7. Context / Privacy Boundary
@@ -276,15 +318,21 @@ prompt. Each is a candidate leak vector for a media request.
 | 7 | Tool schemas + last tool result | `ConversationContext.tool` | dispatcher | `[Tool Context]` / `[Tool Results]` |
 | 8 | Request-scoped runtime keys: `chat_id`, `request_message_id`, `request_text`, `request_id`, `request_timeout_s`, `provider_manager`, `reply_msg{message_id, sender_id, sender_name, chat_id, chat_title, media_type, text_preview, timestamp}` | `ToolContext.extra` | `Dispatcher._build_tool_context` (`dispatcher.py:1233`) | **tool-visible only** (not a model message) |
 
-**[FINDING] The precise leak vector for media.** Items 2 and 4 are attached
-**unconditionally** inside `_execute_ai` for every reply-shaped request
-(`ai_unified.py:581`–`640`). Because the current flow can only reach media
-through a reply target — `_extract_reply_context` errors with `"No replied
-message found. Reply to a message first."` when there is none
-(`ai_unified.py:425` region) — a media request is *by construction* a reply, so
-the replied message's 200-char preview **and** up to 10 unrelated surrounding
-Telegram messages would travel in the same prompt as the media. Nothing in the
-current code gates them.
+**[FINDING] The precise leak vector, and how the media route avoids it.** Items 2
+and 4 are attached **unconditionally** inside `_execute_ai` for every
+reply-shaped request (`ai_unified.py:581` onward) — and a media request *is*
+reply-shaped, because media is reachable through a replied-to message or the
+triggering message itself. Those two fields would therefore travel in the same
+prompt as the media.
+
+**[CURRENT] The media route never uses that prompt path.**
+`Dispatcher._try_media_analysis` runs immediately after the deterministic fast
+path and **returns before** `_build_context` / `_build_messages`, so items 1–7
+cannot enter a media request, and `media_ai_service.build_media_messages` builds
+the whole message list itself (a static system instruction + one user message).
+The §7.2 boundary is therefore satisfied **for media, by construction**. The
+unconditional attachment described above still governs every ordinary
+(non-media) request, unchanged.
 
 **[CURRENT] Existing provenance discipline (must be preserved, not duplicated).**
 `backend/ai/context/provenance.py::AI_PROVENANCE_MARKER` (`U+2061\u2062\u2063\u2064`)
@@ -358,16 +406,19 @@ runtime scope (not by the model). Evidence:
   existing fast-path/tool split, keeps the single execution authority, and
   satisfies the provider-independence and zero-context rules simultaneously.
 
-**[RECOMMENDED]** The intended layering (nothing implemented):
+**[CURRENT]** The layering as it now exists. The originally recommended "thin
+registered AI tool" became a **dispatcher media route plus a services-layer
+capability**: nothing was added to the tool registry, and `ToolExecutor` is not
+in this path.
 
 ```
-Telegram media (reply target)
-  → deterministic runtime resolution (request scope, no model)
-  → NEW services-layer media capability   (bounded download → validate → resolve → normalize)
-  → controlled normalized representation (text/structured data)
-  → thin registered AI tool
-  → existing ProviderManager.chat(...)  ← the owner's SELECTED provider, unchanged
-  → ToolResult → existing delivery
+Telegram media (deterministically resolved target)
+  → Dispatcher._media_target                replied-to message, else the triggering message — no model, no text matching
+  → backend/services/media_service.py       bounded download → validate → extract → normalize → cleanup
+  → MediaAnalysis                           provider-independent, Telethon-free
+  → backend/services/media_ai_service.py    builds its own system + user message list
+  → ProviderManager.chat(messages, tools=[])  ← the owner's SELECTED provider, unchanged
+  → EngineResult.response → delivery.process_output → Telegram
 ```
 
 The AI must never receive unrestricted Telegram RPC, filesystem, shell, HTTP or
@@ -392,7 +443,13 @@ SQL access; every media processor stays under explicit application control.
 | Facade short calls | 30 s | `telegram_api/messages.py` `_SHORT_CALL_TIMEOUT` |
 | History page fetch | 5 s | `services/history_service.py` `HISTORY_RPC_TIMEOUT_S` |
 | Bounded Telegram snapshot | 3 s | `conversation/telegram_context.py` `FETCH_TIMEOUT_S` |
-| **Media download** | **none** | both paths (§5) |
+| **Media download** | **120 s ceiling** for the media boundary; **none** for Deep Save's own path | `telegram_api/media.py` `MEDIA_DOWNLOAD_TIMEOUT_S`; `media_service.py:120`; `save_service.py:439` (§5) |
+| Media target resolution | 30 s | `media_service.MEDIA_RESOLVE_TIMEOUT_S` |
+| OCR engine call | 45 s boundary / 30 s engine | `media_service.OCR_TIMEOUT_S`; `gemini_media_engine.OCR_TIMEOUT_S` |
+| STT engine call | 60 s boundary / 40 s engine | `media_service.STT_TIMEOUT_S`; `gemini_media_engine.STT_TIMEOUT_S` |
+| STT input payload | 20 MiB | `media_service.MAX_STT_INPUT_BYTES` |
+| Extracted-text ceiling (OCR / STT / document share it) | `MAX_EXTRACTED_CHARS = DEFAULT_MAX_CONTEXT_TOKENS × 4` = **16 000 chars** | `media_service.py:163`–`165`, `:194`, `:232`; `ai/prompt/budget.py:29` |
+| Media answer provider call | `min(120 s, caller envelope)`; never started with less than 20 s left | `media_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S`, `media_call_timeout`, `MIN_PROVIDER_CALL_TIMEOUT_S` |
 | Media size | 50 MB default, 1..500 configurable | `services/settings_service.py:69`, `:113` |
 | Bounded large scan precedent | 1000 messages | `services/delete_service.py` `_MAX_DELETE_SCAN_MESSAGES`; `services/history_service.py` `MAX_HISTORY_MESSAGES` |
 | History AI operation budget (pacing/deadline math precedent) | `DEFAULT_ENVELOPE_S = 240`, `MAP_CONCURRENCY = 2`, `MAX_CALL_SPACING_S = 5.0`, `ASSUMED_CALL_LATENCY_S = 30`, `call_timeout = min(safety ceiling, time left)` | `services/history_ai_service.py` |
@@ -416,12 +473,22 @@ bytes are obtainable but nothing can decode WEBP/TGS.
 
 - `requirements.txt`: `telethon==1.34.0`, `fastapi==0.111.0`,
   `uvicorn[standard]==0.29.0`, `supabase==2.4.2`, `aiofiles==23.2.1`,
-  `httpx==0.27.0`, `tzdata==2026.3`. Nothing else.
-- Installed venv confirms no image/audio/video/OCR/document library is present
-  (no Pillow, numpy, opencv, pytesseract, whisper, pypdf, python-magic).
-- A target grep (`ffmpeg|pytesseract|import PIL|whisper|opencv|pypdf`) over
-  `backend/` returns **no** matches (only unrelated words such as "magic
-  numbers" in a docstring and "whisper" inside an unrelated Ghost-Room string).
+  `httpx==0.27.0`, `tzdata==2026.3`, `pypdf==6.18.1`. Nothing else.
+- `pypdf` is the only media-adjacent library and it belongs to document text
+  extraction (PDF); DOCX and text-shaped MIME need the standard library only. No
+  image/audio/video/OCR library is declared or installed (no Pillow, numpy,
+  opencv, pytesseract, whisper, python-magic).
+- **Nothing links an OCR or STT library.** Both seams are served by the
+  *remote* `GeminiMediaEngine` over the `httpx` stack the provider adapters
+  already use, provisioned optionally from the repository's existing Gemini
+  credential variables (`backend/services/gemini_media_engine.py`,
+  `provision_gemini_media_engines` ← `backend/runtime/supervisor.py:278`).
+- The engine's accepted containers are deliberately narrow: image `png`/`jpeg`/
+  `webp` and audio `ogg`/`opus`/`wav`/`flac` only — no MP3, M4A, webm, AAC, BMP
+  or GIF (`_GEMINI_IMAGE_MIME_TYPES`, `_GEMINI_AUDIO_MIME_TYPES`,
+  `gemini_mime_type`).
+- A target grep (`ffmpeg|pytesseract|import PIL|whisper|opencv`) over `backend/`
+  still returns no functional match (only unrelated prose).
 - Python **3.11.7** (`render.yaml` `PYTHON_VERSION`), deployed via
   `render.yaml` (`type: web`, `startCommand: python -m backend.main`,
   `healthCheckPath: /health`) and `Procfile` (`web: python -m backend.main`).
@@ -451,74 +518,96 @@ document.
 
 ## 11. Verified Blockers
 
-Only blockers proven by source are listed.
+Only blockers proven by source are listed, each with its status at the audited
+HEAD.
 
-1. **No working multimodal route exists.** `BaseProvider.vision` returns
-   `NOT_IMPLEMENTED` (`contract.py:104`); `OpenAICompatProvider.vision` returns
-   `NOT_IMPLEMENTED` despite `supports_images=True` (`openai_compat.py:253`,
+**Still open**
+
+1. **No working multimodal route exists — and none is used.** `BaseProvider.vision`
+   returns `NOT_IMPLEMENTED` (`contract.py:104`); `OpenAICompatProvider.vision`
+   returns `NOT_IMPLEMENTED` despite `supports_images=True` (`openai_compat.py:253`,
    `:40`); `GeminiProvider` declares `supports_images=True` (`gemini.py:36`) and
    defines **no** `vision`; `grep -rn "\.vision("` finds **no** production call
-   site. Therefore media bytes **cannot** reach any model today. *(True image/
-   audio understanding requires implementing `vision()` per adapter — a
-   provider-abstraction change the handoff explicitly limits.)*
+   site. Media bytes therefore **cannot** reach any model, and the media layer
+   deliberately keeps it that way: media reaches a model **as text** only
+   (§18.6, stage C→D). *(True image/audio understanding would require implementing
+   `vision()` per adapter — a provider-abstraction change explicitly out of scope.)*
 2. **`ProviderManager.vision` is broken and off-policy anyway.** It is
    synchronous (`manager.py:308`) while the adapters' `vision` is `async def`
    (`openai_compat.py:253`), so it receives a coroutine and falls into
    `_fallback_vision` (`manager.py:1108`); and it selects via
    `_get_healthy_provider()` (`manager.py:563`), **ignoring the owner's active
    provider**, which would violate the "do not switch the user's provider"
-   requirement. It must not be used.
-3. **Every media download is unbounded.** `save_service.py:439` and
-   `telegram_api/media.py:32` impose no timeout; a stalled transfer can hold the
-   operation indefinitely.
-4. **Media-only messages cannot activate the AI.** `ai_unified_handler` returns
-   when `raw_text` is empty (`ai_unified.py:924`–`925`), so a caption-less photo
-   starts no request; and the reply path requires an existing reply
-   (`_extract_reply_context`, `ai_unified.py:425` region). *Requires a product
-   decision, not a code discovery.*
-5. **No extraction dependencies.** No OCR, STT, document, image or video
-   library is declared or installed; no ffmpeg/tesseract binary can arrive via
-   `requirements.txt`.
-6. **The facade's message dicts carry `has_media` only** — no mime, size, or
-   type. Media metadata for analysis must come from Telethon objects
-   (`classify_message`) or a new facade primitive, never from
-   `serialize_message` (`telegram_api/_helpers.py`).
-7. **Telegram/conversational context is injected by default.** `reply_context`
-   and the 10-message window are attached unconditionally for any reply-shaped
-   request (`ai_unified.py:581` onward), which is exactly the shape a media
-   request takes (§7.1).
+   requirement. Unchanged, and still never called.
+3. **Media-only messages cannot activate the AI.** `ai_unified_handler` returns
+   when `raw_text` is empty, so a caption-less photo or voice note starts no
+   request; and a reply-shaped request still needs the trigger word or a message
+   already registered as an AI answer. Unchanged by the media phase — still a
+   product decision, not a code discovery. The handler probes the triggering
+   message's media type only on the **trigger mode** branch, so this guard is
+   load-bearing for the media route.
+4. **No local extraction stack.** No OCR, STT, document, image or video library
+   is declared or installed, and no ffmpeg/tesseract binary can arrive through
+   `requirements.txt` (§10). OCR and STT are therefore served **remotely and
+   optionally**; a runtime without a Gemini credential keeps failing closed with
+   an honest `UNSUPPORTED`/stage-tagged failure.
+
+**Closed by the landed media phase**
+
+5. **Media downloads are bounded on the media path.** `telegram_api/media.py`
+   now wraps the transfer in `guarded_await` with a 120 s ceiling and raises
+   `TelegramTimeoutError` on expiry (§5). *(Deep Save's own direct
+   `client.download_media` call remains unbounded and is out of scope, §14.)*
+6. **The media boundary does not depend on facade message dicts.**
+   `serialize_message` still carries `has_media` only (`_helpers.py:89`), but the
+   media boundary reads Telethon objects through `ai/media.py::classify_message`
+   and passes nothing but `MediaAnalysis` onward.
+7. **Telegram/conversational context no longer reaches a media request.**
+   `reply_context` and the 10-message window are still attached unconditionally
+   for ordinary reply-shaped requests, but the media route returns before
+   prompt/context construction, so neither can enter a media request (§7.1).
 
 ---
 
 ## 12. Implementation Readiness
 
-### Verdict: **GO WITH REQUIRED PREWORK**
+### Verdict: **GO — the required prework has landed**
 
-Why:
+The verdict at `893d3f4` was **GO WITH REQUIRED PREWORK** for exactly three
+items. All three are present in source at the audited HEAD:
+
+| Required prework | Status | Evidence |
+|---|---|---|
+| (1) A **bounded** download primitive | **landed** | `telegram_api/media.py` `MEDIA_DOWNLOAD_TIMEOUT_S = 120.0` through `guarded_await`, caller-tightenable, `TelegramTimeoutError` on expiry (§5) |
+| (2) A decision on the media activation path | **landed, conservatively** | caption-less media still does **not** activate; the triggering message's media type or a replied-to media message does (§11.3) |
+| (3) A normalized representation + zero-context enforcement | **landed** | `media_service.MediaAnalysis` + `media_ai_service.build_media_messages`; the media route returns before context/prompt construction (§7.1, §8) |
 
 - **GO** — the seams are real and singular: one activation handler, one request
-  object, one dispatcher, one provider mesh, one tool-execution authority, one
-  existing precedent (`history_service` + `history_ai_service` + thin tool +
-  `extra["provider_manager"].chat`) for a bounded services-layer capability that
-  performs its own LLM call through the selected provider. Media detection
-  already exists (`ai/media.py::classify_message`) and media-relevant Telethon
-  facts already reach the request scope (`ToolContext.extra["reply_msg"]`).
-- **REQUIRED PREWORK** — three things must land *before* any media capability is
-  useful: (1) a **bounded** download primitive (blocker 3); (2) a decision on
-  the media-only activation path (blocker 4); (3) the normalized-representation
-  contract and the explicit gating of `reply_context` / `telegram_context` for
-  media calls (blocker 7), because the text-normalized route is the only one
-  that satisfies provider-independence today.
+  object, one dispatcher, one provider mesh, one media boundary, one download
+  primitive. Provider independence is met by normalizing media to **text
+  upstream** and sending it through `ProviderManager.chat(...)`, so the owner's
+  selected chat provider is never switched (§6).
+- **STILL NOT COVERED** — native image/audio/video input (blockers 1–2, out of
+  scope by design); OCR/STT **quality**, which depends on a remotely provisioned
+  model and is measured only by the owner's next live request (§18.9); document
+  formats beyond text/PDF/DOCX; and video, sticker and animation/GIF content
+  extraction (blocker 4).
 - **NOT BLOCKED** — nothing requires a second client, scheduler, executor,
   provider abstraction, table or background loop.
-
-**Explicitly out of reach for M1:** native image/audio/video understanding
-(blocker 1), speech-to-text, OCR, document parsing, frame extraction (blockers
-1, 5).
 
 ---
 
 ## 13. Exact Minimal Implementation Surface
+
+**[SUPERSEDED — historical plan.]** This section is the original surface estimate
+and is retained as the record of what the prework *was* expected to touch; it is
+**no longer a statement of what remains to be done**. The delivered shape differs
+in one decisive way: the media route landed **inside the dispatcher**
+(`dispatcher._try_media_analysis` → `services/media_ai_service` →
+`services/media_service`), **not** as a registered AI tool —
+`backend/ai/tools/media.py` does not exist at the audited HEAD and is not
+reachable from `backend/ai/tools/registry.py`. The `backend/services/media_service.py`
+and `backend/telegram_api/media.py` rows below are **landed** (§4, §5, §8, §12).
 
 **[RECOMMENDED]** — expected to require changes in the implementation phase.
 Files listed here are those the analysis *proves* must change or be created;
@@ -529,7 +618,7 @@ everything inspected but not required is excluded and named in §14.
 | File | Why it must change | Confidence |
 |---|---|---|
 | `backend/services/media_service.py` | **new** — the bounded capability: download via the facade under a timeout, size/type validation, media resolution, normalized representation, and the LLM call through the request-scoped provider manager | required |
-| `backend/telegram_api/media.py` | **required for safety** — the download must be bounded (`rpc_await` / `guarded_await`) and size-guarded; today it is unbounded (blocker 3) | required |
+| `backend/telegram_api/media.py` | **required for safety** — the download must be bounded (`rpc_await` / `guarded_await`) and size-guarded; it was unbounded at `893d3f4` and is now bounded (§5, §11.5) | required |
 | `backend/ai/tools/media.py` | **new** — thin tool over the service; no Telegram retrieval or provider logic inside it | required |
 | `backend/ai/tools/registry.py` | register the new tool in `create_default_registry` | required |
 | `backend/ai/media.py` | only if the normalized record needs more than `classify_message` yields (today: type, mime, size, filename, caption, text) | conditional |
@@ -571,6 +660,14 @@ Protect explicitly (these are outside the media boundary and were only inspected
 ---
 
 ## 15. Recommended M1 Scope
+
+**[SUPERSEDED — historical plan.]** This section describes the phase as it was
+scoped *before* it landed; where it conflicts with §4/§5/§8/§12, those sections
+are current. Two of its statements are contradicted by the audited HEAD:
+(i) the LLM step **and** the route are not a registered tool — the media route
+runs in the dispatcher (§13), and (ii) OCR **and** STT are **not deferred**: both
+landed as optional remote Gemini engines behind the boundary's existing
+`OcrEngine`/`SttEngine` seams and are invoked live (§6, §12, §18.2).
 
 **[RECOMMENDED]** — the smallest sensible first phase, derived from §6/§11/§12.
 
@@ -708,6 +805,287 @@ Telegram conversation.
 
 ---
 
+## 18. STT UI-Text Lineage — Which Stage Produces the Text the Owner Reads
+
+**Scope.** This is the current-state record of one live incident: a **Persian
+Voice note** was replied to with `این رو stt کن`, and the delivered Telegram
+message was not the string the STT engine returned. This section traces that
+complete path in the source at the audited HEAD and separates the three things
+the original question conflated: the **engine's transcript**, the **chat
+provider's answer**, and the **delivered Telegram text**. Evidence tags are the
+canonical triple **PROVEN FROM SOURCE** / **INFERRED FROM CONTROL FLOW** /
+**NOT PROVABLE WITHOUT LIVE TRACE**. The quoted log lines are the runtime
+evidence from that request; they were not re-produced here (this environment has
+no Telegram session, no provider credential and no live traffic, §2).
+
+### 18.1 Incident
+
+- The owner replied to a Persian **Voice** note with `این رو stt کن`.
+- Runtime evidence for that request: media-target resolution, the bounded
+  download (35 941 bytes), an STT engine invocation, and the engine result
+  reported as **51 characters** (`stt_engine_returned … chars=51`,
+  `media_analysis_completed … chars=51`), followed by a **second** model call
+  (`provider_call_started timeout_s=120.0`, `ROUTER_SELECTED
+  provider=nararouter model=agnes-2.5-flash`, `provider_call_completed chars=80`),
+  then delivery (`AI_OUTPUT_NORMALIZED … changed=True length=75`).
+- The delivered message contained a Persian-language wrapper plus a quoted,
+  garbled-looking transcription — approximately `محتوای صوتی ارسالی شما:` on its
+  own line, then `«دیزی هاتهوا و تون کهم. چیزه باڵێه. هۆڵهسید چات.»`.
+- The engine-level result quoted for the same audio at an earlier point was
+  different in **both script and wording** (`Dia de ventos e de cap. Xi, zabolié.
+  Olha, sei chat.`).
+- **[FINDING]** The raw STT output and the delivered UI text are therefore
+  **separate values** unless source proves otherwise, and here it does not: every
+  media log line carries a **length**, never a **string**. Nothing in the pipeline
+  records the transcript anywhere — `analyze_media` is read-only and persists
+  nothing (`media_service.py::analyze_media`, "media processing is read-only and
+  persists nothing").
+
+### 18.2 Verified execution lineage
+
+Every row was read in source. A step is listed only where the audit established
+it; the log line that corroborates a step is named where the log carries one.
+
+| # | Step | Exact location | Value / effect | Status |
+|---|---|---|---|---|
+| 1 | Replied Voice resolved into the request | `bot/handlers/ai_unified.py` (`_extract_reply_context` → `ai/media.py::classify_message`) | `ReplyContext.media_type == "Voice"`, `exists == True` | PROVEN (log: `media_request target=replied replied_media=Voice request_media=-`) |
+| 2 | Media-target resolution | `ai/engine/dispatcher.py::_media_target` (`:1661`) | Returns `(chat_id, message_id)` of the **replied** message (the replied target is tried first, the triggering message second, and only types in `media_service.is_downloadable` resolve) | PROVEN |
+| 3 | Media request handling | `dispatcher.py::_try_media_analysis` (`:1688`) | Runs **after** the local command fast path and **before** any prompt/context construction; calls `media_ai_service.answer_media_request(source, owner_id, chat_id, message_id, request_text=request.user_message, provider_manager, request_id, timeout_s)` | PROVEN (log: `media_request`, then `media_resolution_started`) |
+| 4 | Deterministic resolution | `services/media_ai_service.py::answer_media_request` (`:209`) → `services/media_service.py::resolve_media_message` (`:1339`) | Fetches the one message the trusted runtime identified, by the ids from step 2 — never by text, recency, sender or model output | PROVEN (log: `media_resolution_started` → `media_resolution_completed`) |
+| 5 | STT availability + bounded transfer | `media_service.py::analyze_media` (`:1410`) → `_stage_trace("stt_availability", …)`, `telegram_api/media.py::download_media`, `_stage_trace("media_download_*", …)` | Availability is `is_stt_mime(mime)` **and** `stt_available()`; the transfer bound is `min(max_download_bytes(), MAX_STT_INPUT_BYTES)`, applied **before** the transfer | PROVEN (log: `stt_availability type=Voice mime=audio/ogg available=True candidate=True`, `media_download_started declared_bytes=35941 timeout_s=120`, `media_download_completed bytes=35941`) |
+| 6 | STT engine invocation | `media_service.py::_extract_audio_content` (`:1243`) → `_run_stt` (`:1190`) | `raw_text = await asyncio.wait_for(asyncio.to_thread(engine.transcribe, data), timeout=STT_TIMEOUT_S=60)` — the engine receives **only the validated audio bytes**; no chat id, no message id, no caption, no owner request text | PROVEN (log: `stt_engine_invoked engine=GeminiMediaEngine bytes=35941`) |
+| 7 | Engine request | `services/gemini_media_engine.py::GeminiMediaEngine.transcribe` (`:311`) → `_run` (`:315`) → `_generate` / `_generate_from_upload` (`:342`, `:356`) | ONE `POST {GEMINI_API_BASE}/models/{model}:generateContent` with `contents=[{role: user, parts:[{text: STT_INSTRUCTION}, audio-part]}]`, `temperature=SAMPLING_TEMPERATURE (0.0)`, `maxOutputTokens=MAX_OUTPUT_TOKENS (8192)`; default model `gemini-3.5-flash-lite` (`DEFAULT_MEDIA_MODEL`, `:90`); one attempt, no internal retry | PROVEN |
+| 8 | Raw Gemini response extraction | `gemini_media_engine.py::_extract_text` (`:544`) | Joins `candidates[0].content.parts[*].text` with `"\n"`; returns `""` for genuinely empty output; raises `MediaError` for blocked/refused/malformed. **No trimming, no case folding, no script conversion, no normalization call** | PROVEN (the engine calls no normalizer on this path) |
+| 9 | Boundary normalization | `media_service.py::_extract_audio_content` (`:1291`–`:1294`) → `_normalize_extracted_text` (`:921`) → `_cap_text` (`:949`) | Whitespace only: per-line `" ".join(line.split())`, blank-run collapse, edge-blank trim; then the `MAX_STT_CHARS` cap. This is the value the log's `chars=51` measures — i.e. the **normalized** length | PROVEN |
+| 10 | Analysis record | `media_service.py::MediaAnalysis` (`:281`), `analyze_media` return | `MediaAnalysis(content=<step 9 text>, status="extracted")` | PROVEN (log: `media_analysis_completed media_type=Voice status=extracted chars=51 truncated=False`) |
+| 11 | Provider input construction | `media_ai_service.py::build_media_messages` (`:104`) | Exactly two messages: the static `MEDIA_ANALYSIS_SYSTEM_PROMPT` (`:63`), and one user message `f"{request_text}\n\n{analysis.as_context_text()}"`. `as_context_text()` (`media_service.py:339`) renders `[Media Content]` / `Type: Voice` / `MIME:` / `Size:` / `Status:` / (`Reason:`) / `Content:\n<transcript>` — and deliberately **no caption, no sender, no chat or message id** | PROVEN |
+| 12 | Provider call | `media_ai_service.py::_provider_call` (`:166`) → `provider_manager.chat(messages, tools=[])` under `asyncio.wait_for(…, media_call_timeout(timeout_s))` = `min(120, envelope)` | One plain-text completion through the owner's selected provider on the non-multimodal path | PROVEN (log: `provider_call_started timeout_s=120.0`, `ROUTER_SELECTED provider=nararouter model=agnes-2.5-flash`, `AI_PROVIDER_ATTEMPT … attempt=1`, `provider_call_completed chars=80`) |
+| 13 | Media answer | `media_ai_service.py::answer_media_request` (`:311`) | `MediaAnswer(text = str(response.text).strip())` — the boundary does not recase, translate, re-script, summarize or re-render the provider's text | PROVEN |
+| 14 | Dispatcher response handling | `dispatcher.py::_try_media_analysis` return → `_build_fast_path_result` (`:1849`) | `EngineResult(response = text if success else "")` — i.e. `answer.text` **verbatim**; there is no media-specific transformation after the provider call | PROVEN (log: `media_completed status=extracted chars=80`) |
+| 15 | Handler → delivery | `ai_unified.py` (`:842`) | `deliver_response(event, display_prompt, response_text=result.response, show_question)` | PROVEN (log: `telegram_response success=True`) |
+| 16 | Output normalization | `ai/tools/delivery.py::process_output` (`:241`) → `_render_tables(_render_markdown(_normalize_plain(text)))` | NFC, optional `ي→ی` / `ك→ک` (only when the text already contains one of `پچژگ`), whitespace collapse, punctuation spacing, markdown/table rendering — see §18.5 | PROVEN (log: `AI_OUTPUT_NORMALIZED scripts=LATIN direction=ltr mixed=False markdown=False changed=True length=75`) |
+| 17 | Presentation | `delivery.py::_format_chunks` (`:651`) → `format_presentation` (`:422`) → `_answer_block`, then `apply_presentation_provenance` (`:440`) | Adds only the `│`-quoted **owner** question (when the `show_question` preference is on), the `└─`/`┘─` elbow + 4-space indent, BiDi isolates, and the **invisible** provenance marker. It never adds a media label | PROVEN |
+| 18 | Delivery | `delivery.py::deliver_response` (`:686`) → `event.edit` / `event.reply` | The delivered chunks are the final Telegram text | PROVEN |
+
+**[FINDING]** The media path is therefore **one engine call plus one chat
+provider call**: the engine produces a transcript (steps 7–9) and the chat
+provider produces the text that is delivered (steps 12–13). There is no second
+transcription step, no cached transcript and no persisted analysis anywhere in
+this chain.
+
+### 18.3 Exact transformation point
+
+- **[PROVEN FROM SOURCE]** The first place the value the owner reads **stops
+  being the transcription** is the **chat provider call in step 12**. Everything
+  from the engine's return (step 8) to the provider input (step 11) is
+  *identity-preserving apart from whitespace*: `_extract_text` joins parts,
+  `_normalize_extracted_text` collapses whitespace, `_cap_text` caps length, and
+  `as_context_text()` embeds the result verbatim after a `Content:` line. No
+  local function in that span rewrites wording, language, script or case.
+- **[PROVEN FROM SOURCE]** The transformation itself is **generation by a second
+  model**, not a local string operation. `MEDIA_ANALYSIS_SYSTEM_PROMPT` asks that
+  model to "answer the owner's request using only the owner's request and that
+  content" and imposes **no** verbatim, no-translation, no-paraphrase or
+  quote-only constraint on the content it received. Nothing in the pipeline
+  compares `response.text` against `analysis.content`, and `MediaAnswer.text`
+  (`media_ai_service.py:311`) is taken unmodified.
+- **[PROVEN FROM SOURCE]** `response.text` is what the dispatcher returns
+  (`_build_fast_path_result`: `response=text`), what the handler passes to
+  `deliver_response`, and what delivery renders. A rewrite performed by that
+  model therefore travels to the owner unopposed, including a change of script.
+- **[INFERRED FROM CONTROL FLOW]** Because the second model is prompted in
+  English about content labelled `[Media Content]` / `Type: Voice` while the
+  owner wrote Persian, a Persian restatement is likely — but the code neither
+  requires nor forbids it.
+- **No local transformation explains the delivered text**, and none was found
+  that renames, translates, transliterates, summarizes or reformats media
+  content (§18.5).
+
+### 18.4 The UI wrapper `محتوای صوتی ارسالی شما:`
+
+- **[PROVEN FROM SOURCE]** The wrapper is **not local**. An exhaustive `git grep`
+  over the tracked tree for `محتوای صوتی` and for `ارسالی` returns **zero hits in
+  any code, configuration, template or test file** — the single hit anywhere is
+  this document's own §2 method note. The guillemet pair `«`/`»` appears only in
+  modules that do not execute on the media path (`ai/confirmation.py`,
+  `ai/preparation_policy.py`, `services/ghost_seen_v2.py` and their tests).
+- The complete set of **local** media-facing strings is enumerable and contains
+  none of it: `MEDIA_ANALYSIS_SYSTEM_PROMPT` (`media_ai_service.py:63`);
+  `MediaAnalysis.as_context_text()` → `[Media Content]`, `Type:`, `MIME:`,
+  `Size:`, `Status:`, `Reason:`, `Content:` (`media_service.py:339`);
+  `unsupported_text()` → `⚠️ I can't process this <type> yet.`
+  (`media_ai_service.py:122`); the dispatcher's failure text
+  `❌ Media processing failed: <reason>` (`dispatcher.py`); and the delivery
+  presentation glyphs `│`, `└─`, `┘─` plus the four-space indent (`delivery.py`).
+- **[PROVEN FROM SOURCE]** Therefore the wrapper is **provider-generated**: it is
+  part of stage E (the chat provider's answer), inside the `80` characters the log
+  reports for `provider_call_completed`, and the presentation layer merely renders
+  that text.
+- **[INFERRED FROM CONTROL FLOW]** Its wording plausibly restates the provider
+  **input**'s own label — `as_context_text()` opens with `[Media Content]` and
+  `Type: Voice` (`media_service.py:339`), which corresponds closely to "the audio
+  content you sent". The correspondence is suggestive but is **not** proof that
+  the model read that label rather than simply inferring an audio note from the
+  owner's request.
+- The wrapper's presence does **not** prove the model rewrote the transcript: the
+  system prompt neither demands nor prohibits a wrapper, so its presence is
+  consistent with a faithful quote. Which of the two happened is the gap in
+  §18.9.
+
+### 18.5 Unicode / script findings
+
+| Mechanism | Where | What it actually does | Can it explain `باڵێه` / `هۆڵهسید`? |
+|---|---|---|---|
+| `unicodedata.normalize("NFC", text)` | `ai/tools/delivery.py:81` | Canonical **composition** only: it composes/decomposes a character with its own combining marks. It performs no letter substitution | **No** — NFC has no canonical mapping that yields `ڵ` (U+06B5), `ێ` (U+06CE) or `ۆ` (U+06C6) |
+| Persian/Arabic character conversion | `ai/tools/delivery.py:82`–`:84` | The **only** letter mapping in the whole output path: `ي`→`ی`, `ك`→`ک`, and it runs **only if** the text already contains one of `پچژگ` | **No** — it cannot synthesize letters, and it never runs on Latin-script text |
+| `_normalize_extracted_text` | `services/media_service.py:921` | Whitespace only (per-line run collapse, blank-run collapse, edge trim). Documented to leave Persian/Arabic text, ZWNJ (U+200C) and directional marks **untouched**. Uses no `unicodedata` at all | **No** — spacing only |
+| `gemini_media_engine._extract_text` | `services/gemini_media_engine.py:544` | Joins response parts with `"\n"`; no normalization, no strip | **No** |
+| Whitespace / punctuation rules | `ai/tools/delivery.py:80`–`:96` | Collapse spaces/tabs, trim around newlines, at most one blank line, remove a space before `,.;:!?،؛؟`, insert a space after `,;!?،؛؟` before a Latin/Cyrillic/Arabic letter. Protected regions (URLs, `@names`, `/commands`, inline/fenced code) are excluded | **No** — spacing only |
+| BiDi / directional marks | `ai/tools/delivery.py:329`–`:339` (`_bidi_isolate`) and `apply_presentation_provenance` (`:440`) | **Adds** `U+2066`/`U+2067`, `U+200E`/`U+200F`, `U+2069` isolates and an invisible provenance marker to the rendered message | **No** — control characters cannot create a letter; they are added after the text exists |
+| Script detection | `ai/tools/delivery.py:42`–`:63` (`_script`, `_profile`, `_RTL_SCRIPTS`) | Read-only classification (`unicodedata.name`), used to choose the elbow direction and to emit the log's `scripts=` / `direction=` fields | **No** — classification only |
+| Transliteration / romanization / script converter | — | **Absent.** A `transliterat` grep finds only the STT instruction's own prohibition and doc prose; there is no conversion table, no Arabic→Persian mapper, no romanizer anywhere in the tree | **No** — no such code exists |
+
+- **[PROVEN FROM SOURCE]** No inspected local stage can produce `ڵ`, `ێ` or `ۆ`,
+  and the only local letter mapping (`ي`→`ی`, `ك`→`ک`) cannot create them. Those
+  characters therefore arrive from **upstream** — stage A (Gemini) and/or stage E
+  (the chat provider).
+- **[PROVEN FROM SOURCE]** The log's `changed=True length=75` proves only that
+  *something* in `process_output` changed the 80-character provider text (a
+  5-character reduction is consistent with the whitespace/punctuation rules above,
+  and equally with the `ي`/`ك` mapping); it does **not** identify which rule fired,
+  and it does not imply that any word was rewritten.
+- **[PROVEN FROM SOURCE — a contradiction inside the runtime evidence]**
+  `AI_OUTPUT_NORMALIZED … scripts=LATIN direction=ltr` is computed on the text
+  **after** normalization, i.e. on what delivery is about to send. It describes
+  the delivered message as Latin-script and left-to-right. That cannot describe
+  the Persian-script text quoted in §18.1. Two observations presented as the same
+  delivery therefore disagree: either they are different requests, or one of the
+  two records is a transcription of the other. The audit cannot decide this
+  without the runtime values (§18.9); the disagreement is recorded as-is rather
+  than resolved in favour of either.
+- **[NOT PROVABLE WITHOUT LIVE TRACE]** Whether `ڵ`/`ێ`/`ۆ` were produced by
+  Gemini from the audio or by the chat provider's restatement cannot be settled
+  from source, because the transcript value (stages A/B/C) and the provider value
+  (stage E) are never recorded — only their lengths are.
+
+### 18.6 Value lineage (A–G)
+
+| Stage | Value | Where it is produced | Proven | Runtime-only |
+|---|---|---|---|---|
+| **A** raw Gemini response | the model text of `generateContent`, parts joined with `"\n"` | `gemini_media_engine._extract_text` (`:544`) | its existence, its construction rule, and that it is passed unchanged to the seam | **the string itself** — never logged; only the post-normalization length (`chars=51`) is |
+| **B** normalized STT text | A with whitespace collapsed and capped at `MAX_STT_CHARS` | `media_service._normalize_extracted_text` (`:921`) → `_cap_text` (`:949`) | the transformation is whitespace/length only | **the string**; the log reports its length only |
+| **C** `MediaAnalysis.content` | exactly B (one assignment path) | `media_service.analyze_media` (`:1410`) | `content` is B verbatim; status `extracted`; nothing is persisted | **the string**; `chars=51 truncated=False` in the log |
+| **D** provider input | `"<owner request>\n\n" + analysis.as_context_text()`, with C embedded verbatim after `Content:` | `media_ai_service.build_media_messages` (`:104`) | the construction is fully determined by the owner's text and C, and it is the **only** construction point, so no Telegram context can enter | **the string** |
+| **E** provider output | `response.text.strip()` from the chat provider | `media_ai_service._provider_call` (`:166`) → `MediaAnswer.text` (`:311`) | that E is taken unmodified by the boundary and by the dispatcher, and **that the wrapper in §18.4 can only be inside E** | **the string**; `chars=80` in the log. Whether E echoes C or restates it is the §18.9 gap |
+| **F** presentation-layer text | E (after `process_output`) + optional `│`-quoted owner question + elbow/indent + invisible marker | `delivery.process_output` (`:241`) → `format_presentation` (`:422`) → `apply_presentation_provenance` (`:440`) | that F adds **no** media wrapper, and that F's only change to E is the §18.5 normalization | **the string**; `length=75` in the log |
+| **G** final Telegram text | the chunk(s) `event.edit` / `event.reply` send | `delivery.deliver_response` (`:686`) | that G is F (plus the invisible marker), and that nothing between F and G alters text | **the string as delivered**; the owner's report is the only record of it |
+
+**[FINDING]** Read together: **G is a rendering of E**, and **E is a second
+model's answer over D**, which contains **C**, which is a whitespace-normalized
+form of **A**. The one step in that chain that can change language, script or
+wording is **D→E** (a generative model). Every earlier step is identity-preserving
+apart from whitespace.
+
+### 18.7 Confidence by claim
+
+**PROVEN FROM SOURCE**
+
+- The media target is resolved deterministically from the runtime's own ids
+  (`_media_target`), never by a model (§18.2 steps 2–3).
+- The STT engine receives only validated bytes, and the engine returns the model's
+  text with no local rewriting (§18.2 steps 6–8).
+- The only local transformations applied to the transcript are whitespace collapse
+  and a character cap (§18.2 step 9, §18.5).
+- The provider input is built in exactly one place and contains the transcript
+  verbatim, with no caption, sender, chat id or message id (`build_media_messages`,
+  `as_context_text`).
+- `MediaAnswer.text` and `EngineResult.response` carry the provider's text
+  unmodified to the handler (§18.2 steps 13–14).
+- Delivery's local additions are the question block, the connectors, BiDi isolates
+  and the invisible provenance marker — none of them a media wrapper (§18.2 step 17).
+- The wrapper `محتوای صوتی ارسالی شما:` occurs nowhere in the tracked tree's code
+  (§18.4), so it is provider-generated.
+- No transliteration, romanization, script conversion or Unicode letter mapping
+  exists in the output path beyond `ي→ی`/`ك→ک`, and `unicodedata.normalize("NFC")`
+  cannot create `ڵ`/`ێ`/`ۆ` (§18.5).
+- `MediaAnalysis` is never persisted, so no stored artifact can be consulted to
+  recover the transcript.
+
+**INFERRED FROM CONTROL FLOW**
+
+- That the wrapper restates the provider input's own `[Media Content]` /
+  `Type: Voice` label (plausible; not established by code).
+- That the reported UI text and the logged `AI_OUTPUT_NORMALIZED` line describe the
+  same delivered value — their script/direction content disagrees (§18.5), so this
+  is an assumption about the evidence, not a source fact.
+- That the `show_question` presentation preference was off for the reported message
+  (the reported text shows no `│` question block) — the preference is owner
+  configuration, not source.
+
+**NOT PROVABLE WITHOUT LIVE TRACE**
+
+- The engine's returned string (stages A/B), and therefore whether the engine's own
+  transcript was Persian-script, Latin-script or gibberish on that request.
+- The provider's returned string (stage E), and therefore whether E quotes C or
+  restates it — the decisive question for "who garbled the text".
+- Which `process_output` rule produced `changed=True`, and the exact delivered
+  string (stage G).
+
+### 18.8 Root-cause status
+
+**[FINDING] MIXED RESPONSIBILITY — the wrapper is resolved; the transcript's
+fidelity is not.** Only these states are supported by the audit:
+
+1. **A local formatting/transformation root cause is excluded.** No local stage can
+   produce the wrapper, and none can rewrite language or script beyond the single
+   `ي→ی`/`ك→ک` mapping plus whitespace (§18.3–§18.5). The delivered text is
+   therefore **not** evidence of what the STT engine returned.
+2. **The owner-visible wrapper is a downstream (provider) responsibility** — a
+   second model's generation, not local presentation (§18.4).
+3. **The transcription quality itself is not attributable from source.** The
+   garbled wording could be (a) the engine's transcript faithfully quoted by the
+   provider, (b) the engine's transcript restated or transliterated by the
+   provider, or (c) the provider's own rendering of a shorter or partially garbled
+   transcript. The code permits all three: the second model's prompt allows
+   paraphrase, and neither value is recorded anywhere.
+4. **What is already known about the engine's language behavior** is recorded in
+   the engine itself, not in this chain: the instruction now requires identifying
+   the spoken language, transcribing verbatim in it, writing it in that language's
+   own script, and forbids translation and transliteration/romanization — with a
+   comment citing the earlier live run in which a Persian Voice note came back as
+   Latin-script gibberish straight from the engine (`STT_INSTRUCTION`,
+   `gemini_media_engine.py:104`–`:127`). That is a **recorded prior live
+   observation**, not a value from the audited request; it explains why the
+   engine's own output is the first suspect without proving it.
+
+**Verdict: RESOLVED FOR THE WRAPPER; UNRESOLVED FOR THE TRANSCRIPT.** The claim
+"the delivered text is the Gemini STT output" is **false on the evidence**: it is a
+second model's output. The claim "the delivered text is a faithfully quoted Gemini
+transcript" is **not proven**: it remains a runtime-only question.
+
+### 18.9 Remaining gap
+
+The value-level lineage cannot be closed from source. The following runtime
+observations are the ones that would close it — named because the audit must make
+the gap explicit, **not** because this document changes anything:
+
+1. **The engine's returned string** (stages A/B) alongside its length, so the
+   transcript is a value rather than a `chars=` count.
+2. **The provider's returned string** (stage E) alongside its length, so it can be
+   compared with (1) — that single comparison separates "faithful quote" from
+   "provider restatement".
+3. **The delivered string** (stage G) with its `show_question` state, to reconcile
+   the script/direction contradiction recorded in §18.5.
+
+The existing traces already identify *which leg* ran and *how large* each value was
+— `stt_engine_invoked` / `stt_engine_returned` / `media_analysis_completed` /
+`provider_call_started` / `provider_call_completed` / `media_completed` /
+`AI_OUTPUT_NORMALIZED` — so the gap is specifically the **content** of those
+values, not the shape of the path. Until such an observation exists, the quality of
+the STT result is measured only by the owner's next live request (§12).
+
+---
+
 ## Validation Status
 
 | Item | Status |
@@ -718,26 +1096,33 @@ Telegram conversation.
 | Supabase / schema / migrations / `DATABASE_ARCHITECTURE.md` / Save | **untouched** |
 | Provider architecture | **untouched** |
 | Implementation performed | **none** — investigation + documentation only |
-| New abstraction created | **none** — every `media_service.py` / tool / registry entry named in §13 is a recommendation, not a file |
-| Evidence | every material claim cites an exact path + symbol/line (§3–§10) |
+| New abstraction created | **none by this document** — the media boundary, the engines and the services it names are *pre-existing* at the audited HEAD (§4, §13); §13/§15 are marked superseded |
+| Evidence | every material claim cites an exact path + symbol/line (§3–§18) |
 | Tests run | none — no code changed |
-| Live Telegram / Supabase / Render verification | **not performed** (out of scope) |
+| Media STT UI-text lineage (§18) | **traced from source** — the owner-visible wrapper is provider-generated (§18.4); the transcript's fidelity is a runtime-only gap (§18.9) |
+| Media value lineage A–G (§18.6) | separated by stage; the stage **values** are not recorded by the runtime (lengths only) |
+| Live Telegram / Supabase / Render verification | **not performed** — no session, credential or traffic here; §18.9 states what a live observation would have to capture |
 | Fabricated commits / pushes | none claimed |
 
 **Proven from source:** the text-only prompt and provider path and its exact
 seams (§3, §6); the media detection/metadata/download inventory per type (§4);
-the unbounded download boundary and the existing size/temp/cleanup controls
-(§5); the dead `vision()` seam and the manager's inactive-provider selection
+the download bound on the media path plus the existing size/temp/cleanup
+controls (§5); the dead `vision()` seam and the manager's inactive-provider selection
 (§6); every context-injection path into the model and the unconditional
 attachment for reply-shaped requests (§7.1); the services-layer precedent that
 performs its own provider call through the *selected* provider (§6, §8); the
-exact limit values (§9); and the absence of OCR/STT/document/video dependencies
-and system binaries (§10).
+exact limit values (§9); the absence of **local** OCR/STT/document/video dependencies and system
+binaries (§10); and, for §18, that the STT engine normalizes nothing, that the
+provider input is built in exactly one place, that the wrapper phrase exists
+nowhere in the tracked tree, and that no local stage can introduce
+`ڵ`/`ێ`/`ۆ` (§18.3–§18.5).
 
 **Not proven / not measured:** real Telegram latency, memory and RPC cost for a
 50 MB asset inside the 240 s envelope; whether any particular normalization
-quality suffices for the owner's intent; and the product decisions listed in
-§16.
+quality suffices for the owner's intent; the product decisions listed in §16; and,
+for §18, the runtime **values** of the engine transcript (A/B/C) and of the chat
+provider's answer (E) — the two strings that would decide whether the delivered
+transcription was quoted or restated (§18.9).
 
 ---
 
