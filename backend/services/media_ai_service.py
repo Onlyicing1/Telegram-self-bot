@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,6 +70,56 @@ MEDIA_ANALYSIS_SYSTEM_PROMPT = (
     "using only the owner's request and that content. If the content is empty "
     "or incomplete, say so plainly."
 )
+
+
+# ── Direct STT classification ──
+# A request phrased EXPLICITLY as a transcription ask is answered with the
+# extracted transcript itself — no second model, no provider round. The match
+# is intentionally narrow (high confidence, deterministic) so analytical asks
+# ("what does it say", summaries, analysis) keep the full LLM path.
+#: Latin-script verbs that mean transcription. Deliberately excludes "read",
+#: "listen", "understand", "say", "analyze", "translate", ... — those asks
+#: are about the media, not its verbatim text.
+_STT_VERBS = ("transcribe", "transcript", "stt", "speech to text")
+#: Persian equivalents of the same ask, matched as substrings so ordinary
+#: object/politeness words around them (این رو, ویس رو, ...) keep matching.
+#: \u0645\u062a\u0646\u0628\u062e\u0648\u0646 and \u0645\u062a\u0646\u0628\u06a9\u0646 mean "write down the text (for me)" — the
+#: everyday Persian phrasing of a transcription request.
+_STT_FA = (
+    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u067e",                      # transcript/transcription (loanword)
+    "\u062a\u0631\u0627\u0646\u0634\u0631\u06cc\u0646\u06af",                        # transliteration of "transcribing"
+    "\u0633\u06cc\u200c\u062a\u06cc\u200c\u06cc",                            # Persian spelling-out of "STT"
+    "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc",                          # transcription (formal Persian)
+    "\u0645\u062a\u0646\u200c\u0628\u062e\u0648\u0646",                            # "write the text out" (colloquial)
+    "\u0645\u062a\u0646\u200c\u0628\u06a9\u0646",                              # "make the text" (colloquial)
+)
+
+
+def is_direct_stt_request(request_text: str) -> bool:
+    """High-confidence, deterministic detection of an explicit transcription ask.
+
+    Matches only requests whose wording IS the transcription instruction (with
+    ordinary politeness/object words around it): ``transcribe``/``transcript``/
+    ``stt``/``speech to text`` in Latin script, or the Persian
+    transcription/transcribing words, a Persian spelling-out of the STT
+    acronym, or \u0645\u062a\u0646\u0628\u062e\u0648\u0646/\u0645\u062a\u0646\u0628\u06a9\u0646. Analytical asks — what does it say,
+    what is it about, summarize it, analyze it — never match, so they keep the
+    second-LLM path. \u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc alone also names a transcription AS A THING
+    (e.g. a long message quoting one), so it is honored only for request-sized
+    texts.
+    """
+    text = (request_text or "").strip().lower()
+    if not text:
+        return False
+    for token in _STT_VERBS:
+        if re.search(rf"\b{re.escape(token)}\b", text):
+            return True
+    for token in _STT_FA:
+        if token in text:
+            if token == "\u067e\u06cc\u0627\u062f\u0627\u062f\u0627\u0631\u06cc" and len(text) > 120:
+                continue
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -117,6 +168,30 @@ def build_media_messages(request_text: str, analysis: MediaAnalysis) -> list[dic
             "content": f"{(request_text or '').strip()}\n\n{analysis.as_context_text()}",
         },
     ]
+
+
+#: Honest provenance for the deterministic STT answer: no provider was
+#: consulted, so no provider name may be claimed. The dispatcher's fast-path
+#: defaults collapse to the same ("local", "deterministic") shape when a
+#: provider is absent — the STT answer only makes them explicit.
+_DIRECT_STT_PROVIDER = "local"
+_DIRECT_STT_MODEL = "gemini-stt-deterministic"
+
+
+def _direct_stt_answer(analysis: MediaAnalysis, request_id: str) -> MediaAnswer:
+    """The transcript itself as the answer — the direct-STT whole contract."""
+    text = (analysis.content or "").strip()
+    _trace(
+        request_id, "direct_stt_completed",
+        media_type=analysis.media_type or "-", chars=len(text),
+        truncated=analysis.truncated,
+    )
+    return MediaAnswer(
+        text=text,
+        provider=_DIRECT_STT_PROVIDER,
+        model=_DIRECT_STT_MODEL,
+        status=str(analysis.status),
+    )
 
 
 def unsupported_text(analysis: MediaAnalysis) -> str:
@@ -287,6 +362,14 @@ async def answer_media_request(
             reason=bounded_reason(analysis.reason),
         )
         return MediaAnswer(text=unsupported_text(analysis), status=str(analysis.status))
+
+    # An EXPLICIT transcription ask is answered with the transcript itself:
+    # the same analysis, the same normalization, no second model, no provider
+    # round. Analytical requests continue below to the full LLM path.
+    if is_direct_stt_request(request_text) and (
+        analysis.media_type in ("Voice", "Audio")
+    ):
+        return _direct_stt_answer(analysis, request_id)
 
     if provider_manager is None:
         raise MediaError(
