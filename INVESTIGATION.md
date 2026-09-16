@@ -24,16 +24,17 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Audited HEAD | `801f8dbe61a3185d1eb8d87aa35ede12ff75166b` (short `801f8db`, `docs: record the Gemini STT language-contract fix`) — the **source** revision every code citation in this document was read at; the two later commits on this branch (`3edb3c0`, `7bf2d1f`) changed **only this document**, so no cited source line has moved and §18 is current at the branch HEAD as well |
+| Audited HEAD | `6caee182774bad3acf2d5913c67c871e7c799664` (short `6caee18`, `docs: sync the M1.6 report with the explicit-form STT classifier`) — the **source** revision every code citation in this document was read at. Between the previous audit HEAD (`801f8db`) and this one, three commits landed on this branch: `0f8e819` (**M1.6 — deliver direct STT transcripts without a second model**), `14f5469` (**explicit-form STT classifier, adds the `sst` alias**), and `6caee18` (report sync, this document only). The direct-STT source change is confined to `backend/services/media_ai_service.py` (+ `tests/test_media_direct_stt.py`); every other cited source file is byte-identical to the previous audit, so §3–§17 and the §18 lineage remain accurate for the provider-mediated path |
 | Investigation date | 2026-09-16 |
 | Status | **Investigation only. No code was changed while producing this document.** |
 | Scope | (a) At which existing architectural boundary a controlled Media Processing layer sits upstream of the owner's **currently selected** LLM provider — without changing that provider and without leaking Telegram/conversational context to the model; and (b) **the verified source lineage of the STT text the owner reads in Telegram** for a replied Voice note (§18). |
 | Question | How is Telegram media (photo, voice, audio, document, video, sticker, GIF) resolved, downloaded, validated and normalized into a controlled representation that the **currently selected** chat provider consumes as ordinary input — and which stage of that chain produces the text the owner actually sees? |
 | Media-layer verdict | The verdict at `893d3f4` was **GO WITH REQUIRED PREWORK**; that prework has since **landed** (§11, §13, §15). No native multimodal provider path is wired — `vision()` is still declared-but-unreachable across every adapter (§6) — so media is normalized to **text upstream** instead, on a provider-neutral path. |
-| STT-lineage verdict | **RESOLVED FOR THE WRAPPER; ONE RUNTIME GAP REMAINS** (§18.8): the owner-visible text is **neither** the engine transcript **nor** locally formatted — it is a **second model's output**. The exact value the STT engine returned on the Persian live run is still **not provable from source**. |
+| STT-lineage verdict | **SUPERSEDED BY M1.6 FOR EXPLICIT STT ASKS** (§18.8, §19.2): the §18 record stands for the **provider-mediated** path, which analytical media requests still take — the owner-visible text there is a **second model's output**. For an **explicit transcription ask** the second-model stage no longer executes: the transcript itself is the answer (§19.2). The exact value the STT engine returns remains **not provable from source** — it is never recorded (§19.4). |
 | Superseded published inference | The M1.5c record in `IMPLEMENTATION_REPORT.md` reads the same live trace as proof that "the owner-visible text *is* the raw engine output", on the strength of the `chars=51` measured at stage B. §18 supersedes that reading: the value the owner receives is **stage E**, which the same trace reports as `provider_call_completed chars=80`, and no stage records E's content (§18.6) — so the 51-character measurement bounds the **transcript**, not the delivered text, and no recorded trace observes the delivered value at that length. That conclusion is recorded as superseded by §18.8; `IMPLEMENTATION_REPORT.md` is outside this delivery's scope and is unchanged. |
-| STT second-model audit (this pass) | The exact provider-facing message list, the routing/transport path, the value lineage, the evidence boundary and the classification are recorded in **§2.1**; §18 remains the full narrative lineage record. Classification: **UNRESOLVED RUNTIME BOUNDARY** — the owner-visible text is provably the chat provider's generation, while the transcript value that run produced is not observable in the repository. |
-| Files changed by this investigation | only `INVESTIGATION.md` |
+| STT second-model audit (previous pass) | The exact provider-facing message list, the routing/transport path, the value lineage, the evidence boundary and the classification are recorded in **§2.1**; §18 remains the full narrative lineage record for the provider-mediated path. That pass's classification (**UNRESOLVED RUNTIME BOUNDARY**) described the boundary M1.6 has since **removed for explicit STT asks** — the record is retained for the analytical-ask path that still uses it. |
+| STT recognition-quality audit (this pass) | The **current open problem** is STT **recognition quality**, not delivery: the direct-STT path is functioning, and the observed Persian misrecognitions must therefore be attributed to the recognition itself. The full code-side audit — audio-byte lineage, request construction, normalization, retry analysis, observability limits and the A/B/C/D classification — is recorded in **§19**. External/service investigation (model adequacy, API behavior) belongs to Felo.ai and is bounded in §19.6; this document records no external Gemini facts. |
+| Files changed by this investigation | only `INVESTIGATION.md` (the direct-STT source change and its tests were delivered by the separate M1.6 commits, not by this investigation) |
 | Classification labels | **[CURRENT]** implemented behavior verified in source at the audited HEAD (`801f8db`) · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision |
 
 Evidence-strength tags used inline where a claim is not directly readable in
@@ -1287,7 +1288,24 @@ fidelity is not.** Only these states are supported by the audit:
 second model's output. The claim "the delivered text is a faithfully quoted Gemini
 transcript" is **not proven**: it remains a runtime-only question.
 
+> **SUPERSEDED IN PART BY M1.6 (§19).** Everything §18 proves about the
+> provider-mediated chain remains true and remains the path taken by analytical
+> media requests. What this verdict leaves unresolved for explicit transcription
+> asks is resolved **architecturally** by M1.6: that whole chain no longer
+> executes, because the transcript itself is the answer (§19.2). The runtime gap
+> for the recognition value is carried forward unchanged into §19.4 — M1.6
+> delivers the transcript verbatim but still records only its length.
+
+
 ### 18.9 Remaining gap
+
+> **Status after M1.6 (§19).** Items (1) and (2) are resolved architecturally for
+> explicit STT asks — the answer now *is* the engine value (A/B/C verbatim), so
+> there is no second value to compare (item 2 is moot on the direct path and
+> remains relevant only for analytical asks). The gap that remains open is the
+> one §19.4 records: the engine's returned **string** is still never captured, so
+> recognition quality still cannot be attributed after the fact. Item (3) is
+> unchanged.
 
 The value-level lineage cannot be closed from source. The following runtime
 observations are the ones that would close it — named because the audit must make
@@ -1307,6 +1325,162 @@ The existing traces already identify *which leg* ran and *how large* each value 
 `AI_OUTPUT_NORMALIZED` — so the gap is specifically the **content** of those
 values, not the shape of the path. Until such an observation exists, the quality of
 the STT result is measured only by the owner's next live request (§12).
+
+---
+
+## 19. STT Recognition Quality — the current open problem (this pass)
+
+**Scope.** With M1.6 landed (`0f8e819`, `14f5469`), explicit STT requests are
+answered with the transcript itself and the second-model delivery question is
+closed for that path. The remaining live problem is **recognition quality**:
+repeated runs on the same Persian audio produce different, inaccurate
+transcripts. This section records the complete code-side audit of the direct-STT
+path and classifies every candidate cause into exactly one of:
+
+- **A. CODE-PROVEN ROOT CAUSE**
+- **B. CODE-PROVEN CONTRIBUTING FACTOR**
+- **C. CODE-PROVEN NOT THE CAUSE**
+- **D. CANNOT BE DETERMINED FROM CODE**
+
+Evidence discipline is the §2.1/§18 one: **PROVEN FROM SOURCE** means read in
+source at the audited HEAD; live observations are recorded as observations and
+never upgraded into code facts. **No external Gemini/service fact is asserted
+anywhere in this document.** The external investigation (model adequacy, API
+audio behavior, prompt effectiveness) is Felo.ai's scope; §19.6 states the exact
+hand-off boundary.
+
+### 19.1 Observed live symptoms (observations, not code facts)
+
+The owner spoke Persian (`دیدم اتفاقا تو گپ، چیز باحالیه، خلاصه چت`) and the
+delivered transcripts were, across runs, similar-shaped but different and
+wrong — e.g. `دیه چه باحال تو کپ. چیز باحالیه. حالا سهید چت` and
+`دیه آدمو تو ته گپ چیز باحالیه. حالا سید chat`. Errors include real-word
+substitutions (`دیدم`→`دیه`, `گپ`→`کپ`, `خلاصه`→`حالا`) and one Latin-script
+token (`chat`) inside Persian output. These strings are the owner-facing
+**observations**; the repository cannot and does not verify them further.
+
+### 19.2 Current direct-STT architecture (verified at the audited HEAD)
+
+The owner-facing chain for an explicit transcription ask on a Voice/Audio
+target, with every step read in source:
+
+| # | Step | Exact location |
+|---|---|---|
+| 1 | Activation and reply-context capture | `backend/bot/handlers/ai_unified.py` (`_extract_reply_context` → `backend/ai/media.py::classify_message`) |
+| 2 | Deterministic media-target resolution | `backend/ai/engine/dispatcher.py::_media_target` → `_try_media_analysis` |
+| 3 | One bounded message resolution | `backend/services/media_ai_service.py::answer_media_request` → `backend/services/media_service.py::resolve_media_message` |
+| 4 | One bounded download | `media_service.analyze_media` → `backend/telegram_api/media.py::download_media` (bound `min(max_download_bytes(), MAX_STT_INPUT_BYTES=20 MiB)` applied before transfer; transfer ceiling 120 s) |
+| 5 | Container/MIME corroboration + stream bounds | `media_service._validate_audio_payload` (+ `_ogg_audio_info`/`_wav_audio_info`/`_flac_audio_info`) |
+| 6 | Engine invocation | `media_service._extract_audio_content` → `_run_stt` (`asyncio.to_thread` under `STT_TIMEOUT_S=60`) → `backend/services/gemini_media_engine.py::GeminiMediaEngine.transcribe` |
+| 7 | Gemini request | `gemini_media_engine._generate` — ONE `POST {GEMINI_API_BASE}/models/{model}:generateContent`, parts `[STT_INSTRUCTION, audio]`, `temperature=0.0`, `maxOutputTokens=8192`, default model `gemini-3.5-flash-lite` (`DEFAULT_MEDIA_MODEL`); inline base64 up to `INLINE_PAYLOAD_MAX_BYTES=15 MiB` (voice notes travel this path), the documented Files API flow above it, file deleted in `finally` |
+| 8 | Response extraction | `gemini_media_engine._extract_text` — first candidate, text parts joined with `"\n"`; honest empty on no-speech; `MediaError` on blocked/refused; no trimming, rewriting or normalization |
+| 9 | Boundary normalization + cap | `media_service._normalize_extracted_text` (whitespace only) → `_cap_text` (`MAX_STT_CHARS`) |
+| 10 | `MediaAnalysis.content` | `media_service.analyze_media` return (never persisted) |
+| 11 | **Direct-STT branch** | `media_ai_service.answer_media_request`: `if is_direct_stt_request(request_text) and analysis.media_type in ("Voice", "Audio"): return _direct_stt_answer(...)` (`:404`–`:407`) |
+| 12 | Classifier | `media_ai_service.is_direct_stt_request` (`:122`) — closed finite form set (`_STT_FORMS`): whole-token English `stt`/`sst`/`transcribe`/`transcript`, the phrase `speech to text`, and the listed Persian forms (including `sst` as an explicit alias, no regex, no fuzzy matching) |
+| 13 | Direct answer | `media_ai_service._direct_stt_answer` (`:216`) — `MediaAnswer(text=analysis.content.strip(), provider="local", model="gemini-stt-deterministic")`; the provider manager is **never consulted** |
+| 14 | Dispatcher packaging | `dispatcher._build_fast_path_result` — `EngineResult(response=answer.text)` verbatim |
+| 15 | Delivery | `ai_unified` → `backend/ai/tools/delivery.py::deliver_response` → `process_output` → `format_presentation` |
+
+Test lock: `tests/test_media_direct_stt.py` (619 lines) proves the transcript
+reaches the owner with no provider round (`provider.prompts == []`), that
+`build_media_messages` is never called on the direct path, that analytical asks
+(`what does it say`, summarize, …) keep the full LLM path, that non-Voice/Audio
+media never takes the branch, and that failures keep the media failure identity.
+
+### 19.3 Candidate-cause audit (what could alter the transcript)
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| Audio bytes changed before Gemini | **C. NOT THE CAUSE** | The download writes the original bytes to a temp file (`analyze_media` → `download_media`); `_read_document_bytes` reads them back whole; `_validate_audio_payload` only parses headers; no decode/re-encode/resample/channel/bitrate/silence/volume step exists anywhere in the tree (no ffmpeg/pydub/sox import); the engine sends exactly those bytes (`base64.b64encode(payload)` inline, or the identical bytes via Files API) |
+| MIME incorrectly declared | **C. NOT THE CAUSE** | `gemini_media_engine.gemini_mime_type` decides from the container signature alone (`_sniff_mime`); the declared Telegram MIME is corroborated by `media_service` and **never forwarded**; Telegram Voice = OGG/Opus → `audio/ogg` alias. (Whether Gemini accepts that MIME for the model is external — not claimed here) |
+| Container/codec mismatch | **C. NOT THE CAUSE** | `_validate_audio_payload` refuses any payload whose OGG/WAV/FLAC signature does not corroborate the declared type, and bounds channels/rate/duration before the engine runs |
+| Truncation | **C. NOT THE CAUSE** | `_cap_text` bites only above `MAX_STT_CHARS` (16 000); the live runs report 10–20 characters of transcript. `MAX_TOKENS` (8 192) is never approached by short voice notes (`_extract_text` warns if it were) |
+| Boundary normalization | **C. NOT THE CAUSE** | `_normalize_extracted_text` is whitespace-only per its source and its test (`test_persian_transcript_survives_the_boundary_unchanged`); Persian letters and ZWNJ pass through |
+| Delivery-layer transforms | **C. NOT THE CAUSE** | `process_output` = NFC + the single `ي→ی`/`ك→ک` map + whitespace/punctuation rules (§18.5); none can substitute whole words (`دیدم`→`دیه`) |
+| Response-part extraction | **C. NOT THE CAUSE** | `_extract_text` joins text parts verbatim; no rewrite, no language handling |
+| STT instruction | **D / B (hybrid)** | The instruction (`STT_INSTRUCTION`) is the engine's **only** language-shaping input — the request carries no language parameter (proven by `test_the_transmitted_stt_request_offers_no_language_or_script_parameter`). That a single static instruction may be insufficient to produce accurate Persian transcripts is a **contributing design factor** the code proves *structurally* (B); whether the instruction actually underperforms for Persian is external (D here) |
+| Generation parameters / request construction | **D** | `temperature=0.0`, `maxOutputTokens=8192`, two-part contents — all verified, none mutates audio or text locally; their effect on recognition is a remote-model question |
+| Model selection | **D** | `gemini-3.5-flash-lite` (overridable via `AI_GEMINI_MEDIA_MODEL` → `AI_GEMINI_MODEL` → default, through the deprecation map). Which model is chosen is code-proven; whether it is adequate for Persian STT is external |
+| Retry / multiple Gemini requests | **C. NOT THE CAUSE** | Exactly ONE request per transcription: `_generate` is never retried inside the engine; `_run_stt` applies one `wait_for`; there is no engine-level fallback model. A failed STT raises `MediaError` (fail-closed), it never re-asks |
+| ProviderManager involvement (direct path) | **C. NOT THE CAUSE** | The direct branch returns **before** the `provider_manager is None` check and before `_provider_call`; the test suite asserts `provider.prompts == []`. (The §18 finding — second-model rewriting on the provider-mediated path — remains true only for analytical asks, which is the intended M1.6 design) |
+| Another model modifying the transcript | **C. NOT THE CAUSE (direct path)** | Same evidence: no second model is reachable between `MediaAnalysis.content` and the delivered text for explicit STT asks |
+| The recognition itself (engine output) | **D. CANNOT BE DETERMINED FROM CODE** | The transcript string is never recorded anywhere (`stt_engine_returned … chars=N` measures length only; `MediaAnalysis` is never persisted). Whether the wrong words were already produced by Gemini cannot be decided from the repository |
+
+**Summary of the classification:** no candidate cause **inside the repository's
+own code** survives as root cause — the audio, MIME, request, extraction,
+normalization, delivery and single-request properties are all **C**. The two
+items that remain are (1) the instruction-only language contract, a **B**
+contributing factor by structure, and (2) the recognition quality of the remote
+model itself, which is **D** — outside what repository evidence can decide.
+
+### 19.4 Repeated-run variance and the observability limit
+
+- **What code explains:** nothing on the direct path varies between runs for the
+  same audio and the same request text — the target resolution is
+  deterministic, the download is the same bytes, the engine sends one
+  deterministic request (`temperature=0.0`, no retry, no fallback). The direct
+  delivery is the transcript verbatim. Therefore **the repository's own code
+  contributes no run-to-run variance** to the direct-STT result.
+- **What code cannot decide:** the two live runs produced *different* outputs.
+  Since no local stage varies and no second model runs, the difference must
+  originate at or before the engine's return — i.e. inside Gemini's processing
+  of the request. That attribution (model sampling behavior, service-side
+  state) is **D**: it cannot be established from this repository, and this
+  document records no external claim about it.
+- **Observability inventory (what a trace currently proves):** the exact model
+  name, the container-derived MIME, the exact byte count in (`stt_engine_invoked
+  bytes=N`), the inline-vs-upload transport decision (≤15 MiB inline), the
+  request count (exactly one; a second line for the same request id would be
+  impossible without a code change), the transcript's post-normalization
+  **length** (`stt_engine_returned chars=N`), and that the delivered answer
+  length equals it on the direct path (`direct_stt_completed` traces
+  `media_type`, `chars`, `truncated` only).
+- **The decisive gap:** the **content** of the transcript is never captured —
+  no log, no persistence, no telemetry field. Consequently the repository can
+  never retroactively separate *the model misrecognized the audio* from *the
+  code altered the transcript* for a past run. This audit closes the second
+  half by source proof (§19.3), so the open question is purely the first. The
+  minimal future instrument (an implementation decision, **not** made here)
+  would be an opt-in debug capture of the engine's return at
+  `stt_engine_returned` — deliberately excluded from this pass, and never to
+  include raw audio or unconditional transcript logging.
+
+### 19.5 What the repository can and cannot prove
+
+**Can (proven from source):** the audio reaches Gemini byte-identical; the MIME
+is container-derived; validation is pre-decode and fail-closed; exactly one
+deterministic request is sent; extraction and normalization are value-safe;
+`MAX_STT_CHARS` cannot bite at live scales; the direct answer is the transcript
+verbatim with honest provenance; no second model, no ProviderManager and no
+retry exists on the direct path; no local run-to-run variance exists; the
+instruction is the only language input.
+
+**Cannot (from code alone):** what Gemini actually returned on the live runs;
+whether `gemini-3.5-flash-lite` is adequate for Persian speech; whether the
+static instruction (with no language parameter) is the right language contract;
+why two identical requests returned different strings; whether the model/MIME
+combination was accepted and processed as intended. All of these are
+**D** and belong to the external investigation.
+
+### 19.6 External-investigation boundary (Felo.ai) and the next step
+
+**Out of repository scope — Felo.ai investigates:** Gemini audio support and
+accepted MIME types for the configured model; Persian STT accuracy of
+`gemini-3.5-flash-lite` (and any better-suited audio model); the documented
+language-control parameters (e.g. whether a transcription-oriented request can
+pin the language/script deterministically, which our code does **not** send);
+sampling determinism for audio at `temperature=0`; any service-side behavior
+relevant to repeated identical requests.
+
+**In repository scope — the next implementation boundary (decision pending,
+nothing implemented):** (1) adopt whatever external findings recommend —
+pinning an adequate model via the existing `AI_GEMINI_MEDIA_MODEL` override,
+and/or strengthening `STT_INSTRUCTION` — each of which is a one-constant or
+one-string change inside `gemini_media_engine.py`; (2) optionally add the
+§19.4 opt-in observability so the next live run closes the attribution gap;
+(3) no change to `media_service.py` bounds, the direct-STT branch, or the
+delivery layer is warranted by this audit — every one of those is **C**.
 
 ---
 
