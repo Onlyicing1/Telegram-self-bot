@@ -539,7 +539,7 @@ def test_stt_controls_register_on_the_media_panel_only(monkeypatch):
 
     stt_scope = sorted(k for scope, k in inputs if scope == "ai_media_stt")
     assert stt_scope == ["stt_language", "stt_passes"]
-    assert "ai_stt_select_candidate" in actions
+    assert {"ai_stt_select_candidate", "ai_stt_test_candidate"} <= set(actions)
 
 
 def test_the_settings_advanced_panel_keeps_its_unrelated_controls():
@@ -678,9 +678,7 @@ async def test_the_candidate_action_refuses_an_unregistered_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "candidate_id", ["groq:whisper-large-v3", "groq:whisper-large-v3-turbo", "speechmatics:standard"],
-)
+@pytest.mark.parametrize("candidate_id", ["speechmatics:standard"])
 async def test_the_candidate_action_refuses_an_unimplemented_candidate(monkeypatch, candidate_id):
     rec = _Recorder(monkeypatch)
 
@@ -688,6 +686,18 @@ async def test_the_candidate_action_refuses_an_unimplemented_candidate(monkeypat
 
     assert rec.saved == []
     assert result is not None and "not available" in result[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_id", ["groq:whisper-large-v3", "groq:whisper-large-v3-turbo"])
+async def test_the_candidate_action_accepts_an_implemented_groq_candidate(monkeypatch, candidate_id):
+    """M2.1 implemented the Groq adapter, so those candidates select normally."""
+    rec = _Recorder(monkeypatch)
+
+    result = await rec.module._ai_stt_select_candidate_action(None, candidate_id, 1)
+
+    assert rec.saved == [(rec.owner, "stt_model", candidate_id)]
+    assert result is not None and result[1].startswith("✓")
 
 
 # ── 11. Runtime: the persisted selection reaches the live STT engine ───
@@ -743,7 +753,7 @@ def test_an_unimplemented_active_candidate_stays_fail_closed(monkeypatch):
     monkeypatch.setenv(API_KEY_VAR, API_KEY)
 
     status = apply_stt_settings(
-        control_plane.engine_settings({"stt_model": "groq:whisper-large-v3"})
+        control_plane.engine_settings({"stt_model": "speechmatics:standard"})
     )
 
     assert status["configured"] is True

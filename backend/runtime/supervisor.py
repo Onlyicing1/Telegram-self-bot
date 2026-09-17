@@ -306,20 +306,20 @@ class RuntimeSupervisor:
         """Install the owner's persisted STT settings onto the live STT engine.
 
         The owner's stored selection is resolved by the STT CONTROL PLANE
-        (``backend/ai/stt_control_plane.engine_settings``) into the three plain
-        values the existing engine seam accepts — this is the ONLY conversion
-        site, so the engine still never reads the store and never learns an
-        owner id. Failures (and an unknown durable state) are logged, never
-        fatal: the engine then simply keeps the bootstrap configuration it was
-        provisioned with, which is the documented degradation for an unreadable
-        store.
+        (``backend/ai/stt_control_plane.parse_stt_config``) and built by the ONE
+        candidate → engine seam
+        (``backend/services/stt_engine_factory.apply_stt_config``) — this is the
+        ONLY conversion site, so the engine still never reads the store and never
+        learns an owner id. Failures (and an unknown durable state) are logged,
+        never fatal: the engine then simply keeps the bootstrap configuration it
+        was provisioned with, which is the documented degradation for an
+        unreadable store.
         """
         try:
             if not self.owner_id:
                 return
             from backend.ai import config_store
-            from backend.ai.stt_control_plane import engine_settings
-            from backend.services.gemini_media_engine import apply_stt_settings
+            from backend.services.stt_engine_factory import apply_stt_config
             config = await config_store.get_config(self.owner_id)
             if config.get(config_store.DEGRADED_READ_KEY):
                 logger.warning(
@@ -327,12 +327,14 @@ class RuntimeSupervisor:
                     "provisioned bootstrap settings",
                 )
                 return
-            status = apply_stt_settings(engine_settings(config))
+            status = apply_stt_config(config)
             trace(
                 "STT_SETTINGS_APPLIED",
                 configured=status.get("configured"),
+                provider=status.get("provider") or "-",
                 stt_model=status.get("stt_model") or "-",
                 stt_passes=status.get("stt_passes", "-"),
+                reason=status.get("reason") or "-",
             )
         except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
             trace_exception("STT_SETTINGS_APPLY_FAILED", exc)

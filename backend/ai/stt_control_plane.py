@@ -7,9 +7,16 @@ its EXECUTION half:
         ↓
     this module: registered candidates + the owner's persisted selection
         ↓
-    (a later phase: the provider/model test + fallback manager)
+    ``backend/services/stt_engine_factory``: the ONE candidate → engine seam
         ↓
     the EXISTING ``media_service.set_stt_engine`` seam
+
+Two capability-level seams sit beside this module and neither is duplicated
+here: the provider test (``backend/ai/stt_provider_probe.py``) can probe a
+registered candidate and reports credential presence SEPARATELY from a real
+successful request, and the engine factory resolves a candidate to its own
+provider's adapter. The ordered active → fallback → cooldown manager remains a
+later phase.
 
 Nothing here touches ``media_service``, a provider adapter, Telegram, the
 database or the network. The module is STATELESS: it describes what CAN be
@@ -26,8 +33,10 @@ Two concepts are kept apart on purpose:
   candidate.
 * **Credential** — where the provider's API key lives (ENV) is NOT part of a
   candidate and is NOT part of its status here. A key existing is not evidence
-  that a candidate works; only a real test can say that, and the test manager
-  belongs to a later phase.
+  that a candidate works; only a real request can say that, which is exactly why
+  the provider test (``backend/ai/stt_provider_probe.py``) keeps "a credential is
+  present" and "the provider answered" as separate states — and why this module
+  reports neither.
 
 Storage contract (the smallest backward-compatible migration):
 
@@ -145,16 +154,16 @@ def _build_candidates() -> tuple[SttCandidate, ...]:
             provider="groq",
             model="whisper-large-v3",
             label="Groq Whisper Large-v3",
-            implemented=False,
-            note="capability registered — adapter not implemented yet",
+            implemented=True,
+            note="the Groq transcription adapter (highest accuracy of the pair)",
         ),
         SttCandidate(
             candidate_id="groq:whisper-large-v3-turbo",
             provider="groq",
             model="whisper-large-v3-turbo",
             label="Groq Whisper Large-v3 Turbo",
-            implemented=False,
-            note="capability registered — adapter not implemented yet",
+            implemented=True,
+            note="the Groq transcription adapter (faster, lower accuracy)",
         ),
         SttCandidate(
             candidate_id="speechmatics:standard",
@@ -279,12 +288,15 @@ class SttControlPlane:
         return "candidate"
 
     def engine_model(self) -> str:
-        """The model value the EXISTING STT seam understands.
+        """The model value the GEMINI leg of the EXISTING STT seam understands.
 
         A legacy value is returned VERBATIM (never substituted, so a legacy
         configuration keeps transcribing with the same model it used before); a
-        non-Gemini provider has no execution path yet and maps to the empty
-        value, the boundary's already fail-closed "no dedicated STT model" state.
+        candidate of another provider has no Gemini model, so it maps to the empty
+        value — the boundary's already fail-closed "no dedicated STT model" state.
+        The engine factory resolves such a candidate to ITS OWN provider's adapter
+        instead (``backend/services/stt_engine_factory.py``); this conversion is
+        therefore only ever applied to the Gemini leg and to legacy values.
         """
         if self.legacy_model:
             return self.legacy_model

@@ -22,12 +22,19 @@ other AI setting uses, no second store, no new table, no new column. API keys
 stay in ENV: nothing here reads or writes a credential, and no label or prompt
 names an environment variable.
 
-The engine seam is untouched. ``apply_stt_settings_now`` reads the store,
-converts the persisted selection through the control plane into the three plain
-values the EXISTING media boundary understands and hands them to
-``gemini_media_engine.apply_stt_settings`` — so no Telegram object, owner id,
-chat id, message id or caption can reach the engine, and a Telegram change is
-effective on the next media operation with no redeploy and no restart.
+The engine seam is untouched. ``apply_stt_settings_now`` reads the store and
+hands the persisted selection to the ONE candidate → engine seam
+(``backend/services/stt_engine_factory``), which builds the engine of the
+SELECTED candidate's own provider and installs it through the EXISTING media
+boundary — so no Telegram object, owner id, chat id, message id or caption can
+reach an engine, and a Telegram change is effective on the next media operation
+with no redeploy and no restart.
+
+Each candidate also shows its PROVIDER-TEST state (``backend/ai/stt_provider_probe``)
+and can be probed from the panel with one bounded request. The panel never claims
+health from the mere existence of a credential: an untested candidate says so, a
+missing credential is its own state, and only a request that returned a non-empty
+transcript is reported as passed.
 
 Kept in its own module because the panels, the inputs and their validation are
 one cohesive unit and the AI panel module is already at the file-tool size
@@ -38,6 +45,7 @@ from __future__ import annotations
 import logging
 import re
 
+from backend.ai import stt_provider_probe
 from backend.ai.stt_control_plane import (
     DEFAULT_CANDIDATE_ID,
     STORAGE_KEY_ACTIVE,
@@ -69,7 +77,13 @@ _STT_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 
 def stt_selection_line(config: dict) -> str:
-    """The speech-to-text state as ONE line, never raising on a bad value."""
+    """The speech-to-text state as ONE line, never raising on a bad value.
+
+    Carries the active candidate's PROVIDER-TEST state as well as the selection,
+    so the hub distinguishes "selected but never tested" from "selected and
+    verified" without opening the panel — and never implies health from a
+    configuration value alone.
+    """
     if _unreadable(config):
         return "Speech-to-Text · unavailable (database read failed)"
     plane = parse_stt_config(config)
@@ -77,10 +91,13 @@ def stt_selection_line(config: dict) -> str:
     if plane.is_legacy:
         return f"Speech-to-Text · legacy model `{plane.legacy_model}` · unresolved"
     label = candidate.label if candidate else DEFAULT_CANDIDATE_ID
+    state = (            stt_provider_probe.candidate_state_row(candidate)
+        if candidate else stt_provider_probe.state_label("")
+    )
     passes = plane.passes
     return (
         f"Speech-to-Text · {label} · {plane.language or 'auto'} · "
-        f"{passes} pass{'es' if passes > 1 else ''}"
+        f"{passes} pass{'es' if passes > 1 else ''} · {state}"
     )
 
 
@@ -93,16 +110,16 @@ def _unreadable(config: dict) -> bool:
 async def apply_stt_settings_now(owner_id: int) -> bool:
     """Hand the owner's persisted STT selection to the live media engine.
 
-    The HANDLER reads the store and converts the persisted selection through the
-    control plane; the engine never learns an owner id and never sees a Telegram
-    object. Returns whether a live STT engine was reconfigured (a runtime with no
-    credential stays fail-closed).
+    The HANDLER reads the store; the engine factory converts the persisted
+    selection into the SELECTED candidate's own provider engine — the engine
+    never learns an owner id and never sees a Telegram object. Returns whether a
+    live STT engine was provisioned (a missing credential, and a candidate with
+    no execution path, stay fail-closed).
     """
     from backend.ai.config_store import get_config
-    from backend.ai.stt_control_plane import engine_settings
-    from backend.services.gemini_media_engine import apply_stt_settings
+    from backend.services.stt_engine_factory import apply_stt_config
 
-    status = apply_stt_settings(engine_settings(await get_config(owner_id)))
+    status = apply_stt_config(await get_config(owner_id))
     return bool(status.get("configured"))
 
 
@@ -235,17 +252,24 @@ async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
     for index, candidate in enumerate(ranked, start=1):
         role = plane.candidate_role(candidate.candidate_id)
         suffix = " · active" if role == "active" else ""
-        if not candidate.implemented:
-            suffix += f" · {candidate.status_word().lower()}"
+        suffix += f" · {    stt_provider_probe.candidate_state_row(candidate)}"
         lines.append(f"{index}. {candidate.label}{suffix}")
     lines.append("")
     lines.append("_Pick a registered candidate — no model names to type._")
+    lines.append("_Test runs one bounded request to that candidate and reports the result._")
 
     builder = InlinePanelBuilder()
     for candidate in all_candidates():
-        if not candidate.implemented or candidate.candidate_id == plane.active_id:
+        if not candidate.implemented:
             continue
-        builder.add_row(f"Use {candidate.label}", f"action:ai_stt_select_candidate:{candidate.candidate_id}")
+        buttons: list[tuple[str, str]] = []
+        if plane.is_legacy or candidate.candidate_id != plane.active_id:
+            buttons.append((
+                f"Use {candidate.label}",
+                f"action:ai_stt_select_candidate:{candidate.candidate_id}",
+            ))
+        buttons.append(("Test", f"action:ai_stt_test_candidate:{candidate.candidate_id}"))
+        builder.add_buttons(*buttons)
     builder.add_row("Language…", f"input:ai_media_stt:{STORAGE_KEY_LANGUAGE}")
     builder.add_row("Recognition passes…", f"input:ai_media_stt:{STORAGE_KEY_PASSES}")
     _nav_buttons(builder)
@@ -299,6 +323,46 @@ async def _ai_stt_select_candidate_action(event, extra: str, chat_id: int) -> tu
     await update_setting(owner, STORAGE_KEY_ACTIVE, storage_value(candidate.candidate_id))
     await apply_stt_settings_now(owner)
     return await _stt_panel_with_notice(f"✓ Speech-to-Text now uses {candidate.label}")
+
+
+# ── Provider probe (one bounded request per candidate) ─────────────────
+
+
+def test_notice(result: "stt_provider_probe.SttTestResult") -> str:
+    """ONE bounded owner-facing notice for a finished probe.
+
+    Never carries a credential, a transcript or a Telegram identifier: the state
+    wording, the bounded failure class, the elapsed time and the probe's own
+    bounded explanation are all that is shown.
+    """
+    candidate = get_candidate(result.candidate_id)
+    name = candidate.label if candidate else (result.candidate_id or "candidate")
+    state = stt_provider_probe.SttTestState
+    if result.state == state.PASSED.value:
+        return f"\u2713 {name} · {result.summary()}"
+    if result.state == state.CREDENTIAL_MISSING.value:
+        return f"! {name} · {result.summary()} — nothing was sent."
+    if result.state == state.NOT_IMPLEMENTED.value:
+        return f"! {name} · {result.state_label()} on this runtime."
+    detail = f" — {result.detail}" if result.detail else ""
+    return f"\u00d7 {name} · {result.summary()}{detail}"
+
+
+async def _ai_stt_test_candidate_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Probe ONE registered candidate with one bounded request.
+
+    The payload is the provider test's own bounded in-process audio; a candidate
+    the registry does not know is refused without a request, and an unimplemented
+    or credential-less candidate is reported honestly instead of being probed into
+    a misleading success. The refreshed panel then shows the recorded state.
+    """
+    candidate = get_candidate(extra)
+    if candidate is None:
+        return await _stt_panel_with_notice(
+            "\u00d7 Unknown transcription candidate — nothing was tested."
+        )
+    result = await stt_provider_probe.test_candidate(candidate.candidate_id)
+    return await _stt_panel_with_notice(test_notice(result))
 
 
 # ── Behavioral settings (bounded, owner-editable) ──────────────────────
@@ -376,6 +440,7 @@ def register(client=None, owner_id: int = 0) -> None:
         register_panel("ai_media_stt", _ai_media_stt_panel_handler, parent="ai_media", title="Speech-to-Text")
         register_inline_builder("ai_media_stt", _ai_media_stt_inline_builder)
         register_action("ai_stt_select_candidate", _ai_stt_select_candidate_action)
+        register_action("ai_stt_test_candidate", _ai_stt_test_candidate_action)
         register_input("ai_media_stt", STORAGE_KEY_LANGUAGE, {
             "handler": _ai_stt_language_input,
             "prompt": (
