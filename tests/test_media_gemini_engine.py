@@ -627,7 +627,8 @@ def test_the_supervisor_startup_path_provisions_the_media_engines():
     assert "_provision_media_engines()" in source
 
 
-def test_the_supervisor_hook_provisions_and_clears_the_seams(monkeypatch):
+@pytest.mark.asyncio
+async def test_the_supervisor_hook_provisions_and_clears_the_seams(monkeypatch):
     from backend.runtime.supervisor import RuntimeSupervisor
 
     supervisor = RuntimeSupervisor({
@@ -635,11 +636,13 @@ def test_the_supervisor_hook_provisions_and_clears_the_seams(monkeypatch):
         "OWNER_ID": OWNER, "TZ": "UTC",
     })
 
-    supervisor._provision_media_engines()
+    # Awaited: the hook is async because it also installs the owner's persisted
+    # STT settings through the existing config store after provisioning.
+    await supervisor._provision_media_engines()
     assert media_service.ocr_available() is False
 
     monkeypatch.setenv("AI_GEMINI_API_KEY", API_KEY)
-    supervisor._provision_media_engines()
+    await supervisor._provision_media_engines()
     assert media_service.ocr_available() is True
     assert media_service.stt_available() is True
 

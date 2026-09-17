@@ -100,7 +100,7 @@ import base64
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -481,6 +481,113 @@ def resolve_stt_passes() -> tuple[int, str]:
         logger.warning("GEMINI_MEDIA_ENGINE_STT_PASSES_INVALID reason=not-an-integer")
         return 1, STT_PASSES_ENV_VAR
     return max(1, min(value, STT_MAX_PASSES)), STT_PASSES_ENV_VAR
+
+
+#: ── The OWNER'S persisted STT settings (the AI Settings surface) ──
+#:
+#: The three behavioral STT settings are owned by the owner's persisted AI
+#: configuration (``ai_config`` through ``backend/ai/config_store.py``) and edited
+#: from Telegram (AI -> Settings -> Advanced). The three keys are ``stt_model``,
+#: ``stt_language`` and ``stt_passes``. This module never reads that store
+#: and never learns an owner id: the CALLER — the runtime supervisor at startup,
+#: the AI Settings handler after a save — reads the store and hands the plain
+#: values in. The credential and the general media model keep their existing ENV
+#: resolution, because those are deployment concerns rather than owner settings.
+
+#: The default of each setting when the owner has configured nothing. Every one
+#: of them is a REAL behavior, not an absence marker: no dedicated model is the
+#: general media model, an empty language is automatic detection, and one pass is
+#: the single-pass route.
+STT_SETTING_DEFAULTS: dict[str, Any] = {
+    "stt_model": "",
+    "stt_language": "",
+    "stt_passes": 1,
+}
+
+#: The documented value of the language setting that means "detect the language
+#: automatically". The Settings control writes it explicitly when the owner asks
+#: for automatic detection (Telegram cannot send an empty message, and an empty
+#: stored value has to stay what it is: nothing configured). It becomes the empty
+#: engine value, which is what makes the request send no ``language_codes``.
+STT_LANGUAGE_AUTO = "auto"
+
+
+def stt_settings_from(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The three behavioral STT settings as ENGINE values → ``{key: value}``.
+
+    Pure and deterministic: the owner's stored values are the input (the caller
+    reads them through the existing config store), a missing key yields the
+    documented default, and nothing here reads ENV, the database or Telegram. A
+    model id passes through the project's existing deprecation map — a retired
+    alias is substituted exactly as it is for every other model selection, and an
+    unknown id is returned verbatim, never replaced by an invented one. The
+    language ``auto`` becomes the empty value, and the pass count is held inside
+    ``1..STT_MAX_PASSES`` as the engine's own invariant (the Settings control
+    rejects an out-of-range value instead of storing one).
+    """
+    config = config or {}
+    model = str(config.get("stt_model") or "").strip()
+    if model:
+        model = resolve_model("gemini", model)
+    language = str(config.get("stt_language") or "").strip()
+    if language.lower() == STT_LANGUAGE_AUTO:
+        language = ""
+    try:
+        passes = int(config.get("stt_passes"))
+    except (TypeError, ValueError):
+        passes = STT_SETTING_DEFAULTS["stt_passes"]
+    return {
+        "stt_model": model,
+        "stt_language": language,
+        "stt_passes": max(1, min(passes, STT_MAX_PASSES)),
+    }
+
+
+def apply_stt_settings(stt_settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Rebuild the STT seam's engine from the owner's PERSISTED STT settings.
+
+    ONE entry point, called by the two places that own this state: the runtime
+    supervisor at startup (so the persisted values are in effect from the first
+    transcription) and the AI Settings handler immediately after a save (so a
+    Telegram change is effective on the NEXT media operation, with no redeploy
+    and no restart). The caller reads the store; this module only receives plain
+    values, so no Telegram object, owner id, chat id or message id can reach the
+    engine, and there is no second wiring site that could construct an engine.
+
+    The credential and the general media model are deployment configuration and
+    keep their existing resolution. A runtime without a credential stays exactly
+    as fail-closed as before: nothing is provisioned and the boundary keeps
+    reporting the missing engine. Never raises — a settings change must not be
+    able to break either the panel or startup.
+    """
+    try:
+        api_key, key_env_var = resolve_api_key()
+        if not api_key:
+            return {"configured": False, "reason": "no Gemini credential"}
+        model, _model_env_var = resolve_media_model()
+        resolved = stt_settings_from(stt_settings)
+        engine = GeminiMediaEngine(
+            api_key,
+            model,
+            key_env_var=key_env_var,
+            stt_model=resolved["stt_model"],
+            stt_language=resolved["stt_language"],
+            stt_passes=resolved["stt_passes"],
+        )
+        media_service.set_stt_engine(engine)
+        logger.info(
+            "GEMINI_MEDIA_ENGINE_STT_SETTINGS_APPLIED stt_model=%s stt_language=%s "
+            "stt_passes=%d",
+            resolved["stt_model"] or "general-media-model",
+            resolved["stt_language"] or "auto",
+            resolved["stt_passes"],
+        )
+        return {"configured": True, **resolved}
+    except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
+        logger.warning(
+            "GEMINI_MEDIA_ENGINE_STT_SETTINGS_FAILED error=%s", type(exc).__name__,
+        )
+        return {"configured": False, "reason": type(exc).__name__}
 
 
 #: The smallest budget a leg may START with. Below it the operation is reported

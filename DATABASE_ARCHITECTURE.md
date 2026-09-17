@@ -401,9 +401,13 @@ parameters.
 > **Current status:** The `ai_config` table is referenced by
 > `backend/ai/config_store.py` but may not exist in the live database.
 > The initial migration (`20260805075707`) creates the base columns but
-> does NOT include `trigger_en` or `trigger_fa`. Migration
-> `20260827000002_add_ai_config_trigger_columns.sql` (idempotent) now
-> adds them — pending manual application. Until it is applied, the
+> does NOT include `trigger_en`, `trigger_fa`, `show_question` or the
+> three Gemini STT settings (`stt_model`, `stt_language`,
+> `stt_passes`). Migrations
+> `20260827000002_add_ai_config_trigger_columns.sql`,
+> `20260913000000_add_ai_config_show_question.sql` and
+> `20260917000001_add_ai_config_stt_settings.sql` (all idempotent) add
+> them — pending manual application. Until they are applied, the
 > runtime silently falls back to in-memory storage when the table or
 > columns are missing. See
 > [§19 Known Inconsistencies](#19-known-inconsistencies).
@@ -424,6 +428,9 @@ parameters.
 | `trigger_en` | `text` | YES | `NULL` | English trigger word (case-insensitive matching). NULL = not set. |
 | `trigger_fa` | `text` | YES | `NULL` | Persian trigger word (exact matching). NULL = not set. |
 | `show_question` | `boolean` | NO | `false` | Presentation-only "Show my message in AI replies" preference. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload); toggled from AI → Settings. Consumed only by the Telegram reply renderer. Added by `20260913000000_add_ai_config_show_question.sql` — pending manual application. |
+| `stt_model` | `text` | YES | `NULL` | Dedicated Gemini transcription model. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), edited from AI → Settings → Advanced, consumed at runtime by `services/gemini_media_engine.py` (`stt_settings_from` / `apply_stt_settings`). NULL = the general media model answers the STT instruction. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
+| `stt_language` | `text` | YES | `NULL` | BCP-47 language hint for transcription (e.g. `fa-IR`). Same read/write/consumer path as `stt_model`. NULL = automatic language detection. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
+| `stt_passes` | `integer` | NO | `1` | Bounded number of recognition passes (CHECK `BETWEEN 1 AND 3`; 1 = the single-pass route). Same read/write/consumer path as `stt_model`. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
 | `last_request_at` | `timestamptz` | YES | `NULL` | Timestamp of the last AI request. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `last_latency_ms` | `real` | YES | `NULL` | Latency of the last AI request in ms. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `created_at` | `timestamptz` | YES | `now()` | When the config row was created |
@@ -1076,6 +1083,31 @@ application still serves the default (`false`) and the toggle degrades
 to the in-memory fallback exactly like every other `ai_config` key.
 No second preference store exists; the RAM-only `ExecutionTelemetry`
 store is NOT a source of truth for this preference.
+
+### 19.2b `ai_config` — the three Gemini STT settings
+
+**Severity:** Medium
+
+**Problem:** `config_store.py` includes `stt_model`, `stt_language` and
+`stt_passes` (the owner-editable speech-to-text behavior settings,
+edited from AI → Settings → Advanced) in every `ai_config` upsert
+payload and merges them in `get_config` with the defaults (empty model,
+empty language, one pass). The base migration does not create these
+columns. As with the trigger columns (§19.1) and `show_question`
+(§19.2a), an un-migrated database makes the whole upsert degrade to the
+in-memory fallback, so a Telegram change would be lost on restart.
+
+**Resolution [MIGRATION CREATED]:** Migration
+`20260917000001_add_ai_config_stt_settings.sql` adds
+`stt_model TEXT`, `stt_language TEXT` and
+`stt_passes INTEGER NOT NULL DEFAULT 1` (plus the
+`ai_config_stt_passes_range` CHECK `BETWEEN 1 AND 3`) — idempotent, with
+rollback SQL, pending manual application. Until it is applied, the
+application still serves the defaults (the single-pass route) and the
+Settings controls degrade to the in-memory fallback exactly like every
+other `ai_config` key. These values are behavior, not deployment
+configuration: no ENV variable is required for them and no second
+settings store exists.
 
 ### 19.3 `panel_settings` — 10 columns missing from migrations
 

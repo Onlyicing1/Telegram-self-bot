@@ -129,18 +129,25 @@ async def test_advanced_panel_holds_technical_controls_in_plain_terms():
 
 def test_registration_adds_advanced_panel_and_keeps_inputs_unique():
     from backend.bot.handlers import ai as ai_module
+    from backend.bot.handlers import ai_stt_settings as ai_stt_module
 
     panels, inputs = [], []
     with patch.object(ai_module, "register_panel", side_effect=lambda *a, **k: panels.append(a[0])), \
          patch.object(ai_module, "register_action"), \
          patch.object(ai_module, "register_inline_builder"), \
          patch.object(ai_module, "register_input",
+                      side_effect=lambda scope, key, cfg: inputs.append((scope, key))), \
+         patch.object(ai_stt_module, "register_input",
                       side_effect=lambda scope, key, cfg: inputs.append((scope, key))):
         ai_module.register(None, 0)
+        ai_stt_module.register(None, 0)
 
     assert "ai_settings_adv" in panels
     keys = [k for scope, k in inputs if scope == "ai_settings"]
-    assert len(keys) == len(set(keys)) == 6
+    # 6 chat/personality settings + the 3 Voice transcription settings, all on
+    # the SAME panel via the SAME registry — no duplicate input keys.
+    assert len(keys) == len(set(keys)) == 9
+    assert {"stt_model", "stt_language", "stt_passes"} <= set(keys)
 
 
 # ── 4. Input completion restores the panel in ONE edit ──

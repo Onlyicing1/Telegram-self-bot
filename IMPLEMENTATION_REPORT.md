@@ -1,438 +1,294 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.7e: the bounded multi-pass STT accuracy seam
+## Latest phase — M1.8: Telegram-manageable Gemini STT settings (owner config, no redeploy)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-17.
 
 ### Current stage
 
-M1.7e. The two live STT problem classes stay separate, and this phase acts on the
-FIRST one only — **without claiming it is solved**:
+M1.8. The three BEHAVIORAL speech-to-text settings are now **owner settings**
+persisted through the existing AI configuration path and edited from Telegram —
+they are no longer deployment configuration that requires editing Render ENV and
+redeploying.
 
-| Class | Status before this phase | Status after this phase |
-|---|---|---|
-| **A. Recognition quality** (`INVESTIGATION.md` §19: a transcript WAS produced, but with wrong words; the same Persian voice note came back differently across runs) | open. §19 proved the repository's own code contributes **no** run-to-run variance, and that the difference must originate at or before the engine's return — i.e. at or inside the provider. No local mechanism acted on it. | **addressed by an opt-in mechanism, NOT declared fixed.** The engine can now recognise the same bytes up to three times under ONE deadline and reconcile the hypotheses with a pure STT-only consensus, and an operator benchmark exists that measures whether repeated passes differ at all and whether consensus improves WER/CER. The seam is OFF by default, and **no accuracy improvement is claimed** — that claim is reserved for the live benchmark (M1.7f). |
-| **B. Request timeout** (`INVESTIGATION.md` §20: no transcript at all, because the engine's own HTTP bound expired) | addressed by M1.7c (one operation deadline, documented `uri` representation, classified failures, one bounded retry/fallback, bounded cleanup) | **unchanged** — the multi-pass route reuses that deadline and that discipline rather than adding a second one. |
+| Setting | Stored key (`ai_config`) | Default (nothing configured) | Meaning of the default |
+|---|---|---|---|
+| Gemini STT model | `stt_model` | empty | the general media model answers the STT instruction |
+| Gemini STT language hint | `stt_language` | empty | automatic language detection (no `language_codes` sent) |
+| Gemini STT recognition passes | `stt_passes` | `1` | the existing single-pass route |
 
-The phase adds **one new accuracy mechanism, one operator tool and no new
-architecture**: the media boundary, the deterministic target resolution, the
-direct-STT answer contract, the prompt/context layers, the provider mesh, the
-route selection, the request field inventory (PART 1 of M1.7c) and every existing
-dependency are untouched.
-
-### Commit lineage
-
-| Commit | Role | Files |
-|---|---|---|
-| `5b3f6d78a8456581b02161443348347c0d5d5b85` (`fix(stt): bound the dedicated transcription operation to one deadline`) | **starting HEAD** (== `origin/main` when this phase began; the working tree was clean) | (M1.7c) |
-| the implementation commit of this phase (SHA in the hand-off response; `git log -1 --format=%H` re-verifies it) | M1.7e: the bounded multi-pass accuracy seam, the STT-only consensus, the repeat-run benchmark and this report | `backend/services/stt_consensus.py` (new), `backend/services/gemini_media_engine.py`, `backend/tools/__init__.py` (new), `backend/tools/stt_benchmark.py` (new), `tests/test_stt_consensus.py` (new), `tests/test_media_stt_multipass.py` (new), `tests/test_media_stt_benchmark.py` (new), `tests/test_media_dedicated_stt.py`, `tests/test_media_gemini_engine.py`, `tests/test_media_stt_reliability.py`, `IMPLEMENTATION_REPORT.md` |
+Reached from **AI → Settings**: one state line on the personal surface, the three
+controls on the existing **Advanced** sub-panel. No new panel, category, store,
+service or scheduler was created.
 
 | Item | Value |
 |---|---|
-| `INVESTIGATION.md` | **unchanged** — the evidence base is §19 (class A) and §20 (class B); this phase implements, it does not re-investigate |
-| Media boundary (`media_service.py`, `backend/ai/media.py`, `backend/telegram_api/media.py`), `media_ai_service.py`, `dispatcher.py`, `ai_unified.py` | **unchanged** |
-| `ProviderManager`, adapters, registry, `ToolRegistry`, `ToolExecutor`, `RuntimeSupervisor`, `vision()`, prompt/context/memory/tool layers | **untouched** |
-| Supabase / `DATABASE_ARCHITECTURE.md` / Save / Task system / Scheduler / OCR / video / UI | **untouched** |
-| Dependencies (`backend/requirements.txt`), `render.yaml`, `Procfile`, ENV files, secrets | **unchanged** — no new package, no new credential, no new required variable |
-| Live Telegram verification | **NOT PERFORMED** (no session, credential or traffic here) |
-| Live Gemini verification | **NOT PERFORMED** — every HTTP interaction in this phase was a scripted in-process transport |
+| **Starting HEAD** | `01ff211027e3b9c4f395189710c9ec08940f7742` — `feat(stt): add the bounded multi-pass STT accuracy seam` (== `origin/main`; working tree clean at the start of this phase) |
+| **Implementation commit** | the single commit of this phase (`git log -1 --format=%H` re-verifies it; recorded in the hand-off response) |
+| **Database migration required** | **YES** — three additive `ai_config` columns. Created as a migration file, **NOT executed**: applying it to the live Supabase project is a manual owner action. |
+| **Accuracy claim** | **NONE.** This phase makes recognition behavior configurable. It does not make recognition more accurate, and nothing here measures quality. |
+| **Live Telegram verification** | **NOT PERFORMED** (no session or traffic in this environment) |
+| **Live Gemini verification** | **NOT PERFORMED** (every engine interaction in this phase was a scripted in-process transport) |
 
-### Purpose of this phase (what §19 proved, and what follows from it)
+### Commit lineage
 
-`INVESTIGATION.md` §19 established, from source, five facts that decided this
-phase's design:
-
-1. the direct-STT path delivers the engine's transcript **verbatim** — no
-   normalization, no second model, no ProviderManager round (`provider.prompts == []`
-   is asserted by `tests/test_media_direct_stt.py`);
-2. the audio reaches the provider **byte-identical** (no decode/re-encode, no
-   transcoding step exists in the tree);
-3. for the SAME audio and the SAME request, **nothing in the repository varies
-   between runs** — so the observed difference came from the provider side;
-4. therefore the only remaining lever inside this repository is **which request
-   is sent** (model, language, mode — M1.5c/M1.7, all already exercised) and
-   **what is done with more than one answer** (this phase);
-5. the transcript **content** is never captured anywhere, which is why §19.4 could
-   not separate "the model misrecognized" from "the code altered the text" — and
-   why this phase adds an operator benchmark instead of a second logging channel.
-
-### Investigation results this phase added (design evidence, not live evidence)
-
-**1. Do repeated passes actually produce useful independent information? — NOT
-YET PROVEN, and the repository now records exactly what would decide it.**
-
-* On the **general route** the request carries `temperature=0.0` (M1.5c,
-  unchanged). A deterministic-decoding request is *expected* to return identical
-  text for identical bytes, i.e. three passes would agree and the consensus would
-  be a byte-exact no-op. That possibility is now recorded rather than assumed:
-  the consensus line reports `changed=`/`dropped=`, and `0/0` on repeated live
-  runs means "no independent information".
-* On the **dedicated route** the documented transcription contract carries no
-  sampling control at all (M1.7 deliberately introduces none), so that model's
-  determinism for one audio file is **[UNKNOWN]** from here.
-* §19.4's two differing transcripts are **not** proof of provider stochasticity on
-  one route: the dedicated route landed *between* the two observations (`da05ace`),
-  and neither run recorded its route, model or language. Establishing that the
-  runs shared a route now costs nothing — `GEMINI_MEDIA_ENGINE` carries `model`,
-  `transport`, `language`, `mode`, `bytes`, `chars`, `attempts`, `stt_passes` and
-  `failure_class`.
-
-**2. Is STT-only consensus (Design A) technically feasible? — Yes, and it has a
-hard minimum pass count of THREE.**
-
-The rule is a strict majority per aligned position. With **two** hypotheses every
-column is either 2-0 (unanimous ⇒ nothing to change) or 1-1 (a tie ⇒ resolves to
-the scaffold), so a two-pass result is *byte-identical to the first pass by
-construction*: two passes buy a second model call and can change nothing. That is
-a property of the rule, not tuning, and it is now asserted directly
-(`test_two_passes_are_byte_identical_to_the_first`). Three passes are the smallest
-count that can outvote one dissenting reading (2 of 3). Two is still accepted
-because the repeat-run consistency measurement of the benchmark needs it.
-
-**3. Is model-based reconciliation (Design B) admissible? — Evaluated and NOT
-implemented.**
-
-It would put a **second language model** inside the direct-STT path, which
-`INVESTIGATION.md` §19.2/§19.3 and the M1.6 contract forbid, and it would create
-the exact failure mode this task warns about: a model asked to "resolve
-disagreements" can rewrite freely, invent fluent content and silently change the
-speaker's words. It is deferred, not rejected forever: it becomes worth
-reconsidering only if the live benchmark shows STT-only consensus leaves a
-significant residual disagreement rate **and** a bounded, non-rewriting
-reconciliation contract (disagreement spans only, unanimous tokens frozen, no
-context) can be specified and tested first.
-
-**4. Hallucination risk of the implemented mechanism, and how it is bounded.**
-
-| Risk | Mitigation in the code |
+| Commit | Role |
 |---|---|
-| Inventing words | every emitted token is a hypothesis' own surface token; a word only one reading produced is never emitted (insertions are unrepresentable); `test_every_emitted_token_exists_in_at_least_one_hypothesis` |
-| Rewriting/cleaning the transcript | the consensus module never emits its comparison key; unanimity returns the first pass **byte-exact**; there is no second model, prompt or glossary anywhere |
-| Preferring a longer/more "natural" reading | the scaffold is the **median-length** reading, never the longest; a strict majority decides each position, and a tie keeps the scaffold |
-| Losing a word the majority heard | found by this phase's own tests as a real defect of the first design: with pass 1 as the word grid, a length-mangled first reading made two agreeing readings' words "insertions" and dropped a word both of them heard (the §19.1 example lost `خلاصه`). The grid is therefore the median-length reading, with a regression test (`test_a_first_pass_with_a_mangled_length_cannot_set_the_word_grid`) |
-| Correlated errors producing a confident wrong majority | **not mitigable inside one model**: two correlated mis-recognitions outvote one correct reading. This is the fundamental limit of multi-pass, it is stated in the module docstring, and it is the reason the seam is opt-in and benchmark-gated |
-| A transport failure masquerading as a recognition result | a failed pass contributes no hypothesis; pass accounting is separate from attempt accounting (see below) |
-
-### Exact STT architecture after implementation
-
-```
-explicit STT request  ("stt" / "sst" / "transcribe" / …; UNCHANGED)
-→ dispatcher._media_target / _try_media_analysis                (UNCHANGED)
-→ media_ai_service.answer_media_request                         (UNCHANGED)
-→ media_service.resolve_media_message → analyze_media           (UNCHANGED: deterministic target, bounded
-                                                                 download, MIME/container/stream validation,
-                                                                 to_thread(engine.transcribe), cap, cleanup)
-→ GeminiMediaEngine.transcribe                                  (the seam: configuration decides the route)
-     ├─ AI_GEMINI_STT_PASSES unset / 1  → the single-pass routes exactly as M1.7c:
-     │      AI_GEMINI_STT_MODEL unset ⇒ POST /models/<model>:generateContent
-     │      AI_GEMINI_STT_MODEL set   ⇒ POST /v1beta/interactions (Files API uri, inline fallback)
-     └─ AI_GEMINI_STT_PASSES = 2 or 3  → the bounded multi-pass route:
-            ONE upload (dedicated) / inline-or-one-upload (general)
-            → N sequential POSTs against that same input, ONE deadline
-            → reconcile_hypotheses([...])  (pure, STT-only)
-→ MediaAnalysis.content == the (reconciled) transcript           (UNCHANGED)
-→ dispatcher._build_fast_path_result → delivery                  (UNCHANGED: no second model)
-```
-
-### The reconciliation rule, exactly
-
-`backend/services/stt_consensus.py` — pure, dependency-free, `reconcile_hypotheses(hypotheses) -> ConsensusResult`:
-
-1. **Scaffold** — the alignment word grid is the **median-length** non-empty
-   hypothesis (lowest index on a length tie); with fewer than three hypotheses it
-   is the first non-empty one, so a two-pass run is byte-identical to pass 1; an
-   empty hypothesis is never the scaffold (it has no grid).
-2. **Votes** — one vote per scaffold position per hypothesis. A word aligned to
-   the position is a vote for that word; **the absence of a word is a vote too**;
-   a replacement of a *different length* is alignment-ambiguous and votes nothing;
-   a word the scaffold does not have is an **insertion and can never be emitted**.
-3. **Decision** — a strict majority (`votes > total/2`) wins; the scaffold's own
-   surface token is kept when it is in the winning group; when the winning group
-   is "no word" the position is **dropped**; a tie, a lone dissent or an
-   all-different column keeps the scaffold's token (insufficient evidence).
-4. **Output** — rebuilt from the scaffold's own separators, so nothing is
-   re-spaced; when no position was overridden the scaffold string is returned
-   **byte-exact**.
-5. **Comparison key** (alignment only, never emitted) — NFC, the `ي→ی`/`ك→ک`
-   variants and the hamza-alef forms, `ة`/`ۀ`→`ه`, the harakat and tatweel
-   removed, the zero-width family removed (so `میکند` ≡ `میکند`), Persian/Arabic
-   digits ≡ ASCII digits, and punctuation stripped from a token's ends. **`آ` is
-   deliberately NOT folded into `ا`** (`آب` ≠ `اب`), and casing is left alone.
-6. **Counters** — `hypotheses`, `positions`, `changed`, `dropped` are bounded
-   integers with no transcript content, so they are safe to log and are what makes
-   a live multi-pass run measurable.
-
-### Configuration
-
-| Variable | Default | Values | Meaning |
-|---|---|---|---|
-| `AI_GEMINI_STT_PASSES` | unset → **1** | `1`..`3` | recognition passes per explicit STT operation. Clamped (a value above the ceiling becomes 3, a non-integer becomes 1 with a bounded warning that never echoes the value); an explicit constructor argument always wins. **Unset means the single-pass routes of M1.7c, byte-identical.** |
-
-### Deadline, retry and pass behaviour
-
-| Question | Answer |
-|---|---|
-| Operation deadline | **unchanged**: `STT_OPERATION_DEADLINE_S` = 45 s inside the boundary's `STT_TIMEOUT_S` = 60 s. A multi-pass run does **not** get a second or a longer deadline. |
-| Per-leg timeouts | derived from the remaining budget exactly as M1.7c (`connect ≤ 10 s`, `write ≤ 20 s`, `pool ≤ 10 s`, `read` = whatever is left) |
-| How many passes actually run | the configured count is a **ceiling**; a pass starts only with ≥ `STT_MIN_ATTEMPT_S` (8 s) of budget left, so a slow provider yields fewer hypotheses and the operation still succeeds honestly (fewer hypotheses ⇒ the consensus degrades to the best available reading; one hypothesis ⇒ byte-identical to M1.7c) |
-| Can three passes fit 45 s? | only if the provider answers within roughly 12 s per pass (3 × ~12 s + the one upload). Whether that matches the provider's real Persian latency is **[UNKNOWN]** — the benchmark measures it. The documented response is **not** to inflate the deadline silently: the options are (a) keep 1 pass, or (b) raise the deadline deliberately, with the boundary's 60 s bound as the hard ceiling. |
-| Retries per pass | **none** on the multi-pass route: the configured passes *are* the recovery budget, so a transient failure consumes a pass instead of multiplying requests. Total provider requests ≤ the configured pass count (3), never 6. |
-| A transport retry as a recognition pass? | impossible by construction: a pass is appended to the hypotheses **only** when it returned text, and `attempts` (provider requests) is logged separately from `passes`/`hypotheses` |
-| Deterministic failures inside a multi-pass run | stop the loop at once (the same request is never re-sent **even once**); if hypotheses already exist, the reconciled result of what did arrive is returned; if none exist, the operation fails closed with the **first** failure recorded |
-| Transport fallback | the dedicated route keeps M1.7c's contract: upload once (the documented `uri` form) and fall back to the inline form only on a **transient upload failure** with the payload inside the inline budget; a deterministic upload failure fails closed. The general route keeps its own M1.5c rule (inline inside the budget, one upload above it). Exactly one upload per operation either way. |
-| Cleanup | one remote delete per operation, in `finally`, with its own 5 s bound **outside** the deadline; a failed delete is logged, never raised; the inline paths upload nothing and delete nothing |
-
-### Observability added
-
-```
-GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=consensus_start attempt=1 transport=uri bytes=115 elapsed_ms=-
-GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=pass attempt=1 transport=uri bytes=115 elapsed_ms=412
-GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=pass_failed attempt=2 transport=uri bytes=115 elapsed_ms=88
-GEMINI_MEDIA_ENGINE_CONSENSUS model=gemini-3.5-transcribe transport=uri mime=audio/ogg bytes=115 \
-  passes=3 hypotheses=2 positions=8 changed=2 dropped=0 elapsed_ms=1417
-GEMINI_MEDIA_ENGINE kind=speech-to-text engine=GeminiMediaEngine model=… transport=interactions \
-  mime=audio/ogg bytes=115 language=auto mode=verbatim chars=41 elapsed_ms=1502 status=ok \
-  attempts=3 deadline_s=45 failure_class=- stt_passes=3
-```
-
-Every field is bounded operational metadata: no transcript, no audio, no
-credential, no chat id, no sender, no filename, no caption. `changed`/`dropped`
-answer the question §19.4 could not: whether repeated passes differed and whether
-the consensus had to intervene at all.
-
-### Context isolation (verified, not merely intended)
-
-* `reconcile_hypotheses` has exactly **one** parameter (`hypotheses`) — there is
-  no slot for a chat id, sender, username, filename, caption, reply, previous
-  message, memory or session; asserted by `test_the_signature_accepts_hypotheses_and_nothing_else`.
-* The engine calls it with a list of `str` and nothing else
-  (`test_the_reconciler_receives_only_the_hypotheses`).
-* The multi-pass requests contain no caption, filename, chat id or owner id
-  (`test_no_telegram_metadata_reaches_the_model_or_the_reconciler`), and the
-  dedicated route still sends no text instruction at all.
-* The consensus module imports no I/O, network, provider, model or Telegram layer
-  (`test_the_module_imports_no_io_network_or_model_layer`).
-
-### Accuracy-related decisions
-
-* No normalization, no regex correction, no dictionary, no fuzzy matching, no
-  transliteration and no "cleanup" pass was added anywhere. Persian script, ZWNJ,
-  code-switching and legitimate Latin tokens pass through unchanged (asserted).
-* The transcript is still returned to the owner verbatim, still without
-  ProviderManager, and still without a second LLM.
-* The **only** accuracy mechanism added is hypothesis reconciliation, and it can
-  only substitute or delete inside the scaffold's own word grid with a strict
-  majority behind it.
-* **No claim is made that multi-pass recognition improves Persian accuracy.** The
-  benchmark has not been run (no credential, no audio fixture in the repository),
-  and this report contains no fabricated numbers.
-
-### Latency / API-call / quota implications (stated, not discovered later)
-
-| Configuration | HTTP requests per operation (dedicated route) | Model calls |
-|---|---|---|
-| `passes=1` (default, unchanged) | 4 = upload `start` + `upload, finalize` + 1 interaction + 1 delete | 1 |
-| `passes=3` | 6 = upload `start` + `upload, finalize` + 3 interactions + 1 delete | 3 |
-| `passes=3`, general route, small payload | 3 interactions (no upload, no delete) | 3 |
-
-* The upload is shared, so the extra passes cost a **model call** each, not an
-  upload each — the explicit reason the upload is prepared once (a per-pass upload
-  would have been 3 × 2 extra requests).
-* The general route's small-payload path uploads nothing at all (inline).
-* Cost/quota: N× the transcription calls of the single pass, on the project's
-  existing tier. Rate limiting is unchanged and honest: a 429 is a transient
-  failure of that pass (not retried in place), bounded by the pass count.
+| `5b3f6d7` `fix(stt): bound the dedicated transcription operation to one deadline` | M1.7c — the bounded transport (one operation deadline, `uri`-primary representation, classified failures, bounded retry/cleanup) |
+| `01ff211` `feat(stt): add the bounded multi-pass STT accuracy seam` | M1.7e — the opt-in STT-only consensus seam (`stt_consensus.py`, `AI_GEMINI_STT_PASSES`) and the repeat-run benchmark. **starting HEAD of this phase** |
+| the commit of this phase | M1.8 — the owner-managed STT settings, their persistence, their Telegram controls, their runtime application and this report |
 
 ### Files changed by this phase
 
-| File | Change | Lines |
-|---|---|---|
-| `backend/services/gemini_media_engine.py` | the pass-count configuration (`STT_PASSES_ENV_VAR`, `STT_MAX_PASSES`, `resolve_stt_passes`), the `stt_passes` constructor/property, the dispatch in `transcribe`, the bounded `_run_consensus` / `_prepare_consensus_input` / `_inline_item` / `_uri_item`, the consensus trace line, and `stt_passes=` on the outcome line | +262 / −5 |
-| `backend/services/stt_consensus.py` | **new** — the pure STT-only consensus (`reconcile_hypotheses`, `ConsensusResult`, `comparison_key`) | 331 |
-| `backend/tools/stt_benchmark.py` | **new** — the opt-in repeat-run benchmark (pure WER/CER/edit-count/script metrics, API-call accounting, a scripted-engine-injectable runner, a CLI) | 390 |
-| `backend/tools/__init__.py` | **new** — package marker ("operator tools, never imported by the runtime") | 1 |
-| `tests/test_stt_consensus.py` | **new** — 44 tests for the reconciliation rule | 391 |
-| `tests/test_media_stt_multipass.py` | **new** — 44 tests for the engine seam | 621 |
-| `tests/test_media_stt_benchmark.py` | **new** — 32 tests for the benchmark's metrics, accounting and loader | 299 |
-| `tests/test_media_stt_reliability.py` | the `__slots__` assertion gains the new field | +1 |
-| `tests/test_media_dedicated_stt.py` | the same | +1 |
-| `tests/test_media_gemini_engine.py` | the same, plus its comment | +4 / −3 |
-| `IMPLEMENTATION_REPORT.md` | rewritten as the current-state report (this document) | — |
+| File | Change |
+|---|---|
+| `backend/ai/config_store.py` | the three keys in `_DEFAULTS` and in the `ai_config` upsert payload |
+| `backend/services/gemini_media_engine.py` | `STT_SETTING_DEFAULTS`, `STT_LANGUAGE_AUTO`, `stt_settings_from()` (pure) and `apply_stt_settings()` (the ONE engine reconfiguration entry point) |
+| `backend/runtime/supervisor.py` | `_provision_media_engines()` is now async and, after provisioning, installs the owner's persisted STT settings through the existing store (`_apply_persisted_stt_settings()`) |
+| `backend/bot/handlers/ai_stt_settings.py` **(new)** | the three input handlers, their validation, the panel display helpers and the runtime hand-off |
+| `backend/bot/handlers/ai.py` | one transcription state line on the personal Settings surface, the three rows on the existing Advanced panel, and lazy imports of the display helpers |
+| `backend/bot/router.py` | registers the new module in the existing handler list |
+| `supabase/migrations/20260917000001_add_ai_config_stt_settings.sql` **(new)** | the three columns, the pass-range CHECK, and rollback SQL — **pending manual application** |
+| `DATABASE_ARCHITECTURE.md` | §7 column table, the §7 current-status note and a new §19.2b item (schema-change rules) |
+| `tests/test_ai_stt_settings.py` **(new)** | 56 tests for defaults, persistence, validation, panels, inputs, runtime application, isolation and registration |
+| `tests/test_36_ai_settings_ux.py` | the registration test now covers the new module too (9 unique inputs, same registry) |
+| `tests/test_media_gemini_engine.py` | the supervisor-hook test now awaits the async provisioning hook |
+| `IMPLEMENTATION_REPORT.md` | this report |
 
-No other file changed; `backend/requirements.txt`, the boundary, the provider
-mesh, the dispatcher, the handlers, Supabase and the runtime are untouched.
+**Untouched:** `INVESTIGATION.md`, `media_service.py`, `backend/ai/media.py`,
+`backend/telegram_api/media.py`, `media_ai_service.py`, `dispatcher.py`,
+`ai_unified.py`, `stt_consensus.py`, `ProviderManager` and every adapter, the tool
+registry/executor, the media boundary and target resolution, `MediaAnalysis`, the
+Save/Task/Scheduler/OCR/vision paths, the panel infrastructure, `requirements.txt`,
+`render.yaml`, `Procfile`, ENV files and all secrets.
+
+### Why a separate handler module
+
+`backend/bot/handlers/ai.py` is already ~78 KB; the three input handlers plus
+their validation and the runtime hand-off are one cohesive unit and live in
+`ai_stt_settings.py`, exactly as `ai_test_progress.py` exists for its own AI
+sub-feature. The controls still attach to the EXISTING `ai_settings` panel via
+the ONE input registry, and the module is registered alongside every other
+handler module in `backend/bot/router.py` — no second panel, no second registry.
+
+### Persistence
+
+* Owner-specific: the values live on the owner's single existing `ai_config` row
+  (`owner_id` UNIQUE), through `backend/ai/config_store.py` — the same store, the
+  same upsert, the same defaults merge every other AI setting uses.
+* Survives a process restart **when the `ai_config` column set exists** (below).
+  Until the migration is applied, the whole upsert degrades to the documented
+  in-memory fallback and the values are lost on restart — the pre-existing,
+  already-documented behavior of any missing `ai_config` column, not a new mode.
+* Nothing is stored in module globals as a source of truth, nothing in ENV, and
+  no parallel settings dictionary was introduced.
+* No API key is exposed through Telegram; keys stay environment-backed, and no
+  panel label or prompt names an environment variable (asserted by a test).
+
+### Database schema — migration REQUIRED and NOT executed
+
+The existing `ai_config` schema could not store these three settings (they are
+new typed behaviors, not arbitrary keys), so the smallest additive change was
+made: three columns on the existing table. No new table, no new index, no RLS
+change.
+
+**MANUAL SUPABASE ACTION REQUIRED (idempotent — apply in the Supabase SQL editor):**
+
+```sql
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS stt_model text;
+
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS stt_language text;
+
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS stt_passes integer NOT NULL DEFAULT 1;
+
+ALTER TABLE ai_config
+    DROP CONSTRAINT IF EXISTS ai_config_stt_passes_range;
+
+ALTER TABLE ai_config
+    ADD CONSTRAINT ai_config_stt_passes_range
+    CHECK (stt_passes BETWEEN 1 AND 3);
+```
+
+**Rollback (the application keeps working on the defaults afterward; stored
+values are lost):**
+
+```sql
+ALTER TABLE ai_config
+    DROP CONSTRAINT IF EXISTS ai_config_stt_passes_range;
+
+ALTER TABLE ai_config
+    DROP COLUMN IF EXISTS stt_passes;
+
+ALTER TABLE ai_config
+    DROP COLUMN IF EXISTS stt_language;
+
+ALTER TABLE ai_config
+    DROP COLUMN IF EXISTS stt_model;
+```
+
+The repository copy of this migration is
+`supabase/migrations/20260917000001_add_ai_config_stt_settings.sql`. **It was not
+executed here and no claim is made that the columns exist in the live project.**
+`DATABASE_ARCHITECTURE.md` was updated in the same commit because a real schema
+change was required (§7 columns, §7 status note, §19.2b).
+
+### The Telegram controls
+
+| Surface | Content |
+|---|---|
+| AI → Settings (text) | `Voice transcription · <model|default model> · <language|auto> · <n> pass(es)`, or `Voice transcription · unavailable (database read failed)` when the durable read failed — the panel never reports a default as if it were the stored value |
+| AI → Settings → Advanced (text) | `Voice transcription model · …`, `Voice transcription language · …`, `Voice recognition passes · n (single pass)` |
+| AI → Settings → Advanced (buttons) | `Voice transcription model…` → `input:ai_settings:stt_model`; `Voice transcription language…` → `input:ai_settings:stt_language`; `Voice recognition passes…` → `input:ai_settings:stt_passes` |
+
+Each input closes in ONE edit (the existing `_finish_input` contract: notice on
+top of the refreshed Advanced panel), deletes the owner's reply, and on a failed
+durable write shows the failure notice — the pattern the other AI settings use.
+
+### Validation bounds
+
+| Setting | Accepted | Rejected (refused, never clamped, nothing stored) |
+|---|---|---|
+| STT model | one opaque token, `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`; `reset`/`clear`/`default`/`none` → the default (empty) | empty, spaces, punctuation outside the allowed set, > 64 chars |
+| STT language | a BCP-47 shape, `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$` (e.g. `fa-IR`); `auto`/`reset`/`clear`/empty → automatic (stored empty) | `persian`, `fa IR`, `fa_IR`, `f`, `-IR` |
+| STT passes | the integers `1`, `2`, `3` | `0`, `-1`, `4`, `9`, `2.0`, non-integers, empty |
+
+The model is **not** validated against a registry: the project has none for
+transcription models, and an unknown id is stored and passed through unchanged
+(only the project's existing deprecation map may substitute a retired alias).
+The pass count keeps the M1.7e safety bound (1..3, default 1) as an engine
+invariant as well as a Telegram one, and the database CHECK enforces it too.
+
+### Runtime configuration behavior (explicit precedence)
+
+1. **Secrets** — the Gemini API key remains environment-backed
+   (`resolve_api_key()`), unchanged.
+2. **Behavior** — the three STT settings come from the owner's persisted
+   `ai_config` row. The engine never reads the store and never learns an owner
+   id: the caller (the supervisor at startup, the AI Settings handler after a
+   save) reads it and passes plain values into `apply_stt_settings()`. The engine
+   is therefore Telegram-agnostic, and a Telegram change is effective on the
+   **next media operation** with no redeploy and no restart.
+3. **Defaults** — used only when the owner has no configured value (empty
+   model / empty language / one pass), which is byte-identical to the behavior
+   before this phase.
+4. **ENV is not the settings database** — `AI_GEMINI_STT_MODEL`,
+   `AI_GEMINI_STT_LANGUAGE` and `AI_GEMINI_STT_PASSES` remain only as the
+   deployment bootstrap (`build_gemini_media_engine`), and the persisted row
+   supersedes them whenever it can be read (asserted by a test that sets all
+   three ENV variables and shows the persisted values winning).
+5. **Unreadable store** — a FAILED durable read is not treated as "no settings":
+   the supervisor keeps the bootstrap configuration rather than silently
+   downgrading a configured model because the database blinked.
+
+Precedence summary:
+
+```
+behavioral STT value = persisted ai_config value
+                       else (store unreadable) bootstrap ENV/default
+                       else (nothing configured) documented default
+
+credential = ENV only
+```
+
+### Context isolation (verified, not merely intended)
+
+`stt_settings_from()` is pure over a mapping of the three keys and ignores
+everything else, `apply_stt_settings()` accepts only that mapping, and the engine
+holds exactly six slots (`_api_key`, `_model`, `_key_env_var`, `_stt_model`,
+`_stt_language`, `_stt_passes`). Tests feed `owner_id`, `chat_id`,
+`message_id`, `sender`, `username`, `caption`, `filename`, `history`, `memory`
+and `reply_text` alongside the settings and assert the engine keeps only the
+three values and that none of those strings is reachable from the engine. No
+chat history, memory, sender, chat id, message id, filename, caption or reply
+text can reach the transcription model.
 
 ### Tests and exact results
 
-All commands ran in a project-local Python 3.10.12 environment (`.venv`,
-gitignored) from `backend/requirements.txt` plus `pytest 9.1.1` /
-`pytest-asyncio`; **no network, no Gemini credential, no live Telegram**.
+Focused (all green):
 
-```
-.venv/bin/python -m pytest tests/test_stt_consensus.py -q
-  44 passed in 0.07s          (new: the reconciliation rule)
-.venv/bin/python -m pytest tests/test_media_stt_multipass.py -q
-  44 passed in 0.39s          (new: the engine seam)
-.venv/bin/python -m pytest tests/test_media_stt_benchmark.py -q
-  32 passed in 0.26s          (new: the benchmark harness, hermetically)
-.venv/bin/python -m pytest tests/test_stt_consensus.py tests/test_media_stt_multipass.py \
-    tests/test_media_stt_benchmark.py tests/test_media_stt_reliability.py \
-    tests/test_media_dedicated_stt.py tests/test_media_gemini_engine.py \
-    tests/test_media_direct_stt.py tests/test_media_stt.py tests/test_media_stt_language.py \
-    tests/test_media_ai_integration.py tests/test_media_processing.py \
-    tests/test_media_document_extraction.py tests/test_media_image_ocr.py -q
-  636 passed in 40.12s
-.venv/bin/python -m pytest tests/ -q
-  3513 passed, 24 skipped, 3 warnings in 112.63s
-  (baseline before this phase: 3393 passed, 24 skipped — this phase adds 120 tests)
-.venv/bin/python -m py_compile backend/services/gemini_media_engine.py \
-    backend/services/stt_consensus.py backend/tools/stt_benchmark.py backend/tools/__init__.py \
-    tests/test_stt_consensus.py tests/test_media_stt_multipass.py tests/test_media_stt_benchmark.py
-  OK (no output)
-git diff --check
-  clean
-```
+| Suite | Result |
+|---|---|
+| `tests/test_ai_stt_settings.py` (new, 56 tests) | `56 passed` |
+| `tests/test_36_ai_settings_ux.py` | passed (registration now covers 9 unique inputs on the one registry) |
+| `tests/test_media_gemini_engine.py` | passed (supervisor hook awaited) |
+| `tests/test_media_dedicated_stt.py`, `tests/test_media_stt_reliability.py`, `tests/test_media_stt_multipass.py`, `tests/test_stt_consensus.py`, `tests/test_media_stt_benchmark.py`, `tests/test_media_stt.py` | passed |
+| the eight media/settings suites together | `372 passed` |
 
-What the new suites pin, against the task's own checklist:
+The new suite covers: deterministic defaults; persistence of a custom model, a
+custom language, and passes 1/2/3; reload; the upsert payload carrying all three
+keys; the 1..3 bound; the `auto` alias; deprecation substitution vs. unknown-id
+pass-through; the Advanced panel showing current values and defaults; the
+personal panel's state line and its honest "unavailable" state; the three input
+flows changing each value; refusal of malformed models/languages and of 0, −1,
+4, 9, 2.0, non-integers; the live engine taking the persisted values; the
+persisted values winning over ENV; fail-closed with no credential; context
+isolation; the startup application and the unreadable-store degradation; and the
+registration path (module list + one panel scope, no duplicate keys, no second
+store, no `os.getenv`).
 
-* **consensus behaviour** — identical hypotheses; a two-hypothesis disagreement;
-  a three-hypothesis majority; all three disagreeing; an insertion in one
-  hypothesis (never emitted); a deletion/minority deletion; a substitution; the
-  §19.1 Persian example (resolved to the majority reading, byte-exact); mixed
-  Persian/English tokens; punctuation differences; ZWNJ and Persian/Arabic letter
-  and digit variants; an empty hypothesis (and a majority of empty ones); a word
-  the majority heard never being dropped; no token ever invented; the median grid;
-  determinism; purity; a single-parameter signature; non-string inputs ignored;
-* **the engine seam** — the default single-pass route unchanged; environment
-  parsing/clamping/warning without echoing the value; explicit configuration
-  beating the environment; one upload for three passes; three sequential
-  interactions against that one uploaded file; one delete after the last pass;
-  the reconciled (majority) transcript; each leg's timeout still derived from the
-  one deadline; a spent deadline sending nothing; a pass needing budget to start;
-* **retry vs pass separation** — a transient pass failure counted as a failed pass
-  (`passes=3 hypotheses=2`) and never as a hypothesis; a persistent 503 bounded at
-  exactly three requests (no per-pass retry); a deterministic 400 stopping the
-  loop at the first request; a good pass followed by a deterministic failure still
-  returning its transcript; the first failure being the reported one;
-* **transport fallback** — a transient upload failure falling back to the inline
-  form once, with the same bytes; a deterministic upload failure failing closed
-  with no interaction request and no file to delete;
-* **routes** — the dedicated route never touching `generateContent`; the general
-  route running the consensus with the STT instruction and one upload when the
-  payload is large; the OCR seam never running the consensus; an empty payload
-  sending nothing; a non-audio payload refused before any request;
-* **isolation and observability** — the reconciler receiving only hypotheses; no
-  Telegram metadata in any request or log; one outcome line per operation; the
-  consensus line carrying counts but no content; sequential calls; no retained
-  HTTP state; bounded elapsed time;
-* **the benchmark** — edit counts, WER/CER, script buckets and repeat-run
-  consistency over known inputs (Persian included, no quality claim); per-leg API
-  accounting through real `httpx` clients; the report shape, requested pass counts
-  and `repeat`; failures recorded as data; the local-file loader's bounds.
+**Full suite:** `3569 passed, 24 skipped, 3 warnings` in 113.83 s
+(pre-existing skips only; no test was deleted, weakened or skipped).
 
-**These tests prove request construction, bounds, pass/retry separation,
-reconciliation and failure behaviour. They prove nothing about recognition
-quality** — no fixture in this repository can, and none is faked.
+**Syntax / whitespace:** `python -m py_compile` clean on every changed Python
+file; `git diff --check` clean.
 
-### Benchmark methodology (designed and implemented, NOT run)
+### Live verification status
 
-```bash
-# one local audio file, the operator's own human-verified transcript
-.venv/bin/python -m backend.tools.stt_benchmark \
-    --audio var/voice-1.ogg --reference var/voice-1.txt \
-    --passes 1,2,3 --repeat 3 --json var/voice-1.report.json
-```
+* **Telegram:** NOT performed. The controls were verified against the real
+  handler functions, the real registry and the real panel builders, but no
+  Telegram session rendered them.
+* **Gemini:** NOT performed. The runtime application was verified against the
+  real engine constructor and `media_service` seams; no request was sent.
 
-* the **same original bytes**, the same MIME (container-derived), the same model,
-  language configuration and verbatim mode across every configuration — the only
-  variable is the number of passes;
-* per configuration it records: the transcript, the elapsed time, the exact number
-  of API calls per leg, the empty-output state and any failure;
-* `--repeat` measures **repeat-run consistency** (the share of repeated single
-  passes returning the most common transcript) — the precondition the consensus
-  needs — plus the script buckets (Arabic vs Latin letters) that catch the
-  romanization failure without needing a reference;
-* with `--reference` it reports **WER, CER and the substitution/deletion/insertion
-  counts** against a human-verified transcript;
-* **no results are reported here** because no live run has happened. A single
-  sample's WER describes that sample; the tool says so in its own output.
-
-### Live Telegram verification status
-
-**NOT PERFORMED.** No live Telegram session was used. The direct-STT route remains
-end-to-end covered over a scripted transport by `tests/test_media_direct_stt.py`
-and `tests/test_media_dedicated_stt.py`, which still assert `provider.prompts == []`
-and `result.response == TRANSCRIPT`.
-
-### Live Gemini verification status
-
-**NOT PERFORMED.** Consequently the following remain **[UNKNOWN]** and are not
-claimed anywhere:
-
-* whether repeated passes on either route return the SAME text (the precondition
-  for the whole mechanism) — the general route's `temperature=0.0` suggests they
-  will, and the dedicated route's contract has no sampling control at all;
-* whether the dedicated model accepts the inline `data` form (M1.7c's fallback);
-* whether three passes fit inside the 45 s deadline for a real Persian voice note;
-* the real latency distribution, and therefore the real cost of the seam.
+Neither status may be reported as success.
 
 ### Known limitations
 
-1. **No accuracy claim.** The mechanism exists, is bounded and is tested; whether
-   it helps Persian recognition is unmeasured.
-2. **Correlated errors.** All hypotheses come from the same model over the same
-   bytes, so a repeated mistake wins a majority. Multi-pass can only correct a
-   mis-recognition the other passes did not repeat.
-3. **No recovery of a word the grid lacks.** A word no scaffold position covers is
-   an insertion and is never emitted; with three readings the median grid makes
-   that harmless, but a word only ONE reading heard can never be added.
-4. **Three passes are the ceiling**, and they may not fit the deadline; the
-   realized count is not guaranteed (by design — the deadline wins).
-5. Two passes cannot change anything (documented, tested) — `AI_GEMINI_STT_PASSES=2`
-   spends a second call for the repeat-run measurement, not for accuracy.
-6. The alignment is a word diff: a repeated token can pair with the wrong
-   occurrence, which is why a single dissenting vote never changes anything.
-7. The engine is constructed per provisioning call and, since M1.7c, the
-   pass-count configuration is read in the constructor when the caller does not
-   state it (the factory does not pass it), so the startup `…_PROVISIONED` line
-   still shows the model and language but **not** the pass count — the pass count
-   appears on every media operation line instead (`stt_passes=`).
-8. A timeout inside a worker thread still cannot be cancelled (unchanged, M1.7c
-   limitation 3).
+1. The migration is **pending manual application**; until then the settings
+   degrade to the in-memory fallback (lost on restart) — the same degradation
+   already documented for the trigger and `show_question` columns.
+2. The startup log line (`GEMINI_MEDIA_ENGINE_PROVISIONED`) still reports the
+   bootstrap model; the per-operation STT line and the panel report the effective
+   values. (Unchanged from M1.7e's note about the pass count.)
+3. `INVESTIGATION.md` is unchanged, so the recognition-quality question (class A)
+   remains open and unmeasured.
+4. Behavioral settings no longer depend on ENV, so the three `AI_GEMINI_STT_*`
+   variables are bootstrap-only and should be treated as deprecated in
+   documentation.
+5. `main` and `origin/main` verification is recorded in the hand-off response;
+   the migration cannot be verified from here at all.
 
 ### Deferred work
 
-* **Design B (model-based reconciliation)** — deferred until the live benchmark
-  demonstrates a residual disagreement rate that STT-only consensus cannot
-  resolve, and only with a non-rewriting, span-bounded, context-free contract.
-* Reading a **sampling/determinism control** for the dedicated route: none is
-  documented, so none is sent (no invented fields).
-* Promoting the multi-pass route to the default: an evidence-gated decision for
-  after M1.7f, never before.
-* `INVESTIGATION.md` §19.4's optional transcript-capture instrument — still not
-  implemented, and still only acceptable as an explicit opt-in that never logs
-  content by default.
+* Applying the migration to the live Supabase project (owner action).
+* Deprecating/removing the `AI_GEMINI_STT_*` bootstrap variables from any
+  operator documentation once the columns are live.
+* Class A (recognition quality) measurement — `INVESTIGATION.md` §19 stays open.
+* Design B (model-based reconciliation) — still deferred, still gated on live
+  evidence.
 
 ### Explicit next stage — M1.7f: the live evidence pass for class A
 
-1. Deploy with `AI_GEMINI_STT_PASSES` **unset**, and confirm the existing
-   single-pass route is unchanged (`stt_passes=1` on every media line).
-2. Run the benchmark on 5–10 real Persian voice notes with human-verified
-   references: `--passes 1,2,3 --repeat 3`. Record, per note: repeat-run
-   consistency, WER/CER at 1/2/3 passes, per-leg API calls and elapsed times.
-3. Decide from those numbers, and only from them: if consistency is ~1.0, the
-   mechanism is a no-op on this provider and the seam stays off (documented as
-   such); if consistency is low and 3-pass WER/CER improves without introducing
-   words that were never spoken, enable `AI_GEMINI_STT_PASSES=3` — and, if three
-   passes cannot fit 45 s, decide explicitly between keeping one pass and raising
-   the deadline inside the boundary's bound.
-4. Any accuracy statement in `INVESTIGATION.md` §19 is updated **only** from that
-   measurement.
+Unchanged in substance, and now simpler to run:
+
+1. Apply the migration (or accept the RAM fallback) and open **AI → Settings →
+   Advanced** to confirm the three controls render and persist.
+2. Leave the recognition passes at `1` and confirm the existing single-pass route
+   is unchanged.
+3. Run `python -m backend.tools.stt_benchmark --audio v.ogg --reference v.txt
+   --passes 1,2,3 --repeat 3` on 5–10 real Persian voice notes, then set the pass
+   count **from Telegram** (not from ENV) if — and only if — the numbers justify
+   it.
+4. Update `INVESTIGATION.md` §19 only from that measurement.
 
 ### Document version
 
-This document reflects the M1.7e architecture: the bounded, opt-in multi-pass STT
-accuracy seam (STT-only consensus), the unchanged bounded transport of M1.7c, and
-the operator benchmark that must measure quality before any claim about it is
-made. If code changes invalidate any section, update this document in the same
-commit.
+This document reflects the M1.8 state: the three Gemini STT settings are
+owner-persisted through the existing `ai_config`/`config_store` path, edited from
+AI → Settings → Advanced, applied to the live STT engine without a redeploy, with
+the bounded transport of M1.7c and the opt-in multi-pass seam of M1.7e unchanged
+behind them. The three `ai_config` columns are pending manual application. If
+code changes invalidate any section, update this document in the same commit.

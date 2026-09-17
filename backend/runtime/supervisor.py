@@ -176,7 +176,7 @@ class RuntimeSupervisor:
         mark_started()
 
         settings_service.load_all()
-        self._provision_media_engines()
+        await self._provision_media_engines()
 
         self._transition(RuntimeState.CONNECTING)
         await self._build_and_register()
@@ -263,7 +263,7 @@ class RuntimeSupervisor:
             trace_exception("AI_CONFIG_APPLY_BOOT_FAILED", exc)
             logger.warning("AI config boot restore failed: %s", exc)
 
-    def _provision_media_engines(self) -> None:
+    async def _provision_media_engines(self) -> None:
         """Provision the OPTIONAL OCR/STT engines behind the media boundary.
 
         The media boundary (``backend/services/media_service.py``) ships with no
@@ -273,6 +273,17 @@ class RuntimeSupervisor:
         engine wiring and no media path can construct its own engine. A missing
         credential is an expected, harmless state (the boundary keeps failing
         closed), and nothing here can fail startup.
+
+        The three BEHAVIORAL STT settings (model, language, recognition passes)
+        are owner settings, not deployment configuration: they live on the
+        owner's persisted ``ai_config`` row and are edited from Telegram. They are
+        read once here — through the existing config store, the same path the AI
+        engine uses at boot — and handed to the engine as plain values, so the
+        engine keeps knowing nothing about Telegram and a Telegram change still
+        needs no redeploy (the AI Settings handler re-applies them immediately
+        after a save). A read that FAILED is not treated as "no settings": the
+        engine keeps whatever the deployment bootstrap provisioned rather than
+        silently dropping a configured model because the database blinked.
         """
         try:
             from backend.services.gemini_media_engine import provision_gemini_media_engines
@@ -286,9 +297,40 @@ class RuntimeSupervisor:
                 "Media engines provisioned (configured=%s, model=%s)",
                 status.get("configured"), status.get("model") or "-",
             )
+            await self._apply_persisted_stt_settings()
         except Exception as exc:  # noqa: BLE001 — engine wiring is never fatal
             trace_exception("MEDIA_ENGINES_PROVISION_FAILED", exc)
             logger.warning("Media engine provisioning failed: %s", exc)
+
+    async def _apply_persisted_stt_settings(self) -> None:
+        """Install the owner's persisted STT settings onto the live STT engine.
+
+        Failures (and an unknown durable state) are logged, never fatal: the
+        engine then simply keeps the bootstrap configuration it was provisioned
+        with, which is the documented degradation for an unreadable store.
+        """
+        try:
+            if not self.owner_id:
+                return
+            from backend.ai import config_store
+            from backend.services.gemini_media_engine import apply_stt_settings
+            config = await config_store.get_config(self.owner_id)
+            if config.get(config_store.DEGRADED_READ_KEY):
+                logger.warning(
+                    "STT settings: durable AI config unreadable — keeping the "
+                    "provisioned bootstrap settings",
+                )
+                return
+            status = apply_stt_settings(config)
+            trace(
+                "STT_SETTINGS_APPLIED",
+                configured=status.get("configured"),
+                stt_model=status.get("stt_model") or "-",
+                stt_passes=status.get("stt_passes", "-"),
+            )
+        except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
+            trace_exception("STT_SETTINGS_APPLY_FAILED", exc)
+            logger.warning("STT settings apply failed: %s", exc)
 
     def _wire_ai_tools(self) -> None:
         try:
