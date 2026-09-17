@@ -45,6 +45,8 @@ services:
         sync: false
       - key: AI_MISTRAL_API_KEY
         sync: false
+      - key: AI_SPEECHMATICS_API_KEY
+        sync: false
       - key: AI_GEMINI_MODEL
         sync: false
       - key: AI_OPENAI_MODEL

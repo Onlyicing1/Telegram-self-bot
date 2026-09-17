@@ -29,7 +29,12 @@ import httpx
 import pytest
 
 from backend.ai import stt_control_plane, stt_provider_probe
-from backend.services import groq_stt_engine, media_service, stt_engine_factory
+from backend.services import (
+    groq_stt_engine,
+    media_service,
+    speechmatics_stt_engine,
+    stt_engine_factory,
+)
 from backend.services.media_service import MediaError
 
 API_KEY = "gsk_provider-test-suite-key-must-never-be-logged"
@@ -87,6 +92,7 @@ def _isolated(monkeypatch):
     monkeypatch.delenv("AI_GROQ_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("AI_GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("AI_SPEECHMATICS_API_KEY", raising=False)
     stt_provider_probe.clear_results()
     media_service.set_stt_engine(None)
     yield
@@ -98,6 +104,14 @@ def _candidate(candidate_id: str) -> stt_control_plane.SttCandidate:
     candidate = stt_control_plane.get_candidate(candidate_id)
     assert candidate is not None, candidate_id
     return candidate
+
+
+def _forged_unimplemented() -> stt_control_plane.SttCandidate:
+    """A registered-but-unexecutable capability, as the registry can still hold."""
+    return stt_control_plane.SttCandidate(
+        candidate_id="future:standard", provider="future", model="standard",
+        label="Future provider", implemented=False,
+    )
 
 
 def _flatten(buttons) -> list[tuple[str, str]]:
@@ -189,7 +203,7 @@ def test_an_unregistered_model_is_refused_by_the_resolution_seam(monkeypatch):
 
 
 def test_an_unimplemented_candidate_is_never_built():
-    engine, reason = stt_engine_factory.build_engine(_candidate("speechmatics:standard"))
+    engine, reason = stt_engine_factory.build_engine(_forged_unimplemented())
 
     assert engine is None
     assert reason == stt_engine_factory.REASON_NOT_IMPLEMENTED
@@ -232,6 +246,88 @@ def test_a_missing_credential_provisions_nothing_and_no_substitute(monkeypatch):
     assert status["provider"] == "groq"
     assert status["reason"] == groq_stt_engine.FAILURE_MISSING_CREDENTIAL
     assert media_service.stt_available() is False
+    assert media_service.get_stt_engine() is None
+
+
+# ── 2b. The Speechmatics candidate resolves to ITS OWN adapter (M2.2) ──
+
+
+def test_a_registered_speechmatics_candidate_yields_its_own_engine(monkeypatch):
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+
+    engine, reason = stt_engine_factory.build_engine(_candidate("speechmatics:standard"))
+
+    assert reason == ""
+    assert isinstance(engine, speechmatics_stt_engine.SpeechmaticsBatchEngine)
+    assert engine.model == "standard"
+    assert engine.endpoint == f"{speechmatics_stt_engine.API_BASE}/jobs"
+
+
+def test_the_speechmatics_selection_reaches_the_engine_as_plain_settings(monkeypatch):
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+
+    engine, _reason = stt_engine_factory.build_engine(
+        _candidate("speechmatics:standard"), language="fa-IR", passes=2,
+    )
+
+    assert engine is not None
+    assert (engine.language, engine.passes) == ("fa", 2)
+    assert engine.key_env_var == "AI_SPEECHMATICS_API_KEY"
+    assert API_KEY not in repr(engine)
+
+
+def test_a_speechmatics_selection_provisions_the_speechmatics_engine(monkeypatch):
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+
+    status = stt_engine_factory.apply_stt_config({
+        "stt_model": "speechmatics:standard", "stt_language": "fa-IR", "stt_passes": 2,
+    })
+
+    assert status["configured"] is True
+    assert status["provider"] == "speechmatics"
+    engine = media_service.get_stt_engine()
+    assert isinstance(engine, speechmatics_stt_engine.SpeechmaticsBatchEngine)
+    assert (engine.model, engine.language, engine.passes) == ("standard", "fa", 2)
+    assert API_KEY not in repr(status)
+
+
+def test_a_missing_speechmatics_credential_fails_closed(monkeypatch):
+    status = stt_engine_factory.apply_stt_config({"stt_model": "speechmatics:standard"})
+
+    assert status["configured"] is False
+    assert status["provider"] == "speechmatics"
+    assert status["reason"] == stt_engine_factory.REASON_MISSING_CREDENTIAL
+    assert media_service.stt_available() is False
+    assert media_service.get_stt_engine() is None
+
+
+def test_a_speechmatics_selection_never_falls_back_to_gemini(monkeypatch):
+    """Another provider's credential is NOT a substitute for the selection."""
+    monkeypatch.setenv("AI_GEMINI_API_KEY", "gemini-suite-key")
+    monkeypatch.setenv("AI_GROQ_API_KEY", API_KEY)
+
+    status = stt_engine_factory.apply_stt_config({"stt_model": "speechmatics:standard"})
+
+    assert status["configured"] is False
+    assert media_service.get_stt_engine() is None
+
+
+def test_a_groq_selection_never_becomes_speechmatics(monkeypatch):
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+    monkeypatch.setenv("AI_GEMINI_API_KEY", "gemini-suite-key")
+
+    status = stt_engine_factory.apply_stt_config({"stt_model": "groq:whisper-large-v3"})
+
+    assert status["configured"] is False
+    assert media_service.get_stt_engine() is None
+
+
+def test_a_gemini_selection_never_becomes_speechmatics(monkeypatch):
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+
+    status = stt_engine_factory.apply_stt_config({"stt_model": "gemini:default"})
+
+    assert status["configured"] is False
     assert media_service.get_stt_engine() is None
 
 
@@ -295,8 +391,14 @@ async def test_an_unknown_candidate_is_refused_without_a_request():
 
 
 @pytest.mark.asyncio
-async def test_an_unimplemented_candidate_is_reported_and_never_probed():
-    result = await stt_provider_probe.test_candidate("speechmatics:standard")
+async def test_an_unimplemented_candidate_is_reported_and_never_probed(monkeypatch):
+    forged = _forged_unimplemented()
+    monkeypatch.setattr(
+        stt_provider_probe, "get_candidate",
+        lambda candidate_id: forged if candidate_id == forged.candidate_id else None,
+    )
+
+    result = await stt_provider_probe.test_candidate(forged.candidate_id)
 
     assert result.state == stt_provider_probe.SttTestState.NOT_IMPLEMENTED.value
     assert result.failure_class == ""
@@ -392,6 +494,50 @@ async def test_the_probe_runs_in_the_control_planes_canonical_order(monkeypatch)
     expected = [c.candidate_id for c in stt_control_plane.all_candidates() if c.implemented]
     assert recorded == expected
     assert [r.candidate_id for r in results] == expected
+    assert "speechmatics:standard" in recorded, "the Speechmatics candidate is covered"
+    assert len(recorded) == len(set(recorded)), "one attempt per candidate"
+
+
+@pytest.mark.asyncio
+async def test_an_unimplemented_candidate_is_never_requested_by_a_global_run(monkeypatch):
+    forged = _forged_unimplemented()
+    monkeypatch.setattr(
+        stt_control_plane, "STT_CANDIDATES",
+        tuple(stt_control_plane.all_candidates()) + (forged,),
+    )
+    monkeypatch.setattr(
+        stt_control_plane, "all_candidates",
+        lambda: tuple(stt_control_plane.all_candidates()) + (forged,),
+    )
+    requested: list[str] = []
+
+    async def fake_test_candidate(candidate_id, **_kwargs):
+        requested.append(candidate_id)
+        return stt_provider_probe.SttTestResult(
+            candidate_id=candidate_id, provider="", model="",
+            state=stt_provider_probe.SttTestState.NOT_TESTED.value,
+        )
+
+    monkeypatch.setattr(stt_provider_probe, "test_candidate", fake_test_candidate)
+
+    await stt_provider_probe.test_candidates()
+
+    assert forged.candidate_id not in requested
+
+
+@pytest.mark.asyncio
+async def test_credential_presence_is_still_not_a_pass_in_a_global_run(monkeypatch):
+    monkeypatch.setenv("AI_GROQ_API_KEY", API_KEY)
+    script(monkeypatch)
+
+    results = await stt_provider_probe.test_candidates()
+    by_id = {result.candidate_id: result for result in results}
+
+    assert by_id["groq:whisper-large-v3"].state == stt_provider_probe.SttTestState.PASSED.value
+    assert by_id["speechmatics:standard"].state == (
+        stt_provider_probe.SttTestState.CREDENTIAL_MISSING.value
+    )
+    assert by_id["speechmatics:standard"].passed is False
 
 
 def test_the_probe_payload_is_inside_the_media_boundary_contract():
@@ -431,7 +577,7 @@ def test_an_untested_candidate_says_so():
 
 def test_an_unimplemented_candidate_can_never_be_upgraded_by_a_stale_observation():
     """An observation can never make an unexecutable capability look usable."""
-    candidate = _candidate("speechmatics:standard")
+    candidate = _forged_unimplemented()
 
     assert stt_provider_probe.candidate_state_row(candidate) == "not available"
     assert stt_provider_probe.candidate_state_row(candidate) == stt_provider_probe.STATE_LABELS[
@@ -503,80 +649,254 @@ def test_the_adapter_does_not_depend_on_the_probe_or_the_factory():
     assert "stt_engine_factory" not in source
 
 
-# ── 5. The Telegram surface: one bounded probe per candidate ───────────
+# ── 5. The Telegram surface: ONE global provider test ────────────────
+
+
+def _test_actions(flat: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [entry for entry in flat if entry[1].startswith("action:ai_stt_test")]
 
 
 @pytest.mark.asyncio
-async def test_the_panel_offers_a_test_action_for_every_executable_candidate():
+async def test_the_panel_offers_exactly_one_global_test_action():
     from backend.bot.handlers import ai_stt_settings as module
 
     _body, buttons = await module._media_stt_body_and_buttons(dict(_BASE_CONFIG))
+
+    assert _test_actions(_flatten(buttons)) == [
+        ("Test all providers", "action:ai_stt_test_all")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_candidate_gets_its_own_test_button():
+    from backend.bot.handlers import ai_stt_settings as module
+
+    for config in (dict(_BASE_CONFIG), {"stt_model": "groq:whisper-large-v3"}):
+        _body, buttons = await module._media_stt_body_and_buttons(config)
+        flat = _flatten(buttons)
+
+        assert not any(
+            data.startswith("action:ai_stt_test_candidate")
+            for _text, data in flat
+        )
+        assert not any(
+            "Test" in text and data != "action:ai_stt_test_all"
+            for text, data in flat
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_global_test_action_sits_above_the_candidate_rows():
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _body, buttons = await module._media_stt_body_and_buttons(dict(_BASE_CONFIG))
+    datas = [data for _text, data in _flatten(buttons)]
+    use_rows = [
+        index for index, data in enumerate(datas)
+        if data.startswith("action:ai_stt_select_candidate:")
+    ]
+
+    assert use_rows, "the panel must still offer the registered candidates"
+    assert datas.index("action:ai_stt_test_all") < min(use_rows)
+
+
+@pytest.mark.asyncio
+async def test_the_active_candidate_gets_no_use_button_and_others_do():
+    from backend.bot.handlers import ai_stt_settings as module
+
+    active = "groq:whisper-large-v3"
+    _body, buttons = await module._media_stt_body_and_buttons({"stt_model": active})
     flat = _flatten(buttons)
 
     for candidate in stt_control_plane.all_candidates():
         if not candidate.implemented:
             continue
-        assert (
-            "Test", f"action:ai_stt_test_candidate:{candidate.candidate_id}",
-        ) in flat or (
-            f"Test · {candidate.label}",
-            f"action:ai_stt_test_candidate:{candidate.candidate_id}",
+        present = (
+            f"Use {candidate.label}",
+            f"action:ai_stt_select_candidate:{candidate.candidate_id}",
         ) in flat
+        assert present is (candidate.candidate_id != active)
 
-    assert not any("speechmatics" in data for _text, data in flat), (
-        "an unimplemented candidate is never offered as a probe target"
+
+@pytest.mark.asyncio
+async def test_an_unimplemented_candidate_gets_no_use_button(monkeypatch):
+    """The registry can still hold future capabilities, and they stay unselectable."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    forged = _forged_unimplemented()
+    monkeypatch.setattr(
+        module, "all_candidates",
+        lambda: tuple(stt_control_plane.all_candidates()) + (forged,),
     )
+
+    _body, buttons = await module._media_stt_body_and_buttons(dict(_BASE_CONFIG))
+    datas = [data for _text, data in _flatten(buttons)]
+
+    assert f"action:ai_stt_select_candidate:{forged.candidate_id}" not in datas
+    assert not any(forged.candidate_id in data for data in datas)
 
 
 @pytest.mark.asyncio
 async def test_the_panel_shows_the_probe_state_of_each_candidate():
     from backend.bot.handlers import ai_stt_settings as module
 
-    body, _buttons = await module._media_stt_body_and_buttons({"stt_model": "groq:whisper-large-v3"})
+    body, _buttons = await module._media_stt_body_and_buttons(
+        {"stt_model": "groq:whisper-large-v3"}
+    )
 
     assert "not tested" in body
-    assert "not available" in body  # the registered-but-unimplemented candidate
+    assert "not available" not in body  # every registered capability now executes
+    for candidate in stt_control_plane.all_candidates():
+        assert candidate.label in body
 
 
 @pytest.mark.asyncio
-async def test_the_test_action_probes_the_selected_registered_candidate(monkeypatch):
+async def test_the_panel_never_implies_that_the_probe_measures_quality():
+    from backend.bot.handlers import ai_stt_settings as module
+
+    body, _buttons = await module._media_stt_body_and_buttons(dict(_BASE_CONFIG))
+
+    assert "not a recognition-quality benchmark" in body
+    assert "synthetic" in body
+
+
+@pytest.mark.asyncio
+async def test_the_global_action_tests_every_candidate_the_probe_owns(monkeypatch):
+    """The action reuses the probe's own multi-candidate run — not a second loop."""
     from backend.bot.handlers import ai_stt_settings as module
 
     _patch_ai(monkeypatch)
-    called: list[str] = []
-
-    async def fake_probe(candidate_id, **_kwargs):
-        called.append(candidate_id)
-        return stt_provider_probe.SttTestResult(
-            candidate_id=candidate_id, provider="groq", model="whisper-large-v3",
-            state=stt_provider_probe.SttTestState.PASSED.value,
+    calls: list[Any] = []
+    results = [
+        stt_provider_probe.SttTestResult(
+            candidate_id="groq:whisper-large-v3", provider="groq",
+            model="whisper-large-v3", state=stt_provider_probe.SttTestState.PASSED.value,
             latency_ms=412, transcript_chars=12, tested_at="now",
-        )
+        ),
+        stt_provider_probe.SttTestResult(
+            candidate_id="speechmatics:standard", provider="speechmatics",
+            model="standard",
+            state=stt_provider_probe.SttTestState.CREDENTIAL_MISSING.value,
+            detail="No credential is configured for this provider.",
+            tested_at="now",
+        ),
+        stt_provider_probe.SttTestResult(
+            candidate_id="groq:whisper-large-v3-turbo", provider="groq",
+            model="whisper-large-v3-turbo",
+            state=stt_provider_probe.SttTestState.FAILED.value,
+            failure_class="empty_transcription", tested_at="now",
+        ),
+    ]
 
-    monkeypatch.setattr(stt_provider_probe, "test_candidate", fake_probe)
+    async def fake_test_candidates(candidate_ids=None, **_kwargs):
+        calls.append(candidate_ids)
+        return results
 
-    result = await module._ai_stt_test_candidate_action(None, "groq:whisper-large-v3", 1)
+    monkeypatch.setattr(stt_provider_probe, "test_candidates", fake_test_candidates)
 
-    assert called == ["groq:whisper-large-v3"]
+    result = await module._ai_stt_test_all_action(None, "", 1)
+
+    # No explicit order is passed: the probe's registry order governs.
+    assert calls == [None]
     assert result is not None
-    assert result[1].startswith("\u2713")
-    assert "412 ms" in result[1]
+    title, body, buttons = result
+    assert title == "Speech-to-Text"
+    assert buttons, "the refreshed panel still carries its own controls"
+
+    notice = module.test_all_notice(results)
+    assert body.startswith(notice), "the notice is rendered on TOP of the panel body"
+    assert "Provider test · 3 candidates" in notice
+    assert notice.count("Groq Whisper Large-v3 ·") == 1
+    assert "test passed · 412 ms" in notice
+    assert "no credential" in notice
+    assert "empty_transcription" in notice
+    assert "does not measure recognition quality" in notice
 
 
 @pytest.mark.asyncio
-async def test_the_test_action_refuses_an_unknown_candidate_without_probing(monkeypatch):
+async def test_the_global_action_refreshes_the_panel_once(monkeypatch):
+    """ONE edit: a single rendered panel, never a message per provider."""
     from backend.bot.handlers import ai_stt_settings as module
 
     _patch_ai(monkeypatch)
 
-    async def forbidden(*_args, **_kwargs):  # pragma: no cover - must never run
-        raise AssertionError("an unknown identifier must never be probed")
+    results = [
+        stt_provider_probe.SttTestResult(
+            candidate_id=candidate.candidate_id, provider=candidate.provider,
+            model=candidate.model,
+            state=stt_provider_probe.SttTestState.FAILED.value,
+            failure_class="timeout", tested_at="now",
+        )
+        for candidate in stt_control_plane.all_candidates()
+        if candidate.implemented
+    ]
 
-    monkeypatch.setattr(stt_provider_probe, "test_candidate", forbidden)
+    async def fake_test_candidates(candidate_ids=None, **_kwargs):
+        return results
 
-    result = await module._ai_stt_test_candidate_action(None, "groq:whisper-huge", 1)
+    monkeypatch.setattr(stt_provider_probe, "test_candidates", fake_test_candidates)
 
-    assert result is not None and "\u00d7 Unknown" in result[1]
+    result = await module._ai_stt_test_all_action(None, "", 1)
+
+    assert isinstance(result, tuple) and len(result) == 3
+    assert result[1].count("Provider test ·") == 1
+    assert result[1].startswith(module.test_all_notice(results))
+    lines = module.test_all_notice(results).splitlines()
+    for candidate in stt_control_plane.all_candidates():
+        if candidate.implemented:
+            matching = [line for line in lines if f"{candidate.label} ·" in line]
+            assert len(matching) == 1, candidate.label
+
+
+@pytest.mark.asyncio
+async def test_the_global_action_reports_an_empty_run_honestly(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+
+    async def no_results(candidate_ids=None, **_kwargs):
+        return []
+
+    monkeypatch.setattr(stt_provider_probe, "test_candidates", no_results)
+
+    result = await module._ai_stt_test_all_action(None, "", 1)
+
+    assert result is not None and "No registered candidate" in result[1]
+
+
+def test_the_global_test_action_is_registered(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    actions: list[str] = []
+    monkeypatch.setattr(module, "register_panel", lambda *a, **k: None)
+    monkeypatch.setattr(module, "register_inline_builder", lambda *a, **k: None)
+    monkeypatch.setattr(module, "register_input", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "register_action", lambda action_id, handler: actions.append(action_id),
+    )
+
+    module.register(None, 0)
+
+    assert "ai_stt_test_all" in actions
+    assert "ai_stt_test_candidate" not in actions
+
+
+def test_the_global_notice_never_carries_a_credential_or_a_transcript():
+    from backend.bot.handlers import ai_stt_settings as module
+
+    results = [
+        stt_provider_probe.SttTestResult(
+            candidate_id="groq:whisper-large-v3", provider="groq",
+            model="whisper-large-v3", state=stt_provider_probe.SttTestState.PASSED.value,
+            latency_ms=9, transcript_chars=len(TRANSCRIPT), tested_at="now",
+        )
+    ]
+
+    notice = module.test_all_notice(results)
+
+    assert API_KEY not in notice
+    assert TRANSCRIPT not in notice
+    assert "@" not in notice
 
 
 @pytest.mark.asyncio
@@ -602,6 +922,31 @@ async def test_the_panel_line_and_the_notice_never_imply_health(monkeypatch):
 
 
 # ── 6. Live, opt-in probe (never part of the deterministic suite) ──────
+
+
+@pytest.mark.skipif(
+    not os.getenv("AI_SPEECHMATICS_API_KEY"),
+    reason="no Speechmatics credential in this environment — the live probe is opt-in",
+)
+@pytest.mark.asyncio
+async def test_live_probe_reaches_speechmatics_when_a_credential_is_available():
+    """The ONLY test that contacts Speechmatics, and only with a credential.
+
+    A synthetic tone carries no speech, so the honest live outcome is either a
+    transcript or an empty-transcription failure; what this proves is that the
+    credential was accepted and the documented batch endpoint answered — never
+    that recognition quality is good, and never by printing the credential.
+    """
+    result = await stt_provider_probe.test_candidate("speechmatics:standard")
+
+    assert result.state != stt_provider_probe.SttTestState.CREDENTIAL_MISSING.value
+    assert result.failure_class not in {
+        speechmatics_stt_engine.FAILURE_MISSING_CREDENTIAL,
+        speechmatics_stt_engine.FAILURE_AUTH,
+        speechmatics_stt_engine.FAILURE_FORBIDDEN,
+        speechmatics_stt_engine.FAILURE_TIMEOUT,
+        speechmatics_stt_engine.FAILURE_TRANSPORT,
+    }, result.failure_class
 
 
 @pytest.mark.skipif(

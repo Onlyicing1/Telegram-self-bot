@@ -137,7 +137,7 @@ def test_candidates_carry_provider_and_model_identity():
 def test_the_registry_is_more_than_one_provider():
     providers = {c.provider for c in control_plane.all_candidates()}
 
-    assert {"gemini", "groq"} <= providers
+    assert {"gemini", "groq", "speechmatics"} <= providers
 
 
 def test_only_implemented_candidates_are_selectable():
@@ -145,10 +145,30 @@ def test_only_implemented_candidates_are_selectable():
     assert control_plane.is_selectable(control_plane.DEFAULT_CANDIDATE_ID)
     assert implemented == {c.candidate_id for c in control_plane.all_candidates() if control_plane.is_selectable(c.candidate_id)}
 
-    unimplemented = [c for c in control_plane.all_candidates() if not c.implemented]
-    assert unimplemented, "the registry must be able to hold future candidates"
-    for candidate in unimplemented:
-        assert not control_plane.is_selectable(candidate.candidate_id)
+    # Every registered capability currently executes; the registry can still hold
+    # a future one, and such a candidate is never selectable.
+    assert implemented == {c.candidate_id for c in control_plane.all_candidates()}
+    future = control_plane.SttCandidate(
+        candidate_id="future:standard", provider="future", model="standard",
+        label="Future provider", implemented=False,
+    )
+    assert not control_plane.is_selectable(future.candidate_id)
+
+
+def test_a_registered_but_unimplemented_active_candidate_is_reported(monkeypatch):
+    """The defensive path stays: a capability with no execution path is never run."""
+    future = control_plane.SttCandidate(
+        candidate_id="future:standard", provider="future", model="standard",
+        label="Future provider", implemented=False,
+    )
+    monkeypatch.setattr(control_plane, "get_candidate", lambda candidate_id: future)
+
+    plane = control_plane.SttControlPlane(
+        active_id=future.candidate_id, fallback_ids=(), language="", passes=1,
+    )
+
+    assert plane.active_unavailable is True
+    assert plane.engine_model() == ""
 
 
 def test_candidate_status_is_not_credential_presence(monkeypatch):
@@ -539,7 +559,7 @@ def test_stt_controls_register_on_the_media_panel_only(monkeypatch):
 
     stt_scope = sorted(k for scope, k in inputs if scope == "ai_media_stt")
     assert stt_scope == ["stt_language", "stt_passes"]
-    assert {"ai_stt_select_candidate", "ai_stt_test_candidate"} <= set(actions)
+    assert {"ai_stt_select_candidate", "ai_stt_test_all"} <= set(actions)
 
 
 def test_the_settings_advanced_panel_keeps_its_unrelated_controls():
@@ -678,20 +698,28 @@ async def test_the_candidate_action_refuses_an_unregistered_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("candidate_id", ["speechmatics:standard"])
-async def test_the_candidate_action_refuses_an_unimplemented_candidate(monkeypatch, candidate_id):
+async def test_the_candidate_action_refuses_an_unimplemented_candidate(monkeypatch):
+    """A registered capability with no execution path can never be selected."""
     rec = _Recorder(monkeypatch)
+    future = control_plane.SttCandidate(
+        candidate_id="future:standard", provider="future", model="standard",
+        label="Future provider", implemented=False,
+    )
+    monkeypatch.setattr(rec.module, "get_candidate", lambda candidate_id: future)
 
-    result = await rec.module._ai_stt_select_candidate_action(None, candidate_id, 1)
+    result = await rec.module._ai_stt_select_candidate_action(None, future.candidate_id, 1)
 
     assert rec.saved == []
     assert result is not None and "not available" in result[1]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("candidate_id", ["groq:whisper-large-v3", "groq:whisper-large-v3-turbo"])
-async def test_the_candidate_action_accepts_an_implemented_groq_candidate(monkeypatch, candidate_id):
-    """M2.1 implemented the Groq adapter, so those candidates select normally."""
+@pytest.mark.parametrize(
+    "candidate_id",
+    ["groq:whisper-large-v3", "groq:whisper-large-v3-turbo", "speechmatics:standard"],
+)
+async def test_the_candidate_action_accepts_every_implemented_candidate(monkeypatch, candidate_id):
+    """M2.1 made the Groq candidates selectable and M2.2 the Speechmatics one."""
     rec = _Recorder(monkeypatch)
 
     result = await rec.module._ai_stt_select_candidate_action(None, candidate_id, 1)
@@ -746,8 +774,8 @@ def test_the_default_candidate_keeps_the_general_media_route(monkeypatch):
     assert _stt_engine_settings() == ("", "", 1)
 
 
-def test_an_unimplemented_active_candidate_stays_fail_closed(monkeypatch):
-    """A registered provider without an execution path never becomes a model."""
+def test_a_non_gemini_candidate_never_becomes_a_gemini_model(monkeypatch):
+    """The Gemini leg of the conversion maps any other provider to NO model."""
     from backend.services.gemini_media_engine import apply_stt_settings
 
     monkeypatch.setenv(API_KEY_VAR, API_KEY)
@@ -758,6 +786,19 @@ def test_an_unimplemented_active_candidate_stays_fail_closed(monkeypatch):
 
     assert status["configured"] is True
     assert _stt_engine_settings()[0] == ""
+
+
+def test_a_selected_speechmatics_candidate_never_reaches_the_gemini_leg(monkeypatch):
+    """The runtime resolver sends the selection to its OWN provider (M2.2)."""
+    from backend.services import speechmatics_stt_engine, stt_engine_factory
+
+    monkeypatch.setenv("AI_SPEECHMATICS_API_KEY", API_KEY)
+
+    status = stt_engine_factory.apply_stt_config({"stt_model": "speechmatics:standard"})
+
+    assert status["configured"] is True
+    assert status["provider"] == "speechmatics"
+    assert isinstance(media_service.get_stt_engine(), speechmatics_stt_engine.SpeechmaticsBatchEngine)
 
 
 def test_a_legacy_value_keeps_the_previous_engine_behavior(monkeypatch):

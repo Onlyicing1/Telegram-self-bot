@@ -14,8 +14,8 @@ provider-specific engine is constructed, which keeps three contracts intact:
 Routing is deterministic and fail-closed:
 
   * a REGISTERED candidate whose provider has an execution path on this build
-    (``gemini``, ``groq``) is built for ITS OWN provider and model — a candidate
-    is never substituted by a different provider's model;
+    (``gemini``, ``groq``, ``speechmatics``) is built for ITS OWN provider and
+    model — a candidate is never substituted by a different provider's model;
   * a candidate with no execution path yet, or a provider with no credential, is
     reported honestly and the boundary is left with NO STT engine, so the media
     path keeps its documented fail-closed behavior instead of quietly transcribing
@@ -34,7 +34,7 @@ import logging
 from typing import Any, Mapping
 
 from backend.ai.stt_control_plane import SttCandidate, parse_stt_config
-from backend.services import groq_stt_engine, media_service
+from backend.services import groq_stt_engine, media_service, speechmatics_stt_engine
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,18 @@ logger = logging.getLogger(__name__)
 REASON_NOT_IMPLEMENTED = "not_implemented"
 
 #: The bounded reason a provider has no usable credential. Deliberately the SAME
-#: token the Groq adapter's own classification uses, so "the credential is
+#: token the provider adapters' own classifications use, so "the credential is
 #: missing" reads identically whichever leg discovered it.
 REASON_MISSING_CREDENTIAL = groq_stt_engine.FAILURE_MISSING_CREDENTIAL
+
+#: The providers whose selection is provisioned by their OWN adapter rather than
+#: by the Gemini media route. Anything else (the Gemini candidates, a
+#: registered-but-unimplemented capability, a legacy value) stays on the existing
+#: Gemini leg.
+_ADAPTER_PROVIDERS = frozenset({
+    groq_stt_engine.PROVIDER_NAME,
+    speechmatics_stt_engine.PROVIDER_NAME,
+})
 
 
 def build_engine(
@@ -64,6 +73,10 @@ def build_engine(
         return None, REASON_NOT_IMPLEMENTED
     if candidate.provider == groq_stt_engine.PROVIDER_NAME:
         return groq_stt_engine.build_engine(
+            candidate.model, language=language, passes=passes,
+        )
+    if candidate.provider == speechmatics_stt_engine.PROVIDER_NAME:
+        return speechmatics_stt_engine.build_engine(
             candidate.model, language=language, passes=passes,
         )
     if candidate.provider == "gemini":
@@ -103,8 +116,8 @@ def apply_stt_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     try:
         plane = parse_stt_config(config)
         candidate = plane.active_candidate
-        if candidate is not None and candidate.provider == groq_stt_engine.PROVIDER_NAME:
-            return _apply_groq(candidate, plane)
+        if candidate is not None and candidate.provider in _ADAPTER_PROVIDERS:
+            return _apply_adapter(candidate, plane)
         # Gemini candidates, registered-but-unimplemented candidates (which keep
         # the default route, as the control plane documents) and legacy values.
         from backend.services.gemini_media_engine import apply_stt_settings
@@ -115,15 +128,18 @@ def apply_stt_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
         return {"configured": False, "reason": type(exc).__name__}
 
 
-def _apply_groq(candidate: SttCandidate, plane: Any) -> dict[str, Any]:
-    """Provision (or clear) the Groq transcription engine for one selection."""
-    engine, reason = groq_stt_engine.build_engine(
-        candidate.model, language=plane.language, passes=plane.passes,
+def _apply_adapter(candidate: SttCandidate, plane: Any) -> dict[str, Any]:
+    """Provision (or clear) the SELECTED candidate's own adapter engine.
+
+    The resolver is the ONE place an engine is constructed, so this path can
+    never reach a provider other than the candidate's own: whichever adapter
+    ``build_engine`` returns is installed verbatim, and when it returns none
+    NOTHING is provisioned.
+    """
+    engine, reason = build_engine(
+        candidate, language=plane.language, passes=plane.passes,
     )
     if engine is None:
-        # Fail closed: the owner selected a Groq candidate and Groq cannot run on
-        # this runtime, so NOTHING is provisioned. Another provider's model is
-        # never silently substituted for the selection.
         media_service.set_stt_engine(None)
         logger.warning(
             "STT_ENGINE_UNPROVISIONED provider=%s model=%s reason=%s",
@@ -139,9 +155,10 @@ def _apply_groq(candidate: SttCandidate, plane: Any) -> dict[str, Any]:
         }
     media_service.set_stt_engine(engine)
     logger.info(
-        "GROQ_STT_ENGINE_APPLIED model=%s language=%s stt_passes=%d key_env_var=%s",
-        candidate.model, plane.language or "auto", plane.passes,
-        engine.key_env_var or "-",
+        "STT_ENGINE_APPLIED provider=%s model=%s language=%s stt_passes=%d "
+        "key_env_var=%s",
+        candidate.provider, candidate.model, plane.language or "auto",
+        plane.passes, engine.key_env_var or "-",
     )
     return {
         "configured": True,

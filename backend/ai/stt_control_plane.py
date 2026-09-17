@@ -170,8 +170,8 @@ def _build_candidates() -> tuple[SttCandidate, ...]:
             provider="speechmatics",
             model="standard",
             label="Speechmatics",
-            implemented=False,
-            note="capability registered — adapter not implemented yet",
+            implemented=True,
+            note="the Speechmatics batch transcription adapter",
         ),
     )
 

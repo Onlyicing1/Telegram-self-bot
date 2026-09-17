@@ -30,11 +30,14 @@ boundary — so no Telegram object, owner id, chat id, message id or caption can
 reach an engine, and a Telegram change is effective on the next media operation
 with no redeploy and no restart.
 
-Each candidate also shows its PROVIDER-TEST state (``backend/ai/stt_provider_probe``)
-and can be probed from the panel with one bounded request. The panel never claims
-health from the mere existence of a credential: an untested candidate says so, a
-missing credential is its own state, and only a request that returned a non-empty
-transcript is reported as passed.
+Each candidate shows its PROVIDER-TEST state (``backend/ai/stt_provider_probe``),
+and the panel offers ONE bounded **Test all providers** control that probes every
+implemented candidate in the registry's canonical order and re-renders the panel
+once. The panel never claims health from the mere existence of a credential: an
+untested candidate says so, a missing credential is its own state, and only a
+request that returned a non-empty transcript is reported as passed. The probe is
+a capability/transport check — its payload is a synthetic tone, so it is never
+presented as a recognition-quality measurement.
 
 Kept in its own module because the panels, the inputs and their validation are
 one cohesive unit and the AI panel module is already at the file-tool size
@@ -256,20 +259,22 @@ async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
         lines.append(f"{index}. {candidate.label}{suffix}")
     lines.append("")
     lines.append("_Pick a registered candidate — no model names to type._")
-    lines.append("_Test runs one bounded request to that candidate and reports the result._")
+    lines.append(
+        "_Test all providers runs ONE bounded request per registered candidate, "
+        "in order, and reports each result. It is a capability check with a "
+        "synthetic tone — not a recognition-quality benchmark._"
+    )
 
     builder = InlinePanelBuilder()
+    builder.add_row("Test all providers", "action:ai_stt_test_all")
     for candidate in all_candidates():
         if not candidate.implemented:
             continue
-        buttons: list[tuple[str, str]] = []
         if plane.is_legacy or candidate.candidate_id != plane.active_id:
-            buttons.append((
+            builder.add_row(
                 f"Use {candidate.label}",
                 f"action:ai_stt_select_candidate:{candidate.candidate_id}",
-            ))
-        buttons.append(("Test", f"action:ai_stt_test_candidate:{candidate.candidate_id}"))
-        builder.add_buttons(*buttons)
+            )
     builder.add_row("Language…", f"input:ai_media_stt:{STORAGE_KEY_LANGUAGE}")
     builder.add_row("Recognition passes…", f"input:ai_media_stt:{STORAGE_KEY_PASSES}")
     _nav_buttons(builder)
@@ -325,11 +330,11 @@ async def _ai_stt_select_candidate_action(event, extra: str, chat_id: int) -> tu
     return await _stt_panel_with_notice(f"✓ Speech-to-Text now uses {candidate.label}")
 
 
-# ── Provider probe (one bounded request per candidate) ─────────────────
+# ── Provider probe (ONE global test action, one bounded request per candidate) ──
 
 
-def test_notice(result: "stt_provider_probe.SttTestResult") -> str:
-    """ONE bounded owner-facing notice for a finished probe.
+def _candidate_line(result: "stt_provider_probe.SttTestResult") -> str:
+    """ONE bounded owner-facing line for a finished probe.
 
     Never carries a credential, a transcript or a Telegram identifier: the state
     wording, the bounded failure class, the elapsed time and the probe's own
@@ -348,21 +353,44 @@ def test_notice(result: "stt_provider_probe.SttTestResult") -> str:
     return f"\u00d7 {name} · {result.summary()}{detail}"
 
 
-async def _ai_stt_test_candidate_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
-    """Probe ONE registered candidate with one bounded request.
+def test_notice(result: "stt_provider_probe.SttTestResult") -> str:
+    """ONE bounded owner-facing notice for a finished probe."""
+    return _candidate_line(result)
 
-    The payload is the provider test's own bounded in-process audio; a candidate
-    the registry does not know is refused without a request, and an unimplemented
-    or credential-less candidate is reported honestly instead of being probed into
-    a misleading success. The refreshed panel then shows the recorded state.
+
+def test_all_notice(results: list) -> str:
+    """ONE bounded owner-facing summary of a whole provider-test run.
+
+    Shows every candidate's own state — including the credential-less and
+    not-implemented ones, which were never sent a request — and states once, in
+    the same notice, that this is a capability probe rather than a
+    recognition-quality measurement. It never implies that a passing probe means
+    good transcription of real speech.
     """
-    candidate = get_candidate(extra)
-    if candidate is None:
-        return await _stt_panel_with_notice(
-            "\u00d7 Unknown transcription candidate — nothing was tested."
-        )
-    result = await stt_provider_probe.test_candidate(candidate.candidate_id)
-    return await _stt_panel_with_notice(test_notice(result))
+    if not results:
+        return "\u00d7 No registered candidate could be tested."
+    count = len(results)
+    lines = [f"Provider test · {count} candidate{'s' if count != 1 else ''}", ""]
+    lines.extend(_candidate_line(result) for result in results)
+    lines.append("")
+    lines.append(
+        "_Capability probe only — one bounded request per candidate with a "
+        "synthetic tone. It does not measure recognition quality._"
+    )
+    return "\n".join(lines)
+
+
+async def _ai_stt_test_all_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
+    """Probe EVERY registered candidate with one bounded request each.
+
+    The candidates are the registry's own and the provider-aware order is the
+    probe's: only implemented capabilities are executed, an unimplemented one is
+    reported as such WITHOUT a request, and a provider with no credential is
+    reported separately from a provider that answered. The panel is re-rendered
+    ONCE with every result — never one message per provider.
+    """
+    results = await stt_provider_probe.test_candidates()
+    return await _stt_panel_with_notice(test_all_notice(results))
 
 
 # ── Behavioral settings (bounded, owner-editable) ──────────────────────
@@ -440,7 +468,7 @@ def register(client=None, owner_id: int = 0) -> None:
         register_panel("ai_media_stt", _ai_media_stt_panel_handler, parent="ai_media", title="Speech-to-Text")
         register_inline_builder("ai_media_stt", _ai_media_stt_inline_builder)
         register_action("ai_stt_select_candidate", _ai_stt_select_candidate_action)
-        register_action("ai_stt_test_candidate", _ai_stt_test_candidate_action)
+        register_action("ai_stt_test_all", _ai_stt_test_all_action)
         register_input("ai_media_stt", STORAGE_KEY_LANGUAGE, {
             "handler": _ai_stt_language_input,
             "prompt": (

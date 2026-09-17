@@ -47,7 +47,6 @@ from enum import Enum
 from typing import Any, Iterable
 
 from backend.ai.stt_control_plane import SttCandidate, all_candidates, get_candidate
-from backend.services import groq_stt_engine
 from backend.services.media_service import MediaError
 
 logger = logging.getLogger(__name__)
@@ -65,9 +64,20 @@ TEST_TONE_HZ = 440.0
 TEST_TONE_AMPLITUDE = 0.2
 _MAX_TEST_DURATION_S = 5.0
 
-#: The failure class reported when the probe itself could not be completed.
+#: The failure classes the probe itself can report, plus the neutral defaults it
+#: uses when an engine's own classification is unavailable. The probe is
+#: PROVIDER-AGNOSTIC: an adapter attaches its bounded ``failure_class`` to the
+#: failure it raises, and this module reports that token verbatim without
+#: importing any provider module.
 FAILURE_UNKNOWN_CANDIDATE = "unknown_candidate"
 FAILURE_TEST_TIMEOUT = "test_timeout"
+FAILURE_EMPTY = "empty_transcription"
+FAILURE_UNKNOWN = "unknown"
+
+
+def _failure_class_of(error: BaseException) -> str:
+    """The bounded failure class an engine attached to its failure (or a default)."""
+    return str(getattr(error, "failure_class", "") or FAILURE_UNKNOWN)
 
 
 class SttTestState(str, Enum):
@@ -285,7 +295,9 @@ async def test_candidate(
 
     engine, reason = _build_engine(candidate, language)
     if engine is None:
-        missing = reason == groq_stt_engine.FAILURE_MISSING_CREDENTIAL
+        from backend.services.stt_engine_factory import REASON_MISSING_CREDENTIAL
+
+        missing = reason == REASON_MISSING_CREDENTIAL
         return _record(
             SttTestResult(
                 candidate_id=candidate.candidate_id,
@@ -324,11 +336,11 @@ async def test_candidate(
         detail = f"The probe did not finish within {timeout:g}s."
     except MediaError as exc:
         state = SttTestState.FAILED.value
-        failure_class = groq_stt_engine.failure_class_of(exc)
+        failure_class = _failure_class_of(exc)
         detail = "The provider rejected or could not complete the transcription."
     except Exception as exc:  # noqa: BLE001 — the engine boundary
         state = SttTestState.FAILED.value
-        failure_class = groq_stt_engine.failure_class_of(exc)
+        failure_class = _failure_class_of(exc)
         detail = f"The probe failed ({type(exc).__name__})."
     else:
         text = text if isinstance(text, str) else ""
@@ -337,7 +349,7 @@ async def test_candidate(
             # successful empty transcription — the payload's own speech content
             # is reported here, not a claim about the provider.
             state = SttTestState.FAILED.value
-            failure_class = groq_stt_engine.FAILURE_EMPTY
+            failure_class = FAILURE_EMPTY
             detail = (
                 "The provider accepted the audio but returned no transcript. "
                 "A synthetic probe payload contains no speech; run the probe with "
