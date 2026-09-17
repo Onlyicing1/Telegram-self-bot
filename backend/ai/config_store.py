@@ -46,12 +46,16 @@ _DEFAULTS: dict[str, Any] = {
     "trigger_en": "Nova",
     "trigger_fa": "",
     "show_question": False,
-    #: Gemini speech-to-text behavior (AI -> Settings -> Advanced). These are the
-    #: owner's persisted values and the ONLY source the media engine is told
-    #: about; the empty/one defaults are themselves meaningful (no dedicated
-    #: model = the general media model, empty language = automatic detection,
-    #: one pass = the single-pass route), so "not configured" and "the default"
-    #: behave identically by design.
+    #: Speech-to-text behavior (AI -> Media Analysis -> Speech-to-Text). These are
+    #: the owner's persisted values and the ONLY source the media engine is told
+    #: about; the empty/one defaults are themselves meaningful, so "not
+    #: configured" and "the default" behave identically by design.
+    #: ``stt_model`` now holds the REGISTERED control-plane candidate the owner
+    #: picked (``backend/ai/stt_control_plane.py``), not a typed model id: empty =
+    #: the default candidate (the general media model), a registered candidate id
+    #: = that candidate, anything else = legacy/unresolved, which is passed
+    #: through to the engine unchanged rather than re-pointed at another model.
+    #: Language empty = automatic detection; passes one = the single-pass route.
     "stt_model": "",
     "stt_language": "",
     "stt_passes": 1,
@@ -160,10 +164,11 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "trigger_en": config.get("trigger_en", "") or None,
             "trigger_fa": config.get("trigger_fa", "") or None,
             "show_question": bool(config.get("show_question", False)),
-            # STT behavior: an unset/empty model or language is stored as NULL
+            # STT behavior: an unset/empty selection or language is stored as NULL
             # (the writer's existing "empty string -> NULL" convention), and the
             # passes value stays an integer because 1 is a real, meaningful
-            # value rather than an absence marker.
+            # value rather than an absence marker. The column set is unchanged:
+            # the control plane reuses these three keys, so no schema change.
             "stt_model": str(config.get("stt_model") or "").strip() or None,
             "stt_language": str(config.get("stt_language") or "").strip() or None,
             "stt_passes": int(config.get("stt_passes") or _DEFAULTS["stt_passes"]),

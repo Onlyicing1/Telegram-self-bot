@@ -20,8 +20,9 @@ Panels:
   ai_model       — Model selection (auto-fetched from provider API)
   ai_wizard      — Setup wizard (shown when no provider is configured)
   ai_settings    — Personal settings (wake words, reply stats, reply presentation)
-  ai_settings_adv— Advanced (creativity, response length, memory, personality,
-                   voice-transcription model/language/passes)
+  ai_settings_adv— Advanced (creativity, response length, memory, personality)
+  ai_media       — Media Analysis (text recognition + speech-to-text) — owned by
+                   backend/bot/handlers/ai_stt_settings.py, entered from here
   ai_diagnostics — Diagnostics (owner/developer only)
 """
 from __future__ import annotations
@@ -236,6 +237,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
                  "_Tap **Provider** to select one._"]
         builder = InlinePanelBuilder()
         builder.add_row("◈ Select Provider", "panel:ai_provider")
+        builder.add_row("▣ Media Analysis", "panel:ai_media")
         builder.add_row("Test Modules", "action:ai_test_models")
         _nav_buttons(builder)
         return "AI", "\n".join(lines), builder.build()
@@ -247,6 +249,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
         builder = InlinePanelBuilder()
         builder.add_row("◇ Select Model", "panel:ai_model")
         builder.add_row("◈ Change Provider", "panel:ai_provider")
+        builder.add_row("▣ Media Analysis", "panel:ai_media")
         _nav_buttons(builder)
         return "AI", "\n".join(lines), builder.build()
 
@@ -276,6 +279,7 @@ async def _ai_main_panel_handler(event, extra: str) -> tuple[str, str, list] | N
     builder.add_buttons(("▤ Usage", "panel:ai_usage"), ("✚ Health", "panel:ai_health"))
     builder.add_buttons(("⌕ Details", "panel:ai_details"), ("◇ Model", "panel:ai_model"))
     builder.add_buttons(("◈ Provider", "panel:ai_provider"), ("⚙ Settings", "panel:ai_settings"))
+    builder.add_row("▣ Media Analysis", "panel:ai_media")
     builder.add_row("Test Modules", "action:ai_test_models")
     _nav_buttons(builder)
     return "AI", "\n".join(lines), builder.build()
@@ -570,12 +574,8 @@ async def _ai_settings_panel_handler(event, extra: str) -> tuple[str, str, list]
     lines.append(f"Reply stats · {'On' if reply_stats else 'Off'}")
     if read_failed:
         lines.append("My message in replies · unavailable (database read failed)")
-        lines.append("Voice transcription · unavailable (database read failed)")
     else:
         lines.append(f"My message in replies · {'On' if show_question else 'Off'}")
-        from backend.bot.handlers.ai_stt_settings import stt_summary_line
-
-        lines.append(stt_summary_line(config))
 
     builder = InlinePanelBuilder()
     builder.add_row("English wake word", "input:ai_settings:trigger_en")
@@ -609,9 +609,6 @@ async def _ai_settings_adv_panel_handler(event, extra: str) -> tuple[str, str, l
     max_tokens = int(config.get("max_tokens", 4096) or 4096)
     budget = int(config.get("history_budget", 4000) or 4000)
     prompt = config.get("system_prompt", "")
-    from backend.bot.handlers.ai_stt_settings import stt_settings_display
-
-    stt_model, stt_language, stt_passes = stt_settings_display(config)
 
     lines = [
         "**Advanced**",
@@ -620,11 +617,6 @@ async def _ai_settings_adv_panel_handler(event, extra: str) -> tuple[str, str, l
         f"Response length up to {max_tokens:,} tokens",
         f"Remembers about {budget:,} tokens of conversation",
         f"Personality prompt · {'Custom' if prompt else 'Default'}",
-        "",
-        f"Voice transcription model · {stt_model or 'Default'}",
-        f"Voice transcription language · {stt_language or 'Auto'}",
-        f"Voice recognition passes · {stt_passes}"
-        f"{' (single pass)' if stt_passes == 1 else ''}",
     ]
 
     builder = InlinePanelBuilder()
@@ -632,9 +624,6 @@ async def _ai_settings_adv_panel_handler(event, extra: str) -> tuple[str, str, l
     builder.add_row("Response length…", "input:ai_settings:max_tokens")
     builder.add_row("Conversation memory…", "input:ai_settings:history_budget")
     builder.add_row("Personality prompt…", "input:ai_settings:system_prompt")
-    builder.add_row("Voice transcription model…", "input:ai_settings:stt_model")
-    builder.add_row("Voice transcription language…", "input:ai_settings:stt_language")
-    builder.add_row("Voice recognition passes…", "input:ai_settings:stt_passes")
     _nav_buttons(builder)
     return "Advanced", "\n".join(lines), builder.build()
 

@@ -1,294 +1,276 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — M1.8: Telegram-manageable Gemini STT settings (owner config, no redeploy)
+## Latest phase — M2.0: Speech-to-Text control-plane foundation (AI → Media Analysis)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-17.
 
 ### Current stage
 
-M1.8. The three BEHAVIORAL speech-to-text settings are now **owner settings**
-persisted through the existing AI configuration path and edited from Telegram —
-they are no longer deployment configuration that requires editing Render ENV and
-redeploying.
+M2.0 — **Phase 1 of the Speech-to-Text control plane only.** The STT
+configuration is no longer three free-form fields inside **AI → Settings →
+Advanced**; it is a capability under the new **AI → Media Analysis** surface,
+and the model is no longer something the owner types.
 
-| Setting | Stored key (`ai_config`) | Default (nothing configured) | Meaning of the default |
-|---|---|---|---|
-| Gemini STT model | `stt_model` | empty | the general media model answers the STT instruction |
-| Gemini STT language hint | `stt_language` | empty | automatic language detection (no `language_codes` sent) |
-| Gemini STT recognition passes | `stt_passes` | `1` | the existing single-pass route |
-
-Reached from **AI → Settings**: one state line on the personal surface, the three
-controls on the existing **Advanced** sub-panel. No new panel, category, store,
-service or scheduler was created.
+```
+AI                                    (ai)
+├── Media Analysis                    (ai_media)
+│   ├── Text recognition (OCR)        (ai_media_ocr)
+│   └── Speech-to-Text                (ai_media_stt)
+│       ├── pick a REGISTERED candidate   → action:ai_stt_select_candidate:<candidate-id>
+│       ├── Language…                     → input:ai_media_stt:stt_language
+│       └── Recognition passes…           → input:ai_media_stt:stt_passes
+├── Settings                          (ai_settings)   — STT controls REMOVED
+│   └── Advanced                      (ai_settings_adv) — STT controls REMOVED
+└── … (provider, model, usage, health, details, diagnostics: unchanged)
+```
 
 | Item | Value |
 |---|---|
-| **Starting HEAD** | `01ff211027e3b9c4f395189710c9ec08940f7742` — `feat(stt): add the bounded multi-pass STT accuracy seam` (== `origin/main`; working tree clean at the start of this phase) |
+| **Phase** | M2.0 — STT control-plane foundation (registry + configuration model + Media Analysis surface) |
+| **Starting HEAD** | `4a1f9a241d76da27fab38c7a25f8a19f81a4fabe` — `added web investigation report file` (== `origin/main`; working tree clean at the start of this phase) |
 | **Implementation commit** | the single commit of this phase (`git log -1 --format=%H` re-verifies it; recorded in the hand-off response) |
-| **Database migration required** | **YES** — three additive `ai_config` columns. Created as a migration file, **NOT executed**: applying it to the live Supabase project is a manual owner action. |
-| **Accuracy claim** | **NONE.** This phase makes recognition behavior configurable. It does not make recognition more accurate, and nothing here measures quality. |
+| **Database migration required** | **NO** — the existing `ai_config` columns are sufficient (see *Persistence*); no SQL was written, invented or executed |
+| **New tables** | **NONE** |
+| **New provider adapters** | **NONE** (Speechmatics / Groq Whisper are registered as *unimplemented capabilities only*) |
+| **STT execution path** | **UNCHANGED** (only the control-plane → engine conversion was inserted in front of the existing seam) |
 | **Live Telegram verification** | **NOT PERFORMED** (no session or traffic in this environment) |
-| **Live Gemini verification** | **NOT PERFORMED** (every engine interaction in this phase was a scripted in-process transport) |
+| **Live STT provider verification** | **NOT PERFORMED** (no provider request is made anywhere in this phase) |
 
 ### Commit lineage
 
 | Commit | Role |
 |---|---|
-| `5b3f6d7` `fix(stt): bound the dedicated transcription operation to one deadline` | M1.7c — the bounded transport (one operation deadline, `uri`-primary representation, classified failures, bounded retry/cleanup) |
-| `01ff211` `feat(stt): add the bounded multi-pass STT accuracy seam` | M1.7e — the opt-in STT-only consensus seam (`stt_consensus.py`, `AI_GEMINI_STT_PASSES`) and the repeat-run benchmark. **starting HEAD of this phase** |
-| the commit of this phase | M1.8 — the owner-managed STT settings, their persistence, their Telegram controls, their runtime application and this report |
+| `01ff211` `feat(stt): add the bounded multi-pass STT accuracy seam` | M1.7e — the opt-in STT-only consensus seam |
+| (M1.8 commit) | M1.8 — the owner-managed Gemini STT settings (`stt_model` / `stt_language` / `stt_passes`), their persistence, their Telegram controls (AI → Settings → Advanced) and their runtime application |
+| `4a1f9a2` `added web investigation report file` | the web research report — **starting HEAD of this phase** |
+| the commit of this phase | M2.0 — the STT control plane: candidate registry, structured configuration, the AI → Media Analysis surface, and this report |
 
 ### Files changed by this phase
 
 | File | Change |
 |---|---|
-| `backend/ai/config_store.py` | the three keys in `_DEFAULTS` and in the `ai_config` upsert payload |
-| `backend/services/gemini_media_engine.py` | `STT_SETTING_DEFAULTS`, `STT_LANGUAGE_AUTO`, `stt_settings_from()` (pure) and `apply_stt_settings()` (the ONE engine reconfiguration entry point) |
-| `backend/runtime/supervisor.py` | `_provision_media_engines()` is now async and, after provisioning, installs the owner's persisted STT settings through the existing store (`_apply_persisted_stt_settings()`) |
-| `backend/bot/handlers/ai_stt_settings.py` **(new)** | the three input handlers, their validation, the panel display helpers and the runtime hand-off |
-| `backend/bot/handlers/ai.py` | one transcription state line on the personal Settings surface, the three rows on the existing Advanced panel, and lazy imports of the display helpers |
-| `backend/bot/router.py` | registers the new module in the existing handler list |
-| `supabase/migrations/20260917000001_add_ai_config_stt_settings.sql` **(new)** | the three columns, the pass-range CHECK, and rollback SQL — **pending manual application** |
-| `DATABASE_ARCHITECTURE.md` | §7 column table, the §7 current-status note and a new §19.2b item (schema-change rules) |
-| `tests/test_ai_stt_settings.py` **(new)** | 56 tests for defaults, persistence, validation, panels, inputs, runtime application, isolation and registration |
-| `tests/test_36_ai_settings_ux.py` | the registration test now covers the new module too (9 unique inputs, same registry) |
-| `tests/test_media_gemini_engine.py` | the supervisor-hook test now awaits the async provisioning hook |
+| `backend/ai/stt_control_plane.py` **(new)** | the capability registry (`SttCandidate`, `STT_CANDIDATES`), the configuration model (`SttControlPlane`), `parse_stt_config()`, the persistence mapping (`storage_value()`, `engine_settings()`) — stateless, no Telegram/DB/network/boundary imports |
+| `backend/bot/handlers/ai_stt_settings.py` | becomes the **Media Analysis** surface: the `ai_media` / `ai_media_ocr` / `ai_media_stt` panels, the candidate-selection action, the two bounded inputs (language, passes) and the runtime hand-off. The free-form model input is **deleted** |
+| `backend/bot/handlers/ai.py` | the `▣ Media Analysis` entry on the AI main panel; the STT state line removed from **Settings** and the three STT rows/values removed from **Advanced**; module docstring updated |
+| `backend/ai/config_store.py` | documentation only — the STT key comments now describe the control-plane semantics (registered candidate id / legacy-unresolved) and the unchanged column set. **No behavior change** |
+| `backend/runtime/supervisor.py` | `_apply_persisted_stt_settings()` now resolves the stored selection through `stt_control_plane.engine_settings()` before handing it to the existing engine seam (the ONE compatibility hook) |
+| `tests/test_ai_stt_settings.py` | rewritten/extended (87 tests) for the control plane, the Media Analysis surface, the move out of Settings/Advanced, legacy compatibility and the engine conversion |
+| `tests/test_36_ai_settings_ux.py` | the registration test now asserts 6 AI-Settings inputs (STT gone) and the two `ai_media_stt` inputs |
 | `IMPLEMENTATION_REPORT.md` | this report |
 
-**Untouched:** `INVESTIGATION.md`, `media_service.py`, `backend/ai/media.py`,
-`backend/telegram_api/media.py`, `media_ai_service.py`, `dispatcher.py`,
-`ai_unified.py`, `stt_consensus.py`, `ProviderManager` and every adapter, the tool
-registry/executor, the media boundary and target resolution, `MediaAnalysis`, the
-Save/Task/Scheduler/OCR/vision paths, the panel infrastructure, `requirements.txt`,
-`render.yaml`, `Procfile`, ENV files and all secrets.
+**Untouched (deliberately):** `backend/services/media_service.py` (seam and
+execution behavior), `backend/services/gemini_media_engine.py` (transports,
+`apply_stt_settings`, `stt_settings_from`, `STT_MAX_PASSES`),
+`backend/services/stt_consensus.py`, `backend/bot/handlers/ai_unified.py`,
+`backend/ai/engine/dispatcher.py`, the provider adapters and `ProviderManager`,
+the tool registry/executor, `backend/ai/media.py`,
+`backend/telegram_api/media.py`, `media_ai_service.py`, the Save/Task/Scheduler
+paths, OCR behavior, the panel infrastructure, `requirements.txt`,
+`render.yaml`, `Procfile`, `supabase/migrations/*.sql`, `DATABASE_ARCHITECTURE.md`,
+ENV files and all secrets.
 
-### Why a separate handler module
+### What was implemented
 
-`backend/bot/handlers/ai.py` is already ~78 KB; the three input handlers plus
-their validation and the runtime hand-off are one cohesive unit and live in
-`ai_stt_settings.py`, exactly as `ai_test_progress.py` exists for its own AI
-sub-feature. The controls still attach to the EXISTING `ai_settings` panel via
-the ONE input registry, and the module is registered alongside every other
-handler module in `backend/bot/router.py` — no second panel, no second registry.
+1. **A capability-specific candidate registry** (`stt_control_plane.STT_CANDIDATES`)
+   — a deterministic tuple of `SttCandidate(candidate_id, provider, model, label,
+   implemented, note)`. Identity is `provider:model`; `implemented` separates
+   "this project knows the capability exists" from "this project can run it
+   today". The registry is the ONLY source of candidates, which is what removes
+   manual model entry:
 
-### Persistence
+   | Candidate | Provider | Model | Implemented |
+   |---|---|---|---|
+   | `gemini:default` | gemini | *(provider default → general media model)* | **yes** |
+   | `gemini:gemini-3.5-transcribe` | gemini | `gemini-3.5-transcribe` | **yes** |
+   | `groq:whisper-large-v3` | groq | `whisper-large-v3` | no — registered capability only |
+   | `groq:whisper-large-v3-turbo` | groq | `whisper-large-v3-turbo` | no — registered capability only |
+   | `speechmatics:standard` | speechmatics | `standard` | no — registered capability only |
 
-* Owner-specific: the values live on the owner's single existing `ai_config` row
-  (`owner_id` UNIQUE), through `backend/ai/config_store.py` — the same store, the
-  same upsert, the same defaults merge every other AI setting uses.
-* Survives a process restart **when the `ai_config` column set exists** (below).
-  Until the migration is applied, the whole upsert degrades to the documented
-  in-memory fallback and the values are lost on restart — the pre-existing,
-  already-documented behavior of any missing `ai_config` column, not a new mode.
-* Nothing is stored in module globals as a source of truth, nothing in ENV, and
-  no parallel settings dictionary was introduced.
-* No API key is exposed through Telegram; keys stay environment-backed, and no
-  panel label or prompt names an environment variable (asserted by a test).
+2. **A structured configuration model** (`SttControlPlane`) representing the
+   available pool, the selected active candidate, the **ordered active-first
+   fallback list**, the language preference, the bounded pass count, the
+   legacy/unresolved state and the "selected but not executable" state.
 
-### Database schema — migration REQUIRED and NOT executed
+3. **A new AI → Media Analysis surface** built from the project's existing panel
+   / input / action registries (`register_panel` / `register_input` /
+   `register_action` + `InlinePanelBuilder` + `_finish_input` → one edit per
+   interaction, no new messages). No parallel Telegram UI framework, no second
+   registry, no second store.
 
-The existing `ai_config` schema could not store these three settings (they are
-new typed behaviors, not arbitrary keys), so the smallest additive change was
-made: three columns on the existing table. No new table, no new index, no RLS
-change.
+4. **The STT controls left AI → Settings and AI → Settings → Advanced** (state
+   line and the three rows/inputs removed). Everything else on those two panels
+   is preserved, and the eight remaining settings (wake words, reply stats, reply
+   presentation, creativity, response length, conversation memory, personality
+   prompt) behave exactly as before.
 
-**MANUAL SUPABASE ACTION REQUIRED (idempotent — apply in the Supabase SQL editor):**
+5. **A deterministic no-manual-entry selection path**: the STT panel offers one
+   button per *implemented, non-active* registered candidate
+   (`action:ai_stt_select_candidate:<candidate-id>`); the two remaining inputs
+   are the bounded behavioral settings. A typed model identifier is no longer
+   reachable anywhere in the surface.
 
-```sql
-ALTER TABLE ai_config
-    ADD COLUMN IF NOT EXISTS stt_model text;
+6. **The control-plane → engine conversion** (`engine_settings()`), consumed by
+   exactly two callers: the runtime supervisor at startup and the handlers after
+   a save.
 
-ALTER TABLE ai_config
-    ADD COLUMN IF NOT EXISTS stt_language text;
+### Resulting architecture
 
-ALTER TABLE ai_config
-    ADD COLUMN IF NOT EXISTS stt_passes integer NOT NULL DEFAULT 1;
-
-ALTER TABLE ai_config
-    DROP CONSTRAINT IF EXISTS ai_config_stt_passes_range;
-
-ALTER TABLE ai_config
-    ADD CONSTRAINT ai_config_stt_passes_range
-    CHECK (stt_passes BETWEEN 1 AND 3);
+```
+Telegram UI (AI → Media Analysis → Speech-to-Text)
+    ↓  a registered candidate id + language + passes
+persisted owner configuration  (existing ai_config row, existing 3 keys)
+    ↓
+STT CONTROL PLANE  (backend/ai/stt_control_plane.py — stateless)
+    ↓  active candidate + ordered fallback list + engine values
+(a LATER phase: the candidate test / health / fallback manager)
+    ↓
+the EXISTING media boundary seam (media_service.set_stt_engine)
 ```
 
-**Rollback (the application keeps working on the defaults afterward; stored
-values are lost):**
+The control plane owns *configuration*; the media boundary keeps owning
+*execution*. The control plane imports neither Telegram nor the database nor
+`media_service`, and no Telegram object, owner id, chat id, message id, filename
+or caption can cross into it (verified by test, `engine_settings()` carries
+exactly three keys).
 
-```sql
-ALTER TABLE ai_config
-    DROP CONSTRAINT IF EXISTS ai_config_stt_passes_range;
+### Persistence behavior
 
-ALTER TABLE ai_config
-    DROP COLUMN IF EXISTS stt_passes;
+* **Same store, same row, same keys.** The three values live on the owner's
+  single existing `ai_config` row through `backend/ai/config_store.py` — the same
+  upsert, the same defaults merge, the same in-memory fallback. No second store,
+  no new table, **no new column**, no SQL.
+* `stt_model` keeps its column but changes MEANING: empty = the default
+  candidate, a *registered candidate id* = that candidate, anything else =
+  legacy/unresolved. `storage_value()` maps the default candidate back to the
+  empty string, so "nothing configured" and "the default" remain one state and
+  the key never grows a new format.
+* `stt_language` (empty = automatic) and `stt_passes` (integer, 1..3) are
+  unchanged, still written by the same upsert payload, still merged by the same
+  `_DEFAULTS`.
+* A failed durable write still degrades to the documented in-memory fallback;
+  a failed durable *read* is still flagged (`DEGRADED_READ_KEY`) and the
+  supervisor still keeps the provisioned bootstrap settings instead of
+  downgrading a configured model because the database blinked.
 
-ALTER TABLE ai_config
-    DROP COLUMN IF EXISTS stt_language;
+### Backward compatibility behavior
 
-ALTER TABLE ai_config
-    DROP COLUMN IF EXISTS stt_model;
-```
-
-The repository copy of this migration is
-`supabase/migrations/20260917000001_add_ai_config_stt_settings.sql`. **It was not
-executed here and no claim is made that the columns exist in the live project.**
-`DATABASE_ARCHITECTURE.md` was updated in the same commit because a real schema
-change was required (§7 columns, §7 status note, §19.2b).
-
-### The Telegram controls
-
-| Surface | Content |
-|---|---|
-| AI → Settings (text) | `Voice transcription · <model|default model> · <language|auto> · <n> pass(es)`, or `Voice transcription · unavailable (database read failed)` when the durable read failed — the panel never reports a default as if it were the stored value |
-| AI → Settings → Advanced (text) | `Voice transcription model · …`, `Voice transcription language · …`, `Voice recognition passes · n (single pass)` |
-| AI → Settings → Advanced (buttons) | `Voice transcription model…` → `input:ai_settings:stt_model`; `Voice transcription language…` → `input:ai_settings:stt_language`; `Voice recognition passes…` → `input:ai_settings:stt_passes` |
-
-Each input closes in ONE edit (the existing `_finish_input` contract: notice on
-top of the refreshed Advanced panel), deletes the owner's reply, and on a failed
-durable write shows the failure notice — the pattern the other AI settings use.
-
-### Validation bounds
-
-| Setting | Accepted | Rejected (refused, never clamped, nothing stored) |
+| Stored `stt_model` | Parsed as | Engine receives |
 |---|---|---|
-| STT model | one opaque token, `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`; `reset`/`clear`/`default`/`none` → the default (empty) | empty, spaces, punctuation outside the allowed set, > 64 chars |
-| STT language | a BCP-47 shape, `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$` (e.g. `fa-IR`); `auto`/`reset`/`clear`/empty → automatic (stored empty) | `persian`, `fa IR`, `fa_IR`, `f`, `-IR` |
-| STT passes | the integers `1`, `2`, `3` | `0`, `-1`, `4`, `9`, `2.0`, non-integers, empty |
+| empty / unset | the default candidate (`gemini:default`) | `""` → the general media route, byte-identical to before this phase |
+| a registered candidate id | that candidate (active) | its model (`gemini-3.5-transcribe`) or `""` for the provider default |
+| `gemini-2.5-pro` (or any other unregistered value) | **legacy / unresolved** — no candidate is selected, the pool is unranked | the stored value **verbatim** |
 
-The model is **not** validated against a registry: the project has none for
-transcription models, and an unknown id is stored and passed through unchanged
-(only the project's existing deprecation map may substitute a retired alias).
-The pass count keeps the M1.7e safety bound (1..3, default 1) as an engine
-invariant as well as a Telegram one, and the database CHECK enforces it too.
-
-### Runtime configuration behavior (explicit precedence)
-
-1. **Secrets** — the Gemini API key remains environment-backed
-   (`resolve_api_key()`), unchanged.
-2. **Behavior** — the three STT settings come from the owner's persisted
-   `ai_config` row. The engine never reads the store and never learns an owner
-   id: the caller (the supervisor at startup, the AI Settings handler after a
-   save) reads it and passes plain values into `apply_stt_settings()`. The engine
-   is therefore Telegram-agnostic, and a Telegram change is effective on the
-   **next media operation** with no redeploy and no restart.
-3. **Defaults** — used only when the owner has no configured value (empty
-   model / empty language / one pass), which is byte-identical to the behavior
-   before this phase.
-4. **ENV is not the settings database** — `AI_GEMINI_STT_MODEL`,
-   `AI_GEMINI_STT_LANGUAGE` and `AI_GEMINI_STT_PASSES` remain only as the
-   deployment bootstrap (`build_gemini_media_engine`), and the persisted row
-   supersedes them whenever it can be read (asserted by a test that sets all
-   three ENV variables and shows the persisted values winning).
-5. **Unreadable store** — a FAILED durable read is not treated as "no settings":
-   the supervisor keeps the bootstrap configuration rather than silently
-   downgrading a configured model because the database blinked.
-
-Precedence summary:
-
-```
-behavioral STT value = persisted ai_config value
-                       else (store unreadable) bootstrap ENV/default
-                       else (nothing configured) documented default
-
-credential = ENV only
-```
-
-### Context isolation (verified, not merely intended)
-
-`stt_settings_from()` is pure over a mapping of the three keys and ignores
-everything else, `apply_stt_settings()` accepts only that mapping, and the engine
-holds exactly six slots (`_api_key`, `_model`, `_key_env_var`, `_stt_model`,
-`_stt_language`, `_stt_passes`). Tests feed `owner_id`, `chat_id`,
-`message_id`, `sender`, `username`, `caption`, `filename`, `history`, `memory`
-and `reply_text` alongside the settings and assert the engine keeps only the
-three values and that none of those strings is reachable from the engine. No
-chat history, memory, sender, chat id, message id, filename, caption or reply
-text can reach the transcription model.
+An unregistered value is **never** silently re-pointed at another registered
+candidate, and a selected candidate that is not executable (registered, not
+implemented) maps to the boundary's existing fail-closed "no dedicated STT
+model" state and is labelled as such on the panel. The three `AI_GEMINI_STT_*`
+ENV variables remain bootstrap-only, exactly as M1.8 documented.
 
 ### Tests and exact results
 
-Focused (all green):
-
 | Suite | Result |
 |---|---|
-| `tests/test_ai_stt_settings.py` (new, 56 tests) | `56 passed` |
-| `tests/test_36_ai_settings_ux.py` | passed (registration now covers 9 unique inputs on the one registry) |
-| `tests/test_media_gemini_engine.py` | passed (supervisor hook awaited) |
-| `tests/test_media_dedicated_stt.py`, `tests/test_media_stt_reliability.py`, `tests/test_media_stt_multipass.py`, `tests/test_stt_consensus.py`, `tests/test_media_stt_benchmark.py`, `tests/test_media_stt.py` | passed |
-| the eight media/settings suites together | `372 passed` |
+| `tests/test_ai_stt_settings.py` (rewritten, 87 tests) | `87 passed` |
+| `tests/test_36_ai_settings_ux.py`, `tests/test_11_runtime_wiring.py`, `tests/test_33_ai_telemetry.py`, `tests/test_ai_presentation_redesign.py` | `119 passed` |
+| the nine media / STT boundary suites (`test_media_stt.py`, `test_media_dedicated_stt.py`, `test_media_stt_reliability.py`, `test_media_stt_multipass.py`, `test_media_stt_language.py`, `test_media_stt_benchmark.py`, `test_stt_consensus.py`, `test_media_gemini_engine.py`, `test_media_ai_integration.py`) | `442 passed` (unchanged — the boundary and the execution path are untouched) |
+| **Full suite** | **`3600 passed, 24 skipped, 3 warnings` in 114.89 s** (pre-existing skips only; no test was deleted, weakened or skipped) |
 
-The new suite covers: deterministic defaults; persistence of a custom model, a
-custom language, and passes 1/2/3; reload; the upsert payload carrying all three
-keys; the 1..3 bound; the `auto` alias; deprecation substitution vs. unknown-id
-pass-through; the Advanced panel showing current values and defaults; the
-personal panel's state line and its honest "unavailable" state; the three input
-flows changing each value; refusal of malformed models/languages and of 0, −1,
-4, 9, 2.0, non-integers; the live engine taking the persisted values; the
-persisted values winning over ENV; fail-closed with no credential; context
-isolation; the startup application and the unreadable-store degradation; and the
-registration path (module list + one panel scope, no duplicate keys, no second
-store, no `os.getenv`).
-
-**Full suite:** `3569 passed, 24 skipped, 3 warnings` in 113.83 s
-(pre-existing skips only; no test was deleted, weakened or skipped).
+The rewritten suite covers, among others: the registry's provider+model identity;
+deterministic canonical order and a deterministic active-first fallback order;
+persistence of the active candidate, the language and each pass count 1/2/3
+through the existing config store; the 1..3 bound; the `auto` alias; refusal of
+an unregistered candidate (both `storage_value()` and the panel's offered
+candidates); legacy values that stay unresolved and keep the previous engine
+behavior; the Media Analysis panel registering under `ai` with OCR and
+Speech-to-Text under it; STT controls absent from `ai_settings` /
+`ai_settings_adv` and from their rendered bodies/buttons; the untouched Advanced
+controls; the two bounded inputs and their refusals; the candidate action
+(selects implemented, refuses unregistered and unimplemented); the engine
+receiving the resolved model; context isolation (the engine keeps exactly six
+slots and none of the poisoned metadata is reachable); and the supervisor
+startup hook with an unreadable store.
 
 **Syntax / whitespace:** `python -m py_compile` clean on every changed Python
 file; `git diff --check` clean.
 
 ### Live verification status
 
-* **Telegram:** NOT performed. The controls were verified against the real
-  handler functions, the real registry and the real panel builders, but no
-  Telegram session rendered them.
-* **Gemini:** NOT performed. The runtime application was verified against the
-  real engine constructor and `media_service` seams; no request was sent.
+* **Telegram:** NOT performed. The panels, inputs and action were exercised
+  against the real handler functions, the real panel/input/action registries and
+  the real panel builders, but no Telegram session rendered them.
+* **STT providers:** NOT performed — and out of scope: this phase makes no
+  provider request at all, and neither credential presence nor reachability is
+  measured anywhere.
 
 Neither status may be reported as success.
 
+### Intentionally NOT implemented in this phase
+
+* **Speechmatics** (no adapter, no `AI_SPEECHMATICS_API_KEY`, no request) — only
+  a registered, non-selectable capability entry.
+* **Groq Whisper** (no transcription adapter, no request) — same, capability
+  entries only. A general Groq *chat* provider existing in the repository is not
+  evidence of an STT capability and was not treated as one.
+* **Any new STT provider adapter or transport.**
+* **Runtime fallback / retry orchestration / cooldown / concurrency** — the
+  configuration can *represent* an ordered candidate list, but nothing executes
+  a failover yet.
+* **The provider/model test manager** (reachability, latency, failure class,
+  cooldown, last test result) — only the data model it will need was
+  established, and credential-presence is deliberately kept distinct from
+  "tested and usable".
+* **Any change to OCR behavior, the media boundary, the dispatcher, the tool
+  layer, `ProviderManager`, the scheduler, `RuntimeSupervisor` recovery or the
+  Supabase schema.**
+
 ### Known limitations
 
-1. The migration is **pending manual application**; until then the settings
-   degrade to the in-memory fallback (lost on restart) — the same degradation
-   already documented for the trigger and `show_question` columns.
-2. The startup log line (`GEMINI_MEDIA_ENGINE_PROVISIONED`) still reports the
-   bootstrap model; the per-operation STT line and the panel report the effective
-   values. (Unchanged from M1.7e's note about the pass count.)
-3. `INVESTIGATION.md` is unchanged, so the recognition-quality question (class A)
-   remains open and unmeasured.
-4. Behavioral settings no longer depend on ENV, so the three `AI_GEMINI_STT_*`
-   variables are bootstrap-only and should be treated as deprecated in
-   documentation.
-5. `main` and `origin/main` verification is recorded in the hand-off response;
-   the migration cannot be verified from here at all.
+1. **`DATABASE_ARCHITECTURE.md` §7 was intentionally NOT edited.** The schema is
+   unchanged, so no schema documentation change was required by this phase's
+   rules; the `stt_model` row there still describes the M1.8 semantics ("an
+   opaque typed model id, edited from AI → Settings → Advanced") and is now
+   **superseded by this report** until a documentation-only update is made.
+2. The fallback order is derived from the canonical registry order rather than
+   stored per-owner, so it cannot yet be re-ranked by the owner. That belongs to
+   the later test/fallback phase.
+3. `groq:*` and `speechmatics:*` appear in the pool as `not available yet`; they
+   are honest placeholders, not usable engines.
+4. The M1.8 note stands: the `ai_config` STT columns require the pending manual
+   migration; until it is applied the settings degrade to the in-memory fallback.
+5. Recognition quality (class A) remains unmeasured.
 
 ### Deferred work
 
-* Applying the migration to the live Supabase project (owner action).
-* Deprecating/removing the `AI_GEMINI_STT_*` bootstrap variables from any
-  operator documentation once the columns are live.
+* The **STT provider/model test manager** (reachability, latency, failure class,
+  cooldown, last-test result) and the credential discovery that feeds it.
+* The **runtime fallback executor** (primary → next active candidate → honest
+  failure) in front of the existing media boundary seam.
+* The **Speechmatics and Groq Whisper adapters** (and their ENV credentials).
+* Per-owner fallback re-ranking, if it is wanted.
+* Applying the pending `ai_config` migration and the documentation-only
+  `DATABASE_ARCHITECTURE.md` §7 semantics refresh.
 * Class A (recognition quality) measurement — `INVESTIGATION.md` §19 stays open.
-* Design B (model-based reconciliation) — still deferred, still gated on live
-  evidence.
 
-### Explicit next stage — M1.7f: the live evidence pass for class A
+### Explicit next stage — M2.1: the STT provider test manager
 
-Unchanged in substance, and now simpler to run:
-
-1. Apply the migration (or accept the RAM fallback) and open **AI → Settings →
-   Advanced** to confirm the three controls render and persist.
-2. Leave the recognition passes at `1` and confirm the existing single-pass route
-   is unchanged.
-3. Run `python -m backend.tools.stt_benchmark --audio v.ogg --reference v.txt
-   --passes 1,2,3 --repeat 3` on 5–10 real Persian voice notes, then set the pass
-   count **from Telegram** (not from ENV) if — and only if — the numbers justify
-   it.
-4. Update `INVESTIGATION.md` §19 only from that measurement.
+1. Add the credential discovery for the registered candidates (ENV only, never
+   Telegram/Supabase) and expose `credential present` **separately** from
+   `tested`.
+2. Add the bounded, on-demand "Test STT providers" action that probes each
+   implemented candidate once, with a failure class, latency and a bounded
+   cooldown, surfaced through the existing Media Analysis panel.
+3. Only after that, add the runtime fallback executor in front of the existing
+   `media_service.set_stt_engine` seam — one candidate at a time, honest failure
+   at the end.
 
 ### Document version
 
-This document reflects the M1.8 state: the three Gemini STT settings are
-owner-persisted through the existing `ai_config`/`config_store` path, edited from
-AI → Settings → Advanced, applied to the live STT engine without a redeploy, with
-the bounded transport of M1.7c and the opt-in multi-pass seam of M1.7e unchanged
-behind them. The three `ai_config` columns are pending manual application. If
-code changes invalidate any section, update this document in the same commit.
+This document reflects the M2.0 state: Speech-to-Text is a capability under
+**AI → Media Analysis**, configured by picking a REGISTERED candidate from the
+control plane's registry plus a bounded language and pass count; the values are
+persisted on the owner's existing `ai_config` row with no schema change; an
+unregistered stored value stays legacy/unresolved and keeps its previous engine
+behavior; and the media boundary, the execution path and every provider adapter
+are unchanged. Provider adapters and runtime fallback execution are deferred to
+the next phase. If code changes invalidate any section, update this document in
+the same commit.

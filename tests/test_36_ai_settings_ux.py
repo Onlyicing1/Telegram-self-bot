@@ -144,10 +144,15 @@ def test_registration_adds_advanced_panel_and_keeps_inputs_unique():
 
     assert "ai_settings_adv" in panels
     keys = [k for scope, k in inputs if scope == "ai_settings"]
-    # 6 chat/personality settings + the 3 Voice transcription settings, all on
-    # the SAME panel via the SAME registry — no duplicate input keys.
-    assert len(keys) == len(set(keys)) == 9
-    assert {"stt_model", "stt_language", "stt_passes"} <= set(keys)
+    # the 6 chat/personality settings, all on the SAME panel via the SAME
+    # registry — no duplicate input keys.
+    assert len(keys) == len(set(keys)) == 6
+    # Voice transcription is NOT an AI Settings control any more: it moved to
+    # AI -> Media Analysis -> Speech-to-Text (still the same one registry).
+    assert not {"stt_model", "stt_language", "stt_passes"} & set(keys)
+    stt_keys = sorted(k for scope, k in inputs if scope == "ai_media_stt")
+    assert stt_keys == ["stt_language", "stt_passes"]
+    assert len(stt_keys) == len(set(stt_keys))
 
 
 # ── 4. Input completion restores the panel in ONE edit ──
