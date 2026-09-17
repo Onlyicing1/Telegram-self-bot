@@ -135,6 +135,8 @@ class _ApiStub(httpx.BaseTransport):
         interaction_status: str = "completed",
         interaction_payload: Any = None,
         interaction_raw: bytes | None = None,
+        upload_payload: Any = None,
+        interaction_statuses: list[int] | None = None,
         http_status: int = 200,
         generate_text: str = "stub ocr text",
         upload_status: int = 200,
@@ -148,6 +150,12 @@ class _ApiStub(httpx.BaseTransport):
         self.interaction_status = interaction_status
         self.interaction_payload = interaction_payload
         self.interaction_raw = interaction_raw
+        self.upload_payload = upload_payload
+        #: Per-call statuses for the interaction endpoint, so a test can script
+        #: "the first attempt fails, the bounded second one succeeds". The last
+        #: value repeats; ``http_status`` is used when this is not given.
+        self.interaction_statuses = list(interaction_statuses or [])
+        self._interaction_calls = 0
         self.http_status = http_status
         self.generate_text = generate_text
         self.upload_status = upload_status
@@ -177,7 +185,9 @@ class _ApiStub(httpx.BaseTransport):
         if request.method == "POST" and url == _UPLOAD_URL:
             if self.upload_status >= 400:
                 return self._error(request, self.upload_status)
-            payload = self.interaction_payload or {
+            # The finalize response carries the FILE, never the interaction body:
+            # the two are separate endpoints with separate response shapes.
+            payload = self.upload_payload or {
                 "file": {"name": _FILE_NAME, "uri": _FILE_URI, "state": self.file_state}
             }
             return httpx.Response(200, json=payload, request=request)
@@ -192,8 +202,13 @@ class _ApiStub(httpx.BaseTransport):
                 request=request,
             )
         if url == INTERACTIONS_ENDPOINT:
-            if self.http_status >= 400:
-                return self._error(request, self.http_status)
+            status = self.http_status
+            if self.interaction_statuses:
+                index = min(self._interaction_calls, len(self.interaction_statuses) - 1)
+                status = self.interaction_statuses[index]
+            self._interaction_calls += 1
+            if status >= 400:
+                return self._error(request, status)
             if self.interaction_raw is not None:
                 return httpx.Response(200, content=self.interaction_raw, request=request)
             if self.interaction_payload is not None:
@@ -626,7 +641,12 @@ async def test_the_dedicated_request_is_the_documented_transcription_request(stu
     item = _audio_item(request)
     assert item["type"] == "audio"
     assert item["mime_type"] == "audio/ogg"
-    assert base64.b64decode(item["data"]) == payload
+    # The representation the documentation shows for THIS model: the Files API
+    # URI form, never an inline payload the model's own guide does not demonstrate.
+    assert item["uri"] == _FILE_URI
+    assert "data" not in item
+    # The bytes that travelled are the validated bytes, byte-identical.
+    assert transport.requests[1].content == payload
     # Verbatim, explicitly — never Smart transcription.
     assert _config(request)["mode"] == {"type": "verbatim"}
 
@@ -745,20 +765,70 @@ async def test_every_validated_audio_container_maps_to_a_documented_mime(
     assert analysis.content == "stub transcript"
     item = _audio_item(transport.interaction_requests[0])
     assert item["mime_type"] == expected
-    assert base64.b64decode(item["data"]) == payload
+    assert item["uri"] == _FILE_URI
+    # The validated container is what was uploaded, unmodified and untranscoded.
+    assert transport.requests[1].content == payload
 
 
 @pytest.mark.asyncio
-async def test_a_small_voice_note_uses_the_inline_payload_path(stub):
+async def test_a_small_voice_note_uses_the_documented_uri_representation(stub):
+    """Primary transport = the Files API URI form, for small notes too.
+
+    The dedicated model's own documentation shows only ``uri``; the inline
+    ``data`` form is the bounded FALLBACK, not the primary path — so even a tiny
+    voice note is uploaded, referenced by URI, and the remote file is removed.
+    """
     transport = stub()
     payload = _ogg_opus()
 
     _dedicated().transcribe(payload)
 
     item = _audio_item(transport.interaction_requests[0])
-    assert "data" in item and "uri" not in item
-    assert transport.upload_requests == []
+    assert "uri" in item and "data" not in item
+    assert item["uri"] == _FILE_URI
+    assert len(transport.upload_requests) == 1, "one bounded upload sequence"
+    assert transport.requests[1].content == payload
+    assert transport.deleted == [f"{GEMINI_API_BASE}/{_FILE_NAME}"]
     assert _media_temp_dirs() == set()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_upload_failure_falls_back_to_the_inline_form_once(stub):
+    """A transient first-attempt failure uses ONE bounded fallback, never a loop.
+
+    The fallback is the documented inline audio representation (it needs no
+    upload at all), the first attempt's remote file is still deleted, and a
+    successful fallback delivers its transcript.
+    """
+    transport = stub(transcript="fallback transcript", upload_status=503)
+    payload = _ogg_opus()   # small enough for the inline fallback
+
+    text = _dedicated().transcribe(payload)
+
+    assert text == "fallback transcript"
+    assert len(transport.upload_requests) == 1, "the retry never re-uploads"
+    assert len(transport.interaction_requests) == 1
+    item = _audio_item(transport.interaction_requests[0])
+    assert "data" in item and "uri" not in item
+    assert base64.b64decode(item["data"]) == payload
+
+
+@pytest.mark.asyncio
+async def test_the_first_attempts_remote_file_is_deleted_before_the_fallback(stub):
+    """A failed attempt's uploaded file never outlives that attempt.
+
+    The first (URI) attempt's interaction is rejected with a TRANSIENT status, so
+    the bounded second attempt runs — and by then the first attempt's remote file
+    has already been deleted, i.e. cleanup is per attempt, not per operation.
+    """
+    transport = stub(transcript="fallback transcript", interaction_statuses=[500, 200])
+
+    assert _dedicated().transcribe(_ogg_opus()) == "fallback transcript"
+
+    assert len(transport.interaction_requests) == 2
+    assert transport.deleted == [f"{GEMINI_API_BASE}/{_FILE_NAME}"]
+    assert "uri" in _audio_item(transport.interaction_requests[0])
+    assert "data" in _audio_item(transport.interaction_requests[1])
 
 
 @pytest.mark.asyncio
@@ -785,12 +855,15 @@ async def test_large_audio_uses_the_same_files_api_flow_and_is_deleted(stub):
 
 @pytest.mark.asyncio
 async def test_the_uploaded_file_is_deleted_when_the_interaction_fails(stub):
-    transport = stub(http_status=500)
+    # A DETERMINISTIC failure (400): no bounded retry, so exactly one attempt and
+    # exactly one cleanup — the property this test pins.
+    transport = stub(http_status=400)
     payload = _large_wav()
 
     with pytest.raises(MediaError):
         _dedicated().transcribe(payload)
 
+    assert len(transport.interaction_requests) == 1
     assert transport.deleted == [f"{GEMINI_API_BASE}/{_FILE_NAME}"]
 
 
@@ -911,22 +984,24 @@ async def test_a_malformed_response_shape_fails_controlled(stub):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,expected", [
-    (401, "rejected the configured API key"),
-    (403, "rejected the configured API key"),
-    (429, "rate limited"),
-    (404, "could not find the configured model"),
-    (500, "unavailable"),
-    (400, "refused the speech-to-text request"),
+@pytest.mark.parametrize("status,expected,attempts", [
+    (401, "rejected the configured API key", 1),
+    (403, "rejected the configured API key", 1),
+    (429, "rate limited", 2),
+    (404, "could not find the configured model", 1),
+    (500, "unavailable", 2),
+    (400, "refused the speech-to-text request", 1),
 ])
-async def test_api_failures_are_normalized_and_never_fall_back(stub, status, expected):
+async def test_api_failures_are_normalized_and_never_fall_back(stub, status, expected, attempts):
     transport = stub(http_status=status)
 
     with pytest.raises(MediaError) as exc:
         _dedicated().transcribe(_wav())
 
     assert expected in str(exc.value)
-    assert len(transport.interaction_requests) == 1, "no retry loop inside the engine"
+    # DETERMINISTIC statuses (4xx other than 429) are never re-sent; the two
+    # transient ones (429, >= 500) get exactly ONE bounded second attempt.
+    assert len(transport.interaction_requests) == attempts, "bounded attempts, never a loop"
     # The critical property for the experiment: a failing dedicated model is NOT
     # silently re-asked on the general model.
     assert transport.generate_requests == []
@@ -980,9 +1055,20 @@ async def test_an_unavailable_model_keeps_the_media_failure_contract(stub):
     assert _media_temp_dirs() == set()
 
 
-def test_the_engine_bounds_are_unchanged_and_still_inside_the_boundary():
+def test_the_engine_bounds_are_finite_and_inside_the_boundary_bounds():
     assert 0 < engine_module.OCR_TIMEOUT_S < media_service.OCR_TIMEOUT_S
-    assert 0 < engine_module.STT_TIMEOUT_S < media_service.STT_TIMEOUT_S
+    assert 0 < engine_module.STT_OPERATION_DEADLINE_S < media_service.STT_TIMEOUT_S
+    # The whole worst case — ONE operation deadline plus ONE bounded cleanup —
+    # still fits inside the boundary's own bound, so the engine always fails (or
+    # succeeds) with its own precise outcome before the boundary's generic one.
+    assert (
+        engine_module.STT_OPERATION_DEADLINE_S + engine_module.STT_CLEANUP_TIMEOUT_S
+        < media_service.STT_TIMEOUT_S
+    )
+    assert engine_module.STT_CONNECT_TIMEOUT_S < engine_module.STT_OPERATION_DEADLINE_S
+    assert engine_module.STT_WRITE_TIMEOUT_S < engine_module.STT_OPERATION_DEADLINE_S
+    assert engine_module.STT_MIN_ATTEMPT_S < engine_module.STT_OPERATION_DEADLINE_S
+    assert engine_module.STT_MAX_ATTEMPTS == 2, "one attempt plus one bounded retry"
     assert engine_module.MAX_OUTPUT_TOKENS == 8192
 
 

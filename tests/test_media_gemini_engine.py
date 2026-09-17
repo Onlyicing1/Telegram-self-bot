@@ -1131,15 +1131,15 @@ async def test_stt_non_json_response_fails_controlled(stub):
     assert "no speech-to-text result" in str(exc.value)
 
 
-@pytest.mark.parametrize("status,expected", [
-    (401, "rejected the configured API key"),
-    (403, "rejected the configured API key"),
-    (429, "rate limited"),
-    (500, "unavailable"),
-    (400, "refused the speech-to-text request"),
+@pytest.mark.parametrize("status,expected,attempts", [
+    (401, "rejected the configured API key", 1),
+    (403, "rejected the configured API key", 1),
+    (429, "rate limited", 2),
+    (500, "unavailable", 2),
+    (400, "refused the speech-to-text request", 1),
 ])
 @pytest.mark.asyncio
-async def test_stt_api_failures_are_controlled(stub, status, expected):
+async def test_stt_api_failures_are_controlled(stub, status, expected, attempts):
     transport = stub(generate_status=status)
     _provision(_engine())
 
@@ -1147,7 +1147,9 @@ async def test_stt_api_failures_are_controlled(stub, status, expected):
         await _stt_analysis(_FakeClient(payload=_wav(1.0)))
 
     assert expected in str(exc.value)
-    assert len(transport.generate_requests) == 1, "no retry loop inside the engine"
+    # DETERMINISTIC failures are sent once; only the transient statuses (429,
+    # >= 500) get the single bounded second attempt.
+    assert len(transport.generate_requests) == attempts, "bounded attempts, never a loop"
 
 
 @pytest.mark.asyncio
@@ -1164,8 +1166,13 @@ async def test_stt_timeout_is_controlled(stub):
 @pytest.mark.asyncio
 async def test_stt_engine_bounds_are_finite_and_inside_the_boundary_bounds():
     assert 0 < engine_module.OCR_TIMEOUT_S < media_service.OCR_TIMEOUT_S
-    assert 0 < engine_module.STT_TIMEOUT_S < media_service.STT_TIMEOUT_S
+    assert 0 < engine_module.STT_OPERATION_DEADLINE_S < media_service.STT_TIMEOUT_S
     assert 0 < engine_module.INLINE_PAYLOAD_MAX_BYTES < media_service.MAX_STT_INPUT_BYTES
+    assert (
+        engine_module.STT_OPERATION_DEADLINE_S + engine_module.STT_CLEANUP_TIMEOUT_S
+        < media_service.STT_TIMEOUT_S
+    ), "the worst case still fits inside the boundary's own bound"
+    assert engine_module.STT_MAX_ATTEMPTS == 2
 
 
 # ── 8. The Files API path for audio past the inline budget ──
@@ -1211,7 +1218,8 @@ async def test_large_audio_uses_the_documented_files_api_and_is_deleted(stub):
 
 @pytest.mark.asyncio
 async def test_uploaded_audio_is_deleted_even_when_generation_fails(stub):
-    transport = stub(generate_status=500)
+    # A deterministic refusal (400): exactly one attempt, so exactly one cleanup.
+    transport = stub(generate_status=400)
     _provision(_engine())
     payload = _large_wav()
 

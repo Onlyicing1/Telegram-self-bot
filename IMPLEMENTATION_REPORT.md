@@ -1,362 +1,405 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.7: the dedicated Gemini transcription model as a controlled STT option
+## Latest phase — Media Processing M1.7c: the bounded STT transport of the explicit Voice/Audio path
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-17.
 
 ### Current stage
 
-M1.7. The live Persian STT problem is **recognition quality**, not routing: M1.6 proved
-that both `stt` and `sst` reach the direct-transcription path, and that the transcript
-itself (not a second LLM) is delivered. M1.7 therefore adds the **documented dedicated
-transcription model** (`gemini-3.5-transcribe`) as an **explicit, opt-in STT engine
-option** inside the existing `GeminiMediaEngine` boundary, and leaves every other media
-behaviour byte-for-byte intact. This phase does not fix anything by itself — it makes the
-Persian comparison (model × language mode) **configurable, bounded and measurable**.
+M1.7c. The live STT problem has **two separate failure classes** and this phase
+addresses the second one only:
+
+| Class | Status before this phase | Status after this phase |
+|---|---|---|
+| **A. Recognition quality** (`INVESTIGATION.md` §19: a transcript WAS produced, with wrong words) | open, unaffected by any local code path | **still open** — unchanged, and no claim about quality is made here |
+| **B. Request timeout** (§20: NO transcript produced, because the engine's own HTTP bound expired first) | open: the bound was a PER-SOCKET-PHASE `httpx.Client(timeout=40.0)`, every failure collapsed into one sentence, and the route's audio representation was the one the model's own documentation does not demonstrate | **addressed**: ONE operation deadline, the documented `uri` representation, classified failures, one bounded retry/fallback, bounded cleanup, per-leg observability |
+
+The phase changes the **transport, the deadline and the failure identity** of the
+dedicated transcription engine. It does **not** change routing, the media
+boundary, the direct-STT answer contract, the prompt/context layers, the
+provider mesh, the model selection or the request's transcription fields, and it
+adds no second pipeline, no second download and no dependency.
 
 ### Commit lineage
 
 | Commit | Role | Files |
 |---|---|---|
-| `7e1e69a` `docs: record STT quality investigation findings` | **starting HEAD** (== `origin/main` at the time this phase began) | `INVESTIGATION.md` |
-| the implementation commit of this phase (SHA in the hand-off response; `git log -2 --format=%H` re-verifies both) | M1.7: dedicated-transcription route, explicit STT model/language selection, bounded tracing, focused tests | `backend/services/gemini_media_engine.py`, `tests/test_media_gemini_engine.py`, `tests/test_media_dedicated_stt.py` (new) |
+| `308938756e25360d87e8c266afeb57766ef4151f` (`docs: complete the dedicated STT timeout investigation in INVESTIGATION.md`) | **starting HEAD** (== `origin/main` when this phase began) | `INVESTIGATION.md` |
+| the implementation commit of this phase (SHA in the hand-off response; `git log -1 --format=%H` re-verifies it) | M1.7c: the bounded STT transport | `backend/services/gemini_media_engine.py`, `tests/test_media_dedicated_stt.py`, `tests/test_media_gemini_engine.py`, `tests/test_media_stt_reliability.py` (new) |
 | the documentation commit of this phase | synchronizes this report with the repository state after the implementation commit; no production or test change | `IMPLEMENTATION_REPORT.md` only |
 
 | Item | Value |
 |---|---|
-| Media boundary (`media_service.py`, `backend/ai/media.py`, `backend/telegram_api/media.py`) | **unchanged** — not touched by this phase |
-| Direct-STT path (classifier, bypass, answer contract, delivery) | **unchanged** — `media_ai_service.py` was not modified; the classifier is still regex-free |
-| ProviderManager / adapters / registry / `vision()` / fallback mesh | **untouched** |
-| OCR, PDF/DOCX extraction, save system, scheduler, Supabase, deployment files | **untouched** |
-| Dependencies / ENV files / secrets | **none** — no new package, no new credential, no ENV file edit |
-| Live Telegram verification | **NOT PERFORMED** by this phase (no session, credential or traffic here) |
-| Live Gemini request | **NOT PERFORMED** — every HTTP interaction in this phase was a scripted in-process stub |
+| `INVESTIGATION.md` | **unchanged** — this phase implements; it does not re-investigate |
+| Media boundary (`media_service.py`, `backend/ai/media.py`, `backend/telegram_api/media.py`) | **unchanged** |
+| `media_ai_service.py` (direct-STT classifier, bypass, provenance), `dispatcher.py`, `ai_unified.py` | **unchanged** |
+| `ProviderManager`, adapters, registry, `vision()`, prompt/context/memory/tool layers | **untouched** |
+| Supabase / `DATABASE_ARCHITECTURE.md` / Save / Task system / Scheduler / UI | **untouched** |
+| Dependencies (`backend/requirements.txt`), `render.yaml`, `Procfile`, ENV files, secrets | **unchanged** — no new package, no new credential, no new configuration variable |
+| Live Telegram verification | **NOT PERFORMED** (no session, credential or traffic here) |
+| Live Gemini verification | **NOT PERFORMED** — every HTTP interaction in this phase was a scripted in-process transport |
 
 ### Purpose of this phase
 
-The M1.5/M1.6 source audit proved that no stage **inside the repository** alters a
-transcript on the direct-STT path (audio reaches Gemini byte-identical, MIME is
-container-derived, extraction and normalization are value-safe, one request, no retry, no
-second model). The remaining error class is the recognition itself — live Persian voice
-notes came back with real-word substitutions (`دیدم`→`دیه`, `گپ`→`کپ`, `خلاصه`→`حالا`) and
-one Latin token inside Persian output.
+`INVESTIGATION.md` §20 proved, from source, exactly five things about the
+timeout incident, and nothing more:
 
-M1.7 addresses exactly that, without touching routing: the general media model
-(`gemini-3.5-flash-lite`, Generate Content API, instruction-only language control) stays
-the default, and the dedicated ASR model becomes selectable **explicitly** through ENV,
-using **its own documented request contract**.
+1. the owner-visible sentence is generated **locally** by
+   `gemini_media_engine._post_json` from `STT_TIMEOUT_S = 40.0`;
+2. that bound is a **per-socket-phase** bound (connect/write/read/pool), **not** a
+   bound on the operation, and the four phases are indistinguishable afterwards;
+3. the **operation deadline** (`deadline = started + 40`) was consulted only by
+   the non-inline legs, raised no error of its own, and silently degraded into a
+   0.5 s floor;
+4. the **inline** branch sent the audio as base64 `data` — a representation the
+   official documentation shows for the Interactions API but **not** for
+   `gemini-3.5-transcribe`, whose own transcription guide demonstrates only the
+   Files API `uri` form;
+5. cleanup ran with a **fresh full per-phase** bound, so a slow `DELETE` could
+   push the owner-visible failure past the boundary's own 60 s bound.
 
-### Current architecture / data flow
+§20 also established that ProviderManager, a second LLM, retries, duplicate
+requests, model fallback, event-loop blocking, executor starvation, transcoding,
+MIME divergence and the `[Errno 11]` task-repository path were **not** causes.
+This phase implements the fixes for (2)–(5) and nothing else.
+
+### Exact STT architecture after implementation
 
 ```
-explicit STT request  (UNCHANGED: is_direct_stt_request, regex-free)
-→ dispatcher._media_target / _try_media_analysis            (UNCHANGED)
-→ media_ai_service.answer_media_request                     (UNCHANGED)
-→ media_service.resolve_media_message                       (UNCHANGED)
-→ media_service.analyze_media                               (UNCHANGED: bounds, validation,
-                                                             _run_stt to_thread, timeout,
-                                                             normalization, cap)
-→ GeminiMediaEngine.transcribe                              (CHANGED INSIDE ONLY)
-     ├─ AI_GEMINI_STT_MODEL unset  → Generate Content: POST /models/<media model>:generateContent
-     │                              parts [ STT_INSTRUCTION, audio ]   (M1.5c behaviour, identical)
-     └─ AI_GEMINI_STT_MODEL set    → Interactions:      POST /v1beta/interactions
-                                    input [ audio ] + generation_config.transcription_config
-→ MediaAnalysis.content == the transcript                    (UNCHANGED)
-→ dispatcher._build_fast_path_result → delivery              (UNCHANGED, no second model)
+explicit STT request  ("stt" / "sst" / "transcribe" / …; UNCHANGED, regex-free)
+→ dispatcher._media_target / _try_media_analysis                 (UNCHANGED)
+→ media_ai_service.answer_media_request                          (UNCHANGED)
+→ media_service.resolve_media_message → analyze_media            (UNCHANGED: deterministic target,
+                                                                  bounded download, MIME/container
+                                                                  validation, size/duration/channel
+                                                                  bounds, temp cleanup,
+                                                                  to_thread(engine.transcribe),
+                                                                  normalization, cap)
+→ GeminiMediaEngine.transcribe                                   (CHANGED INSIDE ONLY)
+     ├─ AI_GEMINI_STT_MODEL unset → Generate Content route: POST /models/<media model>:generateContent
+     └─ AI_GEMINI_STT_MODEL set   → Dedicated route:      POST /v1beta/interactions
+→ MediaAnalysis.content == the transcript                         (UNCHANGED)
+→ dispatcher._build_fast_path_result → delivery                   (UNCHANGED: no second model)
 ```
 
-Both routes use the **same** `GeminiMediaEngine`, the **same** `SttEngine` seam, the same
-inline-vs-Files transport decision, the same upload adapter and the same
-`finally`-deletion. There is no second pipeline, no second download path, no new engine,
-no new abstraction outside this module and no `ProviderManager` involvement anywhere in
-STT.
+Both routes now run under **one operation deadline** with per-leg derived
+request timeouts and classified failures. The dedicated route's bounded transport
+plan is:
 
-### Model-selection architecture
-
-| ENV variable | Meaning when set | Meaning when unset/blank |
-|---|---|---|
-| `AI_GEMINI_MEDIA_MODEL` (existing) | the general media model for OCR **and** for the general STT route | falls back to `AI_GEMINI_MODEL`, then `DEFAULT_MEDIA_MODEL` = `gemini-3.5-flash-lite` |
-| `AI_GEMINI_STT_MODEL` (**new**, `STT_MODEL_ENV_VAR`) | the dedicated transcription model; `transcribe` switches to the Interactions API | **the general media route** — no substitution, no default model |
-| `AI_GEMINI_STT_LANGUAGE` (**new**, `STT_LANGUAGE_ENV_VAR`) | a BCP-47 code: `language_codes` on the dedicated route, one appended instruction line on the general route | automatic language detection (multilingual behaviour preserved) |
-
-- `resolve_stt_model()` / `resolve_stt_language()` return `("", "")` when nothing is
-  configured; both values pass through the project's existing deprecation map
-  (`resolve_model`), so a retired model configured in ENV cannot poison a request.
-- `DEDICATED_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"` is a named constant, but it is
-  **never selected implicitly**: nothing in the code switches to it, and the string in ENV
-  is what activates the route.
-- **OCR can never move**: `recognize()` always sends `self._model` (the general media
-  model) to Generate Content with `OCR_INSTRUCTION`, whatever STT is configured.
-- Engine state is still config-only: `__slots__ = (_api_key, _model, _key_env_var,
-  _stt_model, _stt_language)`. No Telegram object, no chat/message id, no event-loop state.
-- No new configuration system: two ENV variables following the existing
-  `AI_<PROVIDER>_*` convention, read at provisioning time only.
-
-### Dedicated-STT request behaviour (as implemented)
-
-Request: `POST https://generativelanguage.googleapis.com/v1beta/interactions`, header
-`x-goog-api-key` (never in the URL), body:
-
-```json
-{
-  "model": "gemini-3.5-transcribe",
-  "input": [ { "type": "audio", "data": "<base64>", "mime_type": "audio/ogg" } ],
-  "generation_config": { "transcription_config": { "mode": { "type": "verbatim" } } },
-  "store": false
-}
+```
+attempt 1:  Files API start → upload, finalize → (readiness, only if not ACTIVE)
+            → POST /v1beta/interactions  { "type": "audio", "uri": …, "mime_type": … }
+attempt 2:  ONLY if attempt 1 failed TRANSIENTLY and ≥ STT_MIN_ATTEMPT_S of the
+            deadline remains:
+              payload ≤ INLINE_PAYLOAD_MAX_BYTES → inline { "type": "audio", "data": …, … }
+              otherwise                          → the same URI form once more
 ```
 
-with the uploaded-file variant `{ "type": "audio", "uri": "<files/... uri>", "mime_type": ... }`
-above the inline budget, and with `"language_codes": ["fa-IR"]` added inside
-`transcription_config` **only** when `AI_GEMINI_STT_LANGUAGE` is set.
+Exactly ONE attempt is ever in flight; the plan is fixed **before** the operation
+(`_dedicated_transports`), so it can never loop, never fan out and never depend on
+runtime state.
 
-Fields the API documents for this model and that this engine sends, and nothing else:
+### Exact Gemini model / endpoint / transport
 
-| Field | Source of the contract |
+| Item | Value (unchanged by this phase except where noted) |
 |---|---|
-| `model` | Models page: `gemini-3.5-transcribe` is a **Stable** model ("Low-latency speech-to-text model with utterance-based language detection, speaker diarization, word-level timestamps, and custom vocabulary biasing") |
-| `input[].type/data/mime_type/uri` | Audio-transcription + Audio-understanding guides (inline base64 or Files-API URI, with `mime_type`) |
-| `generation_config.transcription_config.language_codes` | "Language detection and hints": BCP-47 codes, omitted/empty ⇒ automatic detection and code-switching |
-| `generation_config.transcription_config.mode` | "Transcription modes": `"smart"` or a verbatim object `{"type": "verbatim", ...}`; verbatim is the default and is what fidelity needs |
-| `store` | Interactions API overview: `store=false` opts out of the API's default server-side retention |
+| General media model | `AI_GEMINI_MEDIA_MODEL` → `AI_GEMINI_MODEL` → `gemini-3.5-flash-lite` |
+| Dedicated STT model | `AI_GEMINI_STT_MODEL` only (the constant `gemini-3.5-transcribe` is never selected implicitly) |
+| STT language | `AI_GEMINI_STT_LANGUAGE` (BCP-47, e.g. `fa-IR`); unset ⇒ automatic detection |
+| OCR endpoint | `POST {base}/models/<media model>:generateContent` (unchanged) |
+| General STT endpoint | the same Generate Content endpoint, `parts [STT_INSTRUCTION, inlineData|fileData]` (unchanged) |
+| Dedicated STT endpoint | `POST https://generativelanguage.googleapis.com/v1beta/interactions`, key in the `x-goog-api-key` header (never in the URL) |
+| Dedicated request body | `model`, `input:[{type:"audio", uri|data, mime_type}]`, `generation_config.transcription_config{mode:{type:"verbatim"}[, language_codes:[…]]}`, `store:false` — **unchanged field inventory** |
+| **Dedicated audio representation (CHANGED)** | **primary = the Files API `uri` form** (`start` → `upload, finalize` → the returned URI), because that is the only representation the official documentation shows for this model; **`data` is only the bounded fallback** |
+| Uploaded-file display name | static, non-identifying `lifeos-media` (unchanged) |
+| Accepted audio containers | OGG/WAV/FLAC only, derived from the payload signature (unchanged; no MP3/M4A/AAC/WebM, no ffmpeg) |
 
-**Deliberately NOT sent** (each verified as either absent from this contract or actively
-harmful to the experiment):
+### Timeout / deadline behaviour
 
-- `temperature`, `topK`, `topP`, `candidateCount`, `maxOutputTokens`,
-  `system_instruction`, `response_format` — none belongs to the documented transcription
-  request; sampling controls are not a reliable ASR-fidelity lever (the legacy Generate
-  Content route keeps its own two, unchanged).
-- `mode.diarization_mode` — single-speaker voice notes; also incompatible with custom
-  vocabulary.
-- `mode.timestamp_granularities` — the API documents that word timestamps **may degrade**
-  accuracy; they are not needed to compare transcripts.
-- `custom_vocabulary` — no demonstrated need and no concrete vocabulary list; adding it
-  would confound the measurement.
-- No **text instruction** on the dedicated route: the model is documented to accept the
-  audio alone (and it is an ASR model, not a prompt-following multimodal model).
-- `thinking_level` / background execution / `previous_interaction_id` — not part of a
-  single bounded transcription.
-
-`STT_INSTRUCTION` remains exactly as it was and is still the general route's only
-language-shaping input. The multi-variable risk is therefore contained: B/C differ only in
-whether `language_codes` is present, and A/D differ only by the appended language line.
-
-### Language modes
-
-| Mode | Dedicated route | General route |
+| Layer | Bound | Scope |
 |---|---|---|
-| Automatic (default) | `language_codes` omitted ⇒ documented automatic detection / code-switching | `STT_INSTRUCTION` alone (byte-identical to M1.5c) |
-| Explicit (e.g. `fa-IR`) | `transcription_config.language_codes = ["fa-IR"]` | `STT_INSTRUCTION` + one appended, deterministic sentence naming the BCP-47 code |
+| AI execution envelope | 240 s | whole `engine.execute` (unchanged) |
+| Boundary STT bound | `media_service.STT_TIMEOUT_S` = 60 s | the awaited result of `to_thread(engine.transcribe)` (unchanged) |
+| **Engine operation deadline** | `STT_OPERATION_DEADLINE_S` = **45 s** | **the whole engine operation**: upload + readiness + the transcription request + the single bounded retry/fallback |
+| Derived request timeouts | `connect ≤ 10 s`, `write ≤ 20 s`, `pool ≤ 10 s`, **`read` = whatever is left of the deadline** | per leg, computed from ONE remaining-budget number |
+| Deadline enforcement | `_required_budget` raises `FAILURE_DEADLINE` | a spent budget is its **own** failure — it is never turned into a tiny HTTP timeout |
+| Remote cleanup | `STT_CLEANUP_TIMEOUT_S` = 5 s | the `DELETE` only; deliberately **outside** the operation deadline so cleanup can never delay the owner-visible outcome |
+| Retry gate | `STT_MIN_ATTEMPT_S` = 8 s of remaining budget | a second attempt can never exceed the deadline |
 
-No language is forced for all audio: the automatic mode stays the default, and neither the
-boundary nor the delivery layer knows about languages.
+Value derivation, stated instead of assumed: the boundary's own bound is 60 s and
+the engine's worst case is `45 + 5 = 50 s`, leaving ~10 s of margin for the
+boundary's worker-thread return path — so the owner always receives the
+**engine's** precise reason rather than the boundary's generic one. The change is
+therefore not "40 → larger": it replaces four independent per-phase bounds with
+one total operation bound, and adds the missing deadline failure.
 
-### Audio-format behaviour
+### Fallback / retry behaviour
 
-Unchanged and **not broadened**: the boundary already validated OGG/WAV/FLAC, and
-`gemini_mime_type()` still derives the MIME from the container signature
-(`audio/ogg` for OGG/Opus/`application/ogg` aliases, `audio/wav` for the WAV aliases,
-`audio/flac` for the FLAC aliases). No MP3/M4A/AAC/WebM was added, no ffmpeg, no local
-decode/resample/conversion, no Telegram download change. The one new guard is negative:
-if a non-audio payload reaches the dedicated route, the engine refuses it **before** any
-request (`"The dedicated transcription model accepts audio input only."`).
+* **Bounded**: `STT_MAX_ATTEMPTS = 2` (the initial attempt plus at most one
+  retry/fallback), sequential only, never concurrent.
+* **Transient only**: retried conditions are `httpx` timeouts and transport errors
+  (`ConnectError`, `ReadError`, `WriteError`, `RemoteProtocolError`) and the HTTP
+  statuses `429` and `≥ 500`.
+* **Never retried** (deterministic, fail-closed on the first attempt): `401/403`,
+  `404`, any other `4xx` (including a refused request), an unreadable body, a
+  malformed response shape, a non-completed interaction status, an empty
+  transcript, a non-audio payload, an unsupported container and a spent deadline.
+* **Fallback representation**: for the dedicated route the second attempt prefers
+  the inline `data` form when the payload fits the documented inline budget (it
+  needs no upload at all), otherwise it repeats the URI form. This is the ONLY
+  transport fallback in the system, it is decided before the operation, and it is
+  covered by tests.
+* **Route fallback**: none, unchanged — a failing dedicated request is **never**
+  re-asked on the general model (the recognition comparison stays interpretable).
+* **OCR**: unchanged single attempt (`max_attempts = 1`); the retry policy exists
+  only on the STT route.
 
-### Inline vs Files API, and timeouts
+### Accuracy-related decisions
 
-- Inline base64 at or below the existing `INLINE_PAYLOAD_MAX_BYTES` (15 MiB); above it the
-  **existing** Files API adapter is reused (`start` → `upload, finalize` → optional bounded
-  readiness checks → the interaction references the returned `uri`), and the remote file is
-  deleted in a `finally` block. A failed delete never masks the result.
-- The engine's own finite bound (`STT_TIMEOUT_S = 40s`, inside the boundary's 60s) is
-  applied to the interaction request as well, and uploads share one deadline
-  (`_remaining`), so no request can hang.
-- One media operation = one bounded HTTP operation. No retry loop was added, and
-  `_generate` (Generate Content) is still never retried.
+* The dedicated model, the explicit `AI_GEMINI_STT_LANGUAGE` hint, `verbatim` mode,
+  the per-request `language_codes`, the absence of sampling controls, the absence
+  of any second LLM and the byte-identical audio all remain exactly as M1.7 left
+  them. The transcript is still returned to the owner verbatim.
+* The one accuracy-relevant change is about the **contract**, not the text: the
+  request now sends the audio in the representation the documentation shows for
+  this model, so a possible cause of a provider-side stall or rejection is
+  removed rather than papered over.
+* No transcript normalization, no regex correction, no fuzzy matching, no
+  "cleanup" pass, no transliteration and no invented text were added. Persian
+  script, ZWNJ, code-switching and legitimate Latin tokens pass through unchanged
+  (asserted by tests).
+* **Recognition quality (class A) is not improved by this phase and is not
+  claimed to be.** No local fixture can prove it; the owner's comparison remains
+  the only measurement.
 
-### Failure behaviour
+### Latency-related decisions
 
-The dedicated model failing is **final for that operation**: the engine raises the
-boundary's existing `MediaError` (mapped from HTTP status by the unchanged
-`_raise_for_status`: key rejected 401/403, rate limit 429, **model not found / not enabled
-404**, server error ≥500, refused 400), the boundary adds its STT stage and the owner gets
-the existing media failure contract. There is **no** automatic
-dedicated → general → provider chain, and a test asserts that a failing dedicated request
-never produces a Generate Content request. This is deliberate: an automatic fallback would
-make the A/B/C/D comparison uninterpretable.
+Removed from the critical path:
+
+* the per-socket-phase bound that could expire while the operation had budget
+  left, and the 0.5 s deadline floor (`_remaining`) that silently replaced an
+  exhausted budget;
+* up to 1 s of gratuitous sleep before the **first** file-readiness check — the
+  readiness check now runs immediately and only waits *between* attempts;
+* the unbounded-looking cleanup leg (a fresh full per-phase bound) — now a 5 s
+  bound outside the deadline;
+* the ambiguity between "deadline exceeded" and "socket timeout" (two different,
+  explicit failures now).
+
+Added latency, stated honestly: the dedicated route's **primary** transport is
+the Files API, so a small voice note pays two extra small requests (resumable
+`start` + `upload, finalize`) on the same host. That is deliberate: the URI form
+is the only representation the model's documentation demonstrates, and the extra
+round trips are bounded (`connect ≤ 10 s`) and sit inside the same operation
+deadline. The faster inline form is still used, as the bounded fallback.
+
+Measured locally (scripted transport, **no real network**) with a deliberate
+0.25 s upload leg, i.e. the derivation itself rather than provider latency:
+
+```
+upload_start     connect=10.0  write=20.0  read=45.0000  pool=10.0
+upload_finalize  connect=10.0  write=20.0  read=44.9987  pool=10.0
+interaction      connect=10.0  write=20.0  read=44.7478  pool=10.0
+delete           connect=5.0   write=5.0   read=5.0000   pool=5.0
+```
+
+### Reliability-related decisions
+
+* One coherent operation deadline, per-request timeouts derived from the
+  remaining budget, no nested timeout that can defeat the outer bound, and no
+  error path that can silently become a shorter HTTP timeout.
+* A spent deadline, a socket-phase timeout, an HTTP rejection, a malformed body, a
+  stalled file-processing step and a transport failure are now **distinct** and
+  are all reported with the same bounded, honest message contract (the owner still
+  sees `media_stt_engine: <precise reason>`, never a credential, a payload or a
+  Telegram identifier).
+* Cleanup is per **attempt** (the first attempt's remote file is removed before the
+  fallback runs) and can never mask a result or a failure.
+
+### Cleanup behaviour
+
+* Local: unchanged — the boundary owns the temporary directory and removes it on
+  every path (`finally`), including timeout and cancellation.
+* Remote: the uploaded file is deleted in a `finally` per attempt, with its own
+  5 s bound, before any fallback uses a different representation.
+* A failed delete is logged (`GEMINI_MEDIA_ENGINE_UPLOAD_CLEANUP_FAILED`), never
+  raised: the API auto-expires uploaded files.
 
 ### Observability
 
-One bounded, non-sensitive line per media operation:
+Two bounded, non-sensitive line families (never a transcript, raw audio,
+credential, chat id, message id, sender, caption or filename):
 
 ```
-GEMINI_MEDIA_ENGINE kind=speech-to-text engine=GeminiMediaEngine model=gemini-3.5-transcribe
-  transport=interactions mime=audio/ogg bytes=35941 language=fa-IR mode=verbatim
-  chars=51 elapsed_ms=1240 status=ok
+GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=request_start attempt=1 transport=uri bytes=115 elapsed_ms=-
+GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=upload_finalize attempt=1 transport=- bytes=115 elapsed_ms=250
+GEMINI_MEDIA_ENGINE_STAGE kind=speech-to-text stage=interaction attempt=1 transport=- bytes=0 elapsed_ms=151
+GEMINI_MEDIA_ENGINE kind=speech-to-text engine=GeminiMediaEngine model=gemini-3.5-transcribe \
+  transport=interactions mime=audio/ogg bytes=115 language=auto mode=verbatim chars=41 \
+  elapsed_ms=403 status=ok attempts=1 deadline_s=45 failure_class=-
 ```
 
-`status=failed` is traced on every failure path (before the error propagates).
-**Never logged**: transcript text, raw audio, API key, message id, chat id, sender,
-caption, filename. Error messages remain sanitized and credential-redacted (`***`), and the
-remote upload keeps using the static non-identifying display name `lifeos-media`.
+* The **stage** lines close §20.17's "request start NOT observable" gap and carry
+  per-leg timings, so a stall is attributable after the fact.
+* `failure_class` is one bounded token, extended with the evidence it lacked:
+  `interaction_timeout:read`, `upload_timeout:connect`, `http_rejection:http=429`,
+  `operation_deadline`, `malformed_response`, `file_processing`, `transport_failure`.
+* `attempts`, `deadline_s`, `bytes`, `mime`, `elapsed_ms`, `status` cover PART 11's
+  measurement list at the engine boundary; the boundary keeps tracing
+  `stt_engine_invoked bytes=…` / `stt_engine_returned chars=…`.
 
-### Direct-STT path (unchanged, re-verified)
+### HTTP client lifetime (PART 7, evaluated — deliberately NOT changed)
 
-The classifier (`media_ai_service.is_direct_stt_request`, finite form inventory, **no
-regex**), the media-type gate (Voice/Audio only), the bypass branch, the honest provenance
-(`provider="local"`, `model="gemini-stt-deterministic"`) and the delivery layer are
-untouched. The dedicated engine now sits behind the same seam, so the direct path simply
-receives a (different) transcript and still delivers it verbatim with no provider round — a
-test in this phase drives the real `Dispatcher` + real `ProviderManager` + the dedicated
-engine over a scripted API stub and asserts `result.response == TRANSCRIPT` with
-`provider.prompts == []`, while an analytical request over the same setup still reaches the
-provider exactly once.
+The engine still builds **one client per leg** (`httpx.Client(timeout=<derived>)`)
+and closes it. A shared/pooled client was evaluated against §20.15 and rejected
+for now: the engine is called from the boundary's `asyncio.to_thread` workers, so
+module-level client state would be cross-request mutable state (stale connections
+after a failure, an unbounded pool, no deterministic shutdown) and would break the
+engine's `__slots__`/no-shared-state contract that the boundary's offload assumes.
+What WAS changed is the object handed to the client: it is now an
+`httpx.Timeout` derived from the operation budget instead of a bare
+`timeout=40.0` that quietly meant four independent bounds.
 
 ### Files changed by this phase
 
 | File | Change |
 |---|---|
-| `backend/services/gemini_media_engine.py` | the dedicated-transcription route (`_run_dedicated_transcription`, `_transcription_body`, `_transcribe_interaction`, `_transcribe_interaction_from_upload`, `_extract_interaction_text`), explicit STT model/language resolution (`resolve_stt_model`, `resolve_stt_language`, `STT_MODEL_ENV_VAR`, `STT_LANGUAGE_ENV_VAR`, `DEDICATED_TRANSCRIPTION_MODEL`, `INTERACTIONS_ENDPOINT`), the optional appended language line (`stt_instruction`), the audio-only guard, and the bounded `_log_run` tracing replacing the old single-line log |
-| `tests/test_media_gemini_engine.py` | the engine's `__slots__` contract extended with the two config-only STT fields (`_stt_model`, `_stt_language`); the new ENV names added to the isolation fixture |
-| `tests/test_media_dedicated_stt.py` | **new** — 60 tests (see below) |
+| `backend/services/gemini_media_engine.py` | the failure-class vocabulary and the bounded transport helpers (`_error`, `_failure_field`, `_budget`, `_required_budget`, `_request_timeout`, `_timeout_phase`, `_dedicated_transports`, `_decode_json`); the ONE STT operation deadline and its derived phase bounds; the documented `uri`-primary dedicated transport with the single bounded `data` fallback; the bounded retry policy; `_perform` (one classified, budget-derived HTTP call); a deadline-aware, immediate-first readiness check; a bounded, deadline-independent remote cleanup; the extended `_log_run` plus the new per-leg `_trace_stage` |
+| `tests/test_media_dedicated_stt.py` | the transport-plan expectations (URI primary, inline only as the fallback), the retry-attempt counts per HTTP status, the new bounded bounds assertions, the stub's separate finalize vs interaction payloads, and two new tests (transient upload → inline fallback; first attempt's file deleted before the fallback) |
+| `tests/test_media_gemini_engine.py` | the STT attempt counts per HTTP status, the new bounds assertions, and a deterministic `400` for the cleanup test |
+| `tests/test_media_stt_reliability.py` | **new** — 52 tests for the bounded transport, deadline arithmetic, failure classes and phases, retry/fallback rules, cleanup, observability, event-loop safety, concurrency and the audio fixtures |
 | `IMPLEMENTATION_REPORT.md` | rewritten as the current-state report (this document) |
 
 ### Tests and exact results
 
-All commands ran in a project-local Python 3.10.12 environment
-(`.venv`, gitignored) with `pytest 9.1.1` and the repository's own
-`backend/requirements.txt`; no network, no Gemini credential, no live Telegram.
+All commands ran in a project-local Python 3.10.12 environment (`.venv`,
+gitignored) from `backend/requirements.txt` plus `pytest 9.1.1` /
+`pytest-asyncio`; **no network, no Gemini credential, no live Telegram**.
 
 ```
-.venv/bin/python -m pytest tests/test_media_dedicated_stt.py -q
-    .................................................... 60 passed in 0.56s
+.venv/bin/python -m pytest tests/test_media_stt_reliability.py -q
+  52 passed in 1.27s        (new suite)
 
 .venv/bin/python -m pytest tests/test_media_direct_stt.py tests/test_media_ai_integration.py \
     tests/test_media_stt.py tests/test_media_stt_language.py tests/test_media_gemini_engine.py \
     tests/test_media_processing.py tests/test_media_document_extraction.py \
-    tests/test_media_image_ocr.py tests/test_media_dedicated_stt.py -q
-    462 passed in 37.85s
+    tests/test_media_image_ocr.py tests/test_media_dedicated_stt.py \
+    tests/test_media_stt_reliability.py -q
+  516 passed in 40.76s
 
 .venv/bin/python -m pytest tests/ -q
-    3339 passed, 24 skipped, 3 warnings in 113.71s
+  3393 passed, 24 skipped, 3 warnings in 116.82s    (baseline before this phase: 3339 passed, 24 skipped)
 
 .venv/bin/python -m py_compile backend/services/gemini_media_engine.py \
-    tests/test_media_gemini_engine.py tests/test_media_dedicated_stt.py
-    OK (no output)
+    tests/test_media_dedicated_stt.py tests/test_media_gemini_engine.py \
+    tests/test_media_stt_reliability.py
+  OK (no output)
 
 git diff --check
-    clean
+  clean
 ```
 
-`tests/test_media_dedicated_stt.py` covers, per the task's list:
+What the new suite pins, per the task's list (tests assert the **actual request
+bodies**, not merely that a function was called):
 
-1. dedicated model selection (`AI_GEMINI_STT_MODEL` ⇒ `gemini-3.5-transcribe`, through the
-   existing deprecation map);
-2. current general model selection (unset ⇒ `stt_transport == "generate_content"`,
-   `stt_model == ""`);
-3. OCR remains on the general media model **even with the dedicated STT model configured**
-   (URL, `OCR_INSTRUCTION`, image MIME, no `interactions` request) and the `AI_GEMINI_MEDIA_MODEL`
-   override still governs it;
-4. STT selects the dedicated model (URL = `/v1beta/interactions`, `model` field);
-5. explicit `fa-IR` ⇒ `language_codes == ["fa-IR"]`;
-6. automatic mode ⇒ `language_codes` absent, traced as `language=auto`;
-7. verbatim mode ⇒ `mode == {"type": "verbatim"}`);
-8. absence of unverified controls — exact body key sets plus a scan for
-   `temperature/topK/topP/candidateCount/maxOutputTokens/system_instruction/response_format/
-   timestamp_granularities/word/diarization/custom_vocabulary/smart/thinking`, and no text
-   instruction on the dedicated route;
-9. OGG/Opus mapping (`audio/ogg`, `audio/opus`, `application/ogg` aliases);
-10. WAV mapping (all four aliases); 11. FLAC mapping (both aliases);
-12. inline payload path (`data` present, no `uri`, no upload request);
-13. Files API path (resumable start, one finalize carrying the bytes, `uri` referenced);
-14. remote cleanup (`deleted == [<files/...>]`, including when the interaction fails, and a
-    failing delete never masking the result);
-15. timeout behaviour (`ReadTimeout` ⇒ `MediaError … timed out`);
-16. provider/API error normalization (401/403/429/404/500/400) with exactly one request and
-    **no** Generate Content fallback; credential redaction;
-17. response text extraction (documented `steps[].content[].text`, multi-step join,
-    `output_text` only as a fallback, ignored `word_info` items);
-18. empty transcript ⇒ honest empty (boundary reason "No speech was detected in the audio.")
-    and non-completed statuses ⇒ `MediaError`;
-19. direct-STT still bypasses `ProviderManager` (real `Dispatcher`, transcript delivered
-    verbatim, `provider.prompts == []`, for both `stt` and the `sst` alias);
-20. analytical media still uses `ProviderManager` (one prompt, ending in the analysis
-    content);
-21. OCR behaviour unchanged (above) plus the untouched engine bounds;
-22. Telegram metadata never enters the Gemini request (caption, filename, chat id, message
-    id; no `caption/filename/sender/chat_id/message_id` wording);
-23. the direct-STT classifier is unchanged and regex-free (positive/negative forms, no `re`
-    module in `media_ai_service`);
-24. the existing media-boundary tests remain green (the 402-test media suite and the full
-    3339-test suite above).
+* the transport plan (`uri` first; `inline` only as the fallback; `uri` again above
+  the inline budget; exactly two attempts — never a loop);
+* the derived phase bounds, the 45 s operation deadline, the 5 s cleanup bound, the
+  8 s retry gate and the "worst case fits inside 60 s" property;
+* the explicit operation-deadline failure (with **no** request sent);
+* the failure classes and the recorded socket phase (`connect`/`write`/`read`/
+  `pool`), including the `failure_class=…` trace field;
+* the bounded retry rules: transient (timeout / transport error / `429` / `5xx`)
+  retried once; deterministic `4xx`, malformed bodies, non-completed statuses and
+  empty transcripts never retried; no attempt without budget; attempts strictly
+  sequential (an explicit start/end ordering assertion);
+* the fallback representation and its skipped-upload property;
+* cleanup per attempt, before the fallback, never masking a result or a failure,
+  with its own bound;
+* per-leg traces with elapsed times, and the absence of transcript/audio/key/URI/
+  caption/filename text in every log record;
+* OCR's untouched single-attempt contract next to the STT policy;
+* event-loop non-blocking behaviour, bounded concurrent transcriptions (4
+  operations ⇒ 4 requests, ≤ 4 threads), and no shared HTTP state on the engine;
+* audio fixtures: silence (sent byte-identical, empty transcript stays empty),
+  Persian + ZWNJ + code-switching text returned unchanged, a short-but-valid
+  container sent unmodified, and an unsupported container refused before any
+  request.
 
-Two further guards: the engine module gains **no new import** (`module members ==
-{base64, logging, os, time, httpx, media_service}`, no `re`), and its tracing carries no
-transcript, audio, credential or Telegram identifier.
-
-**These tests prove request construction, parsing, bounds and failure behaviour. They prove
-nothing about recognition quality** — no fixture in this repository can, and none is
-faked. That is what the live comparison is for.
+**These tests prove request construction, bounds, classification and failure
+behaviour. They prove nothing about recognition quality** — no fixture in this
+repository can, and none is faked.
 
 ### Live Telegram verification status
 
-**NOT PERFORMED.** No live Telegram session, no live Gemini call and no live Persian voice
-note were used in this phase; `INVESTIGATION.md` was not modified. The transcript quality of
-`gemini-3.5-transcribe` on this project's audio is therefore **entirely unmeasured** here,
-and nothing in this report should be read as a live observation.
+**NOT PERFORMED.** No live Telegram session was used; the direct-STT route is
+exercised end-to-end (real `Dispatcher` + real `ProviderManager` + the engine over
+a scripted API transport) by the existing `tests/test_media_direct_stt.py` and
+`tests/test_media_dedicated_stt.py`, which still assert `provider.prompts == []`
+and `result.response == TRANSCRIPT`.
 
-### Free-tier and model-availability uncertainty
+### Live Gemini verification status
 
-- `gemini-3.5-transcribe` is documented on the Gemini API models page as a **Stable**
-  dedicated speech-to-text model with the endpoint `gemini-3.5-transcribe`, and the
-  Audio-transcription guide documents its request contract. That is what this implementation
-  is based on (read from the official docs on 2026-09-17); a general web search returned no
-  results in this environment, so no third-party material was used.
-- **Free-tier eligibility for this project is NOT verified.** The pricing page was not
-  consulted and no billing/entitlement call was made. Availability must be verified manually
-  in AI Studio / project settings before the comparison is run.
-- No programmatic availability check, probe request or fake validation was added: an
-  unavailable/not-enabled model surfaces as the honest `HTTP 404 … could not find the
-  configured model for speech-to-text (…)` `MediaError`.
-- The single request field whose acceptance is **not** demonstrated by a transcription
-  example is `store: false`. It is documented as a general Interactions control ("you can opt
-  out of storage for any interaction", incompatible only with background execution, which is
-  never used here). If a live run rejects it with HTTP 400, the failure is loud and honest
-  and the fix is to remove that one key — there is no silent fallback.
+**NOT PERFORMED.** Every HTTP interaction in this phase was a scripted in-process
+`httpx` transport. Consequently:
 
-### What was intentionally NOT changed
+* whether `gemini-3.5-transcribe` accepts the **inline `data`** form for this
+  project is still **[UNKNOWN]** — which is exactly why it is now only the
+  fallback and not the primary path;
+* whether the Files API upload leg behaves as documented on the project's tier is
+  **[UNKNOWN]** (it is documented for this model, and now covered by tests);
+* the real latency distribution of one Persian voice note on either route is
+  **[UNKNOWN]**;
+* whether the 45 s operation deadline is generous enough for the provider's real
+  behaviour is **[UNKNOWN]** — it is a bound, not a measurement.
 
-`media_service.py` (resolution, transfer, validation, `_run_stt`, normalization, caps,
-timeouts); `backend/ai/media.py`; `backend/telegram_api/media.py` (download behaviour);
-`media_ai_service.py` (classifier, bypass, provenance); `backend/ai/engine/dispatcher.py`;
-`ProviderManager`, every provider adapter, the registry, `vision()` and the fallback mesh;
-`RuntimeSupervisor` (only the existing provisioning entry point is used, and its status dict
-shape is unchanged); OCR; PDF/DOCX; the save system; the scheduler; Supabase and
-`DATABASE_ARCHITECTURE.md`; `render.yaml`; `Procfile`; `backend/requirements.txt`;
-unrelated commands and tests; the accepted MIME list (no MP3/M4A/AAC/WebM, no ffmpeg);
-retry/fallback policy (still none); and the direct-STT answer contract.
+No claim of a live success is made anywhere in this report.
 
-### Exact next stage — M1.7b: the owner's live Persian comparison
+### Known limitations
 
-Operational notes: the STT selection is read **at provisioning time** (runtime startup), so
-each configuration is set in ENV and the runtime restarted between runs. Only one
-configuration is ever active at a time, and one voice note produces exactly one request.
+1. **Recognition quality is untouched.** A wrong Persian word is still a wrong
+   Persian word; this phase cannot and does not fix class A.
+2. The primary representation now costs two extra requests per transcription. If
+   the live comparison shows the inline form is accepted by this model, the
+   primary/fallback order is a one-line change in `_dedicated_transports`
+   (deliberately left as a decision for the live evidence, not guessed here).
+3. A timeout inside a worker thread still cannot be cancelled: if the boundary's
+   60 s bound fires first, the engine's request keeps running and its outcome is
+   discarded (documented at `media_service.py:1194`-`1198`, unchanged by design).
+4. The deadline is enforced **between** legs. A single leg cannot exceed its own
+   derived bound, but a leg that is slow-but-progressing may still consume its
+   whole remaining budget (that is the intent).
+5. `_FILE_READY_ATTEMPTS = 5` with a 1 s delay remains the readiness policy; it is
+   now deadline-aware and starts immediately, but it is still a fixed small bound.
+6. No programmatic model-availability probe was added (an unavailable model
+   surfaces as the honest HTTP 404 `MediaError`, unchanged).
 
-| Run | `AI_GEMINI_STT_MODEL` | `AI_GEMINI_STT_LANGUAGE` | What it exercises |
-|---|---|---|---|
-| A | *(unset)* | *(unset)* | `gemini-3.5-flash-lite` + Generate Content + automatic language (today's behaviour) |
-| B | `gemini-3.5-transcribe` | *(unset)* | dedicated model, documented automatic language detection |
-| C | `gemini-3.5-transcribe` | `fa-IR` | dedicated model with the Persian language pinned |
-| D | *(unset)* | `fa-IR` | general model with the appended explicit-language line |
+### Deferred work
 
-Procedure: for each configuration, restart with that ENV, then send the **same** Persian
-voice note several times (and at least one analytical request such as
-`این ویس درباره چیه؟`) by replying to it with `این رو STT کن` and `این رو SST کن`. Compare
-the delivered texts and, for each run, capture the matching trace line
-`GEMINI_MEDIA_ENGINE kind=speech-to-text …` (`model`, `transport`, `language`, `mode`,
-`bytes`, `chars`, `elapsed_ms`, `status`) plus `media_completed` / `direct_stt_completed`.
-Record which configuration reproduced or removed the observed substitutions, and write the
-observation into `INVESTIGATION.md`. If run B or C fails with HTTP 404, the model is not
-enabled for the project — that is a finding to record, not a code bug. Any further engine
-work (instruction tuning, vocabulary, timestamps, diarization) stays out of scope until that
-comparison is on record.
+* The M1.7b **live Persian A/B/C/D comparison** (model × language) — unchanged and
+  still the only path to a recognition-quality statement. The traces now make it
+  easier to run: `model`, `transport`, `language`, `mode`, `bytes`, `chars`,
+  `elapsed_ms`, `attempts`, `status`, `failure_class` are all on one line.
+* Reordering the dedicated transport (inline primary) **if and when** live
+  evidence shows the model accepts inline `data` — an explicit, evidence-gated
+  follow-up.
+* `INVESTIGATION.md` §19.4's optional opt-in transcript-length/attribution
+  instrument (still not implemented; it would have to avoid logging content by
+  default).
+* A shared/pooled HTTP client, only if a live measurement shows the per-leg
+  handshake matters (see PART 7 above).
+
+### Explicit next stage — M1.7d: the live evidence pass
+
+1. Deploy, then read the startup line
+   `GEMINI_MEDIA_ENGINE_PROVISIONED … stt_model=… stt_language=…` to record which
+   route is live.
+2. Reply to the same Persian voice note with `.stt` several times and capture, for
+   each run, the `GEMINI_MEDIA_ENGINE` line plus its `GEMINI_MEDIA_ENGINE_STAGE`
+   lines and the boundary's `stt_engine_invoked` / `stt_engine_returned`.
+3. If a failure occurs, the new `failure_class` field identifies the leg, the
+   socket phase or the HTTP status immediately — that is the evidence §20.19 R
+   asked for, and it decides whether the deadline, the representation order or the
+   provider contract needs the next change.
+4. Only then run the M1.7b A/B/C/D model × language comparison for the
+   recognition-quality question.

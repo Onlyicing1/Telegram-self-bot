@@ -52,10 +52,28 @@ deployment decision, never a runtime fallback: the dedicated model failing
 raises the boundary's honest ``MediaError`` and the operation does NOT retry on
 another model, so the recognition comparison stays interpretable.
 
-Audio larger than the documented inline request budget uses the documented Files
-API upload flow, and the uploaded file is deleted in a ``finally`` block, so
-nothing is retained remotely beyond the operation. That is the SAME upload
-adapter for both STT routes — no second download, no second upload subsystem.
+Bounded transport, ONE deadline, and classified failures. One media operation now
+carries a SINGLE explicit wall-clock deadline (inside the boundary's own bound),
+and every HTTP timeout is DERIVED from what is left of it: the connect/write/pool
+phases get tight fixed bounds and the read phase gets the remaining budget, so no
+socket phase can outlive the operation. A spent budget raises its OWN explicit
+deadline failure instead of silently degrading into a near-zero HTTP timeout —
+which is what the previous per-socket-phase bound did.
+
+The dedicated transcription route sends the audio representation the official
+documentation shows for its model (the Files API ``uri`` form). The documented
+inline ``data`` form is used only as ONE bounded fallback when the FIRST attempt
+fails for a TRANSIENT reason, the payload fits the inline budget and the deadline
+still has room. At most :data:`STT_MAX_ATTEMPTS` SEQUENTIAL attempts exist per
+operation: no retry loop, no concurrency, no second model.
+
+Audio larger than the documented inline request budget uses the SAME Files API
+upload flow, and the uploaded file is deleted in a ``finally`` block, so nothing
+is retained remotely beyond the operation — no second download, no second upload
+subsystem. Every failure is CLASSIFIED (upload / upload-timeout / file-processing
+/ interaction / interaction-timeout / HTTP rejection / malformed response /
+deadline) and a timeout records the socket PHASE that expired, so a live incident
+is diagnosable afterwards instead of collapsing into one generic sentence.
 """
 from __future__ import annotations
 
@@ -176,12 +194,101 @@ _VERBATIM_MODE: dict[str, str] = {"type": "verbatim"}
 _OCR_KIND = "OCR"
 _STT_KIND = "speech-to-text"
 
+#: ── Failure classes (bounded, closed tokens) ──
+#:
+#: ONE token per failure SITE, attached to the raised ``MediaError`` and emitted
+#: as the ``failure_class`` field of this module's own trace line. They are the
+#: missing half of the previous observability: an incident could say "timed out"
+#: but never WHICH leg, WHICH socket phase or WHICH HTTP status produced it. They
+#: are operational metadata only — never payload, a credential or a Telegram id.
+FAILURE_UPLOAD = "upload_failed"
+FAILURE_UPLOAD_TIMEOUT = "upload_timeout"
+FAILURE_FILE_PROCESSING = "file_processing"
+FAILURE_INTERACTION = "interaction_failed"
+FAILURE_INTERACTION_TIMEOUT = "interaction_timeout"
+FAILURE_REQUEST = "request_failed"
+FAILURE_REQUEST_TIMEOUT = "request_timeout"
+FAILURE_HTTP = "http_rejection"
+FAILURE_MALFORMED = "malformed_response"
+FAILURE_TRANSPORT = "transport_failure"
+FAILURE_DEADLINE = "operation_deadline"
+
+#: The two audio representations of the dedicated route. ``uri`` is the form the
+#: official documentation shows for the dedicated transcription model (the Files
+#: API); ``inline`` is the documented Interactions audio form (base64 ``data``)
+#: that the model's own transcription guide does not demonstrate, which is why it
+#: is only ever the bounded FALLBACK.
+_TRANSPORT_URI = "uri"
+_TRANSPORT_INLINE = "inline"
+
+#: The ``httpx`` timeout subclasses, most specific first, mapped onto the socket
+#: phase they expired in. Recording the phase is what separates "the connection
+#: never came up" from "the provider never finished answering".
+_TIMEOUT_PHASES: tuple[tuple[type[BaseException], str], ...] = (
+    (httpx.ConnectTimeout, "connect"),
+    (httpx.WriteTimeout, "write"),
+    (httpx.PoolTimeout, "pool"),
+    (httpx.ReadTimeout, "read"),
+)
+
+#: The ONLY failures a bounded second attempt may repeat: transport conditions
+#: that are transient by nature. Deterministic failures — HTTP 4xx (except 429),
+#: an unreadable body, a malformed shape, an empty transcript, a refused container
+#: — are deliberately absent, so no deterministic error is ever re-sent.
+_TRANSIENT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+
 #: Engine-level finite wall-clock bounds, each comfortably INSIDE the boundary's
 #: own bound (``media_service.OCR_TIMEOUT_S`` 45s, ``STT_TIMEOUT_S`` 60s), so the
 #: engine fails with its own precise reason before the boundary's outer bound and
 #: no request can hang.
 OCR_TIMEOUT_S = 30.0
-STT_TIMEOUT_S = 40.0
+
+#: ── The ONE STT operation deadline (replaces the per-phase HTTP bound) ──
+#:
+#: ``httpx.Client(timeout=X)`` bounds each SOCKET PHASE (connect, write, read,
+#: pool) separately — it is not a bound on the operation. The previous STT bound
+#: was such a per-phase 40 s value, which is why a live incident could only say
+#: "timed out after 40s" without being able to say which leg or which phase was
+#: still in flight (INVESTIGATION §20.7, §20.8, §20.17). This constant is instead
+#: the WHOLE operation: upload + file readiness + the transcription request + the
+#: single bounded retry/fallback. Every request timeout is derived from what is
+#: left of it, so the sum of the legs can never exceed it and the deadline is
+#: enforced as an explicit failure rather than as a hidden socket bound.
+#:
+#: Value derivation (not an arbitrary inflation of 40): the boundary's own bound
+#: is ``media_service.STT_TIMEOUT_S`` = 60 s, and the worst case here is one
+#: deadline plus one bounded cleanup (45 + 5 = 50 s), leaving ~10 s of margin for
+#: the boundary's worker-thread return path — so the media failure the owner sees
+#: is always the engine's precise reason and never the boundary's generic one.
+STT_OPERATION_DEADLINE_S = 45.0
+
+#: Phase bounds INSIDE the operation deadline: a stalled handshake or a stalled
+#: request transmission may never consume the whole operation, while the response
+#: body is allowed to use whatever budget is left.
+STT_CONNECT_TIMEOUT_S = 10.0
+STT_WRITE_TIMEOUT_S = 20.0
+
+#: The remote DELETE is cleanup, not part of the outcome: it is bounded on its own
+#: so a slow cleanup can never delay (or outlive) the owner-visible failure, which
+#: the previous full per-phase cleanup bound could do.
+STT_CLEANUP_TIMEOUT_S = 5.0
+
+#: A second attempt (a transient retry, or the fallback from the documented ``uri``
+#: representation to the inline one) starts only when at least this much of the
+#: operation deadline is left, so a retry can never push the operation past its
+#: own deadline.
+STT_MIN_ATTEMPT_S = 8.0
+
+#: Hard ceiling on provider attempts per operation: the initial attempt plus at
+#: most ONE retry/fallback. No loop can exceed it, and only ONE attempt is ever in
+#: flight at a time.
+STT_MAX_ATTEMPTS = 2
 
 #: Finite output ceiling per request. The boundary caps characters at
 #: ``MAX_OCR_CHARS`` / ``MAX_STT_CHARS`` (16 000 ≈ 4 000–8 000 tokens), so this is
@@ -318,9 +425,133 @@ def stt_instruction(language_code: str = "") -> str:
     )
 
 
-def _remaining(deadline: float, timeout_s: float) -> float:
-    """Time left before ``deadline``, never zero/negative (which httpx rejects)."""
-    return max(0.5, min(timeout_s, deadline - time.monotonic()))
+#: The smallest budget a leg may START with. Below it the operation is reported
+#: as an explicit deadline failure instead of being converted into an HTTP timeout
+#: too short to mean anything.
+_DEADLINE_FLOOR_S = 0.5
+
+
+def _error(
+    message: str,
+    failure_class: str,
+    *,
+    retryable: bool = False,
+    http_status: int = 0,
+    phase: str = "",
+) -> MediaError:
+    """Build the boundary's ``MediaError`` with bounded OPERATIONAL metadata.
+
+    ``stage`` stays empty: the media boundary owns stage attribution
+    (``media_stt_engine``). The extra attributes are consumed by this module's own
+    trace line and by the bounded retry decision — the failure CLASS, whether this
+    failure may be repeated within the deadline, the HTTP status when a response
+    did arrive, and the socket phase a timeout expired in. None of them can carry
+    payload, a credential or a Telegram identifier.
+    """
+    error = MediaError(message)
+    error.failure_class = failure_class
+    error.retryable = retryable
+    error.http_status = http_status
+    error.phase = phase
+    return error
+
+
+def _failure_field(error: BaseException) -> str:
+    """The bounded ``failure_class`` trace field of a failed operation.
+
+    ``<class>``, or ``<class>:<phase>`` for a timeout, or
+    ``<class>:http=<status>`` for an HTTP rejection — the three facts (which leg,
+    which socket phase, which status) that a bare ``timed out`` sentence cannot
+    carry.
+    """
+    name = str(getattr(error, "failure_class", "") or FAILURE_TRANSPORT)
+    phase = str(getattr(error, "phase", "") or "")
+    status = int(getattr(error, "http_status", 0) or 0)
+    if phase:
+        return f"{name}:{phase}"
+    if status:
+        return f"{name}:http={status}"
+    return name
+
+
+def _budget(deadline: float) -> float:
+    """Seconds left before the operation deadline (may be negative)."""
+    return deadline - time.monotonic()
+
+
+def _required_budget(deadline: float, leg: str, deadline_s: float) -> float:
+    """The remaining budget, or an explicit, controlled deadline failure.
+
+    A spent deadline is its OWN failure class: it is never silently converted into
+    a tiny HTTP timeout, which is exactly what the previous per-phase bound did
+    and what made a local bound look like a provider-side timeout.
+    """
+    left = _budget(deadline)
+    if left < _DEADLINE_FLOOR_S:
+        raise _error(
+            f"Gemini {leg} did not start within the {deadline_s:g}s operation "
+            "budget.",
+            FAILURE_DEADLINE,
+        )
+    return left
+
+
+def _request_timeout(left: float) -> httpx.Timeout:
+    """Phase bounds DERIVED from the remaining operation budget.
+
+    Connect/write/pool are bounded tightly (a stalled handshake or a stalled
+    request transmission can never eat the operation) and the read is allowed to
+    use the remaining budget. One input, one derived object: no phase can outlive
+    the operation deadline and the client carries no hidden timeout of its own.
+    """
+    return httpx.Timeout(
+        connect=min(STT_CONNECT_TIMEOUT_S, left),
+        read=left,
+        write=min(STT_WRITE_TIMEOUT_S, left),
+        pool=min(STT_CONNECT_TIMEOUT_S, left),
+    )
+
+
+def _timeout_phase(error: httpx.TimeoutException) -> str:
+    """Which socket phase an ``httpx`` timeout expired in (bounded token)."""
+    for klass, name in _TIMEOUT_PHASES:
+        if isinstance(error, klass):
+            return name
+    return "request"
+
+
+def _dedicated_transports(size: int) -> tuple[str, str]:
+    """The bounded, ORDERED transport plan for ONE dedicated transcription.
+
+    ``uri`` is primary because the official documentation for the dedicated model
+    shows ONLY the Files API URI form. The inline ``data`` form is documented for
+    the Interactions API but is not demonstrated for this model, so it is used
+    only as the single bounded fallback — and only when the payload fits the
+    documented inline budget; a larger payload repeats the URI form once instead,
+    which is a plain transient retry and needs no new representation.
+    """
+    if size <= INLINE_PAYLOAD_MAX_BYTES:
+        return (_TRANSPORT_URI, _TRANSPORT_INLINE)
+    return (_TRANSPORT_URI, _TRANSPORT_URI)
+
+
+def _decode_json(response: httpx.Response, leg: str) -> Any:
+    """The JSON body of a received response, or a classified malformed failure.
+
+    A response that arrived but cannot be read is a DETERMINISTIC failure: it is
+    classified as such and never retried.
+    """
+    try:
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001 — malformed response boundary
+        raise _error(
+            f"Gemini returned an unreadable {leg} response.", FAILURE_MALFORMED,
+        ) from exc
+    if not isinstance(data, dict):
+        raise _error(
+            f"Gemini returned an unreadable {leg} response.", FAILURE_MALFORMED,
+        )
+    return data
 
 
 def _safe_detail(response: httpx.Response) -> str:
@@ -415,18 +646,24 @@ class GeminiMediaEngine:
         """Return the transcript of ``audio`` (``""`` when there is no speech).
 
         Two deterministic, mutually exclusive routes chosen ONLY by
-        configuration — never at runtime, and never one as a fallback for the
-        other:
+        configuration:
 
           * a dedicated transcription model is configured ⇒ its own documented
             transcription request (Interactions API);
           * otherwise the general media model answers the STT instruction,
             exactly as before.
+
+        The ROUTE never falls back to the other model (a failing dedicated request
+        is never re-asked on the general model — that would make the recognition
+        comparison uninterpretable). Within one route, the bounded retry/
+        fallback documented at :data:`STT_MAX_ATTEMPTS` may instead repeat the
+        same request or switch the audio REPRESENTATION.
         """
         if self._stt_model:
             return self._run_dedicated_transcription(audio)
         return self._run(
-            _STT_KIND, audio, stt_instruction(self._stt_language), STT_TIMEOUT_S,
+            _STT_KIND, audio, stt_instruction(self._stt_language),
+            STT_OPERATION_DEADLINE_S,
         )
 
     # ── Internals ──
@@ -443,28 +680,67 @@ class GeminiMediaEngine:
         *,
         chars: int = 0,
         failed: bool = False,
+        deadline_s: float = 0.0,
+        attempts: int = 1,
+        failure_class: str = "",
     ) -> None:
         """ONE bounded, non-sensitive line per media operation.
 
-        It carries exactly what the recognition experiment needs to be read
-        (engine, model, API surface, container MIME, payload size, language mode,
-        transcription mode, elapsed time, output LENGTH, success/failure) and
-        never the transcript, the raw audio, the credential, a Telegram id, a
-        filename or a caption.
+        It carries exactly what the recognition experiment and a live incident
+        need (engine, model, API surface, container MIME, payload size, language
+        mode, transcription mode, elapsed time, output LENGTH, success/failure,
+        the operation deadline, how many provider attempts were spent, and the
+        failure CLASS with its socket phase or HTTP status) and never the
+        transcript, the raw audio, the credential, a Telegram id, a filename or a
+        caption.
         """
         logger.info(
             "GEMINI_MEDIA_ENGINE kind=%s engine=%s model=%s transport=%s mime=%s "
-            "bytes=%d language=%s mode=%s chars=%d elapsed_ms=%d status=%s",
+            "bytes=%d language=%s mode=%s chars=%d elapsed_ms=%d status=%s "
+            "attempts=%d deadline_s=%g failure_class=%s",
             kind, type(self).__name__, model,
             self.stt_transport if kind == _STT_KIND else "generate_content",
             mime_type, byte_count,
             language_mode or ("auto" if kind == _STT_KIND else "-"),
             transcription_mode or "-", chars,
             int((time.monotonic() - started) * 1000), "failed" if failed else "ok",
+            attempts, deadline_s, failure_class or "-",
         )
 
-    def _run(self, kind: str, payload: bytes, instruction: str, timeout_s: float) -> str:
-        """The Generate Content route: OCR and the general-model STT request."""
+    def _trace_stage(
+        self,
+        stage: str,
+        kind: str = _STT_KIND,
+        *,
+        attempt: int = 1,
+        transport: str = "",
+        byte_count: int = 0,
+        elapsed_ms: int = -1,
+    ) -> None:
+        """ONE bounded operational line per leg of a media operation.
+
+        This closes the observability gap that made a live incident undecidable:
+        the engine used to emit only its completed/failed aggregate, so a request
+        still in flight produced no line at all. The fields are the leg, the
+        attempt number, the bounded payload size and the leg's own elapsed time —
+        never audio, a transcript, a credential or a Telegram identifier.
+        """
+        logger.info(
+            "GEMINI_MEDIA_ENGINE_STAGE kind=%s stage=%s attempt=%d transport=%s "
+            "bytes=%d elapsed_ms=%s",
+            kind, stage, attempt, transport or "-", byte_count,
+            str(elapsed_ms) if elapsed_ms >= 0 else "-",
+        )
+
+    def _run(self, kind: str, payload: bytes, instruction: str, deadline_s: float) -> str:
+        """The Generate Content route: OCR and the general-model STT request.
+
+        ONE operation deadline (``deadline_s``): every request timeout is derived
+        from what is left of it, so no socket phase can outlive the operation. OCR
+        keeps its single-attempt contract; the STT route may spend ONE bounded
+        second attempt on a transient transport failure — never on a deterministic
+        one, and never without budget.
+        """
         if not payload:
             return ""
         mime_type = gemini_mime_type(payload)
@@ -472,40 +748,73 @@ class GeminiMediaEngine:
         language_mode = self._stt_language if is_stt else ""
         transcription_mode = "instruction" if is_stt else ""
         started = time.monotonic()
-        deadline = started + timeout_s
-        try:
-            if len(payload) <= INLINE_PAYLOAD_MAX_BYTES:
-                part: dict[str, Any] = {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": base64.b64encode(payload).decode("ascii"),
-                    }
-                }
-                text = self._generate(kind, part, instruction, timeout_s)
-            else:
-                text = self._generate_from_upload(
-                    kind, payload, mime_type, instruction, deadline,
+        deadline = started + deadline_s
+        inline = len(payload) <= INLINE_PAYLOAD_MAX_BYTES
+        self._trace_stage(
+            "request_start", kind,
+            transport=_TRANSPORT_INLINE if inline else _TRANSPORT_URI,
+            byte_count=len(payload),
+        )
+        max_attempts = STT_MAX_ATTEMPTS if is_stt else 1
+        attempts = 0
+        failure: MediaError | None = None
+        while attempts < max_attempts:
+            if attempts and _budget(deadline) < STT_MIN_ATTEMPT_S:
+                break
+            attempts += 1
+            if attempts > 1:
+                self._trace_stage(
+                    "attempt", kind, attempt=attempts, byte_count=len(payload),
+                    transport=_TRANSPORT_INLINE if inline else _TRANSPORT_URI,
                 )
-        except MediaError:
+            try:
+                if inline:
+                    part: dict[str, Any] = {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64.b64encode(payload).decode("ascii"),
+                        }
+                    }
+                    text = self._generate(kind, part, instruction, deadline, deadline_s, attempts)
+                else:
+                    text = self._generate_from_upload(
+                        kind, payload, mime_type, instruction, deadline, deadline_s, attempts,
+                    )
+            except MediaError as exc:
+                failure = exc
+                if not getattr(exc, "retryable", False):
+                    break
+                continue
             self._log_run(
                 kind, mime_type, len(payload), started, self._model,
-                language_mode, transcription_mode, failed=True,
+                language_mode, transcription_mode, chars=len(text),
+                deadline_s=deadline_s, attempts=attempts,
             )
-            raise
+            return text
+        error = failure or _error(
+            f"Gemini {kind} produced no result.", FAILURE_TRANSPORT,
+        )
         self._log_run(
             kind, mime_type, len(payload), started, self._model,
-            language_mode, transcription_mode, chars=len(text),
+            language_mode, transcription_mode, failed=True,
+            deadline_s=deadline_s, attempts=max(attempts, 1),
+            failure_class=_failure_field(error),
         )
-        return text
+        raise error
 
     # ── The dedicated transcription route ──
 
     def _run_dedicated_transcription(self, audio: bytes) -> str:
-        """ONE transcription through the dedicated model's own API surface.
+        """ONE dedicated transcription, bounded by ONE operation deadline.
 
-        Same boundary contract as the general route: one bounded operation, the
-        same inline-vs-Files transport decision, the same output handling and no
-        retry. A failure here is final — it is never re-asked on another model.
+        The representation is the Files API URI form the official documentation
+        shows for this model. A TRANSIENT failure of the first attempt may use the
+        ONE bounded alternative — the documented inline audio representation when
+        the payload fits the inline budget (it needs no upload at all), otherwise
+        the URI form once more. At most :data:`STT_MAX_ATTEMPTS` sequential
+        attempts, decided BEFORE the operation and never at runtime: no retry
+        loop, no concurrency, no second model, and never any attempt without
+        budget left.
         """
         if not audio:
             return ""
@@ -515,36 +824,75 @@ class GeminiMediaEngine:
                 "The dedicated transcription model accepts audio input only."
             )
         started = time.monotonic()
-        deadline = started + STT_TIMEOUT_S
-        try:
-            if len(audio) <= INLINE_PAYLOAD_MAX_BYTES:
-                item: dict[str, Any] = {
-                    "type": "audio",
-                    "data": base64.b64encode(audio).decode("ascii"),
-                    "mime_type": mime_type,
-                }
-                text = self._transcribe_interaction(item, STT_TIMEOUT_S)
-            else:
-                text = self._transcribe_interaction_from_upload(audio, mime_type, deadline)
-        except MediaError:
+        deadline = started + STT_OPERATION_DEADLINE_S
+        transports = _dedicated_transports(len(audio))
+        self._trace_stage(
+            "request_start", transport=transports[0], byte_count=len(audio),
+        )
+        attempts = 0
+        failure: MediaError | None = None
+        while attempts < STT_MAX_ATTEMPTS:
+            # A second attempt runs only with a meaningful budget left, so the
+            # bounded fallback can never push the operation past its deadline.
+            if attempts and _budget(deadline) < STT_MIN_ATTEMPT_S:
+                break
+            transport = transports[attempts]
+            attempts += 1
+            if attempts > 1:
+                self._trace_stage(
+                    "attempt", transport=transport, attempt=attempts,
+                    byte_count=len(audio),
+                )
+            try:
+                text = self._dedicated_attempt(
+                    transport, audio, mime_type, deadline, attempts,
+                )
+            except MediaError as exc:
+                failure = exc
+                if not getattr(exc, "retryable", False):
+                    break
+                continue
             self._log_run(
                 _STT_KIND, mime_type, len(audio), started, self._stt_model,
-                self._stt_language, _VERBATIM_MODE["type"], failed=True,
+                self._stt_language, _VERBATIM_MODE["type"], chars=len(text),
+                deadline_s=STT_OPERATION_DEADLINE_S, attempts=attempts,
             )
-            raise
+            return text
+        error = failure or _error(
+            "Gemini speech-to-text produced no result.", FAILURE_INTERACTION,
+        )
         self._log_run(
             _STT_KIND, mime_type, len(audio), started, self._stt_model,
-            self._stt_language, _VERBATIM_MODE["type"], chars=len(text),
+            self._stt_language, _VERBATIM_MODE["type"], failed=True,
+            deadline_s=STT_OPERATION_DEADLINE_S, attempts=max(attempts, 1),
+            failure_class=_failure_field(error),
         )
-        return text
+        raise error
+
+    def _dedicated_attempt(
+        self, transport: str, audio: bytes, mime_type: str, deadline: float, attempt: int,
+    ) -> str:
+        """ONE attempt of the bounded transport plan (never a retry loop)."""
+        if transport == _TRANSPORT_INLINE:
+            item: dict[str, Any] = {
+                "type": "audio",
+                "data": base64.b64encode(audio).decode("ascii"),
+                "mime_type": mime_type,
+            }
+            return self._transcribe_interaction(item, deadline, attempt=attempt)
+        return self._transcribe_interaction_from_upload(
+            audio, mime_type, deadline, attempt=attempt,
+        )
 
     def _transcription_body(self, audio_item: dict[str, Any]) -> dict[str, Any]:
         """The documented request body for the dedicated transcription model.
 
         Field inventory, and nothing beyond it:
           * ``model`` — the selected dedicated model;
-          * ``input`` — ONE audio item, inline ``data`` (base64) or an uploaded
-            ``uri``, plus its documented ``mime_type``;
+          * ``input`` — ONE audio item plus its documented ``mime_type``. The
+            PRIMARY attempt uses the uploaded ``uri`` form (the representation the
+            documentation shows for this model); the inline ``data`` (base64)
+            form is only ever the bounded fallback;
           * ``generation_config.transcription_config.language_codes`` — a
             single BCP-47 code, included ONLY when a language is configured, so
             the automatic-detection mode sends no language field at all;
@@ -573,35 +921,54 @@ class GeminiMediaEngine:
         }
 
     def _transcribe_interaction(
-        self, audio_item: dict[str, Any], timeout_s: float,
+        self, audio_item: dict[str, Any], deadline: float, *, attempt: int = 1,
     ) -> str:
-        """ONE ``POST /interactions`` — never retried here (no retry loop)."""
+        """ONE ``POST /interactions`` for ONE attempt (never a retry loop)."""
         body = self._transcription_body(audio_item)
-        data = self._post_json(_STT_KIND, INTERACTIONS_ENDPOINT, body, timeout_s)
-        return _extract_interaction_text(_STT_KIND, data, self._api_key)
+        response = self._perform(
+            deadline,
+            "interaction",
+            lambda client: client.post(
+                INTERACTIONS_ENDPOINT, json=body, headers=self._headers(),
+            ),
+            budget_leg="speech-to-text request",
+            message_leg="speech-to-text request",
+            timeout_class=FAILURE_INTERACTION_TIMEOUT,
+            failure_class=FAILURE_INTERACTION,
+            deadline_s=STT_OPERATION_DEADLINE_S,
+            attempt=attempt,
+        )
+        _raise_for_status("speech-to-text", response, self._api_key)
+        return _extract_interaction_text(
+            _STT_KIND, _decode_json(response, "speech-to-text"), self._api_key,
+        )
 
     def _transcribe_interaction_from_upload(
-        self, audio: bytes, mime_type: str, deadline: float,
+        self, audio: bytes, mime_type: str, deadline: float, *, attempt: int = 1,
     ) -> str:
-        """The SAME Files API upload flow, reused for the dedicated route.
+        """The documented Files API flow, reused for the dedicated route.
 
-        The uploaded file is used by its returned URI and deleted in a
-        ``finally`` block, so nothing outlives the operation.
+        The uploaded file is referenced by its returned URI and deleted in a
+        ``finally`` block, so nothing outlives the ATTEMPT — including a failed
+        one, before the bounded fallback can run.
         """
-        timeout_s = _remaining(deadline, STT_TIMEOUT_S)
-        upload_url = self._start_upload(audio, mime_type, timeout_s)
-        file_info = self._finish_upload(upload_url, audio, mime_type, timeout_s)
+        upload_url = self._start_upload(audio, mime_type, deadline, attempt=attempt)
+        file_info = self._finish_upload(
+            upload_url, audio, mime_type, deadline, attempt=attempt,
+        )
         name = str(file_info.get("name") or "")
         uri = str(file_info.get("uri") or "")
         if not name or not uri:
-            raise MediaError("Gemini did not accept the uploaded audio file.")
+            raise _error(
+                "Gemini did not accept the uploaded audio file.", FAILURE_UPLOAD,
+            )
         try:
             state = str(file_info.get("state") or "").upper()
             if state and state != "ACTIVE":
                 uri = self._await_file_ready(name, uri, deadline)
             return self._transcribe_interaction(
                 {"type": "audio", "uri": uri, "mime_type": mime_type},
-                _remaining(deadline, STT_TIMEOUT_S),
+                deadline, attempt=attempt,
             )
         finally:
             self._delete_file(name)
@@ -610,9 +977,10 @@ class GeminiMediaEngine:
         return {"x-goog-api-key": self._api_key, "Content-Type": "application/json"}
 
     def _generate(
-        self, kind: str, part: dict[str, Any], instruction: str, timeout_s: float,
+        self, kind: str, part: dict[str, Any], instruction: str, deadline: float,
+        deadline_s: float, attempt: int = 1,
     ) -> str:
-        """ONE generateContent request — never retried here (no retry loop)."""
+        """ONE generateContent request per attempt (never a retry loop)."""
         url = f"{GEMINI_API_BASE}/models/{self._model}:generateContent"
         body = {
             "contents": [{"role": "user", "parts": [{"text": instruction}, part]}],
@@ -621,10 +989,24 @@ class GeminiMediaEngine:
                 "maxOutputTokens": MAX_OUTPUT_TOKENS,
             },
         }
-        return _extract_text(kind, self._post_json(kind, url, body, timeout_s), self._api_key)
+        response = self._perform(
+            deadline,
+            "generate_content",
+            lambda client: client.post(url, json=body, headers=self._headers()),
+            budget_leg=f"{kind} request",
+            message_leg=f"{kind} request",
+            timeout_class=FAILURE_REQUEST_TIMEOUT,
+            failure_class=FAILURE_REQUEST,
+            deadline_s=deadline_s,
+            attempt=attempt,
+            kind=kind,
+        )
+        _raise_for_status(kind, response, self._api_key)
+        return _extract_text(kind, _decode_json(response, kind), self._api_key)
 
     def _generate_from_upload(
-        self, kind: str, payload: bytes, mime_type: str, instruction: str, deadline: float,
+        self, kind: str, payload: bytes, mime_type: str, instruction: str,
+        deadline: float, deadline_s: float, attempt: int = 1,
     ) -> str:
         """The documented Files API path for audio past the inline budget.
 
@@ -633,13 +1015,16 @@ class GeminiMediaEngine:
         ``finally`` block. A failed delete is logged (never raised) because a
         file the API fails to delete is still auto-expired by the API itself.
         """
-        timeout_s = _remaining(deadline, STT_TIMEOUT_S)
-        upload_url = self._start_upload(payload, mime_type, timeout_s)
-        file_info = self._finish_upload(upload_url, payload, mime_type, timeout_s)
+        upload_url = self._start_upload(payload, mime_type, deadline, attempt=attempt)
+        file_info = self._finish_upload(
+            upload_url, payload, mime_type, deadline, attempt=attempt,
+        )
         name = str(file_info.get("name") or "")
         uri = str(file_info.get("uri") or "")
         if not name or not uri:
-            raise MediaError("Gemini did not accept the uploaded audio file.")
+            raise _error(
+                "Gemini did not accept the uploaded audio file.", FAILURE_UPLOAD,
+            )
         try:
             state = str(file_info.get("state") or "").upper()
             if state and state != "ACTIVE":
@@ -648,12 +1033,65 @@ class GeminiMediaEngine:
                 kind,
                 {"fileData": {"mimeType": mime_type, "fileUri": uri}},
                 instruction,
-                _remaining(deadline, STT_TIMEOUT_S),
+                deadline,
+                deadline_s,
+                attempt,
             )
         finally:
             self._delete_file(name)
 
-    def _start_upload(self, payload: bytes, mime_type: str, timeout_s: float) -> str:
+    def _perform(
+        self,
+        deadline: float,
+        stage: str,
+        call: Any,
+        *,
+        budget_leg: str,
+        message_leg: str,
+        timeout_class: str,
+        failure_class: str,
+        deadline_s: float,
+        attempt: int = 1,
+        byte_count: int = 0,
+        kind: str = _STT_KIND,
+    ) -> httpx.Response:
+        """ONE bounded HTTP call, inside the operation deadline.
+
+        The request timeout is DERIVED from what is left of the deadline (tight
+        connect/write/pool bounds, the remaining budget for the read), so no socket
+        phase can outlive the operation. Every failure is CLASSIFIED: an explicit
+        deadline failure when the budget is spent, a timeout carrying the expired
+        socket PHASE, an HTTP rejection carrying its status, or a named transport
+        failure — with ``retryable`` set ONLY for the conditions a bounded second
+        attempt may repeat.
+        """
+        left = _required_budget(deadline, budget_leg, deadline_s)
+        timeout = _request_timeout(left)
+        call_started = time.monotonic()
+        try:
+            with self._client(timeout) as client:
+                response = call(client)
+        except httpx.TimeoutException as exc:
+            phase = _timeout_phase(exc)
+            raise _error(
+                f"Gemini {message_leg} timed out after {left:g}s ({phase} phase).",
+                timeout_class, retryable=True, phase=phase,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — the transport boundary
+            raise _error(
+                f"Gemini {message_leg} failed ({type(exc).__name__}).",
+                failure_class,
+                retryable=isinstance(exc, _TRANSIENT_TRANSPORT_ERRORS),
+            ) from exc
+        self._trace_stage(
+            stage, kind, attempt=attempt, byte_count=byte_count,
+            elapsed_ms=int((time.monotonic() - call_started) * 1000),
+        )
+        return response
+
+    def _start_upload(
+        self, payload: bytes, mime_type: str, deadline: float, *, attempt: int = 1,
+    ) -> str:
         url = f"{GEMINI_UPLOAD_BASE}/files"
         headers = {
             **self._headers(),
@@ -663,25 +1101,27 @@ class GeminiMediaEngine:
             "X-Goog-Upload-Header-Content-Type": mime_type,
         }
         body = {"file": {"display_name": _UPLOAD_DISPLAY_NAME}}
-        with self._client(timeout_s) as client:
-            try:
-                response = client.post(url, json=body, headers=headers)
-            except httpx.TimeoutException as exc:
-                raise MediaError(
-                    f"Gemini speech-to-text upload timed out after {timeout_s:g}s."
-                ) from exc
-            except Exception as exc:  # noqa: BLE001 — transport boundary
-                raise MediaError(
-                    f"Gemini speech-to-text upload failed ({type(exc).__name__})."
-                ) from exc
+        response = self._perform(
+            deadline,
+            "upload_start",
+            lambda client: client.post(url, json=body, headers=headers),
+            budget_leg="speech-to-text upload",
+            message_leg="speech-to-text upload",
+            timeout_class=FAILURE_UPLOAD_TIMEOUT,
+            failure_class=FAILURE_UPLOAD,
+            deadline_s=STT_OPERATION_DEADLINE_S,
+            attempt=attempt,
+            byte_count=len(payload),
+        )
         _raise_for_status("speech-to-text upload", response, self._api_key)
         upload_url = str(response.headers.get("x-goog-upload-url") or "").strip()
         if not upload_url:
-            raise MediaError("Gemini did not return an upload URL.")
+            raise _error("Gemini did not return an upload URL.", FAILURE_UPLOAD)
         return upload_url
 
     def _finish_upload(
-        self, upload_url: str, payload: bytes, mime_type: str, timeout_s: float,
+        self, upload_url: str, payload: bytes, mime_type: str, deadline: float,
+        *, attempt: int = 1,
     ) -> dict[str, Any]:
         # No credential is sent to the upload URL: it comes from the API and only
         # ever receives the bytes plus the protocol headers.
@@ -691,52 +1131,62 @@ class GeminiMediaEngine:
             "X-Goog-Upload-Offset": "0",
             "X-Goog-Upload-Command": "upload, finalize",
         }
-        with self._client(timeout_s) as client:
-            try:
-                response = client.post(upload_url, content=payload, headers=headers)
-            except httpx.TimeoutException as exc:
-                raise MediaError(
-                    f"Gemini speech-to-text upload timed out after {timeout_s:g}s."
-                ) from exc
-            except Exception as exc:  # noqa: BLE001 — transport boundary
-                raise MediaError(
-                    f"Gemini speech-to-text upload failed ({type(exc).__name__})."
-                ) from exc
+        response = self._perform(
+            deadline,
+            "upload_finalize",
+            lambda client: client.post(upload_url, content=payload, headers=headers),
+            budget_leg="speech-to-text upload",
+            message_leg="speech-to-text upload",
+            timeout_class=FAILURE_UPLOAD_TIMEOUT,
+            failure_class=FAILURE_UPLOAD,
+            deadline_s=STT_OPERATION_DEADLINE_S,
+            attempt=attempt,
+            byte_count=len(payload),
+        )
         _raise_for_status("speech-to-text upload", response, self._api_key)
-        try:
-            data = response.json()
-        except Exception as exc:  # noqa: BLE001 — malformed response boundary
-            raise MediaError("Gemini returned an unreadable upload response.") from exc
-        if not isinstance(data, dict):
-            raise MediaError("Gemini returned an unreadable upload response.")
+        data = _decode_json(response, "upload")
         file_info = data.get("file")
         return file_info if isinstance(file_info, dict) else data
 
     def _await_file_ready(self, name: str, uri: str, deadline: float) -> str:
-        """Bounded readiness checks; a file that never becomes ready fails closed."""
-        for _ in range(_FILE_READY_ATTEMPTS):
-            time.sleep(_FILE_READY_DELAY_S)
-            info = self._file_info(name, _remaining(deadline, STT_TIMEOUT_S))
+        """Bounded readiness checks; a file that never becomes ready fails closed.
+
+        The FIRST check runs immediately — the finalize response usually already
+        reports ``ACTIVE``, and a gratuitous sleep would only add latency — and the
+        wait is bounded by BOTH an attempt count and the operation deadline. No
+        polling loop exists beyond this.
+        """
+        for attempt in range(1, _FILE_READY_ATTEMPTS + 1):
+            if attempt > 1:
+                time.sleep(_FILE_READY_DELAY_S)
+            info = self._file_info(name, deadline, attempt=attempt)
             state = str(info.get("state") or "").upper()
             if state == "ACTIVE":
+                self._trace_stage("file_ready", attempt=attempt)
                 return str(info.get("uri") or uri)
             if state == "FAILED":
-                raise MediaError("Gemini failed to process the uploaded audio file.")
-        raise MediaError("Gemini did not finish processing the uploaded audio file in time.")
+                raise _error(
+                    "Gemini failed to process the uploaded audio file.",
+                    FAILURE_FILE_PROCESSING,
+                )
+        raise _error(
+            "Gemini did not finish processing the uploaded audio file in time.",
+            FAILURE_FILE_PROCESSING,
+        )
 
-    def _file_info(self, name: str, timeout_s: float) -> dict[str, Any]:
+    def _file_info(self, name: str, deadline: float, *, attempt: int = 1) -> dict[str, Any]:
         url = f"{GEMINI_API_BASE}/{name}"
-        with self._client(timeout_s) as client:
-            try:
-                response = client.get(url, headers=self._headers())
-            except httpx.TimeoutException as exc:
-                raise MediaError(
-                    f"Gemini speech-to-text upload timed out after {timeout_s:g}s."
-                ) from exc
-            except Exception as exc:  # noqa: BLE001 — transport boundary
-                raise MediaError(
-                    f"Gemini speech-to-text upload failed ({type(exc).__name__})."
-                ) from exc
+        response = self._perform(
+            deadline,
+            "file_status",
+            lambda client: client.get(url, headers=self._headers()),
+            budget_leg="uploaded-file status check",
+            message_leg="speech-to-text upload status check",
+            timeout_class=FAILURE_UPLOAD_TIMEOUT,
+            failure_class=FAILURE_UPLOAD,
+            deadline_s=STT_OPERATION_DEADLINE_S,
+            attempt=attempt,
+        )
         _raise_for_status("speech-to-text upload", response, self._api_key)
         try:
             data = response.json()
@@ -745,52 +1195,44 @@ class GeminiMediaEngine:
         return data if isinstance(data, dict) else {}
 
     def _delete_file(self, name: str) -> None:
-        """Best-effort cleanup of the remote upload. Never raises.
+        """Best-effort cleanup of the remote upload, bounded on its own. Never raises.
 
-        The API auto-expires uploaded files, so a failed delete is logged and the
-        operation still reports its own honest outcome.
+        The DELETE is deliberately NOT part of the operation deadline: cleanup must
+        never delay or outlive the owner-visible outcome, which is why it gets its
+        own small finite bound instead of the previous full per-phase timeout (that
+        one could push a failure past the boundary's outer bound). The API
+        auto-expires uploaded files, so a failed delete is only logged.
         """
         try:
-            with self._client(STT_TIMEOUT_S) as client:
+            with self._client(_request_timeout(STT_CLEANUP_TIMEOUT_S)) as client:
                 client.delete(f"{GEMINI_API_BASE}/{name}", headers=self._headers())
         except Exception as exc:  # noqa: BLE001 — cleanup must not mask the result
             logger.warning("GEMINI_MEDIA_ENGINE_UPLOAD_CLEANUP_FAILED error=%s",
                            type(exc).__name__)
 
-    def _post_json(self, kind: str, url: str, body: dict[str, Any], timeout_s: float) -> Any:
-        with self._client(timeout_s) as client:
-            try:
-                response = client.post(url, json=body, headers=self._headers())
-            except httpx.TimeoutException as exc:
-                raise MediaError(f"Gemini {kind} request timed out after {timeout_s:g}s.") from exc
-            except Exception as exc:  # noqa: BLE001 — transport boundary
-                raise MediaError(f"Gemini {kind} request failed ({type(exc).__name__}).") from exc
-        _raise_for_status(kind, response, self._api_key)
-        try:
-            data = response.json()
-        except Exception as exc:  # noqa: BLE001 — malformed response boundary
-            raise MediaError(f"Gemini returned an unreadable {kind} response.") from exc
-        if not isinstance(data, dict):
-            raise MediaError(f"Gemini returned an unreadable {kind} response.")
-        return data
+    def _client(self, timeout: httpx.Timeout) -> httpx.Client:
+        """A per-call client carrying the DERIVED phase bounds.
 
-    def _client(self, timeout_s: float) -> httpx.Client:
-        """A per-call client: one request, one connection, deterministic cleanup.
-
-        Creating it per call (rather than sharing one across worker threads) keeps
-        the engine free of cross-request state, which is what the boundary's
-        ``asyncio.to_thread`` offload assumes.
+        Deliberately not a shared/pooled client: the engine is called from the
+        boundary's ``asyncio.to_thread`` workers, so module-level client state
+        would be cross-request mutable state (stale connections after a failure,
+        an unbounded pool, no deterministic shutdown) — the engine's ``__slots__``
+        contract is exactly that it holds none. What used to be a hidden timeout
+        (``timeout=40.0``, i.e. four independent per-phase bounds) is now an object
+        derived from the remaining operation budget, so the client can never carry
+        a bound the operation does not know about.
         """
-        return httpx.Client(timeout=timeout_s)
+        return httpx.Client(timeout=timeout)
 
 
 def _raise_for_status(kind: str, response: httpx.Response, api_key: str) -> None:
     """Map a non-2xx Gemini response onto the boundary's controlled error contract.
 
     The credential is redacted from any provider detail, so a redacted key can
-    never reach a log line or the owner's failure message. Only deterministic
-    client failures and transport availability are distinguished; nothing is
-    retried.
+    never reach a log line or the owner's failure message. Every status is
+    CLASSIFIED and carries its own HTTP status, and only the two genuinely
+    transient statuses (429, >= 500) are marked retryable — a rejection, a
+    missing model or a refused request is DETERMINISTIC and is never re-sent.
     """
     status = response.status_code
     if status < 400:
@@ -800,16 +1242,29 @@ def _raise_for_status(kind: str, response: httpx.Response, api_key: str) -> None
         detail = detail.replace(api_key, "***")
     suffix = f" ({detail})" if detail else ""
     if status in (401, 403):
-        raise MediaError(f"Gemini rejected the configured API key (HTTP {status}).{suffix}")
+        raise _error(
+            f"Gemini rejected the configured API key (HTTP {status}).{suffix}",
+            FAILURE_HTTP, http_status=status,
+        )
     if status == 429:
-        raise MediaError("Gemini rate limited the request (HTTP 429).")
+        raise _error(
+            "Gemini rate limited the request (HTTP 429).",
+            FAILURE_HTTP, retryable=True, http_status=status,
+        )
     if status == 404:
-        raise MediaError(
-            f"Gemini could not find the configured model for {kind} (HTTP 404).{suffix}"
+        raise _error(
+            f"Gemini could not find the configured model for {kind} (HTTP 404).{suffix}",
+            FAILURE_HTTP, http_status=status,
         )
     if status >= 500:
-        raise MediaError(f"Gemini is unavailable right now (HTTP {status}).")
-    raise MediaError(f"Gemini refused the {kind} request (HTTP {status}).{suffix}")
+        raise _error(
+            f"Gemini is unavailable right now (HTTP {status}).",
+            FAILURE_HTTP, retryable=True, http_status=status,
+        )
+    raise _error(
+        f"Gemini refused the {kind} request (HTTP {status}).{suffix}",
+        FAILURE_HTTP, http_status=status,
+    )
 
 
 def _extract_interaction_text(kind: str, data: Any, api_key: str) -> str:
@@ -825,10 +1280,13 @@ def _extract_interaction_text(kind: str, data: Any, api_key: str) -> str:
     seam's honest empty string, never a fabricated transcript.
     """
     if not isinstance(data, dict):
-        raise MediaError(f"Gemini returned an unreadable {kind} response.")
+        raise _error(f"Gemini returned an unreadable {kind} response.", FAILURE_MALFORMED)
     status = str(data.get("status") or "").strip().lower()
     if status and status != "completed":
-        raise MediaError(f"Gemini did not complete the {kind} request ({status}).")
+        raise _error(
+            f"Gemini did not complete the {kind} request ({status}).",
+            FAILURE_MALFORMED,
+        )
     chunks: list[str] = []
     steps = data.get("steps")
     if isinstance(steps, list):
@@ -865,14 +1323,14 @@ def _extract_text(kind: str, data: Any, api_key: str) -> str:
     malformed, blocked or refused response raises ``MediaError``.
     """
     if not isinstance(data, dict):
-        raise MediaError(f"Gemini returned an unreadable {kind} response.")
+        raise _error(f"Gemini returned an unreadable {kind} response.", FAILURE_MALFORMED)
     feedback = data.get("promptFeedback") if isinstance(data.get("promptFeedback"), dict) else {}
     blocked = str(feedback.get("blockReason") or "").strip()
     candidates = data.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         if blocked:
-            raise MediaError(f"Gemini blocked the {kind} request ({blocked}).")
-        raise MediaError(f"Gemini returned no {kind} result.")
+            raise _error(f"Gemini blocked the {kind} request ({blocked}).", FAILURE_MALFORMED)
+        raise _error(f"Gemini returned no {kind} result.", FAILURE_MALFORMED)
     candidate = candidates[0] if isinstance(candidates[0], dict) else {}
     content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
     parts = content.get("parts") if isinstance(content.get("parts"), list) else []
@@ -892,7 +1350,10 @@ def _extract_text(kind: str, data: Any, api_key: str) -> str:
         )
     if not chunks:
         if finish_reason in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST"}:
-            raise MediaError(f"Gemini refused to return {kind} content ({finish_reason}).")
+            raise _error(
+                f"Gemini refused to return {kind} content ({finish_reason}).",
+                FAILURE_MALFORMED,
+            )
         # Genuinely empty output: no readable text / no speech. Reported honestly.
         return ""
     return "\n".join(chunks)
