@@ -34,7 +34,7 @@
 |---|---|
 | Repository | `Onlyicing1/Telegram-self-bot` |
 | Branch | `main` |
-| Audited HEAD | `2a03813e5292128cab8ea93d3dd6ffd6eefba09d` (short `2a03813`, `docs: record the dedicated transcription STT route as current state`) — the **source** revision every code citation in this document was read at. Three commits landed since the earlier `6caee18` audit HEAD: `7e1e69a` (docs: STT quality investigation findings), `da05ace` (**feat: the dedicated Gemini transcription model as an opt-in STT route** — `backend/services/gemini_media_engine.py`, `tests/test_media_dedicated_stt.py`, `tests/test_media_gemini_engine.py`), and `2a03813` (docs: `IMPLEMENTATION_REPORT.md` only). §18 and §19 remain accurate for every claim they make; §20 records what the new engine route changes about the STT request itself. Between the `801f8db` audit and `6caee18`, three earlier commits landed: `0f8e819` (**M1.6 — deliver direct STT transcripts without a second model**), `14f5469` (**explicit-form STT classifier, adds the `sst` alias**), and `6caee18` (report sync only) |
+| Audited HEAD | `2a03813e5292128cab8ea93d3dd6ffd6eefba09d` (short `2a03813`, `docs: record the dedicated transcription STT route as current state`) — the **source** revision every code citation in this document was read at. Three commits landed since the earlier `6caee18` audit HEAD: `7e1e69a` (docs: STT quality investigation findings), `da05ace` (**feat: the dedicated Gemini transcription model as an opt-in STT route** — `backend/services/gemini_media_engine.py`, `tests/test_media_dedicated_stt.py`, `tests/test_media_gemini_engine.py`), and `2a03813` (docs: `IMPLEMENTATION_REPORT.md` only). §18 and §19 remain accurate for every claim they make; §20 records what the new engine route changes about the STT request itself. **Re-audit HEAD of the §20 pass (2026-09-17): `4b2fe47`** (`docs: record dedicated STT timeout investigation findings`, docs-only) — against `2a03813` only `INVESTIGATION.md` differs, and `backend/services/gemini_media_engine.py` is unchanged since `da05ace`, so every §20 citation resolves against the same source lines it was read at. Between the `801f8db` audit and `6caee18`, three earlier commits landed: `0f8e819` (**M1.6 — deliver direct STT transcripts without a second model**), `14f5469` (**explicit-form STT classifier, adds the `sst` alias**), and `6caee18` (report sync only) |
 | Investigation date | 2026-09-16 (media / lineage / recognition passes) · **2026-09-17 (dedicated-STT timeout pass, §20)** |
 | Status | **Investigation only. No code was changed while producing this document.** The current open problem is the §20 timeout failure class; the §19 recognition-quality problem is a **separate** failure class that §20 neither explains nor supersedes |
 | Scope | (a) At which existing architectural boundary a controlled Media Processing layer sits upstream of the owner's **currently selected** LLM provider — without changing that provider and without leaking Telegram/conversational context to the model; and (b) **the verified source lineage of the STT text the owner reads in Telegram** for a replied Voice note (§18); and (c) **the complete code-side analysis of the dedicated-STT 40-second timeout incident** — which leg timed out, what the code can and cannot prove about it, and the exact evidence that would close the remaining gap (§20). |
@@ -45,9 +45,12 @@
 | STT second-model audit (previous pass) | The exact provider-facing message list, the routing/transport path, the value lineage, the evidence boundary and the classification are recorded in **§2.1**; §18 remains the full narrative lineage record for the provider-mediated path. That pass's classification (**UNRESOLVED RUNTIME BOUNDARY**) described the boundary M1.6 has since **removed for explicit STT asks** — the record is retained for the analytical-ask path that still uses it. |
 | STT recognition-quality audit (previous pass) | STT **recognition quality** (a transcript was produced, with the wrong words) was the open problem of that pass, not delivery: the direct-STT path was functioning, so the observed Persian misrecognitions had to be attributed to the recognition itself. The full code-side audit — audio-byte lineage, request construction, normalization, retry analysis, observability limits and the A/B/C/D classification — is recorded in **§19**. External/service investigation (model adequacy, API behavior) is bounded in §19.6; this document records no external Gemini facts. Still an open problem in its own right — see the failure-class statement at the head of §20. |
 | STT timeout audit (this pass, §20) | A **different failure class**: a live explicit-STT request produced **no transcript at all**. The delivered notice was `✕ Couldn't process this media` / `media_stt_engine: Gemini speech-to-text request timed out after 40s.`. The complete code-side audit — the 40 s provenance, the call graph, both HTTP routes, the timeout stack and the operation deadline, the HTTP client semantics, the exception chain, request counts, ProviderManager non-involvement, event-loop/threading behaviour, the Render evidence, the `[Errno 11]` separation, client lifetime, observability gaps and test coverage — is recorded in **§20**. |
-| Current timeout finding | **Source-verified boundary:** the failure is the **engine's own HTTP bound** (`gemini_media_engine.STT_TIMEOUT_S = 40.0`, one socket phase), converted locally into `MediaError` and stamped by `media_service._run_stt` with the stage `media_stt_engine`. What the code **cannot** say: which socket phase expired, whether any byte of the request was transmitted, or whether Gemini saw it at all. §20.20 records the full classification; §20.19 R the exact evidence needed. |
+| Current timeout finding | **Source-verified boundary:** the failure is the **engine's own per-phase HTTP bound** (`gemini_media_engine.STT_TIMEOUT_S = 40.0` -> `httpx.Client(timeout=...)`), converted locally into `MediaError` and stamped by `media_service._run_stt` with the stage `media_stt_engine`. Two supporting findings close the previous pass's gaps: the supplied watchdog lines are the routine `ASYNC_TASK_DUMP` inventory and **not** a stall report (§20.1), and the official docs confirm every structural field of the request while leaving the inline `data` form unshown for this model (§20.21). What the code **cannot** say: which socket phase expired, whether any byte was transmitted, or whether Gemini saw it at all. §20.20 records the full A/B/C/D classification and the six-hypothesis scorecard; §20.19 R the exact evidence needed. |
 | Evidence limitations (this pass) | No live Telegram, no live Gemini call, no Render API access and no credential was used. The Render lines quoted in §20.1 are **reproduced from the incident hand-off**, not read from Render by this pass. No HTTP request was observed leaving the process. Everything beyond "the engine's httpx call raised a timeout" is marked **[UNKNOWN]** in §20. |
-| Files changed by this investigation | only `INVESTIGATION.md` — for **every** pass, including the §20 timeout pass (the engine change and its tests were delivered by the separate `da05ace` commit, not by this investigation) |
+| Source-revision verification (this pass) | `git log -1 -- backend/services/gemini_media_engine.py` = `da05ace3152b388f01e45a9a48a5fd1b3b416c1d` — i.e. the engine file is **unchanged** since the dedicated-transcription route landed, so every §20 code citation still resolves against the audited source |
+| Supplied runtime evidence (this pass) | The Render lines quoted in §20.1 (the `ASYNC_TASK_DUMP` inventory, the health snapshot, `KEEPALIVE_OK`, the `[Errno 11]` line) were **supplied with the incident**; this pass did **not** read Render, and §20.1 records what each line establishes from source instead |
+| External evidence (this pass) | §20.21 records an official-documentation check (three `ai.google.dev` pages fetched 2026-09-17) and §20.22 lists the external investigation's claims with statuses. Both are **external evidence, not repository-proven** |
+| Files changed by this investigation | only `INVESTIGATION.md` — for **every** pass, including the §20 timeout passes (the engine change and its tests were delivered by the separate `da05ace` commit, not by this investigation) |
 | Classification labels | **[CURRENT]** implemented behavior verified in source at the audited HEAD (`2a03813`) · **[FINDING]** conclusion derived from that source (evidence cited) · **[RECOMMENDED]** future proposal — **nothing in those sections is implemented** · **[UNKNOWN]** requires an implementation-phase decision. §20 additionally uses the failure-classification quadruple **A** code-proven root cause / **B** code-proven contributing factor / **C** code-proven not the cause / **D** cannot be determined from code |
 
 Evidence-strength tags used inline where a claim is not directly readable in
@@ -1551,12 +1554,47 @@ between them:
 | **VERIFIED FROM SOURCE** | read in this repository at the audited HEAD (`2a03813`) | yes |
 | **LOCAL RUNTIME EVIDENCE (library)** | measured in the local Python interpreter against the **installed** HTTP stack (`httpx==0.27.0`, `httpcore==1.0.9`, `postgrest`) — not a repository test | yes |
 | **LIVE PROVIDER EVIDENCE** | observed at or returned by the Gemini service for this incident | **no** |
+| **EXTERNAL EVIDENCE** (documentation) | the official Gemini docs fetched during this pass — recorded in §20.21 and §20.22 | yes, but **never** as a repository finding |
 
 Everything that would need the third is marked **[UNKNOWN]** and collected in
-§20.19. **No external Gemini/service fact is asserted anywhere in this section.**
-This pass did **not** verify that the request reached Google, that any response
-came back, that the model is available to the project, or that any quota was
-involved.
+§20.19. **No external Gemini/service fact is asserted as a code finding anywhere
+in §20.1-§20.20.** This pass did **not** verify, by any live call, that the request
+reached Google, that any response came back, that the model is available to the
+project, or that any quota was involved.
+
+Two clearly separated external subsections follow the A-S index and must not be
+read as repository findings: **§20.21** records an official-documentation check
+(external evidence, dated, with sources — useful for the contract question and
+explicitly *not* repository-proven), and **§20.22** lists the external
+investigation's claims with their verification status.
+
+**Coverage map of this section** (navigation only; the evidence is in the
+subsections):
+
+| Required item | Where |
+|---|---|
+| 1. Incident | §20.1 |
+| 2. Exact execution path | §20.2 |
+| 3. Exact model / configuration | §20.3 |
+| 4. Exact endpoint | §20.4 |
+| 5. Exact request representation (`data` vs `uri`) | §20.4, §20.6; external check §20.21 |
+| 6. Audio lineage | §20.5 (+ target resolution §20.12) |
+| 7. Timeout semantics | §20.7 |
+| 8. HTTP client semantics | §20.8 |
+| 9. Exception chain | §20.9 (seven-case table §20.9 I.1) |
+| 10. Request count / retries | §20.10 |
+| 11. ProviderManager / second-model proof | §20.11 |
+| 12. Event-loop / runtime analysis | §20.13 (+ the supplied evidence in §20.1) |
+| 13. `[Errno 11]` analysis | §20.16 |
+| 14. Test coverage | §20.18 |
+| 15. Evidence limitations | §20 head, §20.19 R, Validation Status |
+| 16. Ruled-out hypotheses | §20.19 P |
+| 17. Remaining hypotheses | §20.19 Q |
+| 18. Evidence needed to distinguish them | §20.19 R |
+| 19. Final code-side classification | §20.20 (A/B/C/D + hypothesis scorecard) |
+| Concurrency | §20.14 |
+| Observability | §20.17 |
+| External context (not repository-proven) | §20.21, §20.22 |
 
 ### 20.1 The incident and the runtime evidence
 
@@ -1574,37 +1612,79 @@ the dispatcher's `media_failure_stage` / `media_failure_reason` metadata — i.e
 stage label and the reason sentence are the dispatcher's copy of the engine's own
 message (§20.9). **VERIFIED FROM SOURCE.**
 
-**N. What the runtime evidence establishes — and what it does not.** The
-following Render observations are **reproduced from the incident hand-off**; this
-pass did not read Render and cannot verify them further:
+**N. The supplied runtime evidence, and what it establishes.** The lines below
+are **reproduced from the incident hand-off supplied with this investigation**.
+This pass did **not** access Render, and nothing below is independently
+re-verified:
 
-| Observation | Establishes | Does **not** establish |
+```
+2026-09-17T08:09:50.748222557Z [PERMANENT] lifeos-heartbeat: _immortal_wrapper awaiting=_immortal_wrapper elapsed=180s
+[PERMANENT] lifeos-keepalive: _immortal_wrapper awaiting=_immortal_wrapper elapsed=180s
+[BOUNDED] Task-1: main awaiting=main elapsed=180s
+[PERMANENT] Task-3: _recv_loop awaiting=_recv_loop elapsed=180s
+[PERMANENT] Task-7: _keepalive_loop awaiting=_keepalive_loop elapsed=180s
+[PERMANENT] lifeos-task-scheduler: run awaiting=run elapsed=180s
+
+Last RPC: 59.5s ago | RPC latency: 175.2ms | Last command: 21.2s ago
+Last update: 1.6s ago | Last event dispatch: 1.6s ago | loop_latency_ms=0.1 | runtime_state=READY
+
+KEEPALIVE_OK latency_ms=165.4 gen=1
+
+TASK_FALLBACK_CLASSIFIED reason=local_resource exception=ReadError message=[Errno 11] Resource temporarily unavailable
+```
+
+**Critical semantics of the `[PERMANENT]` / `[BOUNDED] … elapsed=Ns` lines
+(VERIFIED FROM SOURCE).** Those six lines are the body of ONE **informational**
+`ASYNC_TASK_DUMP` line emitted by `backend/runtime/diagnostics.py::_dump_tasks`
+(`:415`-`:420`, `logger.info`). The dump runs every `_INTERVAL = 60.0` s (`:35`,
+`:424`-`:426`) and prints the pending-task inventory whenever any task is pending
+(`:387`). Within that inventory `elapsed` is `now - _task_first_seen[name]`
+(`:295`-`:296`) — **the time since the diagnostics loop first observed that task**,
+i.e. an observed task *age*; `_task_first_seen` is never reset. `[PERMANENT]` vs
+`[BOUNDED]` is only the classification produced by `_is_permanent_task`
+(`:128`-`:145`: known runtime task names, coroutine-name patterns, or a
+Telethon-machinery frame). **Genuine stall conditions are reported by DIFFERENT,
+separately named warnings, none of which appears in the supplied evidence:**
+`TASK_NO_PROGRESS` (`:359`), `DEADLOCK_DETECTED` (`:379`),
+`TASK_STARVATION` (`:382`; `_STARVATION_THRESHOLD = 3` at `:37`) and
+`SLOW_EVENT_HANDLER` (`:385`). **INFERENCE FROM SOURCE:**
+the six lines therefore record six long-lived tasks that had existed for at least
+three minutes — normal for `lifeos-heartbeat`, `lifeos-keepalive`, Telethon's
+`_recv_loop`/`_keepalive_loop` and the task scheduler — and are **not** a stall
+report and **not** evidence about the media request.
+
+| Supplied observation | Establishes (VERIFIED FROM SOURCE) | Does **not** establish |
 |---|---|---|
-| `loop_latency_ms=0.1`; `Last update / Last Telethon event / Last event dispatch: 1.6s ago`; `runtime_state=READY` | the event loop was responsive and Telethon was receiving and dispatching around the incident | nothing about the STT HTTP call — that call runs off-loop by construction (§20.13), so loop health is expected whether Gemini answers quickly or never |
-| `Last RPC: 59.5s ago`; `Last command: 21.2s ago` | recent RPC/command activity existed | nothing about this request's own legs |
-| `pending_tasks=24`, `permanent_tasks=6`, `bounded_tasks=18`, `memory_mb=152.4` | a bounded task set and modest memory use at that moment | nothing about Gemini; no code path links task count or memory to the media engine (§20.14) |
-| long-lived tasks awaiting ~180 s, followed by `KEEPALIVE_OK` | the runtime's own supervision and keepalive were functioning | nothing about this request; the awaiters are unrelated tasks |
-| `TASK_FALLBACK_CLASSIFIED reason=local_resource … [Errno 11] Resource temporarily unavailable` | a **local socket-resource failure in the task-repository / Supabase path** occurred | nothing about this request: §20.16 shows no shared client, pool, executor, semaphore, store or schema |
-| the 40 s timeout itself | the engine's `httpx` call raised a timeout, converted locally into `MediaError` (§20.9) | which socket phase expired; whether the request was ever transmitted; whether Gemini saw it |
-| `AI_MAX_CONCURRENCY = 4`, the 240 s envelope, the 60 s boundary bound | the configured local bounds | nothing about the remote service |
+| `KEEPALIVE_OK latency_ms=165.4 gen=1`, `Last RPC: 59.5s ago`, `RPC latency: 175.2ms` | a **live Telethon RPC** (`client.get_me()`) completed in ~165-175 ms around the incident: `runtime/keepalive.py:48`-`:58` performs the RPC and, on success, calls `set_last_rpc()` / `set_rpc_latency()` (`health.py:151`, `:186`) — the two health fields are that same measurement | nothing about the Gemini call: a different connection, to a different host, executed off-loop (§20.13) |
+| `runtime_state=READY`, `loop_latency_ms=0.1`, `Last update` / `Last event dispatch: 1.6s ago` | the event loop was responsive and Telethon was receiving and dispatching | nothing about the media request's phases |
+| the six `[PERMANENT]`/`[BOUNDED] … elapsed=180s` lines | routine task inventory: those tasks existed >=180 s (see the semantics block above) | **not** a stall report; a stall would appear as `TASK_NO_PROGRESS` / `TASK_STARVATION` / `DEADLOCK_DETECTED` / `SLOW_EVENT_HANDLER` |
+| `TASK_FALLBACK_CLASSIFIED reason=local_resource … [Errno 11]` | a local socket-resource failure in the **task-repository / Supabase** path (§20.16) | nothing about this request: no shared client, pool, executor, semaphore, store or schema (§20.16) |
+| the delivered 40 s message | **our own bound expired** on the engine leg (§20.9) | which HTTP phase expired; whether the request was transmitted; whether any response came back |
+| `AI_MAX_CONCURRENCY = 4` (`ai_unified.py:72`), the 240 s envelope (`:71`), the 60 s boundary bound (`media_service.py:236`) | the configured local bounds | nothing about the remote service |
 
-**Conclusion for N:** the evidence is **consistent with** an off-loop blocking
-HTTP wait, and it **rules out** event-loop starvation, a runtime disconnect, a
-stuck provider mesh and local resource exhaustion as the producer of *this*
-message. It does **not** identify a cause and must not be presented as one.
+**Conclusion for N.** The supplied evidence establishes that the **runtime and the
+Telegram side were healthy** in that window (responsive loop, live RPCs at
+~165-175 ms, `READY`, and a routine diagnostics inventory carrying **no** stall
+warning), and that the only error present, `[Errno 11]`, belongs to the
+task-repository/Supabase path (§20.16). It establishes **nothing** about the
+Gemini request: the media HTTP call runs off-loop by construction, so loop health
+is *expected* whether the service answered in 200 ms or never. It therefore
+**rules out** event-loop starvation, a Telethon/runtime disconnect, and executor
+starvation as the producer of *this* message — and it does **not** identify a
+cause.
 
 ### 20.2 B. Which execution path handled it
 
-Every step read in source at `2a03813`; nothing here is inferred from a symbol's
+Every step read in source at `4b2fe47` (the files cited in §20 are unchanged since `2a03813`); nothing here is inferred from a symbol's
 existence alone.
 
 | # | Leg | Exact location | Behaviour |
 |---|---|---|---|
-| 1 | Activation | `backend/bot/handlers/ai_unified.py::_execute_ai` (`:625`), `_media_type_of` (`:605`-`:621`, called `:1060`) | the triggering message is plain text, so `request_media_type=""` |
-| 2 | Reply context | `_extract_reply_context` (`:449`), `classify_message` (`:483`), `ReplyContext(...)` (`:550`-`:552`) | `reply_context.media_type="Voice"`, `exists=True` |
+| 1 | Activation | `backend/bot/handlers/ai_unified.py::_execute_ai` (`:624`), `_media_type_of` (`:605`-`:621`, called `:1060`) | the triggering message is plain text, so `request_media_type=""` |
+| 2 | Reply context | `_extract_reply_context` (`:449`), `ai/media.py::classify_message` (`media.py:67`, called here `:459`), `ReplyContext(...)` (`:550`-`:552`) | `reply_context.media_type="Voice"`, `exists=True` |
 | 3 | Request | `AIRequest(...)` (`:710`-`:725`) | `timeout_s=_AI_EXECUTE_TIMEOUT=240.0` (`:71`) |
 | 4 | Envelope | `asyncio.wait_for(engine.execute(...), timeout=request.timeout_s or 240.0)` (`:741`-`:743`) | 240 s outer bound |
-| 5 | Dispatcher | `backend/ai/engine/dispatcher.py::execute` | deterministic local fast path (`:428`) runs first; the media route is `:437`-`:441`, gated on `tools_allowed` |
+| 5 | Dispatcher | `backend/ai/engine/dispatcher.py::execute` | deterministic local fast path (`:426`-`:427`) runs first; the media route is `:437`-`:441`, gated on `tools_allowed` |
 | 6 | Target | `dispatcher.py::_media_target` (`:1661`-`:1686`) | replied media preferred, else the triggering message (§20.12) |
 | 7 | Media route | `_try_media_analysis` (`:1688`-`:1782`) | `answer_media_request(..., timeout_s=request.timeout_s)` at `:1775` |
 | 8 | Service | `backend/services/media_ai_service.py::answer_media_request` (`:319`) → `media_service.resolve_media_message` (`:1339`) | one `guarded_await(client.get_messages(...))`, bound `min(240, MEDIA_RESOLVE_TIMEOUT_S=30)` |
@@ -1681,8 +1761,9 @@ body: {"contents":[{"role":"user","parts":[{"text": <STT_INSTRUCTION (+ optional
 
 **E. Which one the incident used → [UNKNOWN]**, because it depends on the
 deployment's `AI_GEMINI_STT_MODEL`. The failure message itself does **not**
-distinguish them: both inline branches pass exactly `STT_TIMEOUT_S` (`:484` for
-the general route, `:526` for the dedicated route) with `kind="speech-to-text"`,
+distinguish them: both inline branches end up bounded by exactly `STT_TIMEOUT_S` (`:429`
+selects it for the general route and `:484` forwards it; the dedicated route
+passes the constant directly at `:526`) with `kind="speech-to-text"`,
 so they emit a byte-identical sentence. The route is identifiable only from the
 logged `model=` / `transport=` fields (§20.17).
 
@@ -1701,18 +1782,18 @@ logged `model=` / `transport=` fields (§20.17).
   `gemini_mime_type` (`:282`-`:299`) calls `_sniff_mime` (`:257`-`:279`), which
   recognises `OggS` → `audio/ogg`, `RIFF…WAVE` → `audio/wav`, `fLaC` ->
   `audio/flac`; aliases are normalised through `_GEMINI_AUDIO_MIME_TYPES`
-  (`:242`-`:252`). The declared Telegram MIME is used **only** by the boundary's
+  (`:228`-`:238`). The declared Telegram MIME is used **only** by the boundary's
   validator and is never forwarded.
 - **[UNKNOWN]:** the incident's byte count and MIME. They are not recorded in
   this repository's code as constants — they are per-request values, logged at
-  runtime (`stt_engine_invoked … bytes=N`, `media_service.py:1290`-`:1293`;
+  runtime (`stt_engine_invoked … bytes=N`, `media_service.py:1287`-`:1290`;
   `GEMINI_MEDIA_ENGINE … mime=… bytes=…`). The message's exact `40s` (rather
   than a reduced fractional value — see §20.6) is **INFERENCE FROM SOURCE** that
   the payload was under the inline budget, i.e. a normal voice note.
 
 ### 20.6 F/G. Inline vs Files API
 
-- **Decision point:** `len(payload) <= INLINE_PAYLOAD_MAX_BYTES` (`:478` in the
+- **Decision point:** `len(payload) <= INLINE_PAYLOAD_MAX_BYTES` (`:477` in the
   general route, `:520` in the dedicated route), where the constant is
   `15 * 1024 * 1024` (`:200`). Base64 inflation is **not** computed; the constant
   encodes the documented 20 MB inline ceiling with room for the prompt.
@@ -1815,6 +1896,23 @@ HTTP response object was obtained. **NOT PROVEN:** that *zero* bytes arrived, or
 that the request was never transmitted; a mid-body stall (C) is not excluded.
 The earlier framing "no usable response" is the precise one; the stronger claim
 "Gemini never responded" is **[UNKNOWN]**.
+
+**I.1 The seven cases, and which the code can decide.** Each is stated as the
+repository can support it:
+
+| # | Case | Code-side status |
+|---|---|---|
+| 1 | Gemini **rejected** the request | **DISPROVEN for this incident** — a rejection is an HTTP response, and every status path prints a different, status-bearing sentence (`:787`-`:813`) |
+| 2 | Gemini returned an **HTTP error** (4xx / 429 / 5xx) | **DISPROVEN for this incident** — same evidence; none of those sentences was produced |
+| 3 | Gemini **accepted** the request and was still processing | **UNKNOWN WITHOUT LIVE HTTP TRACE** — fully consistent with the observation |
+| 4 | Gemini began responding but the client **timed out while reading the body** | **UNKNOWN WITHOUT LIVE HTTP TRACE** — `ReadTimeout` is the same exception class and is not excluded (§20.8) |
+| 5 | The request **never reached** Gemini | **UNKNOWN WITHOUT LIVE HTTP TRACE** |
+| 6 | The connection was established but **no response arrived** | **UNKNOWN WITHOUT LIVE HTTP TRACE** |
+| 7 | The client timed out **before transmission completed** (write phase) | **UNKNOWN WITHOUT LIVE HTTP TRACE** — *INFERENCE FROM SOURCE*: for a short voice note the base64 body is small (tens of KB), so a 40 s write bound would be physically surprising, but the code records no phase and this is an inference, not proof |
+
+**Summary:** cases 1 and 2 are disproven **for this incident**; cases 3-7 are
+**UNKNOWN WITHOUT LIVE HTTP TRACE**. The application's local timeout message is
+**not** evidence of a provider-side timeout.
 
 **J. What exception actually occurred.** `httpx.TimeoutException` (subtype
 unrecorded). **PROVEN** from the message template alone: `_post_json`'s
@@ -2000,11 +2098,11 @@ in the code links the two.
 
 | Item the incident needs | Status | Evidence |
 |---|---|---|
-| selected model | **observable** | `GEMINI_MEDIA_ENGINE … model=…` (`:434`-`:464`); `PROVISIONED … stt_model=…` (`:1008`-`:1015`) |
-| transport (`interactions` vs `generate_content`) | **observable** | `transport=` (`:437`) |
-| MIME, byte size | **observable** | `mime=`, `bytes=` (`:444`); `stt_engine_invoked … bytes=` (`:1290`-`:1293`) |
-| language / transcription mode | **observable** | `language=…|auto`, `mode=` (`:446`) |
-| elapsed time, outcome | **observable** | `elapsed_ms=`, `status=ok|failed` (`:447`) — the line that could confirm ≈40000 ms |
+| selected model | **observable** | `GEMINI_MEDIA_ENGINE … model=…` (`:434`-`:464`; every field is in the format string at `:456`-`:457`); `PROVISIONED … stt_model=…` (`:1008`-`:1015`) |
+| transport (`interactions` vs `generate_content`) | **observable** | `transport=` (`:456`) |
+| MIME, byte size | **observable** | `mime=` / `bytes=` (`:456`-`:457`); `stt_engine_invoked … bytes=` (`:1287`-`:1290`) |
+| language / transcription mode | **observable** | `language=…|auto` / `mode=` (`:457`) |
+| elapsed time, outcome | **observable** | `elapsed_ms=` / `status=ok|failed` (`:457`) — the line that could confirm ≈40000 ms |
 | **request start** | **NOT observable** | the engine emits its single line only after the call returns or fails (`:490`-`:500`, `:531`-`:539`); during a 40 s stall the engine logs nothing |
 | **exception class / phase** | **NOT observable** | `_run_stt` logs `error=type(exc).__name__` of the **`MediaError`** (`:1228`), and `_log_run` logs no class at all; the `httpx` subclass is preserved only as `__cause__` and is never rendered. **Connect vs write vs read vs pool is therefore unrecoverable after the fact** |
 | upload start / end | **NOT observable** | no per-leg lines; only the aggregate run line |
@@ -2035,7 +2133,7 @@ a real timeout on a slow response, and no test observes a live request.
 | **timeout fired by a slow response** | **NO** | — | every stub injects `raise_error=httpx.ReadTimeout(...)`; the stubs' `delay` knob (`:145`-`:167`) is never used, and it is verified locally that `httpx.MockTransport` does **not** enforce the client timeout (**LOCAL RUNTIME EVIDENCE (library)**) |
 | timeout message text / phase | **NO** | same | only `"timed out" in str(exc)` is asserted (`:948`-`:955`) |
 | no retry (one request) | yes | same + gemini_engine | `test_an_unavailable_model_keeps_the_media_failure_contract` (`:968`), `test_upload_failure_is_controlled_and_attempted_once` (`gemini_engine:1227`), the api-failure parametrisation (`gemini_engine:1142`) |
-| no ProviderManager / no second LLM | yes | `tests/test_media_direct_stt.py`, dedicated | `test_direct_stt_returns_the_transcript_without_a_provider_round` (`:368`), `test_direct_stt_never_builds_messages_for_the_provider` (`:390`), `test_direct_stt_bypasses…` (`:443`), `test_direct_stt_over_the_dedicated_engine_bypasses_the_provider` (`:1188`), `test_analytical_media_still_uses_the_provider_manager` (`:1227`) |
+| no ProviderManager / no second LLM | yes | `tests/test_media_direct_stt.py`, dedicated | `test_direct_stt_returns_the_transcript_without_a_provider_round` (`:368`), `test_direct_stt_never_builds_messages_for_the_provider` (`:390`), `test_direct_stt_skips_only_the_provider_leg_traced` (`:443`), `test_direct_stt_over_the_dedicated_engine_bypasses_the_provider` (`:1188`), `test_analytical_media_still_uses_the_provider_manager` (`:1227`) |
 | direct transcript delivery | yes | direct / dedicated | `test_direct_stt_honest_provenance_and_no_fallback_flag` (`:412`), `test_a_persian_transcript_survives_the_engine_unchanged` (`:853`) |
 | remote cleanup after a failure | yes | dedicated / gemini_engine | `test_the_uploaded_file_is_deleted_when_the_interaction_fails` (`:787` — HTTP 500, not a timeout), `test_a_failed_remote_cleanup_never_masks_the_result` (`gemini_engine:1244`) |
 | cleanup after a **timeout** | **partial** | `tests/test_media_stt.py` | `test_temp_directory_is_removed_on_success_failure_and_timeout` (`:905`) covers the local temp dir only; no test covers remote-file deletion, or cleanup duration, after a timeout |
@@ -2044,6 +2142,26 @@ a real timeout on a slow response, and no test observes a live request.
 | concurrent request behaviour | **NO** | — | no `asyncio.gather` and no concurrency test exists in any media test file |
 | engine module purity | yes | gemini_engine | `test_the_engine_module_has_no_provider_or_prompt_dependency` (`:1386`), `test_the_gemini_integration_adds_no_heavy_dependency` (`:1397`) |
 | no Telegram metadata in the request | yes | dedicated / gemini_engine | `test_no_telegram_metadata_reaches_the_transcription_model` (`:1042`), `test_gemini_receives_no_telegram_metadata_caption_or_history` (`:1325`) |
+
+**Covered for stage stamping (recorded here for completeness):**
+`tests/test_media_stt.py:780` (`test_an_engine_failure_keeps_the_engine_stage_and_the_engines_reason`,
+asserts `stage == MEDIA_STAGE_STT_ENGINE` at `:789` and `:803`), `:818`
+(boundary timeout stage **differs** from the engine stage),
+`tests/test_media_ai_integration.py:985` (`:993` asserts the dispatcher metadata
+carries `MEDIA_STAGE_STT_ENGINE`) and `:1047` (asserts the stage reaches the
+owner-facing notice), and `tests/test_media_direct_stt.py:568`.
+
+**Explicitly NOT tested anywhere in the repository:** the exact `40.0` value
+(only the relational `0 < engine < boundary` assertion); a timeout actually fired
+by a *slow* transport rather than an error-raising one (every stub injects
+`raise_error=httpx.ReadTimeout`, and the stubs' `delay` knob is never used —
+`httpx.MockTransport` does not enforce client timeouts: **LOCAL RUNTIME EVIDENCE
+(library)**); which HTTP phase expired; remote-file cleanup **after a timeout**
+(the existing test uses HTTP 500); client creation/closure per call as such;
+concurrent STT behaviour; and — decisively for the open question — **nothing about
+the live API's acceptance of the request**. Every dedicated-STT test drives a
+scripted transport that answers `200` for the exact URL the code builds, so the
+suite proves **what we send**, never **what the service accepts**.
 
 **No test was added or modified by this pass.**
 
@@ -2058,7 +2176,7 @@ a real timeout on a slow response, and no test observes a live request.
 4. **An HTTP application error from Gemini** (4xx/5xx, rate limit, model not
    found, key rejection, refusal) — those map to different sentences (§20.9).
 5. **A malformed or absent JSON body from a received response** — different
-   sentences (`_post_json:769`-`:775`, `_extract_interaction_text:832`-`:834`).
+   sentences (`_post_json:768`-`:775`, `_extract_interaction_text:827`-`:831`).
 6. **The boundary's 60 s bound, the download bound, the resolver bound and the
    240 s envelope** — each has a distinct stage/message and none appeared.
 7. **Event-loop blocking** — §20.13.
@@ -2129,6 +2247,31 @@ implemented here):
 - **UNRESOLVED (separate finding):** the §19 recognition-quality problem, which
   this incident neither caused nor explains.
 
+**A/B/C/D classification of this timeout**
+
+| Class | Items (all with source evidence above) |
+|---|---|
+| **A - code-proven root cause** | The owner-visible failure is generated **locally**: `_post_json` (`:763`-`:766`) converts an `httpx.TimeoutException` into `MediaError("Gemini speech-to-text request timed out after 40s.")` from `STT_TIMEOUT_S = 40.0` (`:184`), and `media_service._run_stt` (`:1224`-`:1225`) stamps the engine leg `media_stt_engine`. **No upstream cause is proven.** |
+| **B - code-proven contributing factor** | (1) the bound is **per socket phase**, not a total deadline (§20.7, §20.8); (2) the four phases are indistinguishable in the message and the logs (§20.9, §20.17); (3) the inline path ignores the operation deadline while the Files path shares it and adds a non-budgeted cleanup (§20.6); (4) no connection reuse, so a fresh DNS/TCP/TLS handshake sits inside every call's own connect budget (§20.15); (5) a timed-out worker thread cannot be cancelled (§20.13) |
+| **C - code-proven not the cause** | ProviderManager / second LLM; the direct-STT classifier; retries, duplicate requests, model fallback; any status-bearing rejection (4xx/429/404/5xx); malformed-response paths; the boundary's 60 s, the download, the resolver and the 240 s envelope; event-loop blocking; executor starvation as the producer; audio transcoding/resampling; MIME-vs-bytes divergence; Telegram metadata exposure; the `[Errno 11]` task-repository path; a **quota/eligibility rejection** (that would be a response, see case 1) |
+| **D - cannot be determined from code** | which phase expired; whether any byte was transmitted; whether the service received, processed or answered; whether the model is enabled/eligible for the project; the real latency distribution; whether 40 s is an appropriate bound; host-level resource pressure. **UNKNOWN WITHOUT LIVE PROVIDER/NETWORK EVIDENCE** |
+
+**Hypothesis scorecard (the six the incident brief listed)**
+
+| Hypothesis | Code-side status |
+|---|---|
+| **A. Invalid / incompatible request construction** | **Weakened, undecided.** The observed failure is **not** consistent with an outright rejection (that would be a status-bearing sentence, §20.9); whether this model accepts the inline `data` form is **[UNKNOWN]** (§20.21) |
+| **B. Valid request exceeding the application's 40 s bound** | **Consistent with every code fact; unproven.** Requires live timing |
+| **C. HTTP/network/transport failure before completion** | **Consistent; unproven.** The phases collapse into one message (§20.9) |
+| **D. Local resource / runtime / concurrency issue** | **Disproven as the producer** (§20.13-§20.16): the engine was entered and there is no shared client, pool, executor, lock or store. Host-level pressure remains **[UNKNOWN]** |
+| **E. Provider / account / access problem** | **Neither excluded nor supported:** a rejection would be an HTTP response; a service-side stall is invisible to the code |
+| **F. Observability gap** | **PROVEN.** The code cannot distinguish A / B / C / E after the fact (§20.9, §20.17) |
+
+**If one sentence is required:** the repository proves that **the application's
+40-second per-phase HTTP bound expired before a completed response was received**
+and that our own code produced the message; it does **not** prove which upstream
+condition caused it.
+
 **Index of the required questions**
 
 | | Question | Answered in |
@@ -2155,6 +2298,70 @@ implemented here):
 
 ---
 
+### 20.21 External evidence — official-documentation check (NOT repository-proven)
+
+**Framing.** This subsection records a documentation check performed during this
+pass (2026-09-17) against the official Gemini API documentation. It is included
+because the *external* validity of the request shape cannot be decided from this
+repository, and because it is the only sourced record of that contract: the
+engine's docstring (`gemini_media_engine.py:36`-`:62`) and
+`IMPLEMENTATION_REPORT.md:113`-`:125` both claim the same field provenance but
+**cite no URL**. Treat everything below as **external evidence**: documentation
+changes, and **no live request was made**. The code remains authoritative for
+*what we send*; the documentation only speaks to *what the service accepts*.
+
+**Sources fetched during this pass (HTTP 200, full page returned):**
+`https://ai.google.dev/gemini-api/docs/transcribe` ("Audio transcription"),
+`https://ai.google.dev/gemini-api/docs/audio` ("Audio understanding" ->
+"Pass audio data inline"), `https://ai.google.dev/gemini-api/docs/interactions`
+(redirects to `.../interactions-overview`).
+
+| What our code sends (VERIFIED FROM SOURCE) | What the fetched documentation shows | Verdict |
+|---|---|---|
+| `POST https://generativelanguage.googleapis.com/v1beta/interactions`, header `x-goog-api-key`, `Content-Type: application/json` (`:163`, `:609`-`:610`) | identical REST curl on the Transcribe and Audio-understanding pages | **matches (external)** |
+| `"model": "gemini-3.5-transcribe"` — bare id, no `models/` prefix (`:152`, `:570`) | identical bare id in every example | **matches (external)** |
+| `input: [ { "type": "audio", ... } ]` | identical content-type item | **matches (external)** |
+| inline `{ "type": "audio", "data": "<base64>", "mime_type": ... }` (`:521`-`:525`) | the Transcribe page shows **only** `uri` and recommends the Files API ("Use the Files API for large recordings"); the Audio-understanding page documents inline `data` for the Interactions API (example on a different model), with "Maximum request size is 20 MB total (including prompts and all files)" | **shape is documented for the API; NOT shown for this model -> still [UNKNOWN]** |
+| Files path `{ "type": "audio", "uri": ..., "mime_type": ... }` (`:602`-`:605`) | the exact form shown on the Transcribe page | **matches (external)** |
+| `generation_config.transcription_config.mode = {"type": "verbatim"}` (`:565`) | "Accepts `"smart"` or a verbatim mode object `{"type": "verbatim", ...}`"; `mode.type` "Always set to `verbatim`" | **matches (external)** |
+| `language_codes` absent by default, `["fa-IR"]` when configured (`:566`-`:567`) | omitted or `[]` => automatic detection; `fa-IR` (Farsi) appears in the published supported-language table | **matches (external)** |
+| `mime_type: "audio/ogg"` for a Telegram OGG/Opus voice note (`_GEMINI_AUDIO_MIME_TYPES`, `:228`-`:238`) | supported-format list includes `OGG - audio/ogg` and `Opus - audio/opus` | **matches (external)** |
+| `store: false` (`:572`) | Interactions API overview documents `store=false` as the stateless opt-out; incompatible with `background=true` | **matches (external)** |
+| response parsing: `status`, `steps[].type == "model_output"`, `content[].type == "text"`, `.text`, `output_text` fallback (`_extract_interaction_text`, `:815`-`:858`) | "The complete transcript text is returned in `interaction.output_text`"; the REST sample shows `status:"completed"`, `steps[].type:"model_output"`, `content[].type:"text"`, `text` | **matches (external)** |
+| one unary POST, no `background` | unary requests support audio up to 1 hour; `background=true` exists for long-running tasks; **no latency bound is documented** | **no documented latency guarantee either way** |
+
+**What this check does NOT settle** (all still external, see §20.19 R):
+(1) whether `gemini-3.5-transcribe` accepts the inline `data` form or requires
+`uri`; (2) the real wall-clock latency of one short Persian voice note on this
+model; (3) whether the model is enabled/eligible for the project and key, and on
+which tier; (4) whether the 20 MB request-size limit is decimal or binary and
+whether it counts raw or base64 bytes (our 15 MiB inline threshold is exactly
+20 MiB of base64); (5) whether the service can hold a unary interaction open past
+a 40 s client bound.
+
+### 20.22 External investigation context — NOT repository-proven
+
+Statuses below use this document's language. "CONSISTENT WITH CODE" means the
+repository neither contradicts the claim nor proves it; "EXTERNAL" means only
+external evidence (or none) supports it.
+
+| External claim | Status in this investigation |
+|---|---|
+| `gemini-3.5-transcribe` is a dedicated prerecorded-audio transcription model | **EXTERNAL.** The repository contains it only as a constant (`gemini_media_engine.py:152`); the fetched docs describe it as such (§20.21) |
+| The dedicated route uses the Interactions API with endpoint `/v1beta/interactions` | **Endpoint string VERIFIED FROM SOURCE** (`:163`); that the API serves it is **EXTERNAL** (§20.21) |
+| Canonical Transcribe examples may use Files API / URI-based input | **EXTERNAL, and confirmed by §20.21** for the examples; whether inline `data` is accepted **remains [UNKNOWN]** |
+| It must be distinguished whether `input[].data` is valid for this model/endpoint | **Agreed; [UNKNOWN WITHOUT LIVE PROVIDER EVIDENCE].** Our inline branch provably sends `data` (§20.4) |
+| OGG/Opus is documented as supported by Gemini | **EXTERNAL** (§20.21); the repository only maps its own validated containers (`:228`-`:238`) |
+| No current evidence that Persian, OGG/Opus or verbatim mode inherently causes a 40 s stall | **CONSISTENT WITH CODE.** Nothing in the timeout path varies by language, container or mode; the code cannot confirm or refute a service-side effect |
+| Dedicated Transcribe may have documented occasional slowness/timeout behaviour | **EXTERNAL CLAIM, NOT VERIFIED IN THIS PASS.** No such statement was found on the pages fetched in §20.21; that is absence of evidence, not evidence of absence. **[UNKNOWN]** |
+| A local 40 s timeout does not prove Gemini completed or failed at 40 s | **AGREED, and PROVEN FROM SOURCE:** the message is generated locally from `httpx.TimeoutException` (`:763`-`:766`) |
+| 429/503-style provider failures should be distinguished from a client-side timeout when observable | **PROVEN FROM SOURCE that they ARE distinguished when a response arrives** (`_raise_for_status`, `:787`-`:813`: 429 -> "rate limited", >=500 -> "unavailable"); **they were not the observed failure**, and a timeout discards any status. See §20.9 |
+| Explicit `fa-IR` is relevant to recognition quality, not established as a timeout cause | **CONSISTENT WITH CODE.** The language setting only adds `language_codes` (`:566`) or appends one instruction line (`stt_instruction`, `:302`-`:318`); it cannot reach the timeout path |
+| Verbatim vs Smart affects transcription behaviour, not proven latency | **Request-shape VERIFIED FROM SOURCE** (`mode`, `:565`); any latency effect is **[UNKNOWN]** |
+| A controlled live test is ultimately required to determine provider-side behaviour | **Agreed** — §20.19 R lists it as the closing experiment |
+
+---
+
 ## Validation Status
 
 | Item | Status |
@@ -2174,6 +2381,10 @@ implemented here):
 | Which STT route was live in production (§20.3/§20.4) | **[UNKNOWN]** — depends on the deployment's `AI_GEMINI_STT_MODEL`; only the runtime `PROVISIONED` line can settle it |
 | Live provider evidence for the incident (§20.9, §20.19) | **none obtained** — no request was observed leaving the process and no response was observed coming back; every hypothesis past "the engine's httpx call raised a timeout" is **[UNKNOWN]** |
 | `[Errno 11] Resource temporarily unavailable` (Render log, task repository) | **classified separate / unproven** — no shared client, pool, executor, semaphore, store or schema with the Gemini media engine (§20.16) |
+| Watchdog lines (`[PERMANENT]/[BOUNDED] … elapsed=180s`) | **decoded from source**: they are the informational `ASYNC_TASK_DUMP` inventory (`diagnostics.py:415`-`:420`) whose `elapsed` is observed task age (`:296`), **not** a stall report; genuine stalls would appear as `TASK_NO_PROGRESS`/`TASK_STARVATION`/`DEADLOCK_DETECTED`/`SLOW_EVENT_HANDLER` (§20.1) |
+| Official Gemini documentation check (§20.21) | **external evidence only** — dated, sourced, not repository-proven, and no substitute for a live call |
+| External investigation claims (§20.22) | itemised with per-claim status; none promoted to a repository fact |
+| A/B/C/D classification + six-hypothesis scorecard (§20.20) | recorded; the only **A** item is the locally-generated 40 s timeout, and the decisive upstream cause is **D** |
 | Live Telegram / Supabase / Render verification | **not performed** — no session, credential or traffic here; §18.9 states what a live observation would have to capture, and §20.19 R states what this incident's evidence must capture |
 | Fabricated commits / pushes | none claimed |
 
