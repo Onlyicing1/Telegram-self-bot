@@ -6,6 +6,16 @@ This module owns ONE AI sub-surface and everything behind it:
     └── Media Analysis            (``ai_media``)
         ├── Text recognition       (``ai_media_ocr``)
         └── Speech-to-Text         (``ai_media_stt``)
+            └── STT Settings       (``ai_media_stt_settings``)
+
+The Speech-to-Text screen is a compact control panel: the active candidate and
+its state, the ordered provider list with each candidate's own state, ONE global
+provider test, the candidate selection as two-column buttons, and a single way
+into the bounded behavioral settings. The behavioral settings (language,
+recognition passes) live in the nested **STT Settings** panel so they do not
+occupy the main screen; they keep their existing storage keys, input ids and
+validation, and the nested panel uses the shared panel/navigation registry, so
+Back returns to Speech-to-Text and Home returns to the usual navigation.
 
 Speech-to-Text used to be three free-form controls inside **AI → Settings →
 Advanced** (a model identifier the owner typed, a language code and a pass
@@ -77,6 +87,43 @@ _STT_RESET_WORDS = frozenset({"reset", "clear", "default", "none"})
 #: (``fa``, ``fa-IR``, ``en-US``). Deterministic shape check only — no fuzzy
 #: parsing and no language list to drift.
 _STT_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+#: Presentation-only button text for the two-column candidate grid: the registry
+#: labels are too wide for a row of two on a phone. A candidate id this map does
+#: not know falls back to its registry label, so a newly registered capability is
+#: still offered (and still selectable) without touching this table. The callback
+#: payload — and therefore the selection semantics — never depends on the text.
+_CANDIDATE_BUTTON_LABELS: dict[str, str] = {
+    "gemini:default": "Gemini",
+    "gemini:gemini-3.5-transcribe": "Gemini Transcribe",
+    "groq:whisper-large-v3": "Groq v3",
+    "groq:whisper-large-v3-turbo": "Groq Turbo",
+    "speechmatics:standard": "Speechmatics",
+}
+
+
+def _candidate_button(candidate) -> tuple[str, str]:
+    """``(text, callback)`` for ONE candidate's selection button.
+
+    The callback payload is the registered candidate id and is NEVER derived from
+    the button text, so shortening a label can never change which candidate is
+    selected.
+    """
+    label = _CANDIDATE_BUTTON_LABELS.get(candidate.candidate_id, candidate.label)
+    return f"Use {label}", f"action:ai_stt_select_candidate:{candidate.candidate_id}"
+
+
+def _two_column_rows(
+    buttons: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]]:
+    """Chunk candidate buttons into deterministic two-column rows.
+
+    Order is the caller's (the registry's canonical order) and the chunk size is
+    fixed, so the layout is a pure function of the candidate list — a changed
+    registry re-flows the rows without any hard-coded wrapping. An odd trailing
+    button keeps its own row.
+    """
+    return [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
 
 
 def stt_selection_line(config: dict) -> str:
@@ -223,19 +270,23 @@ def _ocr_model() -> str:
         return "default"
 
 
-async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
-    """The Speech-to-Text section: active candidate, pool, bounded settings."""
-    from backend.bot.handlers.ai import _nav_buttons
+def _media_stt_lines(plane, unreadable: bool) -> list[str]:
+    """The compact owner-facing state block: what is active and what is available.
 
-    unreadable = _unreadable(config)
-    plane = parse_stt_config({} if unreadable else config)
-
+    Only real runtime states are shown — a failed database read, an unresolved
+    legacy selection and a registered-but-unavailable active candidate all stay
+    visible, because hiding one for visual cleanliness would misreport the
+    runtime. Nothing here claims provider health: each candidate carries its own
+    probe state and the probe reports credential presence separately.
+    """
     lines = ["**Speech-to-Text**", ""]
     if unreadable:
         lines.append("! Current selection unavailable (database read failed).")
     elif plane.is_legacy:
-        lines.append(f"! Legacy model `{plane.legacy_model}` is not a registered candidate.")
-        lines.append("_It keeps running unchanged until you pick one below._")
+        lines.append(
+            f"! Legacy model `{plane.legacy_model}` is not a registered "
+            "candidate — it keeps running unchanged."
+        )
     else:
         active = plane.active_candidate
         lines.append(f"Active · {active.label if active else DEFAULT_CANDIDATE_ID}")
@@ -245,40 +296,86 @@ async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
                 "— the default route is used."
             )
     lines.append(f"Language · {plane.language or 'Auto'}")
-    lines.append(
-        f"Recognition passes · {plane.passes}"
-        f"{' (single pass)' if plane.passes == 1 else ''}"
-    )
+    lines.append(f"Passes · {plane.passes}")
     lines.append("")
     ranked = plane.ordered_candidates if not plane.is_legacy else all_candidates()
-    lines.append("Fallback order" if not plane.is_legacy else "Registered candidates")
+    lines.append("Providers")
     for index, candidate in enumerate(ranked, start=1):
         role = plane.candidate_role(candidate.candidate_id)
         suffix = " · active" if role == "active" else ""
-        suffix += f" · {    stt_provider_probe.candidate_state_row(candidate)}"
+        suffix += f" · {stt_provider_probe.candidate_state_row(candidate)}"
         lines.append(f"{index}. {candidate.label}{suffix}")
+    return lines
+
+
+async def _media_stt_body_and_buttons(config: dict) -> tuple[str, list]:
+    """The Speech-to-Text screen: active candidate, provider states, controls.
+
+    Deliberately compact — the state block says only what the owner needs to pick
+    a candidate, the provider list carries each candidate's own state, candidate
+    selection is a two-column grid built from the registry, and the bounded
+    behavioral settings live one level down in the nested STT Settings panel.
+    """
+    from backend.bot.handlers.ai import _nav_buttons
+
+    unreadable = _unreadable(config)
+    plane = parse_stt_config({} if unreadable else config)
+
+    lines = _media_stt_lines(plane, unreadable)
     lines.append("")
-    lines.append("_Pick a registered candidate — no model names to type._")
-    lines.append(
-        "_Test all providers runs ONE bounded request per registered candidate, "
-        "in order, and reports each result. It is a capability check with a "
-        "synthetic tone — not a recognition-quality benchmark._"
-    )
+    lines.append("_Test all = synthetic capability probe, not a quality benchmark._")
 
     builder = InlinePanelBuilder()
     builder.add_row("Test all providers", "action:ai_stt_test_all")
-    for candidate in all_candidates():
-        if not candidate.implemented:
-            continue
-        if plane.is_legacy or candidate.candidate_id != plane.active_id:
-            builder.add_row(
-                f"Use {candidate.label}",
-                f"action:ai_stt_select_candidate:{candidate.candidate_id}",
-            )
+    selectable = [
+        _candidate_button(candidate)
+        for candidate in all_candidates()
+        if candidate.implemented
+        and (plane.is_legacy or candidate.candidate_id != plane.active_id)
+    ]
+    for row in _two_column_rows(selectable):
+        if len(row) == 1:
+            builder.add_row(*row[0])
+        else:
+            builder.add_buttons(*row)
+    builder.add_row("\u2699 STT Settings", "panel:ai_media_stt_settings")
+    _nav_buttons(builder)
+    return "\n".join(lines), builder.build()
+
+
+async def _ai_media_stt_settings_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
+    """The bounded behavioral STT settings: language and recognition passes.
+
+    Only presentation moved here. The inputs are the SAME registered inputs the
+    main screen used to render (``input:ai_media_stt:stt_language`` /
+    ``input:ai_media_stt:stt_passes``), so their ids, prompts, validation and the
+    persistence keys they write are unchanged.
+    """
+    from backend.bot.handlers.ai import _nav_buttons
+
+    _owner, config = await _saved_config()
+    unreadable = _unreadable(config)
+    plane = parse_stt_config({} if unreadable else config)
+
+    lines = ["**\u2699 STT Settings**", ""]
+    if unreadable:
+        lines.append("! Current settings unavailable (database read failed).")
+    lines.append(f"Language · {plane.language or 'Auto'}")
+    lines.append(f"Passes · {plane.passes}")
+
+    builder = InlinePanelBuilder()
     builder.add_row("Language…", f"input:ai_media_stt:{STORAGE_KEY_LANGUAGE}")
     builder.add_row("Recognition passes…", f"input:ai_media_stt:{STORAGE_KEY_PASSES}")
     _nav_buttons(builder)
-    return "\n".join(lines), builder.build()
+    return "STT Settings", "\n".join(lines), builder.build()
+
+
+async def _ai_media_stt_settings_inline_builder(event, extra: str) -> list:
+    result = await _ai_media_stt_settings_panel_handler(event, extra)
+    if result is None:
+        return [render("STT Settings", "Error.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
 
 
 async def _ai_media_stt_panel_handler(event, extra: str) -> tuple[str, str, list] | None:
@@ -467,6 +564,11 @@ def register(client=None, owner_id: int = 0) -> None:
         register_inline_builder("ai_media_ocr", _ai_media_ocr_inline_builder)
         register_panel("ai_media_stt", _ai_media_stt_panel_handler, parent="ai_media", title="Speech-to-Text")
         register_inline_builder("ai_media_stt", _ai_media_stt_inline_builder)
+        register_panel(
+            "ai_media_stt_settings", _ai_media_stt_settings_panel_handler,
+            parent="ai_media_stt", title="STT Settings",
+        )
+        register_inline_builder("ai_media_stt_settings", _ai_media_stt_settings_inline_builder)
         register_action("ai_stt_select_candidate", _ai_stt_select_candidate_action)
         register_action("ai_stt_test_all", _ai_stt_test_all_action)
         register_input("ai_media_stt", STORAGE_KEY_LANGUAGE, {

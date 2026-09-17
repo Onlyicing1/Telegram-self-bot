@@ -322,6 +322,20 @@ def test_a_typed_model_identifier_is_never_a_candidate(typed):
 
 
 @pytest.mark.asyncio
+async def test_the_stt_settings_panel_exposes_the_two_bounded_inputs(monkeypatch):
+    """The language and pass controls moved here — same ids, same payloads."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, _body, buttons = await module._ai_media_stt_settings_panel_handler(None, "")
+
+    inputs = [d for _text, d in _flatten(buttons) if d.startswith("input:")]
+    assert set(inputs) == {
+        "input:ai_media_stt:stt_language", "input:ai_media_stt:stt_passes",
+    }
+
+
+@pytest.mark.asyncio
 async def test_the_stt_panel_offers_registered_candidates_only(monkeypatch):
     from backend.bot.handlers import ai_stt_settings as module
 
@@ -335,9 +349,9 @@ async def test_the_stt_panel_offers_registered_candidates_only(monkeypatch):
         candidate_id = data.split(":", 2)[2]
         assert control_plane.get_candidate(candidate_id) is not None
         assert control_plane.is_selectable(candidate_id)
-    # Never a free-form model field: the only inputs are the two bounded settings.
-    inputs = [d for d in datas if d.startswith("input:")]
-    assert set(inputs) == {"input:ai_media_stt:stt_language", "input:ai_media_stt:stt_passes"}
+    # Never a free-form model field, and no settings control on the main screen:
+    # the bounded settings live one level down in STT Settings.
+    assert [d for d in datas if d.startswith("input:")] == []
 
 
 # ── 7. Legacy compatibility ────────────────────────────────────────────
@@ -427,7 +441,7 @@ async def test_the_ocr_panel_is_read_only_and_honest(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_stt_panel_shows_the_active_candidate_and_the_bounded_settings(monkeypatch):
+async def test_the_stt_panel_shows_the_active_candidate_and_its_state(monkeypatch):
     from backend.bot.handlers import ai_stt_settings as module
 
     config = dict(
@@ -440,13 +454,144 @@ async def test_the_stt_panel_shows_the_active_candidate_and_the_bounded_settings
     assert title == "Speech-to-Text"
     assert "Active · Gemini Transcribe" in body
     assert "Language · fa-IR" in body
-    assert "Recognition passes · 3" in body
-    assert "Fallback order" in body
+    assert "Passes · 3" in body
+    assert "Providers" in body
+    # the active candidate is marked in the provider list and not offered again
+    assert "1. Gemini Transcribe · active" in body
     datas = [d for _, d in _flatten(buttons)]
+    assert "action:ai_stt_select_candidate:gemini:gemini-3.5-transcribe" not in datas
+
+
+@pytest.mark.asyncio
+async def test_the_stt_panel_is_compact(monkeypatch):
+    """A control panel, not documentation: no long explanatory paragraph."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, body, _buttons = await module._ai_media_stt_panel_handler(None, "")
+
+    assert len(body) < 500, "the screen is a control panel, not documentation"
+    assert max(len(line) for line in body.splitlines()) <= 80
+    assert "Pick a registered candidate" not in body
+    assert "no model names to type" not in body
+    assert "Test all providers runs" not in body
+    assert len([line for line in body.splitlines() if line.startswith("_")]) <= 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_buttons_are_laid_out_two_per_row(monkeypatch):
+    """Two-column grid, built from the registry, canonical order preserved."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, _body, buttons = await module._ai_media_stt_panel_handler(None, "")
+
+    candidate_rows = [
+        row for row in (_flatten([row]) for row in buttons)
+        if row and all(data.startswith("action:ai_stt_select_candidate:") for _text, data in row)
+    ]
+    offered = [data for row in candidate_rows for _text, data in row]
+    expected = [
+        f"action:ai_stt_select_candidate:{candidate.candidate_id}"
+        for candidate in control_plane.all_candidates()
+        if candidate.implemented and candidate.candidate_id != control_plane.DEFAULT_CANDIDATE_ID
+    ]
+
+    assert len(offered) == len(set(offered))
+    assert set(offered) == set(expected)
+    assert all(len(row) <= 2 for row in candidate_rows)
+    assert any(len(row) == 2 for row in candidate_rows)
+    # only the last row may be short, so the grid never leaves a hole
+    for row in candidate_rows[:-1]:
+        assert len(row) == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_rows_follow_the_registry_order(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, _body, buttons = await module._ai_media_stt_panel_handler(None, "")
+    datas = [d for _text, d in _flatten(buttons) if d.startswith("action:ai_stt_select_candidate:")]
+
+    ordered = [
+        candidate.candidate_id for candidate in control_plane.all_candidates()
+        if candidate.implemented
+    ]
+    assert datas == [
+        f"action:ai_stt_select_candidate:{candidate_id}"
+        for candidate_id in ordered
+        if candidate_id != control_plane.DEFAULT_CANDIDATE_ID
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_behavioral_controls_moved_into_stt_settings(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, main_body, main_buttons = await module._ai_media_stt_panel_handler(None, "")
+    main_flat = _flatten(main_buttons)
+
+    # No settings control on the main screen; the values stay visible.
+    assert "input:ai_media_stt:stt_language" not in [d for _text, d in main_flat]
+    assert "input:ai_media_stt:stt_passes" not in [d for _text, d in main_flat]
+    assert ("Language…", "input:ai_media_stt:stt_language") not in main_flat
+    assert ("Recognition passes…", "input:ai_media_stt:stt_passes") not in main_flat
+    assert "Language · Auto" in main_body
+    assert "Passes · 1" in main_body
+    # One way into the nested settings panel.
+    assert ("\u2699 STT Settings", "panel:ai_media_stt_settings") in main_flat
+
+
+@pytest.mark.asyncio
+async def test_the_stt_settings_panel_shows_the_current_values(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch, dict(_BASE_CONFIG, stt_language="fa-IR", stt_passes=3))
+    title, body, buttons = await module._ai_media_stt_settings_panel_handler(None, "")
+    flat = _flatten(buttons)
+
+    assert title == "STT Settings"
+    assert "Language · fa-IR" in body
+    assert "Passes · 3" in body
+    assert ("Language…", "input:ai_media_stt:stt_language") in flat
+    assert ("Recognition passes…", "input:ai_media_stt:stt_passes") in flat
+    assert ("← Back", "panel:_nav:back") in flat
+    assert ("⌂ Home", "panel:_nav:home") in flat
+
+
+@pytest.mark.asyncio
+async def test_every_stt_callback_payload_is_unchanged(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, _body, main_buttons = await module._ai_media_stt_panel_handler(None, "")
+    _title2, _body2, settings_buttons = await module._ai_media_stt_settings_panel_handler(None, "")
+    datas = {d for _text, d in _flatten(main_buttons) + _flatten(settings_buttons)}
+
+    assert "action:ai_stt_test_all" in datas
+    assert "panel:ai_media_stt_settings" in datas
     assert "input:ai_media_stt:stt_language" in datas
     assert "input:ai_media_stt:stt_passes" in datas
-    # the active candidate is not offered again
-    assert "action:ai_stt_select_candidate:gemini:gemini-3.5-transcribe" not in datas
+    assert {"panel:_nav:back", "panel:_nav:home"} <= datas
+
+
+@pytest.mark.asyncio
+async def test_the_stt_ui_carries_no_secret_or_telegram_metadata(monkeypatch):
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch, dict(_BASE_CONFIG, stt_language="fa-IR", stt_passes=2))
+    rendered: list[str] = []
+    for handler in (module._ai_media_stt_panel_handler, module._ai_media_stt_settings_panel_handler):
+        title, body, buttons = await handler(None, "")
+        rendered.append(title)
+        rendered.append(body)
+        rendered.extend(text for text, _data in _flatten(buttons))
+    blob = "\n".join(rendered)
+
+    for leak in ("AI_", "@", "api key", "token", "credential"):
+        assert leak.lower() not in blob.lower()
 
 
 @pytest.mark.asyncio
@@ -457,6 +602,35 @@ async def test_the_stt_panel_admits_an_unreadable_store(monkeypatch):
     _title, body, _buttons = await module._ai_media_stt_panel_handler(None, "")
 
     assert "unavailable (database read failed)" in body
+
+
+@pytest.mark.asyncio
+async def test_the_stt_panel_still_warns_about_an_unavailable_active_candidate(monkeypatch):
+    """A real runtime warning stays visible on the compact screen.
+
+    Every registered capability currently executes, so this state is reached
+    through a forged control plane — exactly how the later test/fallback phase
+    would report a candidate that exists in the registry but cannot run here.
+    """
+    from types import SimpleNamespace
+
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    plane = SimpleNamespace(
+        is_legacy=False, active_id="future:standard", active_unavailable=True,
+        active_candidate=SimpleNamespace(label="Future provider"),
+        language="", passes=1, ordered_candidates=(),
+    )
+    monkeypatch.setattr(module, "parse_stt_config", lambda _config: plane)
+    monkeypatch.setattr(module, "all_candidates", lambda: ())
+
+    _title, body, buttons = await module._ai_media_stt_panel_handler(None, "")
+
+    assert "Active · Future provider" in body
+    assert "registered but not available on this runtime" in body
+    assert "the default route is used" in body
+    assert "panel:ai_media_stt_settings" in [d for _text, d in _flatten(buttons)]
 
 
 @pytest.mark.asyncio
@@ -525,6 +699,37 @@ def test_media_analysis_panels_register_under_ai(monkeypatch):
     assert ("ai_media", "ai") in panels
     assert ("ai_media_ocr", "ai_media") in panels
     assert ("ai_media_stt", "ai_media") in panels
+    assert ("ai_media_stt_settings", "ai_media_stt") in panels
+
+
+@pytest.mark.asyncio
+async def test_back_from_stt_settings_returns_to_speech_to_text(monkeypatch):
+    """The shared navigation stack, not a second one: Back lands on the STT panel."""
+    from backend.helper import panels as panels_module
+
+    sessions = panels_module.get_lifecycle().sessions
+    sessions.push_nav(910001, 910002, "ai_media_stt", "")
+    sessions.push_nav(910001, 910002, "ai_media_stt_settings", "")
+
+    visited: list[str] = []
+
+    async def recorder(event, extra):
+        visited.append(extra)
+        return ("Speech-to-Text", "body", [])
+
+    async def no_render(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        panels_module, "get_panel",
+        lambda panel_id: recorder if panel_id == "ai_media_stt" else None,
+    )
+    monkeypatch.setattr(panels_module, "_render_and_edit", no_render)
+
+    await panels_module._handle_navigation(None, "back", 910001, 910002, 4242)
+
+    assert visited == [""]
+    assert sessions.current_nav(910001, 910002) == ("ai_media_stt", "")
 
 
 def test_stt_controls_register_on_the_media_panel_only(monkeypatch):

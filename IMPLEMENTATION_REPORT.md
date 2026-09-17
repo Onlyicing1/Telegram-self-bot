@@ -1,29 +1,33 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — M2.2: Speechmatics STT adapter + ONE global provider test
+## Latest phase — M2.2.1: Speech-to-Text panel cleanup (compact control panel + nested STT Settings)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-17.
 
 ### Current stage
 
-M2.2 — **the Speechmatics transcription capability and the provider-test UX
-cleanup.** `speechmatics:standard`, the candidate M2.0 registered as *capability
-only* and M2.1 left unimplemented, is now **executable and selectable** through
-its own batch adapter, and the Speech-to-Text panel no longer carries one Test
-button per candidate: it has **ONE bounded `Test all providers` control** that
-probes every executable candidate in the registry's canonical order and refreshes
-the panel once. Nothing moved back into AI → Settings / Advanced, no model is
-typed by the owner, and **automatic fallback is still NOT implemented.**
+M2.2.1 — a **presentation-only cleanup of AI → Media Analysis → Speech-to-Text**,
+done before live testing. The screen is now a compact control panel instead of a
+page of documentation: the verbose explanatory paragraphs are gone, the candidate
+selection is a deterministic **two-column grid** built from the registry, and the
+two bounded behavioral controls (language, recognition passes) moved one level
+down into a new nested **⚙ STT Settings** panel so they no longer occupy the main
+screen. **Nothing about behavior, persistence, callbacks, adapters, the probe,
+the media boundary or the fallback status changed** — every action id, input id
+and stored key is byte-identical to M2.2.
 
 ```
 AI                                    (ai)
 ├── Media Analysis                    (ai_media)
 │   ├── Text recognition (OCR)        (ai_media_ocr)   — unchanged (no OCR change)
 │   └── Speech-to-Text                (ai_media_stt)
-│       ├── TEST ALL PROVIDERS             → action:ai_stt_test_all            ← M2.2 (ONE global action)
-│       ├── pick a REGISTERED candidate    → action:ai_stt_select_candidate:<candidate-id>
-│       ├── Language…                      → input:ai_media_stt:stt_language
-│       └── Recognition passes…            → input:ai_media_stt:stt_passes
+│       ├── Test all providers             → action:ai_stt_test_all          ← ONE global action (unchanged payload)
+│       ├── two-column candidate grid      → action:ai_stt_select_candidate:<candidate-id>
+│       └── ⚙ STT Settings                 → panel:ai_media_stt_settings     ← NEW navigation row
+│           └── ⚙ STT Settings            (ai_media_stt_settings)            ← NEW nested panel
+│               ├── Language…              → input:ai_media_stt:stt_language
+│               ├── Recognition passes…    → input:ai_media_stt:stt_passes
+│               └── ← Back / ⌂ Home        → panel:_nav:back / panel:_nav:home
 ├── Settings                          (ai_settings)      — still no STT controls
 │   └── Advanced                      (ai_settings_adv)  — still no STT controls
 └── … (provider, model, usage, health, details, diagnostics: unchanged)
@@ -31,19 +35,18 @@ AI                                    (ai)
 
 | Item | Value |
 |---|---|
-| **Phase** | M2.2 — Speechmatics STT adapter + ONE global provider test control |
-| **Starting HEAD** | `9d63766b1630b8e589a1de01d7be120db02d1d90` — `feat(stt): add the Groq Whisper STT adapter, the candidate → engine resolver and the provider test` (== `origin/main`) |
+| **Phase** | M2.2.1 — Speech-to-Text panel UI cleanup (compact panel + nested STT Settings) |
+| **Starting HEAD** | `56762a9a6a27c49f814fa4e3d39efc034b026a29` — `feat(stt): make Speechmatics executable and add one global provider test` (== `origin/main`) |
 | **Implementation commit** | the single commit of this phase (`git log -1 --format=%H` re-verifies it; recorded in the hand-off response) |
-| **Database migration required** | **NO** — no schema change; `ai_config` is untouched (same three STT columns, same defaults, same upsert, same NULL convention) |
-| **New tables / columns** | **NONE** |
-| **New environment variables** | **ONE secret: `AI_SPEECHMATICS_API_KEY`** (`sync: false` in `render.yaml`). No behavioral variable was added — model/language/passes stay Telegram-managed |
-| **New dependencies** | **NONE** — the project's existing `httpx` stack; no Speechmatics client package, no Whisper/PyTorch/ONNX/ffmpeg |
-| **STT execution path** | The **existing** seam (`SttEngine` / `set_stt_engine` / `get_stt_engine` / `stt_available` + `media_service`) is unchanged; the M2.1 **candidate → engine resolver** gained one more provider branch |
-| **Provider adapters added** | **Speechmatics batch transcription ONLY.** The Groq and Gemini routes are untouched |
-| **Automatic fallback** | **NOT implemented** (next phase) |
+| **Database migration required** | **NO** — no schema change, no column, no table |
+| **New environment variables** | **NONE** |
+| **New dependencies** | **NONE** (`requirements.txt` untouched) |
+| **Files changed** | **four** — `backend/bot/handlers/ai_stt_settings.py`, `tests/test_ai_stt_settings.py`, `tests/test_stt_provider_probe.py`, this report |
+| **Behavioral changes** | **NONE** — presentation/navigation only; every callback and input payload is unchanged |
+| **Fallback / health manager** | **NOT implemented** (next phase, unchanged) |
 | **Live Telegram verification** | **NOT PERFORMED** (no session or traffic in this environment) |
-| **Live provider verification** | **NOT PERFORMED** — neither `AI_GROQ_API_KEY` nor `AI_SPEECHMATICS_API_KEY` exists in this implementation environment, so no request was made and no provider is claimed healthy or reachable |
-| **Recognition-quality claim** | **NONE** — a passing capability probe is a transport/credential/response-path fact, never a claim that Persian recognition is good |
+| **Live provider verification** | **NOT PERFORMED** — neither `AI_GROQ_API_KEY` nor `AI_SPEECHMATICS_API_KEY` exists in this implementation environment; no provider is claimed healthy |
+| **Recognition-quality claim** | **NONE** |
 
 ### Commit lineage
 
@@ -53,72 +56,48 @@ AI                                    (ai)
 | (M1.8 commit) | M1.8 — the owner-managed Gemini STT settings (`stt_model` / `stt_language` / `stt_passes`) and their runtime application |
 | `4a1f9a2` `added web investigation report file` | the web research report |
 | `8d3ba14` `feat(stt): establish the Speech-to-Text control plane and the Media Analysis surface` | M2.0 — the control plane |
-| `9d63766` `feat(stt): add the Groq Whisper STT adapter, … and the provider test` | M2.1 — the Groq adapter, the resolver, the per-candidate probe (**starting HEAD of this phase**) |
-| the commit of this phase | M2.2 — the Speechmatics adapter, the ONE global provider test, the secret declaration and this report |
+| `9d63766` `feat(stt): add the Groq Whisper STT adapter, … and the provider test` | M2.1 — the Groq adapter, the resolver, the provider probe |
+| `56762a9` `feat(stt): make Speechmatics executable and add one global provider test` | M2.2 — the Speechmatics adapter, the ONE global provider test, the secret declaration (**starting HEAD of this phase**) |
+| the commit of this phase | M2.2.1 — the compact Speech-to-Text panel, the two-column candidate grid, the nested STT Settings panel and this report |
 
 ### Files changed by this phase
 
 | File | Change |
 |---|---|
-| `backend/services/speechmatics_stt_engine.py` **(new)** | the Speechmatics batch transcription adapter: one synchronous `SttEngine` (`SpeechmaticsBatchEngine`) that creates a job, waits for it under ONE deadline and fetches the plain-text transcript, plus the closed failure-class taxonomy |
-| `backend/services/stt_engine_factory.py` | one more provider branch in the resolver, and the apply path is now ONE provider-agnostic `_apply_adapter` (the resolver is the only place an engine is built) |
-| `backend/ai/stt_control_plane.py` | `speechmatics:standard` flips `implemented=False → True` with an updated note. **Registry order, identity and storage semantics unchanged** |
-| `backend/ai/stt_provider_probe.py` | now **provider-agnostic**: it no longer imports a provider module; the bounded failure class is read off the raised failure and the missing-credential reason comes from the resolver |
-| `backend/bot/handlers/ai_stt_settings.py` | the per-candidate Test buttons are gone; ONE `Test all providers` row sits above the candidate rows; one bounded multi-candidate notice replaces the per-provider message; the panel text states plainly that this is a synthetic-tone capability probe |
-| `render.yaml` | `AI_SPEECHMATICS_API_KEY` declared with `sync: false` (the only configuration change) |
-| `tests/test_speechmatics_stt_engine.py` **(new)** | 92 tests for the adapter (endpoint, auth, multipart, job cycle, language, classification, bounds, retries, ceiling, isolation, secret hygiene) |
-| `tests/test_stt_provider_probe.py` | the global-test UI/probe coverage, the Speechmatics resolver coverage and two opt-in live probes |
-| `tests/test_ai_stt_settings.py` | every registered candidate is selectable; the unimplemented-candidate guards are covered through a forged capability; the registration assertion covers the new action |
+| `backend/bot/handlers/ai_stt_settings.py` | the Speech-to-Text screen became a compact control panel; the candidate buttons are laid out in two columns; language/passes moved into the new `ai_media_stt_settings` panel; the long explanatory paragraphs were replaced by one short hint line |
+| `tests/test_ai_stt_settings.py` | the new UI contract: one global test action, two-column grid + registry order, no settings control on the main screen, the nested panel and its values, unchanged payloads, secret/metadata hygiene, the new panel registration and Back navigation |
+| `tests/test_stt_provider_probe.py` | updated to the shortened labels (via the handler's own button builder) and the shortened panel hint; the result notice still states it does not measure quality |
 | `IMPLEMENTATION_REPORT.md` | this report |
 
-**Untouched (deliberately):** `backend/services/media_service.py` (the seam, every
-bound and the whole execution path), `backend/services/groq_stt_engine.py`,
-`backend/services/gemini_media_engine.py`, `backend/services/stt_consensus.py`
-(reused as-is), `backend/ai/providers/**` (including `groq.py`,
-`openai_compat.py` and `factory.py`), `backend/ai/providers/manager/**`,
-`backend/ai/engine/dispatcher.py`, the tool layer, `backend/ai/media.py`,
-`backend/telegram_api/media.py`, `backend/ai/config_store.py`, the OCR path,
-`backend/bot/handlers/ai.py`, the panel/input/action infrastructure,
-Save / Tasks / scheduler / `RuntimeSupervisor`, `requirements.txt`, `Procfile`,
-`supabase/migrations/*.sql`, `DATABASE_ARCHITECTURE.md`, ENV files and all
-secrets.
+**Untouched (deliberately):** every provider adapter (`groq_stt_engine.py`,
+`speechmatics_stt_engine.py`, `gemini_media_engine.py`), `stt_engine_factory.py`,
+`stt_control_plane.py`, `stt_provider_probe.py`, `media_service.py`,
+`stt_consensus.py`, `config_store.py`, `backend/bot/handlers/ai.py`,
+`backend/helper/**` (the shared panel/input/action registry and its navigation
+stack are reused as-is), the provider/manager/dispatcher/tool layer, OCR,
+Save / Tasks / scheduler / `RuntimeSupervisor`, `render.yaml`, `requirements.txt`,
+`supabase/migrations/*.sql`, `DATABASE_ARCHITECTURE.md` and all secrets.
 
-### Speechmatics API integration summary
+### The Speech-to-Text screen after this phase
 
-| Aspect | Decision |
+| Aspect | Behavior |
 |---|---|
-| **API** | the official **batch v2 REST API** (`https://asr.api.speechmatics.com/v2`), verified against the published API reference and the vendor's own client source. Speechmatics transcribes **asynchronously**, so one recognition is a bounded job cycle: `POST /v2/jobs` → `GET /v2/jobs/{id}` until `done` → `GET /v2/jobs/{id}/transcript?format=txt`. No WebSocket, no management platform, no temporary-token exchange |
-| **Authorization** | `Authorization: Bearer <API key>` on every leg. Never logged, never persisted, never placed in Telegram/Supabase; a provider error body is redacted before it can surface |
-| **Request** | `multipart/form-data`: the `config` part is the documented JSON (`{"type":"transcription","transcription_config":{"language":…,"operating_point":…}}`) and the audio is the `data_file` part under a **static, non-identifying** name (`audio.ogg` / `audio.wav` / `audio.flac`), so an untrusted Telegram filename can never leak. No diarization and no extra output are requested — the recognition control variables |
-| **Model mapping** | the registered candidate model IS the API's `operating_point` (`standard`), through an explicit table so an unregistered value can never reach the API |
-| **Credential** | `AI_SPEECHMATICS_API_KEY` — the ONE declared secret. No compatibility alias was invented: the repository has no existing Speechmatics credential convention (`backend/ai/providers/factory.py` declares none), so a second variable would have been a fabricated convention |
-| **Audio input contract** | unchanged: the adapter receives the already-bounded, already-validated payload bytes from `media_service` (resolution, transfer, size/duration/channel/rate/MIME validation, cleanup and normalization all stay there). OGG/Opus, WAV and FLAC — the containers the batch API documents **and** the boundary corroborates — are accepted; anything else is refused locally before any request. The boundary's accepted list was not broadened, no second download path and no second Telegram boundary were added |
-| **Language** | an explicit BCP-47 tag is reduced to the ISO-639-1 primary subtag the API documents (`fa-IR` → `fa`); empty means **automatic detection**, which this API spells with its own `language: "auto"` token — never a fabricated code. Nothing is translated, transliterated or forced to English; a Persian transcript returns in Persian script |
-| **Recognition passes** | the owner's bounded count (`1..3`) reuses the **existing** STT-only consensus (`stt_consensus.reconcile_hypotheses`): sequential passes over the same audio, each one full job cycle, under ONE deadline. A pass is a recognition attempt, never a transport retry, and a deterministic failure stops the loop |
-| **Bounds** | one engine operation deadline of **45 s**, inside the boundary's own `STT_TIMEOUT_S` (60 s) so the engine's precise reason always wins; connect/write/pool bounds derived from what is **left** of the deadline and re-derived for every leg; a bounded status poll; at most **2** sequential attempts and only for transient conditions |
-| **Output ceiling** | `media_service.MAX_STT_CHARS` is applied in the adapter, so the engine can never return more text than the boundary would keep. Empty or unreadable provider output is a **failure**, never a successful empty transcription |
+| **State block** | `Active · <candidate>` / `Language · <language or Auto>` / `Passes · <N>`, then a numbered `Providers` list where each entry carries its own probe state and the active candidate is marked `· active`. Four lines of state, no prose |
+| **One short hint** | a single italic line: `Test all = synthetic capability probe, not a quality benchmark.` — the full warning is repeated in the test result notice, so the short panel never implies a quality measurement. On the whole main screen there is at most ONE italic line and no line exceeds 80 characters (`test_the_stt_panel_is_compact` fails otherwise) |
+| **Candidate grid** | deterministic two-column rows built from the candidate list in canonical registry order — a changed registry re-flows the rows with no hard-coded wrapping and never leaves a hole (only the final row may be short). Buttons are presentation-shortened (`Use Gemini` / `Use Gemini Transcribe` / `Use Groq v3` / `Use Groq Turbo` / `Use Speechmatics`) through a display-only label map whose **fallback is the registry label**, so a newly registered candidate is still offered without touching the table. The callback payload is the registered candidate id and is **never derived from the button text** |
+| **Selection semantics** | unchanged — the active candidate gets no `Use` button, an unimplemented candidate gets none either, and a legacy/unresolved selection offers the whole implemented pool |
+| **Global test** | exactly ONE `Test all providers` row, above the candidate rows, payload `action:ai_stt_test_all`, delegating to the existing `stt_provider_probe.test_candidates()` (no second loop in the handler), re-rendering the same panel **once** with one bounded line per candidate |
+| **Nested settings** | `⚙ STT Settings` (`panel:ai_media_stt_settings`, parent `ai_media_stt`) holds `Language…` and `Recognition passes…` — the **same** registered inputs (`input:ai_media_stt:stt_language`, `input:ai_media_stt:stt_passes`), the same prompts, validation, storage keys and runtime application. It shows the current values compactly and reaches them through the shared navigation stack, so Back returns to Speech-to-Text and Home to the usual destination — no second navigation system |
+| **Real states preserved** | a failed database read, an unresolved legacy model and a registered-but-unavailable active candidate are all still rendered (they are runtime facts, not documentation); no error was hidden for visual cleanliness |
+| **No secrets / no metadata** | no label, body line or button names an environment variable, a credential, a transcript or a Telegram identifier (asserted by test) |
 
-### Failure classification
+### Carried forward: the STT control plane as it stands (M2.0 → M2.2, unchanged by this phase)
 
-One closed token per failure SITE, attached to the raised `MediaError` and emitted
-as the `failure_class` field of the adapter's own bounded trace line (with the
-socket phase or HTTP status when one applies). The vocabulary is the same one the
-Groq adapter already uses — `missing_credential`, `unsupported_model`, `auth`,
-`forbidden`, `invalid_request`, `unsupported_audio`, `timeout`, `transport`,
-`rate_limit`, `server`, `malformed_response`, `empty_transcription`,
-`provider_rejection`, `operation_deadline` — so the provider probe reports the
-same tokens whichever adapter failed.
+The sections below describe the **current** operating architecture. This phase
+changed none of it; they are kept here because they are the live contract behind
+the panels above.
 
-Deterministic failures (a rejected credential or key, a refused payload or config,
-an unreadable body, an empty transcript, a rejected/failed job) are **never**
-re-sent. Transient ones (`timeout`, `transport`, `429`, `>= 500`) may repeat the
-**submit** leg at most once while the deadline has room; a transient failure while
-**waiting** for an already-submitted job only repeats the status read (at most
-three consecutive times) and then fails — it never submits a second job, so a
-retry can never silently double the translation work. Recognition quality is never
-reclassified: a poor transcript is a successful provider response.
-
-### Global "Test all providers" behavior
+#### Global "Test all providers" behavior
 
 | Aspect | Behavior |
 |---|---|
@@ -132,9 +111,9 @@ reclassified: a poor transcript is a successful provider response.
 | **Persistence** | none — process-local observations only; no `ai_config` write, no new column, no new table, and a restart returns every candidate to `not tested` |
 | **Ordering determinism** | the registry order is a tuple literal, so the probe order is identical on every process |
 
-### Real replied-to audio for the probe — investigated, deliberately NOT added
+#### Real replied-to audio for the probe — investigated, deliberately NOT added
 
-The task asked whether the existing architecture can safely feed a **real**
+The earlier task asked whether the existing architecture can safely feed a **real**
 replied-to Voice/Audio message into the same bounded probe. It cannot, and no
 mechanism was invented to force it:
 
@@ -144,7 +123,7 @@ mechanism was invented to force it:
 * the only place a reply is available is the **pending-input** path, whose
   handlers receive the owner's *typed text*, not the replied-to media object;
   deriving audio from it would mean adding a new Telegram-context mechanism —
-  exactly what this phase was told not to do.
+  exactly what that phase was told not to do.
 
 So the global provider test remains a **bounded capability/transport probe**, it
 says so on the panel and in its result, and **real Persian recognition
@@ -152,7 +131,42 @@ benchmarking remains a separate next step** (see Deferred work). The probe API
 already accepts explicit `audio=` bytes, so that step can be built without
 touching the adapters.
 
-### Current provider candidate states
+#### Speechmatics API integration summary
+
+| Aspect | Decision |
+|---|---|
+| **API** | the official **batch v2 REST API** (`https://asr.api.speechmatics.com/v2`), verified against the published API reference and the vendor's own client source. Speechmatics transcribes **asynchronously**, so one recognition is a bounded job cycle: `POST /v2/jobs` → `GET /v2/jobs/{id}` until `done` → `GET /v2/jobs/{id}/transcript?format=txt`. No WebSocket, no management platform, no temporary-token exchange |
+| **Authorization** | `Authorization: Bearer <API key>` on every leg. Never logged, never persisted, never placed in Telegram/Supabase; a provider error body is redacted before it can surface |
+| **Request** | `multipart/form-data`: the `config` part is the documented JSON (`{"type":"transcription","transcription_config":{"language":…,"operating_point":…}}`) and the audio is the `data_file` part under a **static, non-identifying** name (`audio.ogg` / `audio.wav` / `audio.flac`), so an untrusted Telegram filename can never leak. No diarization and no extra output are requested |
+| **Model mapping** | the registered candidate model IS the API's `operating_point` (`standard`), through an explicit table so an unregistered value can never reach the API |
+| **Credential** | `AI_SPEECHMATICS_API_KEY` — the ONE declared secret. No compatibility alias was invented: the repository has no existing Speechmatics credential convention, so a second variable would have been a fabricated convention |
+| **Audio input contract** | unchanged: the adapter receives the already-bounded, already-validated payload bytes from `media_service` (resolution, transfer, size/duration/channel/rate/MIME validation, cleanup and normalization all stay there). OGG/Opus, WAV and FLAC are accepted; anything else is refused locally before any request |
+| **Language** | an explicit BCP-47 tag is reduced to the ISO-639-1 primary subtag the API documents (`fa-IR` → `fa`); empty means **automatic detection**, which this API spells with its own `language: "auto"` token — never a fabricated code. Nothing is translated, transliterated or forced to English; a Persian transcript returns in Persian script |
+| **Recognition passes** | the owner's bounded count (`1..3`) reuses the **existing** STT-only consensus (`stt_consensus.reconcile_hypotheses`): sequential passes over the same audio, each one full job cycle, under ONE deadline. A pass is a recognition attempt, never a transport retry |
+| **Bounds** | one engine operation deadline of **45 s**, inside the boundary's own `STT_TIMEOUT_S` (60 s) so the engine's precise reason always wins; connect/write/pool bounds derived from what is **left** of the deadline and re-derived for every leg; a bounded status poll; at most **2** sequential attempts and only for transient conditions |
+| **Output ceiling** | `media_service.MAX_STT_CHARS` is applied in the adapter. Empty or unreadable provider output is a **failure**, never a successful empty transcription |
+
+#### Failure classification
+
+One closed token per failure SITE, attached to the raised `MediaError` and emitted
+as the `failure_class` field of the adapter's own bounded trace line (with the
+socket phase or HTTP status when one applies). The vocabulary is shared by both
+adapters — `missing_credential`, `unsupported_model`, `auth`, `forbidden`,
+`invalid_request`, `unsupported_audio`, `timeout`, `transport`, `rate_limit`,
+`server`, `malformed_response`, `empty_transcription`, `provider_rejection`,
+`operation_deadline` — so the provider probe reports the same tokens whichever
+adapter failed.
+
+Deterministic failures (a rejected credential or key, a refused payload or config,
+an unreadable body, an empty transcript, a rejected/failed job) are **never**
+re-sent. Transient ones (`timeout`, `transport`, `429`, `>= 500`) may repeat the
+**submit** leg at most once while the deadline has room; a transient failure while
+**waiting** for an already-submitted job only repeats the status read (at most
+three consecutive times) and then fails — it never submits a second job, so a retry
+can never silently double the translation work. Recognition quality is never
+reclassified: a poor transcript is a successful provider response.
+
+#### Current provider candidate states
 
 | Candidate id | Provider | Execution | Credential | Test state |
 |---|---|---|---|---|
@@ -160,16 +174,16 @@ touching the adapters.
 | `gemini:gemini-3.5-transcribe` | gemini | implemented (unchanged) | `AI_GEMINI_API_KEY` | not tested until probed |
 | `groq:whisper-large-v3` | groq | implemented (M2.1) | `AI_GROQ_API_KEY` (→ `GROQ_API_KEY`) | not tested until probed |
 | `groq:whisper-large-v3-turbo` | groq | implemented (M2.1) | `AI_GROQ_API_KEY` (→ `GROQ_API_KEY`) | not tested until probed |
-| `speechmatics:standard` | speechmatics | **implemented (M2.2)** | **`AI_SPEECHMATICS_API_KEY`** | not tested until probed |
+| `speechmatics:standard` | speechmatics | implemented (M2.2) | `AI_SPEECHMATICS_API_KEY` | not tested until probed |
 
-Every registered candidate is now selectable and testable. **An adapter existing
-is not a health claim**: only a completed request that returned a non-empty
+Every registered candidate is selectable and testable. **An adapter existing is
+not a health claim**: only a completed request that returned a non-empty
 transcript is reported as passed, and none has been run here.
 
-### Resulting architecture
+#### Resulting architecture
 
 ```
-Telegram UI (AI → Media Analysis → Speech-to-Text)
+Telegram UI (AI → Media Analysis → Speech-to-Text → ⚙ STT Settings)
     ↓  a registered candidate id + language + passes
 persisted owner configuration  (existing ai_config row, existing 3 keys)
     ↓
@@ -193,9 +207,9 @@ takes `bytes` and nothing else, and each engine holds no such state).
 it cannot run the boundary stays fail-closed rather than silently transcribing
 with a different model.
 
-### Configuration / ENV behavior
+#### Configuration / ENV behavior
 
-* ENV holds **secrets only**. `AI_SPEECHMATICS_API_KEY` was added to `render.yaml`
+* ENV holds **secrets only**. `AI_SPEECHMATICS_API_KEY` is declared in `render.yaml`
   with `sync: false`; `AI_GROQ_API_KEY` (already declared) is reused, never
   duplicated.
 * No behavioral variable exists for either transcription provider — no
@@ -209,63 +223,50 @@ with a different model.
 
 | Suite | Result |
 |---|---|
-| `tests/test_speechmatics_stt_engine.py` (new) | **`92 passed`** |
-| `tests/test_stt_provider_probe.py` (extended) | **`56 passed, 2 skipped`** (the skips are the two opt-in live probes — no credential here) |
-| `tests/test_ai_stt_settings.py` (extended) | **`90 passed`** |
+| `tests/test_ai_stt_settings.py` (extended) | **`100 passed`** |
+| `tests/test_stt_provider_probe.py` (updated) | **`57 passed, 2 skipped`** (the skips are the two opt-in live probes — no credential here) |
 | `tests/test_groq_stt_engine.py` (unchanged, re-run) | **`90 passed`** |
+| `tests/test_speechmatics_stt_engine.py` (unchanged, re-run) | **`92 passed`** |
 | `tests/test_36_ai_settings_ux.py` (unchanged, re-run) | **`9 passed`** |
 | the media / STT boundary suites (`test_media_stt.py`, `test_media_dedicated_stt.py`, `test_media_stt_reliability.py`, `test_media_stt_multipass.py`, `test_media_stt_language.py`, `test_media_stt_benchmark.py`, `test_stt_consensus.py`, `test_media_gemini_engine.py`, `test_media_ai_integration.py`, `test_media_direct_stt.py`, `test_media_processing.py`) | **`559 passed`** — the boundary's behavior is unchanged |
-| **Full suite** | **`3841 passed, 26 skipped, 3 warnings` in 111.89 s** (`24` of the skips are pre-existing; the other `2` are the opt-in live provider probes, Groq and Speechmatics. No test was deleted or weakened) |
+| **Full suite** | **`3852 passed, 26 skipped, 3 warnings` in 112.56 s** (`24` of the skips are pre-existing; the other `2` are the opt-in live provider probes. No test was deleted or weakened) |
 
-The new/updated coverage includes: the adapter's model list equalling the
-registered Speechmatics candidates; an unregistered model refused; a missing
-credential reported without a request; the credential variable being the ONE
-declared name; no behavioral ENV variable; the documented batch base URL and
-`POST /jobs`; the bearer header; multipart `config` + `data_file` and the static
-remote filename; the config shape (type / language / operating_point, and nothing
-else); the audio containers recognised and an undocumented one refused locally
-without a request; empty input; `fa-IR` → `fa` and automatic → the provider's own
-`auto`; create → poll → transcript with `format=txt`; running-until-done polling;
-a rejected/failed job; an empty transcript as a failure; malformed create/status
-bodies; the transcript ceiling; every HTTP classification (401/403/404/422/429/5xx
-and the three 400 families); the timeout phase; transport failures on every leg;
-the bounded submit retry versus a deterministic failure; the bounded status
-re-reads that never re-submit the job; the operation deadline (including "spent
-deadline starts no request" and a per-leg derived timeout); passes defaulting to
-one and one job per pass; the engine holding no Telegram state; no Telegram
-identifier in any request; the credential and the transcript never logged; an
-error body unable to echo the key; no chat-completion surface and no provider
-module imported; no Speechmatics client dependency; the resolver building the
-Speechmatics engine only from a registered candidate; a missing credential failing
-closed with **no** Gemini/Groq substitution (and the reverse directions);
-the probe being provider-agnostic; the global action delegating to the probe's own
-multi-candidate run in registry order with one result per candidate; unimplemented
-candidates never requested; credential presence still not a pass; exactly one
-`Test all providers` button and no per-candidate Test buttons; the button sitting
-above the candidate rows; the active candidate having no `Use` button and the
-others having one; an unimplemented candidate having no button at all; and the
-notice never carrying a credential or a transcript.
+New/updated coverage added by this phase: exactly one global test action and no
+per-candidate Test button; the two-column candidate grid with the registry's
+canonical order preserved and no hole except the last row; the active candidate
+still absent from the grid and unimplemented candidates still excluded; the
+shortened labels (the full candidate set is still offered); **no** settings
+control on the main screen while the values stay visible; the `⚙ STT Settings`
+navigation row; the nested panel's own title, current values, the two existing
+input payloads and Back/Home rows; every callback and input payload unchanged;
+Back from STT Settings landing back on Speech-to-Text through the shared
+navigation stack; the new panel registered with parent `ai_media_stt`; the main
+body staying under 500 characters with ≤ 80-character lines and at most one
+italic line; the unavailable-active-candidate warning still rendering on the
+compact screen (through a forged control plane, since every registered
+capability currently executes); and no credential, transcript, Telegram
+identifier or environment variable name appearing anywhere in either panel's
+text or buttons.
 
-**Syntax / whitespace:** `python -m py_compile` clean on every changed and new
-Python file; `git diff --check` clean.
+**Syntax / whitespace:** `python -m py_compile` clean on every changed Python
+file; `git diff --check` clean.
 
 ### Live verification status
 
-* **Telegram:** NOT performed — the panels, buttons, actions and notices were
-  exercised against the real handlers, the real registries and the real panel
-  builders, but no Telegram session rendered them.
-* **Groq API:** NOT performed — no `AI_GROQ_API_KEY` in this environment.
-* **Speechmatics API:** NOT performed — no `AI_SPEECHMATICS_API_KEY` in this
+* **Telegram:** NOT performed — the panels, grid, nested settings panel and
+  navigation were exercised against the real handlers, the real registries and
+  the real panel builders, but no Telegram session rendered them.
+* **Groq API / Speechmatics API:** NOT performed — no credential in this
   environment, so no request was made and no reachability is claimed. The opt-in
   live test (`tests/test_stt_provider_probe.py`, skipped without a credential) is
   the safe path for an operator who has one: it uses the bounded probe payload,
   reports only state/model/elapsed/failure class, never prints or persists the
   key, and never treats a synthetic tone as proof of recognition quality.
 
-Speechmatics is **not** claimed healthy merely because the adapter exists, and no
+No provider is claimed healthy merely because an adapter exists, and no
 recognition-quality improvement is claimed because a provider answered.
 
-### Intentionally NOT implemented in this phase
+### Intentionally NOT implemented
 
 * **Automatic fallback / failover / cooldown / retry orchestration across
   providers** — the control plane can represent the ordered pool, the resolver
@@ -277,12 +278,14 @@ recognition-quality improvement is claimed because a provider answered.
 * **Real Persian recognition benchmarking** — the probe payload is a synthetic
   tone and is never presented as a quality benchmark.
 * **A real replied-to audio feed for the probe** (see above) — no new
-  Telegram-context mechanism was invented to force it into this phase.
-* **Any change to recognition quality, the STT consensus logic, OCR, the media
-  boundary's execution behavior, the dispatcher, the tool layer,
-  `ProviderManager`, the scheduler, `RuntimeSupervisor` recovery, the Supabase
-  schema, `DATABASE_ARCHITECTURE.md` or the Render configuration beyond the one
-  secret declaration.**
+  Telegram-context mechanism was invented to force it into this line of work.
+* **Any behavioral change from this phase** — no adapter, resolver, control plane,
+  probe, media boundary, persistence or callback was modified; this phase is
+  presentation and navigation only.
+* **Any change to the dispatcher, the tool layer, `ProviderManager`, the
+  scheduler, `RuntimeSupervisor` recovery, the Supabase schema,
+  `DATABASE_ARCHITECTURE.md`, `render.yaml`, `requirements.txt`, OCR or the media
+  boundary's execution behavior.**
 * **Any new dependency, any local Whisper/PyTorch/ONNX/ffmpeg stack, any second
   media download path or Telegram media boundary, and any behavioral ENV
   variable.**
@@ -306,11 +309,16 @@ recognition-quality improvement is claimed because a provider answered.
    `failed` + `empty_transcription` (or a provider-side no-speech rejection)
    until the probe is run with real-speech audio. This never claims quality and
    never fabricates a transcript.
-6. The M1.8/M2.0 note stands: the `ai_config` STT columns still require the
+6. The candidate button labels are shortened for the two-column grid; they are
+   presentation only and the registry remains the single source of candidate
+   identity. A label map that does not know a newly registered candidate falls
+   back to its registry label, so no candidate can become unselectable because of
+   a label.
+7. The M1.8/M2.0 note stands: the `ai_config` STT columns still require the
    pending manual migration; until it is applied the settings degrade to the
    documented in-memory fallback, and `DATABASE_ARCHITECTURE.md` §7 still
    describes the superseded M1.8 semantics.
-7. Recognition quality (class A) remains unmeasured and is not claimed.
+8. Recognition quality (class A) remains unmeasured and is not claimed.
 
 ### Deferred work
 
@@ -324,28 +332,35 @@ recognition-quality improvement is claimed because a provider answered.
 * Applying the pending `ai_config` migration and the documentation-only
   `DATABASE_ARCHITECTURE.md` §7 semantics refresh.
 
-### Exact next stage — M2.3: real Persian recognition benchmarking
+### Exact next stage — live Telegram verification, then M2.3: real Persian recognition benchmarking
 
-1. Feed **real** Persian voice notes through the SAME bounded probe
+1. Open **AI → Media Analysis → Speech-to-Text** on the live account and confirm
+   the compact panel, the two-column grid, the nested `⚙ STT Settings` panel and
+   its `Language…` / `Recognition passes…` inputs render and persist as expected —
+   this UI cleanup exists to make that walkthrough readable on a phone.
+2. Run `Test all providers` with the deployment credentials in place to learn each
+   candidate's transport/credential state (still not a quality measurement).
+3. Feed **real** Persian voice notes through the SAME bounded probe
    (`stt_provider_probe.test_candidate(..., audio=<bounded bytes>)` already
    accepts explicit audio) and record per-candidate transcripts and timings
    **outside** the repository's deterministic suite.
-2. Decide, on that evidence, which candidates are worth keeping active and in
+4. Decide, on that evidence, which candidates are worth keeping active and in
    which order — the decision the control plane already models but deliberately
    does not act on.
-3. Only after that, the ordered active → cooldown → fallback execution in front
+5. Only after that, the ordered active → cooldown → fallback execution in front
    of the existing `media_service.set_stt_engine` seam (never a second STT
-   pipeline), consuming this phase's resolver and failure taxonomy.
+   pipeline), consuming the resolver and failure taxonomy already in place.
 
 ### Document version
 
-This document reflects the M2.2 state: Speech-to-Text is configured under
-**AI → Media Analysis** by picking a REGISTERED candidate; all five registered
-candidates (Gemini ×2, Groq Whisper ×2, Speechmatics ×1) are executable, and all
-are testable through **ONE** bounded `Test all providers` control that reports
-each candidate's own state without ever claiming health or recognition quality;
-the candidate → engine resolution is one small seam in front of the **unchanged**
-`media_service` STT boundary; the only configuration change is the
-`AI_SPEECHMATICS_API_KEY` deployment secret; **automatic fallback and real Persian
-quality benchmarking are deferred to the next phases.** If code changes
-invalidate any section, update this document in the same commit.
+This document reflects the M2.2.1 state: Speech-to-Text lives under
+**AI → Media Analysis** as a compact control panel — one global `Test all
+providers` action, a deterministic two-column grid of REGISTERED candidates, and
+a nested **⚙ STT Settings** panel holding only the bounded language and
+recognition-pass controls. All five registered candidates (Gemini ×2, Groq
+Whisper ×2, Speechmatics ×1) remain executable and testable through the ONE
+bounded probe that never claims health or recognition quality; the candidate →
+engine resolution is one small seam in front of the **unchanged**
+`media_service` STT boundary; and **automatic fallback and real Persian quality
+benchmarking are still deferred.** If code changes invalidate any section, update
+this document in the same commit.

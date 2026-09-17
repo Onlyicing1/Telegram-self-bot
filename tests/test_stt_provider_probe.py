@@ -711,10 +711,7 @@ async def test_the_active_candidate_gets_no_use_button_and_others_do():
     for candidate in stt_control_plane.all_candidates():
         if not candidate.implemented:
             continue
-        present = (
-            f"Use {candidate.label}",
-            f"action:ai_stt_select_candidate:{candidate.candidate_id}",
-        ) in flat
+        present = module._candidate_button(candidate) in flat
         assert present is (candidate.candidate_id != active)
 
 
@@ -756,8 +753,24 @@ async def test_the_panel_never_implies_that_the_probe_measures_quality():
 
     body, _buttons = await module._media_stt_body_and_buttons(dict(_BASE_CONFIG))
 
-    assert "not a recognition-quality benchmark" in body
-    assert "synthetic" in body
+    assert "synthetic capability probe" in body
+    assert "not a quality benchmark" in body
+
+
+@pytest.mark.asyncio
+async def test_the_test_result_notice_states_it_does_not_measure_quality():
+    """The short panel hint is backed by the explicit statement in the result."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    notice = module.test_all_notice([
+        stt_provider_probe.SttTestResult(
+            candidate_id="groq:whisper-large-v3", provider="groq",
+            model="whisper-large-v3", state=stt_provider_probe.SttTestState.PASSED.value,
+            latency_ms=9, transcript_chars=12, tested_at="now",
+        )
+    ])
+
+    assert "does not measure recognition quality" in notice
 
 
 @pytest.mark.asyncio
