@@ -1155,6 +1155,7 @@ def test_the_engine_still_exposes_the_two_existing_seams():
     assert not inspect.iscoroutinefunction(engine.recognize)
     assert set(engine.__slots__) == {
         "_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language",
+        "_stt_passes",
     }
 
 

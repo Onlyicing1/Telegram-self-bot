@@ -60,6 +60,25 @@ socket phase can outlive the operation. A spent budget raises its OWN explicit
 deadline failure instead of silently degrading into a near-zero HTTP timeout —
 which is what the previous per-socket-phase bound did.
 
+Bounded multi-pass recognition (the accuracy seam, OFF by default). The
+recognition-quality class (``INVESTIGATION.md`` §19) is addressed by exactly ONE
+opt-in mechanism: ``AI_GEMINI_STT_PASSES``. Unset — or ``1`` — keeps the
+single-pass behaviour above, byte-identical, so no installation changes without
+asking. With ``2`` or ``3``, ``transcribe`` performs that many SEQUENTIAL
+recognition passes over the SAME audio under the SAME operation deadline (the
+audio is uploaded ONCE and every pass references that one uploaded file) and
+reconciles the hypotheses with the pure STT-only consensus in
+``backend/services/stt_consensus.py``.
+
+A pass is a RECOGNITION attempt and never a transport retry: it is counted only
+when it actually returned a transcript, a deterministic failure stops the pass
+loop outright instead of being re-sent, and a transient one simply contributes no
+hypothesis. The loop is bounded by the configured count AND by the deadline (a
+pass starts only with budget left), so no configuration can exceed the deadline
+or issue more requests than the configured number of passes. The two concepts
+stay separate in the code and in the traces: ``attempts`` counts provider
+requests, ``passes``/``hypotheses`` count recognition results.
+
 The dedicated transcription route sends the audio representation the official
 documentation shows for its model (the Files API ``uri`` form). The documented
 inline ``data`` form is used only as ONE bounded fallback when the FIRST attempt
@@ -88,6 +107,7 @@ import httpx
 from backend.ai.providers.base.defaults import resolve_model
 from backend.services import media_service
 from backend.services.media_service import MediaError
+from backend.services.stt_consensus import reconcile_hypotheses
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +310,24 @@ STT_MIN_ATTEMPT_S = 8.0
 #: flight at a time.
 STT_MAX_ATTEMPTS = 2
 
+#: ── Bounded multi-pass recognition (the accuracy seam, OFF by default) ──
+#:
+#: The configured number of SEQUENTIAL recognition passes over the SAME audio,
+#: reconciled by the pure STT-only consensus
+#: (``backend/services/stt_consensus.py``). Unset — and therefore the default — is
+#: ONE pass: exactly the single-pass behaviour above, byte for byte.
+#:
+#: ``3`` is the only other count that can resolve anything, and that is a
+#: property of the consensus rule rather than tuning: a two-hypothesis
+#: disagreement is a 1-1 tie, and a tie resolves to the first pass, so two passes
+#: spend a second model call to change nothing. ``2`` is nevertheless accepted,
+#: because the repeat-run consistency measurement of the benchmark needs to be
+#: able to run exactly two passes. The ceiling is ``3`` because every pass is a
+#: full model call: a three-pass run that cannot fit the deadline yields fewer
+#: hypotheses and the operation still succeeds honestly.
+STT_PASSES_ENV_VAR = "AI_GEMINI_STT_PASSES"
+STT_MAX_PASSES = 3
+
 #: Finite output ceiling per request. The boundary caps characters at
 #: ``MAX_OCR_CHARS`` / ``MAX_STT_CHARS`` (16 000 ≈ 4 000–8 000 tokens), so this is
 #: generous enough never to be the binding limit for text the project would keep,
@@ -423,6 +461,26 @@ def stt_instruction(language_code: str = "") -> str:
         + f"\nThe spoken language is identified by the BCP-47 code {code};"
         " transcribe it in that language and in its own writing system."
     )
+
+
+def resolve_stt_passes() -> tuple[int, str]:
+    """``(passes, env_var_name)`` for STT; ``(1, "")`` means the single-pass route.
+
+    Unset — the default — is ONE pass, i.e. exactly the existing behaviour. A
+    value below ``1`` or above :data:`STT_MAX_PASSES` is clamped instead of
+    trusted, and a value that is not an integer falls back to one pass with a
+    bounded warning (the value itself is never logged), so a typo in ENV can
+    neither fail startup nor create an unbounded number of model calls.
+    """
+    raw = (os.getenv(STT_PASSES_ENV_VAR) or "").strip()
+    if not raw:
+        return 1, ""
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("GEMINI_MEDIA_ENGINE_STT_PASSES_INVALID reason=not-an-integer")
+        return 1, STT_PASSES_ENV_VAR
+    return max(1, min(value, STT_MAX_PASSES)), STT_PASSES_ENV_VAR
 
 
 #: The smallest budget a leg may START with. Below it the operation is reported
@@ -587,7 +645,10 @@ class GeminiMediaEngine:
     one is a deployment decision that cannot alter the media contract.
     """
 
-    __slots__ = ("_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language")
+    __slots__ = (
+        "_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language",
+        "_stt_passes",
+    )
 
     def __init__(
         self,
@@ -597,6 +658,7 @@ class GeminiMediaEngine:
         key_env_var: str = "",
         stt_model: str = "",
         stt_language: str = "",
+        stt_passes: int | None = None,
     ) -> None:
         self._api_key = str(api_key or "").strip()
         self._model = str(model or "").strip() or DEFAULT_MEDIA_MODEL
@@ -605,6 +667,18 @@ class GeminiMediaEngine:
         self._stt_model = str(stt_model or "").strip()
         #: Empty means automatic language detection; a BCP-47 code pins it.
         self._stt_language = str(stt_language or "").strip()
+        #: ``None`` means the caller stated no pass count, so the deployment's own
+        #: ``AI_GEMINI_STT_PASSES`` decides; with that unset the value is ``1`` and
+        #: the engine keeps the single-pass route EXACTLY as before. Clamped to the
+        #: hard ceiling, so neither a caller nor a stale env value can create an
+        #: unbounded number of model calls.
+        if stt_passes is None:
+            stt_passes, _passes_env_var = resolve_stt_passes()
+        try:
+            passes = int(stt_passes)
+        except (TypeError, ValueError):  # pragma: no cover - resolve_stt_passes guards it
+            passes = 1
+        self._stt_passes = max(1, min(passes, STT_MAX_PASSES))
 
     @property
     def model(self) -> str:
@@ -620,6 +694,11 @@ class GeminiMediaEngine:
     def stt_language(self) -> str:
         """The configured BCP-47 language code, or ``""`` for automatic."""
         return self._stt_language
+
+    @property
+    def stt_passes(self) -> int:
+        """The configured number of recognition passes (``1`` = single pass)."""
+        return self._stt_passes
 
     @property
     def stt_transport(self) -> str:
@@ -658,7 +737,14 @@ class GeminiMediaEngine:
         comparison uninterpretable). Within one route, the bounded retry/
         fallback documented at :data:`STT_MAX_ATTEMPTS` may instead repeat the
         same request or switch the audio REPRESENTATION.
+
+        With :data:`STT_PASSES_ENV_VAR` configured above one, the SAME audio is
+        recognised that many times instead (:meth:`_run_consensus`) and the
+        hypotheses are reconciled by the STT-only consensus — the accuracy seam,
+        which is off unless it is explicitly asked for.
         """
+        if self._stt_passes > 1:
+            return self._run_consensus(audio)
         if self._stt_model:
             return self._run_dedicated_transcription(audio)
         return self._run(
@@ -689,22 +775,24 @@ class GeminiMediaEngine:
         It carries exactly what the recognition experiment and a live incident
         need (engine, model, API surface, container MIME, payload size, language
         mode, transcription mode, elapsed time, output LENGTH, success/failure,
-        the operation deadline, how many provider attempts were spent, and the
-        failure CLASS with its socket phase or HTTP status) and never the
+        the operation deadline, how many provider attempts were spent, the
+        configured recognition PASS count (so a multi-pass deployment is visible
+        on every line) and the failure CLASS with its socket phase or HTTP status)
+        and never the
         transcript, the raw audio, the credential, a Telegram id, a filename or a
         caption.
         """
         logger.info(
             "GEMINI_MEDIA_ENGINE kind=%s engine=%s model=%s transport=%s mime=%s "
             "bytes=%d language=%s mode=%s chars=%d elapsed_ms=%d status=%s "
-            "attempts=%d deadline_s=%g failure_class=%s",
+            "attempts=%d deadline_s=%g failure_class=%s stt_passes=%d",
             kind, type(self).__name__, model,
             self.stt_transport if kind == _STT_KIND else "generate_content",
             mime_type, byte_count,
             language_mode or ("auto" if kind == _STT_KIND else "-"),
             transcription_mode or "-", chars,
             int((time.monotonic() - started) * 1000), "failed" if failed else "ok",
-            attempts, deadline_s, failure_class or "-",
+            attempts, deadline_s, failure_class or "-", self._stt_passes,
         )
 
     def _trace_stage(
@@ -801,6 +889,175 @@ class GeminiMediaEngine:
             failure_class=_failure_field(error),
         )
         raise error
+
+    # ── The bounded multi-pass route (the opt-in accuracy seam) ──
+
+    def _run_consensus(self, audio: bytes) -> str:
+        """N SEQUENTIAL recognition passes of the configured route, ONE deadline.
+
+        Bounded in every dimension: the pass count is the configured ceiling, only
+        ONE request is ever in flight, the audio is uploaded ONCE and reused by
+        every pass, and the whole operation runs inside
+        :data:`STT_OPERATION_DEADLINE_S` — a pass starts only with meaningful
+        budget left, and a spent deadline ends the loop with the hypotheses
+        already in hand.
+
+        A pass that failed contributes NO hypothesis (a transport problem can
+        therefore never be mistaken for a recognition result) and is never
+        retried: the configured passes ARE the transient-recovery budget here,
+        which is why this route deliberately spends no per-pass transport retry.
+        A DETERMINISTIC failure ends the loop at once — the same request is never
+        re-sent — and when no pass produced a transcript at all the operation
+        fails closed with the first, most informative failure.
+        """
+        if not audio:
+            return ""
+        mime_type = gemini_mime_type(audio)
+        dedicated = bool(self._stt_model)
+        if dedicated and mime_type not in _TRANSCRIPTION_AUDIO_MIME_TYPES:
+            raise MediaError(
+                "The dedicated transcription model accepts audio input only."
+            )
+        instruction = "" if dedicated else stt_instruction(self._stt_language)
+        transcription_mode = _VERBATIM_MODE["type"] if dedicated else "instruction"
+        started = time.monotonic()
+        deadline = started + STT_OPERATION_DEADLINE_S
+        transport = _TRANSPORT_URI
+        uploaded_name = ""
+        hypotheses: list[str] = []
+        failure: MediaError | None = None
+        passes = 0
+        try:
+            uploaded_name, transport, item = self._prepare_consensus_input(
+                audio, mime_type, dedicated, deadline,
+            )
+            self._trace_stage(
+                "consensus_start", transport=transport, byte_count=len(audio),
+            )
+            for index in range(1, self._stt_passes + 1):
+                if index > 1 and _budget(deadline) < STT_MIN_ATTEMPT_S:
+                    break
+                pass_started = time.monotonic()
+                try:
+                    if dedicated:
+                        text = self._transcribe_interaction(item, deadline, attempt=index)
+                    else:
+                        text = self._generate(
+                            _STT_KIND, item, instruction, deadline,
+                            _required_budget(
+                                deadline, "speech-to-text request",
+                                STT_OPERATION_DEADLINE_S,
+                            ),
+                            index,
+                        )
+                except MediaError as exc:
+                    if failure is None:
+                        failure = exc
+                    passes += 1
+                    self._trace_stage(
+                        "pass_failed", attempt=index, transport=transport,
+                        byte_count=len(audio),
+                        elapsed_ms=int((time.monotonic() - pass_started) * 1000),
+                    )
+                    if not getattr(exc, "retryable", False):
+                        break
+                    continue
+                passes += 1
+                hypotheses.append(text)
+                self._trace_stage(
+                    "pass", attempt=index, transport=transport,
+                    byte_count=len(audio),
+                    elapsed_ms=int((time.monotonic() - pass_started) * 1000),
+                )
+        finally:
+            if uploaded_name:
+                self._delete_file(uploaded_name)
+
+        if not hypotheses:
+            error = failure or _error(
+                "Gemini speech-to-text produced no result.", FAILURE_INTERACTION,
+            )
+            self._log_run(
+                _STT_KIND, mime_type, len(audio), started,
+                self._stt_model or self._model, self._stt_language,
+                transcription_mode, failed=True,
+                deadline_s=STT_OPERATION_DEADLINE_S, attempts=max(passes, 1),
+                failure_class=_failure_field(error),
+            )
+            raise error
+
+        # The reconciler sees the hypotheses and NOTHING else: no chat id, no
+        # sender, no filename, no caption, no reply and no history exist in its
+        # signature, so no Telegram or conversational context can reach it.
+        result = reconcile_hypotheses(hypotheses)
+        logger.info(
+            "GEMINI_MEDIA_ENGINE_CONSENSUS model=%s transport=%s mime=%s bytes=%d "
+            "passes=%d hypotheses=%d positions=%d changed=%d dropped=%d elapsed_ms=%d",
+            self._stt_model or self._model, transport, mime_type, len(audio),
+            passes, result.hypotheses, result.positions, result.changed,
+            result.dropped, int((time.monotonic() - started) * 1000),
+        )
+        self._log_run(
+            _STT_KIND, mime_type, len(audio), started,
+            self._stt_model or self._model, self._stt_language,
+            transcription_mode, chars=len(result.text),
+            deadline_s=STT_OPERATION_DEADLINE_S, attempts=max(passes, 1),
+        )
+        return result.text
+
+    def _prepare_consensus_input(
+        self, audio: bytes, mime_type: str, dedicated: bool, deadline: float,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """``(uploaded_name, transport, input)`` — the representation, prepared ONCE.
+
+        Each route keeps the representation it already documents, and either way
+        exactly ONE upload happens per operation, so the extra passes cost a model
+        call each instead of a whole fresh upload each:
+
+        * the general route sends a payload inside the inline budget INLINE (no
+          upload is needed at all) and uploads once above it — the M1.5c rule,
+          unchanged;
+        * the dedicated route uploads once (the ``uri`` form its documentation
+          shows) and falls back to the inline form only when that upload fails
+          TRANSIENTLY with the payload inside the documented inline budget; a
+          deterministic failure fails closed.
+        """
+        if not dedicated and len(audio) <= INLINE_PAYLOAD_MAX_BYTES:
+            return "", _TRANSPORT_INLINE, self._inline_item(audio, mime_type, dedicated)
+        try:
+            upload_url = self._start_upload(audio, mime_type, deadline, attempt=1)
+            file_info = self._finish_upload(
+                upload_url, audio, mime_type, deadline, attempt=1,
+            )
+        except MediaError as exc:
+            if len(audio) <= INLINE_PAYLOAD_MAX_BYTES and getattr(exc, "retryable", False):
+                return "", _TRANSPORT_INLINE, self._inline_item(audio, mime_type, dedicated)
+            raise
+        name = str(file_info.get("name") or "")
+        uri = str(file_info.get("uri") or "")
+        if not name or not uri:
+            raise _error(
+                "Gemini did not accept the uploaded audio file.", FAILURE_UPLOAD,
+            )
+        state = str(file_info.get("state") or "").upper()
+        if state and state != "ACTIVE":
+            uri = self._await_file_ready(name, uri, deadline)
+        return name, _TRANSPORT_URI, self._uri_item(uri, mime_type, dedicated)
+
+    @staticmethod
+    def _inline_item(audio: bytes, mime_type: str, dedicated: bool) -> dict[str, Any]:
+        """The documented INLINE audio representation of the selected route."""
+        data = base64.b64encode(audio).decode("ascii")
+        if dedicated:
+            return {"type": "audio", "data": data, "mime_type": mime_type}
+        return {"inlineData": {"mimeType": mime_type, "data": data}}
+
+    @staticmethod
+    def _uri_item(uri: str, mime_type: str, dedicated: bool) -> dict[str, Any]:
+        """The documented UPLOADED-file representation of the selected route."""
+        if dedicated:
+            return {"type": "audio", "uri": uri, "mime_type": mime_type}
+        return {"fileData": {"mimeType": mime_type, "fileUri": uri}}
 
     # ── The dedicated transcription route ──
 

@@ -1416,12 +1416,13 @@ def test_the_gemini_integration_adds_no_heavy_dependency():
 
 
 def test_the_engine_holds_no_telegram_or_event_loop_state():
-    # Credential, the general media model and the OPTIONAL dedicated-STT selection
-    # only: the engine still holds no Telegram object, no chat/message id and no
-    # event-loop state.
+    # Credential, the general media model, the OPTIONAL dedicated-STT selection
+    # and the bounded pass count only: the engine still holds no Telegram object,
+    # no chat/message id and no event-loop state.
     slots = set(GeminiMediaEngine.__slots__)
     assert slots == {
         "_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language",
+        "_stt_passes",
     }
     # A synchronous engine: the boundary owns the thread offload and the timeout.
     assert not inspect.iscoroutinefunction(GeminiMediaEngine.recognize)

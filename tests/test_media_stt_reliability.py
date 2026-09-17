@@ -936,6 +936,7 @@ async def test_the_engine_owns_no_http_state_between_operations(script):
     ), "no module-level HTTP client (would be cross-request mutable state)"
     assert set(GeminiMediaEngine.__slots__) == {
         "_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language",
+        "_stt_passes",
     }
 
 
