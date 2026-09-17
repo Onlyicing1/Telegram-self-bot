@@ -37,11 +37,25 @@ or an error string can never echo it).
 Model: :data:`DEFAULT_MEDIA_MODEL`, the smallest CURRENT Gemini model that accepts
 both image and audio input on the documented free tier (see the module constant's
 own note and ``IMPLEMENTATION_REPORT.md``). It is overridable through the
-project's existing per-provider ENV convention.
+project's existing per-provider ENV convention. OCR ALWAYS uses that general
+media model — it is never moved onto a speech model.
+
+STT has a second, EXPLICITLY SELECTABLE route. When
+:data:`STT_MODEL_ENV_VAR` names the documented dedicated speech-to-text model
+(:data:`DEDICATED_TRANSCRIPTION_MODEL`), ``transcribe`` uses that model's OWN
+documented request (the Interactions API, ``POST /v1beta/interactions`` with a
+``generation_config.transcription_config``), not the Generate Content request:
+the two API surfaces differ, and the dedicated model is only reachable through
+its own. With the variable unset, ``transcribe`` keeps the M1.5c behaviour
+exactly (the general media model answering ``STT_INSTRUCTION``). The route is a
+deployment decision, never a runtime fallback: the dedicated model failing
+raises the boundary's honest ``MediaError`` and the operation does NOT retry on
+another model, so the recognition comparison stays interpretable.
 
 Audio larger than the documented inline request budget uses the documented Files
 API upload flow, and the uploaded file is deleted in a ``finally`` block, so
-nothing is retained remotely beyond the operation.
+nothing is retained remotely beyond the operation. That is the SAME upload
+adapter for both STT routes — no second download, no second upload subsystem.
 """
 from __future__ import annotations
 
@@ -85,8 +99,9 @@ CHAT_MODEL_ENV_VAR = "AI_GEMINI_MODEL"
 #: audio-understanding model/MIME table lists Gemini 3.5 Flash-Lite among the
 #: models that accept audio input. It is the cheapest current Flash-Lite that
 #: accepts both image and audio, which is exactly what one engine serving two
-#: seams needs. No dedicated transcription model is assumed or used: the task's
-#: warning about unverified free tiers is respected by not depending on one.
+#: seams needs. No dedicated transcription model is depended on here: the STT
+#: section below is OPT-IN, so the default path uses no model this project
+#: cannot verify.
 DEFAULT_MEDIA_MODEL = "gemini-3.5-flash-lite"
 
 #: The ONLY instruction sent for OCR. Deliberately minimal, deterministic and
@@ -127,6 +142,39 @@ STT_INSTRUCTION = (
     "Do not invent or guess unintelligible words.\n"
     "If the audio contains no speech, return nothing."
 )
+
+#: ── Dedicated transcription model (explicitly selectable, never automatic) ──
+
+#: The documented dedicated speech-to-text model (Gemini 3.5 Transcribe). It is
+#: NOT the default and is never chosen implicitly: it is used for ``transcribe``
+#: only when this model is named in :data:`STT_MODEL_ENV_VAR`, so OCR and the
+#: general media request keep the existing media model.
+DEDICATED_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
+
+#: The STT-specific model override and the optional explicit language override.
+#: Both follow the project's existing ``AI_<PROVIDER>_*`` ENV convention, and
+#: neither has a default value: an unset variable means "use the existing
+#: general media route", never a silently substituted model.
+STT_MODEL_ENV_VAR = "AI_GEMINI_STT_MODEL"
+STT_LANGUAGE_ENV_VAR = "AI_GEMINI_STT_LANGUAGE"
+
+#: The documented Interactions API endpoint the dedicated model is served by
+#: (the same base URL the provider adapter and this module already use).
+INTERACTIONS_ENDPOINT = f"{GEMINI_API_BASE}/interactions"
+
+#: The documented transcription mode used by this engine. The dedicated model
+#: defaults to ``verbatim``; it is sent EXPLICITLY so the request cannot drift
+#: into Smart transcription (which removes disfluencies and reformats), and
+#: nothing else is enabled: no ``timestamp_granularities`` (the API documents
+#: that word timestamps may DEGRADE accuracy), no ``diarization_mode`` (voice
+#: notes are single-speaker) and no ``custom_vocabulary`` (no list and no
+#: demonstrated need). Those omissions are the experiment's control variables.
+_VERBATIM_MODE: dict[str, str] = {"type": "verbatim"}
+
+#: The two seam kinds, named once. ``_STT_KIND`` also selects the STT route and
+#: the STT log fields, so the string never has to be repeated or guessed.
+_OCR_KIND = "OCR"
+_STT_KIND = "speech-to-text"
 
 #: Engine-level finite wall-clock bounds, each comfortably INSIDE the boundary's
 #: own bound (``media_service.OCR_TIMEOUT_S`` 45s, ``STT_TIMEOUT_S`` 60s), so the
@@ -189,6 +237,12 @@ _GEMINI_AUDIO_MIME_TYPES: dict[str, str] = {
     "audio/x-flac": "audio/flac",
 }
 
+#: The audio MIME types Gemini documents for the dedicated transcription model —
+#: exactly the ones :func:`gemini_mime_type` can produce for audio. Used to
+#: refuse a non-audio payload on the dedicated route instead of sending an image
+#: to a speech model. The accepted-format list is NOT broadened.
+_TRANSCRIPTION_AUDIO_MIME_TYPES = frozenset(_GEMINI_AUDIO_MIME_TYPES.values())
+
 #: Container signatures, mirrored from the boundary's own validators. The bytes
 #: reaching an engine have already been corroborated against a declared type by
 #: ``media_service``; sniffing here only decides WHICH documented Gemini MIME type
@@ -245,6 +299,25 @@ def gemini_mime_type(data: bytes) -> str:
     raise MediaError("The media payload is not a container Gemini can read.")
 
 
+def stt_instruction(language_code: str = "") -> str:
+    """The instruction for the GENERAL media model's STT request.
+
+    Byte-identical to :data:`STT_INSTRUCTION` when no language is configured, so
+    the existing multilingual contract is untouched by default. A configured
+    language only APPENDS one deterministic sentence naming its BCP-47 code —
+    it never replaces the instruction, never names a chat/person/message and
+    never varies per request.
+    """
+    code = str(language_code or "").strip()
+    if not code:
+        return STT_INSTRUCTION
+    return (
+        STT_INSTRUCTION
+        + f"\nThe spoken language is identified by the BCP-47 code {code};"
+        " transcribe it in that language and in its own writing system."
+    )
+
+
 def _remaining(deadline: float, timeout_s: float) -> float:
     """Time left before ``deadline``, never zero/negative (which httpx rejects)."""
     return max(0.5, min(timeout_s, deadline - time.monotonic()))
@@ -283,17 +356,45 @@ class GeminiMediaEngine:
     one is a deployment decision that cannot alter the media contract.
     """
 
-    __slots__ = ("_api_key", "_model", "_key_env_var")
+    __slots__ = ("_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language")
 
-    def __init__(self, api_key: str, model: str = "", *, key_env_var: str = "") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "",
+        *,
+        key_env_var: str = "",
+        stt_model: str = "",
+        stt_language: str = "",
+    ) -> None:
         self._api_key = str(api_key or "").strip()
         self._model = str(model or "").strip() or DEFAULT_MEDIA_MODEL
         self._key_env_var = str(key_env_var or "")
+        #: Empty means "the general media model answers the STT instruction".
+        self._stt_model = str(stt_model or "").strip()
+        #: Empty means automatic language detection; a BCP-47 code pins it.
+        self._stt_language = str(stt_language or "").strip()
 
     @property
     def model(self) -> str:
-        """The Gemini model this engine sends requests to (never a secret)."""
+        """The Gemini model OCR and the general media route use (no secret)."""
         return self._model
+
+    @property
+    def stt_model(self) -> str:
+        """The dedicated transcription model, or ``""`` when not configured."""
+        return self._stt_model
+
+    @property
+    def stt_language(self) -> str:
+        """The configured BCP-47 language code, or ``""`` for automatic."""
+        return self._stt_language
+
+    @property
+    def stt_transport(self) -> str:
+        """The API surface ``transcribe`` uses: ``interactions`` or
+        ``generate_content``. Deterministic from configuration alone."""
+        return "interactions" if self._stt_model else "generate_content"
 
     @property
     def key_env_var(self) -> str:
@@ -303,37 +404,207 @@ class GeminiMediaEngine:
     # ── The two seam methods ──
 
     def recognize(self, image: bytes) -> str:
-        """Return the text visible in ``image`` (``""`` when there is none)."""
-        return self._run("OCR", image, OCR_INSTRUCTION, OCR_TIMEOUT_S)
+        """Return the text visible in ``image`` (``""`` when there is none).
+
+        Always the general media model: the dedicated speech model is never used
+        for OCR, whatever STT is configured with.
+        """
+        return self._run(_OCR_KIND, image, OCR_INSTRUCTION, OCR_TIMEOUT_S)
 
     def transcribe(self, audio: bytes) -> str:
-        """Return the transcript of ``audio`` (``""`` when there is no speech)."""
-        return self._run("speech-to-text", audio, STT_INSTRUCTION, STT_TIMEOUT_S)
+        """Return the transcript of ``audio`` (``""`` when there is no speech).
+
+        Two deterministic, mutually exclusive routes chosen ONLY by
+        configuration — never at runtime, and never one as a fallback for the
+        other:
+
+          * a dedicated transcription model is configured ⇒ its own documented
+            transcription request (Interactions API);
+          * otherwise the general media model answers the STT instruction,
+            exactly as before.
+        """
+        if self._stt_model:
+            return self._run_dedicated_transcription(audio)
+        return self._run(
+            _STT_KIND, audio, stt_instruction(self._stt_language), STT_TIMEOUT_S,
+        )
 
     # ── Internals ──
 
+    def _log_run(
+        self,
+        kind: str,
+        mime_type: str,
+        byte_count: int,
+        started: float,
+        model: str,
+        language_mode: str,
+        transcription_mode: str,
+        *,
+        chars: int = 0,
+        failed: bool = False,
+    ) -> None:
+        """ONE bounded, non-sensitive line per media operation.
+
+        It carries exactly what the recognition experiment needs to be read
+        (engine, model, API surface, container MIME, payload size, language mode,
+        transcription mode, elapsed time, output LENGTH, success/failure) and
+        never the transcript, the raw audio, the credential, a Telegram id, a
+        filename or a caption.
+        """
+        logger.info(
+            "GEMINI_MEDIA_ENGINE kind=%s engine=%s model=%s transport=%s mime=%s "
+            "bytes=%d language=%s mode=%s chars=%d elapsed_ms=%d status=%s",
+            kind, type(self).__name__, model,
+            self.stt_transport if kind == _STT_KIND else "generate_content",
+            mime_type, byte_count,
+            language_mode or ("auto" if kind == _STT_KIND else "-"),
+            transcription_mode or "-", chars,
+            int((time.monotonic() - started) * 1000), "failed" if failed else "ok",
+        )
+
     def _run(self, kind: str, payload: bytes, instruction: str, timeout_s: float) -> str:
+        """The Generate Content route: OCR and the general-model STT request."""
         if not payload:
             return ""
         mime_type = gemini_mime_type(payload)
+        is_stt = kind == _STT_KIND
+        language_mode = self._stt_language if is_stt else ""
+        transcription_mode = "instruction" if is_stt else ""
         started = time.monotonic()
         deadline = started + timeout_s
-        if len(payload) <= INLINE_PAYLOAD_MAX_BYTES:
-            part: dict[str, Any] = {
-                "inlineData": {
-                    "mimeType": mime_type,
-                    "data": base64.b64encode(payload).decode("ascii"),
+        try:
+            if len(payload) <= INLINE_PAYLOAD_MAX_BYTES:
+                part: dict[str, Any] = {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": base64.b64encode(payload).decode("ascii"),
+                    }
                 }
-            }
-            text = self._generate(kind, part, instruction, timeout_s)
-        else:
-            text = self._generate_from_upload(kind, payload, mime_type, instruction, deadline)
-        logger.info(
-            "GEMINI_MEDIA_ENGINE kind=%s mime=%s bytes=%d chars=%d elapsed_ms=%d",
-            kind, mime_type, len(payload), len(text),
-            int((time.monotonic() - started) * 1000),
+                text = self._generate(kind, part, instruction, timeout_s)
+            else:
+                text = self._generate_from_upload(
+                    kind, payload, mime_type, instruction, deadline,
+                )
+        except MediaError:
+            self._log_run(
+                kind, mime_type, len(payload), started, self._model,
+                language_mode, transcription_mode, failed=True,
+            )
+            raise
+        self._log_run(
+            kind, mime_type, len(payload), started, self._model,
+            language_mode, transcription_mode, chars=len(text),
         )
         return text
+
+    # ── The dedicated transcription route ──
+
+    def _run_dedicated_transcription(self, audio: bytes) -> str:
+        """ONE transcription through the dedicated model's own API surface.
+
+        Same boundary contract as the general route: one bounded operation, the
+        same inline-vs-Files transport decision, the same output handling and no
+        retry. A failure here is final — it is never re-asked on another model.
+        """
+        if not audio:
+            return ""
+        mime_type = gemini_mime_type(audio)
+        if mime_type not in _TRANSCRIPTION_AUDIO_MIME_TYPES:
+            raise MediaError(
+                "The dedicated transcription model accepts audio input only."
+            )
+        started = time.monotonic()
+        deadline = started + STT_TIMEOUT_S
+        try:
+            if len(audio) <= INLINE_PAYLOAD_MAX_BYTES:
+                item: dict[str, Any] = {
+                    "type": "audio",
+                    "data": base64.b64encode(audio).decode("ascii"),
+                    "mime_type": mime_type,
+                }
+                text = self._transcribe_interaction(item, STT_TIMEOUT_S)
+            else:
+                text = self._transcribe_interaction_from_upload(audio, mime_type, deadline)
+        except MediaError:
+            self._log_run(
+                _STT_KIND, mime_type, len(audio), started, self._stt_model,
+                self._stt_language, _VERBATIM_MODE["type"], failed=True,
+            )
+            raise
+        self._log_run(
+            _STT_KIND, mime_type, len(audio), started, self._stt_model,
+            self._stt_language, _VERBATIM_MODE["type"], chars=len(text),
+        )
+        return text
+
+    def _transcription_body(self, audio_item: dict[str, Any]) -> dict[str, Any]:
+        """The documented request body for the dedicated transcription model.
+
+        Field inventory, and nothing beyond it:
+          * ``model`` — the selected dedicated model;
+          * ``input`` — ONE audio item, inline ``data`` (base64) or an uploaded
+            ``uri``, plus its documented ``mime_type``;
+          * ``generation_config.transcription_config.language_codes`` — a
+            single BCP-47 code, included ONLY when a language is configured, so
+            the automatic-detection mode sends no language field at all;
+          * ``generation_config.transcription_config.mode`` — the verbatim mode
+            object, sent explicitly;
+          * ``store: false`` — the documented opt-out from the API's default
+            server-side retention of the interaction, so a voice note is not
+            kept remotely for a day (it is compatible with every feature used
+            here; it is incompatible only with background execution, which this
+            engine never requests).
+
+        No text instruction is sent: the dedicated model is documented to accept
+        the audio alone. No ``temperature``/``topK``/``topP``/``candidateCount``/
+        ``maxOutputTokens`` and no ``system_instruction`` are sent (they are not
+        part of this request's documented transcription contract, and sampling
+        controls are not a reliable ASR-fidelity lever).
+        """
+        transcription_config: dict[str, Any] = {"mode": dict(_VERBATIM_MODE)}
+        if self._stt_language:
+            transcription_config["language_codes"] = [self._stt_language]
+        return {
+            "model": self._stt_model,
+            "input": [audio_item],
+            "generation_config": {"transcription_config": transcription_config},
+            "store": False,
+        }
+
+    def _transcribe_interaction(
+        self, audio_item: dict[str, Any], timeout_s: float,
+    ) -> str:
+        """ONE ``POST /interactions`` — never retried here (no retry loop)."""
+        body = self._transcription_body(audio_item)
+        data = self._post_json(_STT_KIND, INTERACTIONS_ENDPOINT, body, timeout_s)
+        return _extract_interaction_text(_STT_KIND, data, self._api_key)
+
+    def _transcribe_interaction_from_upload(
+        self, audio: bytes, mime_type: str, deadline: float,
+    ) -> str:
+        """The SAME Files API upload flow, reused for the dedicated route.
+
+        The uploaded file is used by its returned URI and deleted in a
+        ``finally`` block, so nothing outlives the operation.
+        """
+        timeout_s = _remaining(deadline, STT_TIMEOUT_S)
+        upload_url = self._start_upload(audio, mime_type, timeout_s)
+        file_info = self._finish_upload(upload_url, audio, mime_type, timeout_s)
+        name = str(file_info.get("name") or "")
+        uri = str(file_info.get("uri") or "")
+        if not name or not uri:
+            raise MediaError("Gemini did not accept the uploaded audio file.")
+        try:
+            state = str(file_info.get("state") or "").upper()
+            if state and state != "ACTIVE":
+                uri = self._await_file_ready(name, uri, deadline)
+            return self._transcribe_interaction(
+                {"type": "audio", "uri": uri, "mime_type": mime_type},
+                _remaining(deadline, STT_TIMEOUT_S),
+            )
+        finally:
+            self._delete_file(name)
 
     def _headers(self) -> dict[str, str]:
         return {"x-goog-api-key": self._api_key, "Content-Type": "application/json"}
@@ -541,6 +812,51 @@ def _raise_for_status(kind: str, response: httpx.Response, api_key: str) -> None
     raise MediaError(f"Gemini refused the {kind} request (HTTP {status}).{suffix}")
 
 
+def _extract_interaction_text(kind: str, data: Any, api_key: str) -> str:
+    """The model text of ONE completed transcription interaction.
+
+    Reads the documented Interactions response shape: the transcript is the
+    ``text`` of every ``type: "text"`` content item inside the ``model_output``
+    steps, joined in reading order (the same join rule as
+    :func:`_extract_text`). ``output_text`` — the documented accessor name — is
+    accepted only as a fallback when no such item exists, so one response shape
+    is not silently assumed. A non-completed status, an unreadable body or a
+    malformed shape raises ``MediaError``; genuinely absent speech returns the
+    seam's honest empty string, never a fabricated transcript.
+    """
+    if not isinstance(data, dict):
+        raise MediaError(f"Gemini returned an unreadable {kind} response.")
+    status = str(data.get("status") or "").strip().lower()
+    if status and status != "completed":
+        raise MediaError(f"Gemini did not complete the {kind} request ({status}).")
+    chunks: list[str] = []
+    steps = data.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("type") or "") != "model_output":
+                continue
+            content = step.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "") != "text":
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    chunks.append(text)
+    if not chunks:
+        fallback = data.get("output_text")
+        if isinstance(fallback, str) and fallback.strip():
+            chunks.append(fallback)
+    if not chunks:
+        return ""
+    return "\n".join(chunks)
+
+
 def _extract_text(kind: str, data: Any, api_key: str) -> str:
     """The model text of ONE generateContent response, or the seam's empty result.
 
@@ -594,6 +910,34 @@ def resolve_api_key() -> tuple[str, str]:
     return "", ""
 
 
+def resolve_stt_model() -> tuple[str, str]:
+    """``(model, env_var_name)`` for STT; ``("", "")`` when unset.
+
+    No default and no substitution: an unset variable means the EXISTING
+    general media route (the general model answering ``STT_INSTRUCTION``), which
+    is exactly why activating the dedicated model is an explicit act. The value
+    passes through the project's existing deprecation map.
+    """
+    value = (os.getenv(STT_MODEL_ENV_VAR) or "").strip()
+    if not value:
+        return "", ""
+    return resolve_model("gemini", value), STT_MODEL_ENV_VAR
+
+
+def resolve_stt_language() -> tuple[str, str]:
+    """``(bcp47_code, env_var_name)`` for STT; ``("", "")`` means automatic.
+
+    The code is passed through as configured (trimmed) — no reinterpretation and
+    no invented validation. An unset/blank value keeps the multilingual,
+    automatic-detection behaviour, so this can never make every voice note
+    Persian.
+    """
+    value = (os.getenv(STT_LANGUAGE_ENV_VAR) or "").strip()
+    if not value:
+        return "", ""
+    return value, STT_LANGUAGE_ENV_VAR
+
+
 def resolve_media_model() -> tuple[str, str]:
     """``(model, env_var_name)``; the media override wins, then the chat model.
 
@@ -623,7 +967,19 @@ def build_gemini_media_engine() -> tuple[GeminiMediaEngine | None, str, str]:
             + " or ".join(API_KEY_ENV_VARS) + "."
         )
     model, _model_env_var = resolve_media_model()
-    return GeminiMediaEngine(api_key, model, key_env_var=key_env_var), model, ""
+    stt_model, _stt_env_var = resolve_stt_model()
+    stt_language, _language_env_var = resolve_stt_language()
+    return (
+        GeminiMediaEngine(
+            api_key,
+            model,
+            key_env_var=key_env_var,
+            stt_model=stt_model,
+            stt_language=stt_language,
+        ),
+        model,
+        "",
+    )
 
 
 def provision_gemini_media_engines() -> dict[str, Any]:
@@ -649,8 +1005,12 @@ def provision_gemini_media_engines() -> dict[str, Any]:
     media_service.set_ocr_engine(engine)
     media_service.set_stt_engine(engine)
     logger.info(
-        "GEMINI_MEDIA_ENGINE_PROVISIONED configured=%s model=%s key_env_var=%s reason=%s",
-        engine is not None, model or "-", (engine.key_env_var if engine else "") or "-",
+        "GEMINI_MEDIA_ENGINE_PROVISIONED configured=%s model=%s stt_model=%s "
+        "stt_language=%s key_env_var=%s reason=%s",
+        engine is not None, model or "-",
+        (engine.stt_model if engine else "") or "general-media-model",
+        (engine.stt_language if engine else "") or "auto",
+        (engine.key_env_var if engine else "") or "-",
         reason or "-",
     )
     return {

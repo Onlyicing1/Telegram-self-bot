@@ -481,7 +481,7 @@ def _reset_engines_and_env(monkeypatch):
     media_service.set_ocr_engine(None)
     media_service.set_stt_engine(None)
     for name in ("AI_GEMINI_API_KEY", "GEMINI_API_KEY", "AI_GEMINI_MEDIA_MODEL",
-                 "AI_GEMINI_MODEL"):
+                 "AI_GEMINI_MODEL", "AI_GEMINI_STT_MODEL", "AI_GEMINI_STT_LANGUAGE"):
         monkeypatch.delenv(name, raising=False)
     yield
     media_service.set_ocr_engine(ocr)
@@ -1408,8 +1408,13 @@ def test_the_gemini_integration_adds_no_heavy_dependency():
 
 
 def test_the_engine_holds_no_telegram_or_event_loop_state():
+    # Credential, the general media model and the OPTIONAL dedicated-STT selection
+    # only: the engine still holds no Telegram object, no chat/message id and no
+    # event-loop state.
     slots = set(GeminiMediaEngine.__slots__)
-    assert slots == {"_api_key", "_model", "_key_env_var"}
+    assert slots == {
+        "_api_key", "_model", "_key_env_var", "_stt_model", "_stt_language",
+    }
     # A synchronous engine: the boundary owns the thread offload and the timeout.
     assert not inspect.iscoroutinefunction(GeminiMediaEngine.recognize)
     assert not inspect.iscoroutinefunction(GeminiMediaEngine.transcribe)
