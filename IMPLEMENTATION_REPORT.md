@@ -1,6 +1,328 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.7: Video/GIF out of scope, and ONE controlled media response
+## Latest phase — Media Processing M1.8: bounded long-audio STT chunking
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Media Processing M1.8** — bounded long-audio STT chunking inside the existing media boundary |
+| Starting HEAD | `b5e7c10` `feat: drop video/GIF from media processing, deliver one media response` — equal to `origin/main` at phase start |
+| Implementation commit | the single phase commit that contains this report (`feat(stt): transcribe over-long audio in bounded chunks`) |
+| Live Telegram verification | **NOT PERFORMED** |
+
+### Purpose of this phase
+
+`MAX_STT_DURATION_S` (300 s) was the longest audio the boundary would **accept**, so
+a 14-minute recording could not be transcribed at all — it was refused with
+`“exceeds the 300s speech-to-text bound”`. It is now the longest audio ONE
+recognition may be asked to handle, and a longer recording is divided into ordered,
+bounded chunks that the **unchanged** `SttEngine.transcribe(audio: bytes) -> str`
+seam transcribes one at a time.
+
+The division lives at the **orchestration boundary**: no provider adapter, no
+`ProviderManager`, no new pipeline, no second download path and no second scheduler
+was touched, and `transcribe(audio) -> str` is still the only engine contract — a
+provider still receives ONE already-bounded payload per call.
+
+Explicitly NOT implemented: automatic provider fallback, a provider health/cooldown
+manager, credential pools, key rotation, TTS, Native Vision, video/GIF processing, new
+STT or AI providers, quality benchmarking, Supabase tables or SQL, Render ENV
+behaviour, any change to `ProviderManager`, any change to Telegram media target
+resolution, any AI-based transcript correction, and any LLM-based chunk merge.
+
+### Audit — what the code actually did with over-long audio
+
+Traced before anything was changed, in the project’s source order:
+
+* `media_service.analyze_media` → `_extract_audio_content` →
+  `_validate_audio_payload(data, mime_type)`, whose duration guard raised
+  `MediaError("The audio is 330s — exceeds the 300s speech-to-text bound.")` with stage
+  `media_validation`. A long voice note therefore never reached an engine at all: no
+  transfer-past-validation, no engine call, no partial processing.
+* The engines behind the seam each already implement their own bounded multi-pass:
+  `GeminiMediaEngine.transcribe` (general `generateContent` route, or the dedicated
+  transcription route over the `interactions` API, both inside
+  `STT_OPERATION_DEADLINE_S` = 45 s), `GroqWhisperEngine.transcribe` and
+  `SpeechmaticsEngine.transcribe` — all three reconciling their passes through the
+  existing `stt_consensus.reconcile_hypotheses`.
+* The engine is chosen once by configuration (`stt_engine_factory.apply_stt_config` →
+  `media_service.set_stt_engine`) from the registered candidates
+  (`gemini:default`, `gemini:gemini-3.5-transcribe`, `groq:whisper-large-v3`,
+  `groq:whisper-large-v3-turbo`, `speechmatics:standard`), and the boundary holds
+  exactly ONE engine reference.
+* Existing bounds: `MAX_STT_INPUT_BYTES` 20 MiB (pre-transfer), `MAX_STT_DURATION_S`
+  300 s, `MAX_STT_CHANNELS` 2, `MAX_STT_SAMPLE_RATE` 48 kHz, `STT_TIMEOUT_S` 60 s,
+  `MAX_STT_CHARS` = `MAX_EXTRACTED_CHARS` (the presentation ceiling).
+* **No chunking existed anywhere.** `backend/tools/stt_benchmark.py` is the only other
+  audio tool in the repository and it is not on the runtime path.
+* **Environment facts that decided the mechanism:** `ffmpeg` is NOT present, the venv
+  holds none of pydub/soundfile/numpy/av/torch, and `backend/requirements.txt` carries
+  no audio dependency. A decoder-based splitter was therefore not available, and no
+  heavy media stack was added for this phase.
+* The media request’s own envelope is `media_ai_service.DEFAULT_ENVELOPE_S` = 240 s
+  (the handler’s backstop), of which the provider call that answers an analytical media
+  request reserves `PROVIDER_CALL_SAFETY_TIMEOUT_S` = 120 s. Those two established
+  constants are what the new aggregate deadline is derived from.
+
+### How the audio is divided (`backend/services/stt_chunking.py`)
+
+One new module, standard library only (`typing` is its only import), whose entire
+input is a validated payload plus two numeric ceilings — no Telegram object, no chat
+id, no filename, no caption, no provider, no credential:
+
+| Container | Divided at | Every chunk is |
+|---|---|---|
+| OGG/Opus, OGG/Vorbis (`audio/ogg`, `audio/opus`, `application/ogg`) | **OGG page boundaries** — the container’s own unit of framing (lacing table, granule position, CRC over itself) | the stream’s own codec header pages followed by a run of complete pages, **concatenated byte-for-byte** |
+| RIFF/WAVE (`audio/wav`, `audio/x-wav`, `audio/wave`, `audio/vnd.wave`) | **frame boundaries** of its `data` chunk (plain PCM) | the source’s own pre-`data` chunks with the RIFF and `data` size fields repatched, so its duration is genuinely its own |
+| anything else (incl. **FLAC**) | — | refused (`None`) |
+
+* **Nothing is ever split on an arbitrary byte offset**, and no compressed packet is
+  ever cut: an OGG chunk boundary is always a page boundary the stream itself declares,
+  and a WAVE boundary always lands on a whole frame. Because every OGG page is copied
+  verbatim, **no page CRC is invalidated** and no page has to be rebuilt.
+* The chunk’s duration is taken from the stream’s **own granule positions** (Opus
+  granules are always 48 kHz units; Vorbis granules are samples at the rate its
+  identification header declares — the same rule the boundary’s reader uses), so a
+  chunk is closed on the page *before* the one that would push it past the ceiling.
+  Chunk 1 is therefore `[0 … 300 s]`, chunk 2 `[300 s … 600 s]`, and so on: contiguous,
+  non-overlapping, and ordered.
+* **Contiguous with no overlap, deliberately.** No overlap is invented “to improve
+  quality”, so there is nothing to deduplicate on merge.
+* **Fail-closed on everything else**: an unknown MIME, an unclean page walk (trailing
+  bytes, a page whose payload runs past the file), a stream that is not Ogg Opus/Vorbis,
+  a first page without the BOS flag, a multiplexed/chained stream (mixed serials), more
+  chunks than the cap allows, and a **single indivisible unit** (one OGG page that alone
+  spans more than the ceiling) all return `None`. The caller then raises the boundary’s
+  existing deterministic refusal —
+  `“The audio is Ns — exceeds the 300s speech-to-text bound and this container cannot be
+  divided into shorter parts of the same format.”` (stage `media_validation`).
+* **FLAC is the concrete refusal.** A FLAC frame boundary cannot be found without
+  decoding subframes, and a re-headed FLAC would need STREAMINFO’s total-sample count
+  and MD5 rewritten; a long FLAC is reported honestly instead of being approximated.
+  This is a deliberate, documented limit, not a silent gap: **long FLAC behaves exactly
+  as it did before this phase.**
+
+### The operation around the division
+
+`media_service._run_stt_chunked` owns the operation; the division itself runs off the
+event loop (`asyncio.to_thread(stt_chunking.plan, …)`), the same pattern the boundary
+already uses for document parsing:
+
+1. the payload is validated once against the **total** ceiling, then (only if it
+   exceeds one chunk) planned into ordered chunks;
+2. chunks are transcribed **strictly in source order, one at a time**, always with the
+   ONE engine the request selected;
+3. each chunk’s transcript is normalized by the **existing**
+   `_normalize_extracted_text` and appended to the ordered list;
+4. the list is joined by `stt_chunking.join_transcripts` — **one newline between
+   chunks, nothing else**: no bridging text, no inferred words, no translation, no
+   summarization, no deduplication and no second model;
+5. the single merged transcript then flows through the **unchanged**
+   `_normalize_extracted_text` → `_cap_text(limit)` → `MediaAnalysis` path, so one
+   request still produces ONE analysis, ONE owner-facing response and no intermediate
+   chunk output.
+
+Stages traced (content-free, `key=value`, the project’s existing trace shape):
+`stt_chunks_planned`, `stt_chunk_invoked` (with the chunk index, the chunk count, the
+byte count and the applied bound), `stt_chunk_returned` (with the character count, so
+an EMPTY chunk is distinguishable from a failure), `stt_chunks_merged`, plus the
+existing `stt_engine_invoked` / `stt_engine_returned` on the single-pass route.
+
+### Bounds — per chunk, total, count, deadline
+
+| Bound | Value | Enforced |
+|---|---|---|
+| Duration of ONE chunk | `MAX_STT_DURATION_S` = 300 s (unchanged constant, new meaning) | by the planner and by each chunk’s own granule span |
+| Chunk count per request | `MAX_STT_CHUNKS` = 4 (new, explicit) | by the planner (`> max_chunks` ⇒ refusal) |
+| Total duration per request | `MAX_STT_TOTAL_DURATION_S` = **`MAX_STT_CHUNKS × MAX_STT_DURATION_S`** = 1200 s (20 min) | by the duration guard, now applied against the TOTAL bound |
+| Input bytes | `MAX_STT_INPUT_BYTES` = 20 MiB (**unchanged**) | before the transfer, as before |
+| Aggregate recognition deadline | `STT_TOTAL_TIMEOUT_S` = 120 s (new) | one clock started before chunk 1 |
+| Per-chunk call timeout | `min(STT_TIMEOUT_S, remaining aggregate)` | passed to `_run_stt` |
+
+* The total bound is **derived, not inflated**: it is exactly the small explicit chunk
+  cap times the existing per-chunk ceiling, so “300 s × a huge number” is impossible.
+* The aggregate value is derived from two constants that already govern this request:
+  the 240 s media envelope minus the 120 s an analytical media answer reserves for its
+  provider call = 120 s for recognition — which is also exactly two per-chunk bounds.
+* Temporary storage is unchanged: chunks are **in-memory slices of the already
+  validated payload**, so there is no chunk file to write, leak or clean, and peak
+  memory stays the payload plus ONE chunk (the plan holds byte ranges, not chunks).
+* No new environment variable and no new persisted setting was introduced: these are
+  architectural ceilings, not per-deployment behaviour.
+
+### Timeouts — the three layers and their relationship
+
+```
+media request envelope        240 s   (media_ai_service.DEFAULT_ENVELOPE_S, the handler backstop)
+  └── aggregate recognition   120 s   (STT_TOTAL_TIMEOUT_S)               ← new, one clock per request
+        └── per chunk          60 s   (STT_TIMEOUT_S, or what is left of the 120 s)
+              └── engine op    45 s   (Gemini STT_OPERATION_DEADLINE_S; its own for each other engine)
+```
+
+* Each chunk’s call stays bounded exactly as before; a three-pass configuration inside
+  one chunk still runs under the engine’s own single operation deadline.
+* **N chunks cannot multiply the request lifetime**: the aggregate clock is checked
+  before every chunk, and a spent deadline fails the operation honestly
+  (stage `media_stt_timeout`) instead of starting another chunk.
+* The 120 s left outside the aggregate is what an analytical media answer needs for its
+  provider call, so chunking cannot starve the answer step.
+
+### Interaction with multi-pass / consensus, and provider selection
+
+* No second consensus exists and none was added: each chunk goes through the SAME
+  `transcribe` seam, so the engine’s configured pass count multiplies the calls **per
+  chunk** (chunks × passes), never the other way around. With both caps in force the
+  worst case is 4 × 3 = 12 provider calls, each still bounded by the engine’s own
+  deadline and by the aggregate.
+* The engine receives ONE bounded payload per call and cannot see a chunk boundary, so
+  no provider adapter needed a change and none was made.
+* **The selected engine stays authoritative**: every chunk uses it, a chunk failure
+  fails the whole operation, and no fallback happens here (there is no health/fallback
+  manager yet). The seam where a future per-chunk provider choice belongs is the single
+  `engine` binding at the top of `_run_stt_chunked`.
+
+### Zero-context and Telegram output
+
+Unchanged and re-tested for the chunked route: the engine receives nothing but the
+chunk’s audio bytes and the adapter’s existing configuration (no chat id, message id,
+filename, caption, reply, history, memory or inferred target), `MediaAnalysis.
+as_context_text()` still renders no Telegram metadata, and the delivery layer is
+untouched — **one media request → one logical result → one controlled Telegram
+representation** (M1.7). Internal chunking is never user-facing.
+
+### Exact files changed
+
+| File | Change |
+|---|---|
+| `backend/services/stt_chunking.py` | **new** — the deterministic OGG-page / RIFF-frame division, the chunk plan, and the ordered transcript join (standard library only) |
+| `backend/services/media_service.py` | the per-chunk/total/count/deadline constants, `_validate_audio_payload(max_duration_s=…)`, the chunked branch in `_extract_audio_content`, and `_run_stt_chunked` |
+| `tests/test_media_stt_chunking.py` | **new** — the focused regression suite |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+No other file was modified. `media_ai_service.py`, `media.py`, the provider adapters,
+`ProviderManager`, the delivery layer, the panel/handler code, `requirements.txt`,
+`render.yaml` and the Supabase schema are untouched.
+
+### Tests added and changed
+
+`tests/test_media_stt_chunking.py` (34 tests), grouped exactly as the phase’s risks:
+
+* **SHORT** — ≤ 300 s is ONE engine call on the payload’s **own unchanged bytes**
+  (`test_short_audio_is_one_call_on_its_own_unchanged_bytes`), and exactly 300 s stays on
+  the single-pass route (`test_exactly_one_chunk_worth_of_audio_stays_on_the_single_pass_route`).
+* **BOUNDARY** — 301 s starts the chunked route and yields two ordered chunks
+  (`test_one_second_past_the_bound_starts_the_chunked_route`).
+* **LONG** — 301/480/840/1200 s produce 2/2/3/4 chunks whose transcripts merge in
+  strict source order (`test_a_long_recording_merges_its_chunks_in_source_order`);
+  the plan’s own durations, the exact partition of the source’s pages
+  (`test_the_chunks_partition_the_source_pages_exactly_once`), the page-only division
+  (`test_a_long_note_is_divided_at_ogg_page_boundaries_only`), the frame-level WAVE
+  division whose chunks are re-validated by `_validate_audio_payload`
+  (`test_a_wav_is_divided_on_frame_boundaries_and_stays_valid_per_chunk`), and the
+  verbatim byte reuse (`test_the_source_bytes_are_reused_verbatim_not_re_encoded`).
+* **FAILURE** — the first, a middle and the last chunk each fail the whole operation
+  with no partial transcript and no later attempt (`test_any_failing_chunk_fails_the_whole_operation`,
+  parametrized `fail_at=1,2,3`), no retry on another provider
+  (`test_a_failing_engine_is_never_retried_on_another_provider`), an indivisible
+  over-long container and a long FLAC are refused honestly with no engine call.
+* **OUTPUT** — one normalized value (`test_the_merged_transcript_is_one_normalized_value`),
+  the existing ceiling’s honest truncation notice
+  (`test_the_existing_output_ceiling_stays_honest_for_a_chunked_transcript`), and the
+  zero-context rendering on the chunked route
+  (`test_the_chunked_route_keeps_the_zero_context_rule`).
+* **BOUNDS** — total duration refused before any transcription, the derivation asserted
+  directly, the chunk cap enforced by the route (separately from duration), the spent
+  aggregate deadline, and the per-chunk timeout formula.
+* **RESOURCES** — the division runs off the event loop, no temporary artefact on success
+  or failure, and cancellation propagates with cleanup.
+* **MULTI-PASS** — a real `GeminiMediaEngine(stt_passes=3)` over a 2-chunk recording
+  issues exactly `chunks × passes` = 6 interaction requests, uploads each chunk’s own
+  bytes once, deletes each upload, and merges two chunk transcripts
+  (`test_a_three_pass_engine_multiplies_per_chunk_and_stays_bounded`).
+* **DEPENDENCY** — the splitter’s imports are asserted to be `__future__` + `typing`
+  only (`test_the_splitter_is_standard_library_only`).
+
+**No existing test needed to be changed.** Two of them still pin over-long audio being
+refused — `tests/test_media_stt.py::test_audio_longer_than_the_duration_bound_is_refused_before_transcription`
+and `tests/test_media_gemini_engine.py::test_a_container_longer_than_the_duration_bound_never_reaches_gemini`
+(both 330 s) — and they now pass because their **minimal two-page fixture declares its
+entire duration on its only audio page**, which is genuinely indivisible. They are
+kept as the pinnacle of the refusal contract, and the positive chunking cases live in
+the new suite.
+
+### Validation results
+
+| Run | Result |
+|---|---|
+| `tests/test_media_stt_chunking.py` | **34 passed** |
+| Narrow media/STT suites (media processing, image OCR, document extraction, STT, dedicated STT, direct STT, multi-pass, reliability, engine, consensus, Groq, Speechmatics, provider probe, AI STT settings) | **1002 passed, 2 skipped** |
+| Full suite, final tree | **3911 passed, 26 skipped** |
+| Full suite without the new file (the same tree’s baseline) | **3877 passed, 26 skipped** — i.e. the 34 new tests are exactly the delta, and **no existing test changed** |
+| `python -m py_compile` on both changed modules | clean |
+| `git diff --check` | clean |
+
+### Live verification status
+
+**NOT PERFORMED.** No live Telegram voice note, no provider credential and no network
+call was used; the fixtures are synthetic containers and the engines are scripted, so
+nothing here claims the Persian recognition behaviour of any provider — and, as
+`INVESTIGATION.md` §19/§20 already state, recognition QUALITY remains a live
+measurement (`backend/tools/stt_benchmark.py`) rather than a property this phase can
+assert.
+
+### Intentionally NOT implemented
+
+Provider fallback, provider health/cooldown, credential pools, per-chunk provider
+selection, streaming/partial delivery, resumable transcription, FLAC division, MP3/
+M4A/WebM support, chunk overlap, cross-chunk deduplication, LLM chunk merging,
+transcript timing/diarization, TTS, and any change to OCR.
+
+### Known limitations
+
+1. **A chunk’s OGG granule positions are the source’s own absolute values** (and its
+   page sequence numbers are the source’s), because rewriting them would mean
+   recomputing the OGG page CRC — a variant the standard library does not provide
+   (`zlib.crc32` is the reflected ISO-HDLC CRC) and which cannot be verified in this
+   repository without a real Ogg fixture. The decoded audio of a chunk is exactly that
+   chunk’s own packets; only the container’s *declared* duration reads as its position
+   in the source. See the exact next stage.
+2. **Codec header pages are the leading pages whose granule position is 0** — how every
+   real Ogg Opus/Vorbis encoder writes the identification, comment and setup pages. An
+   encoder that packed an audio packet onto a header page would have that one page
+   re-emitted with each chunk (bounded, documented, and never a reason to cut a page).
+3. **A single OGG page / a FLAC stream that spans more than one chunk cannot be
+   divided** and is refused rather than approximated — hence the two existing 330 s
+   tests still assert a refusal.
+4. **A 3-pass configuration over 4 chunks can exhaust the 120 s aggregate deadline** and
+   fail honestly rather than run unbounded. The default is one pass, where the aggregate
+   is not the binding constraint for a 20-minute recording.
+5. The total bound (20 min) is what four chunks of 300 s can cover; longer recordings
+   need a delivery design the project does not have yet.
+
+### Exact next stage
+
+1. **Re-emit OGG chunk pages with normalized granule positions and renumbered sequence
+   numbers**, which requires an OGG CRC-32 implementation plus a real Ogg Opus fixture to
+   verify it against; that makes each chunk’s *declared* duration its own and removes
+   limitation 1.
+2. **Live verification** of a real long voice note end-to-end (one transcript, one
+   message) — the provider, credential and account work an offline suite cannot do.
+3. **FLAC division** only if a supported container truly needs it, and only with a real
+   frame parser rather than a guess.
+
+### Delivery
+
+This phase starts from `b5e7c10`, the `main` tip that already equalled `origin/main`
+when it began, and is delivered as ONE commit on top of it — no rebase, no force-push,
+no new branch, and no unrelated file touched. The delivered commit is the tip of `main`
+(`git log -1 --format=%H` re-verifies it).
+
+---
+
+## Previous phase — Media Processing M1.7: Video/GIF out of scope, and ONE controlled media response
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
 

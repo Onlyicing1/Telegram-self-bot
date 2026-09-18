@@ -93,6 +93,18 @@ measured far outside the project's documented resource budget. No transcript is
 ever fabricated, no hosted service is used, and no audio container whose
 duration cannot be determined is ever handed to an engine.
 
+M1.8 scope: the duration bound becomes the per-CHUNK ceiling instead of the
+ceiling for the whole request. A recording longer than one chunk is divided into
+ordered, bounded chunks by ``backend/services/stt_chunking.py`` — OGG pages and
+RIFF/WAVE frames only, never an arbitrary byte offset — and transcribed one chunk
+at a time through the SAME ``SttEngine`` seam, under an explicit chunk-count and
+total-duration cap and inside ONE aggregate deadline. A container that cannot be
+divided deterministically (FLAC, a single indivisible OGG page) is refused exactly
+as before rather than approximated. Everything else is unchanged: one download
+path, one transcript, one ``MediaAnalysis``, one owner-facing response, and the
+same zero-context rule — a chunk carries nothing but audio the boundary already
+validated.
+
 Scope: Video and GIF are explicitly OUTSIDE Media Processing. Both are refused
 deterministically from the classifier's own label (``UNPROCESSABLE_MEDIA_TYPES``)
 before any capability check, so neither can reach an extractor, a transfer or
@@ -106,6 +118,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -115,7 +128,7 @@ from typing import Any, Protocol
 from backend.ai.media import MediaInfo, classify_message
 from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS
 from backend.runtime.operation_watchdog import guarded_await
-from backend.services import settings_service
+from backend.services import settings_service, stt_chunking
 from backend.telegram_api import media as telegram_media
 from backend.telegram_api.exceptions import TelegramAPIError
 
@@ -250,6 +263,26 @@ MAX_STT_CHARS = MAX_EXTRACTED_CHARS
 #: M1.4 wall-clock bound for ONE transcription. Finite, well inside the media
 #: request's own envelope, and never applied to an unrelated AI request.
 STT_TIMEOUT_S = 60.0
+
+#: Bounded multi-chunk speech-to-text. ``MAX_STT_DURATION_S`` above is the longest
+#: audio ONE recognition may be asked to handle, so it is the per-CHUNK ceiling —
+#: not the ceiling for the whole request. A longer recording is divided into
+#: ordered chunks by ``backend/services/stt_chunking.py`` and transcribed one chunk
+#: at a time through the SAME ``SttEngine`` seam.
+#:
+#: Every bound is finite and together they make an unbounded number of provider
+#: calls impossible: the chunk count is capped explicitly, the total duration is
+#: that cap times the per-chunk ceiling (never an arbitrary large multiplier), the
+#: input-byte bound above is unchanged, and one request's whole transcription runs
+#: inside ONE aggregate deadline. That aggregate value is derived from the media
+#: envelope rather than invented: the handler's own backstop is 240s
+#: (``media_ai_service.DEFAULT_ENVELOPE_S``) and the provider call that answers an
+#: analytical media request reserves 120s of it
+#: (``media_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S``), so 120s is what is left
+#: for recognition — which is also exactly two per-chunk bounds.
+MAX_STT_CHUNKS = 4
+MAX_STT_TOTAL_DURATION_S = MAX_STT_CHUNKS * MAX_STT_DURATION_S
+STT_TOTAL_TIMEOUT_S = 120.0
 
 #: Container signatures. MIME alone is never trusted for a safety-relevant
 #: parse: the actual container must corroborate the declared type.
@@ -1162,7 +1195,9 @@ _STT_SIGNATURE_READERS = {
 }
 
 
-def _validate_audio_payload(data: bytes, mime_type: str) -> tuple[int, int, float]:
+def _validate_audio_payload(
+    data: bytes, mime_type: str, *, max_duration_s: float | None = None,
+) -> tuple[int, int, float]:
     """Corroborate the declared MIME and bound the decoded stream BEFORE any decode.
 
     The payload's own container signature must match the declared MIME, and the
@@ -1170,6 +1205,12 @@ def _validate_audio_payload(data: bytes, mime_type: str) -> tuple[int, int, floa
     bounds, so no container trick can ask an engine to chew on an unbounded
     decoded stream. A stream whose duration cannot be determined is refused
     rather than transcribed unbounded.
+
+    ``max_duration_s`` is the duration ceiling THIS check applies and defaults to
+    ``MAX_STT_DURATION_S``, which is what every other caller means. The audio
+    extraction passes the larger TOTAL ceiling instead, because a recording longer
+    than one chunk is divided by :mod:`backend.services.stt_chunking` rather than
+    refused here.
 
     Raises:
         MediaError: unsupported/unmatched container, invalid stream, a channel,
@@ -1200,10 +1241,11 @@ def _validate_audio_payload(data: bytes, mime_type: str) -> tuple[int, int, floa
             "The audio duration could not be determined, so speech-to-text "
             "cannot be bounded."
         )
-    if duration_s > MAX_STT_DURATION_S:
+    bound = MAX_STT_DURATION_S if max_duration_s is None else float(max_duration_s)
+    if duration_s > bound:
         raise MediaError(
             f"The audio is {duration_s:.0f}s — exceeds the "
-            f"{MAX_STT_DURATION_S:.0f}s speech-to-text bound."
+            f"{bound:.0f}s speech-to-text bound."
         )
     return channels, sample_rate, duration_s
 
@@ -1261,6 +1303,87 @@ async def _run_stt(
     return result if isinstance(result, str) else ""
 
 
+async def _run_stt_chunked(
+    engine: SttEngine, data: bytes, mime_type: str, duration_s: float,
+    request_id: str = "",
+) -> str:
+    """Transcribe ONE over-long audio payload as ordered, bounded chunks.
+
+    The division itself is :mod:`backend.services.stt_chunking`'s job and runs off
+    the event loop (container parsing is CPU-bound over an already size-bounded
+    payload). This function owns the OPERATION around it, and every rule it
+    enforces is deliberate:
+
+      * chunks are transcribed STRICTLY in source order, one at a time, always
+        with the ONE engine this request selected — a chunk never switches
+        provider, and no fallback happens here;
+      * each chunk keeps the engine's own multi-pass behaviour, because it is the
+        SAME ``transcribe`` seam: the configured pass count multiplies the calls
+        per CHUNK (chunks x passes, both already capped by the constants above),
+        and can never become an unbounded retry loop;
+      * the whole operation runs inside ONE aggregate deadline: each chunk gets the
+        smaller of the per-chunk bound and what is left of it, and a spent
+        deadline fails the operation instead of starting another chunk;
+      * a chunk that FAILS fails the WHOLE operation — the error propagates — so a
+        partial transcript is never returned as a complete transcription, and no
+        failed or skipped chunk is ever silently dropped.
+
+    The chunks are in-memory slices of the already-validated payload, so there is
+    no temporary file to leak on any exit path, and the plan (with the last chunk
+    built) is released before returning.
+    """
+    plan = await asyncio.to_thread(
+        stt_chunking.plan, data, mime_type,
+        max_chunk_duration_s=MAX_STT_DURATION_S, max_chunks=MAX_STT_CHUNKS,
+    )
+    if plan is None:
+        raise MediaError(
+            f"The audio is {duration_s:.0f}s — exceeds the "
+            f"{MAX_STT_DURATION_S:.0f}s speech-to-text bound and this container "
+            "cannot be divided into shorter parts of the same format.",
+            stage=MEDIA_STAGE_VALIDATION,
+        )
+    count = plan.count
+    _stage_trace(
+        "stt_chunks_planned", request_id=request_id, mime=mime_type,
+        chunks=count, duration_s=f"{duration_s:.1f}",
+    )
+    started = time.monotonic()
+    parts: list[str] = []
+    try:
+        for index in range(count):
+            remaining = STT_TOTAL_TIMEOUT_S - (time.monotonic() - started)
+            if remaining <= 0:
+                raise MediaError(
+                    f"Speech-to-text did not finish within "
+                    f"{STT_TOTAL_TIMEOUT_S:g}s ({index} of {count} parts "
+                    "transcribed).",
+                    stage=MEDIA_STAGE_STT_TIMEOUT,
+                )
+            payload = plan.chunk(index)
+            bound = min(STT_TIMEOUT_S, remaining)
+            _stage_trace(
+                "stt_chunk_invoked", request_id=request_id, index=index + 1,
+                chunks=count, bytes=len(payload), timeout_s=f"{bound:.1f}",
+            )
+            part = _normalize_extracted_text(
+                await _run_stt(engine, payload, bound, request_id=request_id)
+            )
+            _stage_trace(
+                "stt_chunk_returned", request_id=request_id, index=index + 1,
+                chunks=count, chars=len(part),
+            )
+            parts.append(part)
+    finally:
+        plan = None
+
+    merged = stt_chunking.join_transcripts(parts)
+    _stage_trace(
+        "stt_chunks_merged", request_id=request_id, chunks=count, chars=len(merged),
+    )
+    return merged
+
+
 async def _extract_audio_content(
     path: str, mime_type: str, limit: int, request_id: str = "",
 ) -> tuple[str, bool, str]:
@@ -1268,13 +1391,22 @@ async def _extract_audio_content(
 
     Bounds, in order: the payload must be inside the STT input bound, its
     signature must corroborate the declared MIME, its declared channels, sample
-    rate and duration must fit their bounds, transcription must finish inside the
-    STT timeout, and the normalized transcript is capped at ``limit`` characters.
+    rate and total duration must fit their bounds, transcription must finish
+    inside the STT timeout, and the normalized transcript is capped at ``limit``
+    characters.
+
+    Audio longer than ONE chunk is no longer refused: it is divided into ordered,
+    bounded chunks by :mod:`backend.services.stt_chunking` and transcribed through
+    the same engine seam, and the result is still ONE transcript and ONE
+    ``MediaAnalysis``. The character ceiling keeps its existing meaning in both
+    routes: a cap on the PRESENTED text, reported through ``truncated`` — never a
+    licence to drop audio from the transcription.
 
     The STT stages are traced individually — engine availability, engine
-    invocation, the engine's return (with its character count, so an EMPTY
-    transcript is distinguishable from a failure) and the engine's failure (with
-    its bounded reason) — so a live request identifies its leg without guessing.
+    invocation, each chunk of a divided recording, the engine's return (with its
+    character count, so an EMPTY transcript is distinguishable from a failure) and
+    the engine's failure (with its bounded reason) — so a live request identifies
+    its leg without guessing.
     """
     engine = _stt_engine
     if engine is None:
@@ -1297,7 +1429,9 @@ async def _extract_audio_content(
         )
 
     try:
-        _validate_audio_payload(data, mime_type)
+        _channels, _sample_rate, duration_s = _validate_audio_payload(
+            data, mime_type, max_duration_s=MAX_STT_TOTAL_DURATION_S,
+        )
     except MediaError as exc:
         # The validation leg refuses the container before any engine is invoked;
         # the refined message is preserved and only the stage is attributed.
@@ -1305,11 +1439,18 @@ async def _extract_audio_content(
             exc.stage = MEDIA_STAGE_VALIDATION
         raise
 
-    _stage_trace(
-        "stt_engine_invoked", request_id=request_id,
-        engine=type(engine).__name__, bytes=len(data),
-    )
-    raw_text = await _run_stt(engine, data, STT_TIMEOUT_S, request_id=request_id)
+    if duration_s > MAX_STT_DURATION_S:
+        # Longer than ONE recognition may handle: divided into ordered, bounded
+        # chunks and transcribed one at a time through the same engine seam.
+        raw_text = await _run_stt_chunked(
+            engine, data, mime_type, duration_s, request_id=request_id,
+        )
+    else:
+        _stage_trace(
+            "stt_engine_invoked", request_id=request_id,
+            engine=type(engine).__name__, bytes=len(data),
+        )
+        raw_text = await _run_stt(engine, data, STT_TIMEOUT_S, request_id=request_id)
     text = _normalize_extracted_text(raw_text)
     _stage_trace(
         "stt_engine_returned", request_id=request_id,
