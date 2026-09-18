@@ -142,6 +142,7 @@ EXPECTED_TOOLS = {
     "translate_history": PermissionLevel.READ_ONLY,
     "summarize_history": PermissionLevel.READ_ONLY,
     "send_message": PermissionLevel.READ_WRITE,
+    "text_to_speech": PermissionLevel.READ_WRITE,
     "memory_store": PermissionLevel.READ_WRITE,
     "memory_list": PermissionLevel.READ_ONLY,
 }
@@ -154,7 +155,7 @@ def test_registry_contains_exactly_the_expected_tools():
         f"registry mismatch: missing={set(EXPECTED_TOOLS) - names} "
         f"extra={names - set(EXPECTED_TOOLS)}"
     )
-    assert len(registry.list()) == 43
+    assert len(registry.list()) == 44
 
 
 @pytest.mark.asyncio

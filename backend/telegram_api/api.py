@@ -115,6 +115,23 @@ class TelegramAPI:
             self._client, message, file_path, progress_callback, timeout,
         )
 
+    async def send_voice(
+        self,
+        chat_id: int | str,
+        audio: bytes | bytearray,
+        mime_type: str = media.VOICE_NOTE_MIME,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Send ONE bounded audio buffer as a Telegram voice message.
+
+        The caller owns the DESTINATION and the bounds of the audio; this facade
+        owns only the bounded transfer, exactly like ``download_media`` owns the
+        bounded one in the other direction.
+        """
+        return await media.send_voice(
+            self._client, chat_id, audio, mime_type, timeout,
+        )
+
     # ── Entities ──
 
     async def get_chat(self, chat_id: int | str) -> dict[str, Any]:

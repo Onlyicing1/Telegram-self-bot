@@ -1,21 +1,24 @@
 """
-Media module — bounded download of one message's media.
+Media module — bounded transfer of one message's media, in both directions.
 
-Downloads to a file path or returns raw bytes. The caller (service layer)
-enforces the SIZE limit; this module owns the TIME bound: every download runs
-under ``guarded_await`` — the same bounded-operation primitive ``messages``
-uses — so a stalled transfer can never hang the event loop. A large transfer
-legitimately outlives the short-call bound, so the ceiling is its own finite
-constant rather than the 30s used by the short RPC helpers.
+Downloads to a file path or returns raw bytes; uploads ONE bounded audio buffer
+as a voice message. The caller (service layer) enforces the SIZE limit; this
+module owns the TIME bound: every transfer runs under ``guarded_await`` — the
+same bounded-operation primitive ``messages`` uses — so a stalled transfer can
+never hang the event loop. A large transfer legitimately outlives the short-call
+bound, so the ceiling is its own finite constant rather than the 30s used by the
+short RPC helpers.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 from typing import Any
 
 from backend.runtime.operation_watchdog import guarded_await
+from backend.telegram_api._helpers import serialize_message
 from backend.telegram_api.exceptions import (
     TelegramAPIError,
     TelegramTimeoutError,
@@ -29,6 +32,16 @@ logger = logging.getLogger(__name__)
 #: honestly instead of holding the request forever. This is the single
 #: authority for the bound — the media service derives its budget from it.
 MEDIA_DOWNLOAD_TIMEOUT_S = 120.0
+
+#: Finite ceiling for ONE media upload. Uploading an already-produced, bounded
+#: buffer is a single short RPC by nature, but it is never unbounded: the send
+#: fails honestly instead of holding the request forever.
+MEDIA_UPLOAD_TIMEOUT_S = 120.0
+
+#: Telegram's own voice-note representation: an OGG container with Opus audio.
+#: Declared here (not at the call site) so one caller cannot name a different
+#: container while asking for a voice message.
+VOICE_NOTE_MIME = "audio/ogg"
 
 
 async def download_media(
@@ -88,3 +101,63 @@ def _effective_timeout(timeout: float | None) -> float:
     if value <= 0:
         return MEDIA_DOWNLOAD_TIMEOUT_S
     return min(value, MEDIA_DOWNLOAD_TIMEOUT_S)
+
+
+async def send_voice(
+    client: Any,
+    chat_id: int | str,
+    audio: bytes | bytearray,
+    mime_type: str = VOICE_NOTE_MIME,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Send ONE bounded audio buffer as a Telegram VOICE message.
+
+    The buffer is already-produced audio (the TTS boundary's normalized clip), so
+    this helper owns only the transfer: it never parses, transcodes, names or
+    stores it. ``chat_id`` is the caller's TRUSTED destination, resolved from
+    runtime context — this module never chooses a recipient.
+
+    ``timeout`` lets a caller impose a tighter bound than the module ceiling;
+    ``None`` (or a non-positive value) means "use the ceiling".
+
+    Raises:
+        TelegramAPIError:     nothing usable to send, or the upload failed.
+        TelegramTimeoutError: the upload exceeded its bound.
+    """
+    if not isinstance(audio, (bytes, bytearray)) or not audio:
+        raise TelegramAPIError("send_voice needs audio bytes; nothing was sent.")
+    effective = _effective_upload_timeout(timeout)
+    try:
+        message = await guarded_await(
+            client.send_file(
+                chat_id,
+                io.BytesIO(bytes(audio)),
+                voice_note=True,
+                force_document=False,
+                mime_type=mime_type,
+            ),
+            name="telegram:send_voice",
+            timeout=effective,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "TELEGRAM_VOICE_TIMEOUT timeout=%.1fs — voice note was not sent in time",
+            effective,
+        )
+        raise TelegramTimeoutError(f"send_voice timed out after {effective}s")
+    except Exception as exc:
+        if isinstance(exc, TelegramAPIError):
+            raise
+        raise TelegramAPIError(f"send_voice failed: {exc}") from exc
+    return serialize_message(message)
+
+
+def _effective_upload_timeout(timeout: float | None) -> float:
+    """Clamp a caller-supplied upload bound to the module ceiling (fail-closed)."""
+    try:
+        value = float(timeout) if timeout is not None else MEDIA_UPLOAD_TIMEOUT_S
+    except (TypeError, ValueError):
+        return MEDIA_UPLOAD_TIMEOUT_S
+    if value <= 0:
+        return MEDIA_UPLOAD_TIMEOUT_S
+    return min(value, MEDIA_UPLOAD_TIMEOUT_S)

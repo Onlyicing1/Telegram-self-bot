@@ -5,8 +5,9 @@ This module owns ONE AI sub-surface and everything behind it:
     AI
     └── Media Analysis            (``ai_media``)
         ├── Text recognition       (``ai_media_ocr``)
-        └── Speech-to-Text         (``ai_media_stt``)
-            └── STT Settings       (``ai_media_stt_settings``)
+        ├── Speech-to-Text         (``ai_media_stt``)
+        │   └── STT Settings       (``ai_media_stt_settings``)
+        └── Text-to-Speech         (``ai_media_tts``, see ``ai_tts_settings``)
 
 The Speech-to-Text screen is a compact control panel: the active candidate and
 its state, the ordered provider list with each candidate's own state, ONE global
@@ -199,18 +200,22 @@ async def _ai_media_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     _owner, config = await _saved_config()
     ocr_ready = _ocr_ready()
 
+    from backend.bot.handlers.ai_tts_settings import tts_status_line
+
     lines = [
         "**Media Analysis**",
         "",
-        "Reads what the messages you reply to actually contain.",
+        "Reads what the messages you reply to actually contain — and speaks text back.",
         "",
         f"Text recognition · {'Ready' if ocr_ready else 'Not configured'}",
         stt_selection_line(config),
+        tts_status_line(),
     ]
 
     builder = InlinePanelBuilder()
     builder.add_row("Text recognition (OCR)", "panel:ai_media_ocr")
     builder.add_row("Speech-to-Text", "panel:ai_media_stt")
+    builder.add_row("Text-to-Speech", "panel:ai_media_tts")
     _nav_buttons(builder)
     return "Media Analysis", "\n".join(lines), builder.build()
 

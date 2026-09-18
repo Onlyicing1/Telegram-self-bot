@@ -1,8 +1,479 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M2.4: STT credential pool and API-key rotation
+## Latest phase — Media Processing M3.0: controlled Text-to-Speech foundation
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Media Processing M3.0** — ONE bounded, provider-aware Text-to-Speech capability: a controlled synthesis boundary, one provider adapter, one AI tool and one read-only surface |
+| Starting HEAD | `dbc3f28` `feat(stt): keep a bounded credential pool per provider` (== `origin/main` at phase start) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Provider selected | **OpenAI speech** — `POST {AI_OPENAI_BASE_URL}/audio/speech`, model **`gpt-4o-mini-tts`**, voice **`alloy`**, `response_format` **`opus`** (see “The provider decision” for why, and for the source of every name) |
+| Database migration shipped by this phase | **NONE** — no table, no column, no migration, no SQL. `DATABASE_ARCHITECTURE.md` is untouched |
+| New environment variables | **NONE** — the credential is the OpenAI variable this repository already declares, and the base URL is the one it already declares |
+| New dependencies | **NONE** (`backend/requirements.txt` untouched; `httpx` was already the provider transport) |
+| Files changed | **fourteen** — NEW `backend/services/tts_service.py`, NEW `backend/services/openai_tts_engine.py`, NEW `backend/ai/tools/speech.py`, NEW `backend/bot/handlers/ai_tts_settings.py`, NEW `tests/test_tts_service.py`, NEW `tests/test_tts_openai_engine.py`; MODIFIED `backend/telegram_api/media.py`, `backend/telegram_api/api.py`, `backend/ai/tools/registry.py`, `backend/bot/handlers/ai_stt_settings.py`, `backend/bot/router.py`, `tests/test_tool_health_audit.py`, `tests/test_memory_tools.py`, `tests/test_capability_exposure_tools.py` |
+| Behavioural change | **additive only**: one new capability (one new tool, one new read-only panel) and one new bounded Telegram transfer helper. No existing command, panel, tool, provider, engine or STT/media behavior was changed |
+| Persisted state | **NONE** — this phase writes no setting, because it has no owner-facing setting to write; the capability is deployment configuration |
+| Live Telegram verification | **NOT PERFORMED** — no Telegram session exists in this environment |
+| Live provider verification | **NOT PERFORMED** — no provider credential exists in this environment, so no synthesis has ever been sent to OpenAI |
+| Speech-quality / Persian claim | **NONE** — no synthesis has been heard, and no quality, pronunciation or language claim is made |
+
+### Purpose of this phase
+
+The media stack could READ: it transcribes (STT), recognises text in images (OCR),
+and extracts documents. It could not SPEAK. This phase adds the missing direction
+as a capability of its own, with the same discipline the reading capabilities were
+built with:
+
+```
+AI request (ONE structured action)
+        ↓
+deterministic capability decision       tts_service (fail-closed)
+        ↓
+the synthesis boundary                  tts_service      ← NEW
+        ↓
+the provider adapter                    openai_tts_engine ← NEW
+        ↓
+normalized clip (bounded bytes)
+        ↓
+the EXISTING Telegram transfer           telegram_api/media.send_voice
+the EXISTING AI tool path                ToolExecutor → text_to_speech tool
+```
+
+Speech synthesis is deliberately NOT an STT component. It shares no type, no
+seam, no failure token and no provider adapter with recognition; the new modules
+import none of `stt_fallback`, `stt_credential_pool`, `stt_control_plane`,
+`stt_engine_factory`, `stt_chunking`, `stt_consensus`, `stt_provider_probe`,
+`gemini_media_engine`, `groq_stt_engine` or `speechmatics_stt_engine` — proven by
+test, and by the fact that a synthesis never touches the process's provisioned STT
+engine. `media_service` is untouched, `MediaAnalysis` never represents synthesized
+audio, and the M2.3/M2.4 fallback and credential layers are unchanged.
+
+### The provider decision
+
+**OpenAI was chosen because the repository already declares everything it needs,
+and nothing new is introduced.**
+
+* The credential variables `AI_OPENAI_API_KEY` / `OPENAI_API_KEY` are the ones
+  `backend/ai/providers/factory.py` already resolves for OpenAI, in that same
+  precedence order. An installation that already enabled OpenAI for chat can
+  speak with **no additional key**.
+* The base URL variable `AI_OPENAI_BASE_URL` is that same factory's own.
+* The API contract is a single documented, non-preview request that returns the
+audio itself as the response body, with a documented `opus` output format —
+  which is the low-latency format Telegram's voice-note representation uses, so
+  the response is delivered as-is with **no local transcoding and no audio
+  dependency**.
+* Nothing else in the repository could support synthesis safely: Groq and
+  Speechmatics expose transcription only, and the other registered providers are
+  OpenAI-compatible CHAT gateways whose synthesis contract is not established by
+  anything in this repository. The Gemini media route is a transcription/vision
+  engine, and using it here would have meant altering an STT component.
+
+Every name the adapter sends was taken from the provider's own published contract,
+not inferred: the endpoint path, the model id, the voice list, the output formats
+and the supported-language list. The model and the voice are CLOSED sets in the
+adapter, so neither can be typed or computed into a request.
+
+### The capability hierarchy — where each concern lives
+
+| Concern | Owner |
+|---|---|
+| the registered capability (provider, model, voice, format) | `backend/services/openai_tts_engine.py` (**NEW**) |
+| validation, bounds, the capability decision, the timeout, output validation, the normalized clip, the failure taxonomy | `backend/services/tts_service.py` (**NEW**) |
+| the provider HTTP request | `backend/services/openai_tts_engine.py` — ONE `httpx.AsyncClient` POST, nothing else |
+| the AI-facing request surface | `backend/ai/tools/speech.py` (**NEW**) — registered in the EXISTING registry |
+| the Telegram transfer | `backend/telegram_api/media.py` (**extended**, one bounded helper) + the existing facade |
+| the owner-facing surface | `backend/bot/handlers/ai_tts_settings.py` (**NEW**), under the EXISTING **AI → Media Analysis** hub |
+| tool execution, history, permissions, long-running exemption | the EXISTING `ToolExecutor` / `ToolRegistry` / `Dispatcher` — **unchanged** |
+| the provider mesh, STT, OCR, fallback, credential pool, media boundary | **untouched** |
+
+No second executor, no second registry, no second Telegram abstraction, no second
+panel framework, no second configuration store.
+
+### The boundary — `backend/services/tts_service.py`
+
+The ONE thing a caller may use is
+`await synthesize(text, *, request_id, timeout_s) -> SpeechClip`. It performs, in
+order: validate → resolve the registered provider and its credential → ONE
+provider call under ONE awaited timeout → validate the audio → return the clip.
+There is no retry loop, no queue, no worker, no persisted state.
+
+`SpeechClip` is deliberately minimal — `audio`, `mime_type`, `file_name`,
+`characters`, `provider`, `model`, `voice`, `duration_s` — and carries **no chat
+id, message id, sender, username, caption, reply text, conversation history or
+arbitrary Telegram metadata**. It is bounded resident bytes with no path and no
+file handle, is never persisted, and is the only value the caller receives.
+
+`normalize_request_text` removes leading/trailing whitespace only. Interior
+whitespace is content and is never collapsed, and the text is never translated,
+summarized, truncated or otherwise rewritten: the owner gets exactly the words
+that were requested, or an honest refusal.
+
+### The deterministic capability decision
+
+The decision is deterministic and fail-closed, and lives at ONE seam:
+`capability_reason()` builds a probe engine through the same adapter a request
+would use and returns `""` when synthesis can run, or ONE bounded failure token
+(`missing_credential`, `unsupported_model`, `unsupported_voice`,
+`provider_unavailable`). Because the panel and the request path consult the same
+function, the state the owner is shown and the outcome a request gets **cannot
+disagree**.
+
+The synthesis INTENT is the model's structured action — a single registered tool
+call with a bounded `text` argument. This phase deliberately adds **no
+natural-language “read this aloud” parser**: such a parser would need a new
+phrase inventory and language claims this phase cannot support, whereas a tool
+call is already the repository's deterministic, schema-bounded request contract,
+and it is the mechanism the phase instruction prescribes (“the AI may request a
+structured TTS action; the application executes that action”). Consequently the AI
+never gains Telegram, filesystem or audio authority: it can only name words, and
+the runtime decides whether, where and how they are spoken.
+
+### The adapter — `backend/services/openai_tts_engine.py`
+
+One request, and its whole contract is asserted by test:
+
+```
+POST {AI_OPENAI_BASE_URL}/audio/speech      default base https://api.openai.com/v1
+Authorization: Bearer <credential>          Content-Type: application/json
+{ "model": "gpt-4o-mini-tts", "input": "<the text>", "voice": "alloy",
+  "response_format": "opus" }
+→ 200, the audio itself as the response body
+```
+
+The adapter is async (`httpx.AsyncClient`), so no blocking call can enter the event
+loop and no worker thread is involved. It holds no request state, caches nothing
+and persists nothing. `build_engine` is a pure function of
+`(model, voice, api_key, base_url)`: an unregistered model or voice is refused
+here too, and a missing credential yields `(None, "missing_credential")` instead
+of an exception, so provisioning stays optional and the boundary reports that
+state honestly rather than substituting a provider the owner did not select.
+
+### Bounds, timeout and temporary resources
+
+| Bound | Value | Why |
+|---|---|---|
+| `MAX_TTS_INPUT_CHARS` | **1000** characters | Finite and far below the speech model's 2000-token request bound in every supported script, so a request refused here was never at risk of being silently cut |
+| `TTS_TIMEOUT_S` | **60 s** | ONE wall-clock bound around the provider call, measured by the boundary; the adapter derives every `httpx` phase bound from the remaining budget and never invents a second deadline |
+| `MAX_REQUEST_TIMEOUT_S` | **120 s** | The adapter's own ceiling, which clamps any caller-supplied budget so a future caller can never turn it into an unbounded request; the boundary's 60 s is what actually applies |
+| `MIN_REQUEST_TIMEOUT_S` | **8 s** | A request is not started with less budget than this left — it fails as `deadline` instead of being started only to time out |
+| `MAX_TTS_AUDIO_BYTES` | **5 MiB** | The output ceiling, roughly three minutes of the requested format, so a bounded input cannot legitimately reach it and an over-sized body is a provider anomaly |
+| `MEDIA_UPLOAD_TIMEOUT_S` | **120 s** | The finite ceiling for the ONE Telegram transfer |
+
+**Temporary resources: there are none.** The clip is bounded resident bytes and the
+path creates no temporary file — no `tempfile`, no `mkstemp`, no `shutil` anywhere
+in the boundary (asserted from source) — so cleanup is unconditional by
+construction on success, provider failure, validation failure, timeout,
+cancellation and unexpected exception. The suite proves that a synthesis and a
+failed synthesis both leave the system temp directory byte-identical.
+
+An over-long request is **REFUSED, never truncated**: silently speaking a prefix
+would deliver something the owner did not ask for.
+
+### Telegram delivery — ONE voice message
+
+`backend/telegram_api/media.py` gains ONE bounded helper, `send_voice`, in the
+same module that already owns the bounded DOWNLOAD — the same
+`guarded_await` bound discipline, the same exception mapping, the same
+`serialize_message` result shape, and a module-level `VOICE_NOTE_MIME` so a caller
+cannot name a different container while asking for a voice message. The facade
+exposes it as `TelegramAPI.send_voice`.
+
+The tool sends **exactly one** voice note through that helper and returns ONE
+`ToolResult`. There is no multi-message burst, no intermediate provider or debug
+message, and the destination is resolved from TRUSTED runtime context
+(`extra["chat_id"]`, falling back to the owner's own chat) — never from model
+output, exactly like `SendMessageTool` and `RetrieveSaveTool`. The result carries
+the bounded synthesis facts (`characters`, `mime_type`, `voice`, `model`) and
+deliberately **not** the destination chat, so no Telegram identifier travels back
+into the model's conversation either.
+
+### Zero-context guarantee
+
+The provider receives the text being synthesized and the minimum synthesis
+configuration, and nothing else:
+
+* the request body has exactly four fields — asserted by test;
+* the service's signature has no parameter that could carry Telegram context, and
+the tool calls it with `text` plus `(request_id, timeout_s)` only — asserted by a
+  spy on that exact call;
+* the adapter's `speak(text, *, timeout_s)` has no chat/message parameter, and the
+  serialized request is asserted to contain none of `chat`, `message_id`,
+  `caption`, `sender`, `username`, `reply`, `owner`, `history`;
+* the synthesis log line carries the input LENGTH, never the input text.
+
+### The failure taxonomy
+
+Nineteen closed, deterministic classes — `missing_credential`, `auth`,
+`forbidden`, `rate_limit`, `quota_exceeded`, `invalid_request`,
+`unsupported_model`, `unsupported_voice`, `empty_input`, `input_too_large`,
+`timeout`, `transport`, `server`, `malformed_response`, `empty_audio`,
+`output_too_large`, `provider_rejection`, `deadline`, `provider_unavailable` —
+each with the leg that raised it (`TTS_STAGE_*`), the provider's HTTP status when
+it answered, and an honest `retryable` verdict (transient classes only).
+
+`TtsError` is the ONLY handled failure type: an already-classified provider failure
+propagates **unchanged**, `asyncio.CancelledError` is re-raised, and a programming
+error is never dressed up as a provider failure. Provider responses are classified
+from the status plus the provider's OWN bounded `code`/`type` token (so a refused
+voice, a refused model and a refused input are told apart deterministically);
+free-form prose is never parsed, no non-2xx is ever re-sent, and the credential is
+redacted from every message the adapter produces. `retryable` is metadata only:
+**this phase performs no retry and no provider fallback.**
+
+### Configuration and credential model
+
+The credential is deployment configuration and is read through the provider's own
+declared variable names — never an environment sweep, never a database column,
+never Telegram. There is **no TTS credential pool** in this phase: the instruction
+was explicit that the STT pool must not be copied, and the audit found no second
+provider to warrant a provider-agnostic refactor, so the M2.4 STT pool is
+untouched.
+
+**No owner-facing TTS setting exists, and therefore no schema change was needed.**
+The `ai_config` table has a FIXED column set and the writer builds an explicit
+column payload, so persisting a new TTS key would have required a new column —
+which this phase's scope forbids unless it is unavoidable. It is not unavoidable:
+the first phase has one registered capability and no behavior-changing setting, so
+the surface is read-only and nothing is persisted. That also keeps the panel
+honest — it offers no control that would not work.
+
+### The Telegram surface — read-only, under Media Analysis
+
+```
+AI
+└── Media Analysis            (ai_media, existing hub — one new row)
+    ├── Text recognition       (existing)
+    ├── Speech-to-Text         (existing)
+    └── Text-to-Speech         (ai_media_tts — NEW, read-only)
+```
+
+The screen reports only what is true: the registered provider, model, voice and
+output format; the input limit and the synthesis timeout; and whether a credential
+is present. It never claims provider HEALTH (a credential existing is not evidence
+that a provider answers — only a real request can say that), never prints or hints
+at a credential value, and never names an environment variable. When the
+capability cannot run it says so plainly and states that nothing is sent. It
+registers through the ONE shared panel/navigation registry and registers **no
+action and no input** in this phase.
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/services/tts_service.py` | **NEW** — the boundary: bounds, closed taxonomy, `TtsError`, `SpeechClip`, the capability decision, the awaited provider call, output validation |
+| `backend/services/openai_tts_engine.py` | **NEW** — the adapter: closed model/voice sets, the ONE POST, status classification, secret redaction, bounded phase timeouts |
+| `backend/ai/tools/speech.py` | **NEW** — `text_to_speech`: one bounded `text` argument, trusted destination, ONE voice note, a result with no Telegram identifier |
+| `backend/bot/handlers/ai_tts_settings.py` | **NEW** — the read-only Text-to-Speech panel + its Media Analysis hub line |
+| `backend/ai/tools/registry.py` | MODIFIED — `SpeakTool` registered in the ONE registry (2 lines) |
+| `backend/telegram_api/media.py` | MODIFIED — the bounded `send_voice` helper + `VOICE_NOTE_MIME` + the upload ceiling (download path untouched) |
+| `backend/telegram_api/api.py` | MODIFIED — the `send_voice` facade method |
+| `backend/bot/handlers/ai_stt_settings.py` | MODIFIED — the hub row, the hub status line, and the module's surface tree |
+| `backend/bot/router.py` | MODIFIED — register the new handler module (2 lines) |
+| `tests/test_tts_service.py` | **NEW** — 56 tests (boundary, tool, panel, isolation) |
+| `tests/test_tts_openai_engine.py` | **NEW** — 42 tests (request contract, capability set, credentials, taxonomy, bounds, secret hygiene) |
+| `tests/test_tool_health_audit.py` | MODIFIED — the tool inventory gains `text_to_speech: READ_WRITE`; expected count 43 → 44 |
+| `tests/test_memory_tools.py` | MODIFIED — registry-count assertion 43 → 44 |
+| `tests/test_capability_exposure_tools.py` | MODIFIED — duplicate-registration count 43 → 44 |
+
+### Tests added and exact results
+
+| Suite | Result |
+|---|---|
+| `tests/test_tts_openai_engine.py` (new) | **`42 passed` in 0.22 s** |
+| `tests/test_tts_service.py` (new) | **`56 passed` in 0.26 s** |
+| the STT / media regression set (`test_ai_stt_settings.py`, `test_stt_fallback.py`, `test_stt_credential_pool.py`, `test_stt_provider_probe.py`, `test_stt_consensus.py`, `test_media_stt.py`, `test_media_stt_chunking.py`, `test_media_stt_language.py`, `test_media_stt_multipass.py`, `test_media_stt_reliability.py`, `test_media_stt_benchmark.py`, `test_media_direct_stt.py`, `test_media_dedicated_stt.py`, `test_groq_stt_engine.py`, `test_speechmatics_stt_engine.py`) | **`894 passed, 2 skipped` in 9.29 s** |
+| **Full suite** | **`4162 passed, 26 skipped, 3 warnings` in 114.75 s** |
+
+Count provenance, so the arithmetic is auditable: this phase's starting HEAD
+`dbc3f28` was recorded by the M2.4 section below as **4064 passed / 26 skipped**.
+This phase adds **98** tests and deletes, weakens or skips **none** →
+**4162 / 26**. (The `26` skips are the pre-existing opt-in live probes; the local
+interpreter is CPython 3.10.12 while production is the `render.yaml` pin of
+3.11.7.) The three MODIFIED test files above are inventory assertions that must
+name every registered tool; they were updated to include the new tool and nothing
+else about them changed.
+
+The new suites pin, from the source rather than from prose:
+
+* **the request** — exactly ONE POST to the documented path, with the bearer
+  credential and a JSON body of exactly four fields, sent verbatim; the configured
+  base URL is honored and the public base is the default; the body can never carry
+  a chat/message/caption/sender/reply field; the service and engine signatures
+  have no parameter that could carry Telegram context; the tool calls the boundary
+  with the text plus `(request_id, timeout_s)` and nothing else;
+* **the closed capability set** — only the registered model and a documented voice
+  can be built; a typed model or voice is refused; `SUPPORTED_MODELS` and the
+  voice set are the declared ones;
+* **credentials** — the repository's own OpenAI variables in their existing
+  precedence order; a decoy variable is never read; a missing credential is a
+  bounded reason and not an exception; the only traced credential identity is a
+  variable NAME;
+* **validation and bounds** — only surrounding whitespace is removed and interior
+  whitespace is preserved; empty/whitespace/non-string input is refused; an
+  over-long request is REFUSED (never truncated) and never reaches the provider;
+  the limit boundary is inclusive; every bound is the documented finite value; the
+  caller's budget is clamped to the ceiling and every `httpx` phase bound is
+  derived from what is left;
+* **the failure taxonomy** — every status (401/403/404/429/5xx/other) is
+  classified with its HTTP status; only transient families are retryable; a 400 is
+  narrowed by the provider's own token (voice / model / input / generic); a spent
+  quota is its own class; a timeout, a transport failure, an empty body, a JSON
+  body on the success path, an over-sized body and a spent deadline are each their
+  own class; the taxonomy is closed and every token the adapter can raise belongs
+  to it; a programming error is never converted and a `CancelledError` is
+  re-raised;
+* **the tool** — one bounded `text` argument and no other accepted shape; the
+  destination comes from trusted context, not arguments; a missing text, a missing
+  transport and an untrusted destination all send nothing; every failure surfaces
+  as a failed result with its bounded class and no send; the result data and
+  message carry no chat identifier; the metadata (`READ_WRITE`, `safe`,
+  `long_running`, `required_arguments`, the bounded parameter schema) is the
+  documented one; the tool is present in the ONE registry and visible to the
+  provider schema list; the synthesis budget is the request's own envelope capped
+  by the boundary ceiling;
+* **the surface** — it registers under `ai_media`, reports the registered
+  capability, says “No credential on this runtime” when nothing can run, offers no
+action and no input (`No owner controls`), and its hub line appears in the Media
+  Analysis hub beside the existing rows;
+* **temporary resources** — the boundary's source creates no temporary file, and
+  both a successful and a failed synthesis leave the temp directory unchanged;
+* **async / event-loop safety** — the boundary and the adapter methods are
+  coroutines, the service contains no `httpx` and no `to_thread`, and the adapter
+  uses `AsyncClient` and no blocking client;
+* **secret hygiene** — the credential never appears in a failure message (and is
+  redacted when the provider echoes it) and never in a log line, while the bounded
+  facts (provider, model, voice, input LENGTH, bytes, elapsed, class, status) do;
+* **capability isolation** — neither new module references any STT/media-engine
+  module, neither exposes `transcribe`, and a synthesis and a tool call never touch
+  the process's provisioned STT engine.
+
+**Syntax / whitespace:** `python -m py_compile` clean on all fourteen changed Python
+files; `git diff --check` clean.
+
+### Database impact
+
+**NONE.** No table, no column, no view, no function, no migration, no SQL, and
+`DATABASE_ARCHITECTURE.md` is untouched. Nothing on the TTS path reads the
+database either: the capability is deployment configuration, so a synthesis makes
+no database call at all. There is consequently **no manual Supabase step required
+by this phase** — unlike M2.4, whose optional Vault RPC remains outstanding.
+
+### Environment impact
+
+**NONE.** No variable was added, renamed or removed. Speech synthesis uses
+`AI_OPENAI_API_KEY` / `OPENAI_API_KEY` (the variables this repository already
+declares for OpenAI, first match wins) and `AI_OPENAI_BASE_URL` (that same
+declaration), defaulting to `https://api.openai.com/v1`. Consequently:
+
+* an installation that already has an OpenAI key gets the capability with **no
+  configuration change**;
+* an installation without one sees the capability reported as
+  “No credential on this runtime” and nothing is ever sent;
+* `render.yaml` is untouched, and no numbered or scanned variable exists.
+
+### Live verification status
+
+* **Live Telegram: NOT PERFORMED.** No Telegram session or traffic exists in this
+  environment, so no voice message has been delivered, played or inspected. The
+  delivery contract is proven by test against a recording facade and the real
+  bounded transfer helper's shape — not by a live walkthrough.
+* **Live provider: NOT PERFORMED.** No OpenAI credential exists here, so **no
+  synthesis has ever been sent to the real endpoint**. Every provider interaction
+  in this phase's evidence is a scripted `httpx` transport or a fake engine. No
+  provider is claimed healthy, reachable or correctly billed.
+* **Speech quality: unmeasured and unclaimed.** Nothing in this phase has heard a
+  generated voice. In particular, although the provider's published contract lists
+  Persian among its supported input languages, this phase makes **no claim about
+  Persian pronunciation, accent or intelligibility**, and it performed no
+  translation and no language detection.
+* **Voice-note rendering: unverified live.** The requested `opus` format is the
+  format Telegram's voice-note representation uses, so the response is delivered
+  as-is with no transcoding; that the delivered message renders as a voice note
+  with a server-computed duration has not been observed live (see limitation 3).
+
+### Known limitations
+
+1. **One provider, one model, one voice, no fallback and no retry.** The phase
+   instruction deliberately excluded provider management: the adapter marks the
+   transient classes retryable, but nothing consumes that verdict yet, so a
+   provider outage fails with its own bounded class rather than trying another
+   provider. Voice selection is likewise deferred: the voice is fixed so the same
+   text produces the same deterministic result.
+2. **No owner-facing setting and no persistence.** The surface is read-only by
+   design. Making the model, voice or format configurable needs storage, and the
+   `ai_config` writer is column-explicit, so that change would require the pending
+   migration discussed below — it was NOT smuggled into this phase.
+3. **Duration is reported as 0.** The speech response carries no duration metadata
+   and the container is deliberately not parsed, so the value is left explicitly
+   unknown rather than guessed. Telegram renders the voice note regardless; a
+   client that shows a duration derives it itself.
+4. **The response container is not re-validated locally.** Only non-emptiness and
+   the byte ceiling are checked, so a future format change cannot be refused by a
+   stale local magic-bytes guess; Telegram remains the validator of what it
+   receives.
+5. **A synthesis is the request's whole budget, not a pipelined stream.** One
+   request produces one clip; there is no streaming, no partial delivery and no
+   chunking.
+6. **The tool result is a separate message from the voice note.** The AI's one
+   confirmation line follows the existing tool-result convention (the same shape
+   `send_message` and `retrieve_save` already use) rather than being merged into
+   the voice message.
+7. **The capability is deployment-global, not per-owner.** This is a single-owner
+   self-bot, so the credential and the registered capability are runtime
+   configuration; there is no per-owner TTS profile.
+
+### Deferred work
+
+* **TTS provider fallback and a TTS credential pool** — the analogue of M2.3/M2.4
+  for synthesis. The taxonomy already carries an honest `retryable` verdict and
+  the adapter is one small seam, but nothing was built ahead of a second provider.
+* **Voice / model / format selection with persistence** — needs the `ai_config`
+  column decision above, plus a registered candidate registry if the store's
+  convention (finite registered candidates, never typed ids) is to hold.
+* **Speech-quality benchmarking** — including whether Persian input is delivered
+  intelligibly, which only a live listening comparison can establish.
+* **Streaming/interruptible synthesis and length/style controls** — not attempted.
+* Still open from earlier phases and unchanged by this one: **Native Vision**,
+  **Video/GIF processing**, real Persian recognition benchmarking, evidence-based
+  STT provider ranking, a persisted STT credential roster, the manual Supabase
+  Vault configuration, and the pending `ai_config` migration with the
+  documentation-only `DATABASE_ARCHITECTURE.md` §7 refresh.
+
+### Exact next phase
+
+1. **Live verification of M3.0** — send one real synthesis request and confirm:
+   exactly ONE voice note arrives in the owner's chat and plays; the log carries
+   `TTS_STAGE … stage=tts_completed` with `provider=openai`, `model`, `voice`,
+   `chars`, `bytes` and **no text, no credential and no identifier**; and that
+   `AI → Media Analysis → Text-to-Speech` reports `Ready`. This is the live test no
+   environment here can perform.
+2. **Confirm the negative path live** — remove the OpenAI credential and confirm
+   the refusal is the bounded `missing_credential` class, that the panel says
+   “No credential on this runtime”, and that nothing is sent.
+3. **Then, and only then, decide the next capability** in the order the earlier
+   phases recorded: real Persian STT benchmarking, the M2.4 Vault configuration,
+   or a TTS provider fallback — not a second TTS provider added speculatively.
+
+---
+
+
+## Previous phase — Media Processing M2.4: STT credential pool and API-key rotation
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+> **Additive predecessor of M3.0 (above).** Nothing in this section is
+> superseded: the STT provider layer, the credential pool, the rotation semantics,
+> the cooldowns, the bounds and the security guarantees are all exactly as
+> recorded here, and M3.0 touched none of them — it added a separate synthesis
+> capability that shares no seam with recognition and did not create a TTS copy of
+> this pool. The ONE statement this section makes that M3.0 changes is the
+> deferral of TTS itself, annotated in “Deferred work” below.
 
 ### Phase identity
 
@@ -457,8 +928,10 @@ files; `git diff --check` clean.
 
 ### Deferred work
 
-* **TTS** — deliberately absent: nothing in this phase speaks, and no local model
-  or cloud voice was added.
+* **TTS** — deliberately absent in this phase: nothing in M2.4 speaks, and no
+  local model or cloud voice was added. **Delivered in M3.0** (above) as a separate
+  capability on a separate boundary — NOT as a copy of this credential pool, which
+  remains STT-only.
 * **Native Vision, Video and GIF processing** — still out of scope by the M1.7
   decision; the media boundary still excludes them before any transfer.
 * **Credential-management UI in Telegram**, a persisted credential roster, a
@@ -1734,7 +2207,35 @@ recognition-quality improvement is claimed because a provider answered.
 
 ### Document version
 
-This document reflects the M2.4 state: Speech-to-Text lives under
+This document reflects the M3.0 state. Speech **synthesis** now exists as a
+capability of its own: ONE bounded service boundary
+(`backend/services/tts_service.py`), ONE provider adapter
+(`backend/services/openai_tts_engine.py` — the OpenAI speech endpoint this
+repository's existing OpenAI credential and base-URL declarations already reach),
+one registered AI tool (`text_to_speech`, `READ_WRITE`, long-running, a single
+bounded `text` argument and a destination resolved from trusted runtime context),
+and ONE read-only surface under **AI → Media Analysis → Text-to-Speech**. A
+request is validated and bounded (1000 characters, refused rather than truncated;
+a 60 s synthesis timeout; a 5 MiB output ceiling), ONE provider call is made under
+ONE awaited timeout, the result is validated and normalized into a `SpeechClip`
+that holds no Telegram metadata, and ONE voice message is delivered through the
+existing bounded Telegram transfer. No temporary file is created anywhere on the
+path, no provider receives any Telegram context, no credential or synthesized text
+can reach a log line, and **no database, no environment variable, no dependency
+and no SQL changed**. **No synthesis has been sent to a live provider and no live
+Telegram delivery has been performed, so speech quality — including Persian — is
+unmeasured and unclaimed.** The M2.4 state below is otherwise current: the STT
+control plane, the M2.3 provider fallback, the M2.4 credential pool, its manual
+Supabase Vault RPC (still NOT configured) and the outstanding Persian recognition
+benchmarking all stand as recorded. A history of the earlier phases follows
+unchanged. If code changes invalidate any section, update this document in the
+same commit.
+
+---
+
+### Document version of the M2.4 phase (retained, superseded by the M3.0 state above)
+
+This document reflected the M2.4 state: Speech-to-Text lives under
 **AI → Media Analysis** as a compact control panel — one global `Test all
 providers` action, a deterministic two-column grid of REGISTERED candidates, and
 a nested **⚙ STT Settings** panel holding only the bounded language and
