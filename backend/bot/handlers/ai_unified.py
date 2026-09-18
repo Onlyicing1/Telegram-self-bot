@@ -122,6 +122,19 @@ def _is_silent_delete(result) -> bool:
     return all(bool(item.get("success")) for item in tool_results)
 
 
+def _is_media_result(result) -> bool:
+    """True when the engine answered through the media-processing boundary.
+
+    The dispatcher stamps ``metadata["ai_action"]`` on every fast-path result;
+    ``action == "media_analysis"`` identifies the media route, whose answer is
+    ONE logical value — a single extraction, transcript or analysis. Such a
+    result must reach Telegram as ONE controlled response instead of one
+    message per page, so it is delivered by ``deliver_single_message``.
+    """
+    action = (getattr(result, "metadata", None) or {}).get("ai_action") or {}
+    return isinstance(action, dict) and action.get("action") == "media_analysis"
+
+
 def _wizard_signal(result) -> dict | None:
     """The Taskloom-wizard signal a tool result asked the delivery layer to surface.
 
@@ -813,8 +826,9 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 return
             ai_diag.set_stage(rid, "TELEGRAM_REPLY")
             logger.info("AI_RESPONSE_SEND_START id=%s", rid)
-            from backend.ai.tools.delivery import deliver_response
+            from backend.ai.tools.delivery import deliver_response, deliver_single_message
             response_text = result.response
+            is_media_answer = _is_media_result(result)
             if wizard_unavailable:
                 response_text = f"{response_text}\n\n_{_WIZARD_UNAVAILABLE_HINT}_"
             if result.metadata.get("tool_rounds_exhausted"):
@@ -837,11 +851,20 @@ async def _execute_ai(event, owner_id: int, prompt_text: str, trigger_word: str,
                 line = compact_telemetry_line(telemetry.last())
                 if line:
                     notes.append(f"_{line}_")
-            if notes:
+            if notes and not is_media_answer:
                 response_text = f"{response_text}\n\n" + "\n".join(notes)
-            delivery_result = await deliver_response(
-                event, display_prompt, response_text, show_question,
-            )
+            if is_media_answer:
+                # A media answer is ONE logical result: delivered as ONE
+                # controlled response (the complete result attached when it
+                # cannot fit one message), never as one message per page.
+                delivery_result = await deliver_single_message(
+                    event, display_prompt, response_text, show_question,
+                    client=client, notes=tuple(notes),
+                )
+            else:
+                delivery_result = await deliver_response(
+                    event, display_prompt, response_text, show_question,
+                )
             if delivery_result.success:
                 ai_diag.mark_success("TELEGRAM_REPLY")
             logger.info(

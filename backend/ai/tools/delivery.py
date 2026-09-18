@@ -1,6 +1,7 @@
 """Centralized, language-agnostic AI output normalization and Telegram delivery."""
 from __future__ import annotations
 
+import io
 import logging
 import re
 import unicodedata
@@ -18,6 +19,10 @@ from backend.ai.context.provenance import (
 logger = logging.getLogger(__name__)
 SAFE_LIMIT = 4000
 _MIN_SPLIT_CHUNK = 100
+
+#: Name of the single attached document the media path uses when ONE result
+#: cannot fit in ONE Telegram message (see ``deliver_single_message``).
+_MEDIA_ATTACHMENT_NAME = "media-extract.txt"
 
 @dataclass(frozen=True)
 class OutputProfile:
@@ -681,6 +686,158 @@ def _format_chunks(user_message: str, response_text: str, show_question: bool = 
     for index, page in enumerate(pages[1:], 2):
         chunks.append(_format_continuation(_answer_block(page), index, len(pages)))
     return chunks
+
+
+def _attachment_notice(chars: int, notes_block: str = "") -> str:
+    """The one honest line that stands in for an oversized single result.
+
+    It states the size and names the attachment instead of pretending the result
+    was truncated or silently split, and it is the ONLY place the owner is told
+    the answer did not fit one message.
+    """
+    notice = (
+        f"\U0001f4c4 Extracted content is {chars} characters \u2014 too long for one "
+        f"Telegram message. The complete result is attached as "
+        f"{_MEDIA_ATTACHMENT_NAME} (nothing was truncated or split)."
+    )
+    return f"{notice}{notes_block}" if notes_block else notice
+
+
+def _event_entity(event: Any) -> Any:
+    """The peer an attachment belongs to: the event's own input peer, else its id."""
+    try:
+        peer = getattr(event, "input_chat", None)
+    except Exception:  # noqa: BLE001 — an event without a resolvable peer
+        peer = None
+    return peer if peer is not None else getattr(event, "chat_id", None)
+
+
+async def _send_text_attachment(sender: Any, entity: Any, payload: bytes) -> None:
+    """Send the COMPLETE result as ONE attached text document."""
+    if sender is None or not hasattr(sender, "send_file"):
+        raise RuntimeError("no Telegram client is available to attach the result")
+    if entity is None:
+        raise RuntimeError("the request has no chat to attach the result to")
+    await sender.send_file(
+        entity,
+        io.BytesIO(payload),
+        attributes=[tg_types.DocumentAttributeFilename(file_name=_MEDIA_ATTACHMENT_NAME)],
+        force_document=True,
+    )
+
+
+async def deliver_single_message(
+    event: Any,
+    user_message: str,
+    response_text: str,
+    show_question: bool = False,
+    *,
+    client: Any = None,
+    notes: tuple[str, ...] = (),
+) -> DeliveryResult:
+    """Deliver ONE logical result as exactly ONE controlled Telegram response.
+
+    Used by the media-processing path, whose answer is a single logical value
+    (one extraction, one transcript). ``deliver_response`` paginates anything
+    longer than ``SAFE_LIMIT`` into one Telegram message per page, which for a
+    large extraction is a burst of messages for a single request; media answers
+    therefore use this path instead while EVERY other response keeps the
+    paginating ``deliver_response`` unchanged.
+
+    What does NOT change: the rendering (``process_output`` \u2192
+    ``format_presentation`` \u2192 the durable provenance marker) is identical, so a
+    result that fits one message is byte-for-byte the message the normal path
+    would have produced. What DOES change is only the delivery:
+
+      * fits one message \u2192 edited into the request message exactly once, with
+        the same reply fallback the normal path uses;
+      * too large for one message \u2192 the COMPLETE normalized result is sent as
+        ONE attached document and the request message is edited into one honest
+        notice. Nothing is truncated, nothing is split, no burst is emitted;
+      * the attachment itself cannot be sent \u2192 the existing paginated delivery
+        is used as a last resort so extracted content is never silently lost.
+    """
+    if not isinstance(response_text, str) or not response_text.strip():
+        try:
+            await event.edit(
+                format_failure(user_message, "Error\nAI returned no response.", show_question)
+            )
+        except Exception as exc:
+            logger.warning("delivery: empty-response edit failed: %s", exc)
+            return DeliveryResult(False, 0, 0, str(exc))
+        return DeliveryResult(True, 1, 1)
+    try:
+        processed = process_output(response_text)
+        response_text = processed.text
+        logger.info(
+            "AI_OUTPUT_NORMALIZED scripts=%s direction=%s mixed=%s markdown=%s "
+            "changed=%s length=%d",
+            ",".join(processed.profile.scripts) or "none", processed.profile.direction,
+            processed.profile.mixed_direction, processed.profile.markdown_detected,
+            processed.changed, len(response_text),
+        )
+    except Exception as exc:
+        logger.warning(
+            "AI_OUTPUT_NORMALIZATION_FALLBACK error_type=%s nonempty_after_strip=%s",
+            type(exc).__name__, bool(response_text and response_text.strip()),
+        )
+    # The secondary notes (a backup-model note, the optional telemetry line) are
+    # normalized by the same renderer the paginating path uses, then ride with the
+    # delivered message when it fits and with the notice when the result is
+    # attached — so neither mode can silently swallow them.
+    notes_block = ""
+    if notes:
+        try:
+            notes_block = "\n\n" + process_output("\n".join(notes)).text.strip()
+        except Exception:  # noqa: BLE001 — a note is decoration, never the result
+            notes_block = "\n\n" + "\n".join(notes)
+    rendered = _format_chunks(user_message, f"{response_text}{notes_block}", show_question)
+    if len(rendered) == 1:
+        messages = [apply_presentation_provenance(rendered[0], user_message, show_question)]
+        delivered = 0
+        try:
+            await event.edit(messages[0])
+            delivered += 1
+        except Exception as exc:
+            logger.warning("delivery: first chunk edit failed: %s", exc)
+            try:
+                await event.reply(messages[0])
+                delivered += 1
+            except Exception as exc2:
+                return DeliveryResult(
+                    False, delivered, 1, f"edit failed: {exc}; reply failed: {exc2}",
+                )
+        return DeliveryResult(True, delivered, 1)
+
+    sender = client if client is not None else getattr(event, "client", None)
+    try:
+        await _send_text_attachment(
+            sender, _event_entity(event), response_text.encode("utf-8", "replace"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "delivery: single-message media attachment failed (%s) \u2014 falling back "
+            "to the paginated delivery so the extracted content is never lost", exc,
+        )
+        return await deliver_response(event, user_message, response_text, show_question)
+    notice = apply_presentation_provenance(
+        format_presentation(
+            user_message, _attachment_notice(len(response_text), notes_block), show_question,
+        ),
+        user_message, show_question,
+    )
+    try:
+        await event.edit(notice)
+    except Exception as exc:
+        logger.warning("delivery: media attachment notice edit failed: %s", exc)
+        try:
+            await event.reply(notice)
+        except Exception as exc2:
+            logger.warning("delivery: media attachment notice reply failed: %s", exc2)
+    logger.info(
+        "delivery: media result delivered as ONE attachment chars=%d", len(response_text),
+    )
+    return DeliveryResult(True, 1, 1)
 
 
 async def deliver_response(

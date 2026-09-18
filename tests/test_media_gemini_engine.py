@@ -55,6 +55,8 @@ from telethon.tl.types import (
     Document,
     DocumentAttributeAudio,
     DocumentAttributeFilename,
+    DocumentAttributeSticker,
+    InputStickerSetEmpty,
     MessageMediaDocument,
     MessageMediaPhoto,
     Photo,
@@ -391,10 +393,16 @@ def _photo_media() -> MessageMediaPhoto:
     ))
 
 
-def _image_document(mime: str, name: str, size: int) -> MessageMediaDocument:
+def _image_document(mime: str, name: str, size: int, *, sticker: bool = False) -> MessageMediaDocument:
+    """A still-image document. ``sticker`` labels it ``Sticker`` instead of the
+    type derived from ``mime`` — used for ``image/gif``, whose own media type is
+    outside Media Processing scope while the FORMAT is still an OCR format."""
+    attributes = [DocumentAttributeFilename(file_name=name)]
+    if sticker:
+        attributes.append(DocumentAttributeSticker(alt="x", stickerset=InputStickerSetEmpty()))
     return MessageMediaDocument(document=Document(
         id=2, access_hash=2, file_reference=b"", date=None, mime_type=mime, size=size,
-        dc_id=1, attributes=[DocumentAttributeFilename(file_name=name)],
+        dc_id=1, attributes=attributes,
     ))
 
 
@@ -939,19 +947,25 @@ async def test_ocr_propagates_the_validated_container_as_a_documented_mime(
     assert _sent_mime(transport.generate_requests[0]) == expected
 
 
-@pytest.mark.parametrize("mime,payload", [
-    ("image/gif", _gif(4, 4)),
-    ("image/bmp", _bmp(4, 4)),
+# ``image/gif`` is labeled ``Sticker`` on purpose: the GIF media type is refused
+# by the Media Processing scope gate before any capability check, so the engine's
+# own undocumented-container guard is pinned through the FORMAT, which is still a
+# declared OCR format. The scope refusal itself lives in
+# tests/test_media_scope_and_delivery.py.
+@pytest.mark.parametrize("mime,payload,sticker", [
+    ("image/gif", _gif(4, 4), True),
+    ("image/bmp", _bmp(4, 4), False),
 ])
 @pytest.mark.asyncio
-async def test_ocr_refuses_a_container_gemini_does_not_document(stub, mime, payload):
+async def test_ocr_refuses_a_container_gemini_does_not_document(stub, mime, payload, sticker):
     transport = stub()
     _provision(_engine())
     client = _FakeClient(payload=payload)
 
     with pytest.raises(MediaError) as exc:
         await media_service.analyze_media(
-            client, OWNER, _FakeMessage(_image_document(mime, FILE_NAME, len(payload))),
+            client, OWNER,
+            _FakeMessage(_image_document(mime, FILE_NAME, len(payload), sticker=sticker)),
         )
 
     assert "Gemini does not accept" in str(exc.value)

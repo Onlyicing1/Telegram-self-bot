@@ -92,6 +92,11 @@ candidate evaluated either could not be delivered by ``requirements.txt`` or
 measured far outside the project's documented resource budget. No transcript is
 ever fabricated, no hosted service is used, and no audio container whose
 duration cannot be determined is ever handed to an engine.
+
+Scope: Video and GIF are explicitly OUTSIDE Media Processing. Both are refused
+deterministically from the classifier's own label (``UNPROCESSABLE_MEDIA_TYPES``)
+before any capability check, so neither can reach an extractor, a transfer or
+the model; the owner receives the boundary's existing honest UNSUPPORTED result.
 """
 from __future__ import annotations
 
@@ -131,6 +136,17 @@ MEDIA_RESOLVE_TIMEOUT_S = 30.0
 DOWNLOADABLE_MEDIA_TYPES = frozenset({
     "Photo", "Voice", "Audio", "Document", "Video", "Sticker", "Animation", "GIF",
 })
+
+#: Media Processing scope. Video is OUT of scope, and so is the animated image
+#: the classifier labels ``GIF`` (an ``image/gif`` document) or ``Animation``
+#: (``DocumentAttributeAnimated``) — the two shapes a Telegram GIF arrives in.
+#: The label is the single existing classifier's own deterministic read of the
+#: Telegram metadata, so the refusal is pure data inspection: no model, no
+#: download and no per-request heuristic is involved. These types are refused
+#: BEFORE any capability check, so they can never reach OCR, speech-to-text,
+#: text extraction, the bounded transfer or the model — a GIF is otherwise an
+#: ``image/gif`` asset the OCR capability would have accepted.
+UNPROCESSABLE_MEDIA_TYPES = frozenset({"Video", "GIF", "Animation"})
 
 #: MIME prefixes that can be turned into text with the standard library only.
 TEXT_MIME_PREFIXES = ("text/",)
@@ -415,6 +431,11 @@ def _stage_trace(
 def is_downloadable(media_type: str) -> bool:
     """True when ``media_type`` is an asset this boundary may transfer."""
     return str(media_type or "") in DOWNLOADABLE_MEDIA_TYPES
+
+
+def is_unprocessable(media_type: str) -> bool:
+    """True when ``media_type`` is explicitly outside Media Processing scope."""
+    return str(media_type or "") in UNPROCESSABLE_MEDIA_TYPES
 
 
 def is_extractable_mime(mime_type: str) -> bool:
@@ -1461,6 +1482,18 @@ async def analyze_media(
         logger.info(
             "MEDIA_ANALYZE owner=%s type=%s status=%s", owner_id,
             info.media_type or "Unknown", analysis.status,
+        )
+        return analysis
+
+    if is_unprocessable(info.media_type):
+        analysis = _unsupported(
+            info, message,
+            f"{info.media_type} is outside the Media Processing scope "
+            "(video and GIF are not processed).",
+        )
+        logger.info(
+            "MEDIA_ANALYZE owner=%s type=%s status=%s reason=out_of_scope",
+            owner_id, info.media_type, analysis.status,
         )
         return analysis
 

@@ -1,6 +1,226 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — M2.2.1: Speech-to-Text panel cleanup (compact control panel + nested STT Settings)
+## Latest phase — Media Processing M1.7: Video/GIF out of scope, and ONE controlled media response
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Media Processing M1.7** — explicit Video/GIF scope exclusion + single-message media delivery |
+| Starting HEAD | `7e1e69a` `docs: record STT quality investigation findings` — equal to `origin/main` at phase start |
+| Implementation commit | the single phase commit that contains this report (`feat: drop video/GIF from media processing, deliver one media response`) |
+| Live Telegram verification | **NOT PERFORMED** |
+
+### Purpose of this phase
+
+Two focused corrections, both inside the existing Media Processing architecture and
+nowhere else:
+
+1. **Video and GIF are explicitly OUT of Media Processing.** The audit (below)
+   found that a GIF really did enter the pipeline — it was downloaded and handed
+   to the OCR engine — so the exclusion is not hypothetical.
+2. **One media request produces ONE controlled Telegram response.** A single
+   extracted document could previously be delivered as a burst of Telegram
+   messages (one per rendered page). It is now delivered as exactly one message,
+   or as ONE attached document when it cannot fit one message — never as a burst
+   and never truncated.
+
+Explicitly out of scope for this phase and NOT implemented: STT chunking, TTS,
+Native Vision, new providers, credential pools, provider fallback, any change to
+OCR/STT recognition quality, and any change to `MediaAnalysis` limits.
+
+### Part 1 — what was found in the existing Video/GIF path
+
+The audit traced every entry point for Video/GIF into the media pipeline:
+
+- **One classifier.** `backend/ai/media.py::classify_message` is the single
+  classifier and the only authority for a media type. Video/GIF reach
+  `backend/services/media_service.py::analyze_media` labelled `Video`,
+  `GIF` (an `image/gif` document) or `Animation` (`DocumentAttributeAnimated`) —
+  Telegram's usual animated-image shape.
+- **Video was already inert.** `video/mp4` is neither an extractable MIME nor an
+  OCR/STT MIME, so a Video fell through to the generic
+  `"No local extraction capability for Video (video/mp4)"` UNSUPPORTED result and
+  was never transferred.
+- **GIF was the real leak.** `"image/gif"` is listed in
+  `OCR_IMAGE_MIME_TYPES`, and `provision_gemini_media_engines()` provisions the
+  OCR engine on the live runtime, so `ocr_candidate = is_image_mime(mime) and
+  ocr_available()` was `True` for a GIF: it was **downloaded and sent to the OCR
+  engine**. `Animation` (`video/mp4`) was inert like Video.
+- **A second, narrower leak.** A document carrying `DocumentAttributeVideo` whose
+  MIME is `image/gif` is labelled `Video` but still matched the OCR capability by
+  MIME alone, so it too reached OCR.
+- Video/GIF are in `DOWNLOADABLE_MEDIA_TYPES`, so a video/GIF reply still
+  resolves as a media target: the request reaches the media boundary rather than
+  silently falling through to the LLM.
+
+### How Video/GIF is now explicitly excluded
+
+`backend/services/media_service.py`:
+
+- New single authority: `UNPROCESSABLE_MEDIA_TYPES = frozenset({"Video", "GIF",
+  "Animation"})` with the predicate `is_unprocessable(media_type)`.
+- `analyze_media` refuses those types **immediately after** the
+  `is_downloadable` check and **before every capability check** (OCR, STT, text,
+  container extraction, the size gate and the transfer). The result is the
+  boundary's existing honest `UNSUPPORTED` outcome via `_unsupported()`.
+- The refusal is fully deterministic: it comes from the existing classifier's own
+  label (Telegram metadata), never from model inference, and no regex was added.
+- The owner-facing result is the existing convention —
+  `media_ai_service.unsupported_text()` renders
+  `⚠️ I can't process this Video yet.` plus the reason
+  `Video is outside the Media Processing scope (video and GIF are not processed).`
+  `answer_media_request` returns that answer **before** the provider branch, so
+  `ProviderManager.chat` is never consulted for out-of-scope media.
+- `DOWNLOADABLE_MEDIA_TYPES` was deliberately left unchanged: keeping Video/GIF
+  "downloadable" is what routes a video/GIF reply into the media boundary and
+  therefore to the deterministic refusal. Removing them would have made the
+  request fall through to the ordinary LLM path, where the model would answer
+  about media it cannot see — not a deterministic unsupported result.
+- Ordinary media handling was not touched: no Video/GIF subsystem was added, no
+  generic Telegram utility was deleted, and image/audio/PDF/DOCX paths are
+  unchanged (pinned by tests).
+
+### Part 2 — what caused the multi-message media output
+
+`backend/ai/tools/delivery.py::deliver_response` paginates: `_format_chunks`
+splits anything above `SAFE_LIMIT = 4000` UTF-16 units into pages, chunk 1 is
+delivered with `event.edit(...)` and **every** subsequent chunk with
+`event.reply(...)`.
+
+The media boundary caps extracted text at
+`MAX_EXTRACTED_CHARS = DEFAULT_MAX_CONTEXT_TOKENS (4000) × 4 = 16 000`
+characters (`MAX_OCR_CHARS` and `MAX_STT_CHARS` are the same ceiling). One media
+result could therefore render as up to five pages — one edited message plus up to
+four `event.reply` messages generated automatically — which is the live
+"six or more consecutive Telegram messages for one request" symptom.
+
+Internal extraction chunking was **not** the cause. `_TextAccumulator` already
+recombines PDF pages and DOCX blocks into ONE `MediaAnalysis.content`; the burst
+was produced by the delivery layer paginating one logical result.
+
+### The delivery change
+
+`backend/ai/tools/delivery.py` — new `deliver_single_message()`, used only for
+media answers:
+
+1. The rendering is identical to the normal path (`process_output` →
+   `format_presentation` → the durable provenance marker), so a result that fits
+   one message is byte-for-byte the message the paginating path produced.
+2. If `_format_chunks(...)` yields exactly ONE chunk, that chunk is edited into
+   the request message exactly once (with the same reply fallback).
+3. Otherwise the **COMPLETE** normalized result is sent as ONE attached
+   `media-extract.txt` document, and the request message is edited into one
+   deterministic notice: the character count, the attachment name, and an
+   explicit "nothing was truncated or split". No page-by-page burst is emitted.
+4. If the attachment itself cannot be delivered (no client / no resolvable peer),
+   the existing paginating `deliver_response` is used as a last resort and logged —
+   extracted content is never silently dropped.
+5. Secondary notes (backup-model note, optional telemetry line) are normalized by
+   the same renderer and ride with the delivered message, or with the notice in
+   attachment mode, so neither mode swallows them.
+
+`backend/bot/handlers/ai_unified.py` — `_is_media_result(result)` reads the
+**existing** dispatcher stamp `result.metadata["ai_action"]["action"] ==
+"media_analysis"` and routes only media answers to `deliver_single_message`
+(passing the live client). Every other response — provider answers, tool results,
+confirmations, failures, silent deletes — keeps `deliver_response` and its
+pagination unchanged.
+
+### Internal chunks vs. user-facing delivery
+
+| Layer | Responsibility |
+|---|---|
+| `media_service` extractors | produce ONE normalized `MediaAnalysis.content` (bounded, `truncated` flag) |
+| `media_ai_service` | turns that analysis into ONE `MediaAnswer` (direct STT or provider answer) |
+| dispatcher | ONE `EngineResult` stamped `ai_action.action == "media_analysis"` |
+| `deliver_single_message` | decides the ONE Telegram representation: one message, or one attachment + one notice |
+
+No extractor, `MediaAnalysis` limit, OCR/STT provider call or zero-context rule
+was changed to achieve this.
+
+### Limits and edge cases
+
+- The attachment name is the fixed `media-extract.txt`; the peer is the event's
+  own `input_chat` when the event exposes one, else `event.chat_id`.
+- The notice reports the **normalized character count**; the size test uses the
+  same UTF-16 accounting as `SAFE_LIMIT`.
+- The only case in which more than one Telegram message can still result is the
+  attachment being undeliverable (logged, paginated fallback).
+- No arbitrary message-count cap was introduced — the bound is representational
+  (one message, or one attachment), not a count threshold.
+- Media failures, the direct-STT path, the provider path, `ProviderManager`, and
+  every `MediaAnalysis`/OCR/STT limit are unchanged.
+
+### Tests added and changed
+
+- **New:** `tests/test_media_scope_and_delivery.py` — 25 focused tests:
+  the scope set is exactly `{Video, GIF, Animation}`; Video, both GIF shapes
+  (`GIF` and `Animation`) and a `DocumentAttributeVideo` declaring `image/gif`
+  are refused, never transferred and never reach a provisioned OCR/STT engine;
+  the owner gets the deterministic refusal and the provider is never consulted;
+  the dispatcher stamp routes media answers to the single-message path; photos
+  still reach OCR, Voice still reaches STT, text/DOCX still extract and the
+  PDF/downloadable taxonomy is unchanged; a short media result is one message, a
+  many-piece internal extraction is ONE message, a large result is ONE attachment
+  with the complete content and a one-line notice, an undeliverable attachment
+  still delivers everything, an empty result stays a deterministic failure, and
+  normal (non-media) delivery still paginates exactly as before.
+- **Changed:** `tests/test_media_image_ocr.py` and
+  `tests/test_media_gemini_engine.py` — the `image/gif` rows are now
+  Sticker-labelled so the GIF **format** keeps its OCR-boundary coverage
+  (signature corroboration, decoding, and the engine's undocumented-container
+  guard) while the GIF **media type** is refused by the scope gate. The refusal
+  itself is pinned in the new suite.
+
+### Validation results
+
+```
+tests/test_media_scope_and_delivery.py ................ 25 passed
+media suites (scope_and_delivery, processing, image_ocr, stt, stt_language,
+              document_extraction, ai_integration, direct_stt, gemini_engine,
+              transcribe_engine) ....................... 449 passed
+full suite: pytest tests/ .......... 3328 passed, 24 skipped
+(baseline before this phase: 3303 passed, 24 skipped → +25 tests, no test lost)
+py_compile media_service / delivery / ai_unified ........ OK
+git diff --check ........................................ clean
+```
+
+### Live verification status
+
+**NOT PERFORMED.** Nothing here is a live observation: no Telegram request was
+sent against this change, and the multi-message symptom is reproduced from the
+code path (`MAX_EXTRACTED_CHARS` vs `SAFE_LIMIT` pagination), not measured live.
+
+### Intentionally deferred
+
+1. **Live verification** — reply to a video/GIF and confirm the deterministic
+   refusal; send a large PDF/DOCX and confirm one attachment plus one notice.
+2. **Video/GIF capability** — if it is ever wanted, `UNPROCESSABLE_MEDIA_TYPES` is
+   the single place to change it; no other code knows about the scope.
+3. **Reproducing the exact live six-message count** — the bound is derived from
+   the code (`16 000` characters ÷ `SAFE_LIMIT`) rather than from a captured
+   production transcript.
+
+### Delivery
+
+This phase was implemented on `7e1e69a`, but `origin/main` advanced by twelve
+Speech-to-Text commits (`da05ace` … `c3d3e5e`) before the phase could be pushed.
+The phase was therefore re-applied on top of `c3d3e5e` as ONE commit — no rebase,
+no force-push, no new branch. The only conflict was this report, where both sides
+had gained a "Latest phase": the STT phase keeps its section intact as
+**Previous phase — M2.2.1**, and not a sentence of it was rewritten.
+
+The media change is untouched by the re-application: over the six code/test files
+this phase touches, `git diff c3d3e5e..HEAD` is byte-identical to
+`git diff 7e1e69a..5264fea`. The delivered commit is the tip of `main`
+(`git log -1 --format=%H` re-verifies it).
+
+---
+
+## Previous phase — M2.2.1: Speech-to-Text panel cleanup (compact control panel + nested STT Settings)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-17.
 

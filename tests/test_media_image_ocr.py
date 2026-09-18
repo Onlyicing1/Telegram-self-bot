@@ -43,6 +43,8 @@ import pytest
 from telethon.tl.types import (
     Document,
     DocumentAttributeFilename,
+    DocumentAttributeSticker,
+    InputStickerSetEmpty,
     MessageMediaDocument,
     MessageMediaPhoto,
     Photo,
@@ -190,10 +192,17 @@ def _photo_media() -> MessageMediaPhoto:
     ))
 
 
-def _image_document(mime: str, name: str, size: int) -> MessageMediaDocument:
+def _image_document(mime: str, name: str, size: int, *, sticker: bool = False) -> MessageMediaDocument:
+    """A still-image document. ``sticker`` labels it ``Sticker`` instead of the
+    type derived from ``mime`` — used for ``image/gif``, whose own media type
+    (``GIF``) is outside Media Processing scope while the FORMAT is still a
+    declared OCR format (see ``_IMAGE_SIGNATURE_READERS``)."""
+    attributes: list[Any] = [DocumentAttributeFilename(file_name=name)]
+    if sticker:
+        attributes.append(DocumentAttributeSticker(alt="x", stickerset=InputStickerSetEmpty()))
     return MessageMediaDocument(document=Document(
         id=2, access_hash=2, file_reference=b"", date=None, mime_type=mime, size=size,
-        dc_id=1, attributes=[DocumentAttributeFilename(file_name=name)],
+        dc_id=1, attributes=attributes,
     ))
 
 
@@ -446,35 +455,40 @@ async def test_mime_container_mismatch_is_refused():
     assert "not a readable image of the declared type" in str(error.value)
 
 
-@pytest.mark.parametrize("mime,payload", [
-    ("image/png", _jpeg(8, 8)),
-    ("image/jpeg", _png(4, 4)),
-    ("image/gif", _png(4, 4)),
-    ("image/bmp", _webp_vp8x(4, 4)),
+# ``image/gif`` is a declared OCR format but the GIF *media type* is outside
+# Media Processing scope, so its rows are labeled ``Sticker``: the format still
+# reaches the OCR path (signature corroboration and decoding keep their
+# coverage) while the scope refusal itself is pinned in
+# tests/test_media_scope_and_delivery.py.
+@pytest.mark.parametrize("mime,payload,sticker", [
+    ("image/png", _jpeg(8, 8), False),
+    ("image/jpeg", _png(4, 4), False),
+    ("image/gif", _png(4, 4), True),
+    ("image/bmp", _webp_vp8x(4, 4), False),
 ])
 @pytest.mark.asyncio
-async def test_every_declared_image_type_corroborates_its_signature(mime, payload):
+async def test_every_declared_image_type_corroborates_its_signature(mime, payload, sticker):
     media_service.set_ocr_engine(_ScriptedEngine("never reached"))
     client = _FakeClient(payload=payload)
-    media = _image_document(mime, FILE_NAME, len(payload))
+    media = _image_document(mime, FILE_NAME, len(payload), sticker=sticker)
 
     with pytest.raises(MediaError):
         await media_service.analyze_media(client, OWNER, _FakeMessage(media))
 
 
-@pytest.mark.parametrize("mime,payload", [
-    ("image/png", _png(4, 4)),
-    ("image/jpeg", _jpeg(8, 8)),
-    ("image/gif", _gif(4, 4)),
-    ("image/webp", _webp_vp8x(4, 4)),
-    ("image/bmp", _bmp(4, 4)),
+@pytest.mark.parametrize("mime,payload,sticker", [
+    ("image/png", _png(4, 4), False),
+    ("image/jpeg", _jpeg(8, 8), False),
+    ("image/gif", _gif(4, 4), True),
+    ("image/webp", _webp_vp8x(4, 4), False),
+    ("image/bmp", _bmp(4, 4), False),
 ])
 @pytest.mark.asyncio
-async def test_every_declared_image_type_parses_when_the_signature_matches(mime, payload):
+async def test_every_declared_image_type_parses_when_the_signature_matches(mime, payload, sticker):
     engine = _ScriptedEngine("matched")
     media_service.set_ocr_engine(engine)
     client = _FakeClient(payload=payload)
-    media = _image_document(mime, FILE_NAME, len(payload))
+    media = _image_document(mime, FILE_NAME, len(payload), sticker=sticker)
 
     analysis = await media_service.analyze_media(client, OWNER, _FakeMessage(media))
 
