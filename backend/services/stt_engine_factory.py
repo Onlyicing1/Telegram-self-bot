@@ -115,6 +115,12 @@ def apply_stt_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """
     try:
         plane = parse_stt_config(config)
+        # The fallback rotation is derived from the SAME parsed plane that
+        # provisions the selected engine — never from a second read of the
+        # store. An unresolved legacy value deactivates fallback entirely.
+        from backend.services import stt_fallback
+
+        stt_fallback.register_plan(plane)
         candidate = plane.active_candidate
         if candidate is not None and candidate.provider in _ADAPTER_PROVIDERS:
             return _apply_adapter(candidate, plane)
@@ -140,6 +146,11 @@ def _apply_adapter(candidate: SttCandidate, plane: Any) -> dict[str, Any]:
         candidate, language=plane.language, passes=plane.passes,
     )
     if engine is None:
+        # No engine provisioned → the boundary stays fail-closed; a rotation
+        # whose FIRST candidate cannot run must not silently arm substitutes.
+        from backend.services import stt_fallback
+
+        stt_fallback.clear_registration()
         media_service.set_stt_engine(None)
         logger.warning(
             "STT_ENGINE_UNPROVISIONED provider=%s model=%s reason=%s",

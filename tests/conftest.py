@@ -55,6 +55,21 @@ def now() -> datetime:
     return datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _reset_stt_fallback_state():
+    """STT provider health and the fallback rotation are process-local RUNTIME
+    posture, never configuration, so nothing may leak from one test to the next:
+    a suite that applies an STT config arms a rotation for the whole process, and
+    a provider left in cooldown would silently change a later test's attempts."""
+    from backend.services import stt_fallback
+
+    stt_fallback.clear_registration()
+    stt_fallback.reset_health()
+    yield
+    stt_fallback.clear_registration()
+    stt_fallback.reset_health()
+
+
 @pytest.fixture
 def memory_manager():
     from backend.ai.memory.manager import MemoryManager

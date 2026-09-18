@@ -1,6 +1,329 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M1.8: bounded long-audio STT chunking
+## Latest phase — Media Processing M2.3: STT provider health and bounded automatic fallback
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Media Processing M2.3** — Speech-to-Text provider health and bounded automatic fallback at the STT orchestration seam |
+| Starting HEAD | `add0b88` `feat(stt): transcribe over-long audio in bounded chunks` (== `origin/main` at phase start) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **NO** — no schema change, no column, no table |
+| New environment variables | **NONE** |
+| New dependencies | **NONE** (`requirements.txt` untouched) |
+| Files changed | **five** — NEW `backend/services/stt_fallback.py`, NEW `tests/test_stt_fallback.py`, `backend/services/media_service.py`, `backend/services/stt_engine_factory.py`, `tests/conftest.py` |
+| Behavioural change | **exactly one**: a fallback-ELIGIBLE failure of the selected provider no longer fails the operation by itself — the other eligible candidates are then attempted, under a finite ceiling |
+| Persisted state | **NONE** — provider health and cooldown are process-local runtime posture |
+| Live Telegram verification | **NOT PERFORMED** |
+| Live provider verification | **NOT PERFORMED** — no `AI_GROQ_API_KEY` / `AI_SPEECHMATICS_API_KEY` / `AI_GEMINI_API_KEY` exists in this implementation environment, so no request was made and no provider is claimed healthy |
+| Recognition-quality claim | **NONE** — this phase changes WHICH provider may answer, never what it transcribes |
+
+### Purpose of this phase
+
+The control plane (M2.0–M2.2) could already express the owner's selection, the
+ordered candidate pool and the failure taxonomy, but the execution half was
+missing: the SELECTED candidate was the only one ever tried, so one transient
+provider failure failed the whole media operation and the owner had to retry by
+hand. This phase adds the missing execution half **in front of the existing seam**:
+
+```
+Voice / Audio
+    ↓  deterministic target resolution, ONE bounded download (unchanged)
+media_service.analyze_media()  →  _extract_audio_content / _run_stt_chunked
+    ↓  the selected engine is ALWAYS attempt 1
+stt_fallback.AttemptPlan.run(...)
+    ├── success ─────────────────────────────────────────────→ transcript
+    └── fallback-ELIGIBLE failure
+            ↓  next eligible candidate (control plane's own canonical order)
+        success ──────────────────────────────────────────────→ transcript
+            └── ceiling / budget reached → ONE honest exhaustion failure
+```
+
+| Before M2.3 | After M2.3 |
+|---|---|
+| the selected candidate was the only attempt | the selected candidate is the FIRST attempt, and the ordered pool backs it up |
+| one transient failure failed the media operation | a transient failure moves to the next eligible candidate |
+| a deterministic failure and a transient one were indistinguishable to the caller | only transient failures may fall back; deterministic ones propagate unchanged |
+| a manually-chosen provider was required after a failure | no manual provider/model entry is ever needed — the runtime substitutes |
+| the selection could be silently changed by a workaround | the selection is never written; a fallback is internal to one request |
+
+Explicitly NOT implemented: any second STT pipeline or executor, any provider
+call inside an adapter's own retry (`gemini_media_engine`, `groq_stt_engine`,
+`speechmatics_stt_engine` are untouched), credential pools or key rotation, a
+persisted health table, per-owner ranking, real Persian recognition benchmarking,
+TTS, Native Vision, a new provider, a new dependency, and any change to
+`ProviderManager`, the dispatcher, the tool layer, `RuntimeSupervisor` recovery,
+the Supabase schema, `render.yaml` or `requirements.txt`.
+
+### The new layer — `backend/services/stt_fallback.py`
+
+One new module owns the EXECUTION half and nothing else. It never talks to a
+provider, never touches a Telegram object, never rewrites the owner's selection,
+and never replaces the boundary: it decides which candidate to try next, in what
+order, whether a candidate is temporarily unhealthy, whether a failure is
+fallback-eligible, and when to stop.
+
+| Concern | Where it lives |
+|---|---|
+| which candidates exist, their canonical order, the owner's selection, language, passes | **control plane** (`backend/ai/stt_control_plane.py`) — unchanged, reused as the single source of order |
+| candidate → engine construction | **engine factory** (`backend/services/stt_engine_factory.py`) — the ONE seam, consulted lazily per candidate |
+| health, failure classification, cooldown, the bounded attempt loop | **this phase** (`backend/services/stt_fallback.py`) |
+| resolution, one bounded download, validation, the timeout, cleanup, normalization, chunking | **media boundary** (`backend/services/media_service.py`) — unchanged contracts |
+| talking to a provider | the provider adapters — unchanged, and never invoked by this layer directly |
+
+#### The ordered-attempt contract
+
+* **The selected candidate is attempt 1 of every request, always**, whatever its
+  health: the owner's preference never permanently loses priority because it
+  failed once. Cooldown prunes only the FALLBACK rotation.
+* Candidates come from the control plane's registry in its own canonical order
+  (a tuple literal), never from a hard-coded list in the media service.
+* A candidate that is not registered, not implemented, or **cannot be built**
+  (no credential) is skipped and **never invoked** — it is not an attempt, and it
+  does not consume the budget.
+* A plan is created **per request**. Within one over-long recording the candidate
+  that succeeded is PINNED, so a provider switch mid-recording never
+  retranscribes the earlier chunks, and a candidate that already failed THIS
+  request is not retried within it.
+* **Failure classification is fail-closed.** The adapter's own `retryable`
+  verdict WINS when present (the adapter that talked to the provider is the
+  honest classifier); otherwise only the engines' own transient vocabulary may
+  fall back — `timeout`, `transport`, `transport_failure`, `server`,
+  `rate_limit`, `operation_deadline`, `upload_timeout`, `request_timeout`,
+  `interaction_timeout` — plus the boundary's own `media_stt_timeout` leg
+  (the provider was too slow for THIS budget). Everything deterministic
+  (`auth`, `forbidden`, `missing_credential`, `unsupported_model`,
+  `unsupported_audio`, `invalid_request`, `malformed_response`,
+  `empty_transcription`, `provider_rejection`, `upload_failed`,
+  `file_processing`, `http_rejection`, anything unrecognized, and every
+  non-`MediaError`) propagates unchanged — a programming error is never hidden
+  behind a fallback.
+* **An exhausted rotation is reported as itself** and never as a bad recording:
+  one `MediaError` with `stage=media_stt_exhausted` and
+  `failure_class=fallback_exhausted`, naming the attempt count and the
+  (already adapter-sanitized) reason of the LAST failure.
+* **A request with no runnable substitute keeps the selected provider's own
+  failure VERBATIM** — same exception, same stage, same class. Arming this layer
+  therefore never rewrites the identity of a single-provider failure, which is
+  what keeps every pre-existing single-engine behavior and test intact.
+
+#### Bounds (all finite)
+
+| Bound | Value | Meaning |
+|---|---|---|
+| `MAX_PROVIDER_ATTEMPTS` | **3** | provider attempts per transcription unit (one chunk, or one single-piece audio) — the selected provider plus at most two substitutes. Multi-pass behavior stays INSIDE each engine: one `transcribe()` call is one attempt, however many passes it contains. The chunked route is therefore bounded at `chunks × passes × 3`, still under the pre-existing chunk count, aggregate deadline and character ceilings |
+| `MIN_ATTEMPT_S` | **8.0 s** | a substitute is not even constructed, let alone started, without this much of the unit's budget left — the same floor the adapters use for their own bounded retries |
+| one shared budget | the boundary's `STT_TIMEOUT_S` per chunk, or what is LEFT of the aggregate deadline | a later candidate receives only the REMAINING budget, never a fresh one |
+| `COOLDOWN_BASE_S` / `COOLDOWN_MAX_S` | **60 s → 600 s** | bounded doubling per consecutive failure, capped; deterministic and short enough that a blipped provider is eligible again within minutes |
+
+#### Provider health and cooldown
+
+* Health is **process-local runtime posture, not configuration**: nothing is
+  written to `ai_config`, Supabase or any store, and a restart honestly resets it.
+* A candidate that fails a fallback-eligible attempt leaves the FALLBACK rotation
+  for a bounded cooldown; a SUCCESS restores it immediately.
+* **The Telegram UI state and the persisted selection are never touched** — a
+  runtime substitution is internal to one request, and the panel keeps showing
+  the owner's chosen candidate. The module reads no ENV and holds no credential.
+* A legacy/unresolved stored model deactivates fallback entirely, and a selection
+  whose OWN engine cannot be provisioned clears the rotation — in both states the
+  boundary keeps its exact pre-fallback, fail-closed single-engine behavior.
+
+#### Import direction (why the module is bound eagerly but reads the boundary lazily)
+
+`backend.services.media_service` binds this module at import time (`from
+backend.services import settings_service, stt_chunking, stt_fallback`), so
+`stt_fallback` declares **no** module-level import of the boundary and **no**
+module-level import of the control plane — reaching the control plane pulls
+`backend.services.gemini_media_engine`, which imports `MediaError` from the
+boundary. Both are therefore resolved on first use, and the dependency points one
+way at import time. All import orders were verified directly (`media_service`
+first, `stt_fallback` first, `gemini_media_engine` first, `stt_control_plane`
+first, `stt_engine_factory` first).
+
+#### Boundary integration
+
+* `_extract_audio_content` (single-piece, at or under `MAX_STT_DURATION_S`) and
+  `_run_stt_chunked` (over-long audio) both drive ONE plan through the boundary's
+  **existing** `_run_stt` primitive, reached per attempt via the new thin
+  `_stt_attempt` hook, so every attempt keeps the same worker-thread execution,
+  awaited timeout on the remaining budget and classified stage as before.
+* The boundary traces `stt_fallback_armed` (`selected`, `candidates`) when a
+  rotation is active, so a live request is diagnosable in one line.
+* The chunked contract is unchanged: chunks in strict source order, one at a
+  time, ONE aggregate deadline, and an exhausted attempt plan fails the WHOLE
+  operation — a partial transcript is never returned as a complete one.
+* An unarmed runtime (legacy, unconfigured or unprovisionable selection) takes the
+  exact pre-M2.3 code path.
+
+#### Traces (structured, bounded, content-free)
+
+`STT_FALLBACK_PLAN` (`state=active|inactive`, `selected`, `fallback_candidates`),
+`STT_FALLBACK_ATTEMPT` (`candidate`, `index`, `ceiling`, `budget_s`),
+`STT_FALLBACK_FAILURE` (`candidate`, `attempt`, `failure_class`, `eligible`),
+`STT_FALLBACK_COOLDOWN` (`candidate`, `failures`, `cooldown_s`,
+`failure_class`), `STT_FALLBACK_SKIPPED` (`reason=cooldown|not_implemented|
+unknown_candidate`), `STT_FALLBACK_STOPPED` (`reason=insufficient_budget`,
+`remaining_s`, `attempts`), `STT_FALLBACK_SUCCESS` (`candidate`, `attempt`,
+`chars`) and `STT_FALLBACK_EXHAUSTED` (`attempts`, `last_failure_class`) —
+candidate ids, attempt indices, failure classes, budgets and durations only.
+Never a credential, an audio byte, a transcript, a caption or a Telegram
+identifier, and never an owner id (pinned by test).
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/services/stt_fallback.py` | **NEW** (513 lines) — the execution half: the registered rotation, fail-closed failure classification, bounded cooldown, the ordered attempt plan with its pin and per-request failure memory, and the ONE exhaustion error |
+| `backend/services/media_service.py` | binds the new module, adds the `media_stt_exhausted` stage token and the thin `_stt_attempt` attempt hook, and drives one attempt plan from BOTH the single-piece and the chunked STT routes (unarmed → the previous code path) |
+| `backend/services/stt_engine_factory.py` | arms the rotation inside the ONE `apply_stt_config` entry point, from the SAME parsed control plane that provisions the selected engine; clears it when the selected candidate has no engine |
+| `tests/test_stt_fallback.py` | **NEW** (960 lines, 68 tests) — the contract below |
+| `tests/conftest.py` | one autouse reset: provider health and the rotation are process-local runtime state, so they may not leak between tests (a suite that applies an STT config arms a rotation for the whole process) |
+
+**Untouched (deliberately):** every provider adapter (`gemini_media_engine.py`,
+`groq_stt_engine.py`, `speechmatics_stt_engine.py` — no provider-call change, no
+instruction change), `stt_control_plane.py`,
+`stt_provider_probe.py`, `stt_consensus.py`, `stt_chunking.py`,
+`backend/services/media_ai_service.py`, `backend/bot/handlers/ai_stt_settings.py`,
+`backend/helper/**`, the dispatcher/engine/tool layer, `ProviderManager`,
+`RuntimeSupervisor`, OCR, PDF/DOCX extraction, the database layer,
+`requirements.txt`, `render.yaml`, `supabase/migrations/*.sql`,
+`DATABASE_ARCHITECTURE.md` and all secrets.
+
+### Tests added and exact results
+
+| Suite | Result |
+|---|---|
+| `tests/test_stt_fallback.py` (new, 68 tests) | **`68 passed`** |
+| the STT / media suites (`test_media_stt.py`, `test_media_stt_chunking.py`, `test_media_stt_reliability.py`, `test_ai_stt_settings.py`, `test_stt_provider_probe.py`, `test_media_direct_stt.py`, `test_media_stt_language.py`, `test_media_stt_multipass.py`, `test_media_stt_benchmark.py`, `test_stt_consensus.py`, `test_groq_stt_engine.py`, `test_speechmatics_stt_engine.py`, `test_media_gemini_engine.py`, `test_media_processing.py`, `test_media_ai_integration.py`, `test_media_dedicated_stt.py`) | **`932 passed, 2 skipped`** (the 2 skips are the opt-in live provider probes — no credential here) |
+| **Full suite** | **`3979 passed, 26 skipped, 3 warnings` in 115.20 s** |
+
+Count provenance, so the arithmetic is auditable: the M2.2.1 section below
+recorded **3852 passed / 26 skipped**, the next phase added **25** tests
+(`test_media_scope_and_delivery.py`) and this phase's starting HEAD added **34**
+(`test_media_stt_chunking.py`) → **3911 / 26** at `add0b88`. This phase adds **68**
+and deletes, weakens or skips **none**. (The `26` skips are pre-existing opt-in
+live probes; the local interpreter here was CPython 3.10.12, while production is
+the `render.yaml` pin of 3.11.7.)
+
+The new suite pins, from the source rather than from prose:
+
+* **classification** — the adapter's `retryable` verdict wins over its class; each
+  transient token may fall back; **every** deterministic token and every
+  non-`MediaError` may not; the boundary's timeout leg may; `failure_class` is
+  never empty;
+* **health** — per-candidate cooldown, bounded doubling capped at
+  `COOLDOWN_MAX_S`, immediate healing on success, process-local reset, and (by AST
+  inspection) that the module imports no store, no DB, no `os`/ENV and reads no
+  credential;
+* **arming** — no rotation → no plan; no engine → no plan; the rotation is exactly
+  the control plane's canonical tail; the selection is attempt 1; a legacy value
+  deactivates fallback; the factory arms the rotation from the SAME config it
+  applies; a selected candidate with no engine leaves the boundary fail-closed;
+  substitutes are built with the owner's own language/pass settings;
+* **the attempt loop** — a healthy selection serves the request alone (no
+  substitute is even constructed); an eligible failure moves to the next
+  candidate; a deterministic failure and a programming error propagate unchanged
+  with no substitute built; the ceiling is exactly `MAX_PROVIDER_ATTEMPTS`; the
+  budget strictly shrinks between attempts; a starved substitute is neither built
+  nor started and the selected provider's own failure survives; exhaustion is
+  reported as itself with the LAST bounded reason and never blames the audio; no
+  runnable substitute preserves the failure object verbatim; a failed-this-request
+  candidate is not retried within it; a cooldown prunes only the fallback
+  rotation and never demotes the selection; a success clears the cooldown;
+* **the boundary end-to-end** — a single-piece Voice request returns the
+  substitute's transcript as `MediaAnalysis.content`; the text is still normalized
+  and capped; a fallback rewrites neither the persisted selection nor the engine
+  seam nor the UI (and no `ai_config` write happens); an unarmed boundary returns
+  the selected provider's failure object itself; exhaustion carries
+  `media_stt_exhausted`; an over-long recording is pinned to the candidate that
+  worked for every later chunk; an exhausted chunked operation raises instead of
+  returning a partial transcript; exactly ONE download happens and no temporary
+  artefact survives;
+* **hygiene** — the fallback traces are present, bounded and free of the
+  transcript, the caption, the owner id and any credential; the attempt seam's
+  signature has nowhere to carry a chat, message, sender or caption; the engines
+  receive only the validated audio bytes; and the new module adds no HTTP client,
+  no subprocess, no socket, no worker thread and no second `transcribe` pipeline.
+
+**Syntax / whitespace:** `python -m py_compile` clean on every changed Python file
+(`stt_fallback.py`, `media_service.py`, `stt_engine_factory.py`,
+`test_stt_fallback.py`, `conftest.py`); `git diff --check` clean.
+
+### Live verification status
+
+* **Telegram:** NOT performed — no Telegram session or traffic exists in this
+  environment. The panel still shows the owner's selected candidate, the runtime
+  substitution is invisible to the UI, and that claim is proven by test, not by a
+  live walkthrough.
+* **Providers:** NOT performed — no credential for any STT provider exists here, so
+  no candidate was contacted. **No provider is claimed healthy**, and the
+  cooldowns observed are scripted, not live.
+* **Recognition quality:** unchanged and unmeasured. This phase alters which
+  provider may answer a request; it does not improve what any provider transcribes,
+  and no transcript quality claim is made.
+
+### Known limitations
+
+1. A fallback costs wall-clock time inside the SAME budget: an attempt that fails
+   slowly leaves less for the substitute, and with less than `MIN_ATTEMPT_S`
+   remaining the rotation stops and the selected provider's own failure surfaces.
+   This is deliberate (one bounded budget, no unbounded sweep), not a defect.
+2. Health is process-local: a restart forgets every cooldown, and two Render
+   instances do not share it (deliberate — no new table, no new column).
+3. The rotation order is the control plane's canonical order, not a quality
+   ranking: it exists so a request survives a provider outage, not to pick the
+   most accurate provider. Choosing that order on measured Persian quality is
+   still open.
+4. A fallback can substitute a provider whose language coverage or container
+   support differs from the selected one; the adapter refuses what it cannot take
+   and that refusal is classified as a deterministic failure, so it never cascades
+   further unless it is genuinely transient.
+5. The M1.8/M2.0 persistence note stands unchanged: the `ai_config` STT columns
+   still require the pending manual migration, and `DATABASE_ARCHITECTURE.md` §7
+   still describes the superseded M1.8 semantics.
+
+### Intentionally NOT implemented
+
+* Any provider call, retry or fallback **inside** an adapter — adapters still only
+  talk to their own service; the orchestration lives above them.
+* Any second STT pipeline, executor, scheduler or media download path.
+* Persisted health/cooldown state, credential pools, key rotation, per-owner
+  ranking.
+* Any change to the Telegram UI, the stored selection, the STT instructions, the
+  OCR path, the document extractors, the chunking, the consensus/multi-pass
+  behavior, or the character/duration/size ceilings.
+* Real Persian recognition benchmarking — still the open step (see below).
+* Any new dependency, any local Whisper/PyTorch/ONNX/ffmpeg stack, any behavioral
+  ENV variable.
+
+### Exact order of the remaining work
+
+M2.3 was implemented **before** the benchmarking step the M2.2.1 section planned
+for that slot, on explicit instruction: provider resilience does not depend on
+quality data, and it removes the manual provider re-selection the owner had to do
+by hand. What remains:
+
+1. **Live Telegram verification of this phase** — with real credentials, send a
+   Voice/Audio request with the selected provider deliberately un-credentialed or
+   failing, and confirm: the request still succeeds, the panel still shows the
+   owner's selection, and the logs carry `STT_FALLBACK_ATTEMPT` →
+   `STT_FALLBACK_FAILURE` → `STT_FALLBACK_SUCCESS` (or the ONE
+   `STT_FALLBACK_EXHAUSTED` line) with no transcript or identifier in them.
+2. **Real Persian recognition benchmarking** on 30–50 real voice messages across
+   the registered candidates — still the prerequisite for choosing the rotation
+   ORDER on evidence rather than on the registry's canonical order.
+3. Optionally, a persisted-cooldown design (a new `ai_config` column or a table)
+   and per-owner ranking — deliberately absent today.
+4. Applying the pending `ai_config` migration and the documentation-only
+   `DATABASE_ARCHITECTURE.md` §7 semantics refresh.
+
+---
+
+## Previous phase — Media Processing M1.8: bounded long-audio STT chunking
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
 
@@ -745,9 +1068,11 @@ The `SttEngine` protocol, `set_stt_engine()`, `get_stt_engine()` and
 configuration; and no owner id, chat id, message id, sender, caption, filename,
 reply text, history or memory can reach an adapter (verified by test: the seam
 takes `bytes` and nothing else, and each engine holds no such state).
-**Automatic fallback is NOT implemented** — one selected candidate runs, and when
-it cannot run the boundary stays fail-closed rather than silently transcribing
-with a different model.
+**Automatic fallback was not implemented in M2.2.1** — one selected candidate ran.
+**M2.3 supersedes this sentence**: the selected candidate is still attempt 1 of
+every request and the boundary still fails closed when no engine can be
+provisioned, but a fallback-eligible failure now continues through the control
+plane's own ordered candidates under a finite ceiling (see the M2.3 section).
 
 #### Configuration / ENV behavior
 
@@ -811,12 +1136,14 @@ recognition-quality improvement is claimed because a provider answered.
 ### Intentionally NOT implemented
 
 * **Automatic fallback / failover / cooldown / retry orchestration across
-  providers** — the control plane can represent the ordered pool, the resolver
-  resolves exactly ONE selected candidate, and no second candidate is ever tried.
-  Explicitly deferred, because the tested providers' Persian quality is still
-  unmeasured: failover cannot fix recognition quality.
+  providers** — deferred in M2.2.1 because the tested providers' Persian quality
+  was still unmeasured. **Delivered in M2.3** (fallback never improves
+  recognition quality; it only keeps a request from failing on one provider's
+  transient fault).
 * **Any health manager, failure counters, ranking or persistent health state** —
   observations stay process-local; no `ai_config` column, no Supabase table.
+  **M2.3 keeps this**: its health/cooldown map is process-local and persisted
+  nowhere.
 * **Real Persian recognition benchmarking** — the probe payload is a synthetic
   tone and is never presented as a quality benchmark.
 * **A real replied-to audio feed for the probe** (see above) — no new
@@ -836,7 +1163,8 @@ recognition-quality improvement is claimed because a provider answered.
 
 1. No automatic fallback: if the selected candidate fails, the media operation
    reports the classified failure; the next candidate is not tried (by design,
-   next phase).
+   next phase). **Resolved in M2.3** for fallback-eligible failures only — a
+   deterministic failure still reports itself and is never cascaded.
 2. Speechmatics transcribes **asynchronously**, so a job that outlives the 45 s
    engine deadline fails honestly with `operation_deadline` even though the
    provider might have finished later. Long audio on the Telegram side (the
@@ -866,15 +1194,19 @@ recognition-quality improvement is claimed because a provider answered.
 
 * The **STT health/fallback manager** that consumes these capabilities:
   active candidate → provider health → cooldown → next active candidate →
-  bounded retry/failover → honest failure, in front of the existing seam.
+  bounded retry/failover → honest failure, in front of the existing seam —
+  **delivered in M2.3** (`backend/services/stt_fallback.py`).
 * **Real Persian recognition benchmarking** on 30–50 real voice messages across
-  the registered candidates (the step that must come *before* automatic fallback).
+  the registered candidates. M2.2.1 recorded this as the step that must come
+  *before* automatic fallback; M2.3 was implemented first on explicit instruction,
+  so benchmarking remains the open step — now with the additional purpose of
+  choosing the rotation ORDER on measured evidence.
 * Persisted (if ever wanted) health/cooldown state — deliberately absent today.
 * Per-owner fallback re-ranking.
 * Applying the pending `ai_config` migration and the documentation-only
   `DATABASE_ARCHITECTURE.md` §7 semantics refresh.
 
-### Exact next stage — live Telegram verification, then M2.3: real Persian recognition benchmarking
+### Exact next stage, as recorded by M2.2.1 — live Telegram verification, then benchmarking (M2.3 was delivered as the fallback phase instead)
 
 1. Open **AI → Media Analysis → Speech-to-Text** on the live account and confirm
    the compact panel, the two-column grid, the nested `⚙ STT Settings` panel and
@@ -892,17 +1224,24 @@ recognition-quality improvement is claimed because a provider answered.
 5. Only after that, the ordered active → cooldown → fallback execution in front
    of the existing `media_service.set_stt_engine` seam (never a second STT
    pipeline), consuming the resolver and failure taxonomy already in place.
+   **This item was delivered out of order in M2.3** (steps 1–4 above, the live
+   credential walkthrough and the benchmarking, are still outstanding).
 
 ### Document version
 
-This document reflects the M2.2.1 state: Speech-to-Text lives under
+This document reflects the M2.3 state: Speech-to-Text lives under
 **AI → Media Analysis** as a compact control panel — one global `Test all
 providers` action, a deterministic two-column grid of REGISTERED candidates, and
 a nested **⚙ STT Settings** panel holding only the bounded language and
 recognition-pass controls. All five registered candidates (Gemini ×2, Groq
 Whisper ×2, Speechmatics ×1) remain executable and testable through the ONE
-bounded probe that never claims health or recognition quality; the candidate →
-engine resolution is one small seam in front of the **unchanged**
-`media_service` STT boundary; and **automatic fallback and real Persian quality
-benchmarking are still deferred.** If code changes invalidate any section, update
-this document in the same commit.
+bounded probe that never claims health or recognition quality. The control plane
+owns the owner's selection; the candidate → engine resolution is one small seam
+in front of the **unchanged** `media_service` STT boundary; and a new,
+process-local execution layer (`backend/services/stt_fallback.py`) now keeps the
+SELECTED candidate as attempt 1 of every request while falling back through the
+control plane's OWN canonical order under a finite attempt ceiling and a shared
+budget — so one provider's transient failure no longer fails the media operation
+and no selection is ever silently rewritten. **Real Persian quality benchmarking
+and live Telegram verification of this phase are still outstanding.** If code
+changes invalidate any section, update this document in the same commit.

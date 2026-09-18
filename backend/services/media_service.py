@@ -128,7 +128,7 @@ from typing import Any, Protocol
 from backend.ai.media import MediaInfo, classify_message
 from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS
 from backend.runtime.operation_watchdog import guarded_await
-from backend.services import settings_service, stt_chunking
+from backend.services import settings_service, stt_chunking, stt_fallback
 from backend.telegram_api import media as telegram_media
 from backend.telegram_api.exceptions import TelegramAPIError
 
@@ -429,6 +429,7 @@ MEDIA_STAGE_STT_ENGINE = "media_stt_engine"
 MEDIA_STAGE_STT_TIMEOUT = "media_stt_timeout"
 MEDIA_STAGE_ANALYSIS = "media_analysis"
 MEDIA_STAGE_PROVIDER = "media_provider"
+MEDIA_STAGE_STT_EXHAUSTED = "media_stt_exhausted"
 
 
 def bounded_reason(error: Any, limit: int = 200) -> str:
@@ -1303,6 +1304,19 @@ async def _run_stt(
     return result if isinstance(result, str) else ""
 
 
+async def _stt_attempt(
+    engine: SttEngine, data: bytes, timeout_s: float, request_id: str,
+) -> str:
+    """The primitive ONE provider attempt is made through — :func:`_run_stt`.
+
+    Named as its own bound method so the fallback layer's ``run_engine`` hook
+    receives exactly the boundary's attempt semantics: worker-thread execution,
+    the awaited timeout on the REMAINING budget, and the classified stage on
+    every failure. No other behavior is added here.
+    """
+    return await _run_stt(engine, data, timeout_s, request_id=request_id)
+
+
 async def _run_stt_chunked(
     engine: SttEngine, data: bytes, mime_type: str, duration_s: float,
     request_id: str = "",
@@ -1314,19 +1328,25 @@ async def _run_stt_chunked(
     payload). This function owns the OPERATION around it, and every rule it
     enforces is deliberate:
 
-      * chunks are transcribed STRICTLY in source order, one at a time, always
-        with the ONE engine this request selected — a chunk never switches
-        provider, and no fallback happens here;
+      * chunks are transcribed STRICTLY in source order, one at a time. The
+        engine each chunk uses is the request's attempt plan: the SELECTED
+        engine first, and — through the fallback layer (M2.2) — the next
+        eligible healthy candidate when a provider fails a chunk with a
+        fallback-eligible failure. A plan pins the candidate that succeeded,
+        so earlier chunks are never retranscribed on a later provider switch;
       * each chunk keeps the engine's own multi-pass behaviour, because it is the
         SAME ``transcribe`` seam: the configured pass count multiplies the calls
-        per CHUNK (chunks x passes, both already capped by the constants above),
-        and can never become an unbounded retry loop;
+        per CHUNK (chunks x passes x the fallback attempt ceiling, all capped by
+        the constants above), and can never become an unbounded retry loop;
       * the whole operation runs inside ONE aggregate deadline: each chunk gets the
-        smaller of the per-chunk bound and what is left of it, and a spent
-        deadline fails the operation instead of starting another chunk;
-      * a chunk that FAILS fails the WHOLE operation — the error propagates — so a
-        partial transcript is never returned as a complete transcription, and no
-        failed or skipped chunk is ever silently dropped.
+        smaller of the per-chunk bound and what is left of it — and a fallback
+        candidate receives only what is LEFT of the chunk's own bound, never a
+        fresh one — while a spent deadline fails the operation instead of
+        starting another chunk or another provider;
+      * a chunk whose attempt plan is EXHAUSTED fails the WHOLE operation — the
+        error propagates — so a partial transcript is never returned as a
+        complete transcription, and no failed or skipped chunk is ever silently
+        dropped.
 
     The chunks are in-memory slices of the already-validated payload, so there is
     no temporary file to leak on any exit path, and the plan (with the last chunk
@@ -1348,6 +1368,12 @@ async def _run_stt_chunked(
         "stt_chunks_planned", request_id=request_id, mime=mime_type,
         chunks=count, duration_s=f"{duration_s:.1f}",
     )
+    attempts = stt_fallback.attempt_plan(engine)
+    if attempts is not None:
+        _stage_trace(
+            "stt_fallback_armed", request_id=request_id,
+            selected=attempts.selected_id, candidates=attempts.candidate_count,
+        )
     started = time.monotonic()
     parts: list[str] = []
     try:
@@ -1366,9 +1392,13 @@ async def _run_stt_chunked(
                 "stt_chunk_invoked", request_id=request_id, index=index + 1,
                 chunks=count, bytes=len(payload), timeout_s=f"{bound:.1f}",
             )
-            part = _normalize_extracted_text(
-                await _run_stt(engine, payload, bound, request_id=request_id)
-            )
+            if attempts is not None:
+                raw = await attempts.run(
+                    payload, bound, _stt_attempt, request_id=request_id,
+                )
+            else:
+                raw = await _run_stt(engine, payload, bound, request_id=request_id)
+            part = _normalize_extracted_text(raw)
             _stage_trace(
                 "stt_chunk_returned", request_id=request_id, index=index + 1,
                 chunks=count, chars=len(part),
@@ -1450,7 +1480,17 @@ async def _extract_audio_content(
             "stt_engine_invoked", request_id=request_id,
             engine=type(engine).__name__, bytes=len(data),
         )
-        raw_text = await _run_stt(engine, data, STT_TIMEOUT_S, request_id=request_id)
+        attempts = stt_fallback.attempt_plan(engine)
+        if attempts is not None:
+            _stage_trace(
+                "stt_fallback_armed", request_id=request_id,
+                selected=attempts.selected_id, candidates=attempts.candidate_count,
+            )
+            raw_text = await attempts.run(
+                data, STT_TIMEOUT_S, _stt_attempt, request_id=request_id,
+            )
+        else:
+            raw_text = await _run_stt(engine, data, STT_TIMEOUT_S, request_id=request_id)
     text = _normalize_extracted_text(raw_text)
     _stage_trace(
         "stt_engine_returned", request_id=request_id,
