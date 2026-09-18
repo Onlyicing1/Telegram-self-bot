@@ -162,14 +162,17 @@ async def apply_stt_settings_now(owner_id: int) -> bool:
 
     The HANDLER reads the store; the engine factory converts the persisted
     selection into the SELECTED candidate's own provider engine — the engine
-    never learns an owner id and never sees a Telegram object. Returns whether a
-    live STT engine was provisioned (a missing credential, and a candidate with
-    no execution path, stay fail-closed).
+    never learns an owner id and never sees a Telegram object. The same call
+    reloads the provider credential pools (M2.4), so a selection saved from the
+    panel is effective for BOTH the provider fallback order and the credential
+    rotation on the very next media operation, with no redeploy and no restart.
+    Returns whether a live STT engine was provisioned (a missing credential, and
+    a candidate with no execution path, stay fail-closed).
     """
     from backend.ai.config_store import get_config
-    from backend.services.stt_engine_factory import apply_stt_config
+    from backend.services.stt_engine_factory import apply_stt_config_async
 
-    status = apply_stt_config(await get_config(owner_id))
+    status = await apply_stt_config_async(await get_config(owner_id))
     return bool(status.get("configured"))
 
 

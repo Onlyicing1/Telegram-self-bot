@@ -543,7 +543,10 @@ def stt_settings_from(config: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def apply_stt_settings(stt_settings: Mapping[str, Any] | None) -> dict[str, Any]:
+def apply_stt_settings(
+    stt_settings: Mapping[str, Any] | None,
+    credential: tuple[str, str] | None = None,
+) -> dict[str, Any]:
     """Rebuild the STT seam's engine from the owner's PERSISTED STT settings.
 
     ONE entry point, called by the two places that own this state: the runtime
@@ -555,13 +558,18 @@ def apply_stt_settings(stt_settings: Mapping[str, Any] | None) -> dict[str, Any]
     engine, and there is no second wiring site that could construct an engine.
 
     The credential and the general media model are deployment configuration and
-    keep their existing resolution. A runtime without a credential stays exactly
-    as fail-closed as before: nothing is provisioned and the boundary keeps
-    reporting the missing engine. Never raises — a settings change must not be
-    able to break either the panel or startup.
+    keep their existing resolution. ``credential`` — an ``(api_key, label)`` pair in
+    the very shape :func:`resolve_api_key` returns — is supplied by the STT engine
+    factory when the selected candidate's provider is served by a credential POOL
+    (``backend/services/stt_credential_pool.py``), so the pool decides which
+    credential this engine carries and this module never reaches for one itself.
+    A runtime without a credential stays exactly as fail-closed as before: nothing
+    is provisioned and the boundary keeps reporting the missing engine. Never
+    raises — a settings change must not be able to break either the panel or
+    startup.
     """
     try:
-        api_key, key_env_var = resolve_api_key()
+        api_key, key_env_var = credential if credential is not None else resolve_api_key()
         if not api_key:
             return {"configured": False, "reason": "no Gemini credential"}
         model, _model_env_var = resolve_media_model()

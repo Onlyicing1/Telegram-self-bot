@@ -308,18 +308,20 @@ class RuntimeSupervisor:
         The owner's stored selection is resolved by the STT CONTROL PLANE
         (``backend/ai/stt_control_plane.parse_stt_config``) and built by the ONE
         candidate → engine seam
-        (``backend/services/stt_engine_factory.apply_stt_config``) — this is the
-        ONLY conversion site, so the engine still never reads the store and never
-        learns an owner id. Failures (and an unknown durable state) are logged,
-        never fatal: the engine then simply keeps the bootstrap configuration it
-        was provisioned with, which is the documented degradation for an
-        unreadable store.
+        (``backend/services/stt_engine_factory.apply_stt_config_async``) — this is
+        the ONLY conversion site, so the engine still never reads the store and
+        never learns an owner id. The credential pools are loaded through the same
+        call, BEFORE the engine is provisioned, so the first transcription already
+        runs against the credentials the rotation will use. Failures (and an
+        unknown durable state) are logged, never fatal: the engine then simply
+        keeps the bootstrap configuration it was provisioned with, which is the
+        documented degradation for an unreadable store.
         """
         try:
             if not self.owner_id:
                 return
             from backend.ai import config_store
-            from backend.services.stt_engine_factory import apply_stt_config
+            from backend.services.stt_engine_factory import apply_stt_config_async
             config = await config_store.get_config(self.owner_id)
             if config.get(config_store.DEGRADED_READ_KEY):
                 logger.warning(
@@ -327,7 +329,7 @@ class RuntimeSupervisor:
                     "provisioned bootstrap settings",
                 )
                 return
-            status = apply_stt_config(config)
+            status = await apply_stt_config_async(config)
             trace(
                 "STT_SETTINGS_APPLIED",
                 configured=status.get("configured"),

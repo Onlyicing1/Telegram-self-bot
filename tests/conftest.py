@@ -60,14 +60,19 @@ def _reset_stt_fallback_state():
     """STT provider health and the fallback rotation are process-local RUNTIME
     posture, never configuration, so nothing may leak from one test to the next:
     a suite that applies an STT config arms a rotation for the whole process, and
-    a provider left in cooldown would silently change a later test's attempts."""
-    from backend.services import stt_fallback
+    a provider left in cooldown would silently change a later test's attempts.
+    The credential pool is the same kind of state one level down — a loaded pool
+    and a credential left in cooldown would change a later test's attempts the
+    same way — so it is reset with it."""
+    from backend.services import stt_credential_pool, stt_fallback
 
     stt_fallback.clear_registration()
     stt_fallback.reset_health()
+    stt_credential_pool.reset()
     yield
     stt_fallback.clear_registration()
     stt_fallback.reset_health()
+    stt_credential_pool.reset()
 
 
 @pytest.fixture

@@ -1,8 +1,510 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M2.3: STT provider health and bounded automatic fallback
+## Latest phase — Media Processing M2.4: STT credential pool and API-key rotation
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Media Processing M2.4** — a bounded credential pool per STT provider, with API-key rotation INSIDE a provider and the provider fallback of M2.3 preserved above it |
+| Starting HEAD | `9057f05` `feat(stt): keep provider health and fall back within the ordered STT candidates` (== `origin/main` at phase start) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration shipped by this phase | **NONE** — no SQL was executed, no table, no column, no view, no function, no Vault secret was created by this phase |
+| Database migration required from the USER | **the OPTIONAL Supabase-side contract in “Supabase Vault configuration that MUST be performed manually” below** — the runtime works without it, exactly as it does today |
+| New environment variables | **NONE** — no `*_KEY_1`/`*_KEY_2` variable exists, by design |
+| New dependencies | **NONE** (`requirements.txt` untouched) |
+| Files changed | **nine** — NEW `backend/ai/credential_source.py`, NEW `backend/services/stt_credential_pool.py`, NEW `tests/test_stt_credential_pool.py`; MODIFIED `backend/services/stt_fallback.py`, `backend/services/stt_engine_factory.py`, `backend/services/gemini_media_engine.py`, `backend/runtime/supervisor.py`, `backend/bot/handlers/ai_stt_settings.py`, `tests/conftest.py` |
+| Behavioural change | **exactly one**: a provider configured with MORE THAN ONE credential now rotates inside the provider before the provider-level fallback is engaged, and a credential that is rejected no longer leaves the provider unusable. A provider with ONE credential (every deployment today) behaves **byte for byte as it did before this phase** |
+| Persisted state | **NONE** — the credential snapshot and the credential health/cooldown are process-local runtime posture; no secret is ever written anywhere by this application |
+| Live Telegram verification | **NOT PERFORMED** |
+| Live provider verification | **NOT PERFORMED** — no provider credential exists in this implementation environment |
+| Supabase Vault verification | **NOT PERFORMED** — **no Vault pool has been configured**, so the Vault path has been exercised only against a fake secret backend inside the test suite |
+| Recognition-quality claim | **NONE** — this phase changes WHICH credential may answer, never what any provider transcribes |
+
+### Purpose of this phase
+
+The provider layer now survives one provider failing; it could not survive one
+KEY failing, because a provider had exactly one credential. This phase adds the
+second axis of resilience **without touching the first one**:
+
+```
+Speech-to-Text request
+    ↓  the selected provider is still attempt 1 (M2.3, unchanged)
+selected provider
+    ↓
+credential pool of THAT provider           ← NEW
+    ├── credential A  (priority, then source order)
+    ├── credential B
+    └── credential C
+         ↓
+    credential-specific failure (rejected / revoked / spent / rate-limited key)
+         ↓  the NEXT credential of the SAME provider is tried
+    success ─────────────────────────────────────────────→ transcript
+         └── all usable credentials exhausted
+                  ↓  the EXISTING provider fallback (M2.3, unchanged)
+             next provider ──→ ITS OWN credential pool ──→ …
+```
+
+| Before M2.4 | After M2.4 |
+|---|---|
+| a provider had exactly one key | a provider may have a bounded pool of keys |
+| a rejected/revoked/spent key failed the whole provider | the provider keeps serving through its other credentials, and the provider is NOT marked unhealthy |
+| a 429 on one key looked like a provider-wide condition | a per-key quota rotates the credential; a 5xx does not |
+| keys had to be configured as numbered ENV variables to have more than one | the environment keeps ONE credential per provider; additional credentials live in the secret backend |
+| a revoked key required a redeploy to replace | a credential is refreshed at the next STT settings apply (startup or panel save), with no redeploy and no restart |
+
+Explicitly NOT implemented, per the phase instruction: TTS, Native Vision,
+Video/GIF processing, any new STT provider, provider benchmarking, provider
+quality ranking, automatic account creation, fake accounts, automatic API-key
+purchasing, scraping provider dashboards, arbitrary ENV scanning, raw API keys in
+an ordinary database table, SQL migrations, Supabase schema changes, direct
+Supabase-side administration, Telegram display of raw credentials, any settings
+redesign, and any change to `ProviderManager`, the dispatcher, the tool layer,
+the `RuntimeSupervisor` recovery architecture, `ToolRegistry`/`ToolExecutor`, the
+provider adapters, the Telegram media download boundary, the Gemini STT
+instructions, the OCR/PDF/DOCX paths, `stt_chunking.py`, `stt_consensus.py`,
+`stt_provider_probe.py`, `stt_control_plane.py`, `requirements.txt`,
+`render.yaml`, `DATABASE_ARCHITECTURE.md` or `supabase/migrations/*.sql`.
+
+### The credential hierarchy — where each concern lives
+
+| Concern | Where it lives |
+|---|---|
+| which PROVIDERS exist, their canonical order, the owner's selection, language, passes | **control plane** (`backend/ai/stt_control_plane.py`) — unchanged |
+| which PROVIDER is tried, provider health, provider cooldown, the bounded provider loop | **provider layer** (`backend/services/stt_fallback.py`, M2.3) — extended, not replaced |
+| which CREDENTIALS a provider has and in what order | **secret boundary** (`backend/ai/credential_source.py`) — NEW |
+| credential health, credential cooldown, credential-vs-provider classification | **credential pool** (`backend/services/stt_credential_pool.py`) — NEW |
+| candidate × credential → engine construction (ONE seam) | **engine factory** (`backend/services/stt_engine_factory.py`) — extended with a per-credential entry point |
+| the HTTP request itself | the provider adapters — **untouched**; an adapter receives only the credential of the current attempt |
+| resolution, ONE download, validation, timeouts, cleanup, normalization, chunking | **media boundary** (`backend/services/media_service.py`) — **untouched by this phase** |
+
+### The secret abstraction — `backend/ai/credential_source.py`
+
+One module answers “which credentials may this provider use?” and nothing else.
+It never talks to a provider, never decides which provider to try and never
+decides whether a credential is healthy.
+
+* **Two sources, ONE precedence rule.** The deployment's environment credential
+  is resolved first (through the provider's OWN declared variable names — the
+  same constants the adapters already read: `AI_GEMINI_API_KEY` →
+  `GEMINI_API_KEY`, `AI_GROQ_API_KEY` → `GROQ_API_KEY`,
+  `AI_SPEECHMATICS_API_KEY`), then the secret backend's credentials follow.
+  A missing variable contributes nothing; the first one that carries a value
+  wins and the remaining names are not inspected.
+* **No numbered ENV lists, no scanning.** `PROVIDER_KEY_1` / `_2` / `_3` are
+  explicitly NOT supported, and nothing here enumerates the environment: the
+  caller passes the provider's declared names and the module reads exactly
+  those. A test pins this (“the environment is never scanned for an undeclared
+  name”).
+* **Deterministic order**: `(priority, order_index)`, where the environment
+  credential is `priority=0, order_index=0` and the backend's credentials follow
+  in the order the backend returned them. Explicit priority therefore outranks
+  the source order, and a tie puts the environment credential first — so an
+  installation that configures nothing keeps the exact key it has today.
+* **Bounded**: `MAX_CREDENTIALS_PER_PROVIDER = 4` credentials survive per
+  provider (the bound is applied AFTER ordering, so it is the owner's explicit
+  priorities that decide, never the order two sources happened to be merged in),
+  `MAX_CACHED_PROVIDERS = 16` snapshots are kept, and a backend read is bounded
+  by `VAULT_TIMEOUT_S = 5 s`.
+* **Fail-closed on an optional source.** A missing function, a permission error,
+  a timeout, an unexpected response shape, a row without an id, an id outside the
+  safe alphabet, a disabled row and an empty secret each contribute NOTHING and
+  are reported as a bounded reason. This boundary can never fail a media request
+  and can never invent a credential.
+* **Cache semantics.** A snapshot is loaded by `load()` — called only from the
+  settings-apply path (startup and after a panel save) — and is then served until
+  the next load. `mark_stale(provider)` records that a credential of that provider
+  failed, which the next load reports and refreshes; the snapshot itself KEEPS
+  being served, deliberately, because dropping it mid-incident would leave the
+  runtime with fewer usable credentials than it started with. Nothing is written
+  to disk, nothing is logged, and a credential id is the only credential fact that
+  ever leaves this module.
+
+### The credential pool — `backend/services/stt_credential_pool.py`
+
+* **Ordering is deterministic** — `(priority, then source order)` — and there is
+  no random rotation, no per-request reshuffle and no quality ranking.
+* **Rotation order** (`rotation_for`) skips a credential that is serving its own
+  cooldown, so a spent key does not cost every later request an attempt. The one
+  exception is deliberate and mirrors the provider layer's own pinned rule: when
+  EVERY credential of the provider is cooling down the pool is returned
+  unchanged, because refusing to attempt the provider at all would turn a
+  temporary credential condition into a guaranteed media failure.
+* **Classification** decides whether a failure is about the credential (rotate)
+  or about the provider (do not burn the pool), reusing the adapters' existing
+  bounded vocabulary and their already-attached `http_status`:
+
+| Verdict | Tokens | Rotate the credential? |
+|---|---|---|
+| **credential-specific** | `auth`, `forbidden`, `missing_credential`, `rate_limit`, `quota_exceeded`, and ANY failure carrying HTTP `401` / `403` / `429` | **yes** — bounded by the two ceilings below, and the provider is NOT marked unhealthy |
+| **provider-wide** | `server`, `timeout`, `transport`, `transport_failure`, `upload_failed`, `file_processing`, `malformed_response`, `empty_transcription`, `provider_rejection`, `unsupported_audio`, `unsupported_model`, `operation_deadline`, HTTP 4xx/5xx other than the three above, anything unrecognized | **no** — the remaining credentials would fail the same way; the failure goes straight to the existing provider health/fallback layer |
+| **not classified at all** | a bare `MediaError`, a programming error (anything that is not the boundary's `MediaError`) | **no** — it propagates unchanged, and it is never hidden behind a rotation |
+
+  The HTTP status matters because the Gemini adapter reports a rejection as
+  `http_rejection` with its status attached; the status is the honest classifier
+  there. A 503 is explicitly NOT a credential problem.
+* **Credential metadata** (all of it non-secret): the stable credential id, the
+  provider, the enabled/disabled state, the optional priority and source order,
+  the failure count, the last failure class, the temporary cooldown and the last
+  successful use. Quota/exhaustion state is expressed as the cooldown a
+  credential-specific rate-limit failure produces. The secret lives ONLY in the
+  `CredentialRecord` that is handed to the engine factory for one attempt.
+* **Cooldown** is bounded doubling per consecutive failure:
+  `60 s → 120 s → 240 s → 480 s → 600 s` (capped), and a success resets it
+  immediately. It is process-local, never persisted, and separate from the
+  provider cooldown.
+
+### Integration with the provider layer (M2.3 preserved, extended)
+
+`stt_fallback.AttemptPlan.run` still drives ONE attempt through the boundary's
+unchanged `_stt_attempt` primitive. The change is that the inner sequence is now
+(candidate × credential):
+
+* The provider loop keeps its exact semantics: the SELECTED candidate is attempt 1
+  of every request whatever its health, `MAX_PROVIDER_ATTEMPTS = 3`, a cooldown
+  prunes only the fallback rotation, a provider that failed this request is not
+  retried within it, a success restores provider health immediately, and a
+  request with no runnable substitute still propagates the selected provider's
+  own failure object verbatim.
+* **Provider preference is never rewritten**: a rotation is internal to one
+  request, is never written to `ai_config`, is never shown in the Telegram UI, and
+  the persisted selection keeps resolving to the same candidate.
+* **Only a REAL pool may rotate.** “A pool exists” is asked of the provider's
+  CONFIGURATION (`len(credentials_for(provider)) > 1`), never of what happens to
+  be cooling down. A provider with one credential therefore keeps its exact
+  pre-M2.4 behaviour: a rejected key still propagates unchanged and never becomes
+  a provider sweep.
+* **A credential failure never marks the provider unhealthy** while another
+  credential remains — that is the point of the separate axis.
+* **Pool exhaustion hands the failure to the provider layer**, which is the
+  documented transition: `STT_CREDENTIAL_POOL_EXHAUSTED` →
+  `STT_FALLBACK_POOL_TO_PROVIDER` → the provider cooldown is recorded and the next
+  provider is tried (through ITS own pool). The same happens when the credential
+  ceiling stops the rotation: either way the provider ran out of credentials the
+  runtime is allowed to try, and the abort is bounded and self-healing (the short
+  provider cooldown expires, and the credential cooldowns reorder the pool so an
+  untried credential goes first next time).
+* **Provisioning and execution can never disagree.** `apply_stt_config` builds the
+  selected engine from the pool's OWN first credential and records which one that
+  was (`provisioned_credential_id`) in the rotation registration; the first
+  attempt reuses the already-provisioned engine for that exact credential instead
+  of building an equivalent one. The pool decides which credential the engine
+  carries — the engine factory never reaches for one itself.
+* **The adapters stay untouched.** A pooled credential is passed explicitly
+  (`api_key=…`, and the adapter's own `key_env_var` becomes `explicit`); the
+  deployment's OWN credential is passed as “resolve your own”, which keeps the
+  adapter's existing ENV resolution and its truthful variable-name label. No
+  adapter reads a credential pool, a Vault or an id.
+* **The Gemini leg** received one additive parameter —
+  `apply_stt_settings(stt_settings, credential=(api_key, label) | None)` — whose
+  default is the pre-existing `resolve_api_key()` path, so every existing call
+  site and test is unchanged. Nothing about the Gemini transport, the STT
+  instructions or the recognition passes changed.
+* **Two new entry points, both additive**: `build_engine_with_credential(...)`
+  beside the unchanged `build_engine(...)`, and `apply_stt_config_async(...)`
+  which loads the pools and then calls the unchanged `apply_stt_config(...)`. The
+  two places that already owned this state now await the async form: the runtime
+  supervisor at startup and the STT settings handler after a save.
+
+### Bounds and timeouts
+
+| Bound | Value | Meaning |
+|---|---|---|
+| `MAX_PROVIDER_ATTEMPTS` | **3** | unchanged from M2.3 — providers per transcription unit |
+| `MAX_CREDENTIAL_ATTEMPTS_PER_PROVIDER` | **3** | credentials attempted per provider inside one unit, whatever the pool contains |
+| `MAX_TOTAL_ATTEMPTS` | **6** | ALL attempts of one unit, providers and credential rotations together: credential rotation may at most DOUBLE the pre-existing worst case, so no `credential × retry × provider × chunk × pass` explosion exists |
+| `MIN_ATTEMPT_S` | **8.0 s** | unchanged — no attempt is started without this much of the unit's budget left |
+| one shared budget | the boundary's `STT_TIMEOUT_S` per chunk, or what is LEFT of the aggregate deadline | **credential rotation never resets the deadline**: a later credential receives only the REMAINING budget, computed immediately before its attempt |
+| credential cooldown | **60 s → 600 s** | bounded doubling, capped, process-local |
+| `VAULT_TIMEOUT_S` | **5 s** | the credential read's own bound; it runs at settings-apply time and NEVER inside a media request, so it can never charge the STT budget |
+
+### Interaction with M1.8 chunking
+
+Unchanged in contract, and the unit of rotation is the CHUNK:
+
+* the request keeps ONE attempt plan across all chunks, so a credential that
+  succeeded is PINNED and continues the later chunks (`_pin(candidate, credential)`);
+* a credential that fails on chunk N is never re-tried within the request, so
+  chunks 1..N-1 are **never retranscribed** — the chunks that already succeeded
+  stay valid and the next credential attempts only chunk N;
+* the merge stays ordered (`stt_chunking.join_transcripts`) and a pool exhausted
+  mid-recording fails the WHOLE operation instead of returning a partial
+  transcript;
+* each chunk keeps the same per-chunk / aggregate budget rules, and the rotation
+  consumes only what is left of the chunk's own bound;
+* one download, the same validation, the same cleanup: the pool adds no second
+  transfer and no temporary artefact.
+
+### Interaction with multi-pass / consensus
+
+Untouched. Recognition passes live INSIDE each engine, so one `transcribe()` call
+is exactly ONE attempt of this layer however many passes it contains. A failed
+credential is never treated as a transcript hypothesis, no hypothesis is taken
+from a rotation, and no new consensus mechanism exists.
+
+### Security guarantees
+
+* **The key never leaves the credential record.** The only credential fact ever
+  logged is its id — an environment VARIABLE name, or an id the owner chose — and
+  the repository's existing redaction (`_safe_detail` in each adapter) keeps a
+  provider detail from echoing a key back.
+* **Nothing is persisted by the application.** The snapshot and the health state
+  are in-process memory only; no file, no table, no column, no log line and no
+  Telegram message carries a secret. Two source-scan tests pin that the credential
+  modules contain no file write, no `os.environ`, no `to_thread`, no pickle and no
+  transport/Telegram import.
+* **No arbitrary ENV scanning** — only the provider's declared variable names, as
+  a behavioral test proves.
+* **Zero Telegram context**: the attempt seam's signature is asserted to have
+  nowhere to carry a chat id, message id, sender, caption, reply or user, and the
+  credential modules import nothing from `backend.bot` or Telethon.
+* **No user-visible credential UI**: this phase adds no panel and exposes no key
+  through Telegram. Credential management, if it is ever wanted, is a later phase.
+
+### Supabase Vault configuration that MUST be performed manually
+
+**This phase did NOT configure Supabase Vault.** No SQL was executed, no secret
+was created, no schema was altered, and `DATABASE_ARCHITECTURE.md` was not
+touched. The application-side boundary is implemented and tested against a fake
+backend; the real secret store is the owner's to create.
+
+For a pool to exist, the user creates the Vault secrets AND one callable wrapper
+over them. The exact contract the application expects:
+
+```
+RPC name : stt_credential_pool            (credential_source.VAULT_RPC)
+Transport: PostgREST, with the project's EXISTING service-role client
+Request  : POST /rest/v1/rpc/stt_credential_pool  body {"p_provider": "<provider>"}
+Response : a JSON array of rows, in the desired order:
+           [ { "credential_id": "<stable, non-secret id>",   required
+               "secret":        "<the API key, decrypted>",   required
+               "priority":      <int>,                        optional, default 0
+               "enabled":       <bool> },                     optional, default true
+             ... ]
+```
+
+* `provider` is one of the names the registry uses: `gemini`, `groq`,
+  `speechmatics`. The RPC receives it as `p_provider` and returns only that
+  provider's credentials.
+* `credential_id` is what the logs will show (`vault:<credential_id>`). It must be
+  non-secret, 1–64 characters, and only `A-Z a-z 0-9 . _ -`; anything else is
+  refused rather than sanitized, so an id can never smuggle a key fragment into a
+  log line.
+* `secret` must be the DECRYPTED value. The natural implementation stores the key
+  in Vault and returns `vault.decrypted_secrets.decrypted_secret`, so the
+  application never reads `vault.*` directly and the store's own schema, naming
+  and access policy stay the owner's.
+* `priority` orders the pool; a lower value is tried first. Ties put the
+  deployment's ENV credential first, then the order the RPC returned.
+* `enabled: false` (or an omitted/empty `secret`, or a missing/invalid
+  `credential_id`) makes the row contribute nothing — a half-configured store
+  degrades to the credentials that DO work.
+* At most **4** credentials survive per provider, and a read is abandoned after
+  **5 s**.
+* If the RPC does not exist, is not executable by the service role, or returns
+  anything unexpected, the application logs a bounded reason and keeps using the
+  environment credential. Nothing breaks, and the media path is unaffected.
+
+**Render ENV role:** unchanged, and deliberately minimal. Render keeps the ONE
+credential per provider it already has (`AI_GEMINI_API_KEY`/`GEMINI_API_KEY`,
+`AI_GROQ_API_KEY`/`GROQ_API_KEY`, `AI_SPEECHMATICS_API_KEY`), plus the Supabase
+bootstrap secrets the deployment already needs to reach its own backend
+(`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`). No `*_KEY_1`/`*_KEY_2`/`*_KEY_3`
+variable is introduced, and **no new environment variable at all** is required by
+this phase. A deployment that later wants to drop the provider keys from Render
+and keep them only in Vault can do so, because the pool is authoritative once it
+has been loaded: provisioning uses the pool's first credential either way.
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/ai/credential_source.py` | **NEW** (324 lines) — the secret boundary: the ENV credential, the documented `stt_credential_pool` RPC read, deterministic ordering, the bounded row validation, the bounded process-local cache and the fail-closed degradation |
+| `backend/services/stt_credential_pool.py` | **NEW** (353 lines) — the credential pool: deterministic rotation order, credential health/cooldown, credential-vs-provider classification, the bounded ceilings and the secret-free `describe()` trace field |
+| `backend/services/stt_fallback.py` | **EXTENDED** (513 → 729 lines) — the inner (candidate × credential) loop, the pin extended to the credential, the pool-exhaustion → provider-fallback transition, the credential traces, `MAX_TOTAL_ATTEMPTS`, and the `provisioned_credential_id` registration |
+| `backend/services/stt_engine_factory.py` | **EXTENDED** (139 insertions) — `build_engine_with_credential(...)`, the credential-aware provisioning of the selected candidate, the recorded provisioned credential, and `apply_stt_config_async(...)` (load the pools, then apply) |
+| `backend/services/gemini_media_engine.py` | **14 insertions** — ONE additive parameter on `apply_stt_settings` (`credential: tuple[str, str] | None = None`), defaulting to the pre-existing `resolve_api_key()` path. No transport, instruction or pass change |
+| `backend/runtime/supervisor.py` | **10 insertions** — the startup apply now awaits `apply_stt_config_async`, so the pools are loaded BEFORE the engine is provisioned |
+| `backend/bot/handlers/ai_stt_settings.py` | **8 insertions** — the panel save now awaits the same async apply, so a selection change reloads the pools with it |
+| `tests/conftest.py` | one autouse reset extended: the credential snapshot and credential health are process-local runtime state, so they may not leak between tests |
+| `tests/test_stt_credential_pool.py` | **NEW** (1354 lines, 85 tests) — the contract below |
+
+**Untouched (deliberately):** every provider adapter's execution code
+(`groq_stt_engine.py`, `speechmatics_stt_engine.py`, the Gemini request path),
+`stt_control_plane.py`, `stt_provider_probe.py`, `stt_consensus.py`,
+`stt_chunking.py`, `media_service.py`, `media_ai_service.py`, the Telegram panels
+and helper machinery, the dispatcher/engine/tool layer, `ProviderManager`,
+`RuntimeSupervisor` recovery, OCR, PDF/DOCX extraction, `backend/db/**`,
+`requirements.txt`, `render.yaml`, `supabase/migrations/*.sql`,
+`DATABASE_ARCHITECTURE.md` and all secrets.
+
+### Tests added and exact results
+
+| Suite | Result |
+|---|---|
+| `tests/test_stt_credential_pool.py` (new) | **`85 passed` in 0.76 s** |
+| the STT / media suites (`test_stt_fallback.py`, `test_ai_stt_settings.py`, `test_stt_provider_probe.py`, `test_stt_credential_pool.py`, `test_stt_consensus.py`, `test_media_stt.py`, `test_media_stt_chunking.py`, `test_media_stt_reliability.py`, `test_media_stt_multipass.py`, `test_media_stt_language.py`, `test_media_dedicated_stt.py`, `test_media_direct_stt.py`, `test_media_processing.py`, `test_media_scope_and_delivery.py`, `test_groq_stt_engine.py`, `test_speechmatics_stt_engine.py`, `test_media_stt_benchmark.py`, `test_media_gemini_engine.py`, `test_media_ai_integration.py`, `test_media_image_ocr.py`, `test_media_document_extraction.py`) | **`1187 passed, 2 skipped` in 41.87 s** (the 2 skips are the pre-existing opt-in live provider probes — no credential here) |
+| **Full suite** | **`4064 passed, 26 skipped, 3 warnings` in 115.01 s** |
+
+Count provenance, so the arithmetic is auditable: the M2.3 section below recorded
+**3979 passed / 26 skipped** at this phase's starting HEAD `9057f05`. This phase
+adds **85** tests and deletes, weakens or skips **none** → **4064 / 26**. (The `26`
+skips are pre-existing opt-in live probes; the local interpreter here was CPython
+3.10.12, while production is the `render.yaml` pin of 3.11.7.)
+
+The new suite pins, from the source rather than from prose:
+
+* **ordering** — the environment credential is the first and only default; the
+  environment is never scanned for an undeclared name; the pool follows the
+  environment in the backend's order; an explicit priority outranks the source
+  order; a disabled, unidentified, badly-named or secret-less row contributes
+  nothing; the pool is bounded per provider; a refusing backend keeps the
+  environment credential and marks the pool configured; an unloaded provider is
+  reported unconfigured (which is a DIFFERENT state from loaded-and-empty); a
+  stale marking never reduces the runtime's credentials; the description carries
+  ids and never a secret; an unconfigured database yields no read at all; the
+  Vault read uses exactly the documented RPC name and parameter;
+* **classification** — every credential class and every credential HTTP status
+  (401/403/429) is credential-specific; every provider class and 400/404/5xx is
+  not; a programming error and a bare `MediaError` are never credential-specific;
+* **health** — its own bounded, capped, doubling cooldown with a fake clock; a
+  cooled-down credential leaves the rotation; expiry restores it; success restores
+  it immediately; a provider whose credentials are ALL cooling down is still
+  attempted; the health map is process-local and resettable;
+* **rotation** — one healthy credential serves the request alone (no other engine
+  is even asked for); a rejected credential rotates; two failures rotate twice; a
+  rate limit and an undecryptable credential rotate BEFORE the provider layer; a
+  503 does not burn the pool (the second credential is never even built) and does
+  not touch the credential's health; a programming error never rotates; the last
+  reason survives into the exhaustion error; pool exhaustion hands over to the
+  provider layer with the two transition traces; one bad credential leaves the
+  provider healthy; the next provider uses its own pool; a cooldown prunes only
+  the credential rotation and never demotes the selection; a single configured
+  credential keeps the exact pre-pool behaviour;
+* **bounds** — the per-provider credential ceiling is enforced (a four-credential
+  pool costs at most three attempts); the per-unit total is exactly
+  `MAX_TOTAL_ATTEMPTS`; the budget strictly shrinks between credential attempts
+  and is never reset; a starved credential is neither constructed nor started and
+  the selected provider's own failure survives; every bound is finite and small;
+* **chunking** — a credential that fails on a later chunk never retranscribes the
+  earlier chunks; a healthy credential serves every chunk with no switch; an
+  exhausted pool mid-recording fails the whole operation and never returns a
+  partial transcript; a single-piece request rotates end to end through the media
+  boundary with exactly ONE download;
+* **security** — a failing and a succeeding rotation both keep every secret out of
+  the logs while credential IDS are present; the failure message carries no
+  credential; a provisioned engine exposes the label and never the secret; an
+  environment credential keeps the adapter's own resolution and variable-name
+  label; the credential modules import no transport, no Telegram and no database
+  store; the credential layer persists nothing;
+* **provisioning** — the engine and the recorded rotation agree on the credential
+  they use; an explicit-priority Vault credential is what provisioning uses; a
+  refusing backend leaves provisioning unchanged; and provisioning uses the SAME
+  order the rotation uses.
+
+The suite replaces the secret backend with a fake at the ONE loading seam and
+scripts the engines per `(candidate, credential)` pair, so it says nothing about
+recognition quality and contacts no provider.
+
+**Syntax / whitespace:** `python -m py_compile` clean on all nine changed Python
+files; `git diff --check` clean.
+
+### Live verification status
+
+* **Live Telegram:** NOT PERFORMED — no Telegram session or traffic exists in this
+  environment. The panel still shows the owner's selected candidate, a rotation is
+  invisible to the UI, and that claim is proven by test, not by a live walkthrough.
+* **Live providers:** NOT PERFORMED — no provider credential exists here, so no
+  candidate and no credential was contacted. **No provider is claimed healthy**
+  and no credential is claimed valid.
+* **Live Supabase Vault:** NOT PERFORMED — **no Vault pool has been created**. The
+  Vault path was exercised only against a fake backend that returns the documented
+  row shape (and against one that refuses). The application-side contract is
+  therefore verified; the real secret store is NOT.
+* **Recognition quality:** unchanged and unmeasured. This phase alters WHICH
+  credential may answer a request; it does not change what any provider
+  transcribes, and no transcript-quality claim is made.
+
+### Known limitations
+
+1. **The pool is loaded at startup and at every STT settings apply, not per
+   request.** A credential added to the backend appears at the next settings apply
+   (a panel save or a restart); a revoked one keeps being tried until then, takes
+   its bounded cooldown, and the rotation moves on to a healthy credential. This is
+   deliberate — an in-request secret read would spend the media budget on a
+   database call, and a background refresher would be a second scheduler.
+2. **The rotation is bounded, not exhaustive.** A pool larger than three
+   credentials (or a unit whose budget runs out) stops after the ceiling and hands
+   the rest to the provider layer; the untried credential is picked up by a later
+   request, because the failed ones are cooling down and the pool order follows
+   health.
+3. **Health is process-local**: a restart forgets every cooldown, and two Render
+   instances do not share it (deliberate — no new table, no new column).
+4. **Ordering is priority + source order, not keyword quality.** It exists so a
+   request survives one bad key, not to pick the best key.
+5. **No credential-management UI.** Enabling/disabling, reordering, viewing health
+   and testing a credential from Telegram were explicitly out of scope and remain
+   a later phase; credentials are managed in the secret backend and Render.
+6. **A credential is trusted by its label.** Rotating between keys of the same
+   provider can only change quota and validity, never the response format; the
+   adapters' existing validation is unchanged and still refuses a malformed or
+   empty transcript.
+7. The M1.8/M2.0 persistence note stands unchanged: the `ai_config` STT columns
+   still require the pending manual migration, and `DATABASE_ARCHITECTURE.md` §7
+   still describes the superseded M1.8 semantics.
+
+### Deferred work
+
+* **TTS** — deliberately absent: nothing in this phase speaks, and no local model
+  or cloud voice was added.
+* **Native Vision, Video and GIF processing** — still out of scope by the M1.7
+  decision; the media boundary still excludes them before any transfer.
+* **Credential-management UI in Telegram**, a persisted credential roster, a
+  per-credential quota dashboard, real Persian recognition benchmarking, and
+  evidence-based provider/key ranking — all still open.
+* Any second secret manager (the boundary is written for one to be added without
+  touching the STT runtime, but only the ENV and Vault sources exist today).
+
+### Exact order of the remaining work
+
+1. **Configure the Supabase side** (the RPC contract above) and run
+   `Test all providers` — that is the live verification of the Vault path, which
+   no test in this environment can perform.
+2. **Live Telegram verification of M2.3 + M2.4 together**: send a Voice/Audio
+   request with the selected provider deliberately un-credentialed, then with a
+   first credential deliberately revoked, and confirm the request still succeeds
+   while the panel still shows the owner's own selection, and the logs carry
+   `STT_CREDENTIAL_ATTEMPT` / `STT_CREDENTIAL_FAILURE` / `STT_CREDENTIAL_SUCCESS`
+   (or the ONE `STT_CREDENTIAL_POOL_EXHAUSTED` → `STT_FALLBACK_POOL_TO_PROVIDER`
+   transition) with no secret and no identifier in them.
+3. **Real Persian recognition benchmarking** on 30–50 real voice messages across
+   the registered candidates — the prerequisite for choosing the provider order
+   on evidence rather than on the registry's canonical order.
+4. Optionally, a persisted credential roster/health design and per-owner ranking —
+   deliberately absent today.
+5. Applying the pending `ai_config` migration and the documentation-only
+   `DATABASE_ARCHITECTURE.md` §7 semantics refresh.
+
+---
+
+
+## Previous phase — Media Processing M2.3: STT provider health and bounded automatic fallback
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
+
+> **Superseded in three places by M2.4 (above), which is otherwise additive to
+> this section.** (a) `backend/services/stt_fallback.py` is no longer 513 lines —
+> it was extended with the credential loop, and the per-unit attempt ceiling is
+> now `MAX_TOTAL_ATTEMPTS` on top of `MAX_PROVIDER_ATTEMPTS`. (b) The two
+> “Intentionally NOT implemented” lists below no longer apply to credential pools
+> and key rotation, which M2.4 delivers — and a credential-specific failure is now
+> one additional case that may cascade to another provider, but ONLY when the
+> provider really has more than one credential. (c) `stt_engine_factory.py`,
+> `gemini_media_engine.py`, `backend/bot/handlers/ai_stt_settings.py` and
+> `backend/runtime/supervisor.py` are no longer in this section's “untouched”
+> list, for the additive reasons recorded in M2.4.
 
 ### Phase identity
 
@@ -52,7 +554,8 @@ stt_fallback.AttemptPlan.run(...)
 
 Explicitly NOT implemented: any second STT pipeline or executor, any provider
 call inside an adapter's own retry (`gemini_media_engine`, `groq_stt_engine`,
-`speechmatics_stt_engine` are untouched), credential pools or key rotation, a
+`speechmatics_stt_engine` are untouched), ~~credential pools or key rotation~~
+(**delivered later, in M2.4 — see the phase above**), a
 persisted health table, per-owner ranking, real Persian recognition benchmarking,
 TTS, Native Vision, a new provider, a new dependency, and any change to
 `ProviderManager`, the dispatcher, the tool layer, `RuntimeSupervisor` recovery,
@@ -187,7 +690,8 @@ identifier, and never an owner id (pinned by test).
 `groq_stt_engine.py`, `speechmatics_stt_engine.py` — no provider-call change, no
 instruction change), `stt_control_plane.py`,
 `stt_provider_probe.py`, `stt_consensus.py`, `stt_chunking.py`,
-`backend/services/media_ai_service.py`, `backend/bot/handlers/ai_stt_settings.py`,
+`backend/services/media_ai_service.py`, ~~`backend/bot/handlers/ai_stt_settings.py`~~
+(**touched by M2.4 only to await the credential-aware apply**),
 `backend/helper/**`, the dispatcher/engine/tool layer, `ProviderManager`,
 `RuntimeSupervisor`, OCR, PDF/DOCX extraction, the database layer,
 `requirements.txt`, `render.yaml`, `supabase/migrations/*.sql`,
@@ -291,7 +795,8 @@ The new suite pins, from the source rather than from prose:
 * Any provider call, retry or fallback **inside** an adapter — adapters still only
   talk to their own service; the orchestration lives above them.
 * Any second STT pipeline, executor, scheduler or media download path.
-* Persisted health/cooldown state, credential pools, key rotation, per-owner
+* Persisted health/cooldown state, ~~credential pools, key rotation~~ (**delivered
+  by M2.4, which keeps the health state unpersisted as well**), per-owner
   ranking.
 * Any change to the Telegram UI, the stored selection, the STT instructions, the
   OCR path, the document extractors, the chunking, the consensus/multi-pass
@@ -1229,7 +1734,7 @@ recognition-quality improvement is claimed because a provider answered.
 
 ### Document version
 
-This document reflects the M2.3 state: Speech-to-Text lives under
+This document reflects the M2.4 state: Speech-to-Text lives under
 **AI → Media Analysis** as a compact control panel — one global `Test all
 providers` action, a deterministic two-column grid of REGISTERED candidates, and
 a nested **⚙ STT Settings** panel holding only the bounded language and
@@ -1242,6 +1747,13 @@ process-local execution layer (`backend/services/stt_fallback.py`) now keeps the
 SELECTED candidate as attempt 1 of every request while falling back through the
 control plane's OWN canonical order under a finite attempt ceiling and a shared
 budget — so one provider's transient failure no longer fails the media operation
-and no selection is ever silently rewritten. **Real Persian quality benchmarking
-and live Telegram verification of this phase are still outstanding.** If code
-changes invalidate any section, update this document in the same commit.
+and no selection is ever silently rewritten. Resilience now has a second axis: a
+bounded **credential pool** per provider (`backend/ai/credential_source.py` +
+`backend/services/stt_credential_pool.py`) rotates a rejected, revoked, spent or
+rate-limited key INSIDE the provider before the provider-level fallback is
+engaged, while a provider with a single credential keeps its exact pre-M2.4
+behaviour — and no raw key, selection or credential is ever written to Telegram,
+to a log line or to the database. **The Supabase Vault RPC has NOT been
+configured, and live Telegram verification, live provider verification and real
+Persian quality benchmarking are all still outstanding.** If code changes
+invalidate any section, update this document in the same commit.
