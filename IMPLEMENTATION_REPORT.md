@@ -1,6 +1,225 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — API Credential Vault PART 1: credential metadata + Vault resolution
+## Latest phase — API Credential Vault PART 2: owner-facing credential management
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-19.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **API Credential Vault PART 2 (owner-facing credential management)** — the Telegram surface, the management service and the five owner-scoped SECURITY DEFINER functions that make a stored credential manageable without ever exposing it |
+| Starting HEAD | `f5d93f0` `feat(vault): store credential metadata in Postgres and resolve secrets from Supabase Vault` (== `origin/main` at phase start, i.e. the PART 1 commit) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Migration shipped | **`supabase/migrations/20260919000002_credential_vault_management.sql`** — functions only; it depends on PART 1 having been applied first |
+| Supabase executed by this phase | **NO** — no SQL was run, Supabase was **not** modified, no function was created, no Vault secret was created and no existing key was deleted |
+| Database objects created (pending owner action) | `public.api_credential_list(bigint, text)` · `public.api_credential_create(bigint, text, text, text, integer, boolean)` · `public.api_credential_replace_secret(bigint, text, text)` · `public.api_credential_update(bigint, text, text, boolean, integer)` · `public.api_credential_delete(bigint, text)` — no table, no column, no index, no policy, no extension |
+| New environment variables | **NONE** — deliberately none, and none read by the new code either |
+| New dependencies | **NONE** (`requirements.txt` untouched) |
+| Files changed | **ten** — NEW `supabase/migrations/20260919000002_credential_vault_management.sql`, NEW `backend/services/credential_service.py`, NEW `backend/bot/handlers/ai_credentials.py`, NEW `tests/test_credential_management.py`; MODIFIED `backend/bot/handlers/ai_stt_settings.py`, `backend/bot/router.py`, `backend/services/stt_credential_pool.py`, `tests/conftest.py`, `DATABASE_ARCHITECTURE.md`, `IMPLEMENTATION_REPORT.md` |
+| Behavioural change | **additive only**: the Media Analysis hub gains one row, the runtime gains three panels and six actions, and `stt_credential_pool` gains one public read-only accessor (`env_var_names`). No provider selection, model choice, recognition, chunking, rotation, fallback or delivery behaviour changed |
+| Persisted state | **NONE added by the application** — credential metadata already existed (PART 1); a credential TEST observation is process-local and is never persisted |
+| Live Supabase verification | **NOT PERFORMED** — the management path was exercised only against a fake store in `tests/test_credential_management.py`; no Supabase project was contacted |
+| Live Telegram verification | **NOT PERFORMED** — no Telegram session exists in this environment |
+
+### Purpose of this phase
+
+PART 1 made a credential **resolvable**; PART 2 makes it **manageable**. The owner
+no longer needs to touch Supabase to use a second key:
+
+```
+                    Telegram owner
+                         │
+                         ▼
+        AI → Media Analysis → API Credentials      ai_credentials.py
+                         │
+                         ▼
+             credential management service         credential_service.py
+                         │
+                         ▼
+            five owner-scoped SECURITY DEFINER functions
+                    /                      \
+                   ▼                        ▼
+        public.api_credentials          vault.secrets
+        (metadata only — still        (the raw key, written only
+         no secret column)             through vault.create_secret)
+                   │
+                   ▼
+         public.api_credential_pool   (PART 1, UNCHANGED)
+                   │
+          ┌────────┴────────┐
+          ▼                 ▼
+     STT providers     future TTS providers
+```
+
+The store stays **generic** by the `provider` token. There is deliberately no
+`tts_credential_pool.py`, no `tts_credential_source.py`, no `stt_credentials.py` and
+no second secret architecture — the same table, the same resolution function and the
+same five management functions serve `gemini`, `groq`, `speechmatics` and `openai`.
+
+### The five functions
+
+| Function | Purpose | Secret access | Returns |
+|---|---|---|---|
+| `api_credential_list(p_owner_id, p_provider DEFAULT NULL)` | the owner's credential metadata, optionally for one provider | **none** — it never reads a secret column or view | 7-column metadata, ≤ 64 rows |
+| `api_credential_create(p_owner_id, p_provider, p_label, p_secret, p_priority DEFAULT 0, p_enabled DEFAULT true)` | creates the Vault secret AND the metadata row referencing it | **writes** one (straight into `vault.create_secret`) | the metadata row |
+| `api_credential_replace_secret(p_owner_id, p_credential_id, p_secret)` | swaps in a NEW secret and removes the old one | **writes** one | the metadata row |
+| `api_credential_update(p_owner_id, p_credential_id, p_label DEFAULT NULL, p_enabled DEFAULT NULL, p_priority DEFAULT NULL)` | metadata only: label / enabled / priority | **none** — it cannot read or rotate a key | the metadata row |
+| `api_credential_delete(p_owner_id, p_credential_id)` | removes the Vault secret and the metadata row | **deletes** one (never returns it) | `boolean` |
+
+Every one of them is `SECURITY DEFINER` with `SET search_path = ''`, owned by
+`postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated` and granted to
+`service_role` only, takes `p_owner_id` as a required argument and filters every
+statement on it, and returns **metadata only** — no return shape in the migration can
+hold a secret. There is deliberately **no “show key” function**.
+
+### Secret exposure boundary
+
+| A raw key may exist | A raw key must never reach |
+|---|---|
+| `vault.secrets` (encrypted), written only by `vault.create_secret` from create/replace | `public.api_credentials` — it still has **no column that can hold one** (PART 2 adds no column) |
+| the argument and local variable of the two write functions, for the duration of one call | any return shape, `COMMENT`, or `RAISE` message in the migration |
+| one in-flight application request body (`create_credential` / `replace_secret`) and one provider attempt | a log line, a Telegram message, callback data, `ai_config`, an error string returned to Telegram, or a test fixture |
+
+Three independent guards, each pinned by a test: the migration's return shapes are
+the metadata projection only; `credential_service` logs **a bounded class and at most
+a code — never a database message** and refuses a whole response that contains a
+secret-bearing field; and the Telegram surface addresses a credential by a short
+non-secret handle (a SHA-256 prefix of the id) so no callback payload can carry a
+value. The service additionally refuses any key containing whitespace, which makes an
+accidental ordinary chat message fail closed instead of silently becoming a stored
+credential.
+
+### Deletion, replacement and orphan handling
+
+* **create** — the metadata `INSERT` runs inside a nested `BEGIN … EXCEPTION` block
+  that deletes the secret it just made if the insert fails, then re-raises. A failed
+  create cannot leave an unreferenced secret.
+* **replace** — new secret first, then the row is switched, and the OLD secret is
+  deleted only **after** the switch, because `vault_secret_id` is `ON DELETE
+  CASCADE` and deleting it first would have removed the very row being updated. A
+  failed switch deletes the new secret instead. If the final cleanup of the old
+  secret fails, the swap still stands and one inert, unreferenced secret remains —
+  documented, never hidden.
+* **delete** — the secret is removed **first** (which cascades the metadata row) and
+  the row is then deleted explicitly as a fallback, so no metadata can outlive its
+  secret. A refused secret removal aborts the transaction and is reported as a
+  failure, never as a success.
+* **update** — metadata only; it cannot orphan, rotate or disturb a key.
+
+### The Telegram surface
+
+| Panel / action | What it does |
+|---|---|
+| `AI → Media Analysis → API Credentials` (`ai_cred`) | one row per provider this build can execute, with the enabled/total count for each |
+| one provider (`ai_cred_prov`) | the provider's credentials (label, enabled, priority, last test), whether a **deployment key** exists (present/not present — never named, never shown), and `➕ Add credential` |
+| one credential (`ai_cred_one`) | enable/disable, rename, move earlier/later, set priority, replace key, test (when a bounded test exists), delete |
+| add / replace input | asks for ONE message containing the key, stores it, **deletes that message**, and reports honestly if the deletion could not be performed |
+| delete | asks for confirmation first, then removes the key and the metadata together |
+
+Every credential mutation reloads the affected provider's existing credential pool
+(`stt_credential_pool.prepare`), so a key added, enabled, disabled or deleted from
+Telegram is in effect on the very next request with no restart — and no provider
+selection is ever rewritten.
+
+### The credential test
+
+`credential_service.test_credential` resolves the credential through the **runtime's
+own pool**, builds the provider's engine with **exactly that credential** through the
+existing `stt_engine_factory.build_engine_with_credential` seam, and makes ONE bounded
+request with the existing probe's synthetic tone. It reports a closed state
+(`passed` / `unauthorized` / `rate_limited` / `timeout` / `unavailable` /
+`not_supported` / `disabled` / `not_found` / `failed`) derived from the adapters' OWN
+failure tokens, and the panel states plainly that this proves the provider **accepted
+the key** and is **not** a recognition-quality measurement. The test writes nothing
+into the STT provider-probe state, so a credential-level failure can never mark a
+provider unhealthy; `openai` has no bounded test path in this phase and is reported
+to the owner as *not supported*.
+
+### Tests and exact results
+
+| Suite | Result |
+|---|---|
+| `tests/test_credential_management.py` (**new**) | **99 passed** |
+| Regression set — `test_credential_vault`, `test_stt_credential_pool`, `test_stt_fallback`, `test_stt_provider_probe`, `test_ai_stt_settings`, `test_tts_service`, `test_tts_openai_engine`, `test_36_ai_settings_ux`, `test_media_direct_stt` (9 suites) | **537 passed, 2 skipped** |
+| **Full suite** | **4330 passed, 26 skipped** in 115.06 s |
+
+The baseline at the starting HEAD `f5d93f0` was **4231 passed, 26 skipped**, so this
+phase adds 99 tests and removes or weakens none. `python -m py_compile` is clean on
+all seven changed Python files and `git diff --check` is clean.
+
+What the new suite pins, at the level the phase claims:
+
+* the migration and the documented §29.14 SQL are **statement-identical**, every
+  function is hardened / `SECURITY DEFINER` / `service_role`-only, no return shape
+  can carry a secret, no dynamic SQL exists, and the PART 1 table is not altered;
+* the service validates before calling, maps every failure to a bounded class, refuses
+  a secret-bearing metadata field outright, keeps the listing bounded, orders exactly
+  as the pool resolves, and is owner-scoped (another owner's handle resolves to
+  nothing and another owner's row cannot be modified);
+* a raw key never reaches a log line on the happy path, on a failure, in a rendered
+  panel, in a button label, in a callback payload, in a create/replace outcome, or in
+  the repository's own sources — and only the create/replace calls are ever handed one;
+* the panels, actions and inputs behave as documented (toggle, ±1 priority, rename,
+  priority input, add, replace, delete-with-confirmation, dead handle, vanished
+  credential), the key message is deleted and a failed deletion is reported, and an
+  unusable reply is refused while still being deleted;
+* the existing STT stack is untouched: the pool's public contract, its declared
+  environment-variable names, the provider fallback registration and a per-provider
+  pool refresh all still behave.
+
+### Supabase status (explicit)
+
+* **Supabase was NOT modified by this phase.** No connection was made, no SQL was
+  executed, no function was created and no row was written or deleted.
+* **No Vault secret was created by this phase**, and no existing secret was removed.
+* The documented SQL in `DATABASE_ARCHITECTURE.md` §29.14 is *not* a summary of the
+  migration — it is the migration's statements, byte-identical, with the reversal in
+  §29.15 and the manual checklist in §29.18.
+* **Live Telegram and live provider verification: NOT PERFORMED.** No provider is
+  claimed healthy, no credential is claimed valid and no recognition or synthesis
+  quality claim is made anywhere in this phase.
+
+### Exact manual Supabase action still required
+
+1. Apply PART 1 first (§29.10 / `20260919000001_create_api_credential_vault.sql`) as
+   `postgres` — it creates the table, the resolution function and the alias.
+2. Apply §29.14 / `20260919000002_credential_vault_management.sql` as `postgres` — it
+   creates the five management functions. Nothing else is required: no table, no
+   seed row, no environment variable, no Render setting.
+3. Optional read-only verification:
+   `SELECT credential_id, provider, label, enabled, priority, created_at FROM public.api_credentials ORDER BY provider, priority, created_at, credential_id;`
+4. Reversal, if ever needed, is §29.15 (the five functions only). Applying neither
+   migration leaves the runtime exactly as it is today: the panel reports the store as
+   not configured and every provider keeps using its deployment key.
+
+### Explicitly deferred (not in this phase)
+
+TTS provider fallback and a TTS credential pool · a TTS bounded credential test ·
+TTS voice/model/format selection · Native Vision · Video/GIF · provider benchmarking
+and evidence-based ranking · a persisted credential-health store or history · any
+credential-management UI beyond the three panel levels above · the pending
+`ai_config` migration and the `DATABASE_ARCHITECTURE.md` §7 refresh · live
+verification of PART 1 and PART 2 against the owner's own Supabase project.
+
+### Known limitations (recorded, not hidden)
+
+* A key containing whitespace is refused (documented behavior, and the reason an
+  accidental chat message cannot become a credential).
+* The replace flow's cleanup of the superseded secret is best-effort; a failure leaves
+  one inert, unreferenced secret, recoverable with `SELECT vault.delete_secret('<id>')`.
+* A credential test spends one real provider request (a synthetic tone) and its
+  observation is process-local: a restart honestly returns every credential to “not
+  tested in this session”.
+* If the process restarts between the key prompt and the reply, the pending input is
+  gone: the reply is not consumed, not stored and not deleted — remove it manually.
+* The atomicity of a create/replace is only as good as the surrounding transaction;
+  the failure paths above are written to be safe either way, and **no live database
+  verification of them has been performed**.
+
+---
+
+## Previous phase — API Credential Vault PART 1: credential metadata + Vault resolution
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-19.
 
@@ -2490,34 +2709,30 @@ recognition-quality improvement is claimed because a provider answered.
 
 ### Document version
 
-This document reflects the M3.0 state. Speech **synthesis** now exists as a
-capability of its own: ONE bounded service boundary
-(`backend/services/tts_service.py`), ONE provider adapter
-(`backend/services/openai_tts_engine.py` — the OpenAI speech endpoint this
-repository's existing OpenAI credential and base-URL declarations already reach),
-one registered AI tool (`text_to_speech`, `READ_WRITE`, long-running, a single
-bounded `text` argument and a destination resolved from trusted runtime context),
-and ONE read-only surface under **AI → Media Analysis → Text-to-Speech**. A
-request is validated and bounded (1000 characters, refused rather than truncated;
-a 60 s synthesis timeout; a 5 MiB output ceiling), ONE provider call is made under
-ONE awaited timeout, the result is validated and normalized into a `SpeechClip`
-that holds no Telegram metadata, and ONE voice message is delivered through the
-existing bounded Telegram transfer. No temporary file is created anywhere on the
-path, no provider receives any Telegram context, no credential or synthesized text
-can reach a log line, and **no database, no environment variable, no dependency
-and no SQL changed**. **No synthesis has been sent to a live provider and no live
-Telegram delivery has been performed, so speech quality — including Persian — is
-unmeasured and unclaimed.** The M2.4 state below is otherwise current: the STT
-control plane, the M2.3 provider fallback, the M2.4 credential pool, its manual
-Supabase Vault RPC (still NOT applied — PART 1, above, ships the migration, the
-function and the documented SQL) and the outstanding Persian recognition
-benchmarking all stand as recorded. A history of the earlier phases follows
-unchanged. If code changes invalidate any section, update this document in the
-same commit.
+This document reflects the PART 2 (and PART 1) state of the API Credential Vault.
+The credential store is now **manageable from Telegram** as well as resolvable: an
+owner-facing surface under **AI → Media Analysis → API Credentials** lists the
+providers this build can actually execute, shows each provider's credentials with
+their label, enabled state, priority and last bounded test, and supports add, rename,
+enable/disable, deterministic priority moves, replace-key, a bounded key test and a
+confirmed delete — behind ONE management boundary
+(`backend/services/credential_service.py`) over five owner-scoped SECURITY DEFINER
+functions, with Supabase Vault as the only place a raw key is ever stored and no
+second secret store anywhere. **Neither vault migration has been applied**: Supabase
+was not modified, no function and no Vault secret was created, and the two migrations
+with their complete manual SQL (`DATABASE_ARCHITECTURE.md` §29) remain an owner
+action. A key containing whitespace is refused on purpose, the only statements that
+ever see a raw key are the two write functions, and no key can reach a log line, a
+rendered panel, callback data or an ordinary database column. The M3.0
+speech-synthesis state, the M2.4 credential pool, the M2.3 provider fallback and the
+STT control plane all stand as recorded below, and **live Telegram verification, live
+provider verification and real Persian recognition and synthesis benchmarking are all
+still outstanding**. A history of the earlier phases follows unchanged. If code
+changes invalidate any section, update this document in the same commit.
 
 ---
 
-### Document version of the M2.4 phase (retained, superseded by the M3.0 state above)
+### Document version of the M2.4 phase (retained, superseded by the later phases above)
 
 This document reflected the M2.4 state: Speech-to-Text lives under
 **AI → Media Analysis** as a compact control panel — one global `Test all

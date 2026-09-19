@@ -64,15 +64,17 @@ def _reset_stt_fallback_state():
     The credential pool is the same kind of state one level down — a loaded pool
     and a credential left in cooldown would change a later test's attempts the
     same way — so it is reset with it."""
-    from backend.services import stt_credential_pool, stt_fallback
+    from backend.services import credential_service, stt_credential_pool, stt_fallback
 
     stt_fallback.clear_registration()
     stt_fallback.reset_health()
     stt_credential_pool.reset()
+    credential_service.clear_tests()
     yield
     stt_fallback.clear_registration()
     stt_fallback.reset_health()
     stt_credential_pool.reset()
+    credential_service.clear_tests()
 
 
 @pytest.fixture

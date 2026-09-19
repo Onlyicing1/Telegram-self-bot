@@ -125,6 +125,18 @@ def _register_adapter_env_names() -> None:
 # ── Loading (bounded, explicit, never fatal) ──
 
 
+def env_var_names(provider: str) -> tuple[str, ...]:
+    """The provider's OWN declared credential variables, as public read-only data.
+
+    The same single declaration the pool loads through, exposed so another
+    capability's boundary (the credential-management service) can report whether
+    the deployment still carries a credential for a provider without duplicating
+    a provider → variable-name table anywhere.
+    """
+    _register_adapter_env_names()
+    return _env_var_names(provider)
+
+
 def registered_providers() -> tuple[str, ...]:
     """Every provider the control plane's registry can select, in canonical order.
 

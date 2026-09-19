@@ -200,6 +200,7 @@ async def _ai_media_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     _owner, config = await _saved_config()
     ocr_ready = _ocr_ready()
 
+    from backend.bot.handlers.ai_credentials import hub_line as credentials_line
     from backend.bot.handlers.ai_tts_settings import tts_status_line
 
     lines = [
@@ -210,12 +211,14 @@ async def _ai_media_panel_handler(event, extra: str) -> tuple[str, str, list] | 
         f"Text recognition · {'Ready' if ocr_ready else 'Not configured'}",
         stt_selection_line(config),
         tts_status_line(),
+        await credentials_line(_owner),
     ]
 
     builder = InlinePanelBuilder()
     builder.add_row("Text recognition (OCR)", "panel:ai_media_ocr")
     builder.add_row("Speech-to-Text", "panel:ai_media_stt")
     builder.add_row("Text-to-Speech", "panel:ai_media_tts")
+    builder.add_row("API Credentials", "panel:ai_cred")
     _nav_buttons(builder)
     return "Media Analysis", "\n".join(lines), builder.build()
 

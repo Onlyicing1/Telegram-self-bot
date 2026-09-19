@@ -1486,6 +1486,7 @@ migration. No code change needed.
 | 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Applied (verified by owner) |
 | 12 | `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds` (idempotent backfill + drop) | Pending manual application |
 | 13 | `20260919000001_create_api_credential_vault.sql` | `api_credentials` metadata table (no secret column) + `api_credential_pool` SECURITY DEFINER resolution RPC over Supabase Vault + `stt_credential_pool` compatibility alias | **NOT APPLIED — owner action required** (the application tolerates its absence; see §29) |
+| 14 | `20260919000002_credential_vault_management.sql` | Five owner-scoped SECURITY DEFINER management RPCs over the PART 1 table and Supabase Vault (`api_credential_list`, `api_credential_create`, `api_credential_replace_secret`, `api_credential_update`, `api_credential_delete`). Adds no table, no column and no secret store | **NOT APPLIED — owner action required** (management reports itself as not configured; the runtime and the PART 1 resolution path are unaffected; see §29.13) |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,
@@ -2337,7 +2338,792 @@ DROP TABLE IF EXISTS public.api_credentials;
 NOTIFY pgrst, 'reload schema';
 ```
 
-### 29.12 Migration status and next steps
+### 29.13 API Credential Vault (PART 2) — owner-scoped credential management
+
+> **Status: implemented in the repository; NOTHING was executed against
+> Supabase.** Five SECURITY DEFINER functions are added by
+> `supabase/migrations/20260919000002_credential_vault_management.sql`; the complete
+> manual SQL is §29.14 and the reversal SQL is §29.15. The coding agent created **no
+> function, no table, no column, no index, no policy, no schema change and no Vault
+> secret**, deleted no key, and did not connect to Supabase.
+
+**Migration file:** `supabase/migrations/20260919000002_credential_vault_management.sql`
+— the executable statements in §29.14 are a byte-identical copy of that file.
+**Depends on:** PART 1 (`20260919000001_create_api_credential_vault.sql`, §29.1–§29.12),
+which must be applied first.
+
+PART 1 made a credential *resolvable*; PART 2 makes it *manageable* from Telegram.
+Neither half adds a second secret store:
+
+```
+Telegram owner
+    ↓
+AI → Media Analysis → API Credentials        backend/bot/handlers/ai_credentials.py
+    ↓
+credential management service                backend/services/credential_service.py
+    ↓
+the five functions of this section
+    ├── public.api_credentials   (metadata only — still NO secret column)
+    └── vault.secrets            (the raw key, written only through vault.create_secret)
+    ↓
+public.api_credential_pool  (PART 1, UNCHANGED)
+    ↓
+STT providers (gemini, groq, speechmatics)   ·   future TTS providers (openai)
+```
+
+#### 29.13.1 The five functions
+
+| Function | Purpose | Touches a secret? | Return shape |
+|---|---|---|---|
+| `api_credential_list(p_owner_id bigint, p_provider text DEFAULT NULL)` | the owner's credential METADATA, optionally for one provider | **NO** — it never reads a secret column or view | 7-column metadata table, ≤ 64 rows |
+| `api_credential_create(p_owner_id bigint, p_provider text, p_label text, p_secret text, p_priority integer DEFAULT 0, p_enabled boolean DEFAULT true)` | creates the Vault secret AND the metadata row referencing it | **WRITES** one (the argument is handed straight to `vault.create_secret`) | the metadata row |
+| `api_credential_replace_secret(p_owner_id bigint, p_credential_id text, p_secret text)` | swaps in a NEW secret and removes the old one | **WRITES** one | the metadata row |
+| `api_credential_update(p_owner_id bigint, p_credential_id text, p_label text DEFAULT NULL, p_enabled boolean DEFAULT NULL, p_priority integer DEFAULT NULL)` | metadata only: label / enabled / priority | **NO** — it cannot read or rotate a key | the metadata row |
+| `api_credential_delete(p_owner_id bigint, p_credential_id text)` | removes the Vault secret and the metadata row | **DELETES** one (never returns it) | `boolean` |
+
+All five live in `public`, are `CREATE OR REPLACE` (idempotent), return **metadata
+only** — `credential_id, provider, label, enabled, priority, created_at,
+updated_at` — and **no function can return a secret**: there is no return shape in
+this migration that can hold one.
+
+#### 29.13.2 Parameter and return contract
+
+| Item | Value |
+|---|---|
+| `p_owner_id` | `bigint`, **required by every call**. `<= 0` raises `invalid_owner`. Every statement filters on it, so one owner can never read or modify another owner's credential. |
+| `p_provider` | `text`, the free-form provider token shared with the runtime registry (`^[a-z0-9][a-z0-9._-](0, 31)$`, else `invalid_provider`). |
+| `p_label` | `text`, non-blank and ≤ 80 characters (`invalid_label`). |
+| `p_priority` | `integer`, `0 … 1000000` (`invalid_priority`); lower is tried first. |
+| `p_enabled` | `boolean`; a disabled credential is never returned by `api_credential_pool`. |
+| `p_credential_id` | `text`, `1 … 64` characters from `[A-Za-z0-9._-]` (`invalid_credential`); the same identity PART 1 declared. |
+| `p_secret` | `text`, accepted **only** by create and replace: empty raises `empty_secret`, longer than 8192 characters raises `secret_too_long`. |
+| Unknown credential | raises `credential_not_found` (except delete, which returns `false`). |
+| Ordering (list) | `provider, priority, created_at, credential_id` — the same order `api_credential_pool` resolves in. |
+| Row ceiling (list) | `LIMIT 64`. |
+
+#### 29.13.3 Security model
+
+| Concern | Value |
+|---|---|
+| Language / volatility | `api_credential_list` is `sql STABLE`; the four writers are `plpgsql VOLATILE`. |
+| Security | **`SECURITY DEFINER`** on all five, so they read and write `vault.*` on the caller's behalf and the application never needs a privilege on the Vault schema. |
+| `search_path` | **`SET search_path = ''`** on all five, with a fully qualified body — a caller cannot hijack resolution through the search path. |
+| Ownership | `ALTER FUNCTION … OWNER TO postgres;` on all five. |
+| Grants | `REVOKE ALL … FROM PUBLIC, anon, authenticated;` then `GRANT EXECUTE … TO service_role;` — `service_role` only, exactly like the PART 1 resolution function. |
+| RLS | The PART 1 table already has RLS enabled with **no policy** and no grant to `anon`/`authenticated`; PART 2 does not alter it. Owner scoping is enforced inside each function by `p_owner_id`. |
+| Dynamic SQL | **None.** No `EXECUTE format`, no string-built statement, no `SET LOCAL ROLE`: these are five fixed functions, not a query endpoint. |
+| `usage` tokens | No function in this section calls `supabase_vault`, `usage` or any administrative helper. |
+
+#### 29.13.4 Secret exposure boundary
+
+| Where a raw secret may exist | Where it must NEVER appear |
+|---|---|
+| In `vault.secrets` (encrypted), written only by `vault.create_secret` from create/replace | `public.api_credentials` — it has no column that can hold one |
+| In the argument and local variable of `api_credential_create` / `api_credential_replace_secret`, for the duration of that one call | any return shape, `COMMENT`, or `RAISE` message in this migration |
+| In one in-flight request body inside the application (`credential_service.create_credential` / `replace_secret`) and one provider attempt | a log line, a Telegram message, callback data, `ai_config`, an error string returned to Telegram, or a test fixture |
+
+None of the five functions reads a decrypted secret back out. `api_credential_list`
+selects the metadata columns only, `api_credential_update` touches no secret at all,
+and `api_credential_delete` removes the secret by id without ever selecting it.
+There is deliberately **no "show key" operation** anywhere in the architecture.
+
+#### 29.13.5 Deletion, replacement and orphan handling
+
+| Operation | Order of operations | Guarantee |
+|---|---|---|
+| create | `vault.create_secret` → `INSERT` the metadata row (inside a nested `BEGIN … EXCEPTION` block) | if the metadata insert fails, the just-created secret is deleted and the error is re-raised: **a failed create leaves no unreferenced secret** |
+| replace | read the mapping → `vault.create_secret` (new) → `UPDATE` the row to the new secret → `DELETE` the old secret | the old secret is removed **only after** the row points at the new one, because `vault_secret_id` is `ON DELETE CASCADE` and deleting it first would have cascaded the metadata row away; a failed `UPDATE` deletes the NEW secret instead |
+| delete | read the mapping → `DELETE FROM vault.secrets` (the FK cascades the metadata row) → `DELETE` the metadata row explicitly | a success means **neither the secret nor the metadata remains**; both deletes happen in one transaction, so a refused secret removal aborts and is reported as a failure rather than a success |
+| update | `UPDATE … SET label/enabled/priority, updated_at` | metadata only — it cannot orphan, rotate or disturb a secret |
+
+Two honest exceptions, both documented rather than hidden:
+
+* **A leftover old secret after a replace.** The final `DELETE` of the old secret is
+  best-effort: if it fails, the swap still stands (the row points at the new secret
+  and the runtime uses it) and an unreferenced row remains in `vault.secrets`. It is
+  inert — nothing references it, nothing resolves it — and can be removed with
+  `SELECT vault.delete_secret('<id>')`. Failing the whole swap instead would have
+  left the caller unable to rotate a leaked key.
+* **Uniqueness of the Vault name.** `vault.secrets.name` is UNIQUE, so create names
+  its secret `api_credential:<credential_id>` and replace adds a random suffix to
+  distinguish the new one from the one it is about to delete.
+
+#### 29.13.6 Application consumers
+
+| Layer | File | Responsibility |
+|---|---|---|
+| Telegram surface | `backend/bot/handlers/ai_credentials.py` | owner-only panels, actions and inputs; renders metadata and a bounded result; **no SQL, no database client, no secret-store call** |
+| Management boundary | `backend/services/credential_service.py` | validation, the bounded reason vocabulary, the non-secret credential handle, the credential test, and the ONLY `db.rpc` calls to the five functions |
+| Discovery | `stt_control_plane` + `tts_service` (through `credential_service.registered_providers()`) | decides which providers the panel may offer, so no imaginary provider can be created |
+| Pool refresh | `backend/services/stt_credential_pool.prepare()` | after every successful change, the affected provider's pool is reloaded, so a new key is in effect on the very next request |
+
+#### 29.13.7 Failure behaviour and ENV compatibility
+
+* A management failure never raises into Telegram: `credential_service` maps every
+  outcome to a bounded class (`store_not_configured`, `store_unavailable`,
+  `invalid_*`, `empty_secret`, `secret_too_long`, `secret_shape`,
+  `credential_not_found`, `rejected`, `failed`) and logs **the class and at most a
+  code — never the database's message**, which is what keeps a refused statement
+  from echoing anything sensitive.
+* **Not configured is its own honest state:** an absent function (PostgREST
+  `PGRST202` / PostgreSQL `42883`) or an unconfigured client reports
+  `store_not_configured`, and the panel says so. The runtime is unaffected.
+* **No new environment variable and no ENV reading here.** The managed store is an
+  *additional* source: `backend/ai/credential_source.py` still resolves the
+  provider's own declared variable first (PART 1, unchanged), and PART 2 neither
+  reads nor writes any environment variable.
+* **No automatic migration of ENV keys into Vault.** Adding a managed credential is
+  an explicit owner action.
+
+#### 29.13.8 STT compatibility and future TTS compatibility
+
+The store is generic by the `provider` token, which is why PART 2 adds no
+`tts_credential_pool.py`, no `stt_credentials.py` and no second secret architecture:
+
+* **STT** keeps resolving through `api_credential_pool` → the M2.4 credential pool →
+  the M2.3 provider fallback. A credential added, enabled, disabled or deleted from
+  the panel is picked up by that existing path on the next request; no provider
+  selection, model choice or fallback rule changes.
+* **TTS** (`openai`) is listed by the same panel and managed through the same
+  functions. It has no bounded credential test in this phase, so its TEST action is
+  reported as not supported rather than approximated.
+
+### 29.14 Manual Supabase SQL — NOT EXECUTED BY AI
+
+The block below is `supabase/migrations/20260919000002_credential_vault_management.sql`
+verbatim (header comment included). Apply it **as `postgres`** in the Supabase SQL
+Editor, after PART 1. It creates functions only: no table, no column, no index, no
+policy, no extension and no secret.
+
+```sql
+/*
+# API Credential Vault — PART 2 (owner-scoped management)
+
+PART 1 created the credential METADATA table and the ONE resolution boundary.
+This migration adds the MANAGEMENT boundary the owner-facing Telegram surface
+calls: create, replace the secret, update metadata, delete, and list.
+
+    Telegram owner
+        ↓
+    AI → Media Analysis → API Credentials        backend/bot/handlers/ai_credentials.py
+        ↓
+    credential management service                backend/services/credential_service.py
+        ↓
+    the SECURITY DEFINER functions below
+        ├── public.api_credentials   (metadata only — no secret column exists)
+        └── vault.secrets            (the raw key, via the vault.* API)
+
+WHAT THIS MIGRATION IS NOT
+
+* It is NOT a plaintext key store and it does NOT change the PART 1 table: no
+  column is added, no column can hold a secret, and `api_credentials` is left
+  exactly as PART 1 created it.
+* It is NOT a generic SQL execution endpoint: five functions, a fixed parameter
+  list, a fixed return shape (metadata only — never a secret) and a fixed row
+  ceiling on the one function that lists.
+* It is NOT STT- or TTS-specific: every function takes the free-form `provider`
+  token, so the same five functions manage the credentials of a
+  Speech-to-Text provider and of a Text-to-Speech provider.
+* It does NOT read a secret back out. There is no "show key" function: the only
+  statements that touch a secret are the ones that WRITE one (create/replace).
+
+Objects created (all in `public`, all idempotent):
+
+| Object | Type | Purpose |
+|---|---|---|
+| `api_credential_list(bigint, text)` | function | owner-scoped METADATA listing (no secret), deterministic order, ≤ 64 rows |
+| `api_credential_create(bigint, text, text, text, integer, boolean)` | function | creates the Vault secret AND the metadata row pointing at it |
+| `api_credential_replace_secret(bigint, text, text)` | function | swaps in a NEW Vault secret and removes the old one |
+| `api_credential_update(bigint, text, text, boolean, integer)` | function | metadata only (label / enabled / priority) — never the secret |
+| `api_credential_delete(bigint, text)` | function | removes the Vault secret first, then the metadata row |
+
+SECURITY MODEL
+
+* Every function is SECURITY DEFINER with `SET search_path = ''` and a fully
+  qualified body, owned by `postgres`, and REVOKEd from PUBLIC/anon/authenticated
+  and granted to `service_role` only — the same posture PART 1 established, and
+  deliberately different from the dashboard-readable tables.
+* `owner_id` is a REQUIRED parameter of every call and every statement filters on
+  it, so one owner can never read or modify another owner's credential, whatever
+  button a client sends.
+* A raw secret is accepted ONLY by `api_credential_create` and
+  `api_credential_replace_secret`, only as an argument, and is handed straight to
+  `vault.create_secret` — it is never inserted into `public.api_credentials`,
+  never returned, never placed in a comment and never in a log.
+* No function returns a secret: every RETURNS TABLE shape is the metadata
+  projection of `api_credentials` (`credential_id, provider, label, enabled,
+  priority, created_at, updated_at`).
+
+FAILURE AND ORPHAN HANDLING
+
+The Vault API and this table cannot be joined into one atomic unit by anything
+other than the surrounding transaction, and this migration does not claim
+otherwise. Each write is therefore written to be recoverable:
+
+* CREATE — the metadata insert runs inside a nested BEGIN/EXCEPTION block that
+  deletes the Vault secret it just made if the insert fails, then re-raises, so a
+  failed create can never leave an unreferenced secret.
+* REPLACE — the new secret is created first and the row is switched to it; the
+  OLD secret is deleted only AFTER the switch, because `vault_secret_id` carries
+  `ON DELETE CASCADE` and deleting it first would have removed the very row being
+  updated. A failed switch deletes the new secret instead.
+* DELETE — the secret is removed FIRST (which cascades the metadata row) and the
+  metadata row is then deleted explicitly as a fallback, so no metadata can
+  outlive its secret. A failed secret delete raises, and the caller reports the
+  failure instead of a success.
+* UPDATE — touches metadata only, so it can never orphan a secret.
+
+## MANUAL SUPABASE ACTION REQUIRED
+
+This migration has NOT been executed and Supabase has NOT been modified.
+`vault.secrets` is owned by the Vault extension, so applying this file is an
+owner action in the Supabase SQL Editor (it must run as `postgres`). It depends
+on PART 1 (`20260919000001_create_api_credential_vault.sql`) having been applied
+first. The identical SQL, with rollback, is reproduced in
+DATABASE_ARCHITECTURE.md §29.13–§29.17.
+
+Rollback (destructive only to the objects created here):
+
+    DROP FUNCTION IF EXISTS public.api_credential_delete(bigint, text);
+    DROP FUNCTION IF EXISTS public.api_credential_update(bigint, text, text, boolean, integer);
+    DROP FUNCTION IF EXISTS public.api_credential_replace_secret(bigint, text, text);
+    DROP FUNCTION IF EXISTS public.api_credential_create(bigint, text, text, text, integer, boolean);
+    DROP FUNCTION IF EXISTS public.api_credential_list(bigint, text);
+
+    -- The PART 1 table, its resolution RPC, the supabase_vault extension and any
+    -- Vault secret are NOT touched by this rollback. Dropping the functions stops
+    -- all owner-facing management; credentials already configured keep resolving
+    -- through api_credential_pool and the owner's Telegram panel reports the
+    -- management boundary as unavailable.
+*/
+
+-- ============================================================================
+-- 1. api_credential_list — owner-scoped METADATA read (never a secret)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_list(
+    p_owner_id bigint,
+    p_provider text DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT c.credential_id,
+           c.provider,
+           c.label,
+           c.enabled,
+           c.priority,
+           c.created_at,
+           c.updated_at
+      FROM public.api_credentials AS c
+     WHERE c.owner_id = p_owner_id
+       AND (p_provider IS NULL OR c.provider = p_provider)
+     ORDER BY c.provider ASC, c.priority ASC, c.created_at ASC, c.credential_id ASC
+     LIMIT 64;
+$$;
+
+ALTER FUNCTION public.api_credential_list(bigint, text) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_list(bigint, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_list(bigint, text) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_list(bigint, text) IS
+    'Owner-scoped credential METADATA listing (no secret column is read or returned). Deterministic order: provider, priority, created_at, credential_id. At most 64 rows. Callable by service_role only.';
+
+-- ============================================================================
+-- 2. api_credential_create — Vault secret + metadata row, orphan-safe
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_create(
+    p_owner_id bigint,
+    p_provider text,
+    p_label    text,
+    p_secret   text,
+    p_priority integer DEFAULT 0,
+    p_enabled  boolean DEFAULT true
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_provider   text;
+    v_label      text;
+    v_secret     text;
+    v_priority   integer;
+    v_enabled    boolean;
+    v_id         text;
+    v_attempt    integer := 0;
+    v_secret_id  uuid;
+    v_row        public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_provider := btrim(coalesce(p_provider, ''));
+    IF v_provider !~ '^[a-z0-9][a-z0-9._-]{0,31}$' THEN
+        RAISE EXCEPTION 'invalid_provider' USING ERRCODE = '22023';
+    END IF;
+
+    v_label := btrim(coalesce(p_label, ''));
+    IF length(v_label) = 0 OR length(v_label) > 80 THEN
+        RAISE EXCEPTION 'invalid_label' USING ERRCODE = '22023';
+    END IF;
+
+    v_secret := coalesce(p_secret, '');
+    IF length(v_secret) = 0 THEN
+        RAISE EXCEPTION 'empty_secret' USING ERRCODE = '22023';
+    END IF;
+    IF length(v_secret) > 8192 THEN
+        RAISE EXCEPTION 'secret_too_long' USING ERRCODE = '22023';
+    END IF;
+
+    v_priority := greatest(0, least(coalesce(p_priority, 0), 1000000));
+    v_enabled  := coalesce(p_enabled, true);
+
+    -- A short, non-secret identifier. Bounded retry: a 48-bit collision is
+    -- astronomically unlikely, and the loop can never spin unbounded.
+    LOOP
+        v_attempt := v_attempt + 1;
+        v_id := 'c' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 12);
+        EXIT WHEN NOT EXISTS (
+            SELECT 1 FROM public.api_credentials AS c
+             WHERE c.credential_id = v_id
+        );
+        IF v_attempt >= 3 THEN
+            RAISE EXCEPTION 'credential_id_collision' USING ERRCODE = '23505';
+        END IF;
+    END LOOP;
+
+    -- The ONLY statement in this repository that writes a raw secret, and it
+    -- writes it into Vault. `vault.secrets.name` is UNIQUE, so the name is
+    -- derived from the (already unique) credential id.
+    v_secret_id := vault.create_secret(
+        v_secret,
+        'api_credential:' || v_id,
+        'LifeOS API credential for provider ' || v_provider
+    );
+
+    BEGIN
+        INSERT INTO public.api_credentials AS c (
+            credential_id, provider, label, owner_id, enabled, priority, vault_secret_id
+        ) VALUES (
+            v_id, v_provider, v_label, p_owner_id, v_enabled, v_priority, v_secret_id
+        )
+        RETURNING * INTO v_row;
+    EXCEPTION WHEN OTHERS THEN
+        -- Never leave an unreferenced secret behind. This block runs in its own
+        -- subtransaction, so it survives the failure it is cleaning up after.
+        BEGIN
+            DELETE FROM vault.secrets WHERE id = v_secret_id;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean) IS
+    'Creates one Vault secret and the owner-scoped metadata row referencing it. Accepts a raw secret ONLY as an argument, stores it ONLY in Supabase Vault, and returns metadata only. Removes the just-created secret if the metadata insert fails. Callable by service_role only.';
+
+-- ============================================================================
+-- 3. api_credential_replace_secret — swap the key, never orphan the old one
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_replace_secret(
+    p_owner_id bigint,
+    p_credential_id text,
+    p_secret text
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id        text;
+    v_secret    text;
+    v_old_id    uuid;
+    v_new_id    uuid;
+    v_row       public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    v_secret := coalesce(p_secret, '');
+    IF length(v_secret) = 0 THEN
+        RAISE EXCEPTION 'empty_secret' USING ERRCODE = '22023';
+    END IF;
+    IF length(v_secret) > 8192 THEN
+        RAISE EXCEPTION 'secret_too_long' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT c.vault_secret_id INTO v_old_id
+      FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+       FOR UPDATE;
+
+    IF v_old_id IS NULL THEN
+        RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    v_new_id := vault.create_secret(
+        v_secret,
+        'api_credential:' || v_id || ':' || substr(md5(gen_random_uuid()::text), 1, 8),
+        'LifeOS API credential for provider (replaced)'
+    );
+
+    BEGIN
+        UPDATE public.api_credentials AS c
+           SET vault_secret_id = v_new_id,
+               updated_at = now()
+         WHERE c.credential_id = v_id
+           AND c.owner_id = p_owner_id
+        RETURNING * INTO v_row;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        BEGIN
+            DELETE FROM vault.secrets WHERE id = v_new_id;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+
+    -- Only AFTER the row points at the new secret: deleting the old one first
+    -- would have cascaded the row away (vault_secret_id is ON DELETE CASCADE).
+    BEGIN
+        DELETE FROM vault.secrets WHERE id = v_old_id;
+    EXCEPTION WHEN OTHERS THEN
+        -- The new secret is live and the row is correct; a leftover old secret
+        -- is inert because nothing references it any more. Reported honestly in
+        -- DATABASE_ARCHITECTURE.md §29.16 rather than failing the swap.
+        NULL;
+    END;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_replace_secret(bigint, text, text) IS
+    'Replaces the Vault secret of ONE owner-scoped credential. Never returns the old or the new secret and never changes label/enabled/priority. Callable by service_role only.';
+
+-- ============================================================================
+-- 4. api_credential_update — metadata only, never the secret
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_update(
+    p_owner_id bigint,
+    p_credential_id text,
+    p_label text DEFAULT NULL,
+    p_enabled boolean DEFAULT NULL,
+    p_priority integer DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id      text;
+    v_label   text;
+    v_row     public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    IF p_label IS NOT NULL THEN
+        v_label := btrim(p_label);
+        IF length(v_label) = 0 OR length(v_label) > 80 THEN
+            RAISE EXCEPTION 'invalid_label' USING ERRCODE = '22023';
+        END IF;
+    END IF;
+
+    IF p_priority IS NOT NULL AND (p_priority < 0 OR p_priority > 1000000) THEN
+        RAISE EXCEPTION 'invalid_priority' USING ERRCODE = '22023';
+    END IF;
+
+    UPDATE public.api_credentials AS c
+       SET label      = coalesce(v_label, c.label),
+           enabled    = coalesce(p_enabled, c.enabled),
+           priority   = coalesce(p_priority, c.priority),
+           updated_at = now()
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+    RETURNING * INTO v_row;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer) IS
+    'Updates the owner-scoped METADATA of ONE credential (label / enabled / priority). A NULL argument leaves that field unchanged. Reads and writes no secret. Callable by service_role only.';
+
+-- ============================================================================
+-- 5. api_credential_delete — secret first (it cascades), row as a fallback
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_delete(
+    p_owner_id bigint,
+    p_credential_id text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id        text;
+    v_secret_id uuid;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT c.vault_secret_id INTO v_secret_id
+      FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+       FOR UPDATE;
+
+    IF v_secret_id IS NULL THEN
+        -- Nothing of the owner's matches: an honest "not found", not an error.
+        RETURN false;
+    END IF;
+
+    -- Removing the secret is what makes this a real deletion. If it fails the
+    -- function raises and the caller must NOT report success.
+    DELETE FROM vault.secrets WHERE id = v_secret_id;
+
+    -- The foreign key cascades the metadata row; this explicit delete only does
+    -- anything on a deployment whose constraint is missing, and it guarantees no
+    -- metadata outlives its secret either way.
+    DELETE FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id;
+
+    RETURN true;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_delete(bigint, text) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_delete(bigint, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_delete(bigint, text) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
+    'Deletes ONE owner-scoped credential: the Vault secret first (which cascades the metadata row), then the metadata row. Returns false when the owner has no such credential. Callable by service_role only.';
+
+-- ============================================================================
+-- 6. PostgREST schema cache
+-- ============================================================================
+
+NOTIFY pgrst, 'reload schema';
+```
+
+### 29.15 Manual reversal SQL — NOT EXECUTED BY AI
+
+Destructive only to the five functions created by §29.14. It does **not** drop the
+PART 1 table or its resolution function, does **not** drop the shared
+`supabase_vault` extension, and does **not** delete any stored key — removing the
+panel must not destroy credentials the runtime still resolves.
+
+```sql
+-- 1. The five PART 2 management functions (they depend on the PART 1 table).
+DROP FUNCTION IF EXISTS public.api_credential_delete(bigint, text);
+DROP FUNCTION IF EXISTS public.api_credential_update(bigint, text, text, boolean, integer);
+DROP FUNCTION IF EXISTS public.api_credential_replace_secret(bigint, text, text);
+DROP FUNCTION IF EXISTS public.api_credential_create(bigint, text, text, text, integer, boolean);
+DROP FUNCTION IF EXISTS public.api_credential_list(bigint, text);
+
+-- 2. Deliberately NOT dropped by this reversal:
+--    * public.api_credentials, its three indexes, public.api_credential_pool and
+--      the stt_credential_pool alias — they belong to PART 1 and are reversed by
+--      §29.11, not here;
+--    * EXTENSION supabase_vault — a shared Supabase extension;
+--    * rows in vault.secrets — a management rollback must NOT destroy the owner's
+--      keys, because removing the panel does not remove the credentials the runtime
+--      still resolves through public.api_credential_pool. Remove them explicitly,
+--      in the Vault UI/SQL, only when you are certain nothing uses them:
+--          SELECT id, name FROM vault.secrets ORDER BY name;
+--    * the ENV credentials on the deployment;
+--    * the credential METADATA rows (they are inert without the panel).
+NOTIFY pgrst, 'reload schema';
+```
+
+### 29.16 Orphan-secret handling (summary)
+
+| Situation | Outcome | Recovery |
+|---|---|---|
+| create fails after the secret was made | the secret is deleted before the error leaves the function | none needed |
+| replace fails while switching the row | the NEW secret is deleted; the old key and the row are untouched | none needed |
+| replace succeeds but the old secret cannot be removed | the row points at the new key; one unreferenced secret remains | `SELECT vault.delete_secret('<id>')` at your discretion |
+| delete cannot remove the secret | the transaction aborts; the row and the key both remain | retry, or fix the privilege and retry |
+| metadata row deleted in the Vault UI instead | the FK would already have cascaded the row; nothing to do | none |
+| a key deleted directly in the Vault UI | the metadata row cascades away | the panel simply no longer lists it |
+
+### 29.17 Owner-facing surface added by PART 2
+
+| Panel / action | What it does | Secret handling |
+|---|---|---|
+| `AI → Media Analysis → API Credentials` | lists the registered providers and how many managed keys each has | counts only |
+| one provider | lists that provider's credentials (label, enabled, priority, last test), and whether a deployment key exists | metadata only; the deployment key is reported as present/not present, never named or shown |
+| one credential | enable/disable, rename, move earlier/later, set priority, replace key, test, delete | only "replace key" collects a value |
+| add / replace input | asks for ONE message containing the key, stores it, then **deletes that message** and reports honestly if it could not | the key is never rendered, logged, echoed back or put in callback data |
+| delete | asks for confirmation first, then removes the key and the metadata together | a failure is reported as a failure |
+
+Credential addresses in callback data are short non-secret handles derived from the
+credential id (SHA-256 prefix), so a payload never carries a value and a button is
+never longer than Telegram's 64-byte callback limit.
+
+### 29.18 PART 2 manual configuration still required
+
+1. Apply §29.14 (identical to the migration) as `postgres`, after §29.10.
+2. Nothing else: no table to create, no row to seed, no environment variable to add,
+   no Render setting to change. Keys are added from the panel.
+3. Optional verification, read-only:
+
+```sql
+SELECT credential_id, provider, label, enabled, priority, created_at
+  FROM public.api_credentials
+ ORDER BY provider, priority, created_at, credential_id;
+```
+
+4. Reversal, if ever needed, is §29.15 (management functions only) or §29.11
+   (PART 1 objects).
+
+### 29.19 What PART 2 deliberately does not do
+
+* No second secret store, no per-capability credential table, no `tts_credentials.py`.
+* No SQL execution, no Supabase connection, no secret creation or deletion by the
+  coding agent — every object above is pending an owner action.
+* No display of a raw key: there is no show, reveal, copy or export operation.
+* No credential-management UI beyond the three panel levels described in §29.17, and
+  no credential health claim: credential existence is never presented as provider
+  health.
+* No TTS control-plane change: the TTS provider's credentials are manageable, its
+  model/voice selection and provider fallback remain deferred.
+* No environment-variable scan and no numbered `*_KEY_1/2/3` variable scheme.
+
+### 29.20 Migration status and next steps
 
 | Item | Value |
 |---|---|
@@ -2345,7 +3131,11 @@ NOTIFY pgrst, 'reload schema';
 | Objects pending owner action | `api_credentials`, its 3 indexes, RLS+grants, `api_credential_pool`, `stt_credential_pool` |
 | Application behaviour without it | unchanged from M2.4/M3.0 — the ENV credential keeps every provider working and the RPC failure is a bounded warning |
 | Live Supabase verification | **NOT PERFORMED** — the RPC path was exercised only against a fake secret backend in `tests/test_credential_vault.py` |
-| Next (PART 2, not in this commit) | the owner-facing credential-management surface (enable/disable, priority, health, test) — it will reuse this table/RPC and add no new secret architecture |
+| Applied by the coding agent (PART 2) | **NO** — no SQL was executed, Supabase was not modified, no Vault secret was created and no existing key was deleted |
+| Objects pending owner action (PART 2) | the five management functions of §29.13 (grants and comments included) |
+| PART 2 panel behaviour without it | the panel reports the credential store as not configured and changes nothing; every provider keeps resolving its credentials exactly as before |
+| Live verification (PART 2) | **NOT PERFORMED** — the management path was exercised only against a fake store in `tests/test_credential_management.py`; no real provider request, no Telegram session and no Supabase project was used |
+| Next after PART 2 | live verification of the panel against the owner's own Supabase project, then the deferred TTS provider fallback and its credential pool |
 
 ## Final Canonical Contract
 
