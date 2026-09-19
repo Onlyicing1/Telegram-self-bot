@@ -1,6 +1,276 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — Media Processing M3.0: controlled Text-to-Speech foundation
+## Latest phase — API Credential Vault PART 1: credential metadata + Vault resolution
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-19.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **API Credential Vault PART 1 (infrastructure only)** — a generic, provider-agnostic credential METADATA table plus ONE SECURITY DEFINER resolution function over Supabase Vault |
+| Starting HEAD | `88ccfa2` `feat(tts): speak text through a bounded synthesis boundary` (== `origin/main` at phase start) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Migration shipped | **`supabase/migrations/20260919000001_create_api_credential_vault.sql`** — the repository's first migration for the credential vault, and the first object in this project that uses Supabase Vault |
+| Supabase executed by this phase | **NO** — no SQL was run, Supabase was **not** modified, no Vault secret was created, no schema was altered, and no connection was made |
+| Database objects created (pending owner action) | `public.api_credentials` (table) · `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret` (indexes) · `public.api_credential_pool(text, bigint)` (function) · `public.stt_credential_pool(text, bigint)` (compatibility alias) |
+| New environment variables | **NONE** — deliberately none; Render keeps only the ONE credential per provider plus the Supabase bootstrap secrets |
+| New dependencies | **NONE** (`requirements.txt` untouched) |
+| Files changed | **five** — NEW `supabase/migrations/20260919000001_create_api_credential_vault.sql`, NEW `tests/test_credential_vault.py`; MODIFIED `backend/ai/credential_source.py`, `DATABASE_ARCHITECTURE.md`, `IMPLEMENTATION_REPORT.md` |
+| Behavioural change | **one string**: the credential boundary now calls `api_credential_pool` instead of `stt_credential_pool`. The call shape (`{"p_provider": …}`), the ENV-first precedence, the ordering, the bounds, the fail-closed degradation, the STT pool, the rotation and the provider fallback are all **byte-for-byte unchanged** |
+| Persisted state | **NONE added by the application** — the runtime still persists no credential and no secret; only the owner's metadata rows live in the new table |
+| Live Supabase verification | **NOT PERFORMED** — **Supabase has NOT been modified by this phase** and no Vault pool exists; the RPC path was exercised only against a fake secret backend in the test suite |
+| Live Telegram verification | **NOT PERFORMED** — no Telegram session exists in this environment |
+
+### Purpose of this phase
+
+M2.4 gave the runtime a bounded credential pool and documented a Supabase Vault
+RPC — but nothing created it: the table, the function and the mapping existed only
+as prose, and the application boundary was written as an STT component. PART 1
+supplies the missing infrastructure as **one generic architecture** rather than a
+second, TTS-shaped one:
+
+```
+ENV credentials            (unchanged — still the FIRST credential of every provider)
+        +
+Supabase Vault credentials (new — additional, owner-managed, encrypted at rest)
+        ↓
+generic credential source         backend/ai/credential_source.py
+        ↓
+bounded credential pool           backend/services/stt_credential_pool.py   (STT consumer)
+        ↓
+provider execution                the existing adapter for the CURRENT attempt
+```
+
+Because the table and the function are keyed by a free-form `provider` token, the
+future TTS credential pool is **not** a new module — it is the same
+`credential_source.load("openai", ("AI_OPENAI_API_KEY", …))` call. No
+`tts_credential_pool.py`, no `tts_credential_source.py`, no second secret store.
+
+Explicitly NOT implemented, per the phase instruction: the Telegram
+credential-management UI, any TTS control plane or voice/model selection, Native
+Vision, Video/GIF processing, provider benchmarking, account creation, payment
+automation, dashboard scraping, arbitrary SQL/shell/Telegram execution, and any
+unrelated refactor. **PART 2 (the owner-facing credential surface) is deferred.**
+
+### The database objects
+
+| Object | Kind | Purpose | Contains a secret? |
+|---|---|---|---|
+| `public.api_credentials` | table | credential bookkeeping: `credential_id`, `provider`, `label`, `owner_id`, `enabled`, `priority`, `vault_secret_id`, `created_at`, `updated_at` | **NO — there is no column anywhere in it that can hold a key** |
+| `uq_api_credentials_vault_secret` | UNIQUE index on `(vault_secret_id)` | one Vault secret maps to exactly ONE credential, so rotation can never "rotate" between two names for the same key |
+| `idx_api_credentials_provider_order` | index on `(provider, priority, created_at, credential_id)` | backs the deterministic single-provider read |
+| `idx_api_credentials_owner` | index on `(owner_id, provider)` | backs the owner-scoped read |
+| `public.api_credential_pool(text, bigint)` | SECURITY DEFINER function | the ONE resolution boundary: ordered, ENABLED, decrypted credentials of one provider | the DECRYPTED value is returned to the caller's service-role client and never stored |
+| `public.stt_credential_pool(text, bigint)` | SECURITY DEFINER function | deprecated alias of the same contract, kept because the M2.4 report documented that name | as above |
+
+Schema details (types, nullability, defaults, PK, FK + `ON DELETE CASCADE`, all
+five CHECK constraints, indexes, RLS, grants, ownership, arguments, return shape,
+security boundary, deletion behaviour, orphan handling) are documented in
+`DATABASE_ARCHITECTURE.md` **§29**, which also carries the complete manual SQL and
+the complete manual rollback SQL, both labelled `NOT EXECUTED BY AI`. A test
+asserts that the documented SQL is **statement-identical** to the migration file.
+
+### Vault architecture and the secret boundary
+
+```
+vault.secrets (encrypted)  ◄── FK ──  api_credentials.vault_secret_id
+        │ decrypted on read
+        ▼
+vault.decrypted_secrets  ──►  api_credential_pool(p_provider [, p_owner_id])
+                              SECURITY DEFINER, search_path = '', OWNER postgres
+                              REVOKE PUBLIC/anon/authenticated · GRANT service_role
+        ▼
+backend/ai/credential_source.py  (ONE db.rpc call, 5 s ceiling, bounded dispatch)
+```
+
+* **The application never reads `vault.*`.** Resolution happens inside the
+  SECURITY DEFINER function, which runs as its owner; the backend needs no
+  privilege on the Vault schema and no knowledge of Vault's internals.
+* **The parameter shape is the M2.4 contract unchanged**: the runtime sends
+  `{"p_provider": provider}` and omits the optional `p_owner_id`. Owner scoping is
+  available at the database boundary (the table is `owner_id NOT NULL` and the
+  function filters on it) for the phase that needs it, without a second function.
+* **A shared Vault secret cannot be double-mapped** (`uq_api_credentials_vault_secret`),
+  so a pool can never silently degrade into repeated attempts with the same key.
+
+### Security model
+
+| Boundary | Rule |
+|---|---|
+| Raw secret at rest | only inside `vault.secrets`, encrypted by Vault |
+| Raw secret in `public` | **never** — `api_credentials` declares no secret-bearing column |
+| Raw secret in application memory | only inside the `CredentialRecord` of the attempt that needs it |
+| Raw secret in logs / Telegram / AI context | **never** — the only identifier logged is the non-secret `credential_id` |
+| Table access | RLS enabled with **zero policies**; `REVOKE ALL … FROM PUBLIC, anon, authenticated`; `GRANT` to `service_role` only |
+| Function access | `REVOKE ALL … FROM PUBLIC, anon, authenticated`; `GRANT EXECUTE … TO service_role` only |
+| `search_path` hijack | impossible — `SECURITY DEFINER` + `SET search_path = ''` + a fully qualified body |
+| Generic SQL execution | **not** created — no dynamic SQL, no `EXECUTE`, no user-supplied identifier, one function with two bounded parameters |
+| ENV compatibility | unchanged — the environment credential is still the first and only default; no numbered variables, no environment scanning, no automatic migration of a key into Vault |
+
+`DATABASE_ARCHITECTURE.md` §24.G.3 ("no credentials in the database") is amended in
+the same commit rather than silently contradicted: the rule becomes "no raw key in
+any table; provider keys live in ENV **or** Vault, and the database holds metadata
+only".
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `supabase/migrations/20260919000001_create_api_credential_vault.sql` | **NEW** — the metadata table, its indexes/constraints/RLS/grants, the generic `api_credential_pool` function, the `stt_credential_pool` compatibility alias, explicit ownership, and the rollback in the header |
+| `backend/ai/credential_source.py` | **MODIFIED** — `VAULT_RPC` → `api_credential_pool`, new documented `LEGACY_VAULT_RPC` constant, and a docstring that no longer describes the boundary as STT-specific. No logic, bound, ordering or validation change |
+| `DATABASE_ARCHITECTURE.md` | **MODIFIED** — new §29 (table, RPC, Vault mapping, security model, failure/orphan behaviour, ENV fallback, STT/TTS compatibility, complete manual SQL, complete rollback SQL), TOC entry, migration-status row 13, and corrections to the three stale "zero `.rpc()` calls" statements |
+| `tests/test_credential_vault.py` | **NEW** — 69 tests pinning the migration, the documented SQL, the RPC contract, genericity, row validation, failure behaviour, bounds, the ENV fallback, owner scoping, M2.4 compatibility and secret non-leakage |
+| `IMPLEMENTATION_REPORT.md` | **MODIFIED** — this section; the M3.0 section is demoted to "Previous phase" |
+
+**Untouched (deliberately):** `media_service.py`, `stt_fallback.py`,
+`stt_credential_pool.py`, `stt_engine_factory.py`, `stt_control_plane.py`,
+`stt_provider_probe.py`, `stt_consensus.py`, `stt_chunking.py`, the provider
+adapters, `tts_service.py`, `openai_tts_engine.py`, the tool layer, the Telegram
+panels and handlers, `backend/db/client.py`, `requirements.txt`, `render.yaml`, and
+`supabase/canonical_bootstrap.sql` (the canonical public-schema bootstrap is
+intentionally left as the core-table contract; §29 records why the Vault RPC sits
+outside it).
+
+### Tests added and exact results
+
+| Suite | Result |
+|---|---|
+| `tests/test_credential_vault.py` (new) | **`69 passed` in 0.37 s** |
+| credential + STT suites (`test_stt_credential_pool`, `test_stt_fallback`, `test_ai_stt_settings`, `test_stt_provider_probe`, `test_stt_consensus`) | **`423 passed, 2 skipped` in 1.68 s** |
+| media + TTS regression set (16 media suites + 2 TTS suites + the AI presentation suite) | **`1003 passed` in 40.89 s** |
+| **Full suite** | **`4231 passed, 26 skipped, 3 warnings` in 114.64 s** |
+
+Count provenance: the M3.0 section below records **4162 passed / 26 skipped** at
+this phase's starting HEAD `88ccfa2`. This phase adds **69** tests and deletes,
+weakens or skips **none** → **4231 / 26**. (The `26` skips are the pre-existing
+opt-in live provider probes; the local interpreter is CPython 3.10.12, while
+production pins 3.11.7 in `render.yaml`.)
+
+Also run and clean: `python -m py_compile` on every changed Python file, and
+`git diff --check`.
+
+The new suite pins, from the source rather than from prose:
+
+* **the migration** — the file exists under the project's `YYYYMMDDHHMMSS_…`
+  naming convention; `api_credentials` declares exactly the nine documented
+  columns and **none of them is a secret column**; the FK to `vault.secrets(id)`
+  cascades; all five CHECK constraints exist; the id CHECK matches the
+  application's own alphabet and length exactly; a Vault secret can map to only
+  one credential; RLS is enabled with **no** policy; the table is revoked from
+  `PUBLIC`/`anon`/`authenticated` and granted to `service_role`; the function is
+  `SECURITY DEFINER` with `SET search_path = ''`, an explicit owner, a bounded
+  `LIMIT 8`, a fully deterministic `ORDER BY`, an `enabled` filter and an optional
+  owner filter; execution is revoked from `PUBLIC`/`anon`/`authenticated` and
+  granted to `service_role` only; the read goes through `vault.decrypted_secrets`
+  and never the encrypted table; there is no dynamic SQL; the migration seeds no
+  credential and creates no secret; `NOTIFY pgrst` is present; the `stt_credential_pool`
+  alias exists and resolves to the generic function;
+* **the documentation** — §29 documents the table and both functions, labels the
+  manual SQL and the rollback `NOT EXECUTED BY AI`, states explicitly that the
+  table stores no secret, names **every** object the migration creates, covers the
+  security model / ENV fallback / failure and orphan handling / consumers, and —
+  the strongest check in the file — the documented SQL is **statement-identical**
+  to the migration (comments and blank lines removed, both directions);
+* **the application** — the boundary targets `api_credential_pool` while keeping
+  `stt_credential_pool` as a documented alias that is **never** the runtime
+  target; the RPC call still sends exactly `{"p_provider": …}` (owner filter
+  omitted), so the M2.4 contract is intact; the module imports nothing from
+  `backend.bot`, `backend.services.stt*` or Telethon and names no provider, so it
+  is genuinely provider-agnostic; a non-STT provider (`openai`) resolves its own
+  pool from the same table and RPC while leaving another provider's pool alone;
+* **validation and failure** — a response that is not a list, a row that is not an
+  object, `None`, `{}`, a missing/`badly named`/over-long id, an empty secret, a
+  disabled row and a non-numeric priority each contribute exactly nothing (the
+  bad priority falls back to the documented default `0` instead); a missing
+  database, a refusing RPC and a malformed response each leave the ENV credential
+  in place and still mark the provider loaded; a refusing backend never reduces the
+  credentials already being served; no failure raises and no raw provider error
+  text is propagated;
+* **ordering and bounds** — the ENV credential stays first unless an explicit
+  Vault priority outranks it; the pool is capped at
+  `MAX_CREDENTIALS_PER_PROVIDER`; the environment is never scanned for an
+  undeclared name; an empty backend keeps the ENV credential and an absent ENV
+  credential leaves only the Vault pool;
+* **secrets never leak** — no secret appears in the load log, in the pool
+  description, in the migration, in `DATABASE_ARCHITECTURE.md` or in this report;
+  the boundary's only database call is the RPC (no `.table()`/`.insert()`/
+  `.upsert()`/`.update()`/`.delete()`), it never references the Vault schema, and
+  no key-shaped value (`sk-…`, `AIza…`) is committed in any new artefact;
+* **M2.4 compatibility** — the STT pool still loads through the generic boundary
+  and reports its counts; a Vault-backed credential still rotates inside the
+  provider (a credential-specific failure cools one down and the next Vault
+  credential becomes the head of the rotation); a pool whose credentials are ALL
+  cooling down is still attempted, so the provider-level fallback remains
+  reachable; the credential-vs-provider classification vocabulary is unchanged.
+
+### Exact manual Supabase actions still required
+
+**None of these has been performed.** The complete, copy-pasteable SQL is in
+`DATABASE_ARCHITECTURE.md` §29.10 (apply) and §29.11 (rollback).
+
+1. **Apply the migration** in the Supabase SQL Editor as `postgres` (it must own
+   the SECURITY DEFINER function so it can read `vault.decrypted_secrets`). If
+   Vault is not enabled on the project, enable it from Database → Extensions, or
+   let the `CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;`
+   statement create it.
+2. **Optionally** confirm Vault is available (`select * from vault.secrets`). The
+   application works without any Vault secret: every provider keeps its ENV
+   credential.
+3. **For each extra credential**, create the Vault secret and then insert ONE
+   metadata row mapping it (`vault.create_secret(...)` + an `INSERT INTO
+   public.api_credentials` that selects the secret's id by name — the exact
+   snippet is in §29.10). The metadata row must use a non-secret
+   `credential_id` of 1–64 characters from `[A-Za-z0-9._-]` and the provider token
+   the registry uses (`gemini`, `groq`, `speechmatics`, `openai`). **Priority is
+   lower-first**; ties fall back to `created_at` then `credential_id`.
+4. **Verify** with the read-only `SELECT credential_id, provider, enabled,
+   priority FROM public.api_credentials ORDER BY provider, priority, created_at`
+   — the runtime will pick the pool up at the next startup or STT settings save.
+
+The environment credential is **never** migrated automatically, and Render needs
+no new variable.
+
+### Known limitations
+
+* **Nothing was applied to Supabase** and no Vault secret exists, so this phase's
+  database objects are **untested against a real Postgres**: the SQL was validated
+  syntactically by statement-level assertions in the test suite, not by execution.
+  Applying it is the owner's action and is the real verification of that half.
+* **Live Telegram and live provider verification: NOT PERFORMED** (no session, no
+  credential in this environment). No provider, credential or recognition quality
+  is claimed anywhere.
+* The credential modules keep their existing `STT_CREDENTIAL_*` log tokens even
+  though the boundary is now generic. Renaming them was deliberately avoided in an
+  infrastructure-only phase because production log queries may key on them; it is
+  a cosmetic follow-up.
+* In-request runtime health (cooldown, failure counts) remains **process-local** by
+  design (M2.4) and is therefore not in the database. `last_used_at` and a
+  persisted cooldown were considered and left out: nothing in this phase writes
+  them, and an unwritten column would be dead schema.
+* `supabase/canonical_bootstrap.sql` is intentionally **not** extended with the
+  Vault objects (nor with the earlier `20260827…`–`20260917…` migrations); it
+  remains the core-table bootstrap, and §29 records the boundary explicitly.
+
+### Deferred to PART 2 (not in this commit)
+
+The owner-facing credential management surface: listing credentials, enable /
+  disable, priority reordering, safe health display, and a `Test` action — built on
+  this table and this RPC, adding **no** new secret architecture. Also still
+  deferred from earlier phases: TTS provider fallback and a TTS credential pool,
+  TTS voice/model/format selection, Native Vision, Video/GIF processing, provider
+  benchmarking, and the outstanding live verifications.
+
+### Exact next phase
+
+**API Credential Vault PART 2 — the Telegram credential-management surface**, built
+strictly on `api_credentials` + `api_credential_pool`, followed by the live
+verification of M3.0 (one real synthesis) and of the Vault path (the first real
+credential resolved from Vault).
+
+---
+
+## Previous phase — Media Processing M3.0: controlled Text-to-Speech foundation
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-18.
 
@@ -736,6 +1006,16 @@ from a rotation, and no new consensus mechanism exists.
 
 ### Supabase Vault configuration that MUST be performed manually
 
+> **Superseded in one respect by PART 1 (top of this report).** The security
+> intent, the mapping rules, the bounds and the ENV fallback recorded below all
+> still stand, and the section is preserved as the M2.4 record. Two things
+> changed when PART 1 shipped the actual migration: the RPC name is now
+> `api_credential_pool` (`stt_credential_pool` is kept as a compatibility
+> alias), and the Vault side is no longer an abstract contract — it is
+> `supabase/migrations/20260919000001_create_api_credential_vault.sql`, with its
+> complete SQL in `DATABASE_ARCHITECTURE.md` §29. It is still **NOT applied**:
+> no SQL was executed and no Vault secret exists.
+
 **This phase did NOT configure Supabase Vault.** No SQL was executed, no secret
 was created, no schema was altered, and `DATABASE_ARCHITECTURE.md` was not
 touched. The application-side boundary is implemented and tested against a fake
@@ -836,7 +1116,10 @@ The new suite pins, from the source rather than from prose:
   reported unconfigured (which is a DIFFERENT state from loaded-and-empty); a
   stale marking never reduces the runtime's credentials; the description carries
   ids and never a secret; an unconfigured database yields no read at all; the
-  Vault read uses exactly the documented RPC name and parameter;
+  Vault read uses exactly the documented RPC name and parameter (in this phase
+  that name was `stt_credential_pool`; PART 1 moved the runtime to the generic
+  `api_credential_pool` and kept the old name as an alias — the call shape the
+  test pins, `{"p_provider": …}`, is unchanged);
 * **classification** — every credential class and every credential HTTP status
   (401/403/429) is credential-specific; every provider class and 400/404/5xx is
   not; a programming error and a bare `MediaError` are never credential-specific;
@@ -2226,7 +2509,8 @@ and no SQL changed**. **No synthesis has been sent to a live provider and no liv
 Telegram delivery has been performed, so speech quality — including Persian — is
 unmeasured and unclaimed.** The M2.4 state below is otherwise current: the STT
 control plane, the M2.3 provider fallback, the M2.4 credential pool, its manual
-Supabase Vault RPC (still NOT configured) and the outstanding Persian recognition
+Supabase Vault RPC (still NOT applied — PART 1, above, ships the migration, the
+function and the documented SQL) and the outstanding Persian recognition
 benchmarking all stand as recorded. A history of the earlier phases follows
 unchanged. If code changes invalidate any section, update this document in the
 same commit.
@@ -2254,7 +2538,9 @@ bounded **credential pool** per provider (`backend/ai/credential_source.py` +
 rate-limited key INSIDE the provider before the provider-level fallback is
 engaged, while a provider with a single credential keeps its exact pre-M2.4
 behaviour — and no raw key, selection or credential is ever written to Telegram,
-to a log line or to the database. **The Supabase Vault RPC has NOT been
-configured, and live Telegram verification, live provider verification and real
+to a log line or to the database. **The Supabase Vault RPC has NOT been applied** (PART 1, above, ships the
+migration, the function and the documented SQL, but no SQL was executed and no
+Vault secret exists), **and live Telegram verification, live provider
+verification and real
 Persian quality benchmarking are all still outstanding.** If code changes
 invalidate any section, update this document in the same commit.

@@ -46,6 +46,7 @@
 26. [Hermes Integration Boundary & Corrected Architecture](#26-hermes-integration-boundary--corrected-architecture)
 27. [Font System Persistence](#27-font-system-persistence)
 28. [Current vs Proposed Status Matrix](#28-current-vs-proposed-status-matrix)
+29. [API Credential Vault (PART 1)](#29-api-credential-vault-part-1)
 
 ---
 
@@ -1484,6 +1485,13 @@ migration. No code change needed.
 | 10 | `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` table for Ghost Seen | Applied (verified by owner) |
 | 11 | `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | Added `dashboard_font`, `ghost_seen_retention_days` to `panel_settings` | Applied (verified by owner) |
 | 12 | `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds` (idempotent backfill + drop) | Pending manual application |
+| 13 | `20260919000001_create_api_credential_vault.sql` | `api_credentials` metadata table (no secret column) + `api_credential_pool` SECURITY DEFINER resolution RPC over Supabase Vault + `stt_credential_pool` compatibility alias | **NOT APPLIED — owner action required** (the application tolerates its absence; see §29) |
+
+> This table is not exhaustive: the `20260827…`–`20260917…` migration files
+> (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,
+> `ai_provider_stats`, `ai_tasks`, `ai_task_occurrences`) are not enumerated
+> here. The API Credential Vault objects created by row 13 are documented in
+> full in §29.
 
 ### Missing Migration Files (referenced in prior docs but never created)
 
@@ -1769,6 +1777,11 @@ Telegram (send/deliver results, message IDs, timestamps).
 3. **No credentials in the database**: no `SESSION_STRING`, `API_HASH`,
    provider API keys, `BOT_TOKEN`. AI/Telegram credentials stay in
    environment variables only.
+   *Amended by §29 (API Credential Vault, PART 1):* provider API keys may
+   additionally live in **Supabase Vault**, and the database then holds only
+   non-secret credential METADATA (`api_credentials`). No table anywhere in
+   this database stores a raw API key, and the column-level rule is
+   unchanged.
 4. **No AI SQL execution**: no shell executor, no arbitrary SQL
    executor, no Telegram method executor are added anywhere.
 5. `is_owner` remains the single permission gate for every handler;
@@ -1927,6 +1940,413 @@ producer yet.
 
 ---
 
+---
+
+## 29. API Credential Vault (PART 1)
+
+> **Status: implemented in the repository; NOTHING was executed against
+> Supabase.** The migration file exists, the application-side resolution
+> boundary exists and is covered by tests, and the complete manual SQL is in
+> §29.10–§29.11 below. The coding agent created **no table, no function, no
+> extension, no schema change and no Vault secret**, and did not connect to
+> Supabase. Every object in this section is pending an owner action.
+
+**Migration file:** `supabase/migrations/20260919000001_create_api_credential_vault.sql`
+— the executable statements in §29.10 are a byte-identical copy of that file's
+statements.
+
+### 29.1 Purpose — one generic secret architecture
+
+Before this section the application had exactly one credential per provider, held
+in a deployment environment variable. PART 1 adds the second source without
+creating a second architecture:
+
+```
+ENV credentials            (unchanged — still the first credential)
+        +
+Supabase Vault credentials (new — additional, owner-managed)
+        ↓
+generic credential source         backend/ai/credential_source.py
+        ↓
+bounded credential pool           backend/services/stt_credential_pool.py (STT consumer)
+        ↓
+provider execution                the existing adapter for the current attempt
+```
+
+The design is deliberately **provider-agnostic**: the table and the RPC are keyed
+by a free-form `provider` token, so today's Speech-to-Text providers (`gemini`,
+`groq`, `speechmatics`) and a future Text-to-Speech provider (`openai`) reuse the
+same table, the same RPC and the same application boundary. No `tts_*` secret
+architecture is introduced anywhere.
+
+### 29.2 `api_credentials` — credential metadata (contains NO secret)
+
+| Column | PostgreSQL type | Nullability | Default | Notes |
+|---|---|---|---|---|
+| `credential_id` | `text` | NOT NULL | — | **PRIMARY KEY.** Stable, non-secret identifier, `^[A-Za-z0-9._-]{1,64}$` — the same alphabet and length the application refuses anything outside of. This is the only credential name that may appear in a log line. |
+| `provider` | `text` | NOT NULL | — | Provider token shared with the runtime registry (`gemini`, `groq`, `speechmatics`, `openai`, …), `^[a-z0-9][a-z0-9._-]{0,31}$`. |
+| `label` | `text` | NOT NULL | — | Non-secret display label for the owner; non-blank, ≤ 80 characters. |
+| `owner_id` | `bigint` | NOT NULL | — | Owner scoping, consistent with every other owner-scoped table. `> 0`. |
+| `enabled` | `boolean` | NOT NULL | `true` | A disabled credential is never returned by the RPC. |
+| `priority` | `integer` | NOT NULL | `0` | Deterministic ordering; a **lower** value is tried first. `BETWEEN 0 AND 1000000`. |
+| `vault_secret_id` | `uuid` | NOT NULL | — | **Foreign key** → `vault.secrets(id)` `ON DELETE CASCADE`. The only secret-bearing reference in the row. |
+| `created_at` | `timestamptz` | NOT NULL | `now()` | Also the ordering tie-breaker after `priority`. |
+| `updated_at` | `timestamptz` | NOT NULL | `now()` | Maintained by the writer, exactly like `ai_tasks` / `ai_task_occurrences` (this project has no `updated_at` trigger anywhere). |
+
+**Does it contain secrets? NO.** There is no column of any name that can hold an
+API key, token, password or session string — the schema has no `secret`,
+`api_key`, `token`, `credential_secret` or equivalent column, and the test suite
+asserts that the declared column list contains none. The raw key exists **only**
+inside Supabase Vault; this table stores a *reference* to it.
+
+Constraints
+
+| Constraint | Kind | Definition |
+|---|---|---|
+| `api_credentials_pkey` | PRIMARY KEY | `(credential_id)` |
+| `api_credentials_vault_secret_id_fkey` | FOREIGN KEY | `(vault_secret_id) REFERENCES vault.secrets(id) ON DELETE CASCADE` |
+| `api_credentials_id_format` | CHECK | `credential_id ~ '^[A-Za-z0-9._-]{1,64}$'` |
+| `api_credentials_provider_format` | CHECK | `provider ~ '^[a-z0-9][a-z0-9._-]{0,31}$'` |
+| `api_credentials_label_not_blank` | CHECK | `length(btrim(label)) > 0 AND length(label) <= 80` |
+| `api_credentials_owner_positive` | CHECK | `owner_id > 0` |
+| `api_credentials_priority_range` | CHECK | `priority BETWEEN 0 AND 1000000` |
+
+Indexes
+
+| Index | Kind | Definition | Purpose |
+|---|---|---|---|
+| `api_credentials_pkey` | UNIQUE | `(credential_id)` | identity |
+| `uq_api_credentials_vault_secret` | UNIQUE | `(vault_secret_id)` | **one Vault secret maps to exactly one credential.** A duplicate mapping would silently make rotation a no-op (the pool would "rotate" between two names for the same key), so it is refused at the schema level. |
+| `idx_api_credentials_provider_order` | btree | `(provider, priority, created_at, credential_id)` | backs the single-provider resolution read |
+| `idx_api_credentials_owner` | btree | `(owner_id, provider)` | backs the owner-scoped read |
+
+RLS and grants
+
+* `ALTER TABLE public.api_credentials ENABLE ROW LEVEL SECURITY;`
+* **Policies: NONE.** Not one policy is created for `anon` or `authenticated`,
+  and `REVOKE ALL … FROM PUBLIC, anon, authenticated` removes the default
+  privileges. This is *deliberately different* from every other table in this
+  document (which grant `anon` SELECT for the read-only dashboard): credential
+  bookkeeping has no dashboard consumer, so it is exposed to nobody.
+* `GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.api_credentials TO service_role;`
+  — the backend's service-role client is the only writer/reader. (The service
+  role also bypasses RLS, as for every other table.)
+
+### 29.3 `api_credential_pool(p_provider text, p_owner_id bigint DEFAULT NULL)` — the ONE resolution boundary
+
+| Property | Value |
+|---|---|
+| Args | `p_provider text` (required) · `p_owner_id bigint` (optional, default `NULL`) |
+| Returns | `TABLE(credential_id text, secret text, priority integer, enabled boolean)` |
+| Language / volatility | `sql`, `STABLE` |
+| Security | `SECURITY DEFINER`, `SET search_path = ''` (hardened; the body is fully qualified) |
+| Ownership | `OWNER TO postgres` — the role that owns `vault.decrypted_secrets` |
+| Execute grants | `REVOKE ALL … FROM PUBLIC, anon, authenticated` then `GRANT EXECUTE … TO service_role` |
+| Row ceiling | `LIMIT 8` (a fixed database-side bound; the application applies its own ceiling of 4 — `credential_source.MAX_CREDENTIALS_PER_PROVIDER`) |
+| Ordering | `ORDER BY priority ASC, created_at ASC, credential_id ASC` — fully deterministic, no ties |
+| Filters | `provider = p_provider AND enabled AND (p_owner_id IS NULL OR owner_id = p_owner_id)` |
+
+It joins `api_credentials` to `vault.decrypted_secrets` on
+`decrypted_secrets.id = api_credentials.vault_secret_id` and returns
+`decrypted_secret AS secret`. **The application never reads `vault.*` directly**;
+the SECURITY DEFINER function reads it on the backend's behalf, which keeps the
+Vault schema, naming and access policy entirely the owner's.
+
+The parameter shape is **the M2.4 contract unchanged**: the runtime calls
+`db.rpc("api_credential_pool", {"p_provider": provider})`, and because
+`p_owner_id` carries a default it is simply omitted. Owner scoping is available
+at the database boundary for the phase that needs it (the credential-management
+surface), without a second function.
+
+What it deliberately is **not**: not a generic SQL endpoint, not a
+`SECURITY INVOKER` function, not variadic, not a table-returning view of every
+provider, and not callable by `anon`/`authenticated`.
+
+### 29.4 `stt_credential_pool(p_provider text, p_owner_id bigint DEFAULT NULL)` — deprecated compatibility alias
+
+The M2.4 documentation named this function, so the migration keeps it as a thin
+alias (`SELECT * FROM public.api_credential_pool(p_provider, p_owner_id)`) with
+the same signature, the same security posture, the same grants and the same
+return shape. The application calls the generic name; the alias exists so an
+installation that implemented the earlier name keeps working. It is marked
+`@deprecated` in a `COMMENT ON FUNCTION` and is scheduled for removal in a later
+phase once no deployment relies on it.
+
+### 29.5 Supabase Vault architecture and the secret mapping
+
+```
+Supabase Vault                                  public schema
+┌──────────────────────────┐                    ┌───────────────────────────────┐
+│ vault.secrets (encrypted)│◄── FK (CASCADE) ───│ api_credentials.vault_secret_id│
+└──────────┬───────────────┘                    │ provider / label / enabled /   │
+           │ decrypted on read                  │ priority / owner_id            │
+           ▼                                    └───────────────────────────────┘
+   vault.decrypted_secrets  ──► api_credential_pool() ──► service role ──► credential_source
+```
+
+* The extension is `supabase_vault`, installed into the `vault` schema by
+  `CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;`. On a
+  Supabase project where Vault has not been enabled yet, the owner may need to
+  enable it from the dashboard (Database → Extensions) if the SQL role lacks the
+  privilege; the statement is otherwise idempotent.
+* **Mapping is deterministic and one-to-one:** one `vault.secrets` row → one
+  `api_credentials` row (enforced by `uq_api_credentials_vault_secret`). The
+  application never guesses a secret's name: it reads the row's
+  `vault_secret_id`.
+* The application knows nothing about Vault internals beyond the RPC's return
+  shape — no table name, no key id, no nonce, no decryption key is referenced in
+  Python.
+
+### 29.6 Security model
+
+| Boundary | Rule |
+|---|---|
+| Raw secret at rest | **only** inside `vault.secrets` (encrypted by Vault) |
+| Raw secret in `public` | **never** — `api_credentials` has no secret column |
+| Raw secret in application memory | only inside `credential_source.CredentialRecord.secret` for the attempt that needs it |
+| Raw secret in logs | **never** — the only credential identifier logged is `credential_id` (a non-secret label the owner chose) |
+| Raw secret to the AI layer / Telegram | **never** — the credential modules import nothing from `backend.bot` or Telethon, and no key is ever formatted into a message |
+| Table access | service role only; RLS enabled with zero policies; `anon`/`authenticated` revoked |
+| Function access | `EXECUTE` granted to `service_role` only; `PUBLIC`/`anon`/`authenticated` revoked |
+| `search_path` hijack | impossible — `SECURITY DEFINER` + `SET search_path = ''` + fully qualified body |
+| Owner scoping | `owner_id NOT NULL` plus the optional `p_owner_id` filter on the resolver |
+| Arbitrary SQL | no dynamic SQL, no `EXECUTE`, no user-supplied identifier |
+
+### 29.7 ENV compatibility (unchanged)
+
+The deployment environment remains the **first** credential for every provider,
+resolved through each provider adapter's *own declared* variable names
+(`AI_GEMINI_API_KEY` → `GEMINI_API_KEY`, `AI_GROQ_API_KEY` → `GROQ_API_KEY`,
+`AI_SPEECHMATICS_API_KEY`). There are no numbered `*_KEY_1`/`*_KEY_2` variables,
+no environment scanning, and no automatic migration of an ENV secret into Vault.
+Ordering is `(priority, source order)`, and the ENV credential is
+`priority=0, order_index=0`, so an installation that configures no pool behaves
+exactly as it did before this phase.
+
+### 29.8 Failure behaviour and orphan handling
+
+| Situation | Behaviour |
+|---|---|
+| Migration not applied / RPC missing | PostgREST answers with an error; the runtime logs one bounded warning (`STT_CREDENTIAL_VAULT_READ_FAILED provider=… error=…`) and keeps the ENV credential. Media processing is unaffected. |
+| RPC refuses (permission / role) | same as above |
+| Read exceeds the 5 s ceiling | `run_sync_db` times out, same bounded warning, ENV credential retained |
+| Response is not a list, or a row is not an object | that row/response contributes nothing |
+| Row has no `credential_id`, an id outside `[A-Za-z0-9._-]{1,64}`, or an empty `secret` | row contributes nothing (refused, never sanitized) |
+| Row has `enabled: false` | row contributes nothing |
+| Vault secret deleted | `ON DELETE CASCADE` removes the metadata row, so the credential disappears from the pool atomically and the table can never advertise an unresolvable credential |
+| Metadata row deleted / disabled | the credential disappears from the pool; the Vault secret may remain as an **inert orphan** — the RPC only ever returns secrets anchored by a metadata row, so an orphan is never returned and never logged. Removing the orphan is an owner action in the Vault UI/SQL. |
+| Credential is revoked but still configured | the runtime's credential health (process-local, M2.4) cools it down; `credential_source.mark_stale()` refreshes the snapshot at the next settings apply |
+
+### 29.9 Application consumers
+
+| Consumer | Role |
+|---|---|
+| `backend/ai/credential_source.py` | the **only** module that calls the RPC (`VAULT_RPC = "api_credential_pool"`; `LEGACY_VAULT_RPC` names the alias for reference). Resolves the ENV credential, merges the Vault rows, validates them, orders them and caches the bounded snapshot. |
+| `backend/services/stt_credential_pool.py` | the STT consumer: rotation order, credential health/cooldown, credential-vs-provider failure classification. **Compatibility is unchanged** — it calls the same `credential_source.load()`, so switching the RPC name changed no STT behaviour. |
+| a future TTS consumer | the same `credential_source.load(provider, env_var_names)` call with `provider="openai"` — no new module, table or RPC |
+
+### 29.10 Manual Supabase SQL — NOT EXECUTED BY AI
+
+Apply this in the Supabase SQL Editor **as `postgres`**. It is idempotent
+(`IF NOT EXISTS` / `CREATE OR REPLACE`) but has not been run by the coding agent,
+and no Vault secret is created by it.
+
+```sql
+-- ============================================================================
+-- 1. Supabase Vault — the ONLY place a raw secret may live
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
+
+-- ============================================================================
+-- 2. api_credentials — credential METADATA. No secret column exists here.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.api_credentials (
+    credential_id    text        PRIMARY KEY,
+    provider         text        NOT NULL,
+    label            text        NOT NULL,
+    owner_id         bigint      NOT NULL,
+    enabled          boolean     NOT NULL DEFAULT true,
+    priority         integer     NOT NULL DEFAULT 0,
+    vault_secret_id  uuid        NOT NULL
+                                 REFERENCES vault.secrets(id) ON DELETE CASCADE,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT api_credentials_id_format
+        CHECK (credential_id ~ '^[A-Za-z0-9._-]{1,64}$'),
+    CONSTRAINT api_credentials_provider_format
+        CHECK (provider ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+    CONSTRAINT api_credentials_label_not_blank
+        CHECK (length(btrim(label)) > 0 AND length(label) <= 80),
+    CONSTRAINT api_credentials_owner_positive
+        CHECK (owner_id > 0),
+    CONSTRAINT api_credentials_priority_range
+        CHECK (priority BETWEEN 0 AND 1000000)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_credentials_provider_order
+    ON public.api_credentials (provider, priority, created_at, credential_id);
+CREATE INDEX IF NOT EXISTS idx_api_credentials_owner
+    ON public.api_credentials (owner_id, provider);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_api_credentials_vault_secret
+    ON public.api_credentials (vault_secret_id);
+
+ALTER TABLE public.api_credentials ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE public.api_credentials FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.api_credentials TO service_role;
+
+COMMENT ON TABLE public.api_credentials IS
+    'API credential METADATA for every provider. Stores NO secret: the key lives in Supabase Vault and is referenced by vault_secret_id. Service-role only.';
+COMMENT ON COLUMN public.api_credentials.credential_id IS
+    'Stable, non-secret identifier (1-64 chars, [A-Za-z0-9._-]). This is the only credential name that may appear in a log line.';
+COMMENT ON COLUMN public.api_credentials.provider IS
+    'Provider token shared with the runtime registry (e.g. gemini, groq, speechmatics, openai).';
+COMMENT ON COLUMN public.api_credentials.label IS
+    'Non-secret human label for the owner.';
+COMMENT ON COLUMN public.api_credentials.priority IS
+    'Deterministic ordering; a LOWER value is tried first. Ties fall back to created_at then credential_id.';
+COMMENT ON COLUMN public.api_credentials.vault_secret_id IS
+    'Reference to vault.secrets(id). The raw key exists only in Vault; deleting the secret cascades this metadata row.';
+
+-- ============================================================================
+-- 3. api_credential_pool — the ONE resolution boundary (provider-generic)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_pool(
+    p_provider text,
+    p_owner_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    secret        text,
+    priority      integer,
+    enabled       boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT c.credential_id,
+           d.decrypted_secret AS secret,
+           c.priority,
+           c.enabled
+      FROM public.api_credentials AS c
+      JOIN vault.decrypted_secrets AS d
+        ON d.id = c.vault_secret_id
+     WHERE c.provider = p_provider
+       AND c.enabled
+       AND (p_owner_id IS NULL OR c.owner_id = p_owner_id)
+     ORDER BY c.priority ASC, c.created_at ASC, c.credential_id ASC
+     LIMIT 8;
+$$;
+
+ALTER FUNCTION public.api_credential_pool(text, bigint) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_pool(text, bigint)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_pool(text, bigint) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_pool(text, bigint) IS
+    'Returns the ordered, ENABLED credentials of ONE provider with each secret decrypted from Supabase Vault. At most 8 rows. Callable by service_role only.';
+
+-- ============================================================================
+-- 4. stt_credential_pool — deprecated alias of the same contract
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.stt_credential_pool(
+    p_provider text,
+    p_owner_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    secret        text,
+    priority      integer,
+    enabled       boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT * FROM public.api_credential_pool(p_provider, p_owner_id);
+$$;
+
+ALTER FUNCTION public.stt_credential_pool(text, bigint) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.stt_credential_pool(text, bigint)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.stt_credential_pool(text, bigint) TO service_role;
+
+COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
+    'Deprecated compatibility alias of api_credential_pool. Use api_credential_pool.';
+
+-- ============================================================================
+-- 5. PostgREST schema cache
+-- ============================================================================
+
+NOTIFY pgrst, 'reload schema';
+```
+
+**Populating the pool (owner action, run once per credential).** The secret goes
+into Vault; the table receives only its reference. Replace the placeholders — no
+real key belongs in any file in this repository.
+
+```sql
+-- 1. Store the key in Vault (Vault encrypts it; this is the ONLY secret write).
+SELECT vault.create_secret('<THE_API_KEY>', 'speechmatics-a', 'Speechmatics credential A');
+
+-- 2. Map it into the pool. The metadata row holds no secret.
+INSERT INTO public.api_credentials
+    (credential_id, provider, label, owner_id, enabled, priority, vault_secret_id)
+SELECT 'sm-a', 'speechmatics', 'Speechmatics A', <BOT_OWNER_ID>, true, 10, id
+  FROM vault.secrets
+ WHERE name = 'speechmatics-a'
+ON CONFLICT (credential_id) DO NOTHING;
+
+-- 3. Confirm what the runtime will resolve (never prints a secret here).
+SELECT credential_id, provider, enabled, priority
+  FROM public.api_credentials
+ ORDER BY provider, priority, created_at;
+```
+
+### 29.11 Manual rollback SQL — NOT EXECUTED BY AI
+
+Destructive: it removes the credential metadata and both functions. It does
+**not** drop the shared `supabase_vault` extension and does **not** delete any
+Vault secret — delete secrets explicitly in the Vault UI/SQL only when you are
+certain nothing else uses them, because Vault holds no reference back to this
+schema.
+
+```sql
+-- 1. Resolvers first (they depend on the table).
+DROP FUNCTION IF EXISTS public.stt_credential_pool(text, bigint);
+DROP FUNCTION IF EXISTS public.api_credential_pool(text, bigint);
+
+-- 2. Then the metadata table (and, with it, every credential definition).
+DROP TABLE IF EXISTS public.api_credentials;
+
+-- 3. NOT dropped by this rollback, on purpose:
+--    * EXTENSION supabase_vault — shared by the project, may serve other secrets;
+--    * rows in vault.secrets     — owned by Vault; remove them explicitly:
+--         SELECT id, name FROM vault.secrets ORDER BY name;
+--         SELECT vault.delete_secret('<secret-id>');
+--    * the ENV credentials on Render — untouched by design.
+NOTIFY pgrst, 'reload schema';
+```
+
+### 29.12 Migration status and next steps
+
+| Item | Value |
+|---|---|
+| Applied by the coding agent | **NO** — no SQL was executed, Supabase was not modified, no Vault secret was created |
+| Objects pending owner action | `api_credentials`, its 3 indexes, RLS+grants, `api_credential_pool`, `stt_credential_pool` |
+| Application behaviour without it | unchanged from M2.4/M3.0 — the ENV credential keeps every provider working and the RPC failure is a bounded warning |
+| Live Supabase verification | **NOT PERFORMED** — the RPC path was exercised only against a fake secret backend in `tests/test_credential_vault.py` |
+| Next (PART 2, not in this commit) | the owner-facing credential-management surface (enable/disable, priority, health, test) — it will reuse this table/RPC and add no new secret architecture |
+
 ## Final Canonical Contract
 
 The canonical database consists of the following public-schema tables: `saved_items`, `bio_state`, `username_state`, `bot_logs`, `panel_settings`, `bot_settings`, `ai_config`, `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history`, `ai_usage`, `ai_provider_stats`, and the compatibility-preserved legacy table `ghost_chats`. The complete definitions, defaults, constraints, indexes, RLS policies, and seeds are in the single SQL block in the next section.
@@ -1962,6 +2382,15 @@ zero `.rpc()` calls**), then payload-level tracing of every writer/reader into
 the 16 chronological migrations under `supabase/migrations/`. The current
 source code — not this document's earlier prose, not migration comments, and
 not prior reports — is the authority this script was derived from.
+
+> **Audit-scope note (§29):** the enumeration above was taken at the audited
+> revision `30bb3a4` and is preserved as the basis of the bootstrap script.
+> Since then exactly ONE `.rpc()` call site exists —
+> `backend/ai/credential_source.py::_vault_rows_sync` calling
+> `api_credential_pool` — and it is a **separate, optional** object documented
+> in §29, deliberately NOT folded into the canonical public-schema bootstrap
+> below (that script establishes the tables the core app requires; the vault
+> RPC is an owner-configured secret path).
 
 ### Application ↔ database contract matrix
 
@@ -2014,8 +2443,10 @@ not prior reports — is the authority this script was derived from.
    verbatim (`ON CONFLICT DO NOTHING`) for migration fidelity and classified
    legacy. `ghost_seen_allowed_chats` is created at runtime by
    `ghost_seen_v2` and is deliberately NOT seeded.
-6. **No functions, triggers, or RPC endpoints are required** — the codebase
-   contains zero `.rpc(` calls.
+6. **No functions, triggers, or RPC endpoints are required** — as of the
+   audited revision the codebase contained zero `.rpc(` calls. The optional
+   `api_credential_pool` Vault RPC in §29 is outside this bootstrap and is not
+   required for the application to run.
 7. **Extension.** `pg_trgm` is required by the `saved_items` trigram indexes
    backing the `search_saves` ILIKE paths.
 
@@ -2042,8 +2473,11 @@ canonical reference.**
 --     the documented SELECT-only dashboard boundary.
 --   * Security model: ALL writes use the service-role key (bypasses RLS);
 --     anon + authenticated get SELECT-only (read-only dashboard).
---   * No functions/triggers/RPC endpoints are created — the codebase has
---     zero .rpc() calls.
+--   * No functions/triggers/RPC endpoints are created — as of the audited
+--     revision 30bb3a4 the codebase had zero .rpc() calls. The optional
+--     Vault resolution RPC added later is documented in
+--     DATABASE_ARCHITECTURE.md §29 and is intentionally NOT part of this
+--     bootstrap script.
 --   * Historical application data (saved items, AI sessions/messages/
 --     memories/usage/stats, logs, allow-list values) is intentionally NOT
 --     fabricated. Only deterministic, project-defined seed rows are inserted.

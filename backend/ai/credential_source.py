@@ -1,23 +1,30 @@
 """Credential source — the ONE boundary that answers "which credentials may this
 provider use?".
 
-This module is the SECRET half of the STT credential pool and nothing else. It
-knows where a credential MAY come from and it hands back bounded, ORDERED
-records; it never talks to a provider, never decides which provider to try and
-never decides whether a credential is healthy. The STT runtime asks for
-credentials for provider X and receives candidates — it does not care whether
-they came from the deployment's environment or from an encrypted secret store,
-which is exactly what keeps provider adapters free of backend-specific reads:
+This module is the SECRET half of the credential pool and nothing else. It knows
+where a credential MAY come from and it hands back bounded, ORDERED records; it
+never talks to a provider, never decides which provider to try and never decides
+whether a credential is healthy. A capability asks for credentials for provider X
+and receives candidates — it does not care whether they came from the deployment's
+environment or from an encrypted secret store, which is exactly what keeps
+provider adapters free of backend-specific reads:
 
-    STT request
+    capability request (any provider)
         ↓
     provider adapters            (only the credential of the CURRENT attempt)
         ↓
-    stt_credential_pool          (order, health, classification — provider-agnostic)
+    the credential pool          (order, health, classification — provider-agnostic)
         ↓
     THIS module                  (where a credential comes from)
         ├── the deployment's environment (the pre-existing single-key route)
         └── Supabase Vault (the multi-credential route, via ONE documented RPC)
+
+Nothing here is Speech-to-Text specific: the module takes a provider token and the
+provider's OWN declared environment variable names, so a Speech-to-Text provider,
+a Text-to-Speech provider (``openai``) and any later AI/media provider share this
+ONE secret architecture instead of growing a second one. The STT half lives in
+``backend/services/stt_credential_pool.py`` and is its first consumer, not its
+owner.
 
 Two sources, ONE precedence rule. The environment keeps working as the FIRST
 credential, so an installation that never configures a pool behaves EXACTLY as
@@ -37,16 +44,26 @@ with the project's existing service-role client — the same client and the same
 bounded dispatch (``backend.db.client.run_sync_db``) every other durable read
 uses — and it fails CLOSED when that RPC is absent or refuses:
 
-    POST /rest/v1/rpc/stt_credential_pool   body: {"p_provider": "<provider>"}
+    POST /rest/v1/rpc/api_credential_pool   body: {"p_provider": "<provider>"}
     → [ { "credential_id": "<stable, non-secret id>",
           "priority":      <int, optional>,
           "enabled":       <bool, optional>,
           "secret":        "<the API key, decrypted from Vault>" } , … ]
 
-The function must be callable by the service role and must return the DECRYPTED
-value of each Vault secret; the application never reads ``vault.*`` directly, so
-the secret store's own schema, naming and access policy stay the user's. A
-missing function, a permission error, an unexpected shape, an empty secret or a
+The function is created by ``supabase/migrations/20260919000001_create_api_credential_vault.sql``
+(apply it manually — see DATABASE_ARCHITECTURE.md §29) and is OWNED by
+``postgres`` as SECURITY DEFINER, so it reads ``vault.decrypted_secrets`` on the
+caller's behalf and the application never touches ``vault.*`` directly: the
+secret store's own schema, naming and access policy stay the user's. The
+parameter shape is deliberately unchanged from the M2.4 contract (``p_provider``
+only; the function's second parameter is an optional owner filter the runtime
+omits), so this call is byte-identical to what the previous phase documented.
+
+The older ``stt_credential_pool`` name still works — the migration keeps it as a
+thin alias resolving to this same function — but this module targets the generic
+name, because the boundary is not STT specific.
+
+A missing function, a permission error, an unexpected shape, an empty secret or a
 row without an id is reported as a bounded reason and that provider simply keeps
 the credentials it already had — this boundary can never fail a media request and
 can never invent a credential.
@@ -79,9 +96,14 @@ SOURCE_ENV = "env"
 SOURCE_VAULT = "vault"
 
 #: The documented Supabase RPC this boundary consumes. ONE name, no environment
-#: variable to configure: a deployment that wants a pool implements this function
-#: (over Vault) and nothing else changes.
-VAULT_RPC = "stt_credential_pool"
+#: variable to configure: a deployment that wants a pool applies the migration
+#: that creates this function (over Vault) and nothing else changes.
+VAULT_RPC = "api_credential_pool"
+
+#: The M2.4 name of the same contract. The migration keeps it as a thin alias,
+#: and this module names it only so a trace or a test can refer to the older
+#: spelling without a string literal. The runtime always calls :data:`VAULT_RPC`.
+LEGACY_VAULT_RPC = "stt_credential_pool"
 
 #: Bounds. A pool is a bounded list, not an unbounded secret sweep: the number of
 #: credentials one provider may contribute and the number of provider snapshots
