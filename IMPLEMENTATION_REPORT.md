@@ -1,6 +1,238 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — API Credential Vault PART 2: owner-facing credential management
+## Latest phase — Database architecture repair: canonical schema reconciliation
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-20.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **Canonical schema reconciliation & drift repair** — `DATABASE_ARCHITECTURE.md` becomes a specification whose executable SQL is safe on an EXISTING database instead of a description that only works on an empty one |
+| Starting HEAD | `a065e1d` `feat(vault): manage provider API credentials from Telegram` (== `origin/main` at phase start) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Migration shipped | **`supabase/migrations/20260920000001_reconcile_canonical_schema.sql`** — the complete canonical reconciliation script (§30 of the database document) |
+| Supabase executed by this phase | **NO** — no connection, no SQL, no Vault secret, no schema change was performed by the coding agent |
+| Database objects touched | the canonical script now reconciles **16** public tables / **180** columns / **21** identity constraints; it adds **no** table that a migration did not already create, **no** secret store and **no** column beyond the ones live code already writes |
+| New environment variables | **NONE** |
+| New dependencies | **NONE** (`requirements.txt` untouched) |
+| Files changed | **five** — NEW `supabase/migrations/20260920000001_reconcile_canonical_schema.sql`, NEW `tests/test_canonical_schema_reconciliation.py`; MODIFIED `supabase/canonical_bootstrap.sql`, `DATABASE_ARCHITECTURE.md`, and this report |
+| Application code changed | **NONE** — not one Python module under `backend/`. The defect was in the specification/SQL, so the fix is in the specification/SQL |
+| Behavioural change | **none at runtime**; the only behavioural consequence is that pasting the documented SQL into Supabase now converges an existing database instead of aborting |
+| Persisted state | **NONE added by the application**; the script's only INSERTs are the deterministic seeds that already existed |
+| Live Supabase verification | **NOT PERFORMED** — the script was never executed against any database; see "Validation performed" for exactly what was run instead |
+| Live Telegram verification | **NOT PERFORMED** |
+
+### The reported defect
+
+Applying the document's "complete copy-pasteable" SQL to the existing Supabase
+project failed with:
+
+```
+ERROR:  42703
+column "value_type" of relation "bot_settings" does not exist
+INSERT INTO bot_settings (key, value, value_type) VALUES ...
+```
+
+**Root cause — the mechanism, not the column.** The canonical SQL (and the
+migration history it was reconstructed from) established every table with
+`CREATE TABLE IF NOT EXISTS`, then immediately ran statements referencing
+columns:
+
+```sql
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key text PRIMARY KEY, value text NOT NULL,
+    value_type text NOT NULL DEFAULT 'str', updated_at timestamptz DEFAULT now()
+);
+INSERT INTO bot_settings (key, value, value_type) VALUES ...;   -- 42703
+```
+
+`CREATE TABLE IF NOT EXISTS` is a **silent NO-OP** when the table exists. The
+live `bot_settings` predated `value_type`, so the CREATE did nothing, nothing
+added the column, and the INSERT failed. `IF NOT EXISTS` was being used as the
+*reconciliation* mechanism, and reconciliation was never actually performed.
+Adding `ALTER TABLE bot_settings ADD COLUMN value_type …` alone would have fixed
+the reported symptom and left the class intact — which is why it was not the fix.
+
+### Additional inconsistencies found by the audit
+
+The audit searched the whole contract for the same class rather than stopping at
+the first failure. Everything below was found in the repository (none of it was
+supposed; each is now either fixed or explicitly documented as non-canonical):
+
+1. **`panel_settings`** — `20260726143924` created only `(key,
+   auto_close_enabled, updated_at)`. The eight CHECK blocks reference
+   `auto_close_delay`, `max_deep_save_mb`, … so on a legacy table the *whole*
+   `DO $$` body failed to plan. The reconciliation must run **before** the
+   constraints, not after.
+2. **`saved_items`** — `short_code` / `file_name` arrive with `20260718143752`;
+   the unique and trigram indexes reference them, so a database that predates
+   that migration failed on `CREATE UNIQUE INDEX … (short_code)`.
+3. **`ai_config` — four columns were missing from the canonical contract
+   entirely.** `backend/ai/config_store.py` writes `show_question`,
+   `stt_model`, `stt_language` and `stt_passes` in **every** upsert payload
+   (migrations `20260913000000`, `20260917000001`). A database built from the
+   canonical script alone therefore rejected the whole upsert and silently lost
+   AI settings on restart — a data-loss defect hidden inside a "complete" spec.
+4. **`ai_tasks` / `ai_task_occurrences` were missing from the canonical script**
+   although `backend/ai/task_scheduler.py` and `task_execution.py` depend on
+   them. `ai_task_occurrences` is the *second* confirmed instance of the class:
+   `20260912000001_add_ai_task_occurrences_preparation_metadata.sql` exists
+   precisely because `preparation_metadata` never reached tables created before
+   it — the migration's own comment says so.
+5. **Constraint drift** — a legacy table without the documented UNIQUE made a
+   targeted `ON CONFLICT (key) DO NOTHING` unresolvable, and no PRIMARY
+   KEY/UNIQUE was ever asserted, so a table missing one stayed broken silently.
+6. **The document's own claim was false.** "A byte-identical copy of this script
+   also lives at `supabase/canonical_bootstrap.sql`" — the two differed by three
+   header lines. Now they are identical *and* a test enforces it.
+7. **Stale migration-status prose** — `20260827000001`,
+   `20260827000002`, `20260827000003` and `20260827000004` existed but §20 still
+   listed their work as ungenerated; §19.3 still said the `panel_settings`
+   columns "have no migration file". Corrected in place.
+8. **Deliberately left out of the canonical contract** (documented, not
+   migrated): `ai_messages.tool_calls` (no reader, no writer — §19.5) and
+   `ai_preferences` (no migration, in-memory only — §14, §19.17). Adding them
+   would invent a contract the code does not have.
+
+### What the repair does
+
+Every canonical table now follows one fixed sequence:
+
+```
+CREATE TABLE IF NOT EXISTS <t> ( … canonical definition … )
+ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <col> <type> [DEFAULT <d>]   × 180
+UPDATE <t> SET <col> = <deterministic value> WHERE <col> IS NULL      × every NOT NULL column
+ALTER TABLE <t> ALTER COLUMN <col> SET DEFAULT <d>                    × every defaulted column
+ALTER TABLE <t> ALTER COLUMN <col> SET NOT NULL                       × every NOT NULL column
+… indexes, data-guarded CHECKs/foreign key, guarded unique indexes …
+… one consolidated identity-constraint block (21 PRIMARY KEY / UNIQUE) …
+NOTIFY pgrst, 'reload schema'
+COMMIT
+-- drift report: any canonical (table, column) still missing (must be empty)
+```
+
+* **New-column safety**, the rule that failed before: add (with the canonical
+  default when there is one — safe on an existing table because PostgreSQL seeds
+  existing rows from it) → **backfill every remaining NULL deterministically** →
+  only then enforce `DEFAULT`/`NOT NULL`. The backfill runs for *every* NOT NULL
+  column, so a legacy *nullable* column is converged too and `SET NOT NULL`
+  cannot fail.
+* **Guarded additions**: the 27 CHECK constraints, the task foreign key, the two
+  data-dependent unique indexes and all 21 identity constraints are applied only
+  when the existing rows can satisfy them; otherwise the script raises a
+  `WARNING` naming the table, the constraint and the offending row count and
+  **continues** (39 `RAISE WARNING` guards).
+* **Non-destructive**: no `DROP TABLE`, `DROP COLUMN`, `TRUNCATE` or
+  `DELETE FROM`. The only drops are stale anon **write** policies the documented
+  model forbids, and `DROP CONSTRAINT IF EXISTS` inside a guard that recreates
+  the constraint canonically.
+* **Scope guard**: the script contains **no** `vault.*` reference and never
+  names the §29 credential objects in executable SQL, so reconciliation can
+  never read, move or delete a secret.
+
+### The three-copy contract
+
+The same text now exists in three places, kept **byte-identical** and enforced
+by test — one reconciled definition, no duplication that can drift:
+
+1. the fenced SQL block in `DATABASE_ARCHITECTURE.md` §30 +
+   `### The script (single copy-pasteable block …)` — the canonical reference,
+2. `supabase/canonical_bootstrap.sql` — convenience copy,
+3. `supabase/migrations/20260920000001_reconcile_canonical_schema.sql` — the
+   forward-only repository migration.
+
+The migration is **not** a rewrite of history: every `202607…`–`20260919…`
+migration file is byte-untouched, the repair is the newest file in
+`supabase/migrations/`, and a test asserts that no other migration was edited to
+reference it.
+
+### Documentation added
+
+`DATABASE_ARCHITECTURE.md` gains **§30 Canonical Schema Reconciliation & Drift
+Repair** (§30.1 defect → §30.2 the nine-item drift audit → §30.3 the contract
+incl. the identity block → §30.4 the 180-column inventory → §30.5 the migration
+→ §30.6 the drift report → §30.7 safety rules → §30.8 validation → §30.9 the
+three-part rollback → §30.10 the optional destructive cleanup, kept separate →
+§30.11 the exact manual Supabase action → §30.12 what is NOT proven). §20's
+migration-status tables and §19.1/§19.3/§19.8 were corrected to match what is
+actually in `supabase/migrations/`, and the canonical table list went from 14 to
+16 tables.
+
+### Tests and exact results
+
+New suite `tests/test_canonical_schema_reconciliation.py` — **32 tests**, all
+passing. It works in three registers:
+
+* **static identity / consistency** — the three copies are byte-identical; every
+  table's CREATE column set equals its `ADD COLUMN` set equals its drift-report
+  set; no canonical column is established by a `CREATE … IF NOT EXISTS` alone;
+  all 16 tables appear in the identity block; the script is additive-only; the
+  security model is intact (no `FOR ALL`, no anon write policy); every
+  data-dependent addition is guarded by a warning.
+* **simulated execution** — the test parses the real statements of the shipped
+  script and applies them with PostgreSQL's semantics to an empty schema, the
+  worst-case legacy schema (all nine drift items at once) and an
+  already-canonical schema, failing on any unresolved table/column reference.
+* **the exact regression required** —
+  `test_the_reported_production_failure_is_reproducible_and_fixed` first
+  *reproduces* 42703 by applying the old pattern to a `bot_settings` without
+  `value_type`, then proves the shipped script converges instead: `value_type`
+  exists, is NOT NULL, defaults `'str'`, the three pre-existing rows keep their
+  values and gain `value_type = 'str'`, the five seeds land, and the drift
+  report is empty.
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_canonical_schema_reconciliation.py -q` | **32 passed** |
+| `pytest` on the credential + STT + media + TTS + this-suite batch (12 files) | **736 passed, 2 skipped** |
+| `pytest tests/ -q` (full suite) | **4362 passed, 26 skipped** in 116.30 s |
+| Baseline at the starting HEAD | **4330 passed, 26 skipped** → **+32, none removed or weakened** |
+| `python -m py_compile tests/test_canonical_schema_reconciliation.py` | clean |
+| `git diff --check` | clean |
+
+### Validation performed — and what it does not prove
+
+**NOT performed, and not claimed:** no Supabase connection, no SQL executed
+against any project, no Vault secret created, no schema modified. **No local
+PostgreSQL server exists in the build environment either**, so the executed
+evidence is a faithful simulation of the statement semantics that matter for
+this defect (silent no-op CREATE, unresolved column reference, NOT NULL
+enforcement, `ON CONFLICT` skipping, default seeding of existing rows) — not the
+real planner. `DO $$` guards, `CREATE POLICY`, `GRANT` and `NOTIFY` are
+validated for identifiers and text, not executed. The drift report checks column
+*existence*; column *types* are not compared against the live database (a type
+conflict means the table is not this table and needs manual review). §30.12
+states all of this in the document itself.
+
+### Exact manual Supabase action still required
+
+1. SQL Editor as `postgres` → run the **complete** canonical script (the §30
+   block, `supabase/canonical_bootstrap.sql` or the migration file — identical).
+2. Read the output: `WARNING` lines name any constraint a pre-existing row
+   blocked (fix those rows, re-run); the final `missing_canonical_column` result
+   set must be **empty**.
+3. Nothing else — no table to create by hand, no env var, no Render setting, no
+   Vault change.
+
+Rollback: the repair is additive, so **there is no safe data-level rollback and
+none is needed**; §30.9 separates the reversal of constraints/indexes (no row
+touched), the reversal of the six contract columns (data-losing, per column) and
+the reversal of the seeds (data-losing, not recommended), and states that
+backups are the only contract that can be honoured for a converging schema. The
+§20 cleanup proposals live in §30.10, separated and labelled OPTIONAL and
+DESTRUCTIVE.
+
+### Deferred
+
+Live application of the script and the §29 credential-vault objects against the
+owner's own Supabase project; verifying the RLS posture and the PostgREST schema
+cache live; comparing live column **types**; and the outstanding product work
+recorded in the previous phases (TTS provider fallback and its credential pool,
+TTS voice/model selection, Native Vision, Video/GIF, provider benchmarking, the
+`ai_preferences` decision and the dead-column cleanup decision).
+
+## Previous phase — API Credential Vault PART 2: owner-facing credential management
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main` · state as of 2026-09-19.
 
