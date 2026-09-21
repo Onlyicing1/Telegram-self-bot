@@ -21,7 +21,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
+from backend.ai.tools.base import (
+    _SERVICE_FAILURE_PREFIXES,
+    PermissionLevel,
+    Tool,
+    ToolResult,
+    result_from_service,
+)
 from backend.ai.tools.context import ToolContext
 
 
@@ -79,12 +85,20 @@ def _resolve_management_target(
 
 
 class RenameSaveTool(Tool):
-    """Give ONE saved item a new display name (metadata only).
+    """Give ONE saved item a new display name and/or Telegram file name.
 
-    Delegates to ``retrieve_service.do_rename`` — the same owner-scoped
-    operation (and the same shared name rule) the retrieve panel's Rename
-    action uses. The item's saved Telegram message, its files and its tags are
-    untouched: only ``saved_items.display_name`` changes.
+    Two distinct layers, each explicitly requested:
+
+      - ``display_name`` → ``retrieve_service.do_rename``: the item's logical
+        label (``saved_items.display_name``). Metadata only — the saved
+        Telegram message, its file and its tags are untouched.
+      - ``file_name`` → ``retrieve_service.do_change_file_name``: the ACTUAL
+        filename inside the saved Telegram document. Telegram cannot rename a
+        document in place, so the media is re-uploaded with only the
+        ``DocumentAttributeFilename`` replaced and the row is repointed.
+
+    Never inferred from one another: a plain rename does NOT touch the
+    Telegram file name.
     """
 
     def __init__(self, context: ToolContext) -> None:
@@ -96,23 +110,30 @@ class RenameSaveTool(Tool):
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
-        return ("display_name",)
+        """No single argument is required — see ``required_any_arguments``."""
+        return ()
 
     @property
     def required_any_arguments(self) -> tuple[str, ...]:
-        return ("save_code", "query")
+        """At least one of these; the exact contract is enforced in execute."""
+        return ("display_name", "file_name", "save_code", "query")
 
     @property
     def description(self) -> str:
         return (
-            "Give ONE saved item a new display name. Pass save_code when the "
-            "owner gives a code or a previous result listed one; otherwise "
-            "pass query with the owner's own words (a name or tag) and the "
-            "system resolves it deterministically. With query, EXACTLY one "
-            "match is renamed immediately and MULTIPLE matches are never "
-            "renamed — the result lists them and asks the owner to choose, so "
-            "never pick one yourself. The name is the item's own label; the "
-            "saved file, its Telegram message and its tags are unchanged."
+            "Give ONE saved item a new display name, a new actual Telegram "
+            "file name, or both. Pass save_code when the owner gives a code or "
+            "a previous result listed one; otherwise pass query with the "
+            "owner's own words (a name or tag) and the system resolves it "
+            "deterministically. With query, EXACTLY one match is renamed "
+            "immediately and MULTIPLE matches are never renamed — the result "
+            "lists them and asks the owner to choose, so never pick one "
+            "yourself. display_name is the item's own label and changes NO "
+            "file and NO Telegram message. file_name changes the REAL filename "
+            "of the saved Telegram document and is therefore only used when "
+            "the owner explicitly asks for the file name itself (e.g. 'rename "
+            "the file to X'); it re-uploads the saved media, so never pass it "
+            "for a plain rename and never invent a name."
         )
 
     @property
@@ -134,10 +155,23 @@ class RenameSaveTool(Tool):
             },
             "display_name": {
                 "type": "string",
+                "default": "",
                 "description": (
-                    "The new name for the item, exactly as the owner gave it "
+                    "The item's new logical name, exactly as the owner gave it "
                     "(e.g. 'University Weekly Schedule Semester 2'). Never "
-                    "invent or embellish a name."
+                    "invent or embellish a name. Omit when only the file name "
+                    "changes."
+                ),
+            },
+            "file_name": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "The new ACTUAL Telegram file name, extension included, "
+                    "exactly as the owner gave it (e.g. "
+                    "'University_Weekly_Schedule_Semester_2.pdf'). Only when "
+                    "the owner asked for the file name itself — it re-uploads "
+                    "the saved document. Never invent or embellish it."
                 ),
             },
         }
@@ -157,11 +191,14 @@ class RenameSaveTool(Tool):
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
 
-        raw_name = arguments.get("display_name")
-        if not isinstance(raw_name, str) or not raw_name.strip():
+        name = arguments.get("display_name")
+        name = name.strip() if isinstance(name, str) else ""
+        file_name = arguments.get("file_name")
+        file_name = file_name.strip() if isinstance(file_name, str) else ""
+        if not name and not file_name:
             return ToolResult(
                 success=False,
-                message="A new name is required. Nothing was renamed.",
+                message="A new name or file name is required. Nothing was renamed.",
             )
 
         target = await retrieve_service.resolve_management_target(
@@ -173,16 +210,46 @@ class RenameSaveTool(Tool):
         if blocked is not None:
             return blocked
 
-        try:
-            result = await retrieve_service.do_rename(
-                context.owner_id, target.save_code, raw_name
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ToolResult(success=False, message=f"Rename failed: {exc}")
-        return result_from_service(
-            result,
-            data={"save_code": target.save_code, "display_name": raw_name.strip()},
-        )
+        # The file name is the riskier half (it re-uploads the saved media),
+        # so it runs first and its outcome is reported on its own line: a
+        # failure of one half never disguises the other's result.
+        results: list[str] = []
+        if file_name:
+            client = None
+            if context.telegram is not None:
+                client = getattr(context.telegram, "client", None)
+            if client is None:
+                client = context.client
+            if client is None:
+                return ToolResult(
+                    success=False,
+                    message="No Telegram client available; the saved file name was not changed.",
+                )
+            try:
+                results.append(
+                    await retrieve_service.do_change_file_name(
+                        client, context.owner_id, target.save_code, file_name
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(f"❌ File name change failed: {exc}")
+        if name:
+            try:
+                results.append(
+                    await retrieve_service.do_rename(context.owner_id, target.save_code, name)
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(f"❌ Rename failed: {exc}")
+
+        data = {"save_code": target.save_code}
+        if name:
+            data["display_name"] = name
+        if file_name:
+            data["file_name"] = file_name
+        if len(results) == 1:
+            return result_from_service(results[0], data=data)
+        failed = any(r.startswith(_SERVICE_FAILURE_PREFIXES) for r in results)
+        return ToolResult(success=not failed, message="\n".join(results), data=data)
 
 
 class UpdateSaveTagsTool(Tool):
@@ -192,6 +259,10 @@ class UpdateSaveTagsTool(Tool):
     operation and the same shared tag rules a save uses. The operation is
     explicit (never inferred): ``add`` merges, ``replace`` sets exactly the
     given list (``[]`` clears every tag) and ``remove`` deletes the named ones.
+
+    The owner's tags are their OWN layer: the saved Telegram message's
+    Additional-tags section is synchronized through the same service call,
+    while the generated ``#saved*`` hashtags are never touched.
     """
 
     def __init__(self, context: ToolContext) -> None:
@@ -301,8 +372,16 @@ class UpdateSaveTagsTool(Tool):
             return blocked
 
         try:
+            # The self client travels with the call so the saved Telegram
+            # message's Additional-tags section is synchronized too — the SAME
+            # service operation and caption authority the manual panel uses.
+            client = None
+            if context.telegram is not None:
+                client = getattr(context.telegram, "client", None)
+            if client is None:
+                client = context.client
             result = await retrieve_service.do_edit_tags(
-                context.owner_id, target.save_code, mode, tags
+                context.owner_id, target.save_code, mode, tags, client=client
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Tag update failed: {exc}")

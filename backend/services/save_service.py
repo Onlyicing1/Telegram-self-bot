@@ -92,6 +92,24 @@ _MIME_EXT = {
 MAX_DISPLAY_NAME_CHARS = 120
 MAX_SAVE_TAGS = 10
 MAX_TAG_CHARS = 40
+MAX_FILE_NAME_CHARS = 120
+
+# A file name becomes a REAL Telegram document filename and a temporary upload
+# path, so a separator or a control character can never be part of it.
+_FORBIDDEN_FILE_NAME_CHARS = frozenset("/\\")
+
+# The caption's own section labels. ``📄`` is written by ``build_caption`` for
+# the Telegram file name; the system hashtag line (#saved…) marks the END of
+# the LifeOS metadata block, so everything after it is the original source
+# text and is never touched by a metadata rewrite.
+FILE_NAME_PREFIX = "📄"
+ADDITIONAL_TAGS_PREFIX = "🏷 Additional tags"
+_SYSTEM_TAG_MARKER = "#saved"
+# Only the caption's own header line ("{icon} {code} · DEEP") contains this,
+# and a saved DOCUMENT's header icon IS ``FILE_NAME_PREFIX`` — so the header
+# must be excluded when looking for the file-name section, or a rewrite would
+# replace the header instead of the filename.
+_HEADER_MARKER = "· DEEP"
 
 
 def normalize_display_name(value) -> str | None:
@@ -151,6 +169,104 @@ def normalize_tags(values) -> tuple[str, ...]:
     if len(tags) > MAX_SAVE_TAGS:
         raise ValueError(f"{len(tags)} tags — the limit is {MAX_SAVE_TAGS}")
     return tuple(tags)
+
+
+def normalize_file_name(value) -> str:
+    """The ONE rule for the actual Telegram file name (Save V2 sync).
+
+    Distinct from ``normalize_display_name``: that value is the item's LOGICAL
+    label, this one becomes the document's real filename. Trim + collapse
+    whitespace, refuse an empty name and any path separator, and REFUSE rather
+    than truncate a name over the bound. The owner's exact spelling —
+    extension included — is preserved: nothing is appended or rewritten.
+    """
+    if not isinstance(value, str):
+        raise ValueError("the file name must be text")
+    name = " ".join(value.split())
+    if not name:
+        raise ValueError("send a file name")
+    if any(ch in _FORBIDDEN_FILE_NAME_CHARS for ch in name):
+        raise ValueError("the file name cannot contain / or \\")
+    if len(name) > MAX_FILE_NAME_CHARS:
+        raise ValueError(
+            f"the file name is {len(name)} characters — the limit is {MAX_FILE_NAME_CHARS}"
+        )
+    return name
+
+
+def render_additional_tags(tags) -> str | None:
+    """The caption's Additional-tags section — the OWNER's tags, or ``None``.
+
+    A labelled section of its own, so an owner tag can never be confused with
+    the generated system hashtags on the next line. Empty/blank entries render
+    nothing at all (the section is then omitted instead of emitted empty).
+    """
+    values = [str(tag).strip() for tag in (tags or []) if str(tag or "").strip()]
+    if not values:
+        return None
+    return f"{ADDITIONAL_TAGS_PREFIX}: " + " ".join(f"#{tag}" for tag in values)
+
+
+def _split_metadata_block(caption: str) -> tuple[list[str], list[str]]:
+    """Split a caption into (LifeOS metadata block, everything after it).
+
+    The system hashtag line is the boundary: it is the LAST line
+    ``build_caption`` emits, and ``_append_original_text`` appends the source
+    text after it. A metadata rewrite therefore can never reach the original
+    text. A caption without that line (an item saved before this format) is
+    treated as metadata only.
+    """
+    lines = str(caption or "").split("\n")
+    for index, line in enumerate(lines):
+        if line.strip().startswith(_SYSTEM_TAG_MARKER):
+            return lines[:index], lines[index:]
+    return lines, []
+
+
+def _set_metadata_line(caption: str, prefix: str, rendered: str | None, *, skip=None) -> str:
+    """Set, replace or remove the ONE metadata line starting with ``prefix``.
+
+    Deterministic and bounded: every other line — the other metadata fields,
+    the system hashtags and the original source text — is preserved byte for
+    byte. ``rendered=None`` removes the line when it exists. ``skip`` excludes
+    lines that can never be the section being set (a caption header shares the
+    saved document's icon, so it starts with the same prefix).
+    """
+    head, tail = _split_metadata_block(caption)
+    index = next(
+        (
+            i for i, line in enumerate(head)
+            if line.strip().startswith(prefix) and not (skip and skip(line))
+        ),
+        None,
+    )
+    if index is not None:
+        if rendered is None:
+            head.pop(index)
+        else:
+            head[index] = rendered
+    elif rendered is not None:
+        head.append(rendered)
+    return "\n".join(head + tail)
+
+
+def with_additional_tags(caption: str, tags) -> str:
+    """Return ``caption`` with ONLY its Additional-tags section set to ``tags``.
+
+    The saved Telegram caption's synchronization primitive: the owner's tags
+    are replaced/added/removed as one section, while the system hashtags and
+    the original source text stay exactly as they were.
+    """
+    return _set_metadata_line(caption, ADDITIONAL_TAGS_PREFIX, render_additional_tags(tags))
+
+
+def with_file_name(caption: str, file_name: str | None) -> str:
+    """Return ``caption`` with ONLY its file-name line set to ``file_name``."""
+    name = str(file_name or "").strip()
+    rendered = f"{FILE_NAME_PREFIX} {name}" if name else None
+    return _set_metadata_line(
+        caption, FILE_NAME_PREFIX, rendered, skip=lambda line: _HEADER_MARKER in line
+    )
 
 
 @dataclass(frozen=True)
@@ -248,11 +364,16 @@ def build_caption(
     file_size: int | None,
     file_name: str | None,
     tags: list[str],
+    owner_tags=(),
 ) -> str:
     """Compact, information-dense LifeOS caption.
 
     The model name is dominant, the metadata is one line each, and the
     original source text is appended afterwards by ``_append_original_text``.
+
+    ``tags`` are the generated system hashtags (presentation only);
+    ``owner_tags`` are the owner's own semantic tags and render as their own
+    labelled section, never merged with the hashtag line.
     """
     size_str = _format_bytes(file_size) if file_size else "—"
     icon = media_icon(media_type)
@@ -264,7 +385,10 @@ def build_caption(
         f"🗂 {media_type} · {size_str}" + (f" · {mime}" if mime else ""),
     ]
     if file_name:
-        lines.append(f"📄 {file_name}")
+        lines.append(f"{FILE_NAME_PREFIX} {file_name}")
+    additional = render_additional_tags(owner_tags)
+    if additional:
+        lines.append(additional)
     if tags:
         lines.append(" ".join(tags))
     return "\n".join(lines)
@@ -552,6 +676,7 @@ async def execute_save(
             file_size=file_size,
             file_name=file_name,
             tags=caption_tags,
+            owner_tags=metadata.tags,
         ),
         reply_msg,
     )

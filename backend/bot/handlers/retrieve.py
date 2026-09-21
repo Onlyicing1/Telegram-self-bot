@@ -15,9 +15,10 @@ Actions:
 
 Inputs:
   retrieve:code     — Manual save code entry
-  retrieve_item:rename — New display name
-  retrieve_item:tags   — Add / replace / remove the item's tags
-  retrieve_item:move   — Folder name
+  retrieve_item:rename   — New display name (the item's logical label)
+  retrieve_item:filename — New ACTUAL Telegram file name (re-uploads)
+  retrieve_item:tags     — Add / replace / remove the item's tags
+  retrieve_item:move     — Folder name
 
 The item panel is the MANUAL half of the Save V2 Part 4 management contract:
 it shows the stored display name and tags and edits them through the same
@@ -168,10 +169,25 @@ async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, lis
     builder = InlinePanelBuilder()
     builder.add_row("⬇ Retrieve", f"action:retrieve_item_exec:{code}")
     builder.add_row("✏ Rename", f"input:retrieve_item:rename:{code}")
+    builder.add_row(_file_name_row_label(row), f"input:retrieve_item:filename:{code}")
     builder.add_row("🏷 Tags", f"input:retrieve_item:tags:{code}")
     builder.add_row("📂 Move", f"input:retrieve_item:move:{code}")
     builder.add_row("🗑 Delete", f"action:retrieve_item_delete:{code}")
     return "Item Preview", body, builder.build()
+
+
+def _file_name_row_label(row: dict) -> str:
+    """The File-name row, showing the CURRENT Telegram file name.
+
+    This is the one place the two layers are visibly distinct: Rename edits the
+    item's logical name, this row edits the filename inside the Telegram
+    document (and therefore re-uploads it).
+    """
+    current = retrieve_service.saved_file_name(row)
+    if not current:
+        return "📄 File Name"
+    shown = current if len(current) <= 18 else current[:15] + "…"
+    return f"📄 {shown}"
 
 
 async def _retrieve_item_inline_builder(event, extra: str) -> list:
@@ -537,7 +553,10 @@ async def _retrieve_tags_input_handler(text, chat_id, msg_id, inline_chat_id, in
 
     Same carry-through contract as rename/move: the input listener pops the
     pending state BEFORE calling this handler, so the item code arrives as
-    ``extra`` and is re-verified (owner + existence) inside the service.
+    ``extra`` and is re-verified (owner + existence) inside the service. The
+    self client travels with the call so the saved Telegram message's
+    Additional-tags section is synchronized too — the same service call the AI
+    tag tool makes.
     """
     from backend.helper.inline_engine import _self_client, _owner_id
     code = (extra or "").strip()
@@ -549,13 +568,45 @@ async def _retrieve_tags_input_handler(text, chat_id, msg_id, inline_chat_id, in
         except ValueError as exc:
             result = f"⚠️ Nothing was changed: {exc}"
         else:
-            result = await retrieve_service.do_edit_tags(_owner_id, code, op, tags)
+            result = await retrieve_service.do_edit_tags(
+                _owner_id, code, op, tags, client=_self_client
+            )
     helper = get_client()
     if helper and inline_chat_id and inline_msg_id:
         try:
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
             logger.warning("tags inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+async def _retrieve_filename_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id, extra=None):
+    """Change the item's ACTUAL Telegram file name (not its display name).
+
+    Deliberately separate from Rename: Telegram carries a document's filename
+    in its media attributes, so this operation re-uploads the saved media with
+    the new filename and repoints the row — the same ``do_change_file_name``
+    call the AI uses. Same carry-through contract (the code arrives as
+    ``extra``); the service validates the name and the owner.
+    """
+    from backend.helper.inline_engine import _self_client, _owner_id
+    code = (extra or "").strip()
+    if not code:
+        result = "⚠️ No item selected. Nothing was renamed."
+    else:
+        result = await retrieve_service.do_change_file_name(
+            _self_client, _owner_id, code, text
+        )
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("file name inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -613,6 +664,15 @@ def register(client, owner_id: int):
     register_input("retrieve_item", "rename", {
         "handler": _retrieve_rename_input_handler,
         "prompt": "**Rename Item**\n\nEnter the new display name for this saved item:\n\n_Reply below._",
+    })
+    register_input("retrieve_item", "filename", {
+        "handler": _retrieve_filename_input_handler,
+        "prompt": (
+            "**Change File Name** — the actual Telegram file name\n\n"
+            "This re-uploads the saved media with the new file name; the item's "
+            "name and tags are unchanged.\n\n"
+            "_Reply with the new file name below._"
+        ),
     })
     register_input("retrieve_item", "tags", {
         "handler": _retrieve_tags_input_handler,

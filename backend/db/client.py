@@ -769,7 +769,14 @@ async def get_stats(owner_id: int) -> dict:
 
 # ── saved_items: updates ──
 
-def _update_save_field_sync(owner_id: int, code: str, field: str, value) -> dict | None:
+def _update_save_fields_sync(owner_id: int, code: str, fields: dict) -> dict | None:
+    """Owner-scoped update of one or more saved_items columns in ONE statement.
+
+    A single statement is what keeps a multi-field change (the saved-item
+    synchronizer moving the item's Telegram location to its replacement
+    message) from landing half-applied: the row either carries every new value
+    or none of them.
+    """
     target = _query_save_sync(code)
     if not target or target.get("owner_id") != owner_id:
         return None
@@ -779,16 +786,29 @@ def _update_save_field_sync(owner_id: int, code: str, field: str, value) -> dict
             sc = target.get("save_code")
             res = (
                 db.table("saved_items")
-                .update({field: value})
+                .update(dict(fields))
                 .eq("owner_id", owner_id)
                 .eq("save_code", sc)
                 .execute()
             )
             return res.data[0] if (res.data or []) else None
         except Exception as exc:
-            logger.error("[SAVE_DB] update_save_field FAILED: %s", exc)
-    target[field] = value
+            logger.error("[SAVE_DB] update_save_fields FAILED: %s", exc)
+    target.update(fields)
     return target
+
+
+async def update_save_fields(owner_id: int, code: str, fields: dict) -> dict | None:
+    """Update several fields on a saved_items row by save_code."""
+    try:
+        return await _run_sync(_update_save_fields_sync, owner_id, code, fields)
+    except Exception as exc:
+        logger.error("[SAVE_DB] update_save_fields FAILED: %s", exc)
+        return None
+
+
+def _update_save_field_sync(owner_id: int, code: str, field: str, value) -> dict | None:
+    return _update_save_fields_sync(owner_id, code, {field: value})
 
 
 async def update_save_field(owner_id: int, code: str, field: str, value) -> dict | None:

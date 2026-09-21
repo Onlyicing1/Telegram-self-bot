@@ -93,8 +93,19 @@ def _clean_state():
 
 
 class FakeTelegram:
+    """The Telegram boundary the tools reach through ``context``.
+
+    The client is async-shaped because the management path now synchronizes
+    the saved message (a caption edit for tags, a re-upload for a file name):
+    a MagicMock would make every awaited call raise and turn a passing
+    operation into a silent failure.
+    """
+
     def __init__(self, client=None):
-        self.client = client if client is not None else MagicMock()
+        if client is None:
+            client = AsyncMock()
+            client.get_input_entity = AsyncMock(side_effect=lambda chat_id: chat_id)
+        self.client = client
 
 
 def _ctx(owner_id=OWNER, chat_id=CHAT):
@@ -432,7 +443,8 @@ async def test_tag_edit_owner_isolation_and_confirmation():
 @pytest.mark.asyncio
 async def test_a_tag_write_that_is_not_stored_is_reported_as_failure():
     _seed(_row("S0001", tags=["university"]))
-    with patch.object(db_client, "update_save_field", AsyncMock(return_value=None)):
+    # The tag path writes the tags AND the caption in one statement.
+    with patch.object(db_client, "update_save_fields", AsyncMock(return_value=None)):
         result = await retrieve_service.do_edit_tags(
             OWNER, "S0001", retrieve_service.TAG_OP_REPLACE, ["archive"]
         )
@@ -452,9 +464,11 @@ def test_the_management_tools_are_registered_with_a_safe_contract():
     assert rename is not None
     assert rename.permission_level.value == "read_write"
     assert rename.safe is True
-    assert rename.required_arguments == ("display_name",)
-    assert rename.required_any_arguments == ("save_code", "query")
-    assert "display_name" in rename.parameters and "query" in rename.parameters
+    # A rename carries the item's label and/or its ACTUAL Telegram file name,
+    # each optional on its own; the target is still exactly one of code/query.
+    assert rename.required_arguments == ()
+    assert rename.required_any_arguments == ("display_name", "file_name", "save_code", "query")
+    assert {"display_name", "file_name", "query", "save_code"} <= set(rename.parameters)
 
     tags = registry.get("update_save_tags")
     assert tags is not None
@@ -476,7 +490,10 @@ def test_the_management_tools_are_provider_schema_visible():
     for name in ("rename_save", "update_save_tags"):
         assert name in by_name
     rename_params = by_name["rename_save"]["function"]["parameters"]
-    assert rename_params["required"] == ["display_name"]
+    # No single argument is mandatory (a rename may carry only a file name),
+    # so the provider schema declares no "required" list at all.
+    assert rename_params.get("required") in (None, [])
+    assert {"save_code", "query", "display_name", "file_name"} <= set(rename_params["properties"])
     tags_params = by_name["update_save_tags"]["function"]["parameters"]
     assert set(tags_params["required"]) == {"tags", "mode"}
 
@@ -734,6 +751,10 @@ def engine(monkeypatch):
     client = MagicMock()
     client.send_message = AsyncMock()
     client.delete_messages = AsyncMock()
+    # The management path synchronizes the saved Telegram message, so the
+    # client's Telegram calls must be awaitable.
+    client.get_input_entity = AsyncMock(side_effect=lambda chat_id: chat_id)
+    client.edit_message = AsyncMock()
     monkeypatch.setattr(inline_engine, "_self_client", client, raising=False)
     monkeypatch.setattr(inline_engine, "_owner_id", OWNER, raising=False)
     return client

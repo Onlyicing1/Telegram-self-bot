@@ -21,15 +21,25 @@ Unified workflow:
     reuses the resolver above and never guesses among candidates
   - do_rename / do_edit_tags: the ONE writers of `saved_items.display_name`
     and the owner's `saved_items.tags` after the save itself
+  - do_change_file_name: the ONE writer of the ACTUAL Telegram file name —
+    it re-uploads the saved media with the new DocumentAttributeFilename and
+    repoints the row, because Telegram cannot rename a document in place
+  - _sync_saved_caption: the ONE Telegram-caption synchronization authority,
+    shared by the tag writer and the file-name replacement
   - do_move / do_delete: item actions from the preview panel
 """
 import asyncio
 import logging
+import os
 import re
+import shutil
+import tempfile
 import traceback
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+
+from telethon.tl.types import MessageMediaDocument
 
 from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
@@ -92,6 +102,15 @@ def _display_name(row: dict) -> str:
         if value:
             return value
     return row.get("media_type") or "Untitled"
+
+
+def saved_file_name(row: dict) -> str:
+    """The item's stored TELEGRAM file name (``""`` when it has none).
+
+    The Telegram layer of the item's identity — distinct from
+    ``display_name``, which is the owner's logical label.
+    """
+    return str(row.get("file_name") or "").strip()
 
 
 def build_metadata_block(row: dict) -> str:
@@ -276,7 +295,9 @@ async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
     so success is reported only when the stored value is the one asked for.
 
     The underlying Telegram saved message is never touched: only the item's
-    metadata changes, and only for a row that belongs to this owner.
+    metadata changes, and only for a row that belongs to this owner. The
+    Telegram FILENAME is a separate layer and is never changed here — that is
+    an explicit ``do_change_file_name`` request.
     """
     code = str(save_code or "").upper().strip()
     try:
@@ -682,6 +703,11 @@ TAG_OP_REPLACE = "replace"
 TAG_OP_REMOVE = "remove"
 TAG_OPS = (TAG_OP_ADD, TAG_OP_REPLACE, TAG_OP_REMOVE)
 
+# Telegram's caption bound. The saved-item synchronizer only ever rewrites ONE
+# metadata line, so a caption that would exceed this is refused instead of
+# being silently truncated.
+MAX_CAPTION_CHARS = 1024
+
 
 @dataclass(frozen=True)
 class ManagementTarget:
@@ -799,34 +825,107 @@ def _stored_matches(stored, expected) -> bool:
     return str(stored or "").strip() == str(expected)
 
 
-async def _write_metadata(owner_id: int, save_code: str, field: str, value, expected) -> str:
-    """Persist one metadata field and CONFIRM it by re-reading the row.
+async def _sync_saved_caption(client, row: dict, new_caption: str) -> str:
+    """Rewrite the item's SAVED Telegram message caption ("" = success).
 
-    ``update_save_field`` reports the representation PostgREST returns for an
-    UPDATE, which is not proof the write landed, so success is derived from a
-    second owner-verified read instead: the stored value must equal the value
-    that was asked for. Returns an owner-facing failure string, or ``""`` when
-    the change is confirmed.
+    The ONE caption-synchronization authority: the tag writer and the
+    file-name replacement both go through it, so the saved message can never
+    be updated by two different code paths.
+
+    Bounded and honest: the message must be reachable and the caption must fit
+    Telegram's limit, otherwise the owner gets the reason and nothing is
+    edited. Only a caption change is ever sent — the media is never re-sent
+    here.
     """
+    if len(new_caption) > MAX_CAPTION_CHARS:
+        return (
+            f"❌ The saved message was not updated: the caption would be "
+            f"{len(new_caption)} characters and Telegram allows {MAX_CAPTION_CHARS}."
+        )
+    saved_chat_id = row.get("saved_chat_id")
+    saved_msg_id = row.get("saved_msg_id")
+    if not saved_chat_id or not saved_msg_id:
+        return "❌ Saved location data is missing for this entry."
+    try:
+        peer = await client.get_input_entity(saved_chat_id)
+        await client.edit_message(peer, saved_msg_id, new_caption)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("saved caption sync failed for %s: %s", row.get("save_code"), exc)
+        return f"❌ The saved message could not be updated ({exc})."
+    return ""
+
+
+async def _write_metadata_fields(
+    owner_id: int, save_code: str, fields: dict, expected: dict
+) -> str:
+    """Persist metadata fields in ONE statement and CONFIRM them by re-reading.
+
+    One statement is what keeps a multi-field change (the filename
+    synchronizer repointing the item's Telegram location) from landing
+    half-applied. ``update_save_fields`` reports the representation PostgREST
+    returns, which is not proof the write landed, so success is derived from a
+    second owner-verified read (see ``_confirm_metadata``).
+    """
+    try:
+        await db_client.update_save_fields(owner_id, save_code, fields)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("saved-item metadata write failed for %s: %s", save_code, exc)
+        return f"❌ Could not save the change ({exc})."
+    return await _confirm_metadata(owner_id, save_code, expected)
+
+
+async def _write_metadata(owner_id: int, save_code: str, field: str, value, expected) -> str:
+    """Persist one metadata field and confirm it by re-reading the row."""
     try:
         await db_client.update_save_field(owner_id, save_code, field, value)
     except Exception as exc:  # noqa: BLE001
         logger.warning("saved-item metadata write failed for %s: %s", save_code, exc)
         return f"❌ Could not save the change ({exc})."
+    return await _confirm_metadata(owner_id, save_code, {field: expected})
 
+
+async def _confirm_metadata(owner_id: int, save_code: str, expected: dict) -> str:
+    """Confirm a write by re-reading the owner's row (``""`` when confirmed).
+
+    A write is only reported as success when the STORED value is the one that
+    was asked for, so a silently ignored UPDATE can never be shown as done.
+    """
     try:
         row = await load_saved_item(save_code, owner_id)
     except Exception as exc:  # noqa: BLE001
         return f"❌ DB error while confirming the change: {exc}"
     if row is None:
         return f"❌ No item found for `{save_code}`"
-    if _stored_matches(row.get(field), expected):
+    if all(_stored_matches(row.get(field), value) for field, value in expected.items()):
         return ""
     return "❌ The change was not stored — the saved item is unchanged."
 
 
+async def _caption_base(client, row: dict) -> tuple[str, str]:
+    """The caption a metadata rewrite starts from: ``(caption, error)``.
+
+    The stored ``saved_items.caption`` IS the source of truth. Only when a row
+    carries none (an item saved before the column was populated) does the
+    saved message's own live caption stand in — otherwise a rewrite would
+    build a caption from nothing and destroy the message's real one. Never
+    called without a client, and never guesses: a body that cannot be read is
+    an honest failure.
+    """
+    stored = str(row.get("caption") or "")
+    if stored or client is None:
+        return stored, ""
+    try:
+        peer = await client.get_input_entity(row.get("saved_chat_id"))
+        message = await client.get_messages(peer, ids=row.get("saved_msg_id"))
+    except Exception as exc:  # noqa: BLE001
+        return "", f"❌ Could not read the saved message ({exc})."
+    if message is None:
+        return "", "❌ The saved message could not be found."
+    return str(getattr(message, "message", None) or ""), ""
+
+
 async def do_edit_tags(
-    owner_id: int, save_code: str, op: str, tags=()
+    owner_id: int, save_code: str, op: str, tags=(), *, client=None
 ) -> str:
     """Add, replace or remove one item's OWNER tags (Save V2 Part 4).
 
@@ -840,6 +939,14 @@ async def do_edit_tags(
     honestly instead of being written. Legacy ``#saved*`` values on the row are
     preserved untouched: they were never owner tags. Only the owner's own row
     is ever written.
+
+    Tags are ONE layer and system hashtags another: the generated ``#saved*``
+    line is never read, replaced or merged. When ``client`` is supplied the
+    saved Telegram message is synchronized FIRST (only its Additional-tags
+    section changes, through the shared caption authority), so a message that
+    cannot be updated changes nothing at all in the database. Without a client
+    the stored metadata is still written — the media is never re-sent for a
+    tag-only change.
     """
     code = str(save_code or "").upper().strip()
     operation = str(op or "").strip().lower()
@@ -876,7 +983,21 @@ async def do_edit_tags(
         return f"⚠️ Nothing was changed: {exc}"
 
     stored = _legacy_tags(row) + list(merged)
-    failure = await _write_metadata(owner_id, code, "tags", stored, merged)
+
+    caption, error = await _caption_base(client, row)
+    if error:
+        return error
+    new_caption = save_service.with_additional_tags(caption, merged)
+    caption_changed = new_caption != caption
+    if client is not None and caption_changed:
+        failure = await _sync_saved_caption(client, row, new_caption)
+        if failure:
+            return failure
+
+    fields: dict = {"tags": stored}
+    if caption_changed:
+        fields["caption"] = new_caption
+    failure = await _write_metadata_fields(owner_id, code, fields, {"tags": merged})
     if failure:
         return failure
     await db_client.log(owner_id, "INFO", f"Edited tags {code}", {
@@ -885,3 +1006,145 @@ async def do_edit_tags(
     })
     rendered = ", ".join(merged) if merged else "no tags"
     return f"✅ Tags for `{code}`: {rendered}"
+
+
+async def do_change_file_name(
+    client, owner_id: int, save_code: str, new_file_name: str
+) -> str:
+    """Change the ACTUAL Telegram file name of one owner-owned saved item.
+
+    This is NOT ``do_rename``: the display name is the item's logical label in
+    LifeOS, while this value is the filename inside the Telegram document — a
+    different layer the owner must ask for explicitly. Telegram carries a
+    document's filename in its media attributes and cannot edit it in place,
+    so the content is downloaded and re-uploaded as a NEW Saved Messages
+    message with only the ``DocumentAttributeFilename`` replaced; every other
+    attribute, the MIME type and the caption (with its Additional-tags section
+    intact) are preserved.
+
+    Failure-safe by construction: the replacement is created first, its
+    identifiers are CONFIRMED in the row, and only then is the previous saved
+    message deleted. Any failure before that leaves the original message and
+    the original row untouched and reports the reason — the row can never
+    point at a message that does not exist. A replacement whose identifiers
+    cannot be confirmed is NOT cleaned up (a failed confirmation read must not
+    destroy the message the row may already point at); it is reported instead.
+    """
+    code = str(save_code or "").upper().strip()
+    try:
+        name = save_service.normalize_file_name(new_file_name)
+    except ValueError as exc:
+        return f"⚠️ Nothing was renamed: {exc}"
+
+    if client is None:
+        return "❌ Cannot change the saved file name: no Telegram client available."
+
+    row, error = await _load_for_management(owner_id, code)
+    if error:
+        return error
+    if row is None:
+        return f"❌ No item found for `{code}`"
+
+    saved_chat_id = row.get("saved_chat_id")
+    saved_msg_id = row.get("saved_msg_id")
+    if not saved_chat_id or not saved_msg_id:
+        return "❌ Saved location data is missing for this entry."
+
+    try:
+        peer = await client.get_input_entity(saved_chat_id)
+        current = await client.get_messages(peer, ids=saved_msg_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("saved file-name read failed for %s: %s", code, exc)
+        return f"❌ Could not read the saved message ({exc}). Nothing was renamed."
+    if current is None:
+        return "❌ The saved message could not be found. Nothing was renamed."
+
+    media = getattr(current, "media", None)
+    if not isinstance(media, MessageMediaDocument):
+        return (
+            "❌ This saved item's Telegram media has no file name to change — "
+            "only a saved document carries one. Nothing was renamed."
+        )
+    current_name = save_service.extract_file_name(media)
+    if not current_name:
+        return (
+            "❌ This saved item's Telegram document carries no file name to "
+            "change. Nothing was renamed."
+        )
+    if current_name == name:
+        return f"⚠️ Nothing was renamed: `{code}` is already named `{name}`."
+
+    caption, error = await _caption_base(client, row)
+    if error:
+        return error
+    new_caption = save_service.with_file_name(caption, name)
+
+    # The download target is derived from the owner's name but never trusted
+    # with a path: the basename is taken and an empty one falls back.
+    tmp_dir = tempfile.mkdtemp(prefix="lifeos_rename_")
+    tmp_path = os.path.join(tmp_dir, os.path.basename(name) or "media.bin")
+    try:
+        try:
+            await client.download_media(current, file=tmp_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("saved file-name download failed for %s: %s", code, exc)
+            return f"❌ Could not download the saved media ({exc}). Nothing was renamed."
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            return "❌ The downloaded saved media is empty. Nothing was renamed."
+
+        # The SAME media handling Deep Save uses, with the new filename: the
+        # document's other attributes and its MIME type are carried over, so a
+        # video/audio/animation cannot degrade into a generic document.
+        mime = getattr(getattr(media, "document", None), "mime_type", None) or row.get("mime_type")
+        try:
+            sent = await client.send_file(
+                "me",
+                tmp_path,
+                caption=new_caption,
+                **save_service._upload_kwargs_for_media(media, mime, name),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("saved file-name re-upload failed for %s: %s", code, exc)
+            return f"❌ Could not re-upload the saved media ({exc}). The saved item is unchanged."
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if sent is None or getattr(sent, "id", None) is None:
+        return "❌ The replacement saved message was not created. The saved item is unchanged."
+
+    new_file_id, new_mime, new_size = save_service._extract_uploaded_metadata(sent)
+    fields = {
+        "saved_chat_id": getattr(sent, "chat_id", None) or saved_chat_id,
+        "saved_msg_id": sent.id,
+        "file_name": name,
+        "caption": new_caption,
+        "file_id": new_file_id or row.get("file_id"),
+        "file_size": new_size or row.get("file_size"),
+    }
+    if new_mime:
+        fields["mime_type"] = new_mime
+    failure = await _write_metadata_fields(
+        owner_id, code, fields, {"saved_msg_id": sent.id, "file_name": name}
+    )
+    if failure:
+        logger.error("[SAVE_SYNC] replacement not persisted code=%s", code)
+        return (
+            f"{failure} The original saved message was NOT deleted and the item was "
+            "not repointed; the replacement copy left in Saved Messages was kept "
+            "so nothing is lost."
+        )
+
+    # Only now is the previous message removed: the row already points at the
+    # confirmed replacement.
+    try:
+        await client.delete_messages(peer, [saved_msg_id])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("old saved message cleanup failed for %s: %s", code, exc)
+        await db_client.log(owner_id, "INFO", f"Renamed file {code}", {"file_name": name})
+        return (
+            f"✅ File name for `{code}` is now **{name}** — the previous copy could "
+            "not be removed from Saved Messages."
+        )
+
+    await db_client.log(owner_id, "INFO", f"Renamed file {code}", {"file_name": name})
+    return f"✅ File name for `{code}` is now **{name}**"

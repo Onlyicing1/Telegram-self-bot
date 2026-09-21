@@ -116,7 +116,7 @@ ALLOWED_FIELDS = frozenset({
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
     "task_id", "action_status", "expected_version", "save_code", "status",
-    "display_name", "tags",
+    "display_name", "file_name", "tags",
 })
 
 # The Save actions — the ones that may carry the owner's saved-item metadata
@@ -124,7 +124,8 @@ ALLOWED_FIELDS = frozenset({
 _SAVE_ACTIONS = ("save", "deep_save", "save_link")
 
 # The two management actions that own the same metadata AFTER creation
-# (Save V2 Part 4): a rename carries ``display_name`` and a tag edit carries
+# (Save V2 Part 4): a rename carries ``display_name`` (the item's label) and/or
+# ``file_name`` (the ACTUAL Telegram file name) and a tag edit carries
 # ``tags``. Every other action rejects those fields, so a model can never
 # smuggle saved-item metadata into an unrelated execution — and neither of
 # these two accepts the other's field.
@@ -200,7 +201,10 @@ class ActionParseResult:
     # The owner's optional saved-item metadata, carried verbatim from the
     # validated action into the resolved save tool call. ``""``/``None`` mean
     # "the owner supplied none" — never "an empty name"/"no tags requested".
+    # ``file_name`` is the ACTUAL Telegram file name (a different layer from
+    # ``display_name``) and is only ever set by an explicit rename request.
     display_name: str = ""
+    file_name: str = ""
     tags: list[str] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -341,6 +345,16 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                 "'display_name'/'tags' are only valid for the save, deep_save, "
                 "save_link, rename_saved_item and update_saved_item_tags actions."
             ),
+        )
+
+    # ``file_name`` is the item's ACTUAL Telegram file name — a separate
+    # layer the owner must ask for explicitly, so it is valid for the rename
+    # action alone (never for a save at creation time and never for a tag
+    # edit, which cannot carry a file name at all).
+    if "file_name" in raw and action != "rename_saved_item":
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'file_name' is only valid for the rename_saved_item action.",
         )
 
     # ``save_code`` is only meaningful for the saved-item actions. It is
@@ -772,15 +786,16 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
     INSTEAD of a code: the deterministic resolver turns it into 0/1/N
     candidates and the tool only ever acts on an exact unique match.
 
-    A rename carries ``display_name``; a tag edit carries ``tags`` plus the
-    explicit ``mode``. Neither accepts the other's payload field, and an
-    unknown field is rejected for all five actions.
+    A rename carries ``display_name`` (the item's logical label) and/or
+    ``file_name`` (the ACTUAL Telegram file name); a tag edit carries ``tags``
+    plus the explicit ``mode``. Neither accepts the other's payload field, and
+    an unknown field is rejected for all five actions.
     """
     allowed = {"action", "save_code"}
     if action in _SAVE_ITEM_QUERY_ACTIONS:
         allowed.add("query")
     if action == "rename_saved_item":
-        allowed.add("display_name")
+        allowed.update({"display_name", "file_name"})
     if action == "update_saved_item_tags":
         allowed.update({"tags", "mode"})
     unknown = sorted(set(raw) - allowed)
@@ -793,16 +808,32 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
     # The payload of the two management actions is validated ONCE, before the
     # target is read and independently of how that target is addressed.
     display_name = ""
+    file_name = ""
     tags: list[str] | None = None
     mode = ""
     if action == "rename_saved_item":
+        # Either half may be asked for on its own; at least one is required.
         value = raw.get("display_name")
-        if not isinstance(value, str) or not value.strip():
+        if value is not None and (not isinstance(value, str) or not value.strip()):
             return ActionParseResult(
                 kind=KIND_INVALID,
-                error=f"Missing or invalid 'display_name' for {action}.",
+                error=f"Invalid 'display_name' for {action}.",
             )
-        display_name = value.strip()
+        display_name = value.strip() if isinstance(value, str) else ""
+        raw_file_name = raw.get("file_name")
+        if raw_file_name is not None and (
+            not isinstance(raw_file_name, str) or not raw_file_name.strip()
+        ):
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"Invalid 'file_name' for {action}.",
+            )
+        file_name = raw_file_name.strip() if isinstance(raw_file_name, str) else ""
+        if not display_name and not file_name:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"Missing 'display_name' or 'file_name' for {action}.",
+            )
     elif action == "update_saved_item_tags":
         value = raw.get("tags")
         if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
@@ -850,6 +881,7 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
             target="current_chat" if action == "retrieve_save" else "saved_item",
             query=query,
             display_name=display_name,
+            file_name=file_name,
             tags=tags,
             mode=mode,
         )
@@ -876,6 +908,7 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
         target="current_chat" if action == "retrieve_save" else "saved_item",
         save_code=normalized,
         display_name=display_name,
+        file_name=file_name,
         tags=tags,
         mode=mode,
     )
@@ -1030,10 +1063,16 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         return [{"name": "delete_save", "arguments": {"save_code": result.save_code}}]
 
     if action == "rename_saved_item":
-        # The new name travels verbatim; the target is the resolved item (a
-        # code, or the owner's own words resolved by the shared deterministic
-        # resolver, which refuses to pick among multiple matches).
-        args: dict[str, Any] = {"display_name": result.display_name}
+        # The requested halves travel verbatim — the display name (the item's
+        # label) and/or the actual Telegram file name. The target is the
+        # resolved item (a code, or the owner's own words resolved by the
+        # shared deterministic resolver, which refuses to pick among multiple
+        # matches).
+        args: dict[str, Any] = {}
+        if result.display_name:
+            args["display_name"] = result.display_name
+        if result.file_name:
+            args["file_name"] = result.file_name
         if result.query:
             args["query"] = result.query
         else:

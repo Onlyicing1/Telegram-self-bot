@@ -1,6 +1,153 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — SAVE V2 PART 4: saved-item management (rename + tags)
+## Latest phase — SAVE V2 TELEGRAM SYNC: the saved message carries the owner's file name and tags
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **SAVE V2 — TELEGRAM SAVED-MEDIA SYNCHRONIZATION** (a focused follow-up to Part 4) |
+| Type | runtime feature (service + panel + AI tools/action + shared caption helpers) + tests — **no schema change** |
+| Starting HEAD | `6f5dde7` = `origin/main` (working tree clean on entry) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **NO** — `saved_items` already carries `file_name`, `caption`, `saved_chat_id`, `saved_msg_id`, `file_id`, `file_size` and `mime_type`. No SQL was executed, no migration file was added, and `DATABASE_ARCHITECTURE.md` was not touched. |
+| Live Telegram | **NOT VERIFIED** (see below) — no live account was driven in this environment |
+
+### The live-test finding this phase fixes
+
+Live testing showed the Part 4 gap plainly: renaming or re-tagging an item
+changed **only the database row**. The actual Saved Messages message kept its old
+`University_Week_2.pdf` filename, and the owner's tags existed nowhere the owner
+could see — there was no owner-tag section in the caption at all, so the change
+was invisible in Telegram.
+
+Root cause: `saved_items` was the ONLY thing being written. Nothing in the
+synchronization path touched the Telegram message, because the Telegram filename
+lives in the document's **media attributes** (not in a caption or a database
+column) and therefore cannot be edited in place.
+
+### File name vs Additional tags — two separate layers, never coupled
+
+| Layer | Setting | Meaning | Sync mechanism |
+|---|---|---|---|
+| **File name** | `saved_items.file_name` | the filename INSIDE the Telegram document | download → re-upload with only `DocumentAttributeFilename` replaced → replace the saved message |
+| **Additional tags** | `saved_items.tags` | the owner's semantic tags | caption edit only — the media is **never** re-sent |
+| Display name | `saved_items.display_name` | the item's logical LifeOS label | metadata only; **never** touches the Telegram file name |
+
+The Part 4 panel says *Rename / display name*, so the owner's label behaviour is
+preserved exactly and the Telegram filename is changed only by an **explicit
+request** — a new `📄 File Name` control on the item panel (its row shows the
+current filename) and a new optional `file_name` argument on the AI `rename_save`
+tool / `rename_saved_item` action. Passing `display_name` alone still changes
+nothing in Telegram.
+
+### Exact architecture after implementation
+
+```
+manual: retrieve_item → ✏ Rename      → do_rename(owner, code, name)
+        retrieve_item → 📄 File Name  → do_change_file_name(client, owner, code, new_name)
+        retrieve_item → 🏷 Tags       → do_edit_tags(owner, code, op, tags, client=…)
+AI:     rename_save{display_name?|file_name?} / update_save_tags{tags,mode}
+                     │
+                     └─► retrieve_service (the ONE authority, owner-scoped)
+                            _caption_base        → saved_items.caption, else the live caption
+                            with_additional_tags → rewrite ONLY the Additional-tags section
+                            with_file_name       → rewrite ONLY the file-name section
+                            _sync_saved_caption  → edit_message (tag path, no re-send)
+                            _write_metadata_fields → ONE statement + confirm by re-read
+```
+
+* **One caption authority** — `save_service.with_additional_tags` /
+  `with_file_name` are pure, deterministic caption rewrites; the system hashtag
+  line (`#saved…`) marks the END of the metadata block, so a rewrite can never
+  reach the original source text.
+* **One Telegram caption writer** — `_sync_saved_caption` (tag path) and the
+  replacement message (filename path) are the only places a saved message is
+  edited; the tag path never downloads or re-uploads media.
+* **Owner tags stay the owner's** — `saved_items.tags` holds ONLY owner tags
+  (legacy `#saved*` values are preserved untouched and never matched/rendered as
+  owner tags) and the generated `#saved…` line never enters the column.
+
+### Replacement-message strategy and failure safety (file name)
+
+Telegram cannot rename a document in place, so the content is downloaded and
+re-uploaded as a **new** Saved Messages message with the same bytes and the same
+media handling Deep Save uses (`save_service._upload_kwargs_for_media`), which
+copies every other attribute and the MIME type:
+
+```
+resolve owner item → read the saved message → must be a DOCUMENT with a file name
+  → download to a per-operation temp dir (removed on every path)
+  → send_file("me", …, caption=<file-name + tags synced>, attributes=<new filename>)
+  → confirm saved_msg_id + file_name in the ROW (second owner-verified read)
+  → ONLY THEN delete the previous saved message
+```
+
+* A failure at **any** step before the confirmation leaves the original message
+  **and** the original row untouched, and reports the reason.
+* A replacement whose identifiers cannot be confirmed is deliberately **not**
+  cleaned up: a failed confirmation read must never destroy a message the row
+  may already point at. The row still points at the original, so nothing is lost.
+* If the old message cannot be removed, the rename is still reported as done with
+  an explicit note — the row already points at the confirmed replacement.
+* Photos and documents with no filename attribute are refused honestly (there is
+  no file name to change), never degraded into another media type.
+
+### Verification
+
+| Suite | Result |
+|---|---|
+| `tests/test_save_v2_telegram_sync.py` (**new**, 42 tests) | **`42 passed`** |
+| `tests/test_save_v2_management.py` (Part 4, fakes made async-correct) | **`61 passed`** |
+| 14 Save/retrieve/AI/db suites together | **`486 passed`** |
+| **Full suite** `pytest tests/ -q` | **`4625 passed, 26 skipped, 3 warnings` in 116.72 s** (no test deleted or weakened; the 26 skips are pre-existing) |
+| `python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+The new suite pins: the new `DocumentAttributeFilename` actually passed to
+`send_file`; media type/attributes/MIME preserved; the row repointed to the new
+message; `send_file → db_update → delete_old` ordering; a failed re-upload,
+download or confirmation preserving the original message and row; a photo/bare
+document refusal; owner isolation; the caption section transforms (add/replace/
+clear, idempotent, source text and `#saved…` line byte-preserved, a source-text
+line that merely *looks* like a section never rewritten); tag-only edits never
+re-uploading; the AI tool/action contract; and the manual panel/input path.
+
+### Live verification status
+
+* **Telegram:** NOT performed — no live session was driven. The panel rows,
+  inputs, tools and service operations were exercised against the real handlers
+  and real service code with a faked Telegram client, so the RPC **shape** is
+  tested but reachability is not claimed.
+* **The actual saved message is not claimed to have been verified.**
+
+### Known limitations / deferred work
+
+1. The filename replacement re-uploads the media, so a very large saved document
+   costs a download + upload of its full size; a tag-only change never does.
+2. An item whose Telegram document carries no filename attribute cannot be
+   renamed (there is genuinely no filename to change); this is reported, not
+   worked around.
+3. Legacy rows saved before the `caption` column was populated are handled by
+   reading the message's live caption as the rewrite base — one extra read, only
+   for those rows.
+4. A rename and a tag edit are two separate state changes; the row is not updated
+   atomically across the Telegram call and the database write (the confirmation
+   read makes any partial outcome visible and the caption rewrite is idempotent).
+
+### Exact next step — live Telegram verification
+
+1. Save a document, rename its **File Name**, and confirm the retrieved file
+   exposes the new filename (and that the item no longer offers the old one).
+2. Add / replace / clear **Additional tags** and confirm the saved message's
+   `🏷 Additional tags:` section changes while the `#saved…` line and the original
+   source text do not.
+3. Confirm the item still retrieves correctly by display name, tag and save code,
+   and that deleting the OLD message happened only after the replacement existed.
+
+## Previous phase — SAVE V2 PART 4: saved-item management (rename + tags)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 
