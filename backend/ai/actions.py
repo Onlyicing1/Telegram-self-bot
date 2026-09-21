@@ -50,6 +50,8 @@ ACTION_NAMES = frozenset({
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
+    "rename_saved_item",
+    "update_saved_item_tags",
     "send",
     "clean_chat",
     "remember",
@@ -78,6 +80,8 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
+    "rename_saved_item",
+    "update_saved_item_tags",
 })
 
 # Read-only status/query actions: no target — the mapped tool reads the
@@ -115,10 +119,16 @@ ALLOWED_FIELDS = frozenset({
     "display_name", "tags",
 })
 
-# The Save actions — the only ones that may carry the owner's saved-item
-# metadata (``display_name``/``tags``). Every other action rejects those two
-# fields so a model can never smuggle metadata into an unrelated execution.
+# The Save actions — the ones that may carry the owner's saved-item metadata
+# (``display_name``/``tags``) at creation time.
 _SAVE_ACTIONS = ("save", "deep_save", "save_link")
+
+# The two management actions that own the same metadata AFTER creation
+# (Save V2 Part 4): a rename carries ``display_name`` and a tag edit carries
+# ``tags``. Every other action rejects those fields, so a model can never
+# smuggle saved-item metadata into an unrelated execution — and neither of
+# these two accepts the other's field.
+_METADATA_ACTIONS = (*_SAVE_ACTIONS, "rename_saved_item", "update_saved_item_tags")
 
 # Identity fields the account_status action may request from account_show.
 # Everything else (phone, account ID, session data, credentials) is rejected.
@@ -321,14 +331,15 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         )
 
     # ``display_name``/``tags`` are the owner's own saved-item metadata. They
-    # are only meaningful for the Save actions (and only when the owner asked
-    # for them).
-    if ("display_name" in raw or "tags" in raw) and action not in _SAVE_ACTIONS:
+    # are only meaningful for the Save actions (at creation) and for the two
+    # management actions that own them afterwards — and only when the owner
+    # asked for them.
+    if ("display_name" in raw or "tags" in raw) and action not in _METADATA_ACTIONS:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=(
-                "'display_name'/'tags' are only valid for the save, deep_save "
-                "and save_link actions."
+                "'display_name'/'tags' are only valid for the save, deep_save, "
+                "save_link, rename_saved_item and update_saved_item_tags actions."
             ),
         )
 
@@ -340,8 +351,9 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=(
-                "'save_code' is only valid for the retrieve_save, "
-                "preview_saved_item and delete_saved_item actions."
+                "'save_code' is only valid for the saved-item actions "
+                "(retrieve_save, preview_saved_item, delete_saved_item, "
+                "rename_saved_item, update_saved_item_tags)."
             ),
         )
 
@@ -642,8 +654,32 @@ _TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 _TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 _SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
 
-# Actions that address ONE stored item by its save code.
-_SAVE_ITEM_ACTIONS = ("retrieve_save", "preview_saved_item", "delete_saved_item")
+# Actions that address ONE stored item.
+_SAVE_ITEM_ACTIONS = (
+    "retrieve_save",
+    "preview_saved_item",
+    "delete_saved_item",
+    "rename_saved_item",
+    "update_saved_item_tags",
+)
+
+# The saved-item actions that ALSO accept a name/tag ``query`` INSTEAD of a
+# code. They all go through the SAME deterministic resolver (Save V2 Parts
+# 3–4), which turns the owner's words into 0/1/N candidates and lets the tool
+# act only on an exact unique match. ``preview_saved_item`` and
+# ``delete_saved_item`` stay code-only — previewing or deleting one row out of
+# a fuzzy multi-match is deliberately not reachable from a model string.
+_SAVE_ITEM_QUERY_ACTIONS = (
+    "retrieve_save",
+    "rename_saved_item",
+    "update_saved_item_tags",
+)
+
+# The tag operations ``update_saved_item_tags`` accepts. The operation is
+# ALWAYS explicit — never inferred from the tag list — so "add these tags" and
+# "set the tags to exactly this" cannot be confused, and clearing every tag is
+# ``replace`` with an empty list (the one documented empty vs. no-tags form).
+_SAVE_TAG_MODES = ("add", "replace", "remove")
 
 
 def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
@@ -726,24 +762,71 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
 def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
     """Validate one saved-item action object (exact-field-set rule).
 
-    ``retrieve_save``, ``preview_saved_item`` and ``delete_saved_item`` all
-    address one stored item through the same code validation; only the resolved
-    target differs (re-sending happens in the current chat, previewing/deleting
-    addresses the item itself).
+    Every saved-item action addresses one stored item through the same code
+    validation; only the resolved target differs (re-sending happens in the
+    current chat, previewing/deleting/renaming/re-tagging addresses the item
+    itself).
 
-    ``retrieve_save`` ADDITIONALLY accepts a name/tag ``query`` INSTEAD of a
-    code (Save V2 Part 3): the deterministic resolver turns it into 0/1/N
-    candidates and the tool only ever retrieves an exact unique match. The
-    other two stay code-only — deleting or previewing by a fuzzy name is
-    deliberately not reachable from a model string.
+    The three query-capable actions (``retrieve_save``, ``rename_saved_item``,
+    ``update_saved_item_tags``) ADDITIONALLY accept a name/tag ``query``
+    INSTEAD of a code: the deterministic resolver turns it into 0/1/N
+    candidates and the tool only ever acts on an exact unique match.
+
+    A rename carries ``display_name``; a tag edit carries ``tags`` plus the
+    explicit ``mode``. Neither accepts the other's payload field, and an
+    unknown field is rejected for all five actions.
     """
-    allowed = {"action", "save_code", "query"} if action == "retrieve_save" else {"action", "save_code"}
+    allowed = {"action", "save_code"}
+    if action in _SAVE_ITEM_QUERY_ACTIONS:
+        allowed.add("query")
+    if action == "rename_saved_item":
+        allowed.add("display_name")
+    if action == "update_saved_item_tags":
+        allowed.update({"tags", "mode"})
     unknown = sorted(set(raw) - allowed)
     if unknown:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
         )
+
+    # The payload of the two management actions is validated ONCE, before the
+    # target is read and independently of how that target is addressed.
+    display_name = ""
+    tags: list[str] | None = None
+    mode = ""
+    if action == "rename_saved_item":
+        value = raw.get("display_name")
+        if not isinstance(value, str) or not value.strip():
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"Missing or invalid 'display_name' for {action}.",
+            )
+        display_name = value.strip()
+    elif action == "update_saved_item_tags":
+        value = raw.get("tags")
+        if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"Invalid 'tags' for {action} (must be a list of strings).",
+            )
+        tags = list(value)
+        mode_value = raw.get("mode")
+        if not isinstance(mode_value, str) or mode_value.strip().lower() not in _SAVE_TAG_MODES:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"Invalid 'mode' for {action} (allowed: add, replace, remove).",
+            )
+        mode = mode_value.strip().lower()
+        if mode != "replace" and not tags:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    f"'tags' must not be empty for {action} mode '{mode}' — "
+                    "use mode 'replace' with [] to clear every tag."
+                ),
+            )
+
     has_code = "save_code" in raw
     has_query = "query" in raw
     if has_code and has_query:
@@ -751,7 +834,7 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
             kind=KIND_INVALID,
             error=f"Provide either 'save_code' or 'query' for {action} — not both.",
         )
-    if action == "retrieve_save" and has_query:
+    if has_query:
         query = raw.get("query")
         if not isinstance(query, str) or not query.strip():
             return ActionParseResult(
@@ -764,13 +847,16 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action=action,
-            target="current_chat",
+            target="current_chat" if action == "retrieve_save" else "saved_item",
             query=query,
+            display_name=display_name,
+            tags=tags,
+            mode=mode,
         )
-    if action == "retrieve_save" and not has_code:
+    if action in _SAVE_ITEM_QUERY_ACTIONS and not has_code:
         return ActionParseResult(
             kind=KIND_INVALID,
-            error="Missing 'save_code' or 'query' for retrieve_save.",
+            error=f"Missing 'save_code' or 'query' for {action}.",
         )
     save_code = raw.get("save_code")
     if not isinstance(save_code, str):
@@ -789,6 +875,9 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
         action=action,
         target="current_chat" if action == "retrieve_save" else "saved_item",
         save_code=normalized,
+        display_name=display_name,
+        tags=tags,
+        mode=mode,
     )
 
 
@@ -800,7 +889,12 @@ def _default_target(action: str) -> str:
         return "replied_message"
     if action == "retrieve_save":
         return "current_chat"
-    if action in ("preview_saved_item", "delete_saved_item"):
+    if action in (
+        "preview_saved_item",
+        "delete_saved_item",
+        "rename_saved_item",
+        "update_saved_item_tags",
+    ):
         return "saved_item"
     if action in ("task_list", "task_inspect", "task_transition", "task_delete"):
         return "schedule"
@@ -934,6 +1028,28 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         # boundary enforces owner scoping immediately before the DB row and
         # the Saved Messages copy are removed.
         return [{"name": "delete_save", "arguments": {"save_code": result.save_code}}]
+
+    if action == "rename_saved_item":
+        # The new name travels verbatim; the target is the resolved item (a
+        # code, or the owner's own words resolved by the shared deterministic
+        # resolver, which refuses to pick among multiple matches).
+        args: dict[str, Any] = {"display_name": result.display_name}
+        if result.query:
+            args["query"] = result.query
+        else:
+            args["save_code"] = result.save_code
+        return [{"name": "rename_save", "arguments": args}]
+
+    if action == "update_saved_item_tags":
+        # ``mode`` is the explicit tag operation (add / replace / remove); an
+        # empty list is only meaningful with ``replace``, where it clears
+        # every tag. The validated payload travels unchanged.
+        args = {"tags": list(result.tags or []), "mode": result.mode}
+        if result.query:
+            args["query"] = result.query
+        else:
+            args["save_code"] = result.save_code
+        return [{"name": "update_save_tags", "arguments": args}]
 
     if action == "delete_messages":
         if target == "message_id":

@@ -139,6 +139,8 @@ EXPECTED_TOOLS = {
     "retrieve_save": PermissionLevel.READ_WRITE,
     "preview_save": PermissionLevel.READ_ONLY,
     "delete_save": PermissionLevel.DANGEROUS,
+    "rename_save": PermissionLevel.READ_WRITE,
+    "update_save_tags": PermissionLevel.READ_WRITE,
     "translate_history": PermissionLevel.READ_ONLY,
     "summarize_history": PermissionLevel.READ_ONLY,
     "send_message": PermissionLevel.READ_WRITE,
@@ -155,7 +157,7 @@ def test_registry_contains_exactly_the_expected_tools():
         f"registry mismatch: missing={set(EXPECTED_TOOLS) - names} "
         f"extra={names - set(EXPECTED_TOOLS)}"
     )
-    assert len(registry.list()) == 44
+    assert len(registry.list()) == 46
 
 
 @pytest.mark.asyncio

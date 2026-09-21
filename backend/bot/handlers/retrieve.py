@@ -15,8 +15,14 @@ Actions:
 
 Inputs:
   retrieve:code     — Manual save code entry
-  retrieve_item:rename — New filename
+  retrieve_item:rename — New display name
+  retrieve_item:tags   — Add / replace / remove the item's tags
   retrieve_item:move   — Folder name
+
+The item panel is the MANUAL half of the Save V2 Part 4 management contract:
+it shows the stored display name and tags and edits them through the same
+``retrieve_service`` operations the AI management tools call (do_rename /
+do_edit_tags), so the two surfaces can never drift.
 """
 import json
 import logging
@@ -26,6 +32,9 @@ from telethon import events
 
 from backend.ai.persian import normalize_digits
 from backend.bot.handlers.guard import is_owner
+# The ONE "no tags" vocabulary, shared with the Save panel's metadata step —
+# imported rather than re-typed so the two surfaces cannot drift.
+from backend.bot.handlers.save import _NO_TAGS_TOKENS
 from backend.services import retrieve_service
 from backend.db import client as db_client
 from backend.helper import (
@@ -159,6 +168,7 @@ async def _retrieve_item_panel_handler(event, extra: str) -> tuple[str, str, lis
     builder = InlinePanelBuilder()
     builder.add_row("⬇ Retrieve", f"action:retrieve_item_exec:{code}")
     builder.add_row("✏ Rename", f"input:retrieve_item:rename:{code}")
+    builder.add_row("🏷 Tags", f"input:retrieve_item:tags:{code}")
     builder.add_row("📂 Move", f"input:retrieve_item:move:{code}")
     builder.add_row("🗑 Delete", f"action:retrieve_item_delete:{code}")
     return "Item Preview", body, builder.build()
@@ -456,7 +466,7 @@ async def _retrieve_rename_input_handler(text, chat_id, msg_id, inline_chat_id, 
     code = (extra or "").strip()
     text_stripped = text.strip()
     if not text_stripped:
-        result = "⚠️ Filename cannot be empty."
+        result = "⚠️ Nothing was renamed: send a name for the item."
     elif not code:
         result = "⚠️ No item selected."
     else:
@@ -467,6 +477,85 @@ async def _retrieve_rename_input_handler(text, chat_id, msg_id, inline_chat_id, 
             await helper.edit_message(inline_chat_id, inline_msg_id, result)
         except Exception as exc:
             logger.warning("rename inline edit failed: %s", exc)
+    if _self_client:
+        try:
+            await _self_client.delete_messages(chat_id, [msg_id])
+        except Exception:
+            pass
+
+
+# ── Tag editing (the item panel's one-line grammar) ──
+
+# One documented grammar, so the panel can never invent a tag operation:
+#
+#     university, semester-2   → REPLACE the item's tags with this list
+#     +university, +semester-2 → ADD these tags
+#     -university              → REMOVE these tags
+#     - / none / بدون          → remove EVERY tag
+#
+# Mixing `+` and `-` in one line is refused rather than guessed. The tags
+# themselves are normalized by the SHARED save rules inside the service, so
+# the panel cannot store a tag a save would have refused.
+
+
+def parse_tags_line(text: str) -> tuple[str, tuple[str, ...]]:
+    """Parse the tag line into ``(operation, tags)`` for ``do_edit_tags``.
+
+    Raises ``ValueError`` with an owner-readable reason; the operation is
+    always explicit and never inferred from the tag list.
+    """
+    line = (text or "").strip()
+    if not line:
+        raise ValueError("send tags, or `-` to remove every tag")
+    if line.casefold() in _NO_TAGS_TOKENS:
+        return retrieve_service.TAG_OP_REPLACE, ()
+    parts = [p.strip() for p in line.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        raise ValueError("send tags, or `-` to remove every tag")
+    added = [p for p in parts if p.startswith("+")]
+    removed = [p for p in parts if p.startswith("-")]
+    if added and removed:
+        raise ValueError("use either `+tag` to add or `-tag` to remove — not both in one line")
+    if added:
+        return retrieve_service.TAG_OP_ADD, _require_tags(p[1:] for p in added)
+    if removed:
+        return retrieve_service.TAG_OP_REMOVE, _require_tags(p[1:] for p in removed)
+    return retrieve_service.TAG_OP_REPLACE, _require_tags(parts)
+
+
+def _require_tags(values) -> tuple[str, ...]:
+    """Refuse a tag line whose every token is empty after its prefix."""
+    tags = tuple(str(v) for v in values)
+    if not any(t.strip() for t in tags):
+        raise ValueError("send at least one tag")
+    return tags
+
+
+async def _retrieve_tags_input_handler(text, chat_id, msg_id, inline_chat_id, inline_msg_id, extra=None):
+    """Apply one explicit tag edit to the item the panel carried in ``extra``.
+
+    Same carry-through contract as rename/move: the input listener pops the
+    pending state BEFORE calling this handler, so the item code arrives as
+    ``extra`` and is re-verified (owner + existence) inside the service.
+    """
+    from backend.helper.inline_engine import _self_client, _owner_id
+    code = (extra or "").strip()
+    if not code:
+        result = "⚠️ No item selected. Nothing was changed."
+    else:
+        try:
+            op, tags = parse_tags_line(text)
+        except ValueError as exc:
+            result = f"⚠️ Nothing was changed: {exc}"
+        else:
+            result = await retrieve_service.do_edit_tags(_owner_id, code, op, tags)
+    helper = get_client()
+    if helper and inline_chat_id and inline_msg_id:
+        try:
+            await helper.edit_message(inline_chat_id, inline_msg_id, result)
+        except Exception as exc:
+            logger.warning("tags inline edit failed: %s", exc)
     if _self_client:
         try:
             await _self_client.delete_messages(chat_id, [msg_id])
@@ -523,7 +612,18 @@ def register(client, owner_id: int):
     })
     register_input("retrieve_item", "rename", {
         "handler": _retrieve_rename_input_handler,
-        "prompt": "**Rename Item**\n\nEnter the new filename:\n\n_Reply below._",
+        "prompt": "**Rename Item**\n\nEnter the new display name for this saved item:\n\n_Reply below._",
+    })
+    register_input("retrieve_item", "tags", {
+        "handler": _retrieve_tags_input_handler,
+        "prompt": (
+            "**Edit Tags** — one line\n\n"
+            "• `university, semester-2` → replace the tags\n"
+            "• `+university` → add tags\n"
+            "• `-university` → remove tags\n"
+            "• `-` / `none` / `بدون` → remove every tag\n\n"
+            "_Reply with the tags below._"
+        ),
     })
     register_input("retrieve_item", "move", {
         "handler": _retrieve_move_input_handler,

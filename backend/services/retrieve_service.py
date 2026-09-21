@@ -16,7 +16,12 @@ Unified workflow:
     (the SINGLE Telegram retrieval authority — the resolver never forwards)
   - do_preview / do_send: legacy text-command entry points (still work
     but the panel UI is the primary path)
-  - do_rename / do_move / do_delete: item actions from the preview panel
+  - resolve_management_target(owner_id, save_code|query): the ONE target
+    resolution shared by every management surface (Save V2 Part 4) — it
+    reuses the resolver above and never guesses among candidates
+  - do_rename / do_edit_tags: the ONE writers of `saved_items.display_name`
+    and the owner's `saved_items.tags` after the save itself
+  - do_move / do_delete: item actions from the preview panel
 """
 import asyncio
 import logging
@@ -29,6 +34,7 @@ from datetime import datetime
 from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
 from backend.diagnostics import record_event
+from backend.services import save_service
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +116,7 @@ def format_preview(row: dict) -> str:
         f"**Type** {media_type}\n"
         f"**Format** `{mime}`\n"
         f"**Size** {size}\n"
+        f"**Tags** {format_owner_tags(row)}\n"
         f"**Sender** {sender}\n"
         f"**Saved** {saved}"
     )
@@ -259,15 +266,37 @@ async def do_send(self_client, owner_id: int, save_code: str, target_chat: int) 
 
 
 async def do_rename(owner_id: int, save_code: str, new_name: str) -> str:
-    save_code = save_code.upper().strip()
-    new_name = new_name.strip()
-    if not new_name:
-        return "⚠️ Filename cannot be empty."
-    row = await db_client.query_save(save_code)
-    if not row or row.get("owner_id") != owner_id:
-        return f"❌ No item found for `{save_code}`"
-    await db_client.log(owner_id, "INFO", f"Renamed {save_code}", {"new_name": new_name})
-    return f"✅ Renamed to `{new_name}`"
+    """Give one owner-owned saved item a new display name (Save V2 Part 4).
+
+    The name is the item's OWN metadata (``saved_items.display_name``) and the
+    shared ``save_service`` normalizer decides what a valid name is — the same
+    rule the Save panel already enforces, so a rename can never store a value
+    the save path would have refused. The name is normalized first; then the
+    write is CONFIRMED by re-reading the owner's row (see ``_write_metadata``),
+    so success is reported only when the stored value is the one asked for.
+
+    The underlying Telegram saved message is never touched: only the item's
+    metadata changes, and only for a row that belongs to this owner.
+    """
+    code = str(save_code or "").upper().strip()
+    try:
+        name = save_service.normalize_display_name(new_name)
+    except ValueError as exc:
+        return f"⚠️ Nothing was renamed: {exc}"
+    if name is None:
+        return "⚠️ Nothing was renamed: send a name for the item."
+
+    row, error = await _load_for_management(owner_id, code)
+    if error:
+        return error
+    if row is None:
+        return f"❌ No item found for `{code}`"
+
+    failure = await _write_metadata(owner_id, code, "display_name", name, name)
+    if failure:
+        return failure
+    await db_client.log(owner_id, "INFO", f"Renamed {code}", {"display_name": name})
+    return f"✅ Renamed `{code}` to **{name}**"
 
 
 async def do_move(owner_id: int, save_code: str, folder: str) -> str:
@@ -630,3 +659,229 @@ async def resolve_saved_items(
         )
 
     return SavedItemResolution(status=RESOLUTION_NOT_FOUND, query=raw)
+
+
+# ── Saved-item management (Save V2 Part 4 — rename / tags) ────────────────
+#
+# The ONE management contract for a stored item. Every surface (the retrieve
+# item panel and the AI management tools) resolves its target with
+# ``resolve_management_target``, which REUSES the Part 3 resolver instead of
+# searching again, and then mutates only the item's own metadata through
+# ``do_rename`` / ``do_edit_tags``. There is no second resolver, no second
+# metadata writer, no Telegram side effect in this section, and never a
+# guessed target: 0 matches is an honest not-found and N matches must be
+# narrowed by the owner before anything is written.
+
+TARGET_OK = "ok"
+TARGET_NOT_FOUND = "not_found"
+TARGET_AMBIGUOUS = "ambiguous"
+TARGET_INVALID = "invalid"
+
+TAG_OP_ADD = "add"
+TAG_OP_REPLACE = "replace"
+TAG_OP_REMOVE = "remove"
+TAG_OPS = (TAG_OP_ADD, TAG_OP_REPLACE, TAG_OP_REMOVE)
+
+
+@dataclass(frozen=True)
+class ManagementTarget:
+    """The resolver's answer for a management request: one item, or why not.
+
+    ``status`` is ``ok`` / ``not_found`` / ``ambiguous`` / ``invalid``. Only
+    ``ok`` carries a ``save_code``; ``message`` is the owner-facing rendering
+    of the failure and is empty on success.
+    """
+
+    status: str
+    save_code: str = ""
+    message: str = ""
+    resolution: SavedItemResolution | None = None
+
+
+def format_owner_tags(row: dict) -> str:
+    """One stored row's OWNER tags, rendered (never the legacy hashtags)."""
+    tags = _owner_tags(row)
+    return ", ".join(tags) if tags else "—"
+
+
+def _legacy_tags(row: dict) -> list[str]:
+    """The synthetic ``#saved*`` values a legacy row still carries.
+
+    They are caption decoration, not owner metadata (see ``_owner_tags``), so
+    a tag edit never rewrites or drops them: the owner's tags are stored
+    alongside them and only the owner's are ever replaced or removed.
+    """
+    out: list[str] = []
+    for item in (row.get("tags") or []):
+        tag = str(item or "").strip()
+        if tag.startswith("#"):
+            out.append(tag)
+    return out
+
+
+async def resolve_management_target(
+    owner_id: int, *, save_code: str = "", query: str = ""
+) -> ManagementTarget:
+    """Resolve ONE owner-owned item for a management operation.
+
+    A save code goes through the owner-scoped, identity-verified read; a
+    name/tag request goes through the SAME deterministic resolver retrieval
+    uses. Either way the answer is one item or an explicit refusal — an
+    ambiguous request is never narrowed by a guess, and nothing is written
+    here (resolution is read-only by contract).
+    """
+    code = str(save_code or "").upper().strip()
+    raw_query = str(query or "").strip()
+    if code and raw_query:
+        return ManagementTarget(
+            status=TARGET_INVALID,
+            message="Provide either a save code or a name/tag query — not both.",
+        )
+    if not code and not raw_query:
+        return ManagementTarget(
+            status=TARGET_INVALID,
+            message="A save code or a name/tag query is required.",
+        )
+
+    if code:
+        row, error = await _load_for_management(owner_id, code)
+        if error:
+            return ManagementTarget(status=TARGET_INVALID, message=error)
+        if row is None:
+            return ManagementTarget(
+                status=TARGET_NOT_FOUND, message=f"❌ No item found for `{code}`"
+            )
+        return ManagementTarget(status=TARGET_OK, save_code=code)
+
+    resolution = await resolve_saved_items(owner_id, raw_query)
+    if resolution.status == RESOLUTION_UNIQUE:
+        return ManagementTarget(
+            status=TARGET_OK,
+            save_code=resolution.candidates[0].save_code,
+            resolution=resolution,
+        )
+    if resolution.status == RESOLUTION_AMBIGUOUS:
+        return ManagementTarget(
+            status=TARGET_AMBIGUOUS,
+            message=format_resolution(resolution),
+            resolution=resolution,
+        )
+    return ManagementTarget(
+        status=TARGET_NOT_FOUND,
+        message=format_resolution(resolution),
+        resolution=resolution,
+    )
+
+
+async def _load_for_management(owner_id: int, save_code: str) -> tuple[dict | None, str]:
+    """Owner-verified row read for a management operation.
+
+    Returns ``(row, error)``; ``row`` is ``None`` for a missing or foreign code
+    (reported identically, so another owner's item is never distinguishable
+    from a missing one) and ``error`` is non-empty only when the database
+    itself failed — which is never silently reported as "not found".
+    """
+    try:
+        return await load_saved_item(save_code, owner_id), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, f"❌ DB error: {exc}"
+
+
+def _stored_matches(stored, expected) -> bool:
+    """Does the re-read row carry exactly the value that was written?
+
+    Tags are compared as the row's OWNER tags (legacy ``#`` values are not the
+    owner's metadata and are never expected to disappear); a name is compared
+    as the normalized text that was stored.
+    """
+    if isinstance(expected, tuple):
+        return _owner_tags({"tags": stored}) == expected
+    return str(stored or "").strip() == str(expected)
+
+
+async def _write_metadata(owner_id: int, save_code: str, field: str, value, expected) -> str:
+    """Persist one metadata field and CONFIRM it by re-reading the row.
+
+    ``update_save_field`` reports the representation PostgREST returns for an
+    UPDATE, which is not proof the write landed, so success is derived from a
+    second owner-verified read instead: the stored value must equal the value
+    that was asked for. Returns an owner-facing failure string, or ``""`` when
+    the change is confirmed.
+    """
+    try:
+        await db_client.update_save_field(owner_id, save_code, field, value)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("saved-item metadata write failed for %s: %s", save_code, exc)
+        return f"❌ Could not save the change ({exc})."
+
+    try:
+        row = await load_saved_item(save_code, owner_id)
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ DB error while confirming the change: {exc}"
+    if row is None:
+        return f"❌ No item found for `{save_code}`"
+    if _stored_matches(row.get(field), expected):
+        return ""
+    return "❌ The change was not stored — the saved item is unchanged."
+
+
+async def do_edit_tags(
+    owner_id: int, save_code: str, op: str, tags=()
+) -> str:
+    """Add, replace or remove one item's OWNER tags (Save V2 Part 4).
+
+    ``op`` is ``add`` / ``replace`` / ``remove``; the tag list is normalized by
+    the SHARED ``save_service`` rules, so casing, whitespace, duplicates and
+    the count bound follow exactly the same contract a save does — a tag the
+    Save panel would have refused is refused here too, and nothing is invented.
+
+    ``replace`` with an empty list is the ONE way to clear every tag (the
+    explicit "no tags" case), and a removal that matches nothing is reported
+    honestly instead of being written. Legacy ``#saved*`` values on the row are
+    preserved untouched: they were never owner tags. Only the owner's own row
+    is ever written.
+    """
+    code = str(save_code or "").upper().strip()
+    operation = str(op or "").strip().lower()
+    if operation not in TAG_OPS:
+        return "⚠️ Nothing was changed: unknown tag operation."
+    try:
+        incoming = save_service.normalize_tags(tags)
+    except ValueError as exc:
+        return f"⚠️ Nothing was changed: {exc}"
+    if operation != TAG_OP_REPLACE and not incoming:
+        return "⚠️ Nothing was changed: send at least one tag."
+
+    row, error = await _load_for_management(owner_id, code)
+    if error:
+        return error
+    if row is None:
+        return f"❌ No item found for `{code}`"
+
+    current = _owner_tags(row)
+    if operation == TAG_OP_ADD:
+        merged = current + tuple(t for t in incoming if t.casefold() not in {c.casefold() for c in current})
+    elif operation == TAG_OP_REMOVE:
+        removal = {t.casefold() for t in incoming}
+        merged = tuple(t for t in current if t.casefold() not in removal)
+        if merged == current:
+            return f"⚠️ Nothing was changed: `{code}` has none of those tags."
+    else:
+        merged = incoming
+    # The RESULT must obey the same shared rules (count bound included), so an
+    # add that would exceed the limit is refused BEFORE anything is written.
+    try:
+        merged = save_service.normalize_tags(merged)
+    except ValueError as exc:
+        return f"⚠️ Nothing was changed: {exc}"
+
+    stored = _legacy_tags(row) + list(merged)
+    failure = await _write_metadata(owner_id, code, "tags", stored, merged)
+    if failure:
+        return failure
+    await db_client.log(owner_id, "INFO", f"Edited tags {code}", {
+        "op": operation,
+        "tags": list(merged),
+    })
+    rendered = ", ".join(merged) if merged else "no tags"
+    return f"✅ Tags for `{code}`: {rendered}"

@@ -1,6 +1,177 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — DATABASE SETUP CONSOLIDATION: ONE complete Supabase setup script
+## Latest phase — SAVE V2 PART 4: saved-item management (rename + tags)
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **SAVE V2 PART 4** — the final management/integration layer for Saved Items, on BOTH surfaces (manual panel + AI) |
+| Type | runtime feature (service + AI tools + action contract + panel) + tests — no schema change |
+| Starting HEAD | `0930225` = `origin/main` (working tree clean on entry) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **NO** — `display_name` (Part 1) and `tags` already exist; Part 4 writes only those existing columns. No SQL was executed and `DATABASE_ARCHITECTURE.md` was not touched. |
+| Live Telegram | **NOT YET VERIFIED** (see below) — this is the implementation/test phase |
+
+### What Part 4 adds (and what it deliberately does not)
+
+Parts 1–3 made saved items *saveable* (metadata) and *retrievable* (deterministic
+0/1/N resolution). Part 4 makes them **manageable**. Three concrete gaps existed
+in the real source before this phase:
+
+1. `retrieve_service.do_rename` **did not rename anything** — it validated nothing,
+   wrote no column, and returned `✅ Renamed to \`X\`` (a fabricated success).
+2. There was **no tag editing at all**: no way to add, replace or clear an item's
+   owner tags after the save.
+3. The AI surface had `preview_save` / `delete_save` / `retrieve_save` but **no
+   way to rename or re-tag** an item, so the management model was partial.
+
+Deletion was already implemented (`delete_save` → `do_delete`) with the same
+owner-scoped row lookup; Part 4 only verifies that contract (a test drives it
+through the panel action) and does **not** redesign it.
+
+### Exact architecture after implementation
+
+```
+manual panel                                    AI (native tool call / JSON action)
+  retrieve_item → ✏ Rename → one line              rename_saved_item  → rename_save
+  retrieve_item → 🏷 Tags   → one line             update_saved_item_tags
+  retrieve_item → 🗑 Delete (unchanged)                 → update_save_tags
+          │                                                   │
+          └────────► retrieve_service (the ONE authority) ◄────┘
+                       resolve_management_target(owner, save_code|query)
+                         → ok / not_found / ambiguous / invalid
+                       do_rename(owner, code, name)   → display_name
+                       do_edit_tags(owner, code, op, tags) → tags
+                       (_write_metadata confirms EVERY write by re-reading)
+```
+
+* **One resolver** — `resolve_management_target` calls the Part 3
+  `resolve_saved_items`; there is no second search and no second matching rule.
+  A test patches `resolve_saved_items` and asserts it is the function used.
+* **One metadata writer** — `do_rename` / `do_edit_tags` are the only writers of
+  `saved_items.display_name` / owner `tags` after the save, and both go through
+  the SHARED `save_service.normalize_display_name` / `normalize_tags` rules.
+* **Target rules** — `save_code` XOR `query`; 0 → honest not-found, 1 → act,
+  N → list the bounded candidates and NOTHING is written (the AI is instructed
+  to ask; the panel renders the candidate list).
+* **Owner isolation** — the row is read through `load_saved_item` (owner predicate
+  + row identity); a foreign item is reported exactly like a missing one.
+
+### Manual UI behavior
+
+* `retrieve_item` now shows the stored `**Tags**` line and offers
+  `✏ Rename` and `🏷 Tags` beside Retrieve / Move / Delete. The preview is the
+  same `format_preview` the AI `preview_save` returns, so both surfaces show one
+  stored truth.
+* Rename collects one line and now **persists** `display_name` (the previous
+  handler called a function that wrote nothing).
+* Tags collects one line with one documented grammar —
+  `a, b` = replace, `+a` = add, `-a` = remove, `-`/`none`/`بدون` = clear all;
+  mixed `+`/`-` and empty lines are refused with an owner-readable reason rather
+  than guessed. The "no tags" vocabulary is the SAME constant the Save panel's
+  metadata step uses (imported, not re-typed).
+* No new questionnaire: Save itself is unchanged, and the tags step exists only
+  where the owner asks for it.
+
+### AI behavior
+
+* Two new narrowly-scoped tools: `rename_save` (`display_name`) and
+  `update_save_tags` (`tags` + explicit `mode` add/replace/remove), both
+  `READ_WRITE`, both delegating to the service layer, both resolving the target
+  through the shared resolver. `required_arguments` mirror exactly what
+  `execute()` rejects.
+* The action contract gained `rename_saved_item` and `update_saved_item_tags`
+  with exact per-action field sets: a rename cannot carry `tags`, a tag edit
+  cannot carry `display_name`, unknown fields are rejected, `save_code` and
+  `query` are XOR, and `mode` is required (`replace` + `[]` is the ONE clear-all
+  form; empty tags with add/remove is refused).
+* The prompt template documents both tools, the explicit modes, and the
+  never-choose-among-candidates rule, with JSON examples in English and Persian.
+* Registry: **46** tools (was 44); the three tests that pin the tool inventory
+  were updated accordingly (`test_tool_health_audit` also gained the two
+  permission entries).
+
+### Deterministic resolution / owner isolation — evidence
+
+* `resolve_management_target` takes no Telegram identity at all (a test asserts
+  its exact parameter list), and `rename_save` / `update_save_tags` ignore
+  model-supplied `owner_id` / `chat_id` (a test asserts the stored row keeps the
+  trusted owner).
+* A foreign `save_code` and a missing one produce the identical message; a
+  same-named item belonging to another owner is never resolved.
+
+### Honest writes (a defect found and fixed while testing)
+
+`update_save_field` returns PostgREST's UPDATE representation, which is not
+proof a write landed, so metadata success is derived from a second
+owner-verified READ: the stored value must equal the value asked for, otherwise
+the caller gets `❌ … not stored — the saved item is unchanged.` Two tests drive
+this with a silently-ignored write for both rename and tags.
+
+The new tests also caught a real defect in the first draft: the post-merge tag
+list was re-normalized OUTSIDE the try/except, so an add that exceeded the
+10-tag bound raised `ValueError` instead of refusing — now refused honestly
+before any write (regression test included).
+
+### Tests added and exact results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_save_v2_management.py -q` (new, Part 4) | **61 passed** |
+| `pytest` on the 10 Save/retrieve suites + the DB-setup suite | **363 passed** |
+| `pytest tests/ -q` (full suite) | **4583 passed, 26 skipped** in 116.56s (baseline 4522/26 + the 61 new) |
+| `python -m py_compile` on every changed file | clean |
+| `git diff --check` | clean |
+
+The new suite covers, at the real service/tool/handler boundaries: rename
+unique / ambiguous / missing / invalid-name / foreign-owner; add / replace /
+remove / clear-all tags; shared normalization (case-insensitive dedupe, the
+limits refused before writing); legacy `#saved*` preservation; tag-based unique
+and ambiguous targets; zero-match behavior; the manual panel path (rows, stored
+name and tags, real writes, no carry-through, refusal of an unreadable line,
+rename persistence, another owner's item untouched, delete's existing
+contract); the AI path (registry contract, provider-schema visibility, real
+writes, ambiguous refusal, bad mode/shape refusal, ignored model identity); the
+action contract (14 invalid payload shapes + the one valid clear-all form,
+unrelated actions still rejecting saved-item metadata, JSON→tool mapping); and
+regressions for Parts 1–3 plus Save V1.
+
+### Database status
+
+No migration, no SQL, no Supabase connection. `display_name` and `tags` were
+already part of the canonical schema applied in the previous phase.
+
+### Known limitations (recorded, not hidden)
+
+* Nothing is verified against live Telegram in this phase (per the phase plan).
+* `do_move` still does not persist a folder (it predates Part 4 and has no
+  column contract); it was deliberately left untouched — Part 4 is rename +
+  tags only.
+* Renaming changes the item's LABEL only. The Telegram saved message's own
+  caption still carries the original LifeOS caption block — the documented
+  behaviour, since that caption is a historical artifact of the upload.
+* A tag edit preserves legacy `#saved*` values in the column and edits only the
+  owner's tags; those legacy values remain non-searchable and non-displayed, as
+  Part 3 documented.
+
+### Live Telegram status = NOT YET VERIFIED
+
+No live Telegram interaction was performed. Every verification above is
+in-process (real service/tool/handler code, in-memory database fallback, faked
+Telegram client).
+
+### Exact next step — LIVE TELEGRAM VERIFICATION
+
+Perform live Telegram verification of the complete Save V2 flow: save with a
+name and tags, retrieve by name and by tag (0/1/N), rename, add/replace/clear
+tags, delete — through both the `Menu` panels and the AI trigger path.
+
+---
+
+## Previous phase — DATABASE SETUP CONSOLIDATION: ONE complete Supabase setup script
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

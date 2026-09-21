@@ -1,17 +1,21 @@
 """Saved-item management tools — wrap the existing ``retrieve_service``.
 
-Three thin wrappers over the SAME service operations the retrieve panels
+Five thin wrappers over the SAME service operations the retrieve panels
 already use, so the AI-facing management surface is the panel surface:
 
-  - ``retrieve_save`` — re-send the item (media + metadata caption)
-  - ``preview_save``  — read the item's stored metadata by save code
-  - ``delete_save``   — remove the item (its saved copy + its DB row)
+  - ``retrieve_save``    — re-send the item (media + metadata caption)
+  - ``preview_save``     — read the item's stored metadata by save code
+  - ``delete_save``      — remove the item (its saved copy + its DB row)
+  - ``rename_save``      — change the item's display name (Save V2 Part 4)
+  - ``update_save_tags`` — add / replace / remove the owner's tags
 
 Destinations are resolved from TRUSTED runtime context — the chat the AI
 request came from — never from model output, mirroring ``SendMessageTool``.
 The save code is owner-scoped through the existing service/DB contract:
 the authenticated owner identity always comes from ``context.owner_id``,
-never from tool arguments.
+never from tool arguments. A name/tag target is resolved by the shared
+deterministic resolver (``resolve_management_target``); an ambiguous target
+is NEVER narrowed by the model — it is reported back and the owner chooses.
 """
 from __future__ import annotations
 
@@ -19,6 +23,293 @@ from typing import Any
 
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult, result_from_service
 from backend.ai.tools.context import ToolContext
+
+
+# The tag operations ``update_save_tags`` accepts (the service's own enum).
+_TAG_MODES = ("add", "replace", "remove")
+
+
+def _resolve_management_target(
+    tool_name: str,
+    action_word: str,
+    target,
+) -> ToolResult | None:
+    """Turn a non-``ok`` management target into the tool result to return.
+
+    ``None`` means the caller may proceed. An ambiguous target returns the
+    resolver's owner-facing candidate list plus an explicit instruction never
+    to choose — the tool performs NO write in that case.
+    """
+    from backend.services import retrieve_service
+
+    if target.status == retrieve_service.TARGET_AMBIGUOUS:
+        lines = [target.message]
+        lines.append(
+            f"NOTHING was {action_word}. Ask the owner which one they mean — "
+            f"never choose for them. When they answer, call {tool_name} again "
+            "with that item's exact save_code."
+        )
+        return ToolResult(
+            success=True,
+            message="\n".join(lines),
+            data={
+                "outcome": "ambiguous",
+                "query": getattr(target.resolution, "query", ""),
+                "candidates": [
+                    {
+                        "save_code": c.save_code,
+                        "label": retrieve_service.candidate_label(c),
+                    }
+                    for c in (target.resolution.candidates if target.resolution else ())
+                ],
+            },
+        )
+    if target.status == retrieve_service.TARGET_NOT_FOUND:
+        return ToolResult(
+            success=False,
+            message=target.message or "No saved item matches that request.",
+            data={"outcome": "not_found"},
+        )
+    if target.status != retrieve_service.TARGET_OK:
+        return ToolResult(
+            success=False,
+            message=target.message or "The saved item could not be resolved.",
+        )
+    return None
+
+
+class RenameSaveTool(Tool):
+    """Give ONE saved item a new display name (metadata only).
+
+    Delegates to ``retrieve_service.do_rename`` — the same owner-scoped
+    operation (and the same shared name rule) the retrieve panel's Rename
+    action uses. The item's saved Telegram message, its files and its tags are
+    untouched: only ``saved_items.display_name`` changes.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "rename_save"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("display_name",)
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        return ("save_code", "query")
+
+    @property
+    def description(self) -> str:
+        return (
+            "Give ONE saved item a new display name. Pass save_code when the "
+            "owner gives a code or a previous result listed one; otherwise "
+            "pass query with the owner's own words (a name or tag) and the "
+            "system resolves it deterministically. With query, EXACTLY one "
+            "match is renamed immediately and MULTIPLE matches are never "
+            "renamed — the result lists them and asks the owner to choose, so "
+            "never pick one yourself. The name is the item's own label; the "
+            "saved file, its Telegram message and its tags are unchanged."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "save_code": {
+                "type": "string",
+                "default": "",
+                "description": "The item's save code (e.g. S0001). Never invent a code.",
+            },
+            "query": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "The owner's own words describing the item by name or tag "
+                    "when no code was given. Resolved deterministically; "
+                    "multiple matches always ask the owner to choose."
+                ),
+            },
+            "display_name": {
+                "type": "string",
+                "description": (
+                    "The new name for the item, exactly as the owner gave it "
+                    "(e.g. 'University Weekly Schedule Semester 2'). Never "
+                    "invent or embellish a name."
+                ),
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the rename confirmation or honest failure"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.services import retrieve_service
+
+        raw_name = arguments.get("display_name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            return ToolResult(
+                success=False,
+                message="A new name is required. Nothing was renamed.",
+            )
+
+        target = await retrieve_service.resolve_management_target(
+            context.owner_id,
+            save_code=str(arguments.get("save_code") or ""),
+            query=str(arguments.get("query") or ""),
+        )
+        blocked = _resolve_management_target("rename_save", "renamed", target)
+        if blocked is not None:
+            return blocked
+
+        try:
+            result = await retrieve_service.do_rename(
+                context.owner_id, target.save_code, raw_name
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Rename failed: {exc}")
+        return result_from_service(
+            result,
+            data={"save_code": target.save_code, "display_name": raw_name.strip()},
+        )
+
+
+class UpdateSaveTagsTool(Tool):
+    """Add, replace or remove the OWNER tags of ONE saved item.
+
+    Delegates to ``retrieve_service.do_edit_tags`` — the same owner-scoped
+    operation and the same shared tag rules a save uses. The operation is
+    explicit (never inferred): ``add`` merges, ``replace`` sets exactly the
+    given list (``[]`` clears every tag) and ``remove`` deletes the named ones.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "update_save_tags"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("tags", "mode")
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        return ("save_code", "query")
+
+    @property
+    def description(self) -> str:
+        return (
+            "Change the tags of ONE saved item. Pass mode='add' to add tags, "
+            "mode='replace' to set the tags to exactly the given list (an "
+            "empty list removes every tag when the owner asks for no tags), "
+            "or mode='remove' to delete the given tags. Pass save_code when "
+            "the owner gives a code or a previous result listed one; "
+            "otherwise pass query with the owner's own words and the system "
+            "resolves it deterministically. With query, EXACTLY one match is "
+            "updated and MULTIPLE matches are never updated — the result "
+            "lists them and asks the owner to choose, so never pick one "
+            "yourself. Tags are normalized by the shared rules; never invent "
+            "a tag and never turn a sentence into tags."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "save_code": {
+                "type": "string",
+                "default": "",
+                "description": "The item's save code (e.g. S0001). Never invent a code.",
+            },
+            "query": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "The owner's own words describing the item by name or tag "
+                    "when no code was given. Resolved deterministically; "
+                    "multiple matches always ask the owner to choose."
+                ),
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "The tags to apply, e.g. ['university', 'semester-2']. "
+                    "Pass [] with mode='replace' to remove every tag. Never "
+                    "invent a tag the owner did not give."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "description": (
+                    "Required, explicit: 'add' (merge), 'replace' (set "
+                    "exactly this list) or 'remove' (delete these tags)."
+                ),
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the updated tag list or honest failure"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.services import retrieve_service
+
+        mode = str(arguments.get("mode") or "").strip().lower()
+        if mode not in _TAG_MODES:
+            return ToolResult(
+                success=False,
+                message=(
+                    "The tag mode must be one of add, replace or remove. "
+                    "Nothing was changed."
+                ),
+            )
+        tags = arguments.get("tags")
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            return ToolResult(
+                success=False,
+                message="Tags must be a list of strings. Nothing was changed.",
+            )
+
+        target = await retrieve_service.resolve_management_target(
+            context.owner_id,
+            save_code=str(arguments.get("save_code") or ""),
+            query=str(arguments.get("query") or ""),
+        )
+        blocked = _resolve_management_target("update_save_tags", "updated", target)
+        if blocked is not None:
+            return blocked
+
+        try:
+            result = await retrieve_service.do_edit_tags(
+                context.owner_id, target.save_code, mode, tags
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Tag update failed: {exc}")
+        return result_from_service(
+            result,
+            data={"save_code": target.save_code, "mode": mode, "tags": list(tags)},
+        )
 
 
 class RetrieveSaveTool(Tool):
