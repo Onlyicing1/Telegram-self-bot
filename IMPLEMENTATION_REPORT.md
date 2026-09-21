@@ -16,7 +16,7 @@ Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 | Telegram AI Settings controls | **not applicable** — this phase adds no setting, panel or persistence behavior |
 | Persistence / runtime config | **not applicable** — unchanged; no `config_store`, no `ai_config`, no engine edit |
 | Supabase / live Telegram | untouched / not exercised (no live verification is claimed) |
-| Tests updated | `tests/test_database_setup_order.py` (rewritten, 24 tests) and `tests/test_canonical_schema_reconciliation.py` (the copy-pinning contract moved) |
+| Tests updated | `tests/test_database_setup_order.py` (rewritten, 21 tests) and `tests/test_canonical_schema_reconciliation.py` (the copy-pinning contract moved, 33 tests) |
 
 ### The problem this phase addresses
 
@@ -86,8 +86,8 @@ and a test pins each one back to its file.
 
 | Command | Result |
 |---|---|
-| `pytest tests/test_database_setup_order.py -q` | **24 passed** |
-| `pytest tests/test_canonical_schema_reconciliation.py -q` | **30 passed** |
+| `pytest tests/test_database_setup_order.py -q` | **21 passed** |
+| `pytest tests/test_canonical_schema_reconciliation.py -q` | **33 passed** |
 | `pytest tests/test_credential_management.py tests/test_credential_vault.py tests/test_save_v2_metadata.py` + the two above | **248 passed** |
 | `pytest tests/ -q` (full suite) | **4522 passed, 26 skipped** in 117.67s |
 | `python -m py_compile` on the two changed test files | clean |
