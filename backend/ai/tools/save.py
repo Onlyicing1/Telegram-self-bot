@@ -15,6 +15,41 @@ from backend.ai.tools.context import ToolContext
 logger = logging.getLogger(__name__)
 
 
+def _request_text(context: ToolContext) -> str:
+    """The owner's own request text for this turn (trusted runtime context)."""
+    extra = context.extra or {}
+    return str(extra.get("request_text") or "")
+
+
+def _save_metadata(
+    context: ToolContext, arguments: dict[str, Any]
+) -> tuple["SaveMetadata | None", str]:
+    """Build the SHARED ``SaveMetadata`` from the model's optional arguments.
+
+    Returns ``(metadata, "")`` on success, or ``(None, reason)`` when the
+    request cannot be honoured — the caller then reports the reason and saves
+    nothing (no download, no upload, no row). Bounds, whitespace, dedupe and
+    the tag/name limits are the shared ``save_service`` rules; this adapter
+    never re-implements them.
+
+    An explicit decline in the OWNER's own words is authoritative: it forces an
+    empty tag list, so a model proposal can never re-add tags the owner asked
+    not to have.
+    """
+    from backend.ai.actions import explicit_no_tags_requested
+    from backend.services.save_service import SaveMetadata
+
+    try:
+        metadata = SaveMetadata.from_raw(
+            arguments.get("display_name"), arguments.get("tags")
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    if explicit_no_tags_requested(_request_text(context)):
+        metadata = SaveMetadata.from_raw(metadata.display_name, ())
+    return metadata, ""
+
+
 class SaveTool(Tool):
     """Deep-save a replied message to Saved Messages.
 
@@ -38,31 +73,31 @@ class SaveTool(Tool):
         return (
             "Deep-save a message to Saved Messages by downloading and "
             "re-uploading it as a new message. Requires a replied message. "
-            "Optionally give the saved item an owner display name and/or "
-            "tags when the owner explicitly provides them — NEVER invent a "
-            "name or a tag."
+            "Optionally records the owner's own name and tags for the item, "
+            "but ONLY when the owner explicitly asked for them."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
-            "name": {
+            "display_name": {
                 "type": "string",
-                "default": "",
                 "description": (
-                    "Optional owner-supplied display name for the saved item "
-                    "(e.g. 'University Weekly Schedule — Semester Two'). Use "
-                    "ONLY when the owner names the item; omit otherwise."
+                    "Optional name for the saved item, taken from the owner's "
+                    "own request (e.g. 'save this as University Schedule'). "
+                    "Omit it entirely when the owner did not name the item — "
+                    "never invent a name."
                 ),
             },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "default": [],
                 "description": (
-                    "Optional tags the OWNER gave for this item (e.g. "
-                    "['university', 'semester-2']). Omit when the owner gave "
-                    "none — never invent tags."
+                    "Optional owner tags, ONLY when the owner explicitly asked "
+                    "to tag the item (e.g. 'tag it university semester-2'). "
+                    "Pass an empty array when the owner explicitly declined "
+                    "('save this without tags'). Omit it when they said nothing "
+                    "— never invent a tag."
                 ),
             },
         }
@@ -90,6 +125,13 @@ class SaveTool(Tool):
         if reply_meta is None:
             return ToolResult(success=False, message="No replied message to save.")
 
+        # Metadata is validated BEFORE the reply is fetched from Telegram: an
+        # unhonourable name/tag must refuse with no download, no upload and no
+        # row — it must not depend on a network round-trip to be rejected.
+        metadata, reason = _save_metadata(context, arguments)
+        if metadata is None:
+            return ToolResult(success=False, message=f"Nothing was saved: {reason}")
+
         reply_msg = await self._resolve_reply_message(context, reply_meta)
         if reply_msg is None:
             return ToolResult(
@@ -97,16 +139,10 @@ class SaveTool(Tool):
                 message="Could not fetch the replied message from Telegram to save it.",
             )
 
-        name = arguments.get("name")
-        tags = arguments.get("tags")
         try:
             result = await save_service.execute_save(
-                context.telegram.client,
-                context.owner_id,
-                reply_msg,
-                context.tz_str,
-                display_name=name,
-                tags=tags,
+                context.telegram.client, context.owner_id, reply_msg, context.tz_str,
+                metadata=metadata,
             )
             # Services report failures as "❌ ..."/"⚠️ ..." strings — only a
             # success string means the save actually happened.
@@ -166,7 +202,9 @@ class SaveByLinkTool(Tool):
         return (
             "Deep-save a Telegram message given its t.me / telegram.me message "
             "link. Resolves the linked message and runs the existing Deep Save "
-            "pipeline (download → re-upload as a NEW Saved Messages message)."
+            "pipeline (download → re-upload as a NEW Saved Messages message). "
+            "Optionally records the owner's own name and tags for the item, but "
+            "ONLY when the owner explicitly asked for them."
         )
 
     @property
@@ -177,6 +215,23 @@ class SaveByLinkTool(Tool):
                 "description": (
                     "Exact Telegram message link, e.g. https://t.me/channel/123 "
                     "or https://t.me/c/123456789/42. Preserve it verbatim."
+                ),
+            },
+            "display_name": {
+                "type": "string",
+                "description": (
+                    "Optional name for the saved item, taken from the owner's "
+                    "own request. Omit it entirely when the owner did not name "
+                    "the item — never invent a name."
+                ),
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional owner tags, ONLY when the owner explicitly asked "
+                    "to tag the item. Pass an empty array when they explicitly "
+                    "declined; omit it when they said nothing — never invent a tag."
                 ),
             },
         }
@@ -221,9 +276,13 @@ class SaveByLinkTool(Tool):
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
 
+        metadata, reason = _save_metadata(context, arguments)
+        if metadata is None:
+            return ToolResult(success=False, message=f"Nothing was saved: {reason}")
+
         try:
             result = await save_service.execute_link_save(
-                client, context.owner_id, link, context.tz_str
+                client, context.owner_id, link, context.tz_str, metadata=metadata
             )
             return result_from_service(
                 result, data={"mode": "deep", "source": "telegram_link"}

@@ -112,8 +112,13 @@ ALLOWED_FIELDS = frozenset({
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
     "task_id", "action_status", "expected_version", "save_code", "status",
-    "name", "tags",
+    "display_name", "tags",
 })
+
+# The Save actions — the only ones that may carry the owner's saved-item
+# metadata (``display_name``/``tags``). Every other action rejects those two
+# fields so a model can never smuggle metadata into an unrelated execution.
+_SAVE_ACTIONS = ("save", "deep_save", "save_link")
 
 # Identity fields the account_status action may request from account_show.
 # Everything else (phone, account ID, session data, credentials) is rejected.
@@ -122,13 +127,8 @@ _ACCOUNT_IDENTITY_FIELDS = frozenset({"first_name", "last_name", "full_name", "u
 _MIN_DELETE_COUNT = 1
 _MAX_DELETE_COUNT = 500
 
-# Bounds for the OPTIONAL owner metadata a save action may carry. They mirror
-# the service-layer normalization bounds so an absurd payload is rejected
-# before any Telegram work starts; the service still normalizes
-# authoritatively (trim, dedupe, per-tag ceiling).
-_MAX_SAVE_NAME_CHARS = 120
-_MAX_SAVE_TAGS = 8
-# A saved-item name/tag query is a short phrase, never a document.
+# A saved-item name/tag query is a short phrase, never a document (Save V2
+# Part 3 — the resolver's query bound).
 _MAX_SAVE_QUERY_CHARS = 128
 
 # A Telegram message link, with or without the https:// scheme. The URL is
@@ -187,8 +187,11 @@ class ActionParseResult:
     expected_version: int | None = None
     save_code: str = ""
     status: str = ""
+    # The owner's optional saved-item metadata, carried verbatim from the
+    # validated action into the resolved save tool call. ``""``/``None`` mean
+    # "the owner supplied none" — never "an empty name"/"no tags requested".
     display_name: str = ""
-    tags: tuple[str, ...] = ()
+    tags: list[str] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -236,6 +239,42 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
 # ── Validation ──
 
 
+def _validate_save_metadata(
+    raw: dict[str, Any],
+) -> tuple[str | None, list[str] | None] | ActionParseResult:
+    """Validate the OPTIONAL saved-item metadata fields — shape only.
+
+    Lengths, whitespace, duplicates, the tag count and the name bound are
+    enforced by the SHARED ``save_service`` normalizer, which every surface
+    goes through; duplicating them here would create a second rule that can
+    drift. This layer only guarantees the model sent the right TYPES, so a
+    bound violation surfaces as the service's honest refusal instead of a
+    silently dropped field.
+
+    Returns ``(display_name, tags)`` — ``None`` meaning "the owner supplied
+    none" — or an ``ActionParseResult`` rejection.
+    """
+    display_name: str | None = None
+    if "display_name" in raw:
+        value = raw.get("display_name")
+        if not isinstance(value, str):
+            return ActionParseResult(
+                kind=KIND_INVALID, error="Invalid 'display_name' field (must be text)."
+            )
+        display_name = value
+
+    tags: list[str] | None = None
+    if "tags" in raw:
+        value = raw.get("tags")
+        if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Invalid 'tags' field (must be a list of strings).",
+            )
+        tags = list(value)
+    return display_name, tags
+
+
 def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     """Validate a raw action object. Never raises; never executes.
 
@@ -281,6 +320,18 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             error="'fields' is only valid for the account_status action.",
         )
 
+    # ``display_name``/``tags`` are the owner's own saved-item metadata. They
+    # are only meaningful for the Save actions (and only when the owner asked
+    # for them).
+    if ("display_name" in raw or "tags" in raw) and action not in _SAVE_ACTIONS:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                "'display_name'/'tags' are only valid for the save, deep_save "
+                "and save_link actions."
+            ),
+        )
+
     # ``save_code`` is only meaningful for the saved-item actions. It is
     # validated as a bounded string here; the canonical `S####` shape is
     # enforced by the tool (the code travels verbatim, upper-cased at the
@@ -315,14 +366,6 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         return ActionParseResult(
             kind=KIND_INVALID,
             error="'status' is only valid for the task_list action.",
-        )
-
-    # ``name``/``tags`` are the OPTIONAL owner metadata of a save action and
-    # are meaningless anywhere else.
-    if ("name" in raw or "tags" in raw) and action not in ("save", "deep_save"):
-        return ActionParseResult(
-            kind=KIND_INVALID,
-            error="'name'/'tags' are only valid for the save and deep_save actions.",
         )
 
     if action in ("task_inspect", "task_transition", "task_delete"):
@@ -447,11 +490,17 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                 kind=KIND_INVALID,
                 error="Invalid or missing Telegram link.",
             )
+        metadata = _validate_save_metadata(raw)
+        if isinstance(metadata, ActionParseResult):
+            return metadata
+        display_name, tags = metadata
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action=action,
             target="telegram_link",
             link=url,
+            display_name=display_name or "",
+            tags=tags,
         )
 
     target = raw.get("target", "")
@@ -498,19 +547,6 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         boundary_id = coerce_int(raw.get("boundary_id"))
         if boundary_id is None or boundary_id <= 0:
             return ActionParseResult(kind=KIND_INVALID, error="Invalid 'boundary_id' field.")
-    if action in ("save", "deep_save"):
-        display_name, tags, metadata_error = _validate_save_metadata(raw)
-        if metadata_error:
-            return ActionParseResult(kind=KIND_INVALID, error=metadata_error)
-        return ActionParseResult(
-            kind=KIND_EXECUTABLE,
-            action=action,
-            target=target,
-            caption=bool(raw.get("caption", False)),
-            display_name=display_name,
-            tags=tags,
-        )
-
     if action == "delete_messages":
         if mode == "all" and count is not None:
             return ActionParseResult(kind=KIND_INVALID, error="'all' mode cannot include a count.")
@@ -564,6 +600,17 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             semantic=semantic,
         )
 
+    # Save's optional owner metadata travels with the validated action so
+    # ``resolve_tool_calls`` (and therefore the SaveTool) receives it. Every
+    # other action keeps the field defaults: the guard above already rejects
+    # metadata on a non-save action.
+    display_name, tags = "", None
+    if action in ("save", "deep_save"):
+        metadata = _validate_save_metadata(raw)
+        if isinstance(metadata, ActionParseResult):
+            return metadata
+        display_name, tags = metadata[0] or "", metadata[1]
+
     return ActionParseResult(
         kind=KIND_EXECUTABLE,
         action=action,
@@ -576,6 +623,8 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         boundary_id=boundary_id,
         query=str(query or ""),
         semantic=semantic,
+        display_name=display_name,
+        tags=tags,
     )
 
 
@@ -678,9 +727,9 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
     """Validate one saved-item action object (exact-field-set rule).
 
     ``retrieve_save``, ``preview_saved_item`` and ``delete_saved_item`` all
-    address one stored item through the same field set and the same code
-    validation; only the resolved target differs (re-sending happens in the
-    current chat, previewing/deleting addresses the item itself).
+    address one stored item through the same code validation; only the resolved
+    target differs (re-sending happens in the current chat, previewing/deleting
+    addresses the item itself).
 
     ``retrieve_save`` ADDITIONALLY accepts a name/tag ``query`` INSTEAD of a
     code (Save V2 Part 3): the deterministic resolver turns it into 0/1/N
@@ -743,36 +792,6 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
     )
 
 
-def _validate_save_metadata(raw: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
-    """Validate the OPTIONAL save metadata (``name``/``tags``).
-
-    Returns ``(display_name, tags, error)``. Validation only — the service
-    performs the authoritative normalization; a non-string name, a non-string
-    tag, or an over-bound payload is rejected here, before any Telegram work.
-    """
-    display_name = ""
-    if "name" in raw:
-        value = raw.get("name")
-        if not isinstance(value, str):
-            return "", (), "Invalid 'name' field (must be a string)."
-        display_name = value.strip()
-        if len(display_name) > _MAX_SAVE_NAME_CHARS:
-            return "", (), f"Saved-item name is too long (max {_MAX_SAVE_NAME_CHARS} characters)."
-    tags: tuple[str, ...] = ()
-    if "tags" in raw:
-        raw_tags = raw.get("tags")
-        if isinstance(raw_tags, str):
-            raw_tags = [raw_tags]
-        if not isinstance(raw_tags, (list, tuple)) or not all(
-            isinstance(tag, str) for tag in raw_tags
-        ):
-            return "", (), "Invalid 'tags' field (must be a list of strings)."
-        if len(raw_tags) > _MAX_SAVE_TAGS:
-            return "", (), f"Too many tags (max {_MAX_SAVE_TAGS})."
-        tags = tuple(tag.strip() for tag in raw_tags if tag.strip())
-    return display_name, tags, ""
-
-
 # ── Target resolution ──
 
 
@@ -786,6 +805,21 @@ def _default_target(action: str) -> str:
     if action in ("task_list", "task_inspect", "task_transition", "task_delete"):
         return "schedule"
     return "recent_messages"
+
+
+def _save_metadata_arguments(result: ActionParseResult) -> dict[str, Any]:
+    """The metadata keys a Save tool call carries.
+
+    Absent means "the owner supplied none" — the save service then stores
+    ``NULL``/``'{}'``. An explicitly declined tag list arrives as ``[]`` and is
+    carried as ``[]``, which the shared normalizer turns into no owner tags.
+    """
+    arguments: dict[str, Any] = {}
+    if result.display_name:
+        arguments["display_name"] = result.display_name
+    if result.tags is not None:
+        arguments["tags"] = list(result.tags)
+    return arguments
 
 
 def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
@@ -804,20 +838,19 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action in ("save", "deep_save"):
         # Save is Deep Save only; the SaveTool resolves the replied-to message
         # from runtime context and calls execute_save(). Captions are always
-        # preserved by the existing deep-save pipeline. Optional owner
-        # metadata (name/tags) rides along ONLY when the model supplied it —
-        # nothing is invented here or downstream.
-        arguments: dict[str, Any] = {}
-        if result.display_name:
-            arguments["name"] = result.display_name
-        if result.tags:
-            arguments["tags"] = list(result.tags)
-        return [{"name": "save", "arguments": arguments}]
+        # preserved by the existing deep-save pipeline. The owner's optional
+        # metadata travels as the tool's own optional arguments.
+        return [{"name": "save", "arguments": _save_metadata_arguments(result)}]
 
     if action == "save_link":
         # The existing execute_link_save() resolves the link and reuses the
         # SAME Deep Save pipeline. The URL is passed through verbatim.
-        return [{"name": "save_by_link", "arguments": {"link": result.link}}]
+        return [
+            {
+                "name": "save_by_link",
+                "arguments": {"link": result.link, **_save_metadata_arguments(result)},
+            }
+        ]
 
     if action == "create_task":
         # Routes into the registered create_task tool, which reuses the
@@ -974,6 +1007,8 @@ def parse_action_text(text: str) -> ActionParseResult:
             expected_version=result.expected_version,
             save_code=result.save_code,
             status=result.status,
+            display_name=result.display_name,
+            tags=result.tags,
             tool_calls=tool_calls,
         )
     return result
@@ -997,6 +1032,53 @@ _EN_DELETE = frozenset({"delete", "remove", "deleting", "removing", "deleted", "
 _EN_SAVE = frozenset({"save", "saving", "saved", "store", "storing"})
 _EN_SEND = frozenset({"send", "sending", "forward", "forwarding"})
 _EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
+
+# ── owner-supplied saved-item metadata vocabulary ──
+#
+# The deterministic save path resolves the save COMMAND, never the metadata: a
+# request that explicitly asks for a name or tags stays CONVERSATIONAL so the
+# provider interprets it into the OPTIONAL save parameters (``display_name`` /
+# ``tags``), which this module then validates and the save service persists.
+# Guessing a name or splitting a sentence into tags here would turn arbitrary
+# message text into owner metadata, which the save contract forbids ("if the
+# user does not explicitly provide tags, the system must NOT invent tags").
+# Full Persian/English sentences are the model's job — exactly as task
+# management is routed semantically rather than by per-phrase vocabulary.
+_SAVE_NAME_MARKERS = frozenset({"named", "name", "titled", "title", "اسم", "نام", "عنوان"})
+_SAVE_TAG_MARKERS = frozenset({"tag", "tags", "tagged", "tagging", "تگ", "تگ‌ها", "برچسب", "هشتگ"})
+# "as X" names an item; "as well / as usual / as soon as" does not.
+_AS_IDIOMS = frozenset({
+    "well", "usual", "always", "soon", "much", "long", "if", "far", "before",
+    "after", "possible", "needed", "requested", "such", "yet", "though", "is", "it",
+})
+# The owner explicitly declining tags. Their words are authoritative: the Save
+# adapters force an empty tag list afterwards, so a model can never re-add tags
+# the owner asked not to have.
+_SAVE_NO_TAGS_PHRASES = (
+    "no tags", "no tag", "without tags", "without tag", "dont tag", "never tag",
+    "untagged", "بدون تگ", "تگ نزن", "تگ نده", "بدون برچسب", "برچسب نزن",
+)
+
+
+def explicit_no_tags_requested(text: str) -> bool:
+    """True when the owner explicitly declined tags in this request."""
+    joined = " ".join(_tokenize(text or ""))
+    return any(phrase in joined for phrase in _SAVE_NO_TAGS_PHRASES)
+
+
+def save_metadata_requested(text: str) -> bool:
+    """True when the request explicitly asks for a saved-item name or tags."""
+    words = _tokenize(text or "")
+    if explicit_no_tags_requested(text):
+        return True
+    if any(w in _SAVE_TAG_MARKERS for w in words):
+        return True
+    for i, tok in enumerate(words):
+        if tok in _SAVE_NAME_MARKERS:
+            return True
+        if tok == "as" and i + 1 < len(words) and words[i + 1] not in _AS_IDIOMS:
+            return True
+    return False
 
 # ── Deterministic text-write intent ──
 # "بنویس سلام" / "write hello" is an IMMEDIATE text-write: it reuses the
@@ -1919,6 +2001,13 @@ def parse_command_intent(
 
     do_delete = delete_pos and not delete_neg
     do_save = save_pos and not save_neg
+
+    if do_save and save_metadata_requested(text):
+        # The save COMMAND would resolve deterministically, but the name or
+        # tags the owner asked for cannot: they are semantic, not vocabulary.
+        # Stay conversational so the provider supplies them through the
+        # validated save parameters instead of the fast path dropping them.
+        return ActionParseResult(kind=KIND_CONVERSATIONAL)
 
     delete_mentioned = delete_pos or delete_neg
     save_mentioned = save_pos or save_neg

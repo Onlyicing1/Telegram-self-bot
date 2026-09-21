@@ -615,15 +615,15 @@ def test_save_action_carries_optional_name_and_tags():
     result = validate_action({
         "action": "save",
         "target": "replied_message",
-        "name": "University Weekly Schedule",
+        "display_name": "University Weekly Schedule",
         "tags": ["university", "semester-2"],
     })
     assert result.kind == KIND_EXECUTABLE
     assert result.display_name == "University Weekly Schedule"
-    assert result.tags == ("university", "semester-2")
+    assert list(result.tags or []) == ["university", "semester-2"]
     assert resolve_tool_calls(result) == [{
         "name": "save",
-        "arguments": {"name": "University Weekly Schedule", "tags": ["university", "semester-2"]},
+        "arguments": {"display_name": "University Weekly Schedule", "tags": ["university", "semester-2"]},
     }]
 
 
@@ -642,10 +642,10 @@ def test_name_and_tags_are_rejected_outside_save_actions():
     from backend.ai.actions import KIND_INVALID, validate_action
 
     for action in ("retrieve_save", "search_saved_items", "delete_messages", "send"):
-        payload = {"action": action, "query": "x", "text": "x", "name": "X", "tags": ["a"]}
+        payload = {"action": action, "query": "x", "text": "x", "display_name": "X", "tags": ["a"]}
         result = validate_action(payload)
         assert result.kind == KIND_INVALID, action
-        assert "'name'/'tags'" in result.error
+        assert "'display_name'/'tags'" in result.error, (action, result.error)
 
 
 def test_retrieve_action_accepts_a_query_instead_of_a_code():

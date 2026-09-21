@@ -771,16 +771,32 @@ def test_the_three_copies_of_the_canonical_script_are_byte_identical():
     assert bootstrap == migration, "canonical_bootstrap.sql and the migration must be byte-identical"
 
 
-def test_the_migration_is_new_and_follows_the_project_naming_convention():
+def test_the_migration_is_forward_only_and_its_successors_stay_additive():
     assert re.fullmatch(r"\d{14}_[a-z0-9_]+\.sql", MIGRATION.name), MIGRATION.name
     names = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
-    assert names[-1] == MIGRATION.name, "the repair must be the newest migration"
+    assert MIGRATION.name in names, "the repair must stay in supabase/migrations/"
     others = [p for p in MIGRATIONS_DIR.glob("*.sql") if p.name != MIGRATION.name]
     for path in others:
         assert "schema-drift" not in path.read_text(encoding="utf-8") or "reconcile" not in path.name
     assert "reconcile_canonical_schema" not in "".join(
         p.read_text(encoding="utf-8") for p in others
     ), "historical migrations must not be rewritten to point at the repair"
+    # This script is the reconciliation SNAPSHOT: a later schema change arrives
+    # as its own additive file rather than by editing the repair or a historical
+    # migration. Every file newer than it must therefore be additive-only — the
+    # rollback text in a header comment is documentation, not an executed
+    # statement, so only the executable statements are inspected.
+    for path in [p for p in others if p.name > MIGRATION.name]:
+        executable = strip_comments(path.read_text(encoding="utf-8"))
+        for pattern, verb in (
+            (r"\bDROP\s+TABLE\b", "drops a table"),
+            (r"\bTRUNCATE\b", "truncates"),
+            (r"\bDELETE\s+FROM\b", "deletes rows"),
+            (r"\bDROP\s+COLUMN\b", "drops a column"),
+        ):
+            assert not re.search(pattern, executable, re.I), (
+                f"{path.name} {verb} — a forward-only successor must be additive"
+            )
 
 
 def test_the_canonical_contract_is_the_documented_sixteen_tables():

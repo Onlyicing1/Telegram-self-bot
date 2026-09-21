@@ -1,43 +1,451 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## SAVE V2 — PART 3 — DETERMINISTIC RETRIEVAL RESOLUTION
+## Latest phase — SAVE V2 PART 2: manual + AI Save metadata wiring
 
-> **Nothing in this section is claimed from the task description.** Every
-> statement was re-derived from the source at the starting HEAD below, and every
-> test result is the exact output of a command run in this workspace.
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **SAVE V2 PART 2 — manual + AI metadata wiring**: both user-facing Save surfaces can now supply the optional owner metadata (`display_name`/`tags`) through the SAME `SaveMetadata` object and the SAME `execute_save` pipeline Part 1 built |
+| Input contract | the `SAVE V2 INVESTIGATION` section below (its **Phase B interaction half**) plus the Part 1 report section — both **re-verified against the current source** before this phase began |
+| Part 1 dependency | `49fdb48` — `saved_items.display_name`, the shared `SaveMetadata`, `normalize_display_name`/`normalize_tags`, `caption_hashtags` no longer feeding the `tags` column, and the `20260921000001_add_saved_items_display_name.sql` migration |
+| Starting HEAD | `49fdb48` = `origin/main` (in sync — no fetch, no fast-forward, no rebase needed) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Schema change | **none** — Part 1 already added `display_name`; `DATABASE_ARCHITECTURE.md` needed no change (no inconsistency was created) |
+| Supabase / live Telegram | untouched / not exercised (no live verification is claimed) |
+| Tests added | `tests/test_save_v2_wiring.py` — **51 tests**; 2 existing assertions updated (below) |
+
+### The problem this phase addresses
+
+Part 1 gave the database a place for an owner name and owner tags, and gave
+`execute_save` the capability to persist them — but **nothing user-facing could
+supply them**. The manual Save panel went straight from `Deep Save` to `Reply
+Mode`, and the AI Save tools declared an empty parameter schema (`parameters ==
+{}`), so a request like *"save this as University Schedule and tag it university
+semester-2"* had no path to the new columns. This phase wires both surfaces into
+the Part 1 contract **without** changing the Save pipeline itself, prompting for
+anything, or implementing any retrieval work.
+
+### MANUAL SAVE — the optional `Name & tags` step
+
+The Deep Save source panel gains exactly one row:
+
+```
+📥 Save → ⬇️ Deep Save → 💬 Reply Mode        (unchanged, still prompt-free)
+                       → ✏️ Name & tags      (NEW, optional)
+                       → 🔗 Save using a link (unchanged)
+```
+
+* **Never prompted.** `Name & tags` is its own row, exactly like the existing
+  optional inputs (`input:save:link`). Nothing asks for a name or tags after a
+  save; a plain Reply Mode save stays a two-tap, zero-prompt flow.
+* **ONE documented line format**, stated in the input prompt itself:
+  `Name | tag, tag`. The first `|` splits the name from the tags; a line with no
+  `|` is a name (no tags); an empty left side means no name; an empty right side,
+  or `-` / `none` / `no` / `بدون` / `هیچ`, means **explicitly no tags**. A second
+  `|` is refused (one delimiter, not five syntaxes), and a line that sets neither
+  a name nor tags is refused.
+* **Deterministic parsing**, no LLM: `parse_metadata_line` splits the line and
+  hands it to the shared `SaveMetadata.from_raw` — lengths, whitespace, dedupe,
+  the 10-tag/40-char/120-char bounds stay the service's single authority. A bare
+  sentence is never split into invented tags.
+* **The metadata reaches the reply save through the pending entry itself.** The
+  step arms Reply Mode with `_reply_handler_with_metadata(metadata)` — a closure,
+  because `set_pending` stores the handler callable in the per-owner pending
+  state. That is the one vehicle this architecture provides, and it expires with
+  the state (the same 120 s window as every other pending input). Reading the
+  popped state back inside the handler would **not** work: the input listener
+  clears the entry before it calls the handler (see *Known limitations* for the
+  pre-existing read-back defect this deliberately does not copy).
+* `_save_reply_wait_handler` takes the metadata as an optional keyword-only
+  argument and forwards it to `execute_save(..., metadata=metadata)`. It performs
+  no parsing, no validation and no DB write itself — the handler stays thin.
+
+### AI SAVE — the complete parameter path
+
+The model may now propose the owner's own metadata, and it survives every stage:
+
+```
+MODEL → structured save action → validate_action (shape + save-only guard)
+      → ActionParseResult.display_name/.tags → resolve_tool_calls
+      → SaveTool/SaveByLinkTool arguments → SaveMetadata.from_raw
+      → execute_save → saved_items
+```
+
+| Stage | Change |
+|---|---|
+| `SaveTool.parameters` | `display_name` (string) + `tags` (array of strings), both **optional**, with descriptions that forbid inventing either; still no `mode`/caption parameter (Deep Save remains the only save) |
+| `SaveByLinkTool.parameters` | the same two optional fields beside the required `link` |
+| `ALLOWED_FIELDS` | permits `display_name` + `tags` |
+| `validate_action` | a new guard rejects both fields on **any** non-save action, so metadata can never ride along with an unrelated execution; the two Save actions call `_validate_save_metadata`, which checks **shape only** (text / list-of-strings) and returns an `ActionParseResult` rejection otherwise |
+| `ActionParseResult` | gained `display_name: str = ""` and `tags: list[str] \| None`; `""`/`None` mean *the owner supplied none* — never “an empty name”/“no tags requested” |
+| `resolve_tool_calls` | carries only the fields that were actually supplied (`{}` when there are none — the existing shape), for both `save`/`deep_save` and `save_link` |
+| tools | `_save_metadata(context, arguments)` builds the shared `SaveMetadata.from_raw`, **before** the reply is fetched from Telegram, and returns the service's own reason on refusal (no download, no upload, no row) |
+| prompt template | teaches that the name/tags are optional and owner-supplied only, that `tags: []` is the explicit decline, and that nothing is invented or asked for |
+
+### Explicit “no tags” — deterministic, owner-authoritative
+
+`explicit_no_tags_requested(text)` recognises the owner's own decline phrases
+(`no tags`, `without tags`, `dont tag`, `untagged`, `بدون تگ`, `تگ نزن`, …) and
+runs on the **owner's request text**, which the dispatcher already carries in
+`context.extra["request_text"]`. When it is true, the Save adapters force
+`SaveMetadata.from_raw(name, ())`: a model proposal can never re-add tags the
+owner asked not to have. The request never reaches the deterministic fast path
+either — `parse_command_intent` returns conversational for a save that names an
+item or asks for tags, so the metadata arrives through the validated parameters
+instead of being dropped by the fast path.
+
+### Backward compatibility
+
+* A save with no metadata is byte-identical in behavior: `{}` arguments, the
+  same confirmation, `display_name = NULL`, `tags = '{}'` (Part 1's contract).
+* `execute_save`/`execute_link_save` keep their positional signatures; every
+  caller (panel reply, link, `SaveTool`, tests) keeps working.
+* `save_code` generation, media-target resolution, Deep Save ordering, size
+  limits, owner scoping and caption rendering are untouched.
+* `_save_reply_wait_handler`'s new parameter is keyword-only, so the existing
+  `set_pending(handler=_save_reply_wait_handler, …)` arm is unchanged.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/bot/handlers/save.py` | the `Name & tags` row (both renderings), `parse_metadata_line`, `describe_metadata`, `_reply_handler_with_metadata`, `_save_metadata_input_handler`, the `metadata=` keyword on `_save_reply_wait_handler`, the `register_input("save", "meta", …)` wiring |
+| `backend/ai/tools/save.py` | `_request_text`, `_save_metadata`, the two optional parameters on both tools, metadata built before the reply fetch, forwarded to `execute_save`/`execute_link_save` |
+| `backend/ai/actions.py` | `ALLOWED_FIELDS`, `_SAVE_ACTIONS`, `_validate_save_metadata`, the save-only guard, `ActionParseResult.display_name/.tags`, `_save_metadata_arguments`, the metadata vocabulary (`explicit_no_tags_requested`, `save_metadata_requested`) and the fast-path deferral |
+| `backend/ai/prompt/template.py` | the optional metadata rule + examples (name, tags, both, explicit decline) |
+| `backend/services/save_service.py` | `execute_link_save` accepts and forwards the same optional `SaveMetadata` |
+| `tests/test_save_v2_wiring.py` | new file — 51 tests |
+| `tests/test_14_tool_honesty_glass.py` | the assertion that pinned `SaveTool.parameters == {}` now asserts the two optional parameters (still no mode/caption) |
+| `tests/test_20_advanced_execution.py` | the two spy signatures on `execute_link_save` accept `metadata=` and assert the shared empty contract |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Tests and exact results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_save_v2_wiring.py` | **51 passed** |
+| `pytest tests/test_save_v2_wiring.py tests/test_save_v2_metadata.py tests/test_12_save_engine.py tests/test_20_advanced_execution.py tests/test_14_tool_honesty_glass.py tests/test_canonical_schema_reconciliation.py` | **184 passed** |
+| `pytest tests/ -q -p no:randomly` | **4439 passed, 26 skipped** in 116.5 s (Part 1 baseline: 4388 passed + these 51 = 4439 — no test removed or weakened) |
+
+The new suite covers the whole parameter path (schema → `ALLOWED_FIELDS` →
+validation → `resolve_tool_calls` → tool → service → row), the negative cases
+(metadata on another action, wrong types, over-long name/tag list refused before
+any transfer, model-injected `save_code` ignored), the explicit-decline override,
+the manual line parser (9 accepted forms, 5 refusals), the armed-pending
+contract (the tests pop the entry **before** calling the handler, exactly like
+the listener) and the two end-to-end saves. `git diff --check` is clean.
+
+### Known limitations (recorded, not hidden)
+
+* **Pre-existing defect found, NOT fixed (out of scope):**
+  `backend/bot/handlers/retrieve.py::_retrieve_rename_input_handler` and
+  `::_retrieve_move_input_handler` read the item code back with
+  `get_pending(owner_id)` — but the input listener pops the pending entry
+  (`backend/helper/inline_sender.py`, `clear_pending` **before** the handler
+  runs), so the code is always `""` and those flows can only answer “⚠️ No item
+  selected.” The Part 2 metadata deliberately uses a different vehicle for this
+  exact reason. Fixing retrieve is the retrieval phase's work (it also carries
+  the already-recorded `do_rename`/`do_move` false-success finding).
+* A name/tag request is now **conversational**: the deterministic fast path
+  defers, so it costs one provider round-trip. That is the price of not parsing
+  free-form names and tags with a regex.
+* The decline vocabulary is bounded and phrase-based; an unusual phrasing that
+  the model still passes `tags: []` for behaves identically, since `[]` is
+  already the explicit empty contract.
+* `as X` name detection is heuristic (`as well/usual/soon/…` are excluded); a
+  miss only costs the fast path (the model still receives the request).
+* `display_name` remains unindexed and unsearched, and no post-save rename/tag
+  editing exists — both are later Save V2 phases, by design.
+
+### Explicitly deferred (unchanged from the investigation's plan)
+
+Not implemented in this phase, and not claimed anywhere:
+
+* **retrieval / semantic search** — no `display_name` or tag lookup, no natural
+  language *“give me the university file”*, no `retrieve_save` change;
+* **ambiguity handling** — no candidate list, no 0/1/N resolution, no
+  candidate-selection actions;
+* **manual saved-item management** — no rename UI, no tag editor, no search UI,
+  no delete confirmation;
+* embeddings/vector search, `file_name`/`short_code` cleanup, and any
+  `update_save_field` allow-list redesign.
+
+### Exact next phase
+
+**SAVE V2 PART 3 (retrieval)** — resolve a saved item from what the owner calls
+it: candidate lookup by `display_name` and tags (owner-scoped), the 0/1/N
+ambiguity contract, and the AI action(s) that select a candidate before
+`retrieve_save` runs. Its own report section, its own commit.
+
+---
+
+## Previous phase — SAVE V2 PART 1: the owner-metadata data model and the shared Save contract
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **SAVE V2 PART 1 — data model + shared Save metadata**: `saved_items` gains an optional owner `display_name`, the `tags` column stops being filled with invented hashtags, and `SaveMetadata` becomes the single metadata object both Save adapters hand to `execute_save` |
+| Input contract | the `SAVE V2 INVESTIGATION` section below, written at HEAD `ecdfdf0` and **re-verified against the current source** before this phase began. This phase executes its **Phase A** (the column + its documentation) and the **data half of Phase B** (the shared metadata model and its persistence) |
+| Starting HEAD | `23a51cf` (`docs(save): audit the Save system and plan the user-managed metadata phase`) = `origin/main`. The sandbox was 7 commits behind and was **fast-forwarded** to it before any edit — no rebase, no reset, no force-push |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Migration shipped | `supabase/migrations/20260921000001_add_saved_items_display_name.sql` — forward-only, idempotent, additive, non-destructive |
+| Supabase / live Telegram | untouched / not exercised |
+| Tests added | `tests/test_save_v2_metadata.py` — **26 tests** |
+
+### The problem this phase addresses
+
+The investigation proved the root cause: **identity and label were never
+separated.** `save_code` was the only handle an item had, so every retrieval had
+to round-trip through an opaque code and the UI's idea of a "name" was
+`media_type` (`retrieve_service._display_name`). At the same time the natural tag
+column was already occupied by `build_tags`' five machine-generated hashtags, and
+the one field that could have carried a name (`file_name`) is dead. This phase
+creates the missing data model and the one shared writer for it. **It changes no
+user behavior**: nothing prompts for a name or tags yet.
+
+### Exact schema change
+
+One column, in its own migration:
+
+```sql
+ALTER TABLE saved_items
+    ADD COLUMN IF NOT EXISTS display_name text;
+
+NOTIFY pgrst, 'reload schema';
+```
+
+* **`display_name text`, NULLABLE, NO DEFAULT.** `NULL` means "the owner gave no
+  name": display falls back to the source filename and then to `media_type`, and
+  resolution never treats `NULL` as a value. The column is never auto-filled,
+  never inferred from the caption/filename/media type, and never generated by a
+  model.
+* **`tags` needs no DDL.** The column already exists as `text[] DEFAULT '{}'`;
+  only its **producer** changes (below). No type change, no constraint, no
+  backfill, no rewrite of any row.
+* **No index is added**: no query reads either column yet. The retrieval phase
+  owns the `(owner_id, display_name)` btree and the `tags` GIN decision.
+* The migration also **reloads the PostgREST schema cache** — without it the API
+  keeps rejecting a write that names the new column — and ends with a
+  verification query whose zero-row result means the column exists.
+* `file_name` and `short_code` are **untouched** (their cleanup stays the
+  separate, owner-gated proposal recorded in §19.7 / §30.10).
+
+### The shared metadata contract
+
+`backend/services/save_service.py::SaveMetadata` — one frozen dataclass holding
+the only two fields that are owner metadata:
+
+| Field | Meaning | Absent means |
+|---|---|---|
+| `display_name: str \| None` | the owner's name for the item | `NULL` — no name was given |
+| `tags: tuple[str, ...]` | the owner's semantic tags | `()` — stored `'{}'`, never invented |
+
+* `SaveMetadata.from_raw(display_name, tags)` is the one normalization entry
+  point, and `execute_save(..., metadata=…)` re-normalizes whatever it receives,
+  so no adapter can bypass the rules.
+* `execute_save`'s existing positional signature
+  (`client, owner_id, reply_msg, tz_str`) is unchanged; `metadata` is
+  **keyword-only and optional**, so every existing call site (the panel reply
+  path, the link path, `SaveTool`, the tests) keeps working untouched.
+* `insert_fields()` is the single place that decides the payload contribution: it
+  always writes the normalized `tags`, and it **omits `display_name` entirely
+  when there is no name** — that is what keeps a metadata-less save safe on a
+  database that has not applied the migration yet (PostgREST rejects an INSERT
+  naming an unknown column). A save *with* a name requires the column and fails
+  honestly at insert rather than losing the name silently.
+* There is no `ManualSaveMetadata` / `AISaveMetadata` split and no second writer
+  of either column: the panel and `SaveTool` are thin adapters over the same
+  pipeline — the property the later phases depend on.
+
+### Tag normalization rules (deterministic, one implementation)
+
+| Rule | Behavior |
+|---|---|
+| trim / whitespace | each tag is trimmed; internal whitespace runs collapse to one space |
+| empty values | `None` / `""` / whitespace-only entries are dropped; no tags ⇒ `()` |
+| duplicates | deduped **case-insensitively** (`casefold`), first spelling wins |
+| case | the owner's casing is preserved exactly as typed |
+| Persian / English | identical treatment — no translation, no transliteration, no script folding at storage time |
+| max tags | **10** distinct tags; more is **refused**, never truncated |
+| max length | **40** characters per tag, **120** per display name; over the bound is **refused** |
+| a bare string | is ONE tag, never split per character |
+| failure | `ValueError` from the normalizer; `execute_save` answers `⚠️ Nothing was saved: …` **before any download or upload** |
+
+Matching-time folding of Arabic/Persian letter variants (`ي`→`ی`, `ك`→`ک`,
+ZWNJ collapse) is deliberately **not** applied to storage — it is a
+retrieval-phase concern, where the investigation recorded it as a gap.
+
+### Existing-tag compatibility — what happens to historical rows
+
+1. **No data migration, no backfill, no rewrite.** Rows that already hold the
+   generated hashtags (`#saved`, `#saved_photo`, `#saved_2026_09_20`) keep them
+   exactly as they are and stay fully readable and retrievable by `save_code`.
+2. **New saves stop inventing tags**: a save with no metadata stores `'{}'`. The
+   caption keeps its hashtag line (`caption_hashtags`, formerly `build_tags`), so
+   a saved message looks unchanged.
+3. **The compatibility rule for consumers**: an entry starting with `#` is not an
+   owner tag and must be ignored by the resolver. Nothing converts or clears the
+   old values; removing them would be a separate, gated cleanup (§30.10).
+4. `build_tags` was renamed to `caption_hashtags` because it no longer feeds the
+   `tags` column at all — the name now states what it is for.
+
+### Migration safety and validation
+
+Additive only (`ADD COLUMN IF NOT EXISTS` + `NOTIFY` + one verification `SELECT`),
+idempotent, no `DROP` / `TRUNCATE` / `DELETE`, no table or index creation, and it
+touches no table other than `saved_items` (no Vault reference, no secret store).
+
+| Case | Evidence |
+|---|---|
+| A — current schema → apply → success | the repository's own PostgreSQL-semantics simulator applies the migration's real statements to the fully reconciled schema; `saved_items.display_name` exists afterwards |
+| B — applied twice | the second application changes **nothing** (`snapshot(before) == snapshot(after)`) |
+| C — existing rows preserved | two seeded legacy rows survive, `caption` and `owner_id` included |
+| D — existing codes preserved | `save_code` values (`S0001`, `SAXCK`) are byte-unchanged and no row is duplicated |
+| E — existing tags preserved | the legacy `['#saved', '#saved_photo']` array and the second row's `[]` are unchanged |
+| nullability contract | the added column is nullable with no default, and no `NOT NULL` appears for it |
+| the snapshot stays frozen | the canonical trio (migration / `canonical_bootstrap.sql` / §30 block) is still byte-identical and still passes all 32 of its tests |
+
+**No PostgreSQL server and no Supabase connection exist in this environment**, so
+this is simulated execution with PostgreSQL's semantics (the same register the
+reconciliation phase was validated in) plus static statement inspection — not a
+live run. §30.12 states that limitation.
+
+### Canonical SQL synchronization — and the one test contract that had to move
+
+The repository's canonical workflow is a **three-copy, byte-identical** script
+(the `20260920000001` migration, `supabase/canonical_bootstrap.sql`, the §30 SQL
+block), and its tests also asserted that this file is the *newest* migration.
+Editing it to absorb a new column would rewrite a migration whose content an
+owner who already applied it may hold, and would contradict the repo's own rule
+that a forward-only change arrives as its own file. So:
+
+* the trio is **untouched** (still byte-identical) and is now documented as the
+  reconciliation **snapshot**;
+* the new column arrives in the **newest** additive migration, exactly the way
+  `20260917000001_add_ai_config_stt_settings.sql` did for `ai_config`;
+* `DATABASE_ARCHITECTURE.md` was synchronized in the five places that would
+  otherwise contradict the code: **§2** (the `display_name` column row, the
+  rewritten `tags` row carrying its real `'{}'` default and owner semantics, a new
+  *User-facing metadata* subsection, and the repository line naming
+  `SaveMetadata`), **§20** (migration-status row 16), **§30.4** (the snapshot
+  inventory now states that `display_name` sits outside it), **§30.5** (the
+  snapshot rule) and **§30.11** (the manual action now includes the additive
+  migration);
+* exactly one test assertion moved with the contract:
+  `test_the_migration_is_new_and_follows_the_project_naming_convention` became
+  `test_the_migration_is_forward_only_and_its_successors_stay_additive`. It keeps
+  every previous protection (the naming convention, the repair still present,
+  historical migrations never rewritten to reference it) and replaces "must be
+  the newest file forever" with the property that actually matters: **every file
+  newer than the snapshot is additive-only** — no `DROP TABLE`, `TRUNCATE`,
+  `DELETE FROM` or `DROP COLUMN` statement (comments are stripped first, so a
+  documented rollback block cannot trip it).
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `supabase/migrations/20260921000001_add_saved_items_display_name.sql` | **NEW** — the additive column + cache reload + verification, with the manual action, rollback and security notes |
+| `backend/services/save_service.py` | `SaveMetadata` + `normalize_display_name` + `normalize_tags` and their bounds; `execute_save(..., *, metadata=None)`; the payload carries `tags`/`display_name` through `insert_fields()`; `build_tags` → `caption_hashtags` (caption-only) |
+| `tests/test_save_v2_metadata.py` | **NEW** — 26 tests: the contract, persistence, compatibility, ownership and the migration's A–E cases |
+| `tests/test_12_save_engine.py` | the one assertion that pinned the old invented tags now pins the new contract (`tags == []`, `display_name` absent/None) |
+| `tests/test_canonical_schema_reconciliation.py` | the "must be the newest migration" assertion became the forward-only / successors-additive invariant (above) |
+| `DATABASE_ARCHITECTURE.md` | §2, §20, §30.4, §30.5, §30.11 as described |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+`backend/db/client.py` needed **no** change: `insert_save` passes the payload
+through and the in-memory fallback stores it verbatim. No handler, no AI tool, no
+panel, no provider, no env var and no Supabase object outside `saved_items` was
+touched.
+
+### Tests and exact results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_save_v2_metadata.py tests/test_canonical_schema_reconciliation.py -q` | **58 passed** |
+| Save / database / tool-inventory batch (11 files) | **301 passed** |
+| `pytest tests/ -q` (full suite) | **4388 passed, 26 skipped** in 116.62 s |
+| Baseline at the starting HEAD (`23a51cf`) | **4362 passed, 26 skipped** → **+26, none removed or weakened** |
+| `python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+The tests prove: a metadata-less save still succeeds and invents nothing; a name
+persists; tags persist normalized; both persist together; an invalid name refuses
+*before* any Telegram call and writes no row; a name never changes `save_code`;
+empty/whitespace input follows the documented `NULL` / `'{}'` contract;
+duplicate and whitespace-only tags normalize deterministically; legacy hashtag
+rows stay readable and untouched; owner scoping and `save_code` retrieval are
+unchanged; and the migration is additive, idempotent and preserves
+rows/codes/tags.
+
+### Backward compatibility
+
+* Every existing `execute_save` call keeps working **unmodified** (the metadata
+  parameter is optional and keyword-only) — proven by the untouched
+  `test_12_save_engine.py`, `test_14_tool_honesty_glass.py`,
+  `test_saved_item_sender_and_retrieve.py`, `test_20_advanced_execution.py` and
+  `test_tool_health_audit.py` suites passing.
+* Existing rows remain valid and readable; nothing is regenerated.
+* `save_code` generation, format, uniqueness and immutability are untouched.
+* The AI `SaveTool` schema, the Save panels, caption rendering, the Deep Save
+  order, the size limit and owner isolation are all unchanged.
+* Nothing user-facing is exposed yet: **the AI cannot name or tag an item, and no
+  prompt asks for either** — metadata the owner cannot yet supply is not offered.
+
+### Known limitations (recorded, not hidden)
+
+1. **The AI and panel surfaces cannot pass metadata yet** — by design (the
+   investigation's phases C/E). The pipeline is capable; the wiring is not.
+2. **`update_save_field` still has no field allow-list** (investigation §6/§15).
+   Nothing model-authored reaches it today, so closing it was out of scope — but
+   the management-UI phase must close it before rename/tag editing ships.
+3. `do_rename` / `do_move` still report success without persisting, and the
+   saved-item delete still has no confirmation. Unchanged, unfixed, out of scope.
+4. Legacy rows keep their `#`-prefixed tags until a gated cleanup decides
+   otherwise.
+5. Applying the migration is a manual Supabase action. Until it is applied, the
+   column simply does not exist — harmless for every metadata-less save, and an
+   honest insert failure for a named one.
+
+### Explicitly deferred (Save V2 parts C–G)
+
+Search and semantic retrieval (querying `display_name`/`tags`, the deterministic
+0/1/N resolver, the typed candidate-list tool contract), ambiguity handling, the
+manual management UI (rename, tag editing, delete confirmation), the AI
+`save this as X` / `save with tags …` syntax (`ALLOWED_FIELDS`, the validation
+branch, `resolve_tool_calls`, `SaveTool.parameters`, the prompt template),
+`file_name` / `short_code` cleanup, `update_save_field` allow-listing, and the
+optional future indexes. **Save V2 is NOT complete — this is part 1 of the
+investigation's A–G sequence.**
+
+### Exact next phase
+
+The investigation's **Phase C** (manual Save: an optional "Name & tags" step in
+the Save panel, routed through the existing input machinery, with the plain reply
+path staying prompt-free) and **Phase E** (the AI `name`/`tags` fields, changed
+atomically across `ALLOWED_FIELDS`, the validation branch, `resolve_tool_calls`,
+`SaveTool.parameters` and the prompt template) — after the migration is applied,
+so a name written by either surface has a column to land in.
+
+## SAVE V2 — PART 3 — DETERMINISTIC RETRIEVAL RESOLUTION (0 / 1 / N)
+
+> Written against the **merged** state (Parts 1/2 on `origin/main` + the Part 3
+> resolution layer). Every statement was re-derived from the merged source and
+> every test result is the exact output of a command run in this workspace.
 
 | | |
 |---|---|
-| Starting HEAD | `23a51cf` `docs(save): audit the Save system and plan the user-managed metadata phase` (== `origin/main` at phase start, worktree clean) |
-| Phase | Save V2 Part 3 — deterministic retrieval resolution + 0/1/N ambiguity |
-| Final HEAD | the single PART 3 commit created for this section (SHA in the session's final response; recorded here as "this commit") |
-| Scope | resolution layer BEFORE the existing retrieval pipeline; no replacement of `do_retrieve`; no Telegram UI redesign |
+| Starting HEAD | `23a51cf` `docs(save): audit the Save system…` (== `origin/main` at phase start, worktree clean) |
+| Concurrency note | during the phase, `origin/main` advanced by the PART 1 + PART 2 commits (`49fdb48`, `f9dfd9a`); Part 3 was rebased onto them by a merge before pushing |
+| Scope | the deterministic resolution layer BEFORE the existing retrieval pipeline; direct `save_code` retrieval untouched |
 
-### 1. The premise, checked against the repository
-
-The request described Parts 1 and 2 as already landed (a `display_name` column,
-owner-supplied tags, a shared `SaveMetadata` type, AI Save accepting a name).
-**The repository at `23a51cf` did not contain them** — the newest work was the
-investigation commit, and `grep` proved: no `saved_items.display_name`, no
-`SaveMetadata`, no `name`/`tags` parameters anywhere, and `saved_items.tags`
-written by `save_service.build_tags()` as five synthetic `#saved*` hashtags.
-
-Part 3 therefore **built the minimum write-side foundation its resolution layer
-depends on** and nothing more, then the resolution layer itself:
-
-* one nullable column: `saved_items.display_name`;
-* owner-supplied tags only — `tags` is now written by
-  `save_service.normalize_save_tags()` (trim, drop empties, strip one leading
-  `#`, dedupe, `None`/empty → `[]`); the synthetic hashtags stay in the
-  **caption** and are never persisted as metadata;
-* `name`/`tags` parameters on `SaveTool` and on the `save` action;
-* `save_service.execute_save(..., *, display_name=None, tags=None)` — keyword-only,
-  so every existing positional caller is unchanged.
-
-Nothing from Parts 1/2 was rebuilt or duplicated: there is no `SaveMetadata`
-class, no second metadata model, and no second save pipeline.
-
-### 2. Resolver architecture
+### 1. Resolver architecture
 
 `backend/services/retrieve_service.py`:
 
@@ -54,50 +462,39 @@ confirmed save_code  →  retrieve_service.do_retrieve(...)   ← unchanged
 ```
 
 * `SavedItemCandidate` — `save_code`, `display_name`, `file_name`, `media_type`,
-  `tags`, `created_at`. No origin/saved chat or message id, no sender id, no
-  file id, no internal row id, no caption.
+  `tags` (owner tags only), `created_at`. No origin/saved chat or message id, no
+  sender id, no file id, no internal row id, no caption.
 * `SavedItemResolution` — `status` (`not_found` / `unique` / `ambiguous`),
-  `query`, `candidates` (tuple), `overflowed` (bool).
+  `query`, bounded `candidates`, `overflowed`.
 * `MAX_RESOLUTION_CANDIDATES = 8`; the fetch asks for `limit + 1` so one extra
-  row **proves** more matches exist and `overflowed` is reported honestly
-  ("More matches exist than are shown — narrow the query.").
-* Ordering is deterministic everywhere: `created_at DESC`, then `save_code ASC`
-  on a timestamp tie.
-* The resolver is structurally Telegram-free: its signature has no client/chat
-  argument and its body contains no `forward_messages` / `send_message` /
-  `edit_message` / `delete_messages` (test-enforced). It writes nothing.
+  row **proves** more matches exist and `overflowed` is reported honestly.
+* Ordering is deterministic: `created_at DESC`, then `save_code ASC`.
+* The resolver is structurally Telegram-free (signature and body asserted by
+  test) and writes nothing. It builds directly on the PART 1/2 contract:
+  `display_name` and owner-only `tags` (legacy `#saved*` hashtags are never
+  treated as owner metadata), and it never touches `save_code`.
 
-### 3. Search semantics
+### 2. Search semantics
 
-* **Save-code fast path.** A query shaped `^S[A-Z0-9]{4}$` (case-insensitive) is
-  a *code* request: it goes straight to the existing owner-scoped, identity
-  verified read (`load_saved_item`) and is never fuzzy-matched. A code-shaped
-  query can therefore never fall through to a display name.
-* **Normalization (comparison only).** NFKC + the project's established
-  Persian/Arabic normalization (`backend/ai/semantic_delete.normalize_text`):
-  Persian/Arabic digit folding, script-variant folding (ی↔ي, ک↔ك), diacritic
-  removal, zero-width removal, casefold, whitespace collapse. No translation, no
-  transliteration, and **stored values are never rewritten** (test-enforced).
-  Bounds: 128 characters, 6 tokens; oversize is a clean not-found, never a
-  silent partial match.
-* **Tiers, first non-empty wins.**
-  1. `name` — every query token is a substring of the normalized `display_name`.
-  2. `tag` — whole-tag equality, plus a whole-query tag form so "semester 2"
-     matches the stored tag `semester-2` / `semester_2`.
-  3. `mixed` — each token matches `display_name`, `file_name`, or a whole tag.
-* **Tag semantics are deterministic and explicit.** Tags are matched by whole
-  tag, not by fragment (`"uni"` does NOT match the tag `university`), and
-  arbitrary words are never converted into tag queries. Legacy synthetic
-  `#saved*` hashtags are never treated as owner metadata — not matched, not
-  displayed — while the legacy values stay in the database untouched.
-* **Caption is never searched**, and neither is sender, chat id, message id,
-  Telegram history, "recent media", or "last saved file" — only persisted
-  saved-item metadata.
-* **Combined narrowing** works because every token group must match (name+tag:
-  "project plan alpha" resolves the row whose name is "Project Plan" and whose
-  tags include `alpha`).
+* **Save-code fast path.** A query shaped `^S[A-Z0-9]{4}$` is a *code* request:
+  it goes straight to the owner-scoped `load_saved_item` read and is never
+  fuzzy-matched (a code-shaped query can never fall through to a display name).
+* **Normalization (comparison only).** NFKC + the project's Persian/Arabic
+  normalization (`semantic_delete.normalize_text`): digit folding, script-variant
+  folding (ی↔ي, ک↔ك), diacritic/zero-width removal, casefold, whitespace
+  collapse. No translation, no transliteration; **stored values are never
+  rewritten** (test-enforced). Bounds: 128 chars, 6 tokens.
+* **Tiers, first non-empty wins.** `name` (every token in the normalized
+  `display_name`) → `tag` (whole-tag equality + a whole-query tag form so
+  "semester 2" matches `semester-2`) → `mixed` (token in name / file_name / tag).
+* **Tag semantics are explicit.** Whole-tag equality only (`"uni"` never matches
+  the tag `university`); arbitrary words are never converted into tag queries.
+* **Caption is never searched** — nor sender, chat/message ids, Telegram history,
+  "recent media" or "last saved file". Only persisted saved-item metadata.
+* **Combined narrowing**: every token group must match, so "project plan alpha"
+  resolves the "Project Plan" row tagged `alpha`.
 
-### 4. Database query and owner scoping
+### 3. Database query and owner scoping
 
 `backend/db/client.py` adds exactly one read path:
 
@@ -109,88 +506,68 @@ db.table("saved_items").select(_RESOLVE_COLUMNS)
   .limit(limit)                                   # explicit bound
 ```
 
-* Owner isolation is the `.eq("owner_id", …)` of the query itself — the query
-  string is asserted in the tests, so "fetch globally, filter in Python" cannot
-  regress.
-* The in-memory fallback mirrors the same owner filter, the same tier rule, the
-  same bound and the same ordering (the repository's established
-  Supabase-or-fallback contract).
+* Owner isolation is the `.eq("owner_id", …)` of the query itself — asserted on
+  the query string by test, so "fetch globally, filter in Python" cannot regress.
+  The in-memory fallback mirrors the same owner filter, tier rule, bound and
+  ordering.
 * User text can never alter the filter tree: token values are sanitized
-  (`resolve_pattern` strips `,` `(` `)` `\`; `resolve_tag_term` also strips
-  `{` `}` `"`), and a dedicated test asserts no tree-structural character can
-  reach a condition value.
-* One query per tier attempt — no N+1, no unbounded fetch.
-* `_RESOLVE_COLUMNS` returns only the columns candidate display needs
-  (`save_code`, `display_name`, `file_name`, `media_type`, `tags`, `created_at`).
+  (`resolve_pattern` / `resolve_tag_term` strip the PostgREST tree-structural
+  characters) and a test pins that property.
+* One query per tier attempt — no N+1, no unbounded fetch; `_RESOLVE_COLUMNS`
+  returns only the candidate-display columns.
+* Indexes: `idx_saved_items_display_name_trgm` (GIN trigram, `pg_trgm` already
+  enabled) and `idx_saved_items_tags` (GIN), plus the existing
+  `idx_saved_items_owner_created` for the owner filter + ordering. They ship as
+  an **additive successor migration** (see §5) because the canonical script is a
+  byte-frozen reconciliation snapshot (§30).
 
-### 5. Schema change, migration and indexes
-
-| Object | Change |
-|---|---|
-| `saved_items.display_name` | **new** nullable `text` column (owner display label) |
-| `idx_saved_items_display_name_trgm` | **new** GIN trigram index on `display_name` — supports the resolver's owner-scoped `display_name ILIKE '%token%'` prefilter (`pg_trgm` is already enabled by the canonical script) |
-| `idx_saved_items_tags` | **new** GIN index on `tags` — supports whole-tag containment (`tags.cs.{term}`) |
-| `idx_saved_items_owner_created` | pre-existing — already serves the owner filter + `created_at DESC` ordering |
-
-The change landed in the repository's **single canonical script**, whose three
-copies the repository requires to stay byte-identical and newest
-(`tests/test_canonical_schema_reconciliation.py` asserts both):
-
-* the §30 fenced block in `DATABASE_ARCHITECTURE.md`,
-* `supabase/canonical_bootstrap.sql`,
-* `supabase/migrations/20260920000001_reconcile_canonical_schema.sql`.
-
-**No historical migration was touched** (every `202607…`–`20260919…` file is
-byte-untouched) and **no separate Part 3 migration file was created**, because
-that would break the test-enforced "one canonical script == newest migration"
-contract. The script is a converging, idempotent reconciliation script, so
-re-running the updated version applies the column and the two indexes to a
-database that already ran the previous version.
-
-Documentation updated with it: §2 (the `display_name` column row, corrected
-`tags`/`caption` semantics, the two new index rows — plus the pre-existing name
-drift `idx_saved_items_mime_type_trgm` → the actual `idx_saved_items_mime_trgm`),
-§30.4 (180 → 181 `ADD COLUMN` statements / canonical columns, `saved_items`
-19 → 20 columns) and §30.11 (a re-run applies the Save V2 additions).
-
-**The SQL was not executed, Supabase was not contacted, no live row was read or
-written.** The owner runs the canonical script manually (§30.11).
-
-### 6. 0 / 1 / N behavior
+### 4. 0 / 1 / N behavior
 
 | Case | Behavior | Telegram |
 |---|---|---|
-| **0** | `format_resolution` → "🔍 No saved item matches `…`. Try the saved name, one of its tags, or its save code." | no retrieval at all; nothing is forwarded |
-| **1** | retrieved immediately through `retrieve_service.do_retrieve(self_client, owner_id, save_code, chat_id)` — the same authority as a code lookup, exactly once | exactly one retrieval |
-| **N** | nothing is retrieved. The owner gets the bounded numbered list + the ambiguous prompt | no retrieval; only the panel/candidate list is rendered |
+| **0** | "🔍 No saved item matches … Try the saved name, one of its tags, or its save code." | no retrieval |
+| **1** | retrieved immediately through `do_retrieve(self_client, owner_id, save_code, chat_id)` — exactly once | one retrieval |
+| **N** | nothing retrieved; the owner gets the bounded numbered list + an explicit-choice prompt | no retrieval |
 
-Ambiguity never falls back to "the first row", "the newest row", "the closest
-match", an LLM choice, or the last saved item — including when the fetch
-overflowed the display bound.
+Ambiguity never falls back to first/newest/closest, an LLM choice, or the last
+saved item — including when the fetch overflowed the display bound.
 
-### 7. Ambiguity UX, selection state, expiration
+### 5. Schema, migration and indexes
+
+Ships as **`supabase/migrations/20260922000001_add_saved_items_search_indexes.sql`**,
+an additive successor to the reconciliation snapshot and to
+`20260921000001_add_saved_items_display_name.sql` (the shape the PART 1 migration
+established and §20/§30.11 document): `CREATE EXTENSION IF NOT EXISTS pg_trgm`
+(the canonical script already enables it), the two `CREATE INDEX IF NOT EXISTS`
+statements above, and a PostgREST schema-cache reload. No historical migration
+or snapshot copy is touched; idempotent; no row is rewritten; `save_code` is
+untouched. `DATABASE_ARCHITECTURE.md` documents the indexes (§2) and the
+successor workflow (§30.11). **Nothing was executed against Supabase.**
+
+### 6. Ambiguity UX, selection state, expiration
 
 * **Buttons.** Each candidate row is `action:resolve_pick:{save_code}` carrying
-  the exact presented code (never an index, never a fresh search).
+  the exact presented code — never an index, never a fresh search.
 * **Numbered reply.** The same codes are held in the existing pending-input
   state (`extra` = JSON list of the presented codes, in the presented order,
-  60 s handler timeout, the project's shared 120 s pending-state expiry). A
-  numbered reply (ASCII or Persian/Arabic digits) maps to `codes[i-1]`;
-  an exact presented code is also accepted. Nothing else is.
-* **Selection is re-verified before retrieval.** The chosen code is re-read
-  owner-scoped (`load_saved_item`) — existence **and** owner — and only then is
-  `do_retrieve` called. A candidate deleted between display and selection fails
-  cleanly ("may have been deleted. Nothing was retrieved.") with **no fallback
-  to any other candidate**.
-* **Expired selection** is refused by the shared pending TTL before the handler
-  runs: no retrieval, no rendering, no fallback.
-* **Non-owner / other-chat replies** are ignored by the existing owner guard and
-  chat check; the pending state survives untouched.
-* Cancel words (`cancel` / `لغو`) end the flow without retrieving.
-* Zero-spam: results edit the existing panel in place; the owner's input message
-  is deleted where the existing conventions do it; nothing new is spammed.
+  60 s handler timeout, the shared 120 s pending-state expiry). A numbered reply
+  (ASCII or Persian/Arabic digits) maps to `codes[i-1]`; an exact presented code
+  is also accepted. Nothing else is.
+* **Selection is re-verified before retrieval** — owner + existence via
+  `load_saved_item` — so a candidate deleted between display and selection fails
+  cleanly with **no fallback to any other candidate**. An expired selection is
+  refused by the shared TTL before the handler runs. Non-owner/other-chat replies
+  are ignored. `cancel` / `لغو` ends the flow.
+* **Zero-spam**: results edit the panel in place; the owner's input message is
+  deleted where the existing conventions do it.
+* **The documented rename/move defect is fixed in the shared path**: the input
+  listener now passes the popped state's `extra` to any handler that declares it
+  (`backend/helper/inline_sender.py`), and both handlers take the code from it —
+  three regression tests pin it. The ambiguity flow uses the same mechanism, so
+  it cannot reproduce the defect. `do_rename`/`do_move` themselves remain the
+  documented stubs (unchanged, out of scope).
 
-### 8. AI integration
+### 7. AI integration
 
 ```
 model → retrieve_save(query)  or  retrieve_save(save_code)
@@ -200,127 +577,91 @@ model → retrieve_save(query)  or  retrieve_save(save_code)
       → retrieve_service.do_retrieve   (the only Telegram retrieval authority)
 ```
 
-* `retrieve_save` now requires **exactly one** of `save_code` / `query`
-  (`required_any_arguments`), rejects both, and documents the contract: never
-  invent a code, never choose among ambiguous matches.
-* `owner_id` and the destination chat come from `context.owner_id` /
-  `context.extra["chat_id"]` — model-supplied `owner_id`, `chat_id` or
-  `destination` arguments are ignored (test-enforced).
+* `retrieve_save` requires **exactly one** of `save_code` / `query`
+  (`required_any_arguments`), rejects both, and documents: never invent a code,
+  never choose among ambiguous matches.
+* `owner_id` and the destination chat come from trusted `ToolContext` —
+  model-supplied `owner_id`/`chat_id`/`destination` are ignored (test-enforced).
 * Ambiguous result: `success=True` with `{outcome: "ambiguous", candidates:
   [{save_code, label}], displayed, more_matches_exist}` and the instruction
   "NOTHING was retrieved. Ask the owner which one they mean — never choose for
-  them." Only `save_code` + `label` are exposed — no chat/message/file id, no
-  caption.
-* Not-found result: `success=False`, `{outcome: "not_found", query}`.
-* Unique result: `data` gains `resolved_from: "query"`; the **code path's**
-  structured data stays byte-identical to the pre-resolver contract.
-* The JSON action fallback (`backend/ai/actions.py`) matches the tool: `save`
-  accepts `name`/`tags`; `retrieve_save` accepts `query` XOR `save_code`;
-  `name`/`tags` are rejected on any other action; `preview_saved_item` /
-  `delete_saved_item` stay code-only.
-* The prompt template teaches the model the same four rules (code → direct;
-  natural reference → query; never invent a code; never pick among candidates;
-  repo files only, no Telegram history inference).
+  them." Only `save_code` + `label` are exposed.
+* Not-found: `success=False`, `{outcome: "not_found", query}`. Unique: the data
+  gains `resolved_from: "query"`; the **code path's** data stays byte-identical.
+* The JSON action fallback matches the tool: `retrieve_save` accepts `query` XOR
+  `save_code`; `preview_saved_item`/`delete_saved_item` stay code-only.
+* The prompt template carries both halves of the contract: PART 2's
+  display_name/tags rules and the Part 3 resolver rules (query → deterministic
+  resolution, never choose among matches, never invent a code).
 
-### 9. Manual integration
+### 8. Manual integration
 
-The Retrieve panel uses the **same** resolver — one authoritative resolution
-mechanism, no second search implementation:
+The Retrieve panel uses the **same** resolver — one authoritative mechanism:
+`Menu → Save → Retrieve → 🔍 Search by Name/Tag` → unique retrieves immediately,
+ambiguous lists candidates (buttons + numbered reply), not-found offers
+"Search again". `_resolve_pick_action` and `_retrieve_pick_input_handler` both
+re-verify owner + existence before the single `do_retrieve`. The pre-existing
+browser/Find surfaces keep their literal `ILIKE` behaviour (unification is
+deferred, §13) — no existing search API's meaning changed.
 
-* `Menu → Save → Retrieve → 🔍 Search by Name/Tag` (`input:retrieve:search`)
-  → `_resolve_saved_item_request`
-  → unique: retrieve immediately; ambiguous: candidate buttons + numbered reply;
-  not-found: message + "Search again".
-* `_resolve_pick_action` (button) and `_retrieve_pick_input_handler` (numbered
-  reply) both re-verify owner + existence before the single `do_retrieve`.
-* The pre-existing browser/Find surfaces are **unchanged** in this phase: the
-  paginated Saved-Items browser and `discover_service.do_find`/
-  `search_saves` keep their literal behaviour, so no existing search API's
-  meaning was silently changed. (Unifying them is deferred — see §13.)
+### 9. Tests and exact results
 
-### 10. The documented rename/move defect
-
-`backend/bot/handlers/retrieve.py` rename/move handlers previously read the
-pending state after the listener had already popped it, so the item code was
-lost. Fixed once, in the reusable path: the listener now passes the popped
-state's `extra` to any handler that declares an `extra` parameter
-(`backend/helper/inline_sender.py`), and both handlers take the code from it.
-Three regression tests pin it (carry-through works, a missing string never
-writes, `unfiled` clears the folder). The new ambiguity flow uses the same
-mechanism, so it cannot reproduce the defect. `do_rename`/`do_move` themselves
-remain the documented stubs they were — **not** fixed here (out of scope).
-
-### 11. Tests and exact results
-
-New: `tests/test_save_v2_resolution.py` — **61 tests** covering: 0/1/N;
-owner isolation (same name **and** same tag across two owners, the query string
-asserted, fallback included); foreign owner indistinguishable from missing;
-caption never searched; legacy hashtags never tags; exact/partial/case/whitespace/
+New: `tests/test_save_v2_resolution.py` — **61 tests**: 0/1/N; owner isolation
+(same name **and** same tag across two owners, the query string asserted,
+fallback included); a foreign match indistinguishable from missing; caption
+never searched; legacy hashtags never tags; exact/partial/case/whitespace/
 punctuation matching; whole-tag and multi-word tag forms; arbitrary words never
-treated as tags; name+tag narrowing; duplicate names and duplicate tags; the
-candidate bound and `overflowed`; deterministic ordering incl. timestamp ties;
-Persian names and tags, Persian/Arabic spelling variants, mixed Persian/English;
-save-code fast path incl. an unknown code and a foreign owner's code failing
-identically through the real `do_retrieve`, and a code-shaped query that must
-not fall through to a display name;
-model-supplied owner/destination ignored; the AI tool's unique/ambiguous/not-found/
-XOR contracts; the tool's safe candidate payload; the action layer; filter
-injection safety; the manual panel 0/1/N; the listener's numbered and exact-code
-selection, Persian digits, invalid input, other chat, non-owner, expiry and
-post-deletion staleness; the click action; and the rename/move carry-through.
-
-Also: two write-side tests in `tests/test_12_save_engine.py` (owner display name +
-tags are persisted and normalized; metadata stays optional and is never
-invented), one contract update in `tests/test_14_tool_honesty_glass.py` (the save
-tool has **no** mode/forward/save-code parameter — only the owner's optional
-`name`/`tags`), and the `retrieve_save` schema assertion in
-`tests/test_saved_item_sender_and_retrieve.py` (one of code/query).
+treated as tags; name+tag narrowing; duplicate names and tags; the candidate
+bound and `overflowed`; deterministic ordering incl. timestamp ties; Persian
+names/tags, Persian/Arabic spelling variants, mixed Persian/English; save-code
+fast path incl. unknown and foreign codes failing identically through the real
+`do_retrieve`; model-supplied owner/destination ignored; the tool's
+unique/ambiguous/not-found/XOR contracts and safe candidate payload; the action
+layer; filter-injection safety; the manual panel 0/1/N; the listener's numbered
+and exact-code selection, Persian digits, invalid input, other chat, non-owner,
+expiry and post-deletion staleness; the click action; and the rename/move
+carry-through.
 
 | Command | Result |
 |---|---|
 | `pytest tests/test_save_v2_resolution.py -q` | **61 passed** |
-| Focused batch (Part 3 + save engine + tool honesty + canonical schema + sender/retrieve + preview metadata + AI management + owner isolation) | **239 passed** |
-| `pytest tests/ -q` (full suite) | **4425 passed, 26 skipped, 0 failed** in 115.69 s |
-| baseline `pytest tests/ -q` at `23a51cf` | 4362 passed, 26 skipped — so this phase adds 63 passing tests and removes none |
-| `python -m py_compile` on the 13 changed Python files | clean |
+| Parts 1/2 suites + Part 3 + save engine + tool honesty + actions (`test_save_v2_wiring.py`, `test_save_v2_metadata.py`, `test_19_ai_actions.py` included) | **352 passed** in the focused batch |
+
+| `pytest tests/ -q` (full suite, merged tree) | **4500 passed, 26 skipped, 0 failed** in 117.21 s |
+| `python -m py_compile` on every changed Python file | clean |
 | `git diff --check` | clean |
 
-### 12. Compatibility
+### 10. Compatibility
 
-* Direct `save_code` retrieval, `do_retrieve`, `do_preview`, `do_delete`,
-  `preview_save`, `delete_save` are unchanged, and `do_retrieve` remains the
-  final Telegram retrieval authority (the resolver never forwards).
-* `execute_save`'s positional signature is unchanged (the new parameters are
-  keyword-only and default to the pre-existing behavior).
-* Existing saved items keep their `save_code`, rows, and metadata; nothing is
-  regenerated or migrated. Legacy `tags` values (synthetic hashtags) stay in the
-  database but are ignored as owner metadata.
-* Existing search/list APIs keep their established meaning.
+* Direct `save_code` retrieval, `do_retrieve`/`do_preview`/`do_delete`,
+  `preview_save`/`delete_save` are unchanged; `do_retrieve` remains the final
+  Telegram retrieval authority (the resolver never forwards).
+* The PART 1/2 write contract is untouched: `SaveMetadata`, the shared
+  normalizers, the additive `display_name` migration and the owner-tags
+  behaviour all keep their meaning; the resolver only READS those columns.
+* Existing rows, codes and metadata are untouched; nothing is regenerated.
 * No new dependency, no new env var, no new table, no Vault change.
 
-### 13. Known limitations
+### 11. Known limitations
 
-* Matching is deterministic substring/whole-tag matching: no typo tolerance, no
-  embeddings, no vector store, no LLM ranking (deliberate).
+* Deterministic substring/whole-tag matching: no typo tolerance, no embeddings,
+  no LLM ranking (deliberate).
 * The candidate list is bounded at 8 and reports overflow rather than paging.
-* `saved_items.display_name` and tags must be supplied at save time; the manual
-  Save flow's metadata entry and the rename/tags **editing** UI are not part of
-  this phase.
-* Whole-tag equality with `-`/`_` folding: a fragment never matches a tag.
-* `do_rename` (no persistence) and `do_move` (no column) are still stubs, and
-  the browser/Find search still uses the older literal `ILIKE` search.
-* The resolver was validated against the repository's in-memory repository
-  boundary (owner-scoped query string asserted) — not against a live PostgREST.
+* Rename/tags editing UI and `update_save_field` allow-listing are still the
+  PART 2 report's recorded gaps (Part 3 added no editor).
+* The browser/Find search still uses the older literal `ILIKE` search.
+* Validated against the repository's in-memory boundary (owner-scoped query
+  asserted) — not against a live PostgREST.
 
-### 14. Deferred
+### 12. Deferred
 
-Manual Save metadata entry UI (ask for a name/tags), rename + tag editing UI,
+Manual Save metadata entry UI unification details, rename + tag editing UI,
 unifying `search_saves`/`do_find` with the resolver, `display_name` in the
-dashboard API, the dead `file_name`/`short_code` cleanup decision, typo-tolerant
-matching, and the outstanding earlier-phase work (TTS provider fallback and its
-credential pool, TTS voice/model selection, Native Vision, Video/GIF, provider
-benchmarking, live verification of the vault phases and the canonical script).
-
+dashboard API, dead-column cleanup, typo-tolerant matching, and the outstanding
+earlier-phase work (TTS provider fallback and its credential pool, TTS
+voice/model selection, Native Vision, Video/GIF, provider benchmarking, live
+verification of the vault phases, the canonical snapshot and the successor
+migrations).
 
 ## SAVE V2 INVESTIGATION — investigation only, NOTHING IMPLEMENTED
 

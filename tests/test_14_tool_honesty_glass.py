@@ -198,13 +198,10 @@ class _FakeMessage:
 async def test_save_tool_is_deep_only_and_has_no_mode_param():
     from backend.ai.tools.save import SaveTool
 
-    # Deep Save is the ONLY save method, so there is no mode/forward selector.
-    # The only optional parameters are the owner's own metadata (Save V2:
-    # display name + tags), and neither is ever invented.
-    parameters = SaveTool.parameters.fget(SaveTool)
-    assert set(parameters) == {"name", "tags"}
-    for forbidden in ("mode", "forward", "save_type", "save_code"):
-        assert forbidden not in parameters
+    # Still NO mode/caption parameter — Deep Save is the only save mode. The
+    # only parameters are the OWNER's optional metadata, which the model may
+    # propose but never invent.
+    assert sorted(SaveTool.parameters.fget(SaveTool)) == ["display_name", "tags"]
 
     with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
         tool = SaveTool(_ctx(FakeDeleteClient()))
@@ -215,8 +212,12 @@ async def test_save_tool_is_deep_only_and_has_no_mode_param():
     # execute_save is called with (client, owner_id, reply_msg, tz_str) — no mode.
     assert len(m.await_args.args) == 4
     assert m.await_args.args[2] is not None
-    # A save with no owner metadata passes None for both — never invented.
-    assert m.await_args.kwargs == {"display_name": None, "tags": None}
+    # A save with no owner metadata hands down empty metadata — never invented.
+    assert m.await_args.kwargs.get("metadata") is None or (
+        m.await_args.kwargs.get("metadata") is not None
+        and not m.await_args.kwargs["metadata"].display_name
+        and not m.await_args.kwargs["metadata"].tags
+    )
 
 
 @pytest.mark.asyncio
