@@ -48,6 +48,825 @@
 28. [Current vs Proposed Status Matrix](#28-current-vs-proposed-status-matrix)
 29. [API Credential Vault (PART 1)](#29-api-credential-vault-part-1)
 30. [Canonical Schema Reconciliation & Drift Repair](#30-canonical-schema-reconciliation--drift-repair)
+31. [Canonical Database Setup — Proven Execution Order (one copy/paste block)](#31-canonical-database-setup--proven-execution-order-one-copypaste-block)
+
+---
+
+## 31. Canonical Database Setup — Proven Execution Order (one copy/paste block)
+
+> **Status: NOTHING has been executed against Supabase by the coding agent.**
+> This section is documentation plus a paste-ready artifact. No connection was
+> opened, no SQL was run, no Vault secret was created, and no schema change was
+> applied to any project. Every object named here is still pending an owner
+> action.
+
+> **Placement.** This section sits directly under the table of contents, ahead of
+> §1, because it is the section the owner needs *before* applying anything: it is
+> the ordered, complete apply sequence. The per-object detail it refers to stays
+> where it already lives (§2, §29, §30).
+
+This section answers one question: **in what order must the pending migrations be
+applied, and what exactly does the owner paste?** The order below is derived from
+the migration sources — not from recollection, not from an earlier answer, and not
+from the migrations' own comment banners — and the two migrations that previously
+had no SQL anywhere in this document (`saved_items.display_name` and the Save V2
+search indexes) now carry it verbatim in §31.3.
+
+### 31.1 Audit — every required migration, its objects, and where its SQL lives
+
+| Order | Migration (`supabase/migrations/`) | Objects it establishes | Authoritative SQL in this document |
+|---|---|---|---|
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§30.5** — byte-identical to the migration and to `supabase/canonical_bootstrap.sql` |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§29.10** (identical to **step A** of §31.3) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§29.14** (identical to **step B** of §31.3) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3 step C** — this document carried no SQL for it before this section |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3 step D** — this document carried no SQL for it before this section |
+
+No migration file is rewritten, renamed or superseded by this section. The SQL of
+§31.3 is transcribed from those five files, and `tests/test_database_setup_order.py`
+pins every statement of it back to the file it came from, so the combined block
+cannot drift from the migrations.
+
+### 31.2 The order, and why it is this order (source-proven)
+
+1. **The reconciliation snapshot runs first.** It is the only thing that creates
+   `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the AI tables and
+   the two task tables, and it is where every canonical column, the four
+   `ai_config` columns and the drifted `panel_settings`/`bot_settings` columns are
+   re-established (§30.2, §30.4). Everything after it either writes into those
+   tables (steps B, C, D) or is independent of them (step A).
+2. **Vault PART 1 before Vault PART 2.** PART 2 adds five functions that read
+   `public.api_credentials` and the PART 1 resolution boundary; it creates no table
+   of its own. Applied in the wrong order, PART 2 leaves five `SECURITY DEFINER`
+   functions whose bodies reference a table that does not exist yet, and the
+   credential surface exists without its resolution boundary.
+3. **`display_name` before the search indexes — the one dependency the requested
+   order omitted.** `20260922000001` executes
+   `CREATE INDEX … ON saved_items USING gin (display_name gin_trgm_ops)`, and
+   `display_name` is created by `20260921000001`, **not** by the reconciliation
+   snapshot: §30.4 records explicitly that the snapshot predates the column and
+   that `saved_items.display_name` is added afterwards by that additive migration.
+   On a database that has applied steps 1–3 but not step C, the index statement
+   fails with `ERROR: 42703: column "display_name" does not exist`. The
+   display-name migration is therefore applied immediately before the index
+   migration, and **nothing else in the requested order moves**.
+4. **The vault objects and the Save V2 objects are independent of each other.**
+   The vault migrations never reference `saved_items`, and the Save V2 migrations
+   never reference `api_credentials`, `vault.*` or either RPC — §29.19 and §30.7.5
+   record both boundaries. Their relative order only has to satisfy rule 2 (inside
+   the vault pair) and rule 3 (inside the Save V2 pair); this document keeps the
+   requested order so the sequence stays deterministic.
+5. **Every statement is idempotent.** Re-running any step — or the whole block —
+   is a no-op rather than an error, and the two Save V2 migrations are each safe
+   on any database that already has `saved_items`. Nothing below rewrites a row, a
+   column or an existing value, and nothing below creates a Vault secret.
+
+> **Deviation from the requested order, recorded honestly.** The requested set
+> named four files, with the canonical reconciliation first and the Save V2 search
+> indexes last. The source proves that the search-index migration depends on a
+> fifth file — `20260921000001_add_saved_items_display_name.sql` — which was not in
+> the set, and that applying the index without the column fails. The block below
+> therefore applies five migrations, with the display-name migration placed
+> immediately before the index migration and every other position unchanged. This
+> is the repository-proven order; it is the only change this audit made to the
+> requested sequence.
+
+### 31.3 Paste-ready artifacts — the ordered sequence
+
+**Order, in ONE SQL Editor session as `postgres`:**
+
+1. **Step 0 — the canonical snapshot** = the complete block in §30.5. It is
+   deliberately **not** duplicated inside the block below: that script is
+   byte-frozen, it exists in exactly three byte-identical copies (the migration,
+   `supabase/canonical_bootstrap.sql` and the §30 block), and that
+   "exactly one embed" property is pinned by
+   `test_the_three_copies_of_the_canonical_script_are_byte_identical`. Paste it
+   first; alone it converges any database — fresh, partially migrated or already
+   canonical — onto the canonical schema.
+2. **Steps A–D — the block below.** Paste it immediately after step 0, in the same
+   session, as one batch.
+
+For an owner who prefers a single byte-exact file over two pastes, the equivalent
+one-blob artifact is the concatenation of the five migration files, which needs no
+editing and cannot drift:
+
+```bash
+cat supabase/migrations/20260920000001_reconcile_canonical_schema.sql \
+    supabase/migrations/20260919000001_create_api_credential_vault.sql \
+    supabase/migrations/20260919000002_credential_vault_management.sql \
+    supabase/migrations/20260921000001_add_saved_items_display_name.sql \
+    supabase/migrations/20260922000001_add_saved_items_search_indexes.sql \
+    > lifeos_canonical_setup.sql
+```
+
+Every statement in the block below is transcribed from the migration named in its
+step banner. The migrations' own `/* … */` prose headers are the documentation of
+§29.10, §29.14 and §30 and of the files themselves, so they are not repeated here;
+the `--` banner and inline comments that sit inside the executable text are kept
+verbatim.
+
+```sql
+-- ============================================================================
+-- LifeOS — canonical database setup, steps A–D (DATABASE_ARCHITECTURE.md §31.3)
+--
+-- Paste this WHOLE block, in one SQL Editor session, as `postgres`, immediately
+-- AFTER the canonical reconciliation block of §30.5 (step 0).
+--
+-- Transcribed verbatim from:
+--   A  supabase/migrations/20260919000001_create_api_credential_vault.sql
+--   B  supabase/migrations/20260919000002_credential_vault_management.sql
+--   C  supabase/migrations/20260921000001_add_saved_items_display_name.sql
+--   D  supabase/migrations/20260922000001_add_saved_items_search_indexes.sql
+--
+-- Pinned to those files by tests/test_database_setup_order.py. Idempotent and
+-- additive: no row, no column and no existing value is rewritten, and no Vault
+-- secret is created by any statement here.
+-- ============================================================================
+
+-- ─── STEP A — 20260919000001_create_api_credential_vault.sql ───────────────
+
+-- ============================================================================
+-- 1. Supabase Vault — the ONLY place a raw secret may live
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
+
+-- ============================================================================
+-- 2. api_credentials — credential METADATA. No secret column exists here.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.api_credentials (
+    credential_id    text        PRIMARY KEY,
+    provider         text        NOT NULL,
+    label            text        NOT NULL,
+    owner_id         bigint      NOT NULL,
+    enabled          boolean     NOT NULL DEFAULT true,
+    priority         integer     NOT NULL DEFAULT 0,
+    vault_secret_id  uuid        NOT NULL
+                                 REFERENCES vault.secrets(id) ON DELETE CASCADE,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT api_credentials_id_format
+        CHECK (credential_id ~ '^[A-Za-z0-9._-]{1,64}$'),
+    CONSTRAINT api_credentials_provider_format
+        CHECK (provider ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+    CONSTRAINT api_credentials_label_not_blank
+        CHECK (length(btrim(label)) > 0 AND length(label) <= 80),
+    CONSTRAINT api_credentials_owner_positive
+        CHECK (owner_id > 0),
+    CONSTRAINT api_credentials_priority_range
+        CHECK (priority BETWEEN 0 AND 1000000)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_credentials_provider_order
+    ON public.api_credentials (provider, priority, created_at, credential_id);
+CREATE INDEX IF NOT EXISTS idx_api_credentials_owner
+    ON public.api_credentials (owner_id, provider);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_api_credentials_vault_secret
+    ON public.api_credentials (vault_secret_id);
+
+ALTER TABLE public.api_credentials ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE public.api_credentials FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.api_credentials TO service_role;
+
+COMMENT ON TABLE public.api_credentials IS
+    'API credential METADATA for every provider. Stores NO secret: the key lives in Supabase Vault and is referenced by vault_secret_id. Service-role only.';
+COMMENT ON COLUMN public.api_credentials.credential_id IS
+    'Stable, non-secret identifier (1-64 chars, [A-Za-z0-9._-]). This is the only credential name that may appear in a log line.';
+COMMENT ON COLUMN public.api_credentials.provider IS
+    'Provider token shared with the runtime registry (e.g. gemini, groq, speechmatics, openai).';
+COMMENT ON COLUMN public.api_credentials.label IS
+    'Non-secret human label for the owner.';
+COMMENT ON COLUMN public.api_credentials.priority IS
+    'Deterministic ordering; a LOWER value is tried first. Ties fall back to created_at then credential_id.';
+COMMENT ON COLUMN public.api_credentials.vault_secret_id IS
+    'Reference to vault.secrets(id). The raw key exists only in Vault; deleting the secret cascades this metadata row.';
+
+-- ============================================================================
+-- 3. api_credential_pool — the ONE resolution boundary (provider-generic)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_pool(
+    p_provider text,
+    p_owner_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    secret        text,
+    priority      integer,
+    enabled       boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT c.credential_id,
+           d.decrypted_secret AS secret,
+           c.priority,
+           c.enabled
+      FROM public.api_credentials AS c
+      JOIN vault.decrypted_secrets AS d
+        ON d.id = c.vault_secret_id
+     WHERE c.provider = p_provider
+       AND c.enabled
+       AND (p_owner_id IS NULL OR c.owner_id = p_owner_id)
+     ORDER BY c.priority ASC, c.created_at ASC, c.credential_id ASC
+     LIMIT 8;
+$$;
+
+ALTER FUNCTION public.api_credential_pool(text, bigint) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_pool(text, bigint)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_pool(text, bigint) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_pool(text, bigint) IS
+    'Returns the ordered, ENABLED credentials of ONE provider with each secret decrypted from Supabase Vault. At most 8 rows. Callable by service_role only.';
+
+-- ============================================================================
+-- 4. stt_credential_pool — deprecated alias of the same contract
+-- ============================================================================
+-- The M2.4 documentation named this function. It is kept as a thin alias so an
+-- installation that already implemented the older name keeps working; the
+-- application calls api_credential_pool directly. Remove this alias in a later
+-- phase, once no deployment relies on the old name.
+
+CREATE OR REPLACE FUNCTION public.stt_credential_pool(
+    p_provider text,
+    p_owner_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    secret        text,
+    priority      integer,
+    enabled       boolean
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT * FROM public.api_credential_pool(p_provider, p_owner_id);
+$$;
+
+ALTER FUNCTION public.stt_credential_pool(text, bigint) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.stt_credential_pool(text, bigint)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.stt_credential_pool(text, bigint) TO service_role;
+
+COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
+    'Deprecated compatibility alias of api_credential_pool. Use api_credential_pool.';
+
+-- ============================================================================
+-- 5. PostgREST schema cache
+-- ============================================================================
+
+NOTIFY pgrst, 'reload schema';
+
+-- ─── STEP B — 20260919000002_credential_vault_management.sql ────────────────
+
+-- ============================================================================
+-- 1. api_credential_list — owner-scoped METADATA read (never a secret)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_list(
+    p_owner_id bigint,
+    p_provider text DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT c.credential_id,
+           c.provider,
+           c.label,
+           c.enabled,
+           c.priority,
+           c.created_at,
+           c.updated_at
+      FROM public.api_credentials AS c
+     WHERE c.owner_id = p_owner_id
+       AND (p_provider IS NULL OR c.provider = p_provider)
+     ORDER BY c.provider ASC, c.priority ASC, c.created_at ASC, c.credential_id ASC
+     LIMIT 64;
+$$;
+
+ALTER FUNCTION public.api_credential_list(bigint, text) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_list(bigint, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_list(bigint, text) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_list(bigint, text) IS
+    'Owner-scoped credential METADATA listing (no secret column is read or returned). Deterministic order: provider, priority, created_at, credential_id. At most 64 rows. Callable by service_role only.';
+
+-- ============================================================================
+-- 2. api_credential_create — Vault secret + metadata row, orphan-safe
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_create(
+    p_owner_id bigint,
+    p_provider text,
+    p_label    text,
+    p_secret   text,
+    p_priority integer DEFAULT 0,
+    p_enabled  boolean DEFAULT true
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_provider   text;
+    v_label      text;
+    v_secret     text;
+    v_priority   integer;
+    v_enabled    boolean;
+    v_id         text;
+    v_attempt    integer := 0;
+    v_secret_id  uuid;
+    v_row        public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_provider := btrim(coalesce(p_provider, ''));
+    IF v_provider !~ '^[a-z0-9][a-z0-9._-]{0,31}$' THEN
+        RAISE EXCEPTION 'invalid_provider' USING ERRCODE = '22023';
+    END IF;
+
+    v_label := btrim(coalesce(p_label, ''));
+    IF length(v_label) = 0 OR length(v_label) > 80 THEN
+        RAISE EXCEPTION 'invalid_label' USING ERRCODE = '22023';
+    END IF;
+
+    v_secret := coalesce(p_secret, '');
+    IF length(v_secret) = 0 THEN
+        RAISE EXCEPTION 'empty_secret' USING ERRCODE = '22023';
+    END IF;
+    IF length(v_secret) > 8192 THEN
+        RAISE EXCEPTION 'secret_too_long' USING ERRCODE = '22023';
+    END IF;
+
+    v_priority := greatest(0, least(coalesce(p_priority, 0), 1000000));
+    v_enabled  := coalesce(p_enabled, true);
+
+    -- A short, non-secret identifier. Bounded retry: a 48-bit collision is
+    -- astronomically unlikely, and the loop can never spin unbounded.
+    LOOP
+        v_attempt := v_attempt + 1;
+        v_id := 'c' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 12);
+        EXIT WHEN NOT EXISTS (
+            SELECT 1 FROM public.api_credentials AS c
+             WHERE c.credential_id = v_id
+        );
+        IF v_attempt >= 3 THEN
+            RAISE EXCEPTION 'credential_id_collision' USING ERRCODE = '23505';
+        END IF;
+    END LOOP;
+
+    -- The ONLY statement in this repository that writes a raw secret, and it
+    -- writes it into Vault. `vault.secrets.name` is UNIQUE, so the name is
+    -- derived from the (already unique) credential id.
+    v_secret_id := vault.create_secret(
+        v_secret,
+        'api_credential:' || v_id,
+        'LifeOS API credential for provider ' || v_provider
+    );
+
+    BEGIN
+        INSERT INTO public.api_credentials AS c (
+            credential_id, provider, label, owner_id, enabled, priority, vault_secret_id
+        ) VALUES (
+            v_id, v_provider, v_label, p_owner_id, v_enabled, v_priority, v_secret_id
+        )
+        RETURNING * INTO v_row;
+    EXCEPTION WHEN OTHERS THEN
+        -- Never leave an unreferenced secret behind. This block runs in its own
+        -- subtransaction, so it survives the failure it is cleaning up after.
+        BEGIN
+            DELETE FROM vault.secrets WHERE id = v_secret_id;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean) IS
+    'Creates one Vault secret and the owner-scoped metadata row referencing it. Accepts a raw secret ONLY as an argument, stores it ONLY in Supabase Vault, and returns metadata only. Removes the just-created secret if the metadata insert fails. Callable by service_role only.';
+
+-- ============================================================================
+-- 3. api_credential_replace_secret — swap the key, never orphan the old one
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_replace_secret(
+    p_owner_id bigint,
+    p_credential_id text,
+    p_secret text
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id        text;
+    v_secret    text;
+    v_old_id    uuid;
+    v_new_id    uuid;
+    v_row       public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    v_secret := coalesce(p_secret, '');
+    IF length(v_secret) = 0 THEN
+        RAISE EXCEPTION 'empty_secret' USING ERRCODE = '22023';
+    END IF;
+    IF length(v_secret) > 8192 THEN
+        RAISE EXCEPTION 'secret_too_long' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT c.vault_secret_id INTO v_old_id
+      FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+       FOR UPDATE;
+
+    IF v_old_id IS NULL THEN
+        RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    v_new_id := vault.create_secret(
+        v_secret,
+        'api_credential:' || v_id || ':' || substr(md5(gen_random_uuid()::text), 1, 8),
+        'LifeOS API credential for provider (replaced)'
+    );
+
+    BEGIN
+        UPDATE public.api_credentials AS c
+           SET vault_secret_id = v_new_id,
+               updated_at = now()
+         WHERE c.credential_id = v_id
+           AND c.owner_id = p_owner_id
+        RETURNING * INTO v_row;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        BEGIN
+            DELETE FROM vault.secrets WHERE id = v_new_id;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+        RAISE;
+    END;
+
+    -- Only AFTER the row points at the new secret: deleting the old one first
+    -- would have cascaded the row away (vault_secret_id is ON DELETE CASCADE).
+    BEGIN
+        DELETE FROM vault.secrets WHERE id = v_old_id;
+    EXCEPTION WHEN OTHERS THEN
+        -- The new secret is live and the row is correct; a leftover old secret
+        -- is inert because nothing references it any more. Reported honestly in
+        -- DATABASE_ARCHITECTURE.md §29.16 rather than failing the swap.
+        NULL;
+    END;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_replace_secret(bigint, text, text)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_replace_secret(bigint, text, text) IS
+    'Replaces the Vault secret of ONE owner-scoped credential. Never returns the old or the new secret and never changes label/enabled/priority. Callable by service_role only.';
+
+-- ============================================================================
+-- 4. api_credential_update — metadata only, never the secret
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_update(
+    p_owner_id bigint,
+    p_credential_id text,
+    p_label text DEFAULT NULL,
+    p_enabled boolean DEFAULT NULL,
+    p_priority integer DEFAULT NULL
+)
+RETURNS TABLE (
+    credential_id text,
+    provider      text,
+    label         text,
+    enabled       boolean,
+    priority      integer,
+    created_at    timestamptz,
+    updated_at    timestamptz
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id      text;
+    v_label   text;
+    v_row     public.api_credentials%ROWTYPE;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    IF p_label IS NOT NULL THEN
+        v_label := btrim(p_label);
+        IF length(v_label) = 0 OR length(v_label) > 80 THEN
+            RAISE EXCEPTION 'invalid_label' USING ERRCODE = '22023';
+        END IF;
+    END IF;
+
+    IF p_priority IS NOT NULL AND (p_priority < 0 OR p_priority > 1000000) THEN
+        RAISE EXCEPTION 'invalid_priority' USING ERRCODE = '22023';
+    END IF;
+
+    UPDATE public.api_credentials AS c
+       SET label      = coalesce(v_label, c.label),
+           enabled    = coalesce(p_enabled, c.enabled),
+           priority   = coalesce(p_priority, c.priority),
+           updated_at = now()
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+    RETURNING * INTO v_row;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'credential_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    credential_id := v_row.credential_id;
+    provider      := v_row.provider;
+    label         := v_row.label;
+    enabled       := v_row.enabled;
+    priority      := v_row.priority;
+    created_at    := v_row.created_at;
+    updated_at    := v_row.updated_at;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer)
+    TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer) IS
+    'Updates the owner-scoped METADATA of ONE credential (label / enabled / priority). A NULL argument leaves that field unchanged. Reads and writes no secret. Callable by service_role only.';
+
+-- ============================================================================
+-- 5. api_credential_delete — secret first (it cascades), row as a fallback
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.api_credential_delete(
+    p_owner_id bigint,
+    p_credential_id text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_id        text;
+    v_secret_id uuid;
+BEGIN
+    IF p_owner_id IS NULL OR p_owner_id <= 0 THEN
+        RAISE EXCEPTION 'invalid_owner' USING ERRCODE = '22023';
+    END IF;
+
+    v_id := btrim(coalesce(p_credential_id, ''));
+    IF length(v_id) = 0 OR length(v_id) > 64 THEN
+        RAISE EXCEPTION 'invalid_credential' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT c.vault_secret_id INTO v_secret_id
+      FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id
+       FOR UPDATE;
+
+    IF v_secret_id IS NULL THEN
+        -- Nothing of the owner's matches: an honest "not found", not an error.
+        RETURN false;
+    END IF;
+
+    -- Removing the secret is what makes this a real deletion. If it fails the
+    -- function raises and the caller must NOT report success.
+    DELETE FROM vault.secrets WHERE id = v_secret_id;
+
+    -- The foreign key cascades the metadata row; this explicit delete only does
+    -- anything on a deployment whose constraint is missing, and it guarantees no
+    -- metadata outlives its secret either way.
+    DELETE FROM public.api_credentials AS c
+     WHERE c.credential_id = v_id
+       AND c.owner_id = p_owner_id;
+
+    RETURN true;
+END;
+$$;
+
+ALTER FUNCTION public.api_credential_delete(bigint, text) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.api_credential_delete(bigint, text)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.api_credential_delete(bigint, text) TO service_role;
+
+COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
+    'Deletes ONE owner-scoped credential: the Vault secret first (which cascades the metadata row), then the metadata row. Returns false when the owner has no such credential. Callable by service_role only.';
+
+-- ============================================================================
+-- 6. PostgREST schema cache
+-- ============================================================================
+
+NOTIFY pgrst, 'reload schema';
+
+-- ─── STEP C — 20260921000001_add_saved_items_display_name.sql ───────────────
+
+ALTER TABLE saved_items
+    ADD COLUMN IF NOT EXISTS display_name text;
+
+-- PostgREST caches the schema: without this the API keeps rejecting an INSERT
+-- or UPDATE that names display_name until the cache expires on its own.
+NOTIFY pgrst, 'reload schema';
+
+-- Verification — zero rows means the database now carries the column.
+SELECT v.tbl || '.' || v.col AS missing_canonical_column
+FROM (VALUES ('saved_items','display_name')) AS v(tbl, col)
+LEFT JOIN information_schema.columns c
+    ON c.table_schema = 'public' AND c.table_name = v.tbl AND c.column_name = v.col
+WHERE c.column_name IS NULL
+ORDER BY 1;
+
+-- ─── STEP D — 20260922000001_add_saved_items_search_indexes.sql ─────────────
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX IF NOT EXISTS idx_saved_items_display_name_trgm
+    ON saved_items USING gin (display_name gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS idx_saved_items_tags
+    ON saved_items USING gin (tags);
+
+-- PostgREST caches the schema: without this, newly created indexes may not
+-- be visible to the query planner through the API until the cache expires.
+NOTIFY pgrst, 'reload schema';
+
+-- Verification — zero rows means the database now carries both indexes.
+SELECT v.idx AS missing_save_v2_index
+FROM (VALUES ('idx_saved_items_display_name_trgm'), ('idx_saved_items_tags')) AS v(idx)
+LEFT JOIN pg_indexes i
+    ON i.schemaname = 'public' AND i.indexname = v.idx
+WHERE i.indexname IS NULL
+ORDER BY 1;
+```
+
+### 31.4 Verification after the run
+
+* **Step 0** must print an empty `missing_canonical_column` result set (§30.6), and
+  any `WARNING` line from it names a data-guarded constraint that a pre-existing
+  row blocked.
+* **Step C** and **step D** each end with their own verification query: zero rows
+  means the column / both indexes now exist.
+* **Steps A–B** end with `NOTIFY pgrst, 'reload schema'`; the objects can be
+  confirmed read-only:
+
+```sql
+SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'public'
+   AND p.proname IN ('api_credential_pool', 'stt_credential_pool',
+                     'api_credential_list', 'api_credential_create',
+                     'api_credential_replace_secret', 'api_credential_update',
+                     'api_credential_delete')
+ ORDER BY 1, 2;
+
+SELECT indexname, indexdef
+  FROM pg_indexes
+ WHERE schemaname = 'public'
+   AND indexname IN ('idx_api_credentials_provider_order',
+                     'idx_api_credentials_owner',
+                     'uq_api_credentials_vault_secret',
+                     'idx_saved_items_display_name_trgm',
+                     'idx_saved_items_tags')
+ ORDER BY 1;
+```
+
+After that, every remaining pillar of this section is owner-fact: whether a given
+migration was already applied cannot be decided from this repository, which is
+exactly why every statement above is idempotent.
+
+### 31.5 Reversal
+
+* **Steps A–D** — §29.15 reverses the five PART 2 management functions, §29.11
+  reverses the PART 1 table and both resolution functions, and the two Save V2
+  migrations state their own reversal in their headers
+  (`ALTER TABLE saved_items DROP COLUMN IF EXISTS display_name;` and
+  `DROP INDEX IF EXISTS idx_saved_items_display_name_trgm, idx_saved_items_tags;`).
+  None of them drops `supabase_vault`, deletes a Vault secret, or rewrites a row.
+* **Step 0** — §30.9. The reconciliation is additive and has no safe automatic
+  rollback; the only destructive cleanup in this repository is the explicitly
+  OPTIONAL, owner-gated §30.10.
+
+### 31.6 What this section does not claim
+
+* It is not a substitute for executing the SQL: **no database was contacted and no
+  statement of §31.3 was run** against any Supabase project by the coding agent.
+* It does not assert the live database state, and it does not change §29 or §30:
+  the per-object contracts, the byte-frozen snapshot and the credential-vault
+  documentation all stay exactly as they were.
+* It changes no runtime behaviour, provider, handler, service, dependency or
+  environment variable, and it adds no table, no column, no configuration store
+  and no second secret path of its own.
 
 ---
 
