@@ -143,11 +143,12 @@ async def test_save_by_link_tool_calls_existing_executor_with_exact_url():
 
     captured: dict = {}
 
-    async def fake_execute_link_save(client, owner_id, link, tz_str):
+    async def fake_execute_link_save(client, owner_id, link, tz_str, *, metadata=None):
         captured["client"] = client
         captured["owner_id"] = owner_id
         captured["link"] = link
         captured["tz_str"] = tz_str
+        captured["metadata"] = metadata
         return "📷 **Saved Successfully**"
 
     with patch.object(save_service, "execute_link_save", new=fake_execute_link_save):
@@ -156,6 +157,10 @@ async def test_save_by_link_tool_calls_existing_executor_with_exact_url():
     assert result.success is True
     assert captured["link"] == "https://t.me/SomeChannel/42"
     assert captured["client"] == "CLIENT"
+    # The shared contract always travels with the save — here simply empty,
+    # because the owner supplied no metadata.
+    assert captured["metadata"].display_name is None
+    assert captured["metadata"].tags == ()
 
 
 @pytest.mark.asyncio
@@ -191,7 +196,7 @@ async def test_save_by_link_tool_normalizes_missing_scheme():
 
     captured: dict = {}
 
-    async def fake_execute_link_save(client, owner_id, link, tz_str):
+    async def fake_execute_link_save(client, owner_id, link, tz_str, *, metadata=None):
         captured["link"] = link
         return "saved"
 

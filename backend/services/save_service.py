@@ -657,11 +657,19 @@ async def execute_save(
     return build_confirmation(save_code, media_type, file_name)
 
 
-async def execute_link_save(client, owner_id: int, link: str, tz_str: str) -> str:
+async def execute_link_save(
+    client,
+    owner_id: int,
+    link: str,
+    tz_str: str,
+    *,
+    metadata: SaveMetadata | None = None,
+) -> str:
     """Resolve a Telegram link and Deep-Save the linked message.
 
     This is the same Deep Save pipeline as ``execute_save`` — the only
-    difference is the source resolution (a t.me link instead of a reply).
+    difference is the source resolution (a t.me link instead of a reply), so it
+    takes and forwards the same optional ``SaveMetadata`` contract.
     """
     logger.info("[LINK_SAVE] resolving link: %s", link)
     channel, chat_id, msg_id = parse_telegram_link(link)
@@ -687,4 +695,4 @@ async def execute_link_save(client, owner_id: int, link: str, tz_str: str) -> st
         logger.warning("[LINK_SAVE] source message not found at link")
         return "❌ Message not found at that link."
 
-    return await execute_save(client, owner_id, target_msg, tz_str)
+    return await execute_save(client, owner_id, target_msg, tz_str, metadata=metadata)

@@ -198,7 +198,10 @@ class _FakeMessage:
 async def test_save_tool_is_deep_only_and_has_no_mode_param():
     from backend.ai.tools.save import SaveTool
 
-    assert SaveTool.parameters.fget(SaveTool) == {}
+    # Still NO mode/caption parameter — Deep Save is the only save mode. The
+    # only parameters are the OWNER's optional metadata, which the model may
+    # propose but never invent.
+    assert sorted(SaveTool.parameters.fget(SaveTool)) == ["display_name", "tags"]
 
     with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
         tool = SaveTool(_ctx(FakeDeleteClient()))

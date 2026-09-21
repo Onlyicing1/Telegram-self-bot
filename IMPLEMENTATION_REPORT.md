@@ -1,6 +1,188 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — SAVE V2 PART 1: the owner-metadata data model and the shared Save contract
+## Latest phase — SAVE V2 PART 2: manual + AI Save metadata wiring
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **SAVE V2 PART 2 — manual + AI metadata wiring**: both user-facing Save surfaces can now supply the optional owner metadata (`display_name`/`tags`) through the SAME `SaveMetadata` object and the SAME `execute_save` pipeline Part 1 built |
+| Input contract | the `SAVE V2 INVESTIGATION` section below (its **Phase B interaction half**) plus the Part 1 report section — both **re-verified against the current source** before this phase began |
+| Part 1 dependency | `49fdb48` — `saved_items.display_name`, the shared `SaveMetadata`, `normalize_display_name`/`normalize_tags`, `caption_hashtags` no longer feeding the `tags` column, and the `20260921000001_add_saved_items_display_name.sql` migration |
+| Starting HEAD | `49fdb48` = `origin/main` (in sync — no fetch, no fast-forward, no rebase needed) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Schema change | **none** — Part 1 already added `display_name`; `DATABASE_ARCHITECTURE.md` needed no change (no inconsistency was created) |
+| Supabase / live Telegram | untouched / not exercised (no live verification is claimed) |
+| Tests added | `tests/test_save_v2_wiring.py` — **51 tests**; 2 existing assertions updated (below) |
+
+### The problem this phase addresses
+
+Part 1 gave the database a place for an owner name and owner tags, and gave
+`execute_save` the capability to persist them — but **nothing user-facing could
+supply them**. The manual Save panel went straight from `Deep Save` to `Reply
+Mode`, and the AI Save tools declared an empty parameter schema (`parameters ==
+{}`), so a request like *"save this as University Schedule and tag it university
+semester-2"* had no path to the new columns. This phase wires both surfaces into
+the Part 1 contract **without** changing the Save pipeline itself, prompting for
+anything, or implementing any retrieval work.
+
+### MANUAL SAVE — the optional `Name & tags` step
+
+The Deep Save source panel gains exactly one row:
+
+```
+📥 Save → ⬇️ Deep Save → 💬 Reply Mode        (unchanged, still prompt-free)
+                       → ✏️ Name & tags      (NEW, optional)
+                       → 🔗 Save using a link (unchanged)
+```
+
+* **Never prompted.** `Name & tags` is its own row, exactly like the existing
+  optional inputs (`input:save:link`). Nothing asks for a name or tags after a
+  save; a plain Reply Mode save stays a two-tap, zero-prompt flow.
+* **ONE documented line format**, stated in the input prompt itself:
+  `Name | tag, tag`. The first `|` splits the name from the tags; a line with no
+  `|` is a name (no tags); an empty left side means no name; an empty right side,
+  or `-` / `none` / `no` / `بدون` / `هیچ`, means **explicitly no tags**. A second
+  `|` is refused (one delimiter, not five syntaxes), and a line that sets neither
+  a name nor tags is refused.
+* **Deterministic parsing**, no LLM: `parse_metadata_line` splits the line and
+  hands it to the shared `SaveMetadata.from_raw` — lengths, whitespace, dedupe,
+  the 10-tag/40-char/120-char bounds stay the service's single authority. A bare
+  sentence is never split into invented tags.
+* **The metadata reaches the reply save through the pending entry itself.** The
+  step arms Reply Mode with `_reply_handler_with_metadata(metadata)` — a closure,
+  because `set_pending` stores the handler callable in the per-owner pending
+  state. That is the one vehicle this architecture provides, and it expires with
+  the state (the same 120 s window as every other pending input). Reading the
+  popped state back inside the handler would **not** work: the input listener
+  clears the entry before it calls the handler (see *Known limitations* for the
+  pre-existing read-back defect this deliberately does not copy).
+* `_save_reply_wait_handler` takes the metadata as an optional keyword-only
+  argument and forwards it to `execute_save(..., metadata=metadata)`. It performs
+  no parsing, no validation and no DB write itself — the handler stays thin.
+
+### AI SAVE — the complete parameter path
+
+The model may now propose the owner's own metadata, and it survives every stage:
+
+```
+MODEL → structured save action → validate_action (shape + save-only guard)
+      → ActionParseResult.display_name/.tags → resolve_tool_calls
+      → SaveTool/SaveByLinkTool arguments → SaveMetadata.from_raw
+      → execute_save → saved_items
+```
+
+| Stage | Change |
+|---|---|
+| `SaveTool.parameters` | `display_name` (string) + `tags` (array of strings), both **optional**, with descriptions that forbid inventing either; still no `mode`/caption parameter (Deep Save remains the only save) |
+| `SaveByLinkTool.parameters` | the same two optional fields beside the required `link` |
+| `ALLOWED_FIELDS` | permits `display_name` + `tags` |
+| `validate_action` | a new guard rejects both fields on **any** non-save action, so metadata can never ride along with an unrelated execution; the two Save actions call `_validate_save_metadata`, which checks **shape only** (text / list-of-strings) and returns an `ActionParseResult` rejection otherwise |
+| `ActionParseResult` | gained `display_name: str = ""` and `tags: list[str] \| None`; `""`/`None` mean *the owner supplied none* — never “an empty name”/“no tags requested” |
+| `resolve_tool_calls` | carries only the fields that were actually supplied (`{}` when there are none — the existing shape), for both `save`/`deep_save` and `save_link` |
+| tools | `_save_metadata(context, arguments)` builds the shared `SaveMetadata.from_raw`, **before** the reply is fetched from Telegram, and returns the service's own reason on refusal (no download, no upload, no row) |
+| prompt template | teaches that the name/tags are optional and owner-supplied only, that `tags: []` is the explicit decline, and that nothing is invented or asked for |
+
+### Explicit “no tags” — deterministic, owner-authoritative
+
+`explicit_no_tags_requested(text)` recognises the owner's own decline phrases
+(`no tags`, `without tags`, `dont tag`, `untagged`, `بدون تگ`, `تگ نزن`, …) and
+runs on the **owner's request text**, which the dispatcher already carries in
+`context.extra["request_text"]`. When it is true, the Save adapters force
+`SaveMetadata.from_raw(name, ())`: a model proposal can never re-add tags the
+owner asked not to have. The request never reaches the deterministic fast path
+either — `parse_command_intent` returns conversational for a save that names an
+item or asks for tags, so the metadata arrives through the validated parameters
+instead of being dropped by the fast path.
+
+### Backward compatibility
+
+* A save with no metadata is byte-identical in behavior: `{}` arguments, the
+  same confirmation, `display_name = NULL`, `tags = '{}'` (Part 1's contract).
+* `execute_save`/`execute_link_save` keep their positional signatures; every
+  caller (panel reply, link, `SaveTool`, tests) keeps working.
+* `save_code` generation, media-target resolution, Deep Save ordering, size
+  limits, owner scoping and caption rendering are untouched.
+* `_save_reply_wait_handler`'s new parameter is keyword-only, so the existing
+  `set_pending(handler=_save_reply_wait_handler, …)` arm is unchanged.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `backend/bot/handlers/save.py` | the `Name & tags` row (both renderings), `parse_metadata_line`, `describe_metadata`, `_reply_handler_with_metadata`, `_save_metadata_input_handler`, the `metadata=` keyword on `_save_reply_wait_handler`, the `register_input("save", "meta", …)` wiring |
+| `backend/ai/tools/save.py` | `_request_text`, `_save_metadata`, the two optional parameters on both tools, metadata built before the reply fetch, forwarded to `execute_save`/`execute_link_save` |
+| `backend/ai/actions.py` | `ALLOWED_FIELDS`, `_SAVE_ACTIONS`, `_validate_save_metadata`, the save-only guard, `ActionParseResult.display_name/.tags`, `_save_metadata_arguments`, the metadata vocabulary (`explicit_no_tags_requested`, `save_metadata_requested`) and the fast-path deferral |
+| `backend/ai/prompt/template.py` | the optional metadata rule + examples (name, tags, both, explicit decline) |
+| `backend/services/save_service.py` | `execute_link_save` accepts and forwards the same optional `SaveMetadata` |
+| `tests/test_save_v2_wiring.py` | new file — 51 tests |
+| `tests/test_14_tool_honesty_glass.py` | the assertion that pinned `SaveTool.parameters == {}` now asserts the two optional parameters (still no mode/caption) |
+| `tests/test_20_advanced_execution.py` | the two spy signatures on `execute_link_save` accept `metadata=` and assert the shared empty contract |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Tests and exact results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_save_v2_wiring.py` | **51 passed** |
+| `pytest tests/test_save_v2_wiring.py tests/test_save_v2_metadata.py tests/test_12_save_engine.py tests/test_20_advanced_execution.py tests/test_14_tool_honesty_glass.py tests/test_canonical_schema_reconciliation.py` | **184 passed** |
+| `pytest tests/ -q -p no:randomly` | **4439 passed, 26 skipped** in 116.5 s (Part 1 baseline: 4388 passed + these 51 = 4439 — no test removed or weakened) |
+
+The new suite covers the whole parameter path (schema → `ALLOWED_FIELDS` →
+validation → `resolve_tool_calls` → tool → service → row), the negative cases
+(metadata on another action, wrong types, over-long name/tag list refused before
+any transfer, model-injected `save_code` ignored), the explicit-decline override,
+the manual line parser (9 accepted forms, 5 refusals), the armed-pending
+contract (the tests pop the entry **before** calling the handler, exactly like
+the listener) and the two end-to-end saves. `git diff --check` is clean.
+
+### Known limitations (recorded, not hidden)
+
+* **Pre-existing defect found, NOT fixed (out of scope):**
+  `backend/bot/handlers/retrieve.py::_retrieve_rename_input_handler` and
+  `::_retrieve_move_input_handler` read the item code back with
+  `get_pending(owner_id)` — but the input listener pops the pending entry
+  (`backend/helper/inline_sender.py`, `clear_pending` **before** the handler
+  runs), so the code is always `""` and those flows can only answer “⚠️ No item
+  selected.” The Part 2 metadata deliberately uses a different vehicle for this
+  exact reason. Fixing retrieve is the retrieval phase's work (it also carries
+  the already-recorded `do_rename`/`do_move` false-success finding).
+* A name/tag request is now **conversational**: the deterministic fast path
+  defers, so it costs one provider round-trip. That is the price of not parsing
+  free-form names and tags with a regex.
+* The decline vocabulary is bounded and phrase-based; an unusual phrasing that
+  the model still passes `tags: []` for behaves identically, since `[]` is
+  already the explicit empty contract.
+* `as X` name detection is heuristic (`as well/usual/soon/…` are excluded); a
+  miss only costs the fast path (the model still receives the request).
+* `display_name` remains unindexed and unsearched, and no post-save rename/tag
+  editing exists — both are later Save V2 phases, by design.
+
+### Explicitly deferred (unchanged from the investigation's plan)
+
+Not implemented in this phase, and not claimed anywhere:
+
+* **retrieval / semantic search** — no `display_name` or tag lookup, no natural
+  language *“give me the university file”*, no `retrieve_save` change;
+* **ambiguity handling** — no candidate list, no 0/1/N resolution, no
+  candidate-selection actions;
+* **manual saved-item management** — no rename UI, no tag editor, no search UI,
+  no delete confirmation;
+* embeddings/vector search, `file_name`/`short_code` cleanup, and any
+  `update_save_field` allow-list redesign.
+
+### Exact next phase
+
+**SAVE V2 PART 3 (retrieval)** — resolve a saved item from what the owner calls
+it: candidate lookup by `display_name` and tags (owner-scoped), the 0/1/N
+ambiguity contract, and the AI action(s) that select a candidate before
+`retrieve_save` runs. Its own report section, its own commit.
+
+---
+
+## Previous phase — SAVE V2 PART 1: the owner-metadata data model and the shared Save contract
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 
