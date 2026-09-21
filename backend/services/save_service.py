@@ -12,6 +12,11 @@ is never silently converted into a forward.
 
 Text commands, the Glass UI, and the AI SaveTool all call the same
 ``execute_save`` pipeline — no business logic lives in any handler.
+
+Owner-supplied metadata (a display name and semantic tags) is represented
+exactly once, by ``SaveMetadata``: both adapters build that same object and
+hand it to ``execute_save``, so the normalization rules below cannot drift
+between the manual and the AI path.
 """
 import asyncio
 import logging
@@ -19,6 +24,7 @@ import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 
 from telethon.tl.types import (
@@ -81,6 +87,109 @@ _MIME_EXT = {
 }
 
 
+# ── owner-supplied saved-item metadata ──
+
+MAX_DISPLAY_NAME_CHARS = 120
+MAX_SAVE_TAGS = 10
+MAX_TAG_CHARS = 40
+
+
+def normalize_display_name(value) -> str | None:
+    """The ONE display-name rule, shared by every Save surface.
+
+    ``None`` and an empty/whitespace-only name both mean "the owner gave no
+    name" and store NULL — the column is never filled with ``''`` and never
+    with an invented value. Internal whitespace is collapsed so a pasted name
+    cannot smuggle newlines or runs of spaces into a panel, and a name over the
+    bound is REFUSED rather than silently truncated.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("the name must be text")
+    name = " ".join(value.split())
+    if not name:
+        return None
+    if len(name) > MAX_DISPLAY_NAME_CHARS:
+        raise ValueError(
+            f"the name is {len(name)} characters — the limit is {MAX_DISPLAY_NAME_CHARS}"
+        )
+    return name
+
+
+def normalize_tags(values) -> tuple[str, ...]:
+    """The ONE tag rule, shared by every Save surface.
+
+    Deterministic and non-semantic: trim, collapse internal whitespace, drop
+    empty entries, dedupe case-insensitively (the first spelling wins, so the
+    stored casing is the owner's), bound each tag's length and the count.
+    Nothing is translated, folded to another script, or invented — folding
+    Arabic/Persian letter variants for MATCHING belongs to the retrieval phase,
+    not to storage. A bare string is ONE tag; it is never split per character.
+    """
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        values = [values]
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            raise ValueError("every tag must be text")
+        tag = " ".join(raw.split())
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_CHARS:
+            raise ValueError(
+                f"tag {tag!r} is {len(tag)} characters — the limit is {MAX_TAG_CHARS}"
+            )
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+    if len(tags) > MAX_SAVE_TAGS:
+        raise ValueError(f"{len(tags)} tags — the limit is {MAX_SAVE_TAGS}")
+    return tuple(tags)
+
+
+@dataclass(frozen=True)
+class SaveMetadata:
+    """Owner-supplied metadata for one saved item — the shared Save contract.
+
+    The Glass Save panel and the AI ``SaveTool`` are two thin adapters over
+    ``execute_save``; both hand it THIS object, so the rules above live once,
+    there is no second metadata type and no second writer of
+    ``saved_items.display_name`` / ``saved_items.tags``.
+
+    A save with no metadata is the default and stays valid: the name is NULL
+    and the tags are empty — never generated, never guessed.
+    """
+
+    display_name: str | None = None
+    tags: tuple[str, ...] = ()
+
+    @classmethod
+    def from_raw(cls, display_name=None, tags=None) -> "SaveMetadata":
+        """Build from adapter input (an AI argument or a panel's text).
+
+        Raises ``ValueError`` with an owner-readable reason when the input
+        cannot be honoured; the caller decides what to tell the owner.
+        """
+        return cls(normalize_display_name(display_name), normalize_tags(tags))
+
+    def insert_fields(self) -> dict:
+        """The ``saved_items`` fields this metadata contributes to the payload."""
+        fields: dict = {"tags": list(self.tags)}
+        if self.display_name is not None:
+            # display_name arrives in its own additive migration. Omitting the
+            # key when there is no name keeps every metadata-less save working
+            # against a database that has not applied it yet — PostgREST
+            # rejects an INSERT that names a column it does not know.
+            fields["display_name"] = self.display_name
+        return fields
+
+
 def detect_media_type(mime: str | None) -> str:
     if not mime:
         return "Unknown"
@@ -110,7 +219,14 @@ def generate_filename(media, mime_type: str | None, save_code: str) -> str:
     return f"{save_code}{ext}"
 
 
-def build_tags(media_type: str, dt: datetime) -> list[str]:
+def caption_hashtags(media_type: str, dt: datetime) -> list[str]:
+    """The hashtag line rendered INTO the caption — never into ``tags``.
+
+    These values used to be persisted as the row's ``tags``. Since Save V2 the
+    column belongs to the owner alone, so this line is presentation only: a
+    saved message keeps exactly the look it had, while an owner who supplied no
+    tags now gets ``tags = '{}'`` instead of five invented ones.
+    """
     mt = media_type.lower().replace(" ", "_")
     return [
         "#saved",
@@ -356,7 +472,14 @@ def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | 
     return mime_type, file_size, file_name, file_id, media_type
 
 
-async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
+async def execute_save(
+    client,
+    owner_id: int,
+    reply_msg,
+    tz_str: str,
+    *,
+    metadata: SaveMetadata | None = None,
+) -> str:
     """Deep Save — the single authoritative save pipeline.
 
     Deep Save downloads the source content and uploads it again as a NEW
@@ -367,7 +490,22 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
 
     A download or upload failure is an honest Deep Save failure. The DB
     record is written only after the Telegram operation succeeded.
+
+    ``metadata`` is the owner's optional display name and tags (see
+    ``SaveMetadata``). Omitted/empty metadata reproduces the previous behavior
+    for the row's identity and Telegram side exactly; the only difference is
+    that the ``tags`` column now stays empty instead of receiving invented
+    hashtags. Metadata that cannot be honoured is refused BEFORE any transfer —
+    it is never silently truncated or discarded.
     """
+    if metadata is None:
+        metadata = SaveMetadata()
+    else:
+        try:
+            metadata = SaveMetadata.from_raw(metadata.display_name, list(metadata.tags))
+        except ValueError as exc:
+            return f"⚠️ Nothing was saved: {exc}"
+
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
     sender_name, sender_id = await _resolve_sender(reply_msg)
@@ -389,8 +527,10 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
         file_size = len(original_text.encode("utf-8"))
 
     logger.info(
-        "[SAVE] owner=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s",
+        "[SAVE] owner=%s media=%s save_code=%s file_name=%s mime=%s size=%s file_id=%s "
+        "display_name=%s tags=%s",
         owner_id, media is not None, save_code, file_name, mime_type, file_size, file_id,
+        metadata.display_name, len(metadata.tags),
     )
 
     max_bytes = settings_service.max_deep_save_mb() * 1024 * 1024
@@ -399,7 +539,7 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
         limit_mb = settings_service.max_deep_save_mb()
         return f"⚠️ File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
 
-    tags = build_tags(media_type, now)
+    caption_tags = caption_hashtags(media_type, now)
     caption = _append_original_text(
         build_caption(
             save_code=save_code,
@@ -411,7 +551,7 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
             mime=mime_type,
             file_size=file_size,
             file_name=file_name,
-            tags=tags,
+            tags=caption_tags,
         ),
         reply_msg,
     )
@@ -487,11 +627,11 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
         "file_id": new_file_id or file_id,
         "file_size": actual_size or new_size,
         "media_type": media_type,
-        "tags": tags,
         "caption": caption,
         "owner_id": owner_id,
         "created_at": now.isoformat(),
     }
+    payload.update(metadata.insert_fields())
 
     inserted = None
     try:

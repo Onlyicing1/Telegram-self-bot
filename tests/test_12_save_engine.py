@@ -460,7 +460,13 @@ async def test_deep_save_persists_full_metadata():
     assert row["saved_msg_id"] == 600
     assert row["owner_id"] == 42
     assert row["save_code"] == _save_code(result)
-    assert row["tags"]
+    # Since Save V2 the tags column belongs to the OWNER: a save that supplied
+    # no metadata stores an empty array, never the five synthetic hashtags that
+    # used to be invented here. Those hashtags still render in the caption.
+    assert row["tags"] == []
+    # The name is optional and none was supplied, so it stays NULL — never
+    # invented, and the key is omitted entirely when there is no name.
+    assert row.get("display_name") is None
 
 
 @pytest.mark.asyncio
