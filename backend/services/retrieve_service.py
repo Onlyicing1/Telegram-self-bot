@@ -2,6 +2,9 @@
 Retrieve service — all retrieval business logic lives here.
 
 Unified workflow:
+  - resolve_saved_items(owner_id, query): the ONE deterministic saved-item
+    resolver (Save V2) — turns a name/tag request into 0/1/N candidates
+    (never into a Telegram action) before retrieval
   - load_saved_item(save_code, owner_id): the ONE owner-scoped, row-identity
     verified read of a persisted saved_items row (shared by every preview
     surface) — preview never regenerates metadata, it reads the stored row
@@ -10,15 +13,20 @@ Unified workflow:
     retrieved file captions
   - do_retrieve(self_client, owner_id, save_code, target_chat): forwards
     the saved media and edits its caption to include the metadata block
+    (the SINGLE Telegram retrieval authority — the resolver never forwards)
   - do_preview / do_send: legacy text-command entry points (still work
     but the panel UI is the primary path)
   - do_rename / do_move / do_delete: item actions from the preview panel
 """
 import asyncio
 import logging
+import re
 import traceback
+import unicodedata
+from dataclasses import dataclass
 from datetime import datetime
 
+from backend.ai.semantic_delete import normalize_text as _persian_normalize
 from backend.db import client as db_client
 from backend.diagnostics import record_event
 
@@ -67,6 +75,16 @@ def _type_icon(row: dict) -> str:
 
 
 def _display_name(row: dict) -> str:
+    """Owner-facing label, in owner-metadata order.
+
+    ``display_name`` (the owner's own name for the item) → ``file_name``
+    (the source filename) → ``media_type``. Never derived from the caption,
+    never invented when the owner named nothing.
+    """
+    for key in ("display_name", "file_name"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
     return row.get("media_type") or "Untitled"
 
 
@@ -285,3 +303,330 @@ async def do_delete(self_client, owner_id: int, save_code: str) -> str:
             logger.warning("delete telegram msg failed: %s", exc)
     await db_client.log(owner_id, "INFO", f"Deleted {save_code}", {"save_code": save_code})
     return f"✅ Deleted `{save_code}`"
+
+
+# ── Saved-item resolver (Save V2 Part 3 — deterministic 0/1/N) ────────────
+#
+# The ONE mechanism that turns a semantic saved-item request (a display name,
+# a tag, a combination) into concrete candidate save codes. It is
+# deterministic, owner-scoped INSIDE the database query, bounded, and
+# Telegram-free: it never forwards, never deletes, never writes a row. Only
+# the confirmed save code it returns reaches ``do_retrieve``.
+#
+# Matching is tiered with strict precedence, and the first tier that matches
+# anything decides the outcome (no scoring, no ranking, no model, no
+# embeddings):
+#   1. exact save code (code-shaped input never goes through fuzzy search)
+#   2. every token is a substring of display_name
+#   3. every token is a whole tag — or the whole query is one tag in another
+#      separator form ("semester 2" matches the tag "semester-2")
+#   4. every token matches display_name, file_name or a whole tag
+# Nothing else is searched: never the caption, never Telegram history, never
+# a sender, never "the most recent item". A query that matches nothing is a
+# clean not-found.
+
+RESOLUTION_NOT_FOUND = "not_found"
+RESOLUTION_UNIQUE = "unique"
+RESOLUTION_AMBIGUOUS = "ambiguous"
+
+# The candidate bound shared by every surface (the panel and the AI tool).
+# Mirrors the existing clarification cap in ``ai/chat_resolution.py``.
+MAX_RESOLUTION_CANDIDATES = 8
+
+_MAX_QUERY_CHARS = 128
+_MAX_QUERY_TOKENS = 6
+_SAVE_CODE_SHAPE = re.compile(r"^S[A-Z0-9]{4}$")
+_SEPARATOR_RE = re.compile(r"[-_\s]+")
+
+# The canonical save-code shape (S + 4 alphanumerics). Persian/Arabic
+# alternates — script (ی/ک) and digit (۰-۹ / ٠-٩) spellings — for the database
+# prefilter only; the authoritative comparison folds every spelling to one
+# matching form.
+_PERSIAN_TO_ARABIC = str.maketrans({"ی": "ي", "ک": "ك"})
+_ASCII_TO_PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+_ASCII_TO_ARABIC_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+_ZERO_WIDTH = "\u200b\u200c\u200d\ufeff"
+
+
+def _spelling_variants(token: str) -> list[str]:
+    """Bounded alternate spellings of one normalized token.
+
+    Covers the two recall-critical cases the authoritative folding creates:
+    Arabic-script letters vs Persian letters, and ASCII digits vs the
+    Persian/Arabic digit spellings an owner may have stored. Bounded and
+    deterministic; a stored spelling outside this set simply falls back to
+    the exact normalized match.
+    """
+    variants = [token]
+    arabic = token.translate(_PERSIAN_TO_ARABIC)
+    if arabic != token:
+        variants.append(arabic)
+    if any(ch.isdigit() for ch in token):
+        variants.append(token.translate(_ASCII_TO_PERSIAN_DIGITS))
+        variants.append(token.translate(_ASCII_TO_ARABIC_DIGITS))
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+@dataclass(frozen=True)
+class SavedItemCandidate:
+    """One candidate the owner can act on. No Telegram or internal identity."""
+
+    save_code: str
+    display_name: str | None = None
+    file_name: str | None = None
+    media_type: str | None = None
+    tags: tuple[str, ...] = ()
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class SavedItemResolution:
+    """The resolver's complete answer: 0, 1 or N candidates.
+
+    ``status`` is one of ``not_found`` / ``unique`` / ``ambiguous``.
+    ``overflowed`` means more matches exist than the bounded list shows —
+    the shown candidates are then explicitly NOT the only matches.
+    """
+
+    status: str
+    query: str
+    candidates: tuple[SavedItemCandidate, ...] = ()
+    overflowed: bool = False
+
+
+def _normalize_search(value) -> str:
+    """Deterministic matching form (comparison only, never stored).
+
+    NFKC (Unicode compatibility) + the project's established Persian/Arabic
+    normalization (``semantic_delete.normalize_text``: Persian/Arabic digit
+    folding, script-variant folding e.g. ي→ی and ك→ک, diacritic removal,
+    zero-width removal, casefold, whitespace collapse). Stored values are
+    never rewritten and nothing is translated or transliterated.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return _persian_normalize(text)
+
+
+def _fold_separators(value: str) -> str:
+    """Fold -, _ and whitespace into single spaces (tag-form comparison)."""
+    return _SEPARATOR_RE.sub(" ", str(value or "")).strip()
+
+
+def _owner_tags(row: dict) -> tuple[str, ...]:
+    """The row's OWNER tags, in stored order.
+
+    Legacy rows carry synthetic ``#saved*`` hashtags (caption decoration,
+    written by older versions). They start with ``#`` and are NEVER treated
+    as owner metadata here — not matched and not displayed. Legacy values
+    are kept in the database untouched.
+    """
+    out: list[str] = []
+    for item in (row.get("tags") or []):
+        tag = str(item or "").strip()
+        if not tag or tag.startswith("#"):
+            continue
+        out.append(tag)
+    return tuple(dict.fromkeys(out))
+
+
+def candidate_label(candidate: SavedItemCandidate) -> str:
+    """Owner-facing label: display_name → file_name → media_type → code."""
+    for value in (candidate.display_name, candidate.file_name, candidate.media_type):
+        if value:
+            return str(value)
+    return candidate.save_code
+
+
+def format_candidate(index: int, candidate: SavedItemCandidate) -> str:
+    """One numbered candidate line (label · type · date + save code)."""
+    label = candidate_label(candidate)
+    parts = [label]
+    if candidate.media_type and str(candidate.media_type) != label:
+        parts.append(str(candidate.media_type))
+    if candidate.created_at:
+        parts.append(_format_date(candidate.created_at))
+    return f"{index}. {' · '.join(parts)} `{candidate.save_code}`"
+
+
+def format_resolution(resolution: SavedItemResolution) -> str:
+    """Owner-facing rendering of a resolution (no model instructions)."""
+    if resolution.status == RESOLUTION_NOT_FOUND:
+        return (
+            f"🔍 No saved item matches `{resolution.query}`. "
+            "Try the saved name, one of its tags, or its save code."
+        )
+    if resolution.status == RESOLUTION_UNIQUE:
+        header = f"✅ One saved item matches `{resolution.query}`:"
+    else:
+        header = f"🔍 Multiple saved items match `{resolution.query}`:"
+    lines = [header]
+    for i, candidate in enumerate(resolution.candidates, start=1):
+        lines.append(format_candidate(i, candidate))
+    if resolution.status == RESOLUTION_AMBIGUOUS:
+        if resolution.overflowed:
+            lines.append("_More matches exist than are shown — narrow the query._")
+        lines.append("Reply with the number or the save code of the one you want.")
+    return "\n".join(lines)
+
+
+def _pattern_variants(raw_token: str, normalized_token: str) -> list[str]:
+    """Database-prefilter patterns for one token (a superset of the rule).
+
+    Bounded and deterministic: the normalized token, its Arabic-script
+    alternate (ی/ک), and — when the raw token carried a zero-width
+    character — a wildcard-joined form so a stored ZWNJ spelling still
+    prefilters. Comparison authority stays in Python; these patterns may
+    over-match, never under-match for the folded variants they cover.
+    """
+    patterns = [
+        f"%{db_client.resolve_pattern(v)}%" for v in _spelling_variants(normalized_token)
+    ]
+    if any(ch in raw_token for ch in _ZERO_WIDTH):
+        wild = raw_token
+        for ch in _ZERO_WIDTH:
+            wild = wild.replace(ch, "%")
+        patterns.append(f"%{db_client.resolve_pattern(wild)}%")
+    return list(dict.fromkeys(patterns))[:4]
+
+
+def _tag_variants(normalized_token: str) -> list[str]:
+    """Whole-tag terms for one token (exact membership, bounded)."""
+    terms = [db_client.resolve_tag_term(v) for v in _spelling_variants(normalized_token)]
+    return list(dict.fromkeys(t for t in terms if t))[:4]
+
+
+def _joined_tag_candidates(normalized_tokens: list[str]) -> list[str]:
+    """Whole-query tag forms ("semester 2" → semester-2 / semester_2).
+
+    Only meaningful for multi-token queries; a single token is already
+    matched as a whole tag by its own term.
+    """
+    if len(normalized_tokens) < 2:
+        return []
+    joined = " ".join(normalized_tokens)
+    candidates = [joined.replace(" ", "-"), joined.replace(" ", "_")]
+    arabic = [c.translate(_PERSIAN_TO_ARABIC) for c in candidates]
+    return list(dict.fromkeys(db_client.resolve_tag_term(c) for c in candidates + arabic if c))[:4]
+
+
+def _token_groups(raw_tokens: list[str], normalized_tokens: list[str]) -> list[dict]:
+    groups: list[dict] = []
+    for raw, norm in zip(raw_tokens, normalized_tokens):
+        groups.append({
+            "patterns": _pattern_variants(raw, norm),
+            "tags": _tag_variants(norm),
+        })
+    return groups
+
+
+def _candidate_from_row(row: dict) -> SavedItemCandidate:
+    def _clean(key: str) -> str | None:
+        value = str(row.get(key) or "").strip()
+        return value or None
+
+    return SavedItemCandidate(
+        save_code=str(row.get("save_code") or ""),
+        display_name=_clean("display_name"),
+        file_name=_clean("file_name"),
+        media_type=_clean("media_type"),
+        tags=_owner_tags(row),
+        created_at=_clean("created_at"),
+    )
+
+
+def _refine_rows(tier: str, rows: list, normalized_tokens: list[str], query_norm: str) -> list:
+    """Apply the authoritative (normalized, deterministic) tier rule.
+
+    The database prefilter is deliberately permissive; this is the exact
+    semantics. A row the prefilter over-matched is dropped here, and the
+    next tier is tried only when a tier matches nothing at all.
+    """
+    matched: list = []
+    whole_query = _fold_separators(query_norm)
+    for row in rows:
+        display = _normalize_search(row.get("display_name"))
+        fname = _normalize_search(row.get("file_name"))
+        tags = {_normalize_search(t) for t in _owner_tags(row)}
+        whole_tag_hit = whole_query in {_fold_separators(t) for t in tags}
+        if tier == "name":
+            ok = all(token in display for token in normalized_tokens)
+        elif tier == "tag":
+            ok = whole_tag_hit or all(token in tags for token in normalized_tokens)
+        else:
+            ok = whole_tag_hit or all(
+                token in display or token in fname or token in tags
+                for token in normalized_tokens
+            )
+        if ok:
+            matched.append(row)
+    return matched
+
+
+async def _fetch_resolver_rows(
+    owner_id: int, tier: str, token_groups: list, joined_tags: list, limit: int
+) -> list:
+    fetch_limit = limit + 1  # one extra row proves "more matches exist"
+    return await db_client.resolve_saves(owner_id, tier, token_groups, joined_tags, fetch_limit)
+
+
+async def resolve_saved_items(
+    owner_id: int, query: str, limit: int = MAX_RESOLUTION_CANDIDATES
+) -> SavedItemResolution:
+    """Resolve a saved-item request into 0, 1 or N owner-scoped candidates.
+
+    Owner identity is the trusted runtime owner — never a model argument.
+    Owner scoping happens INSIDE every database query; nothing is fetched
+    globally and filtered afterwards. The resolver performs no Telegram
+    action and writes nothing: a caller retrieves only a candidate it was
+    explicitly given.
+    """
+    raw = str(query or "").strip()
+    if not raw or len(raw) > _MAX_QUERY_CHARS or limit <= 0:
+        return SavedItemResolution(status=RESOLUTION_NOT_FOUND, query=raw)
+
+    # A code-shaped request is a CODE request: it goes straight to the
+    # owner-scoped, identity-verified read and is never fuzzy-matched.
+    code = raw.upper()
+    if _SAVE_CODE_SHAPE.match(code):
+        row = await load_saved_item(code, owner_id)
+        if not row:
+            return SavedItemResolution(status=RESOLUTION_NOT_FOUND, query=raw)
+        return SavedItemResolution(
+            status=RESOLUTION_UNIQUE,
+            query=raw,
+            candidates=(_candidate_from_row(row),),
+        )
+
+    raw_tokens = raw.split()
+    normalized_tokens = [t for t in (_normalize_search(tok) for tok in raw_tokens) if t]
+    normalized_tokens = normalized_tokens[:_MAX_QUERY_TOKENS]
+    if not normalized_tokens:
+        return SavedItemResolution(status=RESOLUTION_NOT_FOUND, query=raw)
+    query_norm = " ".join(normalized_tokens)
+
+    trimmed_raw = raw_tokens[: len(normalized_tokens)]
+    groups = _token_groups(trimmed_raw, normalized_tokens)
+    joined = _joined_tag_candidates(normalized_tokens)
+
+    for tier in ("name", "tag", "mixed"):
+        rows = await _fetch_resolver_rows(owner_id, tier, groups, joined, limit)
+        matched = _refine_rows(tier, rows, normalized_tokens, query_norm)
+        if not matched:
+            continue
+        candidates = [_candidate_from_row(row) for row in matched]
+        # Deterministic order: created_at DESC, then save_code ASC. The
+        # database applies the same order; re-applying it here also covers
+        # the fallback store and any refinement reordering.
+        candidates.sort(key=lambda c: str(c.save_code or ""))
+        candidates.sort(key=lambda c: str(c.created_at or ""), reverse=True)
+        overflowed = len(candidates) > limit
+        candidates = candidates[:limit]
+        status = RESOLUTION_UNIQUE if len(candidates) == 1 else RESOLUTION_AMBIGUOUS
+        return SavedItemResolution(
+            status=status,
+            query=raw,
+            candidates=tuple(candidates),
+            overflowed=overflowed,
+        )
+
+    return SavedItemResolution(status=RESOLUTION_NOT_FOUND, query=raw)

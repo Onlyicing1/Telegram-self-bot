@@ -112,6 +112,7 @@ ALLOWED_FIELDS = frozenset({
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
     "task_id", "action_status", "expected_version", "save_code", "status",
+    "name", "tags",
 })
 
 # Identity fields the account_status action may request from account_show.
@@ -120,6 +121,15 @@ _ACCOUNT_IDENTITY_FIELDS = frozenset({"first_name", "last_name", "full_name", "u
 
 _MIN_DELETE_COUNT = 1
 _MAX_DELETE_COUNT = 500
+
+# Bounds for the OPTIONAL owner metadata a save action may carry. They mirror
+# the service-layer normalization bounds so an absurd payload is rejected
+# before any Telegram work starts; the service still normalizes
+# authoritatively (trim, dedupe, per-tag ceiling).
+_MAX_SAVE_NAME_CHARS = 120
+_MAX_SAVE_TAGS = 8
+# A saved-item name/tag query is a short phrase, never a document.
+_MAX_SAVE_QUERY_CHARS = 128
 
 # A Telegram message link, with or without the https:// scheme. The URL is
 # preserved verbatim — only trailing punctuation is stripped for parsing.
@@ -177,6 +187,8 @@ class ActionParseResult:
     expected_version: int | None = None
     save_code: str = ""
     status: str = ""
+    display_name: str = ""
+    tags: tuple[str, ...] = ()
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -303,6 +315,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         return ActionParseResult(
             kind=KIND_INVALID,
             error="'status' is only valid for the task_list action.",
+        )
+
+    # ``name``/``tags`` are the OPTIONAL owner metadata of a save action and
+    # are meaningless anywhere else.
+    if ("name" in raw or "tags" in raw) and action not in ("save", "deep_save"):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'name'/'tags' are only valid for the save and deep_save actions.",
         )
 
     if action in ("task_inspect", "task_transition", "task_delete"):
@@ -478,6 +498,19 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
         boundary_id = coerce_int(raw.get("boundary_id"))
         if boundary_id is None or boundary_id <= 0:
             return ActionParseResult(kind=KIND_INVALID, error="Invalid 'boundary_id' field.")
+    if action in ("save", "deep_save"):
+        display_name, tags, metadata_error = _validate_save_metadata(raw)
+        if metadata_error:
+            return ActionParseResult(kind=KIND_INVALID, error=metadata_error)
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target=target,
+            caption=bool(raw.get("caption", False)),
+            display_name=display_name,
+            tags=tags,
+        )
+
     if action == "delete_messages":
         if mode == "all" and count is not None:
             return ActionParseResult(kind=KIND_INVALID, error="'all' mode cannot include a count.")
@@ -648,12 +681,47 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
     address one stored item through the same field set and the same code
     validation; only the resolved target differs (re-sending happens in the
     current chat, previewing/deleting addresses the item itself).
+
+    ``retrieve_save`` ADDITIONALLY accepts a name/tag ``query`` INSTEAD of a
+    code (Save V2 Part 3): the deterministic resolver turns it into 0/1/N
+    candidates and the tool only ever retrieves an exact unique match. The
+    other two stay code-only — deleting or previewing by a fuzzy name is
+    deliberately not reachable from a model string.
     """
-    unknown = sorted(set(raw) - {"action", "save_code"})
+    allowed = {"action", "save_code", "query"} if action == "retrieve_save" else {"action", "save_code"}
+    unknown = sorted(set(raw) - allowed)
     if unknown:
         return ActionParseResult(
             kind=KIND_INVALID,
             error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
+        )
+    has_code = "save_code" in raw
+    has_query = "query" in raw
+    if has_code and has_query:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Provide either 'save_code' or 'query' for {action} — not both.",
+        )
+    if action == "retrieve_save" and has_query:
+        query = raw.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Invalid 'query' (expected the saved item's name or a tag).",
+            )
+        query = query.strip()
+        if len(query) > _MAX_SAVE_QUERY_CHARS:
+            return ActionParseResult(kind=KIND_INVALID, error="Saved-item query is too long.")
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="current_chat",
+            query=query,
+        )
+    if action == "retrieve_save" and not has_code:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="Missing 'save_code' or 'query' for retrieve_save.",
         )
     save_code = raw.get("save_code")
     if not isinstance(save_code, str):
@@ -673,6 +741,36 @@ def _validate_saved_item_action(action: str, raw: dict[str, Any]) -> ActionParse
         target="current_chat" if action == "retrieve_save" else "saved_item",
         save_code=normalized,
     )
+
+
+def _validate_save_metadata(raw: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
+    """Validate the OPTIONAL save metadata (``name``/``tags``).
+
+    Returns ``(display_name, tags, error)``. Validation only — the service
+    performs the authoritative normalization; a non-string name, a non-string
+    tag, or an over-bound payload is rejected here, before any Telegram work.
+    """
+    display_name = ""
+    if "name" in raw:
+        value = raw.get("name")
+        if not isinstance(value, str):
+            return "", (), "Invalid 'name' field (must be a string)."
+        display_name = value.strip()
+        if len(display_name) > _MAX_SAVE_NAME_CHARS:
+            return "", (), f"Saved-item name is too long (max {_MAX_SAVE_NAME_CHARS} characters)."
+    tags: tuple[str, ...] = ()
+    if "tags" in raw:
+        raw_tags = raw.get("tags")
+        if isinstance(raw_tags, str):
+            raw_tags = [raw_tags]
+        if not isinstance(raw_tags, (list, tuple)) or not all(
+            isinstance(tag, str) for tag in raw_tags
+        ):
+            return "", (), "Invalid 'tags' field (must be a list of strings)."
+        if len(raw_tags) > _MAX_SAVE_TAGS:
+            return "", (), f"Too many tags (max {_MAX_SAVE_TAGS})."
+        tags = tuple(tag.strip() for tag in raw_tags if tag.strip())
+    return display_name, tags, ""
 
 
 # ── Target resolution ──
@@ -706,8 +804,15 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     if action in ("save", "deep_save"):
         # Save is Deep Save only; the SaveTool resolves the replied-to message
         # from runtime context and calls execute_save(). Captions are always
-        # preserved by the existing deep-save pipeline.
-        return [{"name": "save", "arguments": {}}]
+        # preserved by the existing deep-save pipeline. Optional owner
+        # metadata (name/tags) rides along ONLY when the model supplied it —
+        # nothing is invented here or downstream.
+        arguments: dict[str, Any] = {}
+        if result.display_name:
+            arguments["name"] = result.display_name
+        if result.tags:
+            arguments["tags"] = list(result.tags)
+        return [{"name": "save", "arguments": arguments}]
 
     if action == "save_link":
         # The existing execute_link_save() resolves the link and reuses the
@@ -782,6 +887,10 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         }]
 
     if action == "retrieve_save":
+        # A name/tag request travels as the resolver's query input; the tool
+        # resolves it deterministically and retrieves only a unique match.
+        if result.query:
+            return [{"name": "retrieve_save", "arguments": {"query": result.query}}]
         return [{"name": "retrieve_save", "arguments": {"save_code": result.save_code}}]
 
     if action == "preview_saved_item":

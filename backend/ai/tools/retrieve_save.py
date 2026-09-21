@@ -33,14 +33,27 @@ class RetrieveSaveTool(Tool):
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
-        return ("save_code",)
+        """No single argument is required — see ``required_any_arguments``."""
+        return ()
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        """Exactly one of ``save_code`` / ``query`` (enforced in execute)."""
+        return ("save_code", "query")
 
     @property
     def description(self) -> str:
         return (
-            "Re-send a saved item (by its save code, e.g. S0001) into the "
-            "current chat with its metadata caption. The destination is always "
-            "the chat the request came from — never a user-supplied chat."
+            "Re-send a saved item into the current chat with its metadata "
+            "caption. Pass save_code when the owner gives a concrete code "
+            "(e.g. S0001) — never invent one. Pass query with the owner's "
+            "own words when they refer to an item by name or tag (e.g. "
+            "'university schedule'): the system resolves it deterministically "
+            "against the stored display names and tags. With query, EXACTLY "
+            "one match is sent immediately; MULTIPLE matches are never sent — "
+            "the result lists them and asks the owner to choose, so never "
+            "pick one yourself. The destination is always the chat the "
+            "request came from — never a user-supplied chat."
         )
 
     @property
@@ -48,7 +61,22 @@ class RetrieveSaveTool(Tool):
         return {
             "save_code": {
                 "type": "string",
-                "description": "The save code of the item to retrieve (from search/list_saves).",
+                "default": "",
+                "description": (
+                    "The item's save code (e.g. S0001). Use when the owner "
+                    "gave a code or a previous result listed one. Never invent "
+                    "a code."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "The owner's own words describing the saved item by name "
+                    "or tag (e.g. 'university schedule'). Resolved "
+                    "deterministically; multiple matches always ask the owner "
+                    "to choose instead of sending one."
+                ),
             },
         }
 
@@ -72,10 +100,17 @@ class RetrieveSaveTool(Tool):
         # so a lower-cased echo ("s0012") must be canonicalized here. Codes
         # are `S` + alphanumerics (see db.client._SHORT_CODE_ALPHABET).
         save_code = str(arguments.get("save_code") or "").strip().upper()
-        if not save_code or not all(ch.isalnum() for ch in save_code):
+        query = str(arguments.get("query") or "").strip()
+
+        if save_code and query:
             return ToolResult(
                 success=False,
-                message="A valid save code is required (e.g. S0001).",
+                message="Provide either a save code or a name/tag query — not both. Nothing was retrieved.",
+            )
+        if not save_code and not query:
+            return ToolResult(
+                success=False,
+                message="A save code (e.g. S0001) or a name/tag query is required. Nothing was retrieved.",
             )
 
         chat_id = context.extra.get("chat_id") if context.extra else None
@@ -93,11 +128,69 @@ class RetrieveSaveTool(Tool):
         if client is None:
             return ToolResult(success=False, message="No Telegram client available.")
 
+        # ── Name/tag resolution (Save V2 Part 3) ──
+        # The resolver never performs Telegram work. 0 matches is an honest
+        # not-found; N matches are returned to the model as an explicit
+        # owner-choice prompt and NOTHING is retrieved; exactly one match
+        # falls through to the SAME do_retrieve path as a save code.
+        resolved_from = "code"
+        if query:
+            try:
+                resolution = await retrieve_service.resolve_saved_items(context.owner_id, query)
+            except Exception as exc:  # noqa: BLE001
+                return ToolResult(success=False, message=f"Saved-item search failed: {exc}")
+
+            if resolution.status == retrieve_service.RESOLUTION_NOT_FOUND:
+                return ToolResult(
+                    success=False,
+                    message=retrieve_service.format_resolution(resolution),
+                    data={"outcome": "not_found", "query": resolution.query},
+                )
+
+            if resolution.status == retrieve_service.RESOLUTION_AMBIGUOUS:
+                lines = [retrieve_service.format_resolution(resolution)]
+                lines.append(
+                    "NOTHING was retrieved. Ask the owner which one they mean — "
+                    "never choose for them. When they answer, call retrieve_save "
+                    "again with that item's exact save_code."
+                )
+                return ToolResult(
+                    success=True,
+                    message="\n".join(lines),
+                    data={
+                        "outcome": "ambiguous",
+                        "query": resolution.query,
+                        "candidates": [
+                            {
+                                "save_code": c.save_code,
+                                "label": retrieve_service.candidate_label(c),
+                            }
+                            for c in resolution.candidates
+                        ],
+                        "displayed": len(resolution.candidates),
+                        "more_matches_exist": resolution.overflowed,
+                    },
+                )
+
+            save_code = resolution.candidates[0].save_code
+            resolved_from = "query"
+
+        if not save_code or not all(ch.isalnum() for ch in save_code):
+            return ToolResult(
+                success=False,
+                message="A valid save code is required (e.g. S0001).",
+            )
+
         try:
             result = await retrieve_service.do_retrieve(client, context.owner_id, save_code, chat_id)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Retrieve failed: {exc}")
-        return result_from_service(result, data={"save_code": save_code, "chat_id": chat_id})
+        data: dict[str, Any] = {"save_code": save_code, "chat_id": chat_id}
+        if resolved_from == "query":
+            # The code path's structured data stays byte-identical to the
+            # pre-resolver contract; only a name/tag resolution adds a key.
+            data["resolved_from"] = "query"
+        return result_from_service(result, data=data)
 
 
 class PreviewSaveTool(Tool):

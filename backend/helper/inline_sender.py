@@ -6,6 +6,7 @@ to the PanelLifecycleManager. This module never touches sessions,
 timers, or cleanup directly.
 """
 import asyncio
+import inspect
 import logging
 
 from telethon import events
@@ -97,13 +98,25 @@ def register_input_listener(self_client, owner_id: int) -> None:
         inline_chat_id = pending_entry.get("inline_chat_id", 0)
         inline_msg_id = pending_entry.get("inline_msg_id", 0)
         timeout = pending_entry.get("timeout", 60.0)
+        # The pending state is POPPED above, so a handler that needs the
+        # context carried by ``extra`` (an item save code, or the candidate
+        # list of an ambiguous retrieval) must receive it as an argument.
+        # Reading it back from ``get_pending()`` inside the handler always
+        # saw an empty state — the documented rename/move defect. Handlers
+        # that do not declare the parameter are called exactly as before.
+        handler_kwargs: dict = {}
+        try:
+            if "extra" in inspect.signature(handler).parameters:
+                handler_kwargs["extra"] = pending_entry.get("extra", "")
+        except (TypeError, ValueError):
+            pass
         try:
             if timeout is None:
                 # Long-running operations (Deep Save) are intentionally unbounded.
-                await handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id)
+                await handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id, **handler_kwargs)
             else:
                 await asyncio.wait_for(
-                    handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id),
+                    handler(text, event.chat_id, event.message.id, inline_chat_id, inline_msg_id, **handler_kwargs),
                     timeout=timeout,
                 )
         except asyncio.CancelledError:

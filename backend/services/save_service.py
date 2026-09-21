@@ -111,6 +111,12 @@ def generate_filename(media, mime_type: str | None, save_code: str) -> str:
 
 
 def build_tags(media_type: str, dt: datetime) -> list[str]:
+    """Synthetic hashtags for the CAPTION only.
+
+    These are presentation, not metadata: they are never written to
+    ``saved_items.tags`` (which is exclusively owner-supplied) and are never
+    auto-invented on the owner's behalf.
+    """
     mt = media_type.lower().replace(" ", "_")
     return [
         "#saved",
@@ -119,6 +125,58 @@ def build_tags(media_type: str, dt: datetime) -> list[str]:
         f"#saved_{dt.year}_{dt.month:02d}",
         f"#saved_{dt.year}_{dt.month:02d}_{dt.day}",
     ]
+
+
+_MAX_DISPLAY_NAME_CHARS = 120
+_MAX_SAVE_TAGS = 8
+_MAX_SAVE_TAG_CHARS = 32
+
+
+def normalize_display_name(value) -> str | None:
+    """Canonical saved-item display label, or ``None`` for "no owner name".
+
+    Deterministic and bounded: whitespace collapsed, empty/blank → ``None``
+    (never an invented name), hard-bounded at ``_MAX_DISPLAY_NAME_CHARS`` so
+    a label can never grow into content. Bounding is documented truncation —
+    it never changes ``save_code`` and never touches the saved file.
+    """
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    return text[:_MAX_DISPLAY_NAME_CHARS]
+
+
+def normalize_save_tags(value) -> list[str]:
+    """Owner-supplied tags, normalized; ``None``/empty → ``[]``.
+
+    Trim, drop empties, strip a single leading ``#`` (so owner tags can never
+    be confused with the caption's synthetic hashtags), dedupe
+    case-insensitively, and bound the count and each tag's length. The
+    service NEVER invents tags: no tags given means an empty list.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item is None:
+            continue
+        tag = " ".join(str(item).split())
+        tag = tag.lstrip("#").strip()
+        if not tag:
+            continue
+        tag = tag[:_MAX_SAVE_TAG_CHARS]
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+        if len(out) >= _MAX_SAVE_TAGS:
+            break
+    return out
 
 
 def build_caption(
@@ -356,7 +414,15 @@ def _extract_source_media(reply_msg, save_code: str) -> tuple[str | None, int | 
     return mime_type, file_size, file_name, file_id, media_type
 
 
-async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
+async def execute_save(
+    client,
+    owner_id: int,
+    reply_msg,
+    tz_str: str,
+    *,
+    display_name=None,
+    tags=None,
+) -> str:
     """Deep Save — the single authoritative save pipeline.
 
     Deep Save downloads the source content and uploads it again as a NEW
@@ -367,6 +433,13 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
 
     A download or upload failure is an honest Deep Save failure. The DB
     record is written only after the Telegram operation succeeded.
+
+    ``display_name`` and ``tags`` are the owner's OPTIONAL metadata and are
+    keyword-only so the existing positional signature is unchanged for every
+    caller. ``None`` (the default) reproduces the pre-existing behavior
+exactly: no owner name and an empty tag list. The synthetic ``#saved*``
+    hashtags remain caption decoration only — they are never persisted as
+    tags, and no tag is ever invented on the owner's behalf.
     """
     save_code = await db_client.get_next_save_code()
     now = datetime.now(_get_tz(tz_str))
@@ -399,7 +472,9 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
         limit_mb = settings_service.max_deep_save_mb()
         return f"⚠️ File is {mb:.1f} MB — exceeds the {limit_mb} MB deep-save limit."
 
-    tags = build_tags(media_type, now)
+    caption_tags = build_tags(media_type, now)
+    owner_tags = normalize_save_tags(tags)
+    owner_display_name = normalize_display_name(display_name)
     caption = _append_original_text(
         build_caption(
             save_code=save_code,
@@ -411,7 +486,7 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
             mime=mime_type,
             file_size=file_size,
             file_name=file_name,
-            tags=tags,
+            tags=caption_tags,
         ),
         reply_msg,
     )
@@ -487,11 +562,18 @@ async def execute_save(client, owner_id: int, reply_msg, tz_str: str) -> str:
         "file_id": new_file_id or file_id,
         "file_size": actual_size or new_size,
         "media_type": media_type,
-        "tags": tags,
+        "tags": owner_tags,
         "caption": caption,
         "owner_id": owner_id,
         "created_at": now.isoformat(),
     }
+
+    # ``display_name`` is additive: the key is sent only when the owner
+    # actually named the item, so an unnamed save keeps working on a database
+    # whose canonical reconciliation has not been re-applied yet (the insert
+    # is rejected outright for an unknown column).
+    if owner_display_name is not None:
+        payload["display_name"] = owner_display_name
 
     inserted = None
     try:

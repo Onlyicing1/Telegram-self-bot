@@ -131,8 +131,9 @@ the Save path (see AGENTS.md §6).
 | `file_id` | `text` | YES | — | Telegram file ID |
 | `file_size` | `bigint` | YES | — | File size in bytes |
 | `media_type` | `text` | YES | — | Human-readable media type label (Photo, Video, etc.) |
-| `tags` | `text[]` | YES | — | Array of tags (e.g. `{#saved, #saved_photo}`) |
-| `caption` | `text` | YES | — | Caption attached to the saved message |
+| `tags` | `text[]` | YES | `{}` | Owner-supplied tags only (Save V2). The synthetic `#saved*` hashtags stay in the caption and are never written here; legacy rows keep their historical values. Searched by the saved-item resolver as whole-tag equality. |
+| `caption` | `text` | YES | — | Caption attached to the saved message (includes the synthetic `#saved*` hashtag line and the original source text) |
+| `display_name` | `text` | YES | — | Owner-supplied display label (Save V2), e.g. `University Weekly Schedule — Semester Two`. NULL means "no owner name"; display falls back to `file_name`, then `media_type`. Never auto-populated and never derived from the caption. Changing it never changes `save_code`. Searched by the saved-item resolver (`retrieve_service.resolve_saved_items`). |
 | `owner_id` | `bigint` | NO | `0` | Telegram user ID of the bot owner |
 | `created_at` | `timestamptz` | NO | `now()` | When the save was created |
 
@@ -152,7 +153,9 @@ the Save path (see AGENTS.md §6).
 | `idx_saved_items_owner` | `owner_id` | btree | |
 | `idx_saved_items_created_at` | `created_at` | btree | |
 | `idx_saved_items_save_type` | `save_type` | btree | |
-| `idx_saved_items_owner_created` | `(owner_id, created_at)` | btree | Added by migration `20260718143752`. Composite index for `list_saves` + `list_recent_saves` queries. |
+| `idx_saved_items_owner_created` | `(owner_id, created_at)` | btree | Added by migration `20260718143752`. Composite index for `list_saves` + `list_recent_saves` queries, and the owner filter + `created_at DESC` ordering of the Save V2 resolver. |
+| `idx_saved_items_display_name_trgm` | `display_name` | GIN (trigram) | Save V2 — supports the resolver's owner-scoped `display_name ILIKE '%token%'` prefilter. Requires `pg_trgm` (already enabled by the canonical script). |
+| `idx_saved_items_tags` | `tags` | GIN | Save V2 — supports the resolver's whole-tag containment (`tags.cs.{term}`). |
 
 ### Dead Indexes (depend on dead columns, should be dropped)
 
@@ -162,7 +165,7 @@ the Save path (see AGENTS.md §6).
 | `idx_saved_items_file_name_trgm` | `file_name` | GIN (trigram) | Depends on dead `file_name` column. |
 | `idx_saved_items_save_code_trgm` | `save_code` | GIN (trigram) | Redundant — `save_code` already has a unique btree index. |
 | `idx_saved_items_short_code_trgm` | `short_code` | GIN (trigram) | Depends on dead `short_code` column. |
-| `idx_saved_items_mime_type_trgm` | `mime_type` | GIN (trigram) | No search query uses trigram on `mime_type`. |
+| `idx_saved_items_mime_trgm` | `mime_type` | GIN (trigram) | No search query uses trigram on `mime_type`. (Documented as `idx_saved_items_mime_type_trgm` before the drift repair; the SQL name is authoritative.) |
 
 ### CHECK Constraints
 
@@ -3362,6 +3365,7 @@ CREATE TABLE IF NOT EXISTS saved_items (
     tags            text[]       DEFAULT '{}',
     caption         text,
     file_name       text,
+    display_name    text,
     short_code      text,
     owner_id        bigint       NOT NULL,
     created_at      timestamptz  DEFAULT now()
@@ -3384,6 +3388,7 @@ ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS media_type      text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS tags            text[]      DEFAULT '{}';
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS caption         text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_name       text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS display_name    text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS short_code      text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS owner_id        bigint;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
@@ -3412,6 +3417,10 @@ CREATE INDEX IF NOT EXISTS idx_saved_items_file_name_trgm ON saved_items USING g
 CREATE INDEX IF NOT EXISTS idx_saved_items_save_code_trgm ON saved_items USING gin (save_code gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_saved_items_short_code_trgm ON saved_items USING gin (short_code gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_saved_items_mime_trgm      ON saved_items USING gin (mime_type gin_trgm_ops);
+-- Save V2 resolver indexes: display_name ILIKE (trigram) and whole-tag
+-- array containment (tags.cs.{...}).
+CREATE INDEX IF NOT EXISTS idx_saved_items_display_name_trgm ON saved_items USING gin (display_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_tags           ON saved_items USING gin (tags);
 
 -- Data-guarded partial unique index: legacy rows may share a short_code.
 DO $$
@@ -4968,6 +4977,7 @@ FROM (VALUES
     ('saved_items','sender_name'), ('saved_items','sender_id'), ('saved_items','mime_type'),
     ('saved_items','file_id'), ('saved_items','file_size'), ('saved_items','media_type'),
     ('saved_items','tags'), ('saved_items','caption'), ('saved_items','file_name'),
+    ('saved_items','display_name'),
     ('saved_items','short_code'), ('saved_items','owner_id'), ('saved_items','created_at'),
     ('bio_state','id'), ('bio_state','owner_id'), ('bio_state','template'), ('bio_state','mood'),
     ('bio_state','custom_text'), ('bio_state','is_active'), ('bio_state','last_bio'), ('bio_state','updated_at'),
@@ -5185,7 +5195,7 @@ constraint that the data cannot satisfy is reported instead of attempted.
 
 ### 30.4 Canonical column inventory
 
-**180 `ADD COLUMN IF NOT EXISTS` statements** re-assert the **180 canonical
+**181 `ADD COLUMN IF NOT EXISTS` statements** re-assert the **181 canonical
 columns**; `tests/test_canonical_schema_reconciliation.py` proves that the
 CREATE column set, the `ADD COLUMN` set and the drift-report set are identical
 for every table, so no canonical column can be established by a silent no-op
@@ -5193,7 +5203,7 @@ alone.
 
 | Table | Columns | Column list |
 |---|---|---|
-| `saved_items` | 19 | id, save_code, save_type, origin_chat_id, origin_msg_id, saved_chat_id, saved_msg_id, sender_name, sender_id, mime_type, file_id, file_size, media_type, tags, caption, file_name, short_code, owner_id, created_at |
+| `saved_items` | 20 | id, save_code, save_type, origin_chat_id, origin_msg_id, saved_chat_id, saved_msg_id, sender_name, sender_id, mime_type, file_id, file_size, media_type, tags, caption, file_name, display_name, short_code, owner_id, created_at |
 | `bio_state` | 8 | id, owner_id, template, mood, custom_text, is_active, last_bio, updated_at |
 | `username_state` | 8 | id, owner_id, template, mood, custom_text, is_active, last_name, updated_at |
 | `bot_logs` | 6 | id, owner_id, level, message, context, created_at |
@@ -5300,7 +5310,7 @@ The three kinds of evidence, and what each one does and does not prove:
    text, so there is exactly one reconciled definition.
 2. **Internal consistency** — `test_every_table_declares_adds_and_verifies_exactly_the_same_columns`
    and `test_no_canonical_column_is_established_by_create_table_alone` prove
-   that all 180 canonical columns are re-asserted explicitly. This is the
+   that all 181 canonical columns are re-asserted explicitly. This is the
    property whose absence caused the production failure.
 3. **Simulated execution** — `apply_script()` parses the real statements of the
    shipped script and applies them with PostgreSQL's semantics to (a) an empty
@@ -5459,7 +5469,10 @@ agent.
    * `NOTIFY pgrst, 'reload schema'` has already asked PostgREST to drop its
      stale schema cache, so the API sees the new columns immediately.
 3. Nothing else is required: no new table to create by hand, no env var, no
-   Render setting, no Supabase Vault change.
+   Render setting, no Supabase Vault change. The same script carries every
+   later canonical addition — including the Save V2 `saved_items.display_name`
+   column and its two resolver indexes (see §2) — so a re-run of the current
+   version is what applies them to an already-reconciled database.
 4. §29 (the API Credential Vault) is still a **separate** owner action — with
    neither applied, the credential panel reports the store as not configured and
    every provider keeps its deployment key.

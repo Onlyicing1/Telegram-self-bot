@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS saved_items (
     tags            text[]       DEFAULT '{}',
     caption         text,
     file_name       text,
+    display_name    text,
     short_code      text,
     owner_id        bigint       NOT NULL,
     created_at      timestamptz  DEFAULT now()
@@ -105,6 +106,7 @@ ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS media_type      text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS tags            text[]      DEFAULT '{}';
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS caption         text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_name       text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS display_name    text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS short_code      text;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS owner_id        bigint;
 ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
@@ -133,6 +135,10 @@ CREATE INDEX IF NOT EXISTS idx_saved_items_file_name_trgm ON saved_items USING g
 CREATE INDEX IF NOT EXISTS idx_saved_items_save_code_trgm ON saved_items USING gin (save_code gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_saved_items_short_code_trgm ON saved_items USING gin (short_code gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_saved_items_mime_trgm      ON saved_items USING gin (mime_type gin_trgm_ops);
+-- Save V2 resolver indexes: display_name ILIKE (trigram) and whole-tag
+-- array containment (tags.cs.{...}).
+CREATE INDEX IF NOT EXISTS idx_saved_items_display_name_trgm ON saved_items USING gin (display_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_tags           ON saved_items USING gin (tags);
 
 -- Data-guarded partial unique index: legacy rows may share a short_code.
 DO $$
@@ -1689,6 +1695,7 @@ FROM (VALUES
     ('saved_items','sender_name'), ('saved_items','sender_id'), ('saved_items','mime_type'),
     ('saved_items','file_id'), ('saved_items','file_size'), ('saved_items','media_type'),
     ('saved_items','tags'), ('saved_items','caption'), ('saved_items','file_name'),
+    ('saved_items','display_name'),
     ('saved_items','short_code'), ('saved_items','owner_id'), ('saved_items','created_at'),
     ('bio_state','id'), ('bio_state','owner_id'), ('bio_state','template'), ('bio_state','mood'),
     ('bio_state','custom_text'), ('bio_state','is_active'), ('bio_state','last_bio'), ('bio_state','updated_at'),

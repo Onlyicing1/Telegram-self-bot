@@ -198,7 +198,13 @@ class _FakeMessage:
 async def test_save_tool_is_deep_only_and_has_no_mode_param():
     from backend.ai.tools.save import SaveTool
 
-    assert SaveTool.parameters.fget(SaveTool) == {}
+    # Deep Save is the ONLY save method, so there is no mode/forward selector.
+    # The only optional parameters are the owner's own metadata (Save V2:
+    # display name + tags), and neither is ever invented.
+    parameters = SaveTool.parameters.fget(SaveTool)
+    assert set(parameters) == {"name", "tags"}
+    for forbidden in ("mode", "forward", "save_type", "save_code"):
+        assert forbidden not in parameters
 
     with patch("backend.services.save_service.execute_save", AsyncMock(return_value="✅ Saved")) as m:
         tool = SaveTool(_ctx(FakeDeleteClient()))
@@ -209,6 +215,8 @@ async def test_save_tool_is_deep_only_and_has_no_mode_param():
     # execute_save is called with (client, owner_id, reply_msg, tz_str) — no mode.
     assert len(m.await_args.args) == 4
     assert m.await_args.args[2] is not None
+    # A save with no owner metadata passes None for both — never invented.
+    assert m.await_args.kwargs == {"display_name": None, "tags": None}
 
 
 @pytest.mark.asyncio

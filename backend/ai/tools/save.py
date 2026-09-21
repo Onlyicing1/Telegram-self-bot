@@ -37,12 +37,35 @@ class SaveTool(Tool):
     def description(self) -> str:
         return (
             "Deep-save a message to Saved Messages by downloading and "
-            "re-uploading it as a new message. Requires a replied message."
+            "re-uploading it as a new message. Requires a replied message. "
+            "Optionally give the saved item an owner display name and/or "
+            "tags when the owner explicitly provides them — NEVER invent a "
+            "name or a tag."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {}
+        return {
+            "name": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "Optional owner-supplied display name for the saved item "
+                    "(e.g. 'University Weekly Schedule — Semester Two'). Use "
+                    "ONLY when the owner names the item; omit otherwise."
+                ),
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": (
+                    "Optional tags the OWNER gave for this item (e.g. "
+                    "['university', 'semester-2']). Omit when the owner gave "
+                    "none — never invent tags."
+                ),
+            },
+        }
 
     @property
     def permission_level(self) -> PermissionLevel:
@@ -74,9 +97,16 @@ class SaveTool(Tool):
                 message="Could not fetch the replied message from Telegram to save it.",
             )
 
+        name = arguments.get("name")
+        tags = arguments.get("tags")
         try:
             result = await save_service.execute_save(
-                context.telegram.client, context.owner_id, reply_msg, context.tz_str
+                context.telegram.client,
+                context.owner_id,
+                reply_msg,
+                context.tz_str,
+                display_name=name,
+                tags=tags,
             )
             # Services report failures as "❌ ..."/"⚠️ ..." strings — only a
             # success string means the save actually happened.

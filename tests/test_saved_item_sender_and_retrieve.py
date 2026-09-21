@@ -329,8 +329,14 @@ def test_the_retrieve_tool_exposes_no_model_controllable_destination():
 
     tool = registry.get("retrieve_save")
     assert tool is not None
-    assert set(tool.parameters) == {"save_code"}
-    assert tool.required_arguments == ("save_code",)
+    # Save V2 Part 3: the tool accepts a save code OR a name/tag query that
+    # the deterministic resolver turns into candidates. It still exposes NO
+    # model-controllable destination — the destination is trusted context.
+    assert set(tool.parameters) == {"save_code", "query"}
+    assert tool.required_arguments == ()
+    assert tool.required_any_arguments == ("save_code", "query")
+    for forbidden in ("chat_id", "destination", "target_chat", "recipient", "target"):
+        assert forbidden not in tool.parameters
 
 
 @pytest.mark.asyncio

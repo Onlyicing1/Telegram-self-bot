@@ -448,6 +448,163 @@ async def search_saves(owner_id: int, query: str, limit: int = 20) -> list:
         return []
 
 
+# ── saved_items: deterministic saved-item resolver fetch (Save V2) ──
+#
+# One owner-scoped, bounded, explicit-ORDER-BY candidate fetch per resolver
+# tier. The matching LOGIC lives in ``retrieve_service.resolve_saved_items``;
+# this layer only expresses it as a PostgREST filter so owner scoping and
+# bounding happen IN THE QUERY (never by filtering fetched rows in Python).
+#
+# The logic tree is a single ``or=`` param containing an explicit
+# ``and(...)`` of per-token ``or(...)`` groups (tokens AND, variants OR).
+# Using one param removes any dependency on how a server combines repeated
+# ``or=`` params.
+
+_RESOLVE_COLUMNS = (
+    "save_code,display_name,file_name,media_type,mime_type,file_size,tags,created_at"
+)
+
+# Resolver tiers: display_name only; whole tags only; name/file/tag together.
+_RESOLVE_TIERS = ("name", "tag", "mixed")
+
+# PostgREST filter syntax is stripped from user text before it is placed in
+# the logic tree, so a query can only ever match as literal content inside its
+# own condition — it can never alter the tree. ``%`` survives a pattern on
+# purpose (it is the ILIKE wildcard the resolver adds around a token); a
+# user-typed ``%`` can only broaden the prefilter, and the authoritative
+# comparison in ``retrieve_service`` still decides the match.
+_PATTERN_STRIP = str.maketrans({c: None for c in ",()\\"})
+_TAG_TERM_STRIP = str.maketrans({c: None for c in ',(){}"\\'})
+
+
+def resolve_pattern(token: str) -> str:
+    """Sanitize one raw token for use INSIDE an ILIKE pattern."""
+    return str(token).translate(_PATTERN_STRIP)
+
+
+def resolve_tag_term(token: str) -> str:
+    """One sanitized whole-tag term for ``tags.cs.{term}``."""
+    return str(token).translate(_TAG_TERM_STRIP)
+
+
+def _resolve_condition_groups(tier: str, token_groups: list, joined_tags: list) -> list[list[str]]:
+    """Per-token OR-groups of PostgREST conditions for one tier."""
+    groups: list[list[str]] = []
+    for group in token_groups or []:
+        conditions: list[str] = []
+        patterns = list(group.get("patterns") or []) if isinstance(group, dict) else []
+        if tier in ("name", "mixed"):
+            conditions.extend(f"display_name.ilike.{p}" for p in patterns)
+        if tier == "mixed":
+            conditions.extend(f"file_name.ilike.{p}" for p in patterns)
+        if tier in ("tag", "mixed"):
+            terms = list(group.get("tags") or []) if isinstance(group, dict) else []
+            # A whole-query tag candidate ("semester 2" → "semester-2")
+            # satisfies every token group, so it is offered to each of them.
+            terms.extend(joined_tags or [])
+            conditions.extend(f"tags.cs.{{{t}}}" for t in dict.fromkeys(t for t in terms if t))
+        conditions = list(dict.fromkeys(c for c in conditions if c))
+        if conditions:
+            groups.append(conditions)
+    return groups
+
+
+def resolve_logic_expression(groups: list[list[str]]) -> str:
+    """One PostgREST logic tree: tokens ANDed, each token's variants ORed."""
+    if not groups:
+        return ""
+    if len(groups) == 1 and len(groups[0]) == 1:
+        return groups[0][0]
+    items = [f"or({','.join(g)})" if len(g) > 1 else g[0] for g in groups]
+    return items[0] if len(items) == 1 else f"and({','.join(items)})"
+
+
+def _resolve_saves_sync(owner_id: int, tier: str, token_groups: list, joined_tags: list, limit: int) -> list:
+    groups = _resolve_condition_groups(tier, token_groups, joined_tags)
+    if not groups or not limit or limit <= 0:
+        return []
+    logic = resolve_logic_expression(groups)
+    db = get_db()
+    if db:
+        try:
+            result = (
+                db.table("saved_items")
+                .select(_RESOLVE_COLUMNS)
+                .eq("owner_id", owner_id)
+                .or_(logic)
+                .order("created_at", desc=True)
+                .order("save_code")
+                .limit(limit)
+                .execute()
+            )
+            record_event("database", f"resolve saved_items ({tier})", 0, "SUCCESS")
+            return result.data or []
+        except Exception as exc:
+            logger.error("[SAVE_DB] resolve_saves(%s) FAILED: %s", tier, exc)
+            record_event("database", f"resolve saved_items ({tier})", 0, "ERROR", str(exc))
+
+    # In-memory fallback (the same Supabase-or-fallback contract as every
+    # other read): the SAME owner-scoped, tier-scoped prefilter, the same
+    # bound, and the same created_at DESC / save_code ASC ordering.
+    rows = [r for r in _fallback["saved_items"] if r.get("owner_id") == owner_id]
+    rows = [r for r in rows if _fallback_resolve_match(tier, r, token_groups, joined_tags)]
+    rows.sort(key=lambda r: str(r.get("save_code") or ""))
+    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def _fallback_resolve_match(tier: str, row: dict, token_groups: list, joined_tags: list) -> bool:
+    """Permissive in-memory mirror of the PostgREST prefilter (superset only)."""
+    def name_hit(patterns: list, value) -> bool:
+        text = str(value or "").casefold()
+        return any(str(p).strip("%").casefold() in text for p in patterns)
+
+    tags = [str(t).casefold() for t in (row.get("tags") or []) if str(t)]
+
+    def tag_hit(terms: list) -> bool:
+        wanted = [str(t).casefold() for t in terms if str(t)]
+        return any(w == tag for w in wanted for tag in tags)
+
+    for group in token_groups or []:
+        patterns = list(group.get("patterns") or []) if isinstance(group, dict) else []
+        terms = list(group.get("tags") or []) if isinstance(group, dict) else []
+        terms = terms + list(joined_tags or [])
+        if tier == "name":
+            ok = name_hit(patterns, row.get("display_name"))
+        elif tier == "tag":
+            ok = tag_hit(terms)
+        else:
+            ok = (
+                name_hit(patterns, row.get("display_name"))
+                or name_hit(patterns, row.get("file_name"))
+                or tag_hit(terms)
+            )
+        if not ok:
+            return False
+    return True
+
+
+async def resolve_saves(owner_id: int, tier: str, token_groups: list, joined_tags: list, limit: int) -> list:
+    """Owner-scoped bounded candidate fetch for one resolver tier.
+
+    ``tier``: ``name`` (display_name only), ``tag`` (whole tags only) or
+    ``mixed`` (display_name / file_name / tags). ``token_groups`` is one
+    entry per query token: ``{"patterns": [...], "tags": [...]}``. The
+    result is bounded by ``limit`` and ordered deterministically; failures
+    degrade to the in-memory store per the project's DB contract.
+    """
+    if tier not in _RESOLVE_TIERS:
+        raise ValueError(f"unknown resolver tier: {tier!r}")
+    try:
+        return await _run_sync(
+            _resolve_saves_sync, owner_id, tier, token_groups, joined_tags, limit
+        )
+    except Exception as exc:
+        logger.error("[SAVE_DB] resolve_saves(%s) FAILED: %s", tier, exc)
+        record_event("database", f"resolve saved_items ({tier})", 0, "ERROR", str(exc))
+        return []
+
+
 # ── saved_items: deletes ──
 
 def _delete_save_sync(owner_id: int, code: str) -> dict | None:

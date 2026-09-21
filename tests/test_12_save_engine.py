@@ -460,7 +460,56 @@ async def test_deep_save_persists_full_metadata():
     assert row["saved_msg_id"] == 600
     assert row["owner_id"] == 42
     assert row["save_code"] == _save_code(result)
-    assert row["tags"]
+    # Save V2: the stored tags are OWNER-supplied only. A save with no owner
+    # tags stores an empty list — the synthetic #saved* hashtags stay in the
+    # caption and are never invented as metadata.
+    assert row["tags"] == []
+
+
+@pytest.mark.asyncio
+async def test_deep_save_persists_the_owner_display_name_and_tags():
+    client = MockClient()
+    doc = FakeDoc()
+    doc.mime_type = "application/pdf"
+    doc.attributes = [DocumentAttributeFilename("schedule.pdf")]
+    media = MessageMediaDocument(document=doc, ttl_seconds=None)
+    msg = FakeMessage(media=media)
+    result = await save_service.execute_save(
+        client,
+        42,
+        msg,
+        "UTC",
+        display_name="  University Weekly Schedule — Semester Two  ",
+        tags=["university", "#semester-2", "university", "  "],
+    )
+
+    row = await db_client.query_save(_save_code(result))
+    # The owner's name is trimmed and stored verbatim otherwise.
+    assert row["display_name"] == "University Weekly Schedule — Semester Two"
+    # Owner tags are trimmed, de-hashed, deduped, and never invented.
+    assert row["tags"] == ["university", "semester-2"]
+    # The internal identity and the SOURCE filename stay independent of both.
+    assert row["save_code"] == _save_code(result)
+    assert row["save_code"] in row["caption"]
+    # The source filename is not the display name (``file_name`` remains an
+    # unwritten legacy column — see SAVE V2 INVESTIGATION §3).
+    assert row["display_name"] != "schedule.pdf"
+
+
+@pytest.mark.asyncio
+async def test_deep_save_owner_metadata_is_optional():
+    client = MockClient()
+    msg = FakeMessage(media=MessageMediaPhoto(photo=FakePhoto(), ttl_seconds=None))
+
+    result = await save_service.execute_save(client, 42, msg, "UTC")
+    row = await db_client.query_save(_save_code(result))
+    assert row.get("display_name") in (None, "")
+    assert row["tags"] == []
+
+    # An explicit empty tag list is "no tags" — not "invent some".
+    result2 = await save_service.execute_save(client, 42, msg, "UTC", tags=[])
+    row2 = await db_client.query_save(_save_code(result2))
+    assert row2["tags"] == []
 
 
 @pytest.mark.asyncio
