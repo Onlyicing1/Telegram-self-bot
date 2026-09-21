@@ -48,152 +48,1705 @@
 28. [Current vs Proposed Status Matrix](#28-current-vs-proposed-status-matrix)
 29. [API Credential Vault (PART 1)](#29-api-credential-vault-part-1)
 30. [Canonical Schema Reconciliation & Drift Repair](#30-canonical-schema-reconciliation--drift-repair)
-31. [Canonical Database Setup — Proven Execution Order (one copy/paste block)](#31-canonical-database-setup--proven-execution-order-one-copypaste-block)
+31. [Canonical Database Setup — One Complete Supabase Setup Script](#31-canonical-database-setup--one-complete-supabase-setup-script)
 
 ---
 
-## 31. Canonical Database Setup — Proven Execution Order (one copy/paste block)
+## 31. Canonical Database Setup — One Complete Supabase Setup Script
 
 > **Status: NOTHING has been executed against Supabase by the coding agent.**
-> This section is documentation plus a paste-ready artifact. No connection was
+> This section is documentation plus ONE paste-ready artifact. No connection was
 > opened, no SQL was run, no Vault secret was created, and no schema change was
 > applied to any project. Every object named here is still pending an owner
 > action.
 
 > **Placement.** This section sits directly under the table of contents, ahead of
 > §1, because it is the section the owner needs *before* applying anything: it is
-> the ordered, complete apply sequence. The per-object detail it refers to stays
-> where it already lives (§2, §29, §30).
+> the single, ordered, complete apply script. The per-object detail it refers to
+> stays where it already lives (§2, §29, §30).
 
-This section answers one question: **in what order must the pending migrations be
-applied, and what exactly does the owner paste?** The order below is derived from
-the migration sources — not from recollection, not from an earlier answer, and not
-from the migrations' own comment banners — and the two migrations that previously
-had no SQL anywhere in this document (`saved_items.display_name` and the Save V2
-search indexes) now carry it verbatim in §31.3.
+This section answers one operational question: **what exactly does the owner
+paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
+complete ordered setup: the canonical reconciliation snapshot first, then the
+four pending migrations, in one fenced block. There is no "step 0", no second
+block to paste and no shell workflow. Open this section, copy §31.3, paste it
+into the Supabase SQL Editor as `postgres` and run it.
 
-### 31.1 Audit — every required migration, its objects, and where its SQL lives
+### 31.1 Audit — every required migration, its objects, and its SQL
 
-| Order | Migration (`supabase/migrations/`) | Objects it establishes | Authoritative SQL in this document |
+| Order | Migration (`supabase/migrations/`) | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
-| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§30.5** — byte-identical to the migration and to `supabase/canonical_bootstrap.sql` |
-| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§29.10** (identical to **step A** of §31.3) |
-| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§29.14** (identical to **step B** of §31.3) |
-| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3 step C** — this document carried no SQL for it before this section |
-| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3 step D** — this document carried no SQL for it before this section |
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 5** — the complete canonical reconciliation SQL, physically inside the one deployment block |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 5** (the object contract is also documented in §29.10) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 5** (documented in §29.14) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 5** |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 5** |
 
 No migration file is rewritten, renamed or superseded by this section. The SQL of
-§31.3 is transcribed from those five files, and `tests/test_database_setup_order.py`
-pins every statement of it back to the file it came from, so the combined block
-cannot drift from the migrations.
+§31.3 is transcribed statement-for-statement from those five files (their prose
+comment headers are dropped so the artifact is pure executable SQL; see §31.3),
+and `tests/test_database_setup_order.py` pins every statement of it back to the
+file it came from, so the combined block cannot drift from the migrations.
 
 ### 31.2 The order, and why it is this order (source-proven)
 
-1. **The reconciliation snapshot runs first.** It is the only thing that creates
-   `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the AI tables and
-   the two task tables, and it is where every canonical column, the four
-   `ai_config` columns and the drifted `panel_settings`/`bot_settings` columns are
-   re-established (§30.2, §30.4). Everything after it either writes into those
-   tables (steps B, C, D) or is independent of them (step A).
-2. **Vault PART 1 before Vault PART 2.** PART 2 adds five functions that read
-   `public.api_credentials` and the PART 1 resolution boundary; it creates no table
-   of its own. Applied in the wrong order, PART 2 leaves five `SECURITY DEFINER`
-   functions whose bodies reference a table that does not exist yet, and the
-   credential surface exists without its resolution boundary.
-3. **`display_name` before the search indexes — the one dependency the requested
-   order omitted.** `20260922000001` executes
+1. **The reconciliation snapshot runs first (part 1 of 5).** It is the only thing
+   that creates `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the
+   AI tables and the two task tables, and it is where every canonical column, the
+   four `ai_config` columns and the drifted `panel_settings`/`bot_settings`
+   columns are re-established (§30.2, §30.4). Everything after it either writes
+   into those tables (parts 4–5) or is independent of them (parts 2–3).
+2. **Vault PART 1 before Vault PART 2 (parts 2–3).** PART 2 adds five functions
+   that read `public.api_credentials` and the PART 1 resolution boundary; it
+   creates no table of its own. Applied in the wrong order, PART 2 leaves five
+   `SECURITY DEFINER` functions whose bodies reference a table that does not exist
+   yet, and the credential surface exists without its resolution boundary.
+3. **`display_name` before the search indexes (part 4 before part 5) — the one
+   dependency the requested order omitted.** `20260922000001` executes
    `CREATE INDEX … ON saved_items USING gin (display_name gin_trgm_ops)`, and
    `display_name` is created by `20260921000001`, **not** by the reconciliation
    snapshot: §30.4 records explicitly that the snapshot predates the column and
    that `saved_items.display_name` is added afterwards by that additive migration.
-   On a database that has applied steps 1–3 but not step C, the index statement
-   fails with `ERROR: 42703: column "display_name" does not exist`. The
-   display-name migration is therefore applied immediately before the index
-   migration, and **nothing else in the requested order moves**.
+   On a database that has the snapshot but not the display-name migration, the
+   index statement fails with `ERROR: 42703: column "display_name" does not
+   exist`. The display-name migration is therefore placed immediately before the
+   index migration, and **nothing else in the requested order moves**.
 4. **The vault objects and the Save V2 objects are independent of each other.**
    The vault migrations never reference `saved_items`, and the Save V2 migrations
    never reference `api_credentials`, `vault.*` or either RPC — §29.19 and §30.7.5
    record both boundaries. Their relative order only has to satisfy rule 2 (inside
-   the vault pair) and rule 3 (inside the Save V2 pair); this document keeps the
+   the vault pair) and rule 3 (inside the Save V2 pair); the block keeps the
    requested order so the sequence stays deterministic.
-5. **Every statement is idempotent.** Re-running any step — or the whole block —
+5. **Every statement is idempotent.** Re-running any part — or the whole block —
    is a no-op rather than an error, and the two Save V2 migrations are each safe
-   on any database that already has `saved_items`. Nothing below rewrites a row, a
-   column or an existing value, and nothing below creates a Vault secret.
+   on any database that already has `saved_items`. Nothing in the block rewrites a
+   row, a column or an existing value (the reconciliation's only `UPDATE`s are
+   deterministic backfills of a column that was just added or was `NULL`), and
+   nothing in it creates a Vault secret.
 
-> **Deviation from the requested order, recorded honestly.** The requested set
-> named four files, with the canonical reconciliation first and the Save V2 search
+> **The order is repository-proven, recorded honestly.** The requested set named
+> four files, with the canonical reconciliation first and the Save V2 search
 > indexes last. The source proves that the search-index migration depends on a
 > fifth file — `20260921000001_add_saved_items_display_name.sql` — which was not in
-> the set, and that applying the index without the column fails. The block below
-> therefore applies five migrations, with the display-name migration placed
+> the set, and that applying the index without the column fails. The single block
+> therefore contains five migrations, with the display-name migration placed
 > immediately before the index migration and every other position unchanged. This
 > is the repository-proven order; it is the only change this audit made to the
 > requested sequence.
 
-### 31.3 Paste-ready artifacts — the ordered sequence
+### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT
 
-**Order, in ONE SQL Editor session as `postgres`:**
+Copy the entire SQL block below and paste it into the Supabase SQL Editor as
+`postgres`. This block contains the complete ordered setup. No other SQL block in
+this document needs to be executed manually.
 
-1. **Step 0 — the canonical snapshot** = the complete block in §30.5. It is
-   deliberately **not** duplicated inside the block below: that script is
-   byte-frozen, it exists in exactly three byte-identical copies (the migration,
-   `supabase/canonical_bootstrap.sql` and the §30 block), and that
-   "exactly one embed" property is pinned by
-   `test_the_three_copies_of_the_canonical_script_are_byte_identical`. Paste it
-   first; alone it converges any database — fresh, partially migrated or already
-   canonical — onto the canonical schema.
-2. **Steps A–D — the block below.** Paste it immediately after step 0, in the same
-   session, as one batch.
-
-For an owner who prefers a single byte-exact file over two pastes, the equivalent
-one-blob artifact is the concatenation of the five migration files, which needs no
-editing and cannot drift:
-
-```bash
-cat supabase/migrations/20260920000001_reconcile_canonical_schema.sql \
-    supabase/migrations/20260919000001_create_api_credential_vault.sql \
-    supabase/migrations/20260919000002_credential_vault_management.sql \
-    supabase/migrations/20260921000001_add_saved_items_display_name.sql \
-    supabase/migrations/20260922000001_add_saved_items_search_indexes.sql \
-    > lifeos_canonical_setup.sql
-```
-
-Every statement in the block below is transcribed from the migration named in its
-step banner. The migrations' own `/* … */` prose headers are the documentation of
-§29.10, §29.14 and §30 and of the files themselves, so they are not repeated here;
-the `--` banner and inline comments that sit inside the executable text are kept
-verbatim.
+The block is the five migrations' executable SQL concatenated in order, with a
+part banner before each and the migrations' prose comments removed so the whole
+artifact is pure, runnable SQL. Every statement is verbatim from its migration,
+and `tests/test_database_setup_order.py` pins each one back to the file it came
+from. It is idempotent and additive: no row, column or existing value is rewritten
+and no Vault secret is created.
 
 ```sql
 -- ============================================================================
--- LifeOS — canonical database setup, steps A–D (DATABASE_ARCHITECTURE.md §31.3)
+-- LifeOS — ONE COMPLETE SUPABASE SETUP SCRIPT (DATABASE_ARCHITECTURE.md §31.3)
 --
--- Paste this WHOLE block, in one SQL Editor session, as `postgres`, immediately
--- AFTER the canonical reconciliation block of §30.5 (step 0).
+-- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
+-- It is the complete ordered setup: the canonical reconciliation snapshot first,
+-- then the four pending migrations.
 --
--- Transcribed verbatim from:
---   A  supabase/migrations/20260919000001_create_api_credential_vault.sql
---   B  supabase/migrations/20260919000002_credential_vault_management.sql
---   C  supabase/migrations/20260921000001_add_saved_items_display_name.sql
---   D  supabase/migrations/20260922000001_add_saved_items_search_indexes.sql
+-- Order (source-derived from supabase/migrations/):
+--   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
+--   2. 20260919000001_create_api_credential_vault.sql    (Vault PART 1)
+--   3. 20260919000002_credential_vault_management.sql    (Vault PART 2)
+--   4. 20260921000001_add_saved_items_display_name.sql   (Save V2 column)
+--   5. 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes)
 --
--- Pinned to those files by tests/test_database_setup_order.py. Idempotent and
--- additive: no row, no column and no existing value is rewritten, and no Vault
--- secret is created by any statement here.
+-- Idempotent and additive: no row, column or existing value is rewritten and no
+-- Vault secret is created. Every statement is verbatim from its migration; the
+-- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── STEP A — 20260919000001_create_api_credential_vault.sql ───────────────
+-- ─── PART 1 of 5 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
--- ============================================================================
--- 1. Supabase Vault — the ONLY place a raw secret may live
--- ============================================================================
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS saved_items (
+    id              bigserial    PRIMARY KEY,
+    save_code       text         NOT NULL UNIQUE,
+    save_type       text         NOT NULL DEFAULT 'forward',
+    origin_chat_id  bigint,
+    origin_msg_id   bigint,
+    saved_chat_id   bigint,
+    saved_msg_id    bigint,
+    sender_name     text,
+    sender_id       bigint,
+    mime_type       text,
+    file_id         text,
+    file_size       bigint,
+    media_type      text,
+    tags            text[]       DEFAULT '{}',
+    caption         text,
+    file_name       text,
+    short_code      text,
+    owner_id        bigint       NOT NULL,
+    created_at      timestamptz  DEFAULT now()
+);
+
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS id              bigserial;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS save_code       text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS save_type       text        NOT NULL DEFAULT 'forward';
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS origin_chat_id  bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS origin_msg_id   bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS saved_chat_id   bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS saved_msg_id    bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS sender_name     text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS sender_id       bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS mime_type       text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_id         text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_size       bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS media_type      text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS tags            text[]      DEFAULT '{}';
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS caption         text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_name       text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS short_code      text;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS owner_id        bigint;
+ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
+
+UPDATE saved_items SET save_code  = 'S' || lpad(id::text, 4, '0') WHERE save_code  IS NULL;
+UPDATE saved_items SET save_type  = 'forward'  WHERE save_type  IS NULL;
+UPDATE saved_items SET tags       = '{}'       WHERE tags       IS NULL;
+UPDATE saved_items SET created_at = now()      WHERE created_at IS NULL;
+UPDATE saved_items SET owner_id   = 0          WHERE owner_id   IS NULL;
+
+ALTER TABLE saved_items ALTER COLUMN save_type  SET DEFAULT 'forward';
+ALTER TABLE saved_items ALTER COLUMN tags       SET DEFAULT '{}';
+ALTER TABLE saved_items ALTER COLUMN created_at SET DEFAULT now();
+
+ALTER TABLE saved_items ALTER COLUMN save_code SET NOT NULL;
+ALTER TABLE saved_items ALTER COLUMN save_type SET NOT NULL;
+ALTER TABLE saved_items ALTER COLUMN owner_id  SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_saved_items_owner          ON saved_items (owner_id);
+CREATE INDEX IF NOT EXISTS idx_saved_items_save_code      ON saved_items (save_code);
+CREATE INDEX IF NOT EXISTS idx_saved_items_created_at     ON saved_items (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_saved_items_owner_created  ON saved_items (owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_saved_items_caption_trgm   ON saved_items USING gin (caption gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_file_name_trgm ON saved_items USING gin (file_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_save_code_trgm ON saved_items USING gin (save_code gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_short_code_trgm ON saved_items USING gin (short_code gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_saved_items_mime_trgm      ON saved_items USING gin (mime_type gin_trgm_ops);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_saved_items_short_code') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM saved_items
+            WHERE short_code IS NOT NULL
+            GROUP BY short_code HAVING count(*) > 1
+        ) THEN
+            CREATE UNIQUE INDEX idx_saved_items_short_code
+                ON saved_items (short_code) WHERE short_code IS NOT NULL;
+        ELSE
+            RAISE WARNING 'saved_items: idx_saved_items_short_code NOT created - duplicate non-NULL short_code values exist. Resolve them and re-run this script.';
+        END IF;
+    END IF;
+END $$;
+
+ALTER TABLE saved_items ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_saved_items" ON saved_items;
+DROP POLICY IF EXISTS "anon_update_saved_items" ON saved_items;
+DROP POLICY IF EXISTS "anon_delete_saved_items" ON saved_items;
+DROP POLICY IF EXISTS "anon_select_saved_items" ON saved_items;
+CREATE POLICY "anon_select_saved_items" ON saved_items FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS bio_state (
+    id           bigserial    PRIMARY KEY,
+    owner_id     bigint       NOT NULL UNIQUE,
+    template     text         NOT NULL DEFAULT '🕒 {time} | 💭 {mood}',
+    mood         text         NOT NULL DEFAULT '😊',
+    custom_text  text         NOT NULL DEFAULT '',
+    is_active    boolean      NOT NULL DEFAULT false,
+    last_bio     text         NOT NULL DEFAULT '',
+    updated_at   timestamptz  DEFAULT now()
+);
+
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS id          bigserial;
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS template    text        NOT NULL DEFAULT '🕒 {time} | 💭 {mood}';
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS mood        text        NOT NULL DEFAULT '😊';
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS custom_text text        NOT NULL DEFAULT '';
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS is_active   boolean     NOT NULL DEFAULT false;
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS last_bio    text        NOT NULL DEFAULT '';
+ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS updated_at  timestamptz DEFAULT now();
+
+UPDATE bio_state SET owner_id    = 0                       WHERE owner_id    IS NULL;
+UPDATE bio_state SET template    = '🕒 {time} | 💭 {mood}' WHERE template    IS NULL;
+UPDATE bio_state SET mood        = '😊'                    WHERE mood        IS NULL;
+UPDATE bio_state SET custom_text = ''                      WHERE custom_text IS NULL;
+UPDATE bio_state SET is_active   = false                   WHERE is_active   IS NULL;
+UPDATE bio_state SET last_bio    = ''                      WHERE last_bio    IS NULL;
+UPDATE bio_state SET updated_at  = now()                   WHERE updated_at  IS NULL;
+
+ALTER TABLE bio_state ALTER COLUMN template    SET DEFAULT '🕒 {time} | 💭 {mood}';
+ALTER TABLE bio_state ALTER COLUMN mood        SET DEFAULT '😊';
+ALTER TABLE bio_state ALTER COLUMN custom_text SET DEFAULT '';
+ALTER TABLE bio_state ALTER COLUMN is_active   SET DEFAULT false;
+ALTER TABLE bio_state ALTER COLUMN last_bio    SET DEFAULT '';
+ALTER TABLE bio_state ALTER COLUMN updated_at  SET DEFAULT now();
+
+ALTER TABLE bio_state ALTER COLUMN owner_id    SET NOT NULL;
+ALTER TABLE bio_state ALTER COLUMN template    SET NOT NULL;
+ALTER TABLE bio_state ALTER COLUMN mood        SET NOT NULL;
+ALTER TABLE bio_state ALTER COLUMN custom_text SET NOT NULL;
+ALTER TABLE bio_state ALTER COLUMN is_active   SET NOT NULL;
+ALTER TABLE bio_state ALTER COLUMN last_bio    SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_bio_state_owner ON bio_state (owner_id);
+
+ALTER TABLE bio_state ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_bio_state" ON bio_state;
+DROP POLICY IF EXISTS "anon_update_bio_state" ON bio_state;
+DROP POLICY IF EXISTS "anon_delete_bio_state" ON bio_state;
+DROP POLICY IF EXISTS "anon_select_bio_state" ON bio_state;
+CREATE POLICY "anon_select_bio_state" ON bio_state FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS username_state (
+    id           bigserial    PRIMARY KEY,
+    owner_id     bigint       NOT NULL UNIQUE,
+    template     text         NOT NULL DEFAULT '{time} | {mood}',
+    mood         text         NOT NULL DEFAULT '😊',
+    custom_text  text         NOT NULL DEFAULT '',
+    is_active    boolean      NOT NULL DEFAULT false,
+    last_name    text         NOT NULL DEFAULT '',
+    updated_at   timestamptz  DEFAULT now()
+);
+
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS id          bigserial;
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS template    text        NOT NULL DEFAULT '{time} | {mood}';
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS mood        text        NOT NULL DEFAULT '😊';
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS custom_text text        NOT NULL DEFAULT '';
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS is_active   boolean     NOT NULL DEFAULT false;
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS last_name   text        NOT NULL DEFAULT '';
+ALTER TABLE username_state ADD COLUMN IF NOT EXISTS updated_at  timestamptz DEFAULT now();
+
+UPDATE username_state SET owner_id    = 0                 WHERE owner_id    IS NULL;
+UPDATE username_state SET template    = '{time} | {mood}' WHERE template    IS NULL;
+UPDATE username_state SET mood        = '😊'              WHERE mood        IS NULL;
+UPDATE username_state SET custom_text = ''                WHERE custom_text IS NULL;
+UPDATE username_state SET is_active   = false             WHERE is_active   IS NULL;
+UPDATE username_state SET last_name   = ''                WHERE last_name   IS NULL;
+UPDATE username_state SET updated_at  = now()             WHERE updated_at  IS NULL;
+
+ALTER TABLE username_state ALTER COLUMN template    SET DEFAULT '{time} | {mood}';
+ALTER TABLE username_state ALTER COLUMN mood        SET DEFAULT '😊';
+ALTER TABLE username_state ALTER COLUMN custom_text SET DEFAULT '';
+ALTER TABLE username_state ALTER COLUMN is_active   SET DEFAULT false;
+ALTER TABLE username_state ALTER COLUMN last_name   SET DEFAULT '';
+ALTER TABLE username_state ALTER COLUMN updated_at  SET DEFAULT now();
+
+ALTER TABLE username_state ALTER COLUMN owner_id    SET NOT NULL;
+ALTER TABLE username_state ALTER COLUMN template    SET NOT NULL;
+ALTER TABLE username_state ALTER COLUMN mood        SET NOT NULL;
+ALTER TABLE username_state ALTER COLUMN custom_text SET NOT NULL;
+ALTER TABLE username_state ALTER COLUMN is_active   SET NOT NULL;
+ALTER TABLE username_state ALTER COLUMN last_name   SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_username_state_owner ON username_state (owner_id);
+
+ALTER TABLE username_state ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_username_state" ON username_state;
+DROP POLICY IF EXISTS "anon_update_username_state" ON username_state;
+DROP POLICY IF EXISTS "anon_delete_username_state" ON username_state;
+DROP POLICY IF EXISTS "anon_select_username_state" ON username_state;
+CREATE POLICY "anon_select_username_state" ON username_state FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS bot_logs (
+    id         bigserial    PRIMARY KEY,
+    owner_id   bigint       NOT NULL,
+    level      text         NOT NULL DEFAULT 'INFO',
+    message    text         NOT NULL,
+    context    jsonb        DEFAULT '{}',
+    created_at timestamptz  DEFAULT now()
+);
+
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS id         bigserial;
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS owner_id   bigint      NOT NULL DEFAULT 0;
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS level      text        NOT NULL DEFAULT 'INFO';
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS message    text;
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS context    jsonb       DEFAULT '{}';
+ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
+
+UPDATE bot_logs SET owner_id   = 0      WHERE owner_id   IS NULL;
+UPDATE bot_logs SET level      = 'INFO' WHERE level      IS NULL;
+UPDATE bot_logs SET message    = ''     WHERE message    IS NULL;
+UPDATE bot_logs SET context    = '{}'   WHERE context    IS NULL;
+UPDATE bot_logs SET created_at = now()  WHERE created_at IS NULL;
+
+ALTER TABLE bot_logs ALTER COLUMN level      SET DEFAULT 'INFO';
+ALTER TABLE bot_logs ALTER COLUMN context    SET DEFAULT '{}';
+ALTER TABLE bot_logs ALTER COLUMN created_at SET DEFAULT now();
+
+ALTER TABLE bot_logs ALTER COLUMN owner_id SET NOT NULL;
+ALTER TABLE bot_logs ALTER COLUMN level    SET NOT NULL;
+ALTER TABLE bot_logs ALTER COLUMN message  SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_bot_logs_owner      ON bot_logs (owner_id);
+CREATE INDEX IF NOT EXISTS idx_bot_logs_created_at ON bot_logs (created_at DESC);
+
+ALTER TABLE bot_logs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_bot_logs" ON bot_logs;
+DROP POLICY IF EXISTS "anon_update_bot_logs" ON bot_logs;
+DROP POLICY IF EXISTS "anon_delete_bot_logs" ON bot_logs;
+DROP POLICY IF EXISTS "anon_select_bot_logs" ON bot_logs;
+CREATE POLICY "anon_select_bot_logs" ON bot_logs FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS panel_settings (
+    key                          text        PRIMARY KEY,
+    auto_close_enabled           boolean     NOT NULL DEFAULT true,
+    auto_close_delay             integer     NOT NULL DEFAULT 120,
+    max_deep_save_mb             integer     NOT NULL DEFAULT 50,
+    delete_batch_size            integer     NOT NULL DEFAULT 100,
+    log_retention_days           integer     NOT NULL DEFAULT 7,
+    panel_timeout_seconds        integer     NOT NULL DEFAULT 300,
+    allow_multiple_panels        boolean     NOT NULL DEFAULT false,
+    reuse_existing_panel         boolean     NOT NULL DEFAULT true,
+    language                     text        NOT NULL DEFAULT 'en',
+    debug_callbacks              boolean     NOT NULL DEFAULT false,
+    owner_only                   boolean     NOT NULL DEFAULT true,
+    dashboard_font               text        NOT NULL DEFAULT 'default',
+    update_stale_seconds         integer     NOT NULL DEFAULT 300,
+    ghost_seen_retention_seconds bigint      NOT NULL DEFAULT 2592000,
+    updated_at                   timestamptz DEFAULT now()
+);
+
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS key                          text;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_close_enabled           boolean     NOT NULL DEFAULT true;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_close_delay             integer     NOT NULL DEFAULT 120;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS max_deep_save_mb             integer     NOT NULL DEFAULT 50;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS delete_batch_size            integer     NOT NULL DEFAULT 100;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS log_retention_days           integer     NOT NULL DEFAULT 7;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS panel_timeout_seconds        integer     NOT NULL DEFAULT 300;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS allow_multiple_panels        boolean     NOT NULL DEFAULT false;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS reuse_existing_panel         boolean     NOT NULL DEFAULT true;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS language                     text        NOT NULL DEFAULT 'en';
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS debug_callbacks              boolean     NOT NULL DEFAULT false;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS owner_only                   boolean     NOT NULL DEFAULT true;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS dashboard_font               text        NOT NULL DEFAULT 'default';
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS update_stale_seconds         integer     NOT NULL DEFAULT 300;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS ghost_seen_retention_seconds bigint      NOT NULL DEFAULT 2592000;
+ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS updated_at                   timestamptz DEFAULT now();
+
+UPDATE panel_settings SET auto_close_enabled           = true      WHERE auto_close_enabled           IS NULL;
+UPDATE panel_settings SET auto_close_delay             = 120       WHERE auto_close_delay             IS NULL;
+UPDATE panel_settings SET max_deep_save_mb             = 50        WHERE max_deep_save_mb             IS NULL;
+UPDATE panel_settings SET delete_batch_size            = 100       WHERE delete_batch_size            IS NULL;
+UPDATE panel_settings SET log_retention_days           = 7         WHERE log_retention_days           IS NULL;
+UPDATE panel_settings SET panel_timeout_seconds        = 300       WHERE panel_timeout_seconds        IS NULL;
+UPDATE panel_settings SET allow_multiple_panels        = false     WHERE allow_multiple_panels        IS NULL;
+UPDATE panel_settings SET reuse_existing_panel         = true      WHERE reuse_existing_panel         IS NULL;
+UPDATE panel_settings SET language                     = 'en'      WHERE language                     IS NULL;
+UPDATE panel_settings SET debug_callbacks              = false     WHERE debug_callbacks              IS NULL;
+UPDATE panel_settings SET owner_only                   = true      WHERE owner_only                   IS NULL;
+UPDATE panel_settings SET dashboard_font               = 'default' WHERE dashboard_font               IS NULL;
+UPDATE panel_settings SET update_stale_seconds         = 300       WHERE update_stale_seconds         IS NULL;
+UPDATE panel_settings SET ghost_seen_retention_seconds = 2592000   WHERE ghost_seen_retention_seconds IS NULL;
+UPDATE panel_settings SET updated_at                   = now()     WHERE updated_at                   IS NULL;
+
+ALTER TABLE panel_settings ALTER COLUMN auto_close_enabled           SET DEFAULT true;
+ALTER TABLE panel_settings ALTER COLUMN auto_close_delay             SET DEFAULT 120;
+ALTER TABLE panel_settings ALTER COLUMN max_deep_save_mb             SET DEFAULT 50;
+ALTER TABLE panel_settings ALTER COLUMN delete_batch_size            SET DEFAULT 100;
+ALTER TABLE panel_settings ALTER COLUMN log_retention_days           SET DEFAULT 7;
+ALTER TABLE panel_settings ALTER COLUMN panel_timeout_seconds        SET DEFAULT 300;
+ALTER TABLE panel_settings ALTER COLUMN allow_multiple_panels        SET DEFAULT false;
+ALTER TABLE panel_settings ALTER COLUMN reuse_existing_panel         SET DEFAULT true;
+ALTER TABLE panel_settings ALTER COLUMN language                     SET DEFAULT 'en';
+ALTER TABLE panel_settings ALTER COLUMN debug_callbacks              SET DEFAULT false;
+ALTER TABLE panel_settings ALTER COLUMN owner_only                   SET DEFAULT true;
+ALTER TABLE panel_settings ALTER COLUMN dashboard_font               SET DEFAULT 'default';
+ALTER TABLE panel_settings ALTER COLUMN update_stale_seconds         SET DEFAULT 300;
+ALTER TABLE panel_settings ALTER COLUMN ghost_seen_retention_seconds SET DEFAULT 2592000;
+ALTER TABLE panel_settings ALTER COLUMN updated_at                   SET DEFAULT now();
+
+ALTER TABLE panel_settings ALTER COLUMN auto_close_enabled           SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN auto_close_delay             SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN max_deep_save_mb             SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN delete_batch_size            SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN log_retention_days           SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN panel_timeout_seconds        SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN allow_multiple_panels        SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN reuse_existing_panel         SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN language                     SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN debug_callbacks              SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN owner_only                   SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN dashboard_font               SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN update_stale_seconds         SET NOT NULL;
+ALTER TABLE panel_settings ALTER COLUMN ghost_seen_retention_seconds SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_auto_close_delay_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE auto_close_delay IS NULL OR auto_close_delay NOT BETWEEN 5 AND 3600) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_auto_close_delay_check
+                CHECK (auto_close_delay BETWEEN 5 AND 3600);
+        ELSE
+            RAISE WARNING 'panel_settings_auto_close_delay_check NOT added - % row(s) have auto_close_delay outside 5..3600.',
+                (SELECT count(*) FROM panel_settings WHERE auto_close_delay IS NULL OR auto_close_delay NOT BETWEEN 5 AND 3600);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_max_deep_save_mb_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE max_deep_save_mb IS NULL OR max_deep_save_mb NOT BETWEEN 1 AND 500) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_max_deep_save_mb_check
+                CHECK (max_deep_save_mb BETWEEN 1 AND 500);
+        ELSE
+            RAISE WARNING 'panel_settings_max_deep_save_mb_check NOT added - % row(s) have max_deep_save_mb outside 1..500.',
+                (SELECT count(*) FROM panel_settings WHERE max_deep_save_mb IS NULL OR max_deep_save_mb NOT BETWEEN 1 AND 500);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_delete_batch_size_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE delete_batch_size IS NULL OR delete_batch_size NOT BETWEEN 1 AND 1000) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_delete_batch_size_check
+                CHECK (delete_batch_size BETWEEN 1 AND 1000);
+        ELSE
+            RAISE WARNING 'panel_settings_delete_batch_size_check NOT added - % row(s) have delete_batch_size outside 1..1000.',
+                (SELECT count(*) FROM panel_settings WHERE delete_batch_size IS NULL OR delete_batch_size NOT BETWEEN 1 AND 1000);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_log_retention_days_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE log_retention_days IS NULL OR log_retention_days NOT BETWEEN 1 AND 365) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_log_retention_days_check
+                CHECK (log_retention_days BETWEEN 1 AND 365);
+        ELSE
+            RAISE WARNING 'panel_settings_log_retention_days_check NOT added - % row(s) have log_retention_days outside 1..365.',
+                (SELECT count(*) FROM panel_settings WHERE log_retention_days IS NULL OR log_retention_days NOT BETWEEN 1 AND 365);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_panel_timeout_seconds_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE panel_timeout_seconds IS NULL OR panel_timeout_seconds NOT BETWEEN 30 AND 86400) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_panel_timeout_seconds_check
+                CHECK (panel_timeout_seconds BETWEEN 30 AND 86400);
+        ELSE
+            RAISE WARNING 'panel_settings_panel_timeout_seconds_check NOT added - % row(s) have panel_timeout_seconds outside 30..86400.',
+                (SELECT count(*) FROM panel_settings WHERE panel_timeout_seconds IS NULL OR panel_timeout_seconds NOT BETWEEN 30 AND 86400);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_language_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE language IS NULL OR length(btrim(language)) = 0) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_language_check
+                CHECK (length(btrim(language)) > 0);
+        ELSE
+            RAISE WARNING 'panel_settings_language_check NOT added - % row(s) have a blank language.',
+                (SELECT count(*) FROM panel_settings WHERE language IS NULL OR length(btrim(language)) = 0);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_dashboard_font_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE dashboard_font IS NULL OR dashboard_font NOT IN (
+                'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
+                'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
+                'script', 'script_bold', 'fraktur', 'fraktur_bold',
+                'double_struck', 'mono', 'small_caps', 'circled',
+                'circled_dark', 'fullwidth', 'parenthesized', 'underline',
+                'strikethrough', 'overline', 'wavy_underline'
+            )) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_dashboard_font_check
+                CHECK (dashboard_font IN (
+                    'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
+                    'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
+                    'script', 'script_bold', 'fraktur', 'fraktur_bold',
+                    'double_struck', 'mono', 'small_caps', 'circled',
+                    'circled_dark', 'fullwidth', 'parenthesized', 'underline',
+                    'strikethrough', 'overline', 'wavy_underline'
+                ));
+        ELSE
+            RAISE WARNING 'panel_settings_dashboard_font_check NOT added - % row(s) have a dashboard_font outside the 23-key list.',
+                (SELECT count(*) FROM panel_settings WHERE dashboard_font IS NULL OR dashboard_font NOT IN (
+                    'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
+                    'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
+                    'script', 'script_bold', 'fraktur', 'fraktur_bold',
+                    'double_struck', 'mono', 'small_caps', 'circled',
+                    'circled_dark', 'fullwidth', 'parenthesized', 'underline',
+                    'strikethrough', 'overline', 'wavy_underline'
+                ));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_ghost_seen_retention_seconds_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE ghost_seen_retention_seconds IS NULL
+                       OR NOT (ghost_seen_retention_seconds = 0
+                               OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000)) THEN
+            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_ghost_seen_retention_seconds_check
+                CHECK (ghost_seen_retention_seconds = 0
+                       OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000);
+        ELSE
+            RAISE WARNING 'panel_settings_ghost_seen_retention_seconds_check NOT added - % row(s) have an out-of-range retention window.',
+                (SELECT count(*) FROM panel_settings WHERE ghost_seen_retention_seconds IS NULL
+                   OR NOT (ghost_seen_retention_seconds = 0
+                           OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000));
+        END IF;
+    END IF;
+END $$;
+
+INSERT INTO panel_settings (key) VALUES ('global')
+ON CONFLICT DO NOTHING;
+
+ALTER TABLE panel_settings ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_panel_settings" ON panel_settings;
+DROP POLICY IF EXISTS "anon_update_panel_settings" ON panel_settings;
+DROP POLICY IF EXISTS "anon_delete_panel_settings" ON panel_settings;
+DROP POLICY IF EXISTS "anon_select_panel_settings" ON panel_settings;
+CREATE POLICY "anon_select_panel_settings" ON panel_settings FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key         text        PRIMARY KEY,
+    value       text        NOT NULL,
+    value_type  text        NOT NULL DEFAULT 'str',
+    updated_at  timestamptz DEFAULT now()
+);
+
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS key        text;
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS value      text;
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS value_type text        NOT NULL DEFAULT 'str';
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+
+UPDATE bot_settings SET value      = ''    WHERE value      IS NULL;
+UPDATE bot_settings SET value_type = 'str' WHERE value_type IS NULL;
+UPDATE bot_settings SET updated_at = now() WHERE updated_at IS NULL;
+
+ALTER TABLE bot_settings ALTER COLUMN value_type SET DEFAULT 'str';
+ALTER TABLE bot_settings ALTER COLUMN updated_at SET DEFAULT now();
+
+ALTER TABLE bot_settings ALTER COLUMN value      SET NOT NULL;
+ALTER TABLE bot_settings ALTER COLUMN value_type SET NOT NULL;
+
+INSERT INTO bot_settings (key, value, value_type) VALUES
+    ('auto_close_enabled', 'true', 'bool'),
+    ('panel_auto_close_seconds', '120', 'int'),
+    ('max_deep_save_mb', '50', 'int'),
+    ('delete_batch_size', '100', 'int'),
+    ('log_cleanup_days', '7', 'int')
+ON CONFLICT DO NOTHING;
+
+ALTER TABLE bot_settings ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_bot_settings" ON bot_settings;
+DROP POLICY IF EXISTS "anon_update_bot_settings" ON bot_settings;
+DROP POLICY IF EXISTS "anon_delete_bot_settings" ON bot_settings;
+DROP POLICY IF EXISTS "anon_select_bot_settings" ON bot_settings;
+CREATE POLICY "anon_select_bot_settings" ON bot_settings FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_config (
+    id              bigserial    PRIMARY KEY,
+    owner_id        bigint       NOT NULL UNIQUE,
+    provider        text         DEFAULT '',
+    model           text         DEFAULT '',
+    temperature     real         DEFAULT 1.0,
+    max_tokens      integer      DEFAULT 4096,
+    system_prompt   text         DEFAULT '',
+    history_budget  integer      DEFAULT 4000,
+    is_configured   boolean      DEFAULT false,
+    trigger_en      text         DEFAULT NULL,
+    trigger_fa      text         DEFAULT NULL,
+    show_question   boolean      NOT NULL DEFAULT false,
+    stt_model       text         DEFAULT NULL,
+    stt_language    text         DEFAULT NULL,
+    stt_passes      integer      NOT NULL DEFAULT 1,
+    last_request_at timestamptz,
+    last_latency_ms real         DEFAULT 0,
+    created_at      timestamptz  DEFAULT now(),
+    updated_at      timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS id              bigserial;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS owner_id        bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS provider        text        DEFAULT '';
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS model           text        DEFAULT '';
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS temperature     real        DEFAULT 1.0;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS max_tokens      integer     DEFAULT 4096;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS system_prompt   text        DEFAULT '';
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS history_budget  integer     DEFAULT 4000;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS is_configured   boolean     DEFAULT false;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS trigger_en      text        DEFAULT NULL;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS trigger_fa      text        DEFAULT NULL;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS show_question   boolean     NOT NULL DEFAULT false;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_model       text        DEFAULT NULL;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_language    text        DEFAULT NULL;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_passes      integer     NOT NULL DEFAULT 1;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS last_request_at timestamptz;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS last_latency_ms real        DEFAULT 0;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS updated_at      timestamptz DEFAULT now();
+
+UPDATE ai_config SET owner_id        = 0     WHERE owner_id        IS NULL;
+UPDATE ai_config SET provider        = ''    WHERE provider        IS NULL;
+UPDATE ai_config SET model           = ''    WHERE model           IS NULL;
+UPDATE ai_config SET temperature     = 1.0   WHERE temperature     IS NULL;
+UPDATE ai_config SET max_tokens      = 4096  WHERE max_tokens      IS NULL;
+UPDATE ai_config SET system_prompt   = ''    WHERE system_prompt   IS NULL;
+UPDATE ai_config SET history_budget  = 4000  WHERE history_budget  IS NULL;
+UPDATE ai_config SET is_configured   = false WHERE is_configured   IS NULL;
+UPDATE ai_config SET show_question   = false WHERE show_question   IS NULL;
+UPDATE ai_config SET stt_passes      = 1     WHERE stt_passes      IS NULL;
+UPDATE ai_config SET last_latency_ms = 0     WHERE last_latency_ms IS NULL;
+UPDATE ai_config SET created_at      = now() WHERE created_at      IS NULL;
+UPDATE ai_config SET updated_at      = now() WHERE updated_at      IS NULL;
+
+ALTER TABLE ai_config ALTER COLUMN provider        SET DEFAULT '';
+ALTER TABLE ai_config ALTER COLUMN model           SET DEFAULT '';
+ALTER TABLE ai_config ALTER COLUMN temperature     SET DEFAULT 1.0;
+ALTER TABLE ai_config ALTER COLUMN max_tokens      SET DEFAULT 4096;
+ALTER TABLE ai_config ALTER COLUMN system_prompt   SET DEFAULT '';
+ALTER TABLE ai_config ALTER COLUMN history_budget  SET DEFAULT 4000;
+ALTER TABLE ai_config ALTER COLUMN is_configured   SET DEFAULT false;
+ALTER TABLE ai_config ALTER COLUMN show_question   SET DEFAULT false;
+ALTER TABLE ai_config ALTER COLUMN stt_passes      SET DEFAULT 1;
+ALTER TABLE ai_config ALTER COLUMN last_latency_ms SET DEFAULT 0;
+ALTER TABLE ai_config ALTER COLUMN created_at      SET DEFAULT now();
+ALTER TABLE ai_config ALTER COLUMN updated_at      SET DEFAULT now();
+
+ALTER TABLE ai_config ALTER COLUMN owner_id      SET NOT NULL;
+ALTER TABLE ai_config ALTER COLUMN show_question SET NOT NULL;
+ALTER TABLE ai_config ALTER COLUMN stt_passes    SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_config_stt_passes_range') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_config WHERE stt_passes IS NULL OR stt_passes NOT BETWEEN 1 AND 3) THEN
+            ALTER TABLE ai_config ADD CONSTRAINT ai_config_stt_passes_range
+                CHECK (stt_passes BETWEEN 1 AND 3);
+        ELSE
+            RAISE WARNING 'ai_config_stt_passes_range NOT added - % row(s) have stt_passes outside 1..3.',
+                (SELECT count(*) FROM ai_config WHERE stt_passes IS NULL OR stt_passes NOT BETWEEN 1 AND 3);
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_config_owner ON ai_config (owner_id);
+
+ALTER TABLE ai_config ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_config" ON ai_config;
+DROP POLICY IF EXISTS "anon_update_ai_config" ON ai_config;
+DROP POLICY IF EXISTS "anon_delete_ai_config" ON ai_config;
+DROP POLICY IF EXISTS "anon_select_ai_config" ON ai_config;
+CREATE POLICY "anon_select_ai_config" ON ai_config FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_sessions (
+    id            bigserial    PRIMARY KEY,
+    session_id    text         NOT NULL UNIQUE,
+    owner_id      bigint       NOT NULL,
+    provider      text         DEFAULT '',
+    model         text         DEFAULT '',
+    status        text         DEFAULT 'active',
+    total_tokens  integer      DEFAULT 0,
+    message_count integer      DEFAULT 0,
+    created_at    timestamptz  DEFAULT now(),
+    updated_at    timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS id            bigserial;
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS session_id    text;
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS owner_id      bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS provider      text        DEFAULT '';
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS model         text        DEFAULT '';
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS status        text        DEFAULT 'active';
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS total_tokens  integer     DEFAULT 0;
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS message_count integer     DEFAULT 0;
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS created_at    timestamptz DEFAULT now();
+ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS updated_at    timestamptz DEFAULT now();
+
+UPDATE ai_sessions SET session_id    = 'recovered-' || id WHERE session_id    IS NULL;
+UPDATE ai_sessions SET owner_id      = 0         WHERE owner_id      IS NULL;
+UPDATE ai_sessions SET provider      = ''        WHERE provider      IS NULL;
+UPDATE ai_sessions SET model         = ''        WHERE model         IS NULL;
+UPDATE ai_sessions SET status        = 'active'  WHERE status        IS NULL;
+UPDATE ai_sessions SET total_tokens  = 0         WHERE total_tokens  IS NULL;
+UPDATE ai_sessions SET message_count = 0         WHERE message_count IS NULL;
+UPDATE ai_sessions SET created_at    = now()     WHERE created_at    IS NULL;
+UPDATE ai_sessions SET updated_at    = now()     WHERE updated_at    IS NULL;
+
+ALTER TABLE ai_sessions ALTER COLUMN provider      SET DEFAULT '';
+ALTER TABLE ai_sessions ALTER COLUMN model         SET DEFAULT '';
+ALTER TABLE ai_sessions ALTER COLUMN status        SET DEFAULT 'active';
+ALTER TABLE ai_sessions ALTER COLUMN total_tokens  SET DEFAULT 0;
+ALTER TABLE ai_sessions ALTER COLUMN message_count SET DEFAULT 0;
+ALTER TABLE ai_sessions ALTER COLUMN created_at    SET DEFAULT now();
+ALTER TABLE ai_sessions ALTER COLUMN updated_at    SET DEFAULT now();
+
+ALTER TABLE ai_sessions ALTER COLUMN session_id SET NOT NULL;
+ALTER TABLE ai_sessions ALTER COLUMN owner_id   SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_sessions_status_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_sessions WHERE status IS NULL OR status NOT IN ('active', 'completed', 'error', 'closed')) THEN
+            ALTER TABLE ai_sessions ADD CONSTRAINT ai_sessions_status_check
+                CHECK (status IN ('active', 'completed', 'error', 'closed'));
+        ELSE
+            RAISE WARNING 'ai_sessions_status_check NOT added - % row(s) have an unrecognized status.',
+                (SELECT count(*) FROM ai_sessions WHERE status IS NULL OR status NOT IN ('active', 'completed', 'error', 'closed'));
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_owner      ON ai_sessions (owner_id);
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_session_id ON ai_sessions (session_id);
+
+ALTER TABLE ai_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_sessions" ON ai_sessions;
+DROP POLICY IF EXISTS "anon_update_ai_sessions" ON ai_sessions;
+DROP POLICY IF EXISTS "anon_delete_ai_sessions" ON ai_sessions;
+DROP POLICY IF EXISTS "anon_select_ai_sessions" ON ai_sessions;
+CREATE POLICY "anon_select_ai_sessions" ON ai_sessions FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id          bigserial    PRIMARY KEY,
+    session_id  text         NOT NULL,
+    owner_id    bigint       NOT NULL,
+    role        text         NOT NULL DEFAULT 'user',
+    content     text         NOT NULL DEFAULT '',
+    token_count integer      DEFAULT 0,
+    provider    text         DEFAULT '',
+    model       text         DEFAULT '',
+    created_at  timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS id          bigserial;
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS session_id  text;
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS role        text        NOT NULL DEFAULT 'user';
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS content     text        NOT NULL DEFAULT '';
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS token_count integer     DEFAULT 0;
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS provider    text        DEFAULT '';
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS model       text        DEFAULT '';
+ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now();
+
+UPDATE ai_messages SET session_id  = ''     WHERE session_id  IS NULL;
+UPDATE ai_messages SET owner_id    = 0      WHERE owner_id    IS NULL;
+UPDATE ai_messages SET role        = 'user' WHERE role        IS NULL;
+UPDATE ai_messages SET content     = ''     WHERE content     IS NULL;
+UPDATE ai_messages SET token_count = 0      WHERE token_count IS NULL;
+UPDATE ai_messages SET provider    = ''     WHERE provider    IS NULL;
+UPDATE ai_messages SET model       = ''     WHERE model       IS NULL;
+UPDATE ai_messages SET created_at  = now()  WHERE created_at  IS NULL;
+
+ALTER TABLE ai_messages ALTER COLUMN role        SET DEFAULT 'user';
+ALTER TABLE ai_messages ALTER COLUMN content     SET DEFAULT '';
+ALTER TABLE ai_messages ALTER COLUMN token_count SET DEFAULT 0;
+ALTER TABLE ai_messages ALTER COLUMN provider    SET DEFAULT '';
+ALTER TABLE ai_messages ALTER COLUMN model       SET DEFAULT '';
+ALTER TABLE ai_messages ALTER COLUMN created_at  SET DEFAULT now();
+
+ALTER TABLE ai_messages ALTER COLUMN session_id SET NOT NULL;
+ALTER TABLE ai_messages ALTER COLUMN owner_id   SET NOT NULL;
+ALTER TABLE ai_messages ALTER COLUMN role       SET NOT NULL;
+ALTER TABLE ai_messages ALTER COLUMN content    SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_messages_role_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_messages WHERE role IS NULL OR role NOT IN ('system', 'user', 'assistant', 'tool')) THEN
+            ALTER TABLE ai_messages ADD CONSTRAINT ai_messages_role_check
+                CHECK (role IN ('system', 'user', 'assistant', 'tool'));
+        ELSE
+            RAISE WARNING 'ai_messages_role_check NOT added - % row(s) have an unrecognized role.',
+                (SELECT count(*) FROM ai_messages WHERE role IS NULL OR role NOT IN ('system', 'user', 'assistant', 'tool'));
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages (session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_messages_owner   ON ai_messages (owner_id);
+CREATE INDEX IF NOT EXISTS idx_ai_messages_created ON ai_messages (created_at DESC);
+
+ALTER TABLE ai_messages ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_messages" ON ai_messages;
+DROP POLICY IF EXISTS "anon_update_ai_messages" ON ai_messages;
+DROP POLICY IF EXISTS "anon_delete_ai_messages" ON ai_messages;
+DROP POLICY IF EXISTS "anon_select_ai_messages" ON ai_messages;
+CREATE POLICY "anon_select_ai_messages" ON ai_messages FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_memories (
+    id          bigserial    PRIMARY KEY,
+    owner_id    bigint       NOT NULL,
+    tier        text         NOT NULL DEFAULT 'long',
+    category    text         NOT NULL DEFAULT 'context',
+    content     text         NOT NULL,
+    importance  real         DEFAULT 0.5,
+    expires_at  timestamptz,
+    metadata    jsonb        DEFAULT '{}',
+    created_at  timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS id         bigserial;
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS owner_id   bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS tier       text        NOT NULL DEFAULT 'long';
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS category   text        NOT NULL DEFAULT 'context';
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS content    text;
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS importance real        DEFAULT 0.5;
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS metadata   jsonb       DEFAULT '{}';
+ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
+
+UPDATE ai_memories SET owner_id   = 0         WHERE owner_id   IS NULL;
+UPDATE ai_memories SET tier       = 'long'    WHERE tier       IS NULL;
+UPDATE ai_memories SET category   = 'context' WHERE category   IS NULL;
+UPDATE ai_memories SET content    = ''        WHERE content    IS NULL;
+UPDATE ai_memories SET importance = 0.5       WHERE importance IS NULL;
+UPDATE ai_memories SET metadata   = '{}'      WHERE metadata   IS NULL;
+UPDATE ai_memories SET created_at = now()     WHERE created_at IS NULL;
+
+ALTER TABLE ai_memories ALTER COLUMN tier       SET DEFAULT 'long';
+ALTER TABLE ai_memories ALTER COLUMN category   SET DEFAULT 'context';
+ALTER TABLE ai_memories ALTER COLUMN importance SET DEFAULT 0.5;
+ALTER TABLE ai_memories ALTER COLUMN metadata   SET DEFAULT '{}';
+ALTER TABLE ai_memories ALTER COLUMN created_at SET DEFAULT now();
+
+ALTER TABLE ai_memories ALTER COLUMN owner_id SET NOT NULL;
+ALTER TABLE ai_memories ALTER COLUMN tier     SET NOT NULL;
+ALTER TABLE ai_memories ALTER COLUMN category SET NOT NULL;
+ALTER TABLE ai_memories ALTER COLUMN content  SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_memories_tier_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_memories WHERE tier IS NULL OR tier NOT IN ('short', 'long', 'permanent')) THEN
+            ALTER TABLE ai_memories ADD CONSTRAINT ai_memories_tier_check
+                CHECK (tier IN ('short', 'long', 'permanent'));
+        ELSE
+            RAISE WARNING 'ai_memories_tier_check NOT added - % row(s) have an unrecognized tier.',
+                (SELECT count(*) FROM ai_memories WHERE tier IS NULL OR tier NOT IN ('short', 'long', 'permanent'));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_memories_category_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_memories WHERE category IS NULL OR category NOT IN ('fact', 'preference', 'context', 'summary', 'instruction')) THEN
+            ALTER TABLE ai_memories ADD CONSTRAINT ai_memories_category_check
+                CHECK (category IN ('fact', 'preference', 'context', 'summary', 'instruction'));
+        ELSE
+            RAISE WARNING 'ai_memories_category_check NOT added - % row(s) have an unrecognized category.',
+                (SELECT count(*) FROM ai_memories WHERE category IS NULL OR category NOT IN ('fact', 'preference', 'context', 'summary', 'instruction'));
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_memories_owner      ON ai_memories (owner_id);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_tier       ON ai_memories (tier);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_owner_tier ON ai_memories (owner_id, tier);
+
+ALTER TABLE ai_memories ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_memories" ON ai_memories;
+DROP POLICY IF EXISTS "anon_update_ai_memories" ON ai_memories;
+DROP POLICY IF EXISTS "anon_delete_ai_memories" ON ai_memories;
+DROP POLICY IF EXISTS "anon_select_ai_memories" ON ai_memories;
+CREATE POLICY "anon_select_ai_memories" ON ai_memories FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_tool_history (
+    id             bigserial    PRIMARY KEY,
+    owner_id       bigint       NOT NULL,
+    session_id     text         DEFAULT '',
+    tool_name      text         NOT NULL,
+    arguments      jsonb        DEFAULT '{}',
+    result_success boolean      DEFAULT false,
+    result_message text         DEFAULT '',
+    result_data    jsonb        DEFAULT '{}',
+    latency_ms     real         DEFAULT 0,
+    created_at     timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS id             bigserial;
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS owner_id       bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS session_id     text        DEFAULT '';
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS tool_name      text;
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS arguments      jsonb       DEFAULT '{}';
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_success boolean     DEFAULT false;
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_message text        DEFAULT '';
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_data    jsonb       DEFAULT '{}';
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS latency_ms     real        DEFAULT 0;
+ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS created_at     timestamptz DEFAULT now();
+
+UPDATE ai_tool_history SET owner_id       = 0         WHERE owner_id       IS NULL;
+UPDATE ai_tool_history SET session_id     = ''        WHERE session_id     IS NULL;
+UPDATE ai_tool_history SET tool_name      = 'unknown' WHERE tool_name      IS NULL;
+UPDATE ai_tool_history SET arguments      = '{}'      WHERE arguments      IS NULL;
+UPDATE ai_tool_history SET result_success = false     WHERE result_success IS NULL;
+UPDATE ai_tool_history SET result_message = ''        WHERE result_message IS NULL;
+UPDATE ai_tool_history SET result_data    = '{}'      WHERE result_data    IS NULL;
+UPDATE ai_tool_history SET latency_ms     = 0         WHERE latency_ms     IS NULL;
+UPDATE ai_tool_history SET created_at     = now()     WHERE created_at     IS NULL;
+
+ALTER TABLE ai_tool_history ALTER COLUMN session_id     SET DEFAULT '';
+ALTER TABLE ai_tool_history ALTER COLUMN arguments      SET DEFAULT '{}';
+ALTER TABLE ai_tool_history ALTER COLUMN result_success SET DEFAULT false;
+ALTER TABLE ai_tool_history ALTER COLUMN result_message SET DEFAULT '';
+ALTER TABLE ai_tool_history ALTER COLUMN result_data    SET DEFAULT '{}';
+ALTER TABLE ai_tool_history ALTER COLUMN latency_ms     SET DEFAULT 0;
+ALTER TABLE ai_tool_history ALTER COLUMN created_at     SET DEFAULT now();
+
+ALTER TABLE ai_tool_history ALTER COLUMN owner_id  SET NOT NULL;
+ALTER TABLE ai_tool_history ALTER COLUMN tool_name SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ai_tool_history_owner   ON ai_tool_history (owner_id);
+CREATE INDEX IF NOT EXISTS idx_ai_tool_history_created ON ai_tool_history (created_at DESC);
+
+ALTER TABLE ai_tool_history ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_tool_history" ON ai_tool_history;
+DROP POLICY IF EXISTS "anon_update_ai_tool_history" ON ai_tool_history;
+DROP POLICY IF EXISTS "anon_delete_ai_tool_history" ON ai_tool_history;
+DROP POLICY IF EXISTS "anon_select_ai_tool_history" ON ai_tool_history;
+CREATE POLICY "anon_select_ai_tool_history" ON ai_tool_history FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_usage (
+    id                bigserial    PRIMARY KEY,
+    owner_id          bigint       NOT NULL,
+    session_id        text,
+    provider          text,
+    model             text,
+    prompt_tokens     integer      DEFAULT 0,
+    completion_tokens integer      DEFAULT 0,
+    total_tokens      integer      DEFAULT 0,
+    latency_ms        real         DEFAULT 0,
+    token_source      text         DEFAULT NULL,
+    created_at        timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS id                bigserial;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS owner_id          bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS session_id        text;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS provider          text;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS model             text;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS prompt_tokens     integer     DEFAULT 0;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS completion_tokens integer     DEFAULT 0;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS total_tokens      integer     DEFAULT 0;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS latency_ms        real        DEFAULT 0;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS token_source      text        DEFAULT NULL;
+ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS created_at        timestamptz DEFAULT now();
+
+UPDATE ai_usage SET owner_id          = 0     WHERE owner_id          IS NULL;
+UPDATE ai_usage SET prompt_tokens     = 0     WHERE prompt_tokens     IS NULL;
+UPDATE ai_usage SET completion_tokens = 0     WHERE completion_tokens IS NULL;
+UPDATE ai_usage SET total_tokens      = 0     WHERE total_tokens      IS NULL;
+UPDATE ai_usage SET latency_ms        = 0     WHERE latency_ms        IS NULL;
+UPDATE ai_usage SET created_at        = now() WHERE created_at        IS NULL;
+
+ALTER TABLE ai_usage ALTER COLUMN prompt_tokens     SET DEFAULT 0;
+ALTER TABLE ai_usage ALTER COLUMN completion_tokens SET DEFAULT 0;
+ALTER TABLE ai_usage ALTER COLUMN total_tokens      SET DEFAULT 0;
+ALTER TABLE ai_usage ALTER COLUMN latency_ms        SET DEFAULT 0;
+ALTER TABLE ai_usage ALTER COLUMN created_at        SET DEFAULT now();
+
+ALTER TABLE ai_usage ALTER COLUMN owner_id SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ai_usage_owner      ON ai_usage (owner_id);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_created_at ON ai_usage (created_at);
+
+ALTER TABLE ai_usage ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_usage" ON ai_usage;
+DROP POLICY IF EXISTS "anon_update_ai_usage" ON ai_usage;
+DROP POLICY IF EXISTS "anon_delete_ai_usage" ON ai_usage;
+DROP POLICY IF EXISTS "anon_select_ai_usage" ON ai_usage;
+CREATE POLICY "anon_select_ai_usage" ON ai_usage FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_provider_stats (
+    provider_name            text        NOT NULL,
+    owner_id                 bigint      NOT NULL DEFAULT 0,
+    total_requests           integer     NOT NULL DEFAULT 0,
+    successful_requests      integer     NOT NULL DEFAULT 0,
+    failed_requests          integer     NOT NULL DEFAULT 0,
+    total_prompt_tokens      integer     NOT NULL DEFAULT 0,
+    total_completion_tokens  integer     NOT NULL DEFAULT 0,
+    avg_latency_ms           real        NOT NULL DEFAULT 0,
+    last_request_at          timestamptz,
+    updated_at               timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (provider_name, owner_id)
+);
+
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS provider_name           text        NOT NULL DEFAULT '';
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS owner_id                bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_requests          integer     NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS successful_requests     integer     NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS failed_requests         integer     NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_prompt_tokens     integer     NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_completion_tokens integer     NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS avg_latency_ms          real        NOT NULL DEFAULT 0;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS last_request_at         timestamptz;
+ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS updated_at              timestamptz NOT NULL DEFAULT now();
+
+UPDATE ai_provider_stats SET provider_name           = ''    WHERE provider_name           IS NULL;
+UPDATE ai_provider_stats SET owner_id                = 0     WHERE owner_id                IS NULL;
+UPDATE ai_provider_stats SET total_requests          = 0     WHERE total_requests          IS NULL;
+UPDATE ai_provider_stats SET successful_requests     = 0     WHERE successful_requests     IS NULL;
+UPDATE ai_provider_stats SET failed_requests         = 0     WHERE failed_requests         IS NULL;
+UPDATE ai_provider_stats SET total_prompt_tokens     = 0     WHERE total_prompt_tokens     IS NULL;
+UPDATE ai_provider_stats SET total_completion_tokens = 0     WHERE total_completion_tokens IS NULL;
+UPDATE ai_provider_stats SET avg_latency_ms          = 0     WHERE avg_latency_ms          IS NULL;
+UPDATE ai_provider_stats SET updated_at              = now() WHERE updated_at              IS NULL;
+
+ALTER TABLE ai_provider_stats ALTER COLUMN provider_name           SET DEFAULT '';
+ALTER TABLE ai_provider_stats ALTER COLUMN owner_id                SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_requests          SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN successful_requests     SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN failed_requests         SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_prompt_tokens     SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_completion_tokens SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN avg_latency_ms          SET DEFAULT 0;
+ALTER TABLE ai_provider_stats ALTER COLUMN updated_at              SET DEFAULT now();
+
+ALTER TABLE ai_provider_stats ALTER COLUMN provider_name           SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN owner_id                SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_requests          SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN successful_requests     SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN failed_requests         SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_prompt_tokens     SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN total_completion_tokens SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN avg_latency_ms          SET NOT NULL;
+ALTER TABLE ai_provider_stats ALTER COLUMN updated_at              SET NOT NULL;
+
+ALTER TABLE ai_provider_stats ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ai_provider_stats" ON ai_provider_stats;
+DROP POLICY IF EXISTS "anon_update_ai_provider_stats" ON ai_provider_stats;
+DROP POLICY IF EXISTS "anon_delete_ai_provider_stats" ON ai_provider_stats;
+DROP POLICY IF EXISTS "anon_select_ai_provider_stats" ON ai_provider_stats;
+CREATE POLICY "anon_select_ai_provider_stats" ON ai_provider_stats FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ghost_chats (
+    chat_id         bigint       PRIMARY KEY,
+    display_name    text         NOT NULL DEFAULT '',
+    last_preview    text         NOT NULL DEFAULT '',
+    last_message_at timestamptz,
+    unread_count    integer      NOT NULL DEFAULT 0,
+    created_at      timestamptz  DEFAULT now(),
+    updated_at      timestamptz  DEFAULT now()
+);
+
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS chat_id         bigint;
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS display_name    text        NOT NULL DEFAULT '';
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS last_preview    text        NOT NULL DEFAULT '';
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS last_message_at timestamptz;
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS unread_count    integer     NOT NULL DEFAULT 0;
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
+ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS updated_at      timestamptz DEFAULT now();
+
+UPDATE ghost_chats SET display_name = ''    WHERE display_name IS NULL;
+UPDATE ghost_chats SET last_preview = ''    WHERE last_preview IS NULL;
+UPDATE ghost_chats SET unread_count = 0     WHERE unread_count IS NULL;
+UPDATE ghost_chats SET created_at   = now() WHERE created_at   IS NULL;
+UPDATE ghost_chats SET updated_at   = now() WHERE updated_at   IS NULL;
+
+ALTER TABLE ghost_chats ALTER COLUMN display_name SET DEFAULT '';
+ALTER TABLE ghost_chats ALTER COLUMN last_preview SET DEFAULT '';
+ALTER TABLE ghost_chats ALTER COLUMN unread_count SET DEFAULT 0;
+ALTER TABLE ghost_chats ALTER COLUMN created_at   SET DEFAULT now();
+ALTER TABLE ghost_chats ALTER COLUMN updated_at   SET DEFAULT now();
+
+ALTER TABLE ghost_chats ALTER COLUMN display_name SET NOT NULL;
+ALTER TABLE ghost_chats ALTER COLUMN last_preview SET NOT NULL;
+ALTER TABLE ghost_chats ALTER COLUMN unread_count SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ghost_chats_last_message
+    ON ghost_chats (last_message_at DESC);
+
+ALTER TABLE ghost_chats ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_insert_ghost_chats" ON ghost_chats;
+DROP POLICY IF EXISTS "anon_update_ghost_chats" ON ghost_chats;
+DROP POLICY IF EXISTS "anon_delete_ghost_chats" ON ghost_chats;
+DROP POLICY IF EXISTS "anon_select_ghost_chats" ON ghost_chats;
+CREATE POLICY "anon_select_ghost_chats" ON ghost_chats FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_tasks (
+    id                         bigserial    PRIMARY KEY,
+    owner_id                   bigint       NOT NULL,
+    label                      text         NOT NULL,
+    status                     text         NOT NULL DEFAULT 'active',
+    version                    integer      NOT NULL DEFAULT 1,
+    schedule_type              text         NOT NULL,
+    schedule                   jsonb        NOT NULL,
+    timezone                   text         NOT NULL,
+    next_run_at                timestamptz,
+    actions                    jsonb        NOT NULL,
+    notification_destination   jsonb        NOT NULL,
+    ai_instruction             text,
+    created_at                 timestamptz  NOT NULL DEFAULT now(),
+    updated_at                 timestamptz  NOT NULL DEFAULT now(),
+    terminal_at                timestamptz,
+    CONSTRAINT ai_tasks_label_not_blank CHECK (length(btrim(label)) > 0),
+    CONSTRAINT ai_tasks_actions_count CHECK (jsonb_array_length(actions) BETWEEN 1 AND 5),
+    CONSTRAINT ai_tasks_payload_size CHECK (octet_length(actions::text) <= 32768),
+    CONSTRAINT ai_tasks_schedule_size CHECK (octet_length(schedule::text) <= 16384),
+    CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096),
+    CONSTRAINT ai_tasks_ai_instruction_size
+        CHECK (ai_instruction IS NULL OR (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384))
+);
+
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS id                       bigserial;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS owner_id                 bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS label                    text;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS status                   text        NOT NULL DEFAULT 'active';
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS version                  integer     NOT NULL DEFAULT 1;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS schedule_type            text;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS schedule                 jsonb;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS timezone                 text;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS next_run_at              timestamptz;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS actions                  jsonb;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS notification_destination jsonb;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS ai_instruction           text;
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS created_at               timestamptz NOT NULL DEFAULT now();
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS updated_at               timestamptz NOT NULL DEFAULT now();
+ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS terminal_at              timestamptz;
+
+UPDATE ai_tasks SET owner_id                 = 0           WHERE owner_id                 IS NULL;
+UPDATE ai_tasks SET label                    = 'recovered' WHERE label                    IS NULL;
+UPDATE ai_tasks SET status                   = 'active'    WHERE status                   IS NULL;
+UPDATE ai_tasks SET version                  = 1           WHERE version                  IS NULL;
+UPDATE ai_tasks SET schedule_type            = 'once'      WHERE schedule_type            IS NULL;
+UPDATE ai_tasks SET schedule                 = '{}'        WHERE schedule                 IS NULL;
+UPDATE ai_tasks SET timezone                 = 'UTC'       WHERE timezone                 IS NULL;
+UPDATE ai_tasks SET actions                  = '[]'        WHERE actions                  IS NULL;
+UPDATE ai_tasks SET notification_destination = '{}'        WHERE notification_destination IS NULL;
+UPDATE ai_tasks SET created_at               = now()       WHERE created_at               IS NULL;
+UPDATE ai_tasks SET updated_at               = now()       WHERE updated_at               IS NULL;
+
+ALTER TABLE ai_tasks ALTER COLUMN status     SET DEFAULT 'active';
+ALTER TABLE ai_tasks ALTER COLUMN version    SET DEFAULT 1;
+ALTER TABLE ai_tasks ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE ai_tasks ALTER COLUMN updated_at SET DEFAULT now();
+
+ALTER TABLE ai_tasks ALTER COLUMN owner_id                 SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN label                    SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN status                   SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN version                  SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN schedule_type            SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN schedule                 SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN timezone                 SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN actions                  SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN notification_destination SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN created_at               SET NOT NULL;
+ALTER TABLE ai_tasks ALTER COLUMN updated_at               SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_label_not_blank') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE length(btrim(label)) = 0) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_label_not_blank CHECK (length(btrim(label)) > 0);
+        ELSE
+            RAISE WARNING 'ai_tasks_label_not_blank NOT added - % row(s) have a blank label.',
+                (SELECT count(*) FROM ai_tasks WHERE length(btrim(label)) = 0);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_status_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE status NOT IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted')) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_status_check
+                CHECK (status IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted'));
+        ELSE
+            RAISE WARNING 'ai_tasks_status_check NOT added - % row(s) have an unrecognized status.',
+                (SELECT count(*) FROM ai_tasks WHERE status NOT IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted'));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_version_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE version <= 0) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_version_check CHECK (version > 0);
+        ELSE
+            RAISE WARNING 'ai_tasks_version_check NOT added - % row(s) have version <= 0.',
+                (SELECT count(*) FROM ai_tasks WHERE version <= 0);
+        END IF;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ai_tasks_schedule_type_check'
+          AND pg_get_constraintdef(oid) LIKE '%event%'
+    ) THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE schedule_type NOT IN ('once', 'interval', 'daily', 'weekly', 'event')) THEN
+            ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
+                CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event'));
+        ELSE
+            RAISE WARNING 'ai_tasks_schedule_type_check NOT replaced - % row(s) have an unrecognized schedule_type.',
+                (SELECT count(*) FROM ai_tasks WHERE schedule_type NOT IN ('once', 'interval', 'daily', 'weekly', 'event'));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_actions_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE jsonb_typeof(actions) IS DISTINCT FROM 'array') THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_check CHECK (jsonb_typeof(actions) = 'array');
+        ELSE
+            RAISE WARNING 'ai_tasks_actions_check NOT added - % row(s) have a non-array actions value.',
+                (SELECT count(*) FROM ai_tasks WHERE jsonb_typeof(actions) IS DISTINCT FROM 'array');
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_actions_count') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE jsonb_array_length(actions) NOT BETWEEN 1 AND 5) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (jsonb_array_length(actions) BETWEEN 1 AND 5);
+        ELSE
+            RAISE WARNING 'ai_tasks_actions_count NOT added - % row(s) have an actions array outside 1..5 elements.',
+                (SELECT count(*) FROM ai_tasks WHERE jsonb_array_length(actions) NOT BETWEEN 1 AND 5);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_payload_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(actions::text) > 32768) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_payload_size CHECK (octet_length(actions::text) <= 32768);
+        ELSE
+            RAISE WARNING 'ai_tasks_payload_size NOT added - % row(s) exceed 32768 bytes.',
+                (SELECT count(*) FROM ai_tasks WHERE octet_length(actions::text) > 32768);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_schedule_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(schedule::text) > 16384) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_size CHECK (octet_length(schedule::text) <= 16384);
+        ELSE
+            RAISE WARNING 'ai_tasks_schedule_size NOT added - % row(s) exceed 16384 bytes.',
+                (SELECT count(*) FROM ai_tasks WHERE octet_length(schedule::text) > 16384);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_destination_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(notification_destination::text) > 4096) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096);
+        ELSE
+            RAISE WARNING 'ai_tasks_destination_size NOT added - % row(s) exceed 4096 bytes.',
+                (SELECT count(*) FROM ai_tasks WHERE octet_length(notification_destination::text) > 4096);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_ai_instruction_size') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM ai_tasks
+            WHERE ai_instruction IS NOT NULL
+              AND NOT (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384)
+        ) THEN
+            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_ai_instruction_size
+                CHECK (ai_instruction IS NULL OR (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384));
+        ELSE
+            RAISE WARNING 'ai_tasks_ai_instruction_size NOT added - % row(s) have an empty or oversized ai_instruction.',
+                (SELECT count(*) FROM ai_tasks
+                   WHERE ai_instruction IS NOT NULL
+                     AND NOT (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384));
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_tasks_status_next_run
+    ON ai_tasks (status, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_ai_tasks_owner_updated
+    ON ai_tasks (owner_id, updated_at DESC);
+
+ALTER TABLE ai_tasks ENABLE ROW LEVEL SECURITY;
+
+GRANT SELECT ON ai_tasks TO anon, authenticated;
+
+DROP POLICY IF EXISTS "anon_insert_ai_tasks" ON ai_tasks;
+DROP POLICY IF EXISTS "anon_update_ai_tasks" ON ai_tasks;
+DROP POLICY IF EXISTS "anon_delete_ai_tasks" ON ai_tasks;
+DROP POLICY IF EXISTS "anon_select_ai_tasks" ON ai_tasks;
+CREATE POLICY "anon_select_ai_tasks" ON ai_tasks FOR SELECT
+    TO anon, authenticated USING (true);
+
+CREATE TABLE IF NOT EXISTS ai_task_occurrences (
+    id                    bigserial    PRIMARY KEY,
+    task_id               bigint       NOT NULL REFERENCES ai_tasks(id) ON DELETE RESTRICT,
+    owner_id              bigint       NOT NULL,
+    occurrence_key        text         NOT NULL,
+    definition_version    integer      NOT NULL,
+    action_snapshot       jsonb        NOT NULL,
+    scheduled_for         timestamptz  NOT NULL,
+    attempt               smallint     NOT NULL DEFAULT 1,
+    status                text         NOT NULL DEFAULT 'claimed',
+    claimed_at            timestamptz,
+    started_at            timestamptz,
+    finished_at           timestamptz,
+    retry_at              timestamptz,
+    error_metadata        jsonb        NOT NULL DEFAULT '{}',
+    result_metadata       jsonb        NOT NULL DEFAULT '{}',
+    preparation_metadata  jsonb        NOT NULL DEFAULT '{}',
+    created_at            timestamptz  NOT NULL DEFAULT now(),
+    updated_at            timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT ai_task_occurrences_key_not_blank CHECK (length(btrim(occurrence_key)) > 0),
+    CONSTRAINT ai_task_occurrences_action_count CHECK (jsonb_array_length(action_snapshot) BETWEEN 1 AND 5),
+    CONSTRAINT ai_task_occurrences_payload_size CHECK (octet_length(action_snapshot::text) <= 32768),
+    CONSTRAINT ai_task_occurrences_error_metadata_check CHECK (jsonb_typeof(error_metadata) = 'object'),
+    CONSTRAINT ai_task_occurrences_preparation_metadata_object CHECK (jsonb_typeof(preparation_metadata) = 'object'),
+    CONSTRAINT ai_task_occurrences_error_size CHECK (octet_length(error_metadata::text) <= 8192),
+    CONSTRAINT ai_task_occurrences_result_size CHECK (octet_length(result_metadata::text) <= 8192),
+    CONSTRAINT ai_task_occurrences_preparation_size CHECK (octet_length(preparation_metadata::text) <= 8192),
+    CONSTRAINT ai_task_occurrences_retry_state CHECK (
+        (status = 'retry_pending' AND retry_at IS NOT NULL)
+        OR (status <> 'retry_pending')
+    )
+);
+
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS id                   bigserial;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS task_id              bigint;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS owner_id             bigint      NOT NULL DEFAULT 0;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS occurrence_key       text;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS definition_version   integer;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS action_snapshot      jsonb;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS scheduled_for        timestamptz;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS attempt              smallint    NOT NULL DEFAULT 1;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS status               text        NOT NULL DEFAULT 'claimed';
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS claimed_at           timestamptz;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS started_at           timestamptz;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS finished_at          timestamptz;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS retry_at             timestamptz;
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS error_metadata       jsonb       NOT NULL DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS result_metadata      jsonb       NOT NULL DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS preparation_metadata jsonb       NOT NULL DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS created_at           timestamptz NOT NULL DEFAULT now();
+ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS updated_at           timestamptz NOT NULL DEFAULT now();
+
+UPDATE ai_task_occurrences SET task_id              = COALESCE((SELECT min(id) FROM ai_tasks), 0) WHERE task_id              IS NULL;
+UPDATE ai_task_occurrences SET owner_id             = 0                            WHERE owner_id             IS NULL;
+UPDATE ai_task_occurrences SET occurrence_key       = 'recovered-' || id            WHERE occurrence_key       IS NULL;
+UPDATE ai_task_occurrences SET definition_version   = 1                            WHERE definition_version   IS NULL;
+UPDATE ai_task_occurrences SET action_snapshot      = '[]'                          WHERE action_snapshot      IS NULL;
+UPDATE ai_task_occurrences SET scheduled_for        = now()                         WHERE scheduled_for        IS NULL;
+UPDATE ai_task_occurrences SET attempt              = 1                             WHERE attempt              IS NULL;
+UPDATE ai_task_occurrences SET status               = 'claimed'                     WHERE status               IS NULL;
+UPDATE ai_task_occurrences SET error_metadata       = '{}'                          WHERE error_metadata       IS NULL;
+UPDATE ai_task_occurrences SET result_metadata      = '{}'                          WHERE result_metadata      IS NULL;
+UPDATE ai_task_occurrences SET preparation_metadata = '{}'                          WHERE preparation_metadata IS NULL;
+UPDATE ai_task_occurrences SET created_at           = now()                         WHERE created_at           IS NULL;
+UPDATE ai_task_occurrences SET updated_at           = now()                         WHERE updated_at           IS NULL;
+
+ALTER TABLE ai_task_occurrences ALTER COLUMN attempt              SET DEFAULT 1;
+ALTER TABLE ai_task_occurrences ALTER COLUMN status               SET DEFAULT 'claimed';
+ALTER TABLE ai_task_occurrences ALTER COLUMN error_metadata       SET DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ALTER COLUMN result_metadata      SET DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ALTER COLUMN preparation_metadata SET DEFAULT '{}';
+ALTER TABLE ai_task_occurrences ALTER COLUMN created_at           SET DEFAULT now();
+ALTER TABLE ai_task_occurrences ALTER COLUMN updated_at           SET DEFAULT now();
+
+ALTER TABLE ai_task_occurrences ALTER COLUMN task_id              SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN owner_id             SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN occurrence_key       SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN definition_version   SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN action_snapshot      SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN scheduled_for        SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN attempt              SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN status               SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN error_metadata       SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN result_metadata      SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN preparation_metadata SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN created_at           SET NOT NULL;
+ALTER TABLE ai_task_occurrences ALTER COLUMN updated_at           SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_task_id_fkey') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM ai_task_occurrences o
+            LEFT JOIN ai_tasks t ON t.id = o.task_id
+            WHERE t.id IS NULL
+        ) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_task_id_fkey
+                FOREIGN KEY (task_id) REFERENCES ai_tasks(id) ON DELETE RESTRICT;
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_task_id_fkey NOT added - % row(s) reference a task_id with no ai_tasks row. Resolve them and re-run this script.',
+                (SELECT count(*) FROM ai_task_occurrences o
+                   LEFT JOIN ai_tasks t ON t.id = o.task_id
+                  WHERE t.id IS NULL);
+        END IF;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_key_not_blank') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE length(btrim(occurrence_key)) = 0) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_key_not_blank
+                CHECK (length(btrim(occurrence_key)) > 0);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_key_not_blank NOT added - % row(s) have a blank occurrence_key.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE length(btrim(occurrence_key)) = 0);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_definition_version_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE definition_version <= 0) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_definition_version_check
+                CHECK (definition_version > 0);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_definition_version_check NOT added - % row(s) have definition_version <= 0.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE definition_version <= 0);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_action_count') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_array_length(action_snapshot) NOT BETWEEN 1 AND 5) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_action_count
+                CHECK (jsonb_array_length(action_snapshot) BETWEEN 1 AND 5);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_action_count NOT added - % row(s) have an action_snapshot outside 1..5 elements.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_array_length(action_snapshot) NOT BETWEEN 1 AND 5);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_payload_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(action_snapshot::text) > 32768) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_payload_size
+                CHECK (octet_length(action_snapshot::text) <= 32768);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_payload_size NOT added - % row(s) exceed 32768 bytes.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(action_snapshot::text) > 32768);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_attempt_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE attempt NOT BETWEEN 1 AND 3) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_attempt_check
+                CHECK (attempt BETWEEN 1 AND 3);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_attempt_check NOT added - % row(s) have attempt outside 1..3.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE attempt NOT BETWEEN 1 AND 3);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_status_check') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM ai_task_occurrences
+            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted')
+        ) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_status_check
+                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_status_check NOT added - % row(s) have an unrecognized status.',
+                (SELECT count(*) FROM ai_task_occurrences
+                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_metadata_check') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_typeof(error_metadata) IS DISTINCT FROM 'object') THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_error_metadata_check
+                CHECK (jsonb_typeof(error_metadata) = 'object');
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_error_metadata_check NOT added - % row(s) have a non-object error_metadata.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_typeof(error_metadata) IS DISTINCT FROM 'object');
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_retry_state') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM ai_task_occurrences
+            WHERE NOT ((status = 'retry_pending' AND retry_at IS NOT NULL) OR (status <> 'retry_pending'))
+        ) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_retry_state CHECK (
+                (status = 'retry_pending' AND retry_at IS NOT NULL)
+                OR (status <> 'retry_pending')
+            );
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_retry_state NOT added - % row(s) have status=retry_pending without retry_at.',
+                (SELECT count(*) FROM ai_task_occurrences
+                  WHERE NOT ((status = 'retry_pending' AND retry_at IS NOT NULL) OR (status <> 'retry_pending')));
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_preparation_metadata_object') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_typeof(preparation_metadata) IS DISTINCT FROM 'object') THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_preparation_metadata_object
+                CHECK (jsonb_typeof(preparation_metadata) = 'object');
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_preparation_metadata_object NOT added - % row(s) have a non-object preparation_metadata.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_typeof(preparation_metadata) IS DISTINCT FROM 'object');
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(error_metadata::text) > 8192) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_error_size
+                CHECK (octet_length(error_metadata::text) <= 8192);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_error_size NOT added - % row(s) exceed 8192 bytes.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(error_metadata::text) > 8192);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_result_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(result_metadata::text) > 8192) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_result_size
+                CHECK (octet_length(result_metadata::text) <= 8192);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_result_size NOT added - % row(s) exceed 8192 bytes.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(result_metadata::text) > 8192);
+        END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_preparation_size') THEN
+        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(preparation_metadata::text) > 8192) THEN
+            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_preparation_size
+                CHECK (octet_length(preparation_metadata::text) <= 8192);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences_preparation_size NOT added - % row(s) exceed 8192 bytes.',
+                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(preparation_metadata::text) > 8192);
+        END IF;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'uq_ai_task_occurrences_task_key') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM ai_task_occurrences
+            GROUP BY task_id, occurrence_key HAVING count(*) > 1
+        ) THEN
+            CREATE UNIQUE INDEX uq_ai_task_occurrences_task_key
+                ON ai_task_occurrences (task_id, occurrence_key);
+        ELSE
+            RAISE WARNING 'ai_task_occurrences: uq_ai_task_occurrences_task_key NOT created - duplicate (task_id, occurrence_key) pairs exist. Resolve them and re-run this script.';
+        END IF;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_ai_task_occurrences_owner_scheduled
+    ON ai_task_occurrences (owner_id, scheduled_for DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_task_occurrences_task_scheduled
+    ON ai_task_occurrences (task_id, scheduled_for DESC);
+
+ALTER TABLE ai_task_occurrences ENABLE ROW LEVEL SECURITY;
+
+GRANT SELECT ON ai_task_occurrences TO anon, authenticated;
+
+DROP POLICY IF EXISTS "anon_insert_ai_task_occurrences" ON ai_task_occurrences;
+DROP POLICY IF EXISTS "anon_update_ai_task_occurrences" ON ai_task_occurrences;
+DROP POLICY IF EXISTS "anon_delete_ai_task_occurrences" ON ai_task_occurrences;
+DROP POLICY IF EXISTS "anon_select_ai_task_occurrences" ON ai_task_occurrences;
+CREATE POLICY "anon_select_ai_task_occurrences" ON ai_task_occurrences FOR SELECT
+    TO anon, authenticated USING (true);
+
+DO $$
+DECLARE
+    r record;
+    ok boolean;
+BEGIN
+    FOR r IN
+        SELECT * FROM (VALUES
+            ('saved_items',         'saved_items_pkey',            'p', 'id',                      'id',            'id'),
+            ('saved_items',         'saved_items_save_code_key',   'u', 'save_code',               'save_code',     'save_code'),
+            ('bio_state',           'bio_state_pkey',              'p', 'id',                      'id',            'id'),
+            ('bio_state',           'bio_state_owner_id_key',      'u', 'owner_id',                'owner_id',      'owner_id'),
+            ('username_state',      'username_state_pkey',         'p', 'id',                      'id',            'id'),
+            ('username_state',      'username_state_owner_id_key', 'u', 'owner_id',                'owner_id',      'owner_id'),
+            ('bot_logs',            'bot_logs_pkey',               'p', 'id',                      'id',            'id'),
+            ('panel_settings',      'panel_settings_pkey',         'p', 'key',                     'key',           'key'),
+            ('bot_settings',        'bot_settings_pkey',           'p', 'key',                     'key',           'key'),
+            ('ai_config',           'ai_config_pkey',              'p', 'id',                      'id',            'id'),
+            ('ai_config',           'ai_config_owner_id_key',      'u', 'owner_id',                'owner_id',      'owner_id'),
+            ('ai_sessions',         'ai_sessions_pkey',            'p', 'id',                      'id',            'id'),
+            ('ai_sessions',         'ai_sessions_session_id_key',  'u', 'session_id',              'session_id',    'session_id'),
+            ('ai_messages',         'ai_messages_pkey',            'p', 'id',                      'id',            'id'),
+            ('ai_memories',         'ai_memories_pkey',            'p', 'id',                      'id',            'id'),
+            ('ai_tool_history',     'ai_tool_history_pkey',        'p', 'id',                      'id',            'id'),
+            ('ai_usage',            'ai_usage_pkey',               'p', 'id',                      'id',            'id'),
+            ('ai_provider_stats',   'ai_provider_stats_pkey',      'p', 'provider_name, owner_id', 'provider_name', 'provider_name, owner_id'),
+            ('ghost_chats',         'ghost_chats_pkey',            'p', 'chat_id',                 'chat_id',       'chat_id'),
+            ('ai_tasks',            'ai_tasks_pkey',               'p', 'id',                      'id',            'id'),
+            ('ai_task_occurrences', 'ai_task_occurrences_pkey',    'p', 'id',                      'id',            'id')
+        ) AS v(tbl, cname, kind, cols, nullexpr, distinctexpr)
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'public'
+              AND t.relname = r.tbl
+              AND (CASE WHEN r.kind = 'p' THEN c.contype = 'p' ELSE c.conname = r.cname END)
+        ) THEN
+            EXECUTE format('SELECT (count(*) = count(%s)) AND (count(DISTINCT %s) = count(*)) FROM %I',
+                           r.nullexpr, r.distinctexpr, r.tbl) INTO ok;
+            IF ok THEN
+                EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I ' ||
+                               CASE WHEN r.kind = 'p' THEN 'PRIMARY KEY (' ELSE 'UNIQUE (' END ||
+                               r.cols || ')', r.tbl, r.cname);
+            ELSE
+                RAISE WARNING '%: constraint % NOT added - existing rows contain NULLs or duplicates in (%). Resolve them and re-run this script.',
+                    r.tbl, r.cname, r.cols;
+            END IF;
+        END IF;
+    END LOOP;
+END $$;
+
+NOTIFY pgrst, 'reload schema';
+
+COMMIT;
+
+SELECT v.tbl || '.' || v.col AS missing_canonical_column
+FROM (VALUES
+    ('saved_items','id'), ('saved_items','save_code'), ('saved_items','save_type'),
+    ('saved_items','origin_chat_id'), ('saved_items','origin_msg_id'),
+    ('saved_items','saved_chat_id'), ('saved_items','saved_msg_id'),
+    ('saved_items','sender_name'), ('saved_items','sender_id'), ('saved_items','mime_type'),
+    ('saved_items','file_id'), ('saved_items','file_size'), ('saved_items','media_type'),
+    ('saved_items','tags'), ('saved_items','caption'), ('saved_items','file_name'),
+    ('saved_items','short_code'), ('saved_items','owner_id'), ('saved_items','created_at'),
+    ('bio_state','id'), ('bio_state','owner_id'), ('bio_state','template'), ('bio_state','mood'),
+    ('bio_state','custom_text'), ('bio_state','is_active'), ('bio_state','last_bio'), ('bio_state','updated_at'),
+    ('username_state','id'), ('username_state','owner_id'), ('username_state','template'),
+    ('username_state','mood'), ('username_state','custom_text'), ('username_state','is_active'),
+    ('username_state','last_name'), ('username_state','updated_at'),
+    ('bot_logs','id'), ('bot_logs','owner_id'), ('bot_logs','level'), ('bot_logs','message'),
+    ('bot_logs','context'), ('bot_logs','created_at'),
+    ('panel_settings','key'), ('panel_settings','auto_close_enabled'), ('panel_settings','auto_close_delay'),
+    ('panel_settings','max_deep_save_mb'), ('panel_settings','delete_batch_size'),
+    ('panel_settings','log_retention_days'), ('panel_settings','panel_timeout_seconds'),
+    ('panel_settings','allow_multiple_panels'), ('panel_settings','reuse_existing_panel'),
+    ('panel_settings','language'), ('panel_settings','debug_callbacks'), ('panel_settings','owner_only'),
+    ('panel_settings','dashboard_font'), ('panel_settings','update_stale_seconds'),
+    ('panel_settings','ghost_seen_retention_seconds'), ('panel_settings','updated_at'),
+    ('bot_settings','key'), ('bot_settings','value'), ('bot_settings','value_type'), ('bot_settings','updated_at'),
+    ('ai_config','id'), ('ai_config','owner_id'), ('ai_config','provider'), ('ai_config','model'),
+    ('ai_config','temperature'), ('ai_config','max_tokens'), ('ai_config','system_prompt'),
+    ('ai_config','history_budget'), ('ai_config','is_configured'), ('ai_config','trigger_en'),
+    ('ai_config','trigger_fa'), ('ai_config','show_question'), ('ai_config','stt_model'),
+    ('ai_config','stt_language'), ('ai_config','stt_passes'), ('ai_config','last_request_at'),
+    ('ai_config','last_latency_ms'), ('ai_config','created_at'), ('ai_config','updated_at'),
+    ('ai_sessions','id'), ('ai_sessions','session_id'), ('ai_sessions','owner_id'),
+    ('ai_sessions','provider'), ('ai_sessions','model'), ('ai_sessions','status'),
+    ('ai_sessions','total_tokens'), ('ai_sessions','message_count'), ('ai_sessions','created_at'),
+    ('ai_sessions','updated_at'),
+    ('ai_messages','id'), ('ai_messages','session_id'), ('ai_messages','owner_id'),
+    ('ai_messages','role'), ('ai_messages','content'), ('ai_messages','token_count'),
+    ('ai_messages','provider'), ('ai_messages','model'), ('ai_messages','created_at'),
+    ('ai_memories','id'), ('ai_memories','owner_id'), ('ai_memories','tier'), ('ai_memories','category'),
+    ('ai_memories','content'), ('ai_memories','importance'), ('ai_memories','expires_at'),
+    ('ai_memories','metadata'), ('ai_memories','created_at'),
+    ('ai_tool_history','id'), ('ai_tool_history','owner_id'), ('ai_tool_history','session_id'),
+    ('ai_tool_history','tool_name'), ('ai_tool_history','arguments'), ('ai_tool_history','result_success'),
+    ('ai_tool_history','result_message'), ('ai_tool_history','result_data'),
+    ('ai_tool_history','latency_ms'), ('ai_tool_history','created_at'),
+    ('ai_usage','id'), ('ai_usage','owner_id'), ('ai_usage','session_id'), ('ai_usage','provider'),
+    ('ai_usage','model'), ('ai_usage','prompt_tokens'), ('ai_usage','completion_tokens'),
+    ('ai_usage','total_tokens'), ('ai_usage','latency_ms'), ('ai_usage','token_source'),
+    ('ai_usage','created_at'),
+    ('ai_provider_stats','provider_name'), ('ai_provider_stats','owner_id'),
+    ('ai_provider_stats','total_requests'), ('ai_provider_stats','successful_requests'),
+    ('ai_provider_stats','failed_requests'), ('ai_provider_stats','total_prompt_tokens'),
+    ('ai_provider_stats','total_completion_tokens'), ('ai_provider_stats','avg_latency_ms'),
+    ('ai_provider_stats','last_request_at'), ('ai_provider_stats','updated_at'),
+    ('ghost_chats','chat_id'), ('ghost_chats','display_name'), ('ghost_chats','last_preview'),
+    ('ghost_chats','last_message_at'), ('ghost_chats','unread_count'),
+    ('ghost_chats','created_at'), ('ghost_chats','updated_at'),
+    ('ai_tasks','id'), ('ai_tasks','owner_id'), ('ai_tasks','label'), ('ai_tasks','status'),
+    ('ai_tasks','version'), ('ai_tasks','schedule_type'), ('ai_tasks','schedule'),
+    ('ai_tasks','timezone'), ('ai_tasks','next_run_at'), ('ai_tasks','actions'),
+    ('ai_tasks','notification_destination'), ('ai_tasks','ai_instruction'),
+    ('ai_tasks','created_at'), ('ai_tasks','updated_at'), ('ai_tasks','terminal_at'),
+    ('ai_task_occurrences','id'), ('ai_task_occurrences','task_id'), ('ai_task_occurrences','owner_id'),
+    ('ai_task_occurrences','occurrence_key'), ('ai_task_occurrences','definition_version'),
+    ('ai_task_occurrences','action_snapshot'), ('ai_task_occurrences','scheduled_for'),
+    ('ai_task_occurrences','attempt'), ('ai_task_occurrences','status'),
+    ('ai_task_occurrences','claimed_at'), ('ai_task_occurrences','started_at'),
+    ('ai_task_occurrences','finished_at'), ('ai_task_occurrences','retry_at'),
+    ('ai_task_occurrences','error_metadata'), ('ai_task_occurrences','result_metadata'),
+    ('ai_task_occurrences','preparation_metadata'), ('ai_task_occurrences','created_at'),
+    ('ai_task_occurrences','updated_at')
+) AS v(tbl, col)
+LEFT JOIN information_schema.columns c
+    ON c.table_schema = 'public' AND c.table_name = v.tbl AND c.column_name = v.col
+WHERE c.column_name IS NULL
+ORDER BY 1;
+
+-- ─── PART 2 of 5 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
--- ============================================================================
--- 2. api_credentials — credential METADATA. No secret column exists here.
--- ============================================================================
 
 CREATE TABLE IF NOT EXISTS public.api_credentials (
     credential_id    text        PRIMARY KEY,
@@ -243,9 +1796,6 @@ COMMENT ON COLUMN public.api_credentials.priority IS
 COMMENT ON COLUMN public.api_credentials.vault_secret_id IS
     'Reference to vault.secrets(id). The raw key exists only in Vault; deleting the secret cascades this metadata row.';
 
--- ============================================================================
--- 3. api_credential_pool — the ONE resolution boundary (provider-generic)
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.api_credential_pool(
     p_provider text,
@@ -285,13 +1835,6 @@ GRANT EXECUTE ON FUNCTION public.api_credential_pool(text, bigint) TO service_ro
 COMMENT ON FUNCTION public.api_credential_pool(text, bigint) IS
     'Returns the ordered, ENABLED credentials of ONE provider with each secret decrypted from Supabase Vault. At most 8 rows. Callable by service_role only.';
 
--- ============================================================================
--- 4. stt_credential_pool — deprecated alias of the same contract
--- ============================================================================
--- The M2.4 documentation named this function. It is kept as a thin alias so an
--- installation that already implemented the older name keeps working; the
--- application calls api_credential_pool directly. Remove this alias in a later
--- phase, once no deployment relies on the old name.
 
 CREATE OR REPLACE FUNCTION public.stt_credential_pool(
     p_provider text,
@@ -320,17 +1863,10 @@ GRANT EXECUTE ON FUNCTION public.stt_credential_pool(text, bigint) TO service_ro
 COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
     'Deprecated compatibility alias of api_credential_pool. Use api_credential_pool.';
 
--- ============================================================================
--- 5. PostgREST schema cache
--- ============================================================================
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── STEP B — 20260919000002_credential_vault_management.sql ────────────────
-
--- ============================================================================
--- 1. api_credential_list — owner-scoped METADATA read (never a secret)
--- ============================================================================
+-- ─── PART 3 of 5 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -373,9 +1909,6 @@ GRANT EXECUTE ON FUNCTION public.api_credential_list(bigint, text) TO service_ro
 COMMENT ON FUNCTION public.api_credential_list(bigint, text) IS
     'Owner-scoped credential METADATA listing (no secret column is read or returned). Deterministic order: provider, priority, created_at, credential_id. At most 64 rows. Callable by service_role only.';
 
--- ============================================================================
--- 2. api_credential_create — Vault secret + metadata row, orphan-safe
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.api_credential_create(
     p_owner_id bigint,
@@ -435,8 +1968,6 @@ BEGIN
     v_priority := greatest(0, least(coalesce(p_priority, 0), 1000000));
     v_enabled  := coalesce(p_enabled, true);
 
-    -- A short, non-secret identifier. Bounded retry: a 48-bit collision is
-    -- astronomically unlikely, and the loop can never spin unbounded.
     LOOP
         v_attempt := v_attempt + 1;
         v_id := 'c' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 12);
@@ -449,9 +1980,6 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- The ONLY statement in this repository that writes a raw secret, and it
-    -- writes it into Vault. `vault.secrets.name` is UNIQUE, so the name is
-    -- derived from the (already unique) credential id.
     v_secret_id := vault.create_secret(
         v_secret,
         'api_credential:' || v_id,
@@ -466,8 +1994,6 @@ BEGIN
         )
         RETURNING * INTO v_row;
     EXCEPTION WHEN OTHERS THEN
-        -- Never leave an unreferenced secret behind. This block runs in its own
-        -- subtransaction, so it survives the failure it is cleaning up after.
         BEGIN
             DELETE FROM vault.secrets WHERE id = v_secret_id;
         EXCEPTION WHEN OTHERS THEN
@@ -499,9 +2025,6 @@ GRANT EXECUTE ON FUNCTION public.api_credential_create(bigint, text, text, text,
 COMMENT ON FUNCTION public.api_credential_create(bigint, text, text, text, integer, boolean) IS
     'Creates one Vault secret and the owner-scoped metadata row referencing it. Accepts a raw secret ONLY as an argument, stores it ONLY in Supabase Vault, and returns metadata only. Removes the just-created secret if the metadata insert fails. Callable by service_role only.';
 
--- ============================================================================
--- 3. api_credential_replace_secret — swap the key, never orphan the old one
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.api_credential_replace_secret(
     p_owner_id bigint,
@@ -581,14 +2104,9 @@ BEGIN
         RAISE;
     END;
 
-    -- Only AFTER the row points at the new secret: deleting the old one first
-    -- would have cascaded the row away (vault_secret_id is ON DELETE CASCADE).
     BEGIN
         DELETE FROM vault.secrets WHERE id = v_old_id;
     EXCEPTION WHEN OTHERS THEN
-        -- The new secret is live and the row is correct; a leftover old secret
-        -- is inert because nothing references it any more. Reported honestly in
-        -- DATABASE_ARCHITECTURE.md §29.16 rather than failing the swap.
         NULL;
     END;
 
@@ -615,9 +2133,6 @@ GRANT EXECUTE ON FUNCTION public.api_credential_replace_secret(bigint, text, tex
 COMMENT ON FUNCTION public.api_credential_replace_secret(bigint, text, text) IS
     'Replaces the Vault secret of ONE owner-scoped credential. Never returns the old or the new secret and never changes label/enabled/priority. Callable by service_role only.';
 
--- ============================================================================
--- 4. api_credential_update — metadata only, never the secret
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.api_credential_update(
     p_owner_id bigint,
@@ -701,9 +2216,6 @@ GRANT EXECUTE ON FUNCTION public.api_credential_update(bigint, text, text, boole
 COMMENT ON FUNCTION public.api_credential_update(bigint, text, text, boolean, integer) IS
     'Updates the owner-scoped METADATA of ONE credential (label / enabled / priority). A NULL argument leaves that field unchanged. Reads and writes no secret. Callable by service_role only.';
 
--- ============================================================================
--- 5. api_credential_delete — secret first (it cascades), row as a fallback
--- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.api_credential_delete(
     p_owner_id bigint,
@@ -735,17 +2247,11 @@ BEGIN
        FOR UPDATE;
 
     IF v_secret_id IS NULL THEN
-        -- Nothing of the owner's matches: an honest "not found", not an error.
         RETURN false;
     END IF;
 
-    -- Removing the secret is what makes this a real deletion. If it fails the
-    -- function raises and the caller must NOT report success.
     DELETE FROM vault.secrets WHERE id = v_secret_id;
 
-    -- The foreign key cascades the metadata row; this explicit delete only does
-    -- anything on a deployment whose constraint is missing, and it guarantees no
-    -- metadata outlives its secret either way.
     DELETE FROM public.api_credentials AS c
      WHERE c.credential_id = v_id
        AND c.owner_id = p_owner_id;
@@ -763,22 +2269,16 @@ GRANT EXECUTE ON FUNCTION public.api_credential_delete(bigint, text) TO service_
 COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
     'Deletes ONE owner-scoped credential: the Vault secret first (which cascades the metadata row), then the metadata row. Returns false when the owner has no such credential. Callable by service_role only.';
 
--- ============================================================================
--- 6. PostgREST schema cache
--- ============================================================================
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── STEP C — 20260921000001_add_saved_items_display_name.sql ───────────────
+-- ─── PART 4 of 5 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
 
--- PostgREST caches the schema: without this the API keeps rejecting an INSERT
--- or UPDATE that names display_name until the cache expires on its own.
 NOTIFY pgrst, 'reload schema';
 
--- Verification — zero rows means the database now carries the column.
 SELECT v.tbl || '.' || v.col AS missing_canonical_column
 FROM (VALUES ('saved_items','display_name')) AS v(tbl, col)
 LEFT JOIN information_schema.columns c
@@ -786,7 +2286,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── STEP D — 20260922000001_add_saved_items_search_indexes.sql ─────────────
+-- ─── PART 5 of 5 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -796,11 +2296,8 @@ CREATE INDEX IF NOT EXISTS idx_saved_items_display_name_trgm
 CREATE INDEX IF NOT EXISTS idx_saved_items_tags
     ON saved_items USING gin (tags);
 
--- PostgREST caches the schema: without this, newly created indexes may not
--- be visible to the query planner through the API until the cache expires.
 NOTIFY pgrst, 'reload schema';
 
--- Verification — zero rows means the database now carries both indexes.
 SELECT v.idx AS missing_save_v2_index
 FROM (VALUES ('idx_saved_items_display_name_trgm'), ('idx_saved_items_tags')) AS v(idx)
 LEFT JOIN pg_indexes i
@@ -811,13 +2308,13 @@ ORDER BY 1;
 
 ### 31.4 Verification after the run
 
-* **Step 0** must print an empty `missing_canonical_column` result set (§30.6), and
-  any `WARNING` line from it names a data-guarded constraint that a pre-existing
-  row blocked.
-* **Step C** and **step D** each end with their own verification query: zero rows
-  means the column / both indexes now exist.
-* **Steps A–B** end with `NOTIFY pgrst, 'reload schema'`; the objects can be
-  confirmed read-only:
+The block's canonical part ends with a drift report that runs **after `COMMIT`**
+(§30.6): `missing_canonical_column` must come back **empty**, and any `WARNING`
+line names a data-guarded constraint that a pre-existing row blocked. Its Save V2
+parts each end with their own verification query (`missing_canonical_column` /
+`missing_save_v2_index`: zero rows means the column / both indexes now exist), and
+its Vault parts end with `NOTIFY pgrst, 'reload schema'`. The functions and
+indexes can be confirmed read-only:
 
 ```sql
 SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
@@ -841,29 +2338,28 @@ SELECT indexname, indexdef
  ORDER BY 1;
 ```
 
-After that, every remaining pillar of this section is owner-fact: whether a given
-migration was already applied cannot be decided from this repository, which is
-exactly why every statement above is idempotent.
+Whether a given migration was already applied cannot be decided from this
+repository, which is exactly why every statement in the block is idempotent.
 
 ### 31.5 Reversal
 
-* **Steps A–D** — §29.15 reverses the five PART 2 management functions, §29.11
-  reverses the PART 1 table and both resolution functions, and the two Save V2
-  migrations state their own reversal in their headers
+* **The Vault and Save V2 parts** — §29.15 reverses the five PART 2 management
+  functions, §29.11 reverses the PART 1 table and both resolution functions, and
+  the two Save V2 migrations state their own reversal in their headers
   (`ALTER TABLE saved_items DROP COLUMN IF EXISTS display_name;` and
   `DROP INDEX IF EXISTS idx_saved_items_display_name_trgm, idx_saved_items_tags;`).
   None of them drops `supabase_vault`, deletes a Vault secret, or rewrites a row.
-* **Step 0** — §30.9. The reconciliation is additive and has no safe automatic
-  rollback; the only destructive cleanup in this repository is the explicitly
-  OPTIONAL, owner-gated §30.10.
+* **The reconciliation part** — §30.9. The reconciliation is additive and has no
+  safe automatic rollback; the only destructive cleanup in this repository is the
+  explicitly OPTIONAL, owner-gated §30.10.
 
 ### 31.6 What this section does not claim
 
 * It is not a substitute for executing the SQL: **no database was contacted and no
   statement of §31.3 was run** against any Supabase project by the coding agent.
 * It does not assert the live database state, and it does not change §29 or §30:
-  the per-object contracts, the byte-frozen snapshot and the credential-vault
-  documentation all stay exactly as they were.
+  the per-object contracts, the byte-identical snapshot copies and the
+  credential-vault documentation all stay exactly as they were.
 * It changes no runtime behaviour, provider, handler, service, dependency or
   environment variable, and it adds no table, no column, no configuration store
   and no second secret path of its own.
@@ -2332,7 +3828,7 @@ migration. No code change needed.
 | 12 | `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds` (idempotent backfill + drop) | Pending manual application |
 | 13 | `20260919000001_create_api_credential_vault.sql` | `api_credentials` metadata table (no secret column) + `api_credential_pool` SECURITY DEFINER resolution RPC over Supabase Vault + `stt_credential_pool` compatibility alias | **NOT APPLIED — owner action required** (the application tolerates its absence; see §29) |
 | 14 | `20260919000002_credential_vault_management.sql` | Five owner-scoped SECURITY DEFINER management RPCs over the PART 1 table and Supabase Vault (`api_credential_list`, `api_credential_create`, `api_credential_replace_secret`, `api_credential_update`, `api_credential_delete`). Adds no table, no column and no secret store | **NOT APPLIED — owner action required** (management reports itself as not configured; the runtime and the PART 1 resolution path are unaffected; see §29.13) |
-| 15 | `20260920000001_reconcile_canonical_schema.sql` | The canonical reconciliation script (§30): re-asserts every canonical column of all 16 tables with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding, data-guards every constraint/index addition, adds the four missing `ai_config` columns and the two task tables, and ends with a drift report. Adds no table, no secret store and no data change beyond deterministic backfills | **NOT APPLIED — owner action required** (§30.11). Byte-identical to `supabase/canonical_bootstrap.sql` and to the §30 SQL block; the reconciliation **snapshot**, extended only by additive successors |
+| 15 | `20260920000001_reconcile_canonical_schema.sql` | The canonical reconciliation script (§30): re-asserts every canonical column of all 16 tables with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding, data-guards every constraint/index addition, adds the four missing `ai_config` columns and the two task tables, and ends with a drift report. Adds no table, no secret store and no data change beyond deterministic backfills | **NOT APPLIED — owner action required** (§30.11). Byte-identical to `supabase/canonical_bootstrap.sql`; its statements are embedded as part 1 of the ONE deployment block in §31.3; the reconciliation **snapshot**, extended only by additive successors |
 | 16 | `20260921000001_add_saved_items_display_name.sql` | Adds the nullable, default-less `display_name text` to `saved_items` (`ADD COLUMN IF NOT EXISTS`) — the owner-facing saved-item name — and reloads the PostgREST schema cache. Additive successor to #15: it touches no other table, creates no competing definition of `saved_items`, rewrites no row and changes no existing value (`tags` needs no DDL; only its producer changed) | **NOT APPLIED — owner action required.** Apply it BEFORE any Save surface starts writing a name (§2, *User-facing metadata*). On a database that has not run #15 it is safe only if `saved_items` already exists — #15 creates the table |
 | 17 | `20260922000001_add_saved_items_search_indexes.sql` | The Save V2 resolver's two search indexes on `saved_items`: `idx_saved_items_display_name_trgm` (GIN trigram for the `display_name ILIKE '%token%'` prefilter; enables `pg_trgm` itself) and `idx_saved_items_tags` (GIN for whole-tag containment `tags.cs.{…}`). Additive successor to #15/#16: indexes only — no column, no row, no `save_code` change; idempotent; reloads the PostgREST schema cache | **NOT APPLIED — owner action required** (§2 index table). Safe on any database that already has `saved_items` (created by #15 or earlier migrations) |
 
@@ -2998,9 +4494,11 @@ exactly as it did before this phase.
 
 ### 29.10 Manual Supabase SQL — NOT EXECUTED BY AI
 
-Apply this in the Supabase SQL Editor **as `postgres`**. It is idempotent
-(`IF NOT EXISTS` / `CREATE OR REPLACE`) but has not been run by the coding agent,
-and no Vault secret is created by it.
+This is the object contract for the Vault PART 1 migration. Its executable copy
+is **part 2 of the ONE deployment block in §31.3** — apply that block in the
+Supabase SQL Editor **as `postgres`**, not this snippet on its own. It is
+idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE`), has not been run by the
+coding agent, and no Vault secret is created by it.
 
 ```sql
 -- ============================================================================
@@ -3341,9 +4839,11 @@ The store is generic by the `provider` token, which is why PART 2 adds no
 ### 29.14 Manual Supabase SQL — NOT EXECUTED BY AI
 
 The block below is `supabase/migrations/20260919000002_credential_vault_management.sql`
-verbatim (header comment included). Apply it **as `postgres`** in the Supabase SQL
-Editor, after PART 1. It creates functions only: no table, no column, no index, no
-policy, no extension and no secret.
+verbatim (header comment included), reproduced here as the object contract. Its
+executable copy is **part 3 of the ONE deployment block in §31.3** — apply that
+block **as `postgres`** in the Supabase SQL Editor, after PART 1, not this snippet
+on its own. It creates functions only: no table, no column, no index, no policy,
+no extension and no secret.
 
 ```sql
 /*
@@ -4105,1781 +5605,17 @@ not prior reports — is the authority this script was derived from.
     `ai_messages.tool_calls` (no reader/writer) are deliberately still NOT
     canonical — see §19.5, §19.17 and §30.2.
 
-The same text exists in exactly three places and they are kept
-**byte-identical** — enforced by
-`tests/test_canonical_schema_reconciliation.py`:
-
-1. the fenced block above (the canonical reference, and the SQL the owner
-   pastes into the Supabase SQL Editor),
-2. `supabase/canonical_bootstrap.sql` (convenience copy),
-3. `supabase/migrations/20260920000001_reconcile_canonical_schema.sql`
-   (the repository migration for the §30 repair).
-
-There is therefore exactly ONE reconciled definition of the schema; the
-historical migration files stay untouched as history.
-
-### The script (single copy-pasteable block — Supabase SQL Editor)
-
-```sql
--- ============================================================================
--- LifeOS / Telegram Self-Bot — Canonical Supabase Bootstrap & Reconciliation
---
--- Generated from a repository-wide database contract audit of commit
--- 30bb3a426c2ec419be9d8f43373d85ce27d77099 (origin/main). See
--- DATABASE_ARCHITECTURE.md §30 for the schema-drift audit this revision
--- resolves.
---
--- Properties
---   * Establishes the COMPLETE database state required by CURRENT code:
---     16 canonical tables (the 14 previously documented public-schema tables
---     plus the live task-system tables ai_tasks / ai_task_occurrences that the
---     20260829…–20260912… migrations create) + 1 compatibility-preserved
---     legacy table (ghost_chats, kept additively).
---   * EXISTING-DATABASE RECONCILIATION. `CREATE TABLE IF NOT EXISTS` is a
---     silent NO-OP when the table already exists, so it is NEVER the only
---     mechanism that establishes a column. Immediately after every CREATE,
---     every canonical column is re-asserted with
---     `ADD COLUMN IF NOT EXISTS`, existing rows are backfilled
---     deterministically, and the column is bound to its final default /
---     NOT NULL contract. This is the fix for the 42703 class of failure
---     (`column "..." does not exist`) that a legacy table shape used to cause
---     on `bot_settings.value_type`, on the `panel_settings` constraint blocks
---     and on the `ai_config` upsert columns.
---   * Safe on a FRESH database, safe on any older/partially-migrated one, and
---     safe to run twice (every statement is idempotent or catalog-guarded).
---   * Additive only: no DROP TABLE, no DROP COLUMN, no DELETE, no TRUNCATE and
---     no data destruction. The only intentional drops are stale anon WRITE
---     policies that contradict the documented SELECT-only dashboard boundary.
---     Constraint/index additions that existing data could reject are
---     data-guarded: they are skipped with an explicit WARNING naming the
---     offending row count instead of aborting the script.
---   * Security model: ALL writes use the service-role key (bypasses RLS);
---     anon + authenticated get SELECT-only (read-only dashboard). No anon
---     INSERT/UPDATE/DELETE policy exists on any canonical table.
---   * The optional Supabase Vault credential RPCs are NOT part of this script;
---     they are documented and applied separately in DATABASE_ARCHITECTURE.md
---     §29 (api_credentials, api_credential_pool, the management functions).
---   * Historical application data (saved items, AI sessions/messages/
---     memories/usage/stats, logs, allow-list values) is intentionally NOT
---     fabricated. Only deterministic, project-defined seed rows are inserted.
---   * The script ends with a drift report: after COMMIT it lists any canonical
---     (table, column) that is still absent. Zero rows == the database now
---     matches the canonical contract.
---
--- Execution: paste the whole file into the Supabase SQL Editor as `postgres`.
---
--- This text exists in exactly three places and they are kept byte-identical
--- (tests/test_canonical_schema_reconciliation.py enforces it):
---   1. supabase/migrations/20260920000001_reconcile_canonical_schema.sql
---      (the repository migration for this repair)
---   2. supabase/canonical_bootstrap.sql (this convenience copy)
---   3. the fenced SQL block in DATABASE_ARCHITECTURE.md §30
--- ============================================================================
-
-BEGIN;
-
--- ─── 1. Extensions ──────────────────────────────────────────────────────────
--- pg_trgm powers the saved_items trigram indexes used by the
--- db_client.search_saves caption/save_code/mime_type ILIKE paths.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
--- ─── 2. saved_items ─────────────────────────────────────────────────────────
--- Writer: backend/db/client.py (insert/query/list/search/delete/count/stats)
--- Payload: backend/services/save_service.py::execute_save
--- save_type has NO CHECK: 20260714111706 supersedes the ('forward','deep')
--- CHECK from 20260712234229.
--- file_name / short_code are legacy columns (no live writer) kept additively.
-CREATE TABLE IF NOT EXISTS saved_items (
-    id              bigserial    PRIMARY KEY,
-    save_code       text         NOT NULL UNIQUE,
-    save_type       text         NOT NULL DEFAULT 'forward',
-    origin_chat_id  bigint,
-    origin_msg_id   bigint,
-    saved_chat_id   bigint,
-    saved_msg_id    bigint,
-    sender_name     text,
-    sender_id       bigint,
-    mime_type       text,
-    file_id         text,
-    file_size       bigint,
-    media_type      text,
-    tags            text[]       DEFAULT '{}',
-    caption         text,
-    file_name       text,
-    short_code      text,
-    owner_id        bigint       NOT NULL,
-    created_at      timestamptz  DEFAULT now()
-);
-
--- Existing-database column reconciliation (see the header).
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS id              bigserial;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS save_code       text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS save_type       text        NOT NULL DEFAULT 'forward';
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS origin_chat_id  bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS origin_msg_id   bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS saved_chat_id   bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS saved_msg_id    bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS sender_name     text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS sender_id       bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS mime_type       text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_id         text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_size       bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS media_type      text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS tags            text[]      DEFAULT '{}';
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS caption         text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS file_name       text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS short_code      text;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS owner_id        bigint;
-ALTER TABLE saved_items ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
-
--- Deterministic backfill so the NOT NULL contract below can never fail.
-UPDATE saved_items SET save_code  = 'S' || lpad(id::text, 4, '0') WHERE save_code  IS NULL;
-UPDATE saved_items SET save_type  = 'forward'  WHERE save_type  IS NULL;
-UPDATE saved_items SET tags       = '{}'       WHERE tags       IS NULL;
-UPDATE saved_items SET created_at = now()      WHERE created_at IS NULL;
-UPDATE saved_items SET owner_id   = 0          WHERE owner_id   IS NULL;
-
-ALTER TABLE saved_items ALTER COLUMN save_type  SET DEFAULT 'forward';
-ALTER TABLE saved_items ALTER COLUMN tags       SET DEFAULT '{}';
-ALTER TABLE saved_items ALTER COLUMN created_at SET DEFAULT now();
-
-ALTER TABLE saved_items ALTER COLUMN save_code SET NOT NULL;
-ALTER TABLE saved_items ALTER COLUMN save_type SET NOT NULL;
-ALTER TABLE saved_items ALTER COLUMN owner_id  SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_saved_items_owner          ON saved_items (owner_id);
-CREATE INDEX IF NOT EXISTS idx_saved_items_save_code      ON saved_items (save_code);
-CREATE INDEX IF NOT EXISTS idx_saved_items_created_at     ON saved_items (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_saved_items_owner_created  ON saved_items (owner_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_saved_items_caption_trgm   ON saved_items USING gin (caption gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_saved_items_file_name_trgm ON saved_items USING gin (file_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_saved_items_save_code_trgm ON saved_items USING gin (save_code gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_saved_items_short_code_trgm ON saved_items USING gin (short_code gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_saved_items_mime_trgm      ON saved_items USING gin (mime_type gin_trgm_ops);
-
--- Data-guarded partial unique index: legacy rows may share a short_code.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_saved_items_short_code') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM saved_items
-            WHERE short_code IS NOT NULL
-            GROUP BY short_code HAVING count(*) > 1
-        ) THEN
-            CREATE UNIQUE INDEX idx_saved_items_short_code
-                ON saved_items (short_code) WHERE short_code IS NOT NULL;
-        ELSE
-            RAISE WARNING 'saved_items: idx_saved_items_short_code NOT created - duplicate non-NULL short_code values exist. Resolve them and re-run this script.';
-        END IF;
-    END IF;
-END $$;
-
-ALTER TABLE saved_items ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_saved_items" ON saved_items;
-DROP POLICY IF EXISTS "anon_update_saved_items" ON saved_items;
-DROP POLICY IF EXISTS "anon_delete_saved_items" ON saved_items;
-DROP POLICY IF EXISTS "anon_select_saved_items" ON saved_items;
-CREATE POLICY "anon_select_saved_items" ON saved_items FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 3. bio_state ───────────────────────────────────────────────────────────
--- Writer/reader: backend/db/client.py (bio state + Bio ProfileEngine)
-CREATE TABLE IF NOT EXISTS bio_state (
-    id           bigserial    PRIMARY KEY,
-    owner_id     bigint       NOT NULL UNIQUE,
-    template     text         NOT NULL DEFAULT '🕒 {time} | 💭 {mood}',
-    mood         text         NOT NULL DEFAULT '😊',
-    custom_text  text         NOT NULL DEFAULT '',
-    is_active    boolean      NOT NULL DEFAULT false,
-    last_bio     text         NOT NULL DEFAULT '',
-    updated_at   timestamptz  DEFAULT now()
-);
-
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS id          bigserial;
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS template    text        NOT NULL DEFAULT '🕒 {time} | 💭 {mood}';
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS mood        text        NOT NULL DEFAULT '😊';
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS custom_text text        NOT NULL DEFAULT '';
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS is_active   boolean     NOT NULL DEFAULT false;
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS last_bio    text        NOT NULL DEFAULT '';
-ALTER TABLE bio_state ADD COLUMN IF NOT EXISTS updated_at  timestamptz DEFAULT now();
-
-UPDATE bio_state SET owner_id    = 0                       WHERE owner_id    IS NULL;
-UPDATE bio_state SET template    = '🕒 {time} | 💭 {mood}' WHERE template    IS NULL;
-UPDATE bio_state SET mood        = '😊'                    WHERE mood        IS NULL;
-UPDATE bio_state SET custom_text = ''                      WHERE custom_text IS NULL;
-UPDATE bio_state SET is_active   = false                   WHERE is_active   IS NULL;
-UPDATE bio_state SET last_bio    = ''                      WHERE last_bio    IS NULL;
-UPDATE bio_state SET updated_at  = now()                   WHERE updated_at  IS NULL;
-
-ALTER TABLE bio_state ALTER COLUMN template    SET DEFAULT '🕒 {time} | 💭 {mood}';
-ALTER TABLE bio_state ALTER COLUMN mood        SET DEFAULT '😊';
-ALTER TABLE bio_state ALTER COLUMN custom_text SET DEFAULT '';
-ALTER TABLE bio_state ALTER COLUMN is_active   SET DEFAULT false;
-ALTER TABLE bio_state ALTER COLUMN last_bio    SET DEFAULT '';
-ALTER TABLE bio_state ALTER COLUMN updated_at  SET DEFAULT now();
-
-ALTER TABLE bio_state ALTER COLUMN owner_id    SET NOT NULL;
-ALTER TABLE bio_state ALTER COLUMN template    SET NOT NULL;
-ALTER TABLE bio_state ALTER COLUMN mood        SET NOT NULL;
-ALTER TABLE bio_state ALTER COLUMN custom_text SET NOT NULL;
-ALTER TABLE bio_state ALTER COLUMN is_active   SET NOT NULL;
-ALTER TABLE bio_state ALTER COLUMN last_bio    SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_bio_state_owner ON bio_state (owner_id);
-
-ALTER TABLE bio_state ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_bio_state" ON bio_state;
-DROP POLICY IF EXISTS "anon_update_bio_state" ON bio_state;
-DROP POLICY IF EXISTS "anon_delete_bio_state" ON bio_state;
-DROP POLICY IF EXISTS "anon_select_bio_state" ON bio_state;
-CREATE POLICY "anon_select_bio_state" ON bio_state FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 4. username_state ──────────────────────────────────────────────────────
--- Writer/reader: backend/db/client.py (username state + Username ProfileEngine)
-CREATE TABLE IF NOT EXISTS username_state (
-    id           bigserial    PRIMARY KEY,
-    owner_id     bigint       NOT NULL UNIQUE,
-    template     text         NOT NULL DEFAULT '{time} | {mood}',
-    mood         text         NOT NULL DEFAULT '😊',
-    custom_text  text         NOT NULL DEFAULT '',
-    is_active    boolean      NOT NULL DEFAULT false,
-    last_name    text         NOT NULL DEFAULT '',
-    updated_at   timestamptz  DEFAULT now()
-);
-
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS id          bigserial;
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS template    text        NOT NULL DEFAULT '{time} | {mood}';
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS mood        text        NOT NULL DEFAULT '😊';
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS custom_text text        NOT NULL DEFAULT '';
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS is_active   boolean     NOT NULL DEFAULT false;
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS last_name   text        NOT NULL DEFAULT '';
-ALTER TABLE username_state ADD COLUMN IF NOT EXISTS updated_at  timestamptz DEFAULT now();
-
-UPDATE username_state SET owner_id    = 0                 WHERE owner_id    IS NULL;
-UPDATE username_state SET template    = '{time} | {mood}' WHERE template    IS NULL;
-UPDATE username_state SET mood        = '😊'              WHERE mood        IS NULL;
-UPDATE username_state SET custom_text = ''                WHERE custom_text IS NULL;
-UPDATE username_state SET is_active   = false             WHERE is_active   IS NULL;
-UPDATE username_state SET last_name   = ''                WHERE last_name   IS NULL;
-UPDATE username_state SET updated_at  = now()             WHERE updated_at  IS NULL;
-
-ALTER TABLE username_state ALTER COLUMN template    SET DEFAULT '{time} | {mood}';
-ALTER TABLE username_state ALTER COLUMN mood        SET DEFAULT '😊';
-ALTER TABLE username_state ALTER COLUMN custom_text SET DEFAULT '';
-ALTER TABLE username_state ALTER COLUMN is_active   SET DEFAULT false;
-ALTER TABLE username_state ALTER COLUMN last_name   SET DEFAULT '';
-ALTER TABLE username_state ALTER COLUMN updated_at  SET DEFAULT now();
-
-ALTER TABLE username_state ALTER COLUMN owner_id    SET NOT NULL;
-ALTER TABLE username_state ALTER COLUMN template    SET NOT NULL;
-ALTER TABLE username_state ALTER COLUMN mood        SET NOT NULL;
-ALTER TABLE username_state ALTER COLUMN custom_text SET NOT NULL;
-ALTER TABLE username_state ALTER COLUMN is_active   SET NOT NULL;
-ALTER TABLE username_state ALTER COLUMN last_name   SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_username_state_owner ON username_state (owner_id);
-
-ALTER TABLE username_state ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_username_state" ON username_state;
-DROP POLICY IF EXISTS "anon_update_username_state" ON username_state;
-DROP POLICY IF EXISTS "anon_delete_username_state" ON username_state;
-DROP POLICY IF EXISTS "anon_select_username_state" ON username_state;
-CREATE POLICY "anon_select_username_state" ON username_state FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 5. bot_logs ────────────────────────────────────────────────────────────
--- Writer/reader: backend/db/client.py log/list_logs/count_logs/clean_logs
--- (also backend/runtime/startup_check.py, dormant).
--- level has NO CHECK: 20260714111706 supersedes the ('INFO','WARN','ERROR')
--- CHECK from 20260712234229.
-CREATE TABLE IF NOT EXISTS bot_logs (
-    id         bigserial    PRIMARY KEY,
-    owner_id   bigint       NOT NULL,
-    level      text         NOT NULL DEFAULT 'INFO',
-    message    text         NOT NULL,
-    context    jsonb        DEFAULT '{}',
-    created_at timestamptz  DEFAULT now()
-);
-
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS id         bigserial;
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS owner_id   bigint      NOT NULL DEFAULT 0;
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS level      text        NOT NULL DEFAULT 'INFO';
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS message    text;
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS context    jsonb       DEFAULT '{}';
-ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
-
-UPDATE bot_logs SET owner_id   = 0      WHERE owner_id   IS NULL;
-UPDATE bot_logs SET level      = 'INFO' WHERE level      IS NULL;
-UPDATE bot_logs SET message    = ''     WHERE message    IS NULL;
-UPDATE bot_logs SET context    = '{}'   WHERE context    IS NULL;
-UPDATE bot_logs SET created_at = now()  WHERE created_at IS NULL;
-
-ALTER TABLE bot_logs ALTER COLUMN level      SET DEFAULT 'INFO';
-ALTER TABLE bot_logs ALTER COLUMN context    SET DEFAULT '{}';
-ALTER TABLE bot_logs ALTER COLUMN created_at SET DEFAULT now();
-
-ALTER TABLE bot_logs ALTER COLUMN owner_id SET NOT NULL;
-ALTER TABLE bot_logs ALTER COLUMN level    SET NOT NULL;
-ALTER TABLE bot_logs ALTER COLUMN message  SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_bot_logs_owner      ON bot_logs (owner_id);
-CREATE INDEX IF NOT EXISTS idx_bot_logs_created_at ON bot_logs (created_at DESC);
-
-ALTER TABLE bot_logs ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_bot_logs" ON bot_logs;
-DROP POLICY IF EXISTS "anon_update_bot_logs" ON bot_logs;
-DROP POLICY IF EXISTS "anon_delete_bot_logs" ON bot_logs;
-DROP POLICY IF EXISTS "anon_select_bot_logs" ON bot_logs;
-CREATE POLICY "anon_select_bot_logs" ON bot_logs FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 6. panel_settings ──────────────────────────────────────────────────────
--- Sole accessor: backend/services/panel_settings_repository.py (key='global').
--- Column set = the 12 settings_service._DEFAULTS settings + the two
--- legacy-orphan columns (update_stale_seconds, ghost_seen_retention_seconds)
--- preserved additively. CHECK ranges mirror settings_service._VALIDATORS.
---
--- This is the SECOND instance of the drift class: 20260726143924 created only
--- (key, auto_close_enabled, updated_at), so the CHECK blocks further down
--- referenced columns a silent no-op CREATE never added.
-CREATE TABLE IF NOT EXISTS panel_settings (
-    key                          text        PRIMARY KEY,
-    auto_close_enabled           boolean     NOT NULL DEFAULT true,
-    auto_close_delay             integer     NOT NULL DEFAULT 120,
-    max_deep_save_mb             integer     NOT NULL DEFAULT 50,
-    delete_batch_size            integer     NOT NULL DEFAULT 100,
-    log_retention_days           integer     NOT NULL DEFAULT 7,
-    panel_timeout_seconds        integer     NOT NULL DEFAULT 300,
-    allow_multiple_panels        boolean     NOT NULL DEFAULT false,
-    reuse_existing_panel         boolean     NOT NULL DEFAULT true,
-    language                     text        NOT NULL DEFAULT 'en',
-    debug_callbacks              boolean     NOT NULL DEFAULT false,
-    owner_only                   boolean     NOT NULL DEFAULT true,
-    dashboard_font               text        NOT NULL DEFAULT 'default',
-    update_stale_seconds         integer     NOT NULL DEFAULT 300,
-    ghost_seen_retention_seconds bigint      NOT NULL DEFAULT 2592000,
-    updated_at                   timestamptz DEFAULT now()
-);
-
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS key                          text;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_close_enabled           boolean     NOT NULL DEFAULT true;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS auto_close_delay             integer     NOT NULL DEFAULT 120;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS max_deep_save_mb             integer     NOT NULL DEFAULT 50;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS delete_batch_size            integer     NOT NULL DEFAULT 100;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS log_retention_days           integer     NOT NULL DEFAULT 7;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS panel_timeout_seconds        integer     NOT NULL DEFAULT 300;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS allow_multiple_panels        boolean     NOT NULL DEFAULT false;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS reuse_existing_panel         boolean     NOT NULL DEFAULT true;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS language                     text        NOT NULL DEFAULT 'en';
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS debug_callbacks              boolean     NOT NULL DEFAULT false;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS owner_only                   boolean     NOT NULL DEFAULT true;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS dashboard_font               text        NOT NULL DEFAULT 'default';
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS update_stale_seconds         integer     NOT NULL DEFAULT 300;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS ghost_seen_retention_seconds bigint      NOT NULL DEFAULT 2592000;
-ALTER TABLE panel_settings ADD COLUMN IF NOT EXISTS updated_at                   timestamptz DEFAULT now();
-
-UPDATE panel_settings SET auto_close_enabled           = true      WHERE auto_close_enabled           IS NULL;
-UPDATE panel_settings SET auto_close_delay             = 120       WHERE auto_close_delay             IS NULL;
-UPDATE panel_settings SET max_deep_save_mb             = 50        WHERE max_deep_save_mb             IS NULL;
-UPDATE panel_settings SET delete_batch_size            = 100       WHERE delete_batch_size            IS NULL;
-UPDATE panel_settings SET log_retention_days           = 7         WHERE log_retention_days           IS NULL;
-UPDATE panel_settings SET panel_timeout_seconds        = 300       WHERE panel_timeout_seconds        IS NULL;
-UPDATE panel_settings SET allow_multiple_panels        = false     WHERE allow_multiple_panels        IS NULL;
-UPDATE panel_settings SET reuse_existing_panel         = true      WHERE reuse_existing_panel         IS NULL;
-UPDATE panel_settings SET language                     = 'en'      WHERE language                     IS NULL;
-UPDATE panel_settings SET debug_callbacks              = false     WHERE debug_callbacks              IS NULL;
-UPDATE panel_settings SET owner_only                   = true      WHERE owner_only                   IS NULL;
-UPDATE panel_settings SET dashboard_font               = 'default' WHERE dashboard_font               IS NULL;
-UPDATE panel_settings SET update_stale_seconds         = 300       WHERE update_stale_seconds         IS NULL;
-UPDATE panel_settings SET ghost_seen_retention_seconds = 2592000   WHERE ghost_seen_retention_seconds IS NULL;
-UPDATE panel_settings SET updated_at                   = now()     WHERE updated_at                   IS NULL;
-
-ALTER TABLE panel_settings ALTER COLUMN auto_close_enabled           SET DEFAULT true;
-ALTER TABLE panel_settings ALTER COLUMN auto_close_delay             SET DEFAULT 120;
-ALTER TABLE panel_settings ALTER COLUMN max_deep_save_mb             SET DEFAULT 50;
-ALTER TABLE panel_settings ALTER COLUMN delete_batch_size            SET DEFAULT 100;
-ALTER TABLE panel_settings ALTER COLUMN log_retention_days           SET DEFAULT 7;
-ALTER TABLE panel_settings ALTER COLUMN panel_timeout_seconds        SET DEFAULT 300;
-ALTER TABLE panel_settings ALTER COLUMN allow_multiple_panels        SET DEFAULT false;
-ALTER TABLE panel_settings ALTER COLUMN reuse_existing_panel         SET DEFAULT true;
-ALTER TABLE panel_settings ALTER COLUMN language                     SET DEFAULT 'en';
-ALTER TABLE panel_settings ALTER COLUMN debug_callbacks              SET DEFAULT false;
-ALTER TABLE panel_settings ALTER COLUMN owner_only                   SET DEFAULT true;
-ALTER TABLE panel_settings ALTER COLUMN dashboard_font               SET DEFAULT 'default';
-ALTER TABLE panel_settings ALTER COLUMN update_stale_seconds         SET DEFAULT 300;
-ALTER TABLE panel_settings ALTER COLUMN ghost_seen_retention_seconds SET DEFAULT 2592000;
-ALTER TABLE panel_settings ALTER COLUMN updated_at                   SET DEFAULT now();
-
-ALTER TABLE panel_settings ALTER COLUMN auto_close_enabled           SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN auto_close_delay             SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN max_deep_save_mb             SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN delete_batch_size            SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN log_retention_days           SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN panel_timeout_seconds        SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN allow_multiple_panels        SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN reuse_existing_panel         SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN language                     SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN debug_callbacks              SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN owner_only                   SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN dashboard_font               SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN update_stale_seconds         SET NOT NULL;
-ALTER TABLE panel_settings ALTER COLUMN ghost_seen_retention_seconds SET NOT NULL;
-
--- panel_settings CHECK constraints. Every one is data-guarded: a legacy row
--- outside the documented range yields a WARNING naming the count instead of
--- aborting the whole script (mirrors settings_service._VALIDATORS).
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_auto_close_delay_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE auto_close_delay IS NULL OR auto_close_delay NOT BETWEEN 5 AND 3600) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_auto_close_delay_check
-                CHECK (auto_close_delay BETWEEN 5 AND 3600);
-        ELSE
-            RAISE WARNING 'panel_settings_auto_close_delay_check NOT added - % row(s) have auto_close_delay outside 5..3600.',
-                (SELECT count(*) FROM panel_settings WHERE auto_close_delay IS NULL OR auto_close_delay NOT BETWEEN 5 AND 3600);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_max_deep_save_mb_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE max_deep_save_mb IS NULL OR max_deep_save_mb NOT BETWEEN 1 AND 500) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_max_deep_save_mb_check
-                CHECK (max_deep_save_mb BETWEEN 1 AND 500);
-        ELSE
-            RAISE WARNING 'panel_settings_max_deep_save_mb_check NOT added - % row(s) have max_deep_save_mb outside 1..500.',
-                (SELECT count(*) FROM panel_settings WHERE max_deep_save_mb IS NULL OR max_deep_save_mb NOT BETWEEN 1 AND 500);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_delete_batch_size_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE delete_batch_size IS NULL OR delete_batch_size NOT BETWEEN 1 AND 1000) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_delete_batch_size_check
-                CHECK (delete_batch_size BETWEEN 1 AND 1000);
-        ELSE
-            RAISE WARNING 'panel_settings_delete_batch_size_check NOT added - % row(s) have delete_batch_size outside 1..1000.',
-                (SELECT count(*) FROM panel_settings WHERE delete_batch_size IS NULL OR delete_batch_size NOT BETWEEN 1 AND 1000);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_log_retention_days_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE log_retention_days IS NULL OR log_retention_days NOT BETWEEN 1 AND 365) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_log_retention_days_check
-                CHECK (log_retention_days BETWEEN 1 AND 365);
-        ELSE
-            RAISE WARNING 'panel_settings_log_retention_days_check NOT added - % row(s) have log_retention_days outside 1..365.',
-                (SELECT count(*) FROM panel_settings WHERE log_retention_days IS NULL OR log_retention_days NOT BETWEEN 1 AND 365);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_panel_timeout_seconds_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE panel_timeout_seconds IS NULL OR panel_timeout_seconds NOT BETWEEN 30 AND 86400) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_panel_timeout_seconds_check
-                CHECK (panel_timeout_seconds BETWEEN 30 AND 86400);
-        ELSE
-            RAISE WARNING 'panel_settings_panel_timeout_seconds_check NOT added - % row(s) have panel_timeout_seconds outside 30..86400.',
-                (SELECT count(*) FROM panel_settings WHERE panel_timeout_seconds IS NULL OR panel_timeout_seconds NOT BETWEEN 30 AND 86400);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_language_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE language IS NULL OR length(btrim(language)) = 0) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_language_check
-                CHECK (length(btrim(language)) > 0);
-        ELSE
-            RAISE WARNING 'panel_settings_language_check NOT added - % row(s) have a blank language.',
-                (SELECT count(*) FROM panel_settings WHERE language IS NULL OR length(btrim(language)) = 0);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_dashboard_font_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE dashboard_font IS NULL OR dashboard_font NOT IN (
-                'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
-                'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
-                'script', 'script_bold', 'fraktur', 'fraktur_bold',
-                'double_struck', 'mono', 'small_caps', 'circled',
-                'circled_dark', 'fullwidth', 'parenthesized', 'underline',
-                'strikethrough', 'overline', 'wavy_underline'
-            )) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_dashboard_font_check
-                CHECK (dashboard_font IN (
-                    'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
-                    'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
-                    'script', 'script_bold', 'fraktur', 'fraktur_bold',
-                    'double_struck', 'mono', 'small_caps', 'circled',
-                    'circled_dark', 'fullwidth', 'parenthesized', 'underline',
-                    'strikethrough', 'overline', 'wavy_underline'
-                ));
-        ELSE
-            RAISE WARNING 'panel_settings_dashboard_font_check NOT added - % row(s) have a dashboard_font outside the 23-key list.',
-                (SELECT count(*) FROM panel_settings WHERE dashboard_font IS NULL OR dashboard_font NOT IN (
-                    'default', 'serif_bold', 'serif_italic', 'serif_bold_italic',
-                    'sans', 'sans_bold', 'sans_italic', 'sans_bold_italic',
-                    'script', 'script_bold', 'fraktur', 'fraktur_bold',
-                    'double_struck', 'mono', 'small_caps', 'circled',
-                    'circled_dark', 'fullwidth', 'parenthesized', 'underline',
-                    'strikethrough', 'overline', 'wavy_underline'
-                ));
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'panel_settings_ghost_seen_retention_seconds_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM panel_settings WHERE ghost_seen_retention_seconds IS NULL
-                       OR NOT (ghost_seen_retention_seconds = 0
-                               OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000)) THEN
-            ALTER TABLE panel_settings ADD CONSTRAINT panel_settings_ghost_seen_retention_seconds_check
-                CHECK (ghost_seen_retention_seconds = 0
-                       OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000);
-        ELSE
-            RAISE WARNING 'panel_settings_ghost_seen_retention_seconds_check NOT added - % row(s) have an out-of-range retention window.',
-                (SELECT count(*) FROM panel_settings WHERE ghost_seen_retention_seconds IS NULL
-                   OR NOT (ghost_seen_retention_seconds = 0
-                           OR ghost_seen_retention_seconds BETWEEN 300 AND 31536000));
-        END IF;
-    END IF;
-END $$;
-
--- Required singleton row: repository updates target key='global' and
--- silently no-op without it. `ON CONFLICT DO NOTHING` is deliberately
--- targetless so it cannot fail on a table whose unique index on `key` was not
--- (yet) reconcilable.
-INSERT INTO panel_settings (key) VALUES ('global')
-ON CONFLICT DO NOTHING;
-
-ALTER TABLE panel_settings ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_panel_settings" ON panel_settings;
-DROP POLICY IF EXISTS "anon_update_panel_settings" ON panel_settings;
-DROP POLICY IF EXISTS "anon_delete_panel_settings" ON panel_settings;
-DROP POLICY IF EXISTS "anon_select_panel_settings" ON panel_settings;
-CREATE POLICY "anon_select_panel_settings" ON panel_settings FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 7. bot_settings ────────────────────────────────────────────────────────
--- Live consumer: backend/services/ghost_seen_v2.py (ghost_seen_allowed_chats
--- KV row, created at runtime — deliberately NOT seeded here).
--- The five seed rows below are legacy defaults from migration 20260729213959,
--- consumed by no current reader; retained verbatim for migration fidelity.
---
--- THE REPORTED PRODUCTION FAILURE. A live database whose bot_settings already
--- existed without `value_type` made the CREATE a silent no-op, so the INSERT
--- below raised ERROR 42703 (`column "value_type" of relation "bot_settings"
--- does not exist`). The reconciliation block fixes the class, not the symptom.
-CREATE TABLE IF NOT EXISTS bot_settings (
-    key         text        PRIMARY KEY,
-    value       text        NOT NULL,
-    value_type  text        NOT NULL DEFAULT 'str',
-    updated_at  timestamptz DEFAULT now()
-);
-
-ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS key        text;
-ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS value      text;
-ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS value_type text        NOT NULL DEFAULT 'str';
-ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
-
-UPDATE bot_settings SET value      = ''    WHERE value      IS NULL;
-UPDATE bot_settings SET value_type = 'str' WHERE value_type IS NULL;
-UPDATE bot_settings SET updated_at = now() WHERE updated_at IS NULL;
-
-ALTER TABLE bot_settings ALTER COLUMN value_type SET DEFAULT 'str';
-ALTER TABLE bot_settings ALTER COLUMN updated_at SET DEFAULT now();
-
-ALTER TABLE bot_settings ALTER COLUMN value      SET NOT NULL;
-ALTER TABLE bot_settings ALTER COLUMN value_type SET NOT NULL;
-
-INSERT INTO bot_settings (key, value, value_type) VALUES
-    ('auto_close_enabled', 'true', 'bool'),
-    ('panel_auto_close_seconds', '120', 'int'),
-    ('max_deep_save_mb', '50', 'int'),
-    ('delete_batch_size', '100', 'int'),
-    ('log_cleanup_days', '7', 'int')
-ON CONFLICT DO NOTHING;
-
-ALTER TABLE bot_settings ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_bot_settings" ON bot_settings;
-DROP POLICY IF EXISTS "anon_update_bot_settings" ON bot_settings;
-DROP POLICY IF EXISTS "anon_delete_bot_settings" ON bot_settings;
-DROP POLICY IF EXISTS "anon_select_bot_settings" ON bot_settings;
-CREATE POLICY "anon_select_bot_settings" ON bot_settings FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 8. ai_config ───────────────────────────────────────────────────────────
--- Writer/reader: backend/ai/config_store.py (get/save/record_request).
--- trigger_en / trigger_fa are nullable text; the writer normalizes empty
--- strings to NULL. UNIQUE(owner_id) backs the writer's select-then-
--- insert/update flow.
---
--- show_question / stt_model / stt_language / stt_passes are written by EVERY
--- config_store upsert payload (migrations 20260913000000 and 20260917000001).
--- They are therefore part of the canonical contract: omitting them made a
--- database built only from this script reject the whole upsert and silently
--- lose AI settings on restart.
-CREATE TABLE IF NOT EXISTS ai_config (
-    id              bigserial    PRIMARY KEY,
-    owner_id        bigint       NOT NULL UNIQUE,
-    provider        text         DEFAULT '',
-    model           text         DEFAULT '',
-    temperature     real         DEFAULT 1.0,
-    max_tokens      integer      DEFAULT 4096,
-    system_prompt   text         DEFAULT '',
-    history_budget  integer      DEFAULT 4000,
-    is_configured   boolean      DEFAULT false,
-    trigger_en      text         DEFAULT NULL,
-    trigger_fa      text         DEFAULT NULL,
-    show_question   boolean      NOT NULL DEFAULT false,
-    stt_model       text         DEFAULT NULL,
-    stt_language    text         DEFAULT NULL,
-    stt_passes      integer      NOT NULL DEFAULT 1,
-    last_request_at timestamptz,
-    last_latency_ms real         DEFAULT 0,
-    created_at      timestamptz  DEFAULT now(),
-    updated_at      timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS id              bigserial;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS owner_id        bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS provider        text        DEFAULT '';
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS model           text        DEFAULT '';
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS temperature     real        DEFAULT 1.0;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS max_tokens      integer     DEFAULT 4096;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS system_prompt   text        DEFAULT '';
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS history_budget  integer     DEFAULT 4000;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS is_configured   boolean     DEFAULT false;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS trigger_en      text        DEFAULT NULL;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS trigger_fa      text        DEFAULT NULL;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS show_question   boolean     NOT NULL DEFAULT false;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_model       text        DEFAULT NULL;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_language    text        DEFAULT NULL;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS stt_passes      integer     NOT NULL DEFAULT 1;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS last_request_at timestamptz;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS last_latency_ms real        DEFAULT 0;
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
-ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS updated_at      timestamptz DEFAULT now();
-
-UPDATE ai_config SET owner_id        = 0     WHERE owner_id        IS NULL;
-UPDATE ai_config SET provider        = ''    WHERE provider        IS NULL;
-UPDATE ai_config SET model           = ''    WHERE model           IS NULL;
-UPDATE ai_config SET temperature     = 1.0   WHERE temperature     IS NULL;
-UPDATE ai_config SET max_tokens      = 4096  WHERE max_tokens      IS NULL;
-UPDATE ai_config SET system_prompt   = ''    WHERE system_prompt   IS NULL;
-UPDATE ai_config SET history_budget  = 4000  WHERE history_budget  IS NULL;
-UPDATE ai_config SET is_configured   = false WHERE is_configured   IS NULL;
-UPDATE ai_config SET show_question   = false WHERE show_question   IS NULL;
-UPDATE ai_config SET stt_passes      = 1     WHERE stt_passes      IS NULL;
-UPDATE ai_config SET last_latency_ms = 0     WHERE last_latency_ms IS NULL;
-UPDATE ai_config SET created_at      = now() WHERE created_at      IS NULL;
-UPDATE ai_config SET updated_at      = now() WHERE updated_at      IS NULL;
-
-ALTER TABLE ai_config ALTER COLUMN provider        SET DEFAULT '';
-ALTER TABLE ai_config ALTER COLUMN model           SET DEFAULT '';
-ALTER TABLE ai_config ALTER COLUMN temperature     SET DEFAULT 1.0;
-ALTER TABLE ai_config ALTER COLUMN max_tokens      SET DEFAULT 4096;
-ALTER TABLE ai_config ALTER COLUMN system_prompt   SET DEFAULT '';
-ALTER TABLE ai_config ALTER COLUMN history_budget  SET DEFAULT 4000;
-ALTER TABLE ai_config ALTER COLUMN is_configured   SET DEFAULT false;
-ALTER TABLE ai_config ALTER COLUMN show_question   SET DEFAULT false;
-ALTER TABLE ai_config ALTER COLUMN stt_passes      SET DEFAULT 1;
-ALTER TABLE ai_config ALTER COLUMN last_latency_ms SET DEFAULT 0;
-ALTER TABLE ai_config ALTER COLUMN created_at      SET DEFAULT now();
-ALTER TABLE ai_config ALTER COLUMN updated_at      SET DEFAULT now();
-
-ALTER TABLE ai_config ALTER COLUMN owner_id      SET NOT NULL;
-ALTER TABLE ai_config ALTER COLUMN show_question SET NOT NULL;
-ALTER TABLE ai_config ALTER COLUMN stt_passes    SET NOT NULL;
-
--- stt_passes is the only ranged ai_config column (1..3, mirroring the AI
--- Settings control plane). Data-guarded like the panel_settings CHECKs.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_config_stt_passes_range') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_config WHERE stt_passes IS NULL OR stt_passes NOT BETWEEN 1 AND 3) THEN
-            ALTER TABLE ai_config ADD CONSTRAINT ai_config_stt_passes_range
-                CHECK (stt_passes BETWEEN 1 AND 3);
-        ELSE
-            RAISE WARNING 'ai_config_stt_passes_range NOT added - % row(s) have stt_passes outside 1..3.',
-                (SELECT count(*) FROM ai_config WHERE stt_passes IS NULL OR stt_passes NOT BETWEEN 1 AND 3);
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_config_owner ON ai_config (owner_id);
-
-ALTER TABLE ai_config ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_config" ON ai_config;
-DROP POLICY IF EXISTS "anon_update_ai_config" ON ai_config;
-DROP POLICY IF EXISTS "anon_delete_ai_config" ON ai_config;
-DROP POLICY IF EXISTS "anon_select_ai_config" ON ai_config;
-CREATE POLICY "anon_select_ai_config" ON ai_config FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 9. ai_sessions ─────────────────────────────────────────────────────────
--- Writer/reader: backend/ai/persistence.py (create/update/get_session).
-CREATE TABLE IF NOT EXISTS ai_sessions (
-    id            bigserial    PRIMARY KEY,
-    session_id    text         NOT NULL UNIQUE,
-    owner_id      bigint       NOT NULL,
-    provider      text         DEFAULT '',
-    model         text         DEFAULT '',
-    status        text         DEFAULT 'active',
-    total_tokens  integer      DEFAULT 0,
-    message_count integer      DEFAULT 0,
-    created_at    timestamptz  DEFAULT now(),
-    updated_at    timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS id            bigserial;
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS session_id    text;
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS owner_id      bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS provider      text        DEFAULT '';
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS model         text        DEFAULT '';
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS status        text        DEFAULT 'active';
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS total_tokens  integer     DEFAULT 0;
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS message_count integer     DEFAULT 0;
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS created_at    timestamptz DEFAULT now();
-ALTER TABLE ai_sessions ADD COLUMN IF NOT EXISTS updated_at    timestamptz DEFAULT now();
-
-UPDATE ai_sessions SET session_id    = 'recovered-' || id WHERE session_id    IS NULL;
-UPDATE ai_sessions SET owner_id      = 0         WHERE owner_id      IS NULL;
-UPDATE ai_sessions SET provider      = ''        WHERE provider      IS NULL;
-UPDATE ai_sessions SET model         = ''        WHERE model         IS NULL;
-UPDATE ai_sessions SET status        = 'active'  WHERE status        IS NULL;
-UPDATE ai_sessions SET total_tokens  = 0         WHERE total_tokens  IS NULL;
-UPDATE ai_sessions SET message_count = 0         WHERE message_count IS NULL;
-UPDATE ai_sessions SET created_at    = now()     WHERE created_at    IS NULL;
-UPDATE ai_sessions SET updated_at    = now()     WHERE updated_at    IS NULL;
-
-ALTER TABLE ai_sessions ALTER COLUMN provider      SET DEFAULT '';
-ALTER TABLE ai_sessions ALTER COLUMN model         SET DEFAULT '';
-ALTER TABLE ai_sessions ALTER COLUMN status        SET DEFAULT 'active';
-ALTER TABLE ai_sessions ALTER COLUMN total_tokens  SET DEFAULT 0;
-ALTER TABLE ai_sessions ALTER COLUMN message_count SET DEFAULT 0;
-ALTER TABLE ai_sessions ALTER COLUMN created_at    SET DEFAULT now();
-ALTER TABLE ai_sessions ALTER COLUMN updated_at    SET DEFAULT now();
-
-ALTER TABLE ai_sessions ALTER COLUMN session_id SET NOT NULL;
-ALTER TABLE ai_sessions ALTER COLUMN owner_id   SET NOT NULL;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_sessions_status_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_sessions WHERE status IS NULL OR status NOT IN ('active', 'completed', 'error', 'closed')) THEN
-            ALTER TABLE ai_sessions ADD CONSTRAINT ai_sessions_status_check
-                CHECK (status IN ('active', 'completed', 'error', 'closed'));
-        ELSE
-            RAISE WARNING 'ai_sessions_status_check NOT added - % row(s) have an unrecognized status.',
-                (SELECT count(*) FROM ai_sessions WHERE status IS NULL OR status NOT IN ('active', 'completed', 'error', 'closed'));
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_sessions_owner      ON ai_sessions (owner_id);
-CREATE INDEX IF NOT EXISTS idx_ai_sessions_session_id ON ai_sessions (session_id);
-
-ALTER TABLE ai_sessions ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_sessions" ON ai_sessions;
-DROP POLICY IF EXISTS "anon_update_ai_sessions" ON ai_sessions;
-DROP POLICY IF EXISTS "anon_delete_ai_sessions" ON ai_sessions;
-DROP POLICY IF EXISTS "anon_select_ai_sessions" ON ai_sessions;
-CREATE POLICY "anon_select_ai_sessions" ON ai_sessions FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 10. ai_messages ────────────────────────────────────────────────────────
--- Writer/reader: backend/ai/persistence.py (add_message/get_messages).
-CREATE TABLE IF NOT EXISTS ai_messages (
-    id          bigserial    PRIMARY KEY,
-    session_id  text         NOT NULL,
-    owner_id    bigint       NOT NULL,
-    role        text         NOT NULL DEFAULT 'user',
-    content     text         NOT NULL DEFAULT '',
-    token_count integer      DEFAULT 0,
-    provider    text         DEFAULT '',
-    model       text         DEFAULT '',
-    created_at  timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS id          bigserial;
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS session_id  text;
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS owner_id    bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS role        text        NOT NULL DEFAULT 'user';
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS content     text        NOT NULL DEFAULT '';
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS token_count integer     DEFAULT 0;
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS provider    text        DEFAULT '';
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS model       text        DEFAULT '';
-ALTER TABLE ai_messages ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now();
-
-UPDATE ai_messages SET session_id  = ''     WHERE session_id  IS NULL;
-UPDATE ai_messages SET owner_id    = 0      WHERE owner_id    IS NULL;
-UPDATE ai_messages SET role        = 'user' WHERE role        IS NULL;
-UPDATE ai_messages SET content     = ''     WHERE content     IS NULL;
-UPDATE ai_messages SET token_count = 0      WHERE token_count IS NULL;
-UPDATE ai_messages SET provider    = ''     WHERE provider    IS NULL;
-UPDATE ai_messages SET model       = ''     WHERE model       IS NULL;
-UPDATE ai_messages SET created_at  = now()  WHERE created_at  IS NULL;
-
-ALTER TABLE ai_messages ALTER COLUMN role        SET DEFAULT 'user';
-ALTER TABLE ai_messages ALTER COLUMN content     SET DEFAULT '';
-ALTER TABLE ai_messages ALTER COLUMN token_count SET DEFAULT 0;
-ALTER TABLE ai_messages ALTER COLUMN provider    SET DEFAULT '';
-ALTER TABLE ai_messages ALTER COLUMN model       SET DEFAULT '';
-ALTER TABLE ai_messages ALTER COLUMN created_at  SET DEFAULT now();
-
-ALTER TABLE ai_messages ALTER COLUMN session_id SET NOT NULL;
-ALTER TABLE ai_messages ALTER COLUMN owner_id   SET NOT NULL;
-ALTER TABLE ai_messages ALTER COLUMN role       SET NOT NULL;
-ALTER TABLE ai_messages ALTER COLUMN content    SET NOT NULL;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_messages_role_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_messages WHERE role IS NULL OR role NOT IN ('system', 'user', 'assistant', 'tool')) THEN
-            ALTER TABLE ai_messages ADD CONSTRAINT ai_messages_role_check
-                CHECK (role IN ('system', 'user', 'assistant', 'tool'));
-        ELSE
-            RAISE WARNING 'ai_messages_role_check NOT added - % row(s) have an unrecognized role.',
-                (SELECT count(*) FROM ai_messages WHERE role IS NULL OR role NOT IN ('system', 'user', 'assistant', 'tool'));
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages (session_id);
-CREATE INDEX IF NOT EXISTS idx_ai_messages_owner   ON ai_messages (owner_id);
-CREATE INDEX IF NOT EXISTS idx_ai_messages_created ON ai_messages (created_at DESC);
-
-ALTER TABLE ai_messages ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_messages" ON ai_messages;
-DROP POLICY IF EXISTS "anon_update_ai_messages" ON ai_messages;
-DROP POLICY IF EXISTS "anon_delete_ai_messages" ON ai_messages;
-DROP POLICY IF EXISTS "anon_select_ai_messages" ON ai_messages;
-CREATE POLICY "anon_select_ai_messages" ON ai_messages FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 11. ai_memories ────────────────────────────────────────────────────────
--- Writer/reader: backend/ai/persistence.py
--- (save/query/delete_expired/delete/count_memories).
-CREATE TABLE IF NOT EXISTS ai_memories (
-    id          bigserial    PRIMARY KEY,
-    owner_id    bigint       NOT NULL,
-    tier        text         NOT NULL DEFAULT 'long',
-    category    text         NOT NULL DEFAULT 'context',
-    content     text         NOT NULL,
-    importance  real         DEFAULT 0.5,
-    expires_at  timestamptz,
-    metadata    jsonb        DEFAULT '{}',
-    created_at  timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS id         bigserial;
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS owner_id   bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS tier       text        NOT NULL DEFAULT 'long';
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS category   text        NOT NULL DEFAULT 'context';
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS content    text;
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS importance real        DEFAULT 0.5;
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS expires_at timestamptz;
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS metadata   jsonb       DEFAULT '{}';
-ALTER TABLE ai_memories ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
-
-UPDATE ai_memories SET owner_id   = 0         WHERE owner_id   IS NULL;
-UPDATE ai_memories SET tier       = 'long'    WHERE tier       IS NULL;
-UPDATE ai_memories SET category   = 'context' WHERE category   IS NULL;
-UPDATE ai_memories SET content    = ''        WHERE content    IS NULL;
-UPDATE ai_memories SET importance = 0.5       WHERE importance IS NULL;
-UPDATE ai_memories SET metadata   = '{}'      WHERE metadata   IS NULL;
-UPDATE ai_memories SET created_at = now()     WHERE created_at IS NULL;
-
-ALTER TABLE ai_memories ALTER COLUMN tier       SET DEFAULT 'long';
-ALTER TABLE ai_memories ALTER COLUMN category   SET DEFAULT 'context';
-ALTER TABLE ai_memories ALTER COLUMN importance SET DEFAULT 0.5;
-ALTER TABLE ai_memories ALTER COLUMN metadata   SET DEFAULT '{}';
-ALTER TABLE ai_memories ALTER COLUMN created_at SET DEFAULT now();
-
-ALTER TABLE ai_memories ALTER COLUMN owner_id SET NOT NULL;
-ALTER TABLE ai_memories ALTER COLUMN tier     SET NOT NULL;
-ALTER TABLE ai_memories ALTER COLUMN category SET NOT NULL;
-ALTER TABLE ai_memories ALTER COLUMN content  SET NOT NULL;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_memories_tier_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_memories WHERE tier IS NULL OR tier NOT IN ('short', 'long', 'permanent')) THEN
-            ALTER TABLE ai_memories ADD CONSTRAINT ai_memories_tier_check
-                CHECK (tier IN ('short', 'long', 'permanent'));
-        ELSE
-            RAISE WARNING 'ai_memories_tier_check NOT added - % row(s) have an unrecognized tier.',
-                (SELECT count(*) FROM ai_memories WHERE tier IS NULL OR tier NOT IN ('short', 'long', 'permanent'));
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_memories_category_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_memories WHERE category IS NULL OR category NOT IN ('fact', 'preference', 'context', 'summary', 'instruction')) THEN
-            ALTER TABLE ai_memories ADD CONSTRAINT ai_memories_category_check
-                CHECK (category IN ('fact', 'preference', 'context', 'summary', 'instruction'));
-        ELSE
-            RAISE WARNING 'ai_memories_category_check NOT added - % row(s) have an unrecognized category.',
-                (SELECT count(*) FROM ai_memories WHERE category IS NULL OR category NOT IN ('fact', 'preference', 'context', 'summary', 'instruction'));
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_memories_owner      ON ai_memories (owner_id);
-CREATE INDEX IF NOT EXISTS idx_ai_memories_tier       ON ai_memories (tier);
-CREATE INDEX IF NOT EXISTS idx_ai_memories_owner_tier ON ai_memories (owner_id, tier);
-
-ALTER TABLE ai_memories ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_memories" ON ai_memories;
-DROP POLICY IF EXISTS "anon_update_ai_memories" ON ai_memories;
-DROP POLICY IF EXISTS "anon_delete_ai_memories" ON ai_memories;
-DROP POLICY IF EXISTS "anon_select_ai_memories" ON ai_memories;
-CREATE POLICY "anon_select_ai_memories" ON ai_memories FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 12. ai_tool_history ────────────────────────────────────────────────────
--- Writer: backend/ai/persistence.py::record_tool_call (INSERT only).
--- result_data is migration-defined but never inserted by current code
--- (legacy-preserved column).
-CREATE TABLE IF NOT EXISTS ai_tool_history (
-    id             bigserial    PRIMARY KEY,
-    owner_id       bigint       NOT NULL,
-    session_id     text         DEFAULT '',
-    tool_name      text         NOT NULL,
-    arguments      jsonb        DEFAULT '{}',
-    result_success boolean      DEFAULT false,
-    result_message text         DEFAULT '',
-    result_data    jsonb        DEFAULT '{}',
-    latency_ms     real         DEFAULT 0,
-    created_at     timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS id             bigserial;
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS owner_id       bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS session_id     text        DEFAULT '';
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS tool_name      text;
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS arguments      jsonb       DEFAULT '{}';
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_success boolean     DEFAULT false;
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_message text        DEFAULT '';
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS result_data    jsonb       DEFAULT '{}';
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS latency_ms     real        DEFAULT 0;
-ALTER TABLE ai_tool_history ADD COLUMN IF NOT EXISTS created_at     timestamptz DEFAULT now();
-
-UPDATE ai_tool_history SET owner_id       = 0         WHERE owner_id       IS NULL;
-UPDATE ai_tool_history SET session_id     = ''        WHERE session_id     IS NULL;
-UPDATE ai_tool_history SET tool_name      = 'unknown' WHERE tool_name      IS NULL;
-UPDATE ai_tool_history SET arguments      = '{}'      WHERE arguments      IS NULL;
-UPDATE ai_tool_history SET result_success = false     WHERE result_success IS NULL;
-UPDATE ai_tool_history SET result_message = ''        WHERE result_message IS NULL;
-UPDATE ai_tool_history SET result_data    = '{}'      WHERE result_data    IS NULL;
-UPDATE ai_tool_history SET latency_ms     = 0         WHERE latency_ms     IS NULL;
-UPDATE ai_tool_history SET created_at     = now()     WHERE created_at     IS NULL;
-
-ALTER TABLE ai_tool_history ALTER COLUMN session_id     SET DEFAULT '';
-ALTER TABLE ai_tool_history ALTER COLUMN arguments      SET DEFAULT '{}';
-ALTER TABLE ai_tool_history ALTER COLUMN result_success SET DEFAULT false;
-ALTER TABLE ai_tool_history ALTER COLUMN result_message SET DEFAULT '';
-ALTER TABLE ai_tool_history ALTER COLUMN result_data    SET DEFAULT '{}';
-ALTER TABLE ai_tool_history ALTER COLUMN latency_ms     SET DEFAULT 0;
-ALTER TABLE ai_tool_history ALTER COLUMN created_at     SET DEFAULT now();
-
-ALTER TABLE ai_tool_history ALTER COLUMN owner_id  SET NOT NULL;
-ALTER TABLE ai_tool_history ALTER COLUMN tool_name SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_ai_tool_history_owner   ON ai_tool_history (owner_id);
-CREATE INDEX IF NOT EXISTS idx_ai_tool_history_created ON ai_tool_history (created_at DESC);
-
-ALTER TABLE ai_tool_history ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_tool_history" ON ai_tool_history;
-DROP POLICY IF EXISTS "anon_update_ai_tool_history" ON ai_tool_history;
-DROP POLICY IF EXISTS "anon_delete_ai_tool_history" ON ai_tool_history;
-DROP POLICY IF EXISTS "anon_select_ai_tool_history" ON ai_tool_history;
-CREATE POLICY "anon_select_ai_tool_history" ON ai_tool_history FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 13. ai_usage ───────────────────────────────────────────────────────────
--- Writer/reader: SupabaseUsageRepository
--- (backend/ai/database/usage_repository.py).
--- id is NOT sent by the writer (bigserial); token_source carries the honesty
--- label verbatim (actual / estimated / unavailable).
-CREATE TABLE IF NOT EXISTS ai_usage (
-    id                bigserial    PRIMARY KEY,
-    owner_id          bigint       NOT NULL,
-    session_id        text,
-    provider          text,
-    model             text,
-    prompt_tokens     integer      DEFAULT 0,
-    completion_tokens integer      DEFAULT 0,
-    total_tokens      integer      DEFAULT 0,
-    latency_ms        real         DEFAULT 0,
-    token_source      text         DEFAULT NULL,
-    created_at        timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS id                bigserial;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS owner_id          bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS session_id        text;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS provider          text;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS model             text;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS prompt_tokens     integer     DEFAULT 0;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS completion_tokens integer     DEFAULT 0;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS total_tokens      integer     DEFAULT 0;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS latency_ms        real        DEFAULT 0;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS token_source      text        DEFAULT NULL;
-ALTER TABLE ai_usage ADD COLUMN IF NOT EXISTS created_at        timestamptz DEFAULT now();
-
-UPDATE ai_usage SET owner_id          = 0     WHERE owner_id          IS NULL;
-UPDATE ai_usage SET prompt_tokens     = 0     WHERE prompt_tokens     IS NULL;
-UPDATE ai_usage SET completion_tokens = 0     WHERE completion_tokens IS NULL;
-UPDATE ai_usage SET total_tokens      = 0     WHERE total_tokens      IS NULL;
-UPDATE ai_usage SET latency_ms        = 0     WHERE latency_ms        IS NULL;
-UPDATE ai_usage SET created_at        = now() WHERE created_at        IS NULL;
-
-ALTER TABLE ai_usage ALTER COLUMN prompt_tokens     SET DEFAULT 0;
-ALTER TABLE ai_usage ALTER COLUMN completion_tokens SET DEFAULT 0;
-ALTER TABLE ai_usage ALTER COLUMN total_tokens      SET DEFAULT 0;
-ALTER TABLE ai_usage ALTER COLUMN latency_ms        SET DEFAULT 0;
-ALTER TABLE ai_usage ALTER COLUMN created_at        SET DEFAULT now();
-
-ALTER TABLE ai_usage ALTER COLUMN owner_id SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_ai_usage_owner      ON ai_usage (owner_id);
-CREATE INDEX IF NOT EXISTS idx_ai_usage_created_at ON ai_usage (created_at);
-
-ALTER TABLE ai_usage ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_usage" ON ai_usage;
-DROP POLICY IF EXISTS "anon_update_ai_usage" ON ai_usage;
-DROP POLICY IF EXISTS "anon_delete_ai_usage" ON ai_usage;
-DROP POLICY IF EXISTS "anon_select_ai_usage" ON ai_usage;
-CREATE POLICY "anon_select_ai_usage" ON ai_usage FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 14. ai_provider_stats ──────────────────────────────────────────────────
--- Writer/reader: SupabaseProviderStatsRepository
--- (backend/ai/database/provider_stats_repository.py) which upserts with
--- on_conflict="provider_name,owner_id" — the composite PRIMARY KEY below IS
--- that conflict target.
-CREATE TABLE IF NOT EXISTS ai_provider_stats (
-    provider_name            text        NOT NULL,
-    owner_id                 bigint      NOT NULL DEFAULT 0,
-    total_requests           integer     NOT NULL DEFAULT 0,
-    successful_requests      integer     NOT NULL DEFAULT 0,
-    failed_requests          integer     NOT NULL DEFAULT 0,
-    total_prompt_tokens      integer     NOT NULL DEFAULT 0,
-    total_completion_tokens  integer     NOT NULL DEFAULT 0,
-    avg_latency_ms           real        NOT NULL DEFAULT 0,
-    last_request_at          timestamptz,
-    updated_at               timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (provider_name, owner_id)
-);
-
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS provider_name           text        NOT NULL DEFAULT '';
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS owner_id                bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_requests          integer     NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS successful_requests     integer     NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS failed_requests         integer     NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_prompt_tokens     integer     NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS total_completion_tokens integer     NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS avg_latency_ms          real        NOT NULL DEFAULT 0;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS last_request_at         timestamptz;
-ALTER TABLE ai_provider_stats ADD COLUMN IF NOT EXISTS updated_at              timestamptz NOT NULL DEFAULT now();
-
-UPDATE ai_provider_stats SET provider_name           = ''    WHERE provider_name           IS NULL;
-UPDATE ai_provider_stats SET owner_id                = 0     WHERE owner_id                IS NULL;
-UPDATE ai_provider_stats SET total_requests          = 0     WHERE total_requests          IS NULL;
-UPDATE ai_provider_stats SET successful_requests     = 0     WHERE successful_requests     IS NULL;
-UPDATE ai_provider_stats SET failed_requests         = 0     WHERE failed_requests         IS NULL;
-UPDATE ai_provider_stats SET total_prompt_tokens     = 0     WHERE total_prompt_tokens     IS NULL;
-UPDATE ai_provider_stats SET total_completion_tokens = 0     WHERE total_completion_tokens IS NULL;
-UPDATE ai_provider_stats SET avg_latency_ms          = 0     WHERE avg_latency_ms          IS NULL;
-UPDATE ai_provider_stats SET updated_at              = now() WHERE updated_at              IS NULL;
-
-ALTER TABLE ai_provider_stats ALTER COLUMN provider_name           SET DEFAULT '';
-ALTER TABLE ai_provider_stats ALTER COLUMN owner_id                SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_requests          SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN successful_requests     SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN failed_requests         SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_prompt_tokens     SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_completion_tokens SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN avg_latency_ms          SET DEFAULT 0;
-ALTER TABLE ai_provider_stats ALTER COLUMN updated_at              SET DEFAULT now();
-
-ALTER TABLE ai_provider_stats ALTER COLUMN provider_name           SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN owner_id                SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_requests          SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN successful_requests     SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN failed_requests         SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_prompt_tokens     SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN total_completion_tokens SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN avg_latency_ms          SET NOT NULL;
-ALTER TABLE ai_provider_stats ALTER COLUMN updated_at              SET NOT NULL;
-
-ALTER TABLE ai_provider_stats ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ai_provider_stats" ON ai_provider_stats;
-DROP POLICY IF EXISTS "anon_update_ai_provider_stats" ON ai_provider_stats;
-DROP POLICY IF EXISTS "anon_delete_ai_provider_stats" ON ai_provider_stats;
-DROP POLICY IF EXISTS "anon_select_ai_provider_stats" ON ai_provider_stats;
-CREATE POLICY "anon_select_ai_provider_stats" ON ai_provider_stats FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 15. ghost_chats (LEGACY — preserved, owner-gated removal) ──────────────
--- Zero .table("ghost_chats") references in current backend/tests/src code;
--- the live Ghost Seen allow-list is the bot_settings KV row. The table is
--- kept additively per the no-destruction rule; dropping it remains an owner
--- decision gated on a live-data check.
-CREATE TABLE IF NOT EXISTS ghost_chats (
-    chat_id         bigint       PRIMARY KEY,
-    display_name    text         NOT NULL DEFAULT '',
-    last_preview    text         NOT NULL DEFAULT '',
-    last_message_at timestamptz,
-    unread_count    integer      NOT NULL DEFAULT 0,
-    created_at      timestamptz  DEFAULT now(),
-    updated_at      timestamptz  DEFAULT now()
-);
-
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS chat_id         bigint;
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS display_name    text        NOT NULL DEFAULT '';
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS last_preview    text        NOT NULL DEFAULT '';
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS last_message_at timestamptz;
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS unread_count    integer     NOT NULL DEFAULT 0;
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
-ALTER TABLE ghost_chats ADD COLUMN IF NOT EXISTS updated_at      timestamptz DEFAULT now();
-
-UPDATE ghost_chats SET display_name = ''    WHERE display_name IS NULL;
-UPDATE ghost_chats SET last_preview = ''    WHERE last_preview IS NULL;
-UPDATE ghost_chats SET unread_count = 0     WHERE unread_count IS NULL;
-UPDATE ghost_chats SET created_at   = now() WHERE created_at   IS NULL;
-UPDATE ghost_chats SET updated_at   = now() WHERE updated_at   IS NULL;
-
-ALTER TABLE ghost_chats ALTER COLUMN display_name SET DEFAULT '';
-ALTER TABLE ghost_chats ALTER COLUMN last_preview SET DEFAULT '';
-ALTER TABLE ghost_chats ALTER COLUMN unread_count SET DEFAULT 0;
-ALTER TABLE ghost_chats ALTER COLUMN created_at   SET DEFAULT now();
-ALTER TABLE ghost_chats ALTER COLUMN updated_at   SET DEFAULT now();
-
-ALTER TABLE ghost_chats ALTER COLUMN display_name SET NOT NULL;
-ALTER TABLE ghost_chats ALTER COLUMN last_preview SET NOT NULL;
-ALTER TABLE ghost_chats ALTER COLUMN unread_count SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_ghost_chats_last_message
-    ON ghost_chats (last_message_at DESC);
-
-ALTER TABLE ghost_chats ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "anon_insert_ghost_chats" ON ghost_chats;
-DROP POLICY IF EXISTS "anon_update_ghost_chats" ON ghost_chats;
-DROP POLICY IF EXISTS "anon_delete_ghost_chats" ON ghost_chats;
-DROP POLICY IF EXISTS "anon_select_ghost_chats" ON ghost_chats;
-CREATE POLICY "anon_select_ghost_chats" ON ghost_chats FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 16. ai_tasks ───────────────────────────────────────────────────────────
--- Created by supabase/migrations/20260829000001_create_ai_tasks.sql; the
--- canonical script previously omitted it even though the live task system
--- (backend/ai/task_scheduler.py, task_execution.py) depends on it.
--- schedule_type's CHECK includes 'event' — the final state produced by
--- 20260904000001_add_event_schedule_type.sql.
-CREATE TABLE IF NOT EXISTS ai_tasks (
-    id                         bigserial    PRIMARY KEY,
-    owner_id                   bigint       NOT NULL,
-    label                      text         NOT NULL,
-    status                     text         NOT NULL DEFAULT 'active',
-    version                    integer      NOT NULL DEFAULT 1,
-    schedule_type              text         NOT NULL,
-    schedule                   jsonb        NOT NULL,
-    timezone                   text         NOT NULL,
-    next_run_at                timestamptz,
-    actions                    jsonb        NOT NULL,
-    notification_destination   jsonb        NOT NULL,
-    ai_instruction             text,
-    created_at                 timestamptz  NOT NULL DEFAULT now(),
-    updated_at                 timestamptz  NOT NULL DEFAULT now(),
-    terminal_at                timestamptz,
-    CONSTRAINT ai_tasks_label_not_blank CHECK (length(btrim(label)) > 0),
-    CONSTRAINT ai_tasks_actions_count CHECK (jsonb_array_length(actions) BETWEEN 1 AND 5),
-    CONSTRAINT ai_tasks_payload_size CHECK (octet_length(actions::text) <= 32768),
-    CONSTRAINT ai_tasks_schedule_size CHECK (octet_length(schedule::text) <= 16384),
-    CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096),
-    CONSTRAINT ai_tasks_ai_instruction_size
-        CHECK (ai_instruction IS NULL OR (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384))
-);
-
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS id                       bigserial;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS owner_id                 bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS label                    text;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS status                   text        NOT NULL DEFAULT 'active';
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS version                  integer     NOT NULL DEFAULT 1;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS schedule_type            text;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS schedule                 jsonb;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS timezone                 text;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS next_run_at              timestamptz;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS actions                  jsonb;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS notification_destination jsonb;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS ai_instruction           text;
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS created_at               timestamptz NOT NULL DEFAULT now();
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS updated_at               timestamptz NOT NULL DEFAULT now();
-ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS terminal_at              timestamptz;
-
--- Recovered rows cannot invent a real action list, so the empty array is the
--- deterministic sentinel; the array-count CHECK is then skipped with a
--- warning (see the guarded CHECK block below) rather than aborting the script.
-UPDATE ai_tasks SET owner_id                 = 0           WHERE owner_id                 IS NULL;
-UPDATE ai_tasks SET label                    = 'recovered' WHERE label                    IS NULL;
-UPDATE ai_tasks SET status                   = 'active'    WHERE status                   IS NULL;
-UPDATE ai_tasks SET version                  = 1           WHERE version                  IS NULL;
-UPDATE ai_tasks SET schedule_type            = 'once'      WHERE schedule_type            IS NULL;
-UPDATE ai_tasks SET schedule                 = '{}'        WHERE schedule                 IS NULL;
-UPDATE ai_tasks SET timezone                 = 'UTC'       WHERE timezone                 IS NULL;
-UPDATE ai_tasks SET actions                  = '[]'        WHERE actions                  IS NULL;
-UPDATE ai_tasks SET notification_destination = '{}'        WHERE notification_destination IS NULL;
-UPDATE ai_tasks SET created_at               = now()       WHERE created_at               IS NULL;
-UPDATE ai_tasks SET updated_at               = now()       WHERE updated_at               IS NULL;
-
-ALTER TABLE ai_tasks ALTER COLUMN status     SET DEFAULT 'active';
-ALTER TABLE ai_tasks ALTER COLUMN version    SET DEFAULT 1;
-ALTER TABLE ai_tasks ALTER COLUMN created_at SET DEFAULT now();
-ALTER TABLE ai_tasks ALTER COLUMN updated_at SET DEFAULT now();
-
-ALTER TABLE ai_tasks ALTER COLUMN owner_id                 SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN label                    SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN status                   SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN version                  SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN schedule_type            SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN schedule                 SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN timezone                 SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN actions                  SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN notification_destination SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN created_at               SET NOT NULL;
-ALTER TABLE ai_tasks ALTER COLUMN updated_at               SET NOT NULL;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_label_not_blank') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE length(btrim(label)) = 0) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_label_not_blank CHECK (length(btrim(label)) > 0);
-        ELSE
-            RAISE WARNING 'ai_tasks_label_not_blank NOT added - % row(s) have a blank label.',
-                (SELECT count(*) FROM ai_tasks WHERE length(btrim(label)) = 0);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_status_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE status NOT IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted')) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_status_check
-                CHECK (status IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted'));
-        ELSE
-            RAISE WARNING 'ai_tasks_status_check NOT added - % row(s) have an unrecognized status.',
-                (SELECT count(*) FROM ai_tasks WHERE status NOT IN ('active', 'paused', 'completed', 'failed', 'expired', 'deleted'));
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_version_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE version <= 0) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_version_check CHECK (version > 0);
-        ELSE
-            RAISE WARNING 'ai_tasks_version_check NOT added - % row(s) have version <= 0.',
-                (SELECT count(*) FROM ai_tasks WHERE version <= 0);
-        END IF;
-    END IF;
-    -- schedule_type is DROP+ADD on purpose: a database whose constraint
-    -- predates 20260904000001 still rejects the 'event' schedule type.
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'ai_tasks_schedule_type_check'
-          AND pg_get_constraintdef(oid) LIKE '%event%'
-    ) THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE schedule_type NOT IN ('once', 'interval', 'daily', 'weekly', 'event')) THEN
-            ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
-                CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event'));
-        ELSE
-            RAISE WARNING 'ai_tasks_schedule_type_check NOT replaced - % row(s) have an unrecognized schedule_type.',
-                (SELECT count(*) FROM ai_tasks WHERE schedule_type NOT IN ('once', 'interval', 'daily', 'weekly', 'event'));
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_actions_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE jsonb_typeof(actions) IS DISTINCT FROM 'array') THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_check CHECK (jsonb_typeof(actions) = 'array');
-        ELSE
-            RAISE WARNING 'ai_tasks_actions_check NOT added - % row(s) have a non-array actions value.',
-                (SELECT count(*) FROM ai_tasks WHERE jsonb_typeof(actions) IS DISTINCT FROM 'array');
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_actions_count') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE jsonb_array_length(actions) NOT BETWEEN 1 AND 5) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (jsonb_array_length(actions) BETWEEN 1 AND 5);
-        ELSE
-            RAISE WARNING 'ai_tasks_actions_count NOT added - % row(s) have an actions array outside 1..5 elements.',
-                (SELECT count(*) FROM ai_tasks WHERE jsonb_array_length(actions) NOT BETWEEN 1 AND 5);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_payload_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(actions::text) > 32768) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_payload_size CHECK (octet_length(actions::text) <= 32768);
-        ELSE
-            RAISE WARNING 'ai_tasks_payload_size NOT added - % row(s) exceed 32768 bytes.',
-                (SELECT count(*) FROM ai_tasks WHERE octet_length(actions::text) > 32768);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_schedule_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(schedule::text) > 16384) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_size CHECK (octet_length(schedule::text) <= 16384);
-        ELSE
-            RAISE WARNING 'ai_tasks_schedule_size NOT added - % row(s) exceed 16384 bytes.',
-                (SELECT count(*) FROM ai_tasks WHERE octet_length(schedule::text) > 16384);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_destination_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_tasks WHERE octet_length(notification_destination::text) > 4096) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_destination_size CHECK (octet_length(notification_destination::text) <= 4096);
-        ELSE
-            RAISE WARNING 'ai_tasks_destination_size NOT added - % row(s) exceed 4096 bytes.',
-                (SELECT count(*) FROM ai_tasks WHERE octet_length(notification_destination::text) > 4096);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_tasks_ai_instruction_size') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM ai_tasks
-            WHERE ai_instruction IS NOT NULL
-              AND NOT (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384)
-        ) THEN
-            ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_ai_instruction_size
-                CHECK (ai_instruction IS NULL OR (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384));
-        ELSE
-            RAISE WARNING 'ai_tasks_ai_instruction_size NOT added - % row(s) have an empty or oversized ai_instruction.',
-                (SELECT count(*) FROM ai_tasks
-                   WHERE ai_instruction IS NOT NULL
-                     AND NOT (length(btrim(ai_instruction)) > 0 AND octet_length(ai_instruction) <= 16384));
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_tasks_status_next_run
-    ON ai_tasks (status, next_run_at);
-CREATE INDEX IF NOT EXISTS idx_ai_tasks_owner_updated
-    ON ai_tasks (owner_id, updated_at DESC);
-
-ALTER TABLE ai_tasks ENABLE ROW LEVEL SECURITY;
-
--- SELECT grant is restated because the task migration grants it explicitly
--- (20260829000001) rather than relying on schema default privileges.
-GRANT SELECT ON ai_tasks TO anon, authenticated;
-
-DROP POLICY IF EXISTS "anon_insert_ai_tasks" ON ai_tasks;
-DROP POLICY IF EXISTS "anon_update_ai_tasks" ON ai_tasks;
-DROP POLICY IF EXISTS "anon_delete_ai_tasks" ON ai_tasks;
-DROP POLICY IF EXISTS "anon_select_ai_tasks" ON ai_tasks;
-CREATE POLICY "anon_select_ai_tasks" ON ai_tasks FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 17. ai_task_occurrences ────────────────────────────────────────────────
--- Created by 20260829000001; `preparation_metadata` is the SECOND confirmed
--- instance of the drift class — the table's CREATE was a silent no-op on a
--- database whose table predated the column, so 20260912000001 exists as a
--- single-column repair. The reconciliation block below generalizes it.
-CREATE TABLE IF NOT EXISTS ai_task_occurrences (
-    id                    bigserial    PRIMARY KEY,
-    task_id               bigint       NOT NULL REFERENCES ai_tasks(id) ON DELETE RESTRICT,
-    owner_id              bigint       NOT NULL,
-    occurrence_key        text         NOT NULL,
-    definition_version    integer      NOT NULL,
-    action_snapshot       jsonb        NOT NULL,
-    scheduled_for         timestamptz  NOT NULL,
-    attempt               smallint     NOT NULL DEFAULT 1,
-    status                text         NOT NULL DEFAULT 'claimed',
-    claimed_at            timestamptz,
-    started_at            timestamptz,
-    finished_at           timestamptz,
-    retry_at              timestamptz,
-    error_metadata        jsonb        NOT NULL DEFAULT '{}',
-    result_metadata       jsonb        NOT NULL DEFAULT '{}',
-    preparation_metadata  jsonb        NOT NULL DEFAULT '{}',
-    created_at            timestamptz  NOT NULL DEFAULT now(),
-    updated_at            timestamptz  NOT NULL DEFAULT now(),
-    CONSTRAINT ai_task_occurrences_key_not_blank CHECK (length(btrim(occurrence_key)) > 0),
-    CONSTRAINT ai_task_occurrences_action_count CHECK (jsonb_array_length(action_snapshot) BETWEEN 1 AND 5),
-    CONSTRAINT ai_task_occurrences_payload_size CHECK (octet_length(action_snapshot::text) <= 32768),
-    CONSTRAINT ai_task_occurrences_error_metadata_check CHECK (jsonb_typeof(error_metadata) = 'object'),
-    CONSTRAINT ai_task_occurrences_preparation_metadata_object CHECK (jsonb_typeof(preparation_metadata) = 'object'),
-    CONSTRAINT ai_task_occurrences_error_size CHECK (octet_length(error_metadata::text) <= 8192),
-    CONSTRAINT ai_task_occurrences_result_size CHECK (octet_length(result_metadata::text) <= 8192),
-    CONSTRAINT ai_task_occurrences_preparation_size CHECK (octet_length(preparation_metadata::text) <= 8192),
-    CONSTRAINT ai_task_occurrences_retry_state CHECK (
-        (status = 'retry_pending' AND retry_at IS NOT NULL)
-        OR (status <> 'retry_pending')
-    )
-);
-
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS id                   bigserial;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS task_id              bigint;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS owner_id             bigint      NOT NULL DEFAULT 0;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS occurrence_key       text;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS definition_version   integer;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS action_snapshot      jsonb;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS scheduled_for        timestamptz;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS attempt              smallint    NOT NULL DEFAULT 1;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS status               text        NOT NULL DEFAULT 'claimed';
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS claimed_at           timestamptz;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS started_at           timestamptz;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS finished_at          timestamptz;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS retry_at             timestamptz;
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS error_metadata       jsonb       NOT NULL DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS result_metadata      jsonb       NOT NULL DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS preparation_metadata jsonb       NOT NULL DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS created_at           timestamptz NOT NULL DEFAULT now();
-ALTER TABLE ai_task_occurrences ADD COLUMN IF NOT EXISTS updated_at           timestamptz NOT NULL DEFAULT now();
-
--- task_id points at an existing task when one exists, otherwise at the
--- deterministic sentinel 0; the foreign key is then added only when the data
--- actually resolves (see the guarded block below).
-UPDATE ai_task_occurrences SET task_id              = COALESCE((SELECT min(id) FROM ai_tasks), 0) WHERE task_id              IS NULL;
-UPDATE ai_task_occurrences SET owner_id             = 0                            WHERE owner_id             IS NULL;
-UPDATE ai_task_occurrences SET occurrence_key       = 'recovered-' || id            WHERE occurrence_key       IS NULL;
-UPDATE ai_task_occurrences SET definition_version   = 1                            WHERE definition_version   IS NULL;
-UPDATE ai_task_occurrences SET action_snapshot      = '[]'                          WHERE action_snapshot      IS NULL;
-UPDATE ai_task_occurrences SET scheduled_for        = now()                         WHERE scheduled_for        IS NULL;
-UPDATE ai_task_occurrences SET attempt              = 1                             WHERE attempt              IS NULL;
-UPDATE ai_task_occurrences SET status               = 'claimed'                     WHERE status               IS NULL;
-UPDATE ai_task_occurrences SET error_metadata       = '{}'                          WHERE error_metadata       IS NULL;
-UPDATE ai_task_occurrences SET result_metadata      = '{}'                          WHERE result_metadata      IS NULL;
-UPDATE ai_task_occurrences SET preparation_metadata = '{}'                          WHERE preparation_metadata IS NULL;
-UPDATE ai_task_occurrences SET created_at           = now()                         WHERE created_at           IS NULL;
-UPDATE ai_task_occurrences SET updated_at           = now()                         WHERE updated_at           IS NULL;
-
-ALTER TABLE ai_task_occurrences ALTER COLUMN attempt              SET DEFAULT 1;
-ALTER TABLE ai_task_occurrences ALTER COLUMN status               SET DEFAULT 'claimed';
-ALTER TABLE ai_task_occurrences ALTER COLUMN error_metadata       SET DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ALTER COLUMN result_metadata      SET DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ALTER COLUMN preparation_metadata SET DEFAULT '{}';
-ALTER TABLE ai_task_occurrences ALTER COLUMN created_at           SET DEFAULT now();
-ALTER TABLE ai_task_occurrences ALTER COLUMN updated_at           SET DEFAULT now();
-
-ALTER TABLE ai_task_occurrences ALTER COLUMN task_id              SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN owner_id             SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN occurrence_key       SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN definition_version   SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN action_snapshot      SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN scheduled_for        SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN attempt              SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN status               SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN error_metadata       SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN result_metadata      SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN preparation_metadata SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN created_at           SET NOT NULL;
-ALTER TABLE ai_task_occurrences ALTER COLUMN updated_at           SET NOT NULL;
-
--- The task foreign key is data-guarded: it is added only when every row
--- resolves to an existing ai_tasks row.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_task_id_fkey') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM ai_task_occurrences o
-            LEFT JOIN ai_tasks t ON t.id = o.task_id
-            WHERE t.id IS NULL
-        ) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_task_id_fkey
-                FOREIGN KEY (task_id) REFERENCES ai_tasks(id) ON DELETE RESTRICT;
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_task_id_fkey NOT added - % row(s) reference a task_id with no ai_tasks row. Resolve them and re-run this script.',
-                (SELECT count(*) FROM ai_task_occurrences o
-                   LEFT JOIN ai_tasks t ON t.id = o.task_id
-                  WHERE t.id IS NULL);
-        END IF;
-    END IF;
-END $$;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_key_not_blank') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE length(btrim(occurrence_key)) = 0) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_key_not_blank
-                CHECK (length(btrim(occurrence_key)) > 0);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_key_not_blank NOT added - % row(s) have a blank occurrence_key.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE length(btrim(occurrence_key)) = 0);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_definition_version_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE definition_version <= 0) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_definition_version_check
-                CHECK (definition_version > 0);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_definition_version_check NOT added - % row(s) have definition_version <= 0.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE definition_version <= 0);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_action_count') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_array_length(action_snapshot) NOT BETWEEN 1 AND 5) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_action_count
-                CHECK (jsonb_array_length(action_snapshot) BETWEEN 1 AND 5);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_action_count NOT added - % row(s) have an action_snapshot outside 1..5 elements.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_array_length(action_snapshot) NOT BETWEEN 1 AND 5);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_payload_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(action_snapshot::text) > 32768) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_payload_size
-                CHECK (octet_length(action_snapshot::text) <= 32768);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_payload_size NOT added - % row(s) exceed 32768 bytes.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(action_snapshot::text) > 32768);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_attempt_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE attempt NOT BETWEEN 1 AND 3) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_attempt_check
-                CHECK (attempt BETWEEN 1 AND 3);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_attempt_check NOT added - % row(s) have attempt outside 1..3.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE attempt NOT BETWEEN 1 AND 3);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_status_check') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM ai_task_occurrences
-            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted')
-        ) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_status_check
-                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_status_check NOT added - % row(s) have an unrecognized status.',
-                (SELECT count(*) FROM ai_task_occurrences
-                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_metadata_check') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_typeof(error_metadata) IS DISTINCT FROM 'object') THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_error_metadata_check
-                CHECK (jsonb_typeof(error_metadata) = 'object');
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_error_metadata_check NOT added - % row(s) have a non-object error_metadata.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_typeof(error_metadata) IS DISTINCT FROM 'object');
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_retry_state') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM ai_task_occurrences
-            WHERE NOT ((status = 'retry_pending' AND retry_at IS NOT NULL) OR (status <> 'retry_pending'))
-        ) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_retry_state CHECK (
-                (status = 'retry_pending' AND retry_at IS NOT NULL)
-                OR (status <> 'retry_pending')
-            );
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_retry_state NOT added - % row(s) have status=retry_pending without retry_at.',
-                (SELECT count(*) FROM ai_task_occurrences
-                  WHERE NOT ((status = 'retry_pending' AND retry_at IS NOT NULL) OR (status <> 'retry_pending')));
-        END IF;
-    END IF;
-    -- The preparation_metadata pair is exactly what 20260912000001 adds.
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_preparation_metadata_object') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE jsonb_typeof(preparation_metadata) IS DISTINCT FROM 'object') THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_preparation_metadata_object
-                CHECK (jsonb_typeof(preparation_metadata) = 'object');
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_preparation_metadata_object NOT added - % row(s) have a non-object preparation_metadata.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE jsonb_typeof(preparation_metadata) IS DISTINCT FROM 'object');
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(error_metadata::text) > 8192) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_error_size
-                CHECK (octet_length(error_metadata::text) <= 8192);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_error_size NOT added - % row(s) exceed 8192 bytes.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(error_metadata::text) > 8192);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_result_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(result_metadata::text) > 8192) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_result_size
-                CHECK (octet_length(result_metadata::text) <= 8192);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_result_size NOT added - % row(s) exceed 8192 bytes.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(result_metadata::text) > 8192);
-        END IF;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_preparation_size') THEN
-        IF NOT EXISTS (SELECT 1 FROM ai_task_occurrences WHERE octet_length(preparation_metadata::text) > 8192) THEN
-            ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_preparation_size
-                CHECK (octet_length(preparation_metadata::text) <= 8192);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences_preparation_size NOT added - % row(s) exceed 8192 bytes.',
-                (SELECT count(*) FROM ai_task_occurrences WHERE octet_length(preparation_metadata::text) > 8192);
-        END IF;
-    END IF;
-END $$;
-
--- Unique index: guarded because legacy occurrences may already collide on
--- (task_id, occurrence_key) — the occurrence ids are application-generated.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'uq_ai_task_occurrences_task_key') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM ai_task_occurrences
-            GROUP BY task_id, occurrence_key HAVING count(*) > 1
-        ) THEN
-            CREATE UNIQUE INDEX uq_ai_task_occurrences_task_key
-                ON ai_task_occurrences (task_id, occurrence_key);
-        ELSE
-            RAISE WARNING 'ai_task_occurrences: uq_ai_task_occurrences_task_key NOT created - duplicate (task_id, occurrence_key) pairs exist. Resolve them and re-run this script.';
-        END IF;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_ai_task_occurrences_owner_scheduled
-    ON ai_task_occurrences (owner_id, scheduled_for DESC);
-CREATE INDEX IF NOT EXISTS idx_ai_task_occurrences_task_scheduled
-    ON ai_task_occurrences (task_id, scheduled_for DESC);
-
-ALTER TABLE ai_task_occurrences ENABLE ROW LEVEL SECURITY;
-
-GRANT SELECT ON ai_task_occurrences TO anon, authenticated;
-
-DROP POLICY IF EXISTS "anon_insert_ai_task_occurrences" ON ai_task_occurrences;
-DROP POLICY IF EXISTS "anon_update_ai_task_occurrences" ON ai_task_occurrences;
-DROP POLICY IF EXISTS "anon_delete_ai_task_occurrences" ON ai_task_occurrences;
-DROP POLICY IF EXISTS "anon_select_ai_task_occurrences" ON ai_task_occurrences;
-CREATE POLICY "anon_select_ai_task_occurrences" ON ai_task_occurrences FOR SELECT
-    TO anon, authenticated USING (true);
-
--- ─── 18. Identity-constraint reconciliation ─────────────────────────────────
--- PRIMARY KEY / UNIQUE constraints are asserted here, after every column
--- exists, because PostgreSQL allows only ONE primary key per table and both
--- kinds require data that satisfies them. Each constraint is applied only when
--- the current rows can satisfy it; otherwise a WARNING names the table and
--- column so the owner can resolve it and re-run the script — the script itself
--- never aborts on pre-existing data.
---
--- kinds:  p = PRIMARY KEY (existence checked as "any PK on this table"),
---         u = UNIQUE      (existence checked by constraint name)
--- nullexpr / distinctexpr: the generic "no NULLs and no duplicates" predicate.
-DO $$
-DECLARE
-    r record;
-    ok boolean;
-BEGIN
-    FOR r IN
-        SELECT * FROM (VALUES
-            ('saved_items',         'saved_items_pkey',            'p', 'id',                      'id',            'id'),
-            ('saved_items',         'saved_items_save_code_key',   'u', 'save_code',               'save_code',     'save_code'),
-            ('bio_state',           'bio_state_pkey',              'p', 'id',                      'id',            'id'),
-            ('bio_state',           'bio_state_owner_id_key',      'u', 'owner_id',                'owner_id',      'owner_id'),
-            ('username_state',      'username_state_pkey',         'p', 'id',                      'id',            'id'),
-            ('username_state',      'username_state_owner_id_key', 'u', 'owner_id',                'owner_id',      'owner_id'),
-            ('bot_logs',            'bot_logs_pkey',               'p', 'id',                      'id',            'id'),
-            ('panel_settings',      'panel_settings_pkey',         'p', 'key',                     'key',           'key'),
-            ('bot_settings',        'bot_settings_pkey',           'p', 'key',                     'key',           'key'),
-            ('ai_config',           'ai_config_pkey',              'p', 'id',                      'id',            'id'),
-            ('ai_config',           'ai_config_owner_id_key',      'u', 'owner_id',                'owner_id',      'owner_id'),
-            ('ai_sessions',         'ai_sessions_pkey',            'p', 'id',                      'id',            'id'),
-            ('ai_sessions',         'ai_sessions_session_id_key',  'u', 'session_id',              'session_id',    'session_id'),
-            ('ai_messages',         'ai_messages_pkey',            'p', 'id',                      'id',            'id'),
-            ('ai_memories',         'ai_memories_pkey',            'p', 'id',                      'id',            'id'),
-            ('ai_tool_history',     'ai_tool_history_pkey',        'p', 'id',                      'id',            'id'),
-            ('ai_usage',            'ai_usage_pkey',               'p', 'id',                      'id',            'id'),
-            ('ai_provider_stats',   'ai_provider_stats_pkey',      'p', 'provider_name, owner_id', 'provider_name', 'provider_name, owner_id'),
-            ('ghost_chats',         'ghost_chats_pkey',            'p', 'chat_id',                 'chat_id',       'chat_id'),
-            ('ai_tasks',            'ai_tasks_pkey',               'p', 'id',                      'id',            'id'),
-            ('ai_task_occurrences', 'ai_task_occurrences_pkey',    'p', 'id',                      'id',            'id')
-        ) AS v(tbl, cname, kind, cols, nullexpr, distinctexpr)
-    LOOP
-        IF NOT EXISTS (
-            SELECT 1
-            FROM pg_constraint c
-            JOIN pg_class t ON t.oid = c.conrelid
-            JOIN pg_namespace n ON n.oid = t.relnamespace
-            WHERE n.nspname = 'public'
-              AND t.relname = r.tbl
-              AND (CASE WHEN r.kind = 'p' THEN c.contype = 'p' ELSE c.conname = r.cname END)
-        ) THEN
-            EXECUTE format('SELECT (count(*) = count(%s)) AND (count(DISTINCT %s) = count(*)) FROM %I',
-                           r.nullexpr, r.distinctexpr, r.tbl) INTO ok;
-            IF ok THEN
-                EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I ' ||
-                               CASE WHEN r.kind = 'p' THEN 'PRIMARY KEY (' ELSE 'UNIQUE (' END ||
-                               r.cols || ')', r.tbl, r.cname);
-            ELSE
-                RAISE WARNING '%: constraint % NOT added - existing rows contain NULLs or duplicates in (%). Resolve them and re-run this script.',
-                    r.tbl, r.cname, r.cols;
-            END IF;
-        END IF;
-    END LOOP;
-END $$;
-
--- ─── 19. PostgREST schema-cache reload ──────────────────────────────────────
--- Without this the API keeps serving the pre-reconciliation column list.
-NOTIFY pgrst, 'reload schema';
-
-COMMIT;
-
--- ============================================================================
--- Drift report — runs AFTER the commit, so it always reports the real state.
--- Zero rows means every canonical (table, column) now exists. Any row returned
--- names a column this script could not establish (create it manually).
--- ============================================================================
-SELECT v.tbl || '.' || v.col AS missing_canonical_column
-FROM (VALUES
-    ('saved_items','id'), ('saved_items','save_code'), ('saved_items','save_type'),
-    ('saved_items','origin_chat_id'), ('saved_items','origin_msg_id'),
-    ('saved_items','saved_chat_id'), ('saved_items','saved_msg_id'),
-    ('saved_items','sender_name'), ('saved_items','sender_id'), ('saved_items','mime_type'),
-    ('saved_items','file_id'), ('saved_items','file_size'), ('saved_items','media_type'),
-    ('saved_items','tags'), ('saved_items','caption'), ('saved_items','file_name'),
-    ('saved_items','short_code'), ('saved_items','owner_id'), ('saved_items','created_at'),
-    ('bio_state','id'), ('bio_state','owner_id'), ('bio_state','template'), ('bio_state','mood'),
-    ('bio_state','custom_text'), ('bio_state','is_active'), ('bio_state','last_bio'), ('bio_state','updated_at'),
-    ('username_state','id'), ('username_state','owner_id'), ('username_state','template'),
-    ('username_state','mood'), ('username_state','custom_text'), ('username_state','is_active'),
-    ('username_state','last_name'), ('username_state','updated_at'),
-    ('bot_logs','id'), ('bot_logs','owner_id'), ('bot_logs','level'), ('bot_logs','message'),
-    ('bot_logs','context'), ('bot_logs','created_at'),
-    ('panel_settings','key'), ('panel_settings','auto_close_enabled'), ('panel_settings','auto_close_delay'),
-    ('panel_settings','max_deep_save_mb'), ('panel_settings','delete_batch_size'),
-    ('panel_settings','log_retention_days'), ('panel_settings','panel_timeout_seconds'),
-    ('panel_settings','allow_multiple_panels'), ('panel_settings','reuse_existing_panel'),
-    ('panel_settings','language'), ('panel_settings','debug_callbacks'), ('panel_settings','owner_only'),
-    ('panel_settings','dashboard_font'), ('panel_settings','update_stale_seconds'),
-    ('panel_settings','ghost_seen_retention_seconds'), ('panel_settings','updated_at'),
-    ('bot_settings','key'), ('bot_settings','value'), ('bot_settings','value_type'), ('bot_settings','updated_at'),
-    ('ai_config','id'), ('ai_config','owner_id'), ('ai_config','provider'), ('ai_config','model'),
-    ('ai_config','temperature'), ('ai_config','max_tokens'), ('ai_config','system_prompt'),
-    ('ai_config','history_budget'), ('ai_config','is_configured'), ('ai_config','trigger_en'),
-    ('ai_config','trigger_fa'), ('ai_config','show_question'), ('ai_config','stt_model'),
-    ('ai_config','stt_language'), ('ai_config','stt_passes'), ('ai_config','last_request_at'),
-    ('ai_config','last_latency_ms'), ('ai_config','created_at'), ('ai_config','updated_at'),
-    ('ai_sessions','id'), ('ai_sessions','session_id'), ('ai_sessions','owner_id'),
-    ('ai_sessions','provider'), ('ai_sessions','model'), ('ai_sessions','status'),
-    ('ai_sessions','total_tokens'), ('ai_sessions','message_count'), ('ai_sessions','created_at'),
-    ('ai_sessions','updated_at'),
-    ('ai_messages','id'), ('ai_messages','session_id'), ('ai_messages','owner_id'),
-    ('ai_messages','role'), ('ai_messages','content'), ('ai_messages','token_count'),
-    ('ai_messages','provider'), ('ai_messages','model'), ('ai_messages','created_at'),
-    ('ai_memories','id'), ('ai_memories','owner_id'), ('ai_memories','tier'), ('ai_memories','category'),
-    ('ai_memories','content'), ('ai_memories','importance'), ('ai_memories','expires_at'),
-    ('ai_memories','metadata'), ('ai_memories','created_at'),
-    ('ai_tool_history','id'), ('ai_tool_history','owner_id'), ('ai_tool_history','session_id'),
-    ('ai_tool_history','tool_name'), ('ai_tool_history','arguments'), ('ai_tool_history','result_success'),
-    ('ai_tool_history','result_message'), ('ai_tool_history','result_data'),
-    ('ai_tool_history','latency_ms'), ('ai_tool_history','created_at'),
-    ('ai_usage','id'), ('ai_usage','owner_id'), ('ai_usage','session_id'), ('ai_usage','provider'),
-    ('ai_usage','model'), ('ai_usage','prompt_tokens'), ('ai_usage','completion_tokens'),
-    ('ai_usage','total_tokens'), ('ai_usage','latency_ms'), ('ai_usage','token_source'),
-    ('ai_usage','created_at'),
-    ('ai_provider_stats','provider_name'), ('ai_provider_stats','owner_id'),
-    ('ai_provider_stats','total_requests'), ('ai_provider_stats','successful_requests'),
-    ('ai_provider_stats','failed_requests'), ('ai_provider_stats','total_prompt_tokens'),
-    ('ai_provider_stats','total_completion_tokens'), ('ai_provider_stats','avg_latency_ms'),
-    ('ai_provider_stats','last_request_at'), ('ai_provider_stats','updated_at'),
-    ('ghost_chats','chat_id'), ('ghost_chats','display_name'), ('ghost_chats','last_preview'),
-    ('ghost_chats','last_message_at'), ('ghost_chats','unread_count'),
-    ('ghost_chats','created_at'), ('ghost_chats','updated_at'),
-    ('ai_tasks','id'), ('ai_tasks','owner_id'), ('ai_tasks','label'), ('ai_tasks','status'),
-    ('ai_tasks','version'), ('ai_tasks','schedule_type'), ('ai_tasks','schedule'),
-    ('ai_tasks','timezone'), ('ai_tasks','next_run_at'), ('ai_tasks','actions'),
-    ('ai_tasks','notification_destination'), ('ai_tasks','ai_instruction'),
-    ('ai_tasks','created_at'), ('ai_tasks','updated_at'), ('ai_tasks','terminal_at'),
-    ('ai_task_occurrences','id'), ('ai_task_occurrences','task_id'), ('ai_task_occurrences','owner_id'),
-    ('ai_task_occurrences','occurrence_key'), ('ai_task_occurrences','definition_version'),
-    ('ai_task_occurrences','action_snapshot'), ('ai_task_occurrences','scheduled_for'),
-    ('ai_task_occurrences','attempt'), ('ai_task_occurrences','status'),
-    ('ai_task_occurrences','claimed_at'), ('ai_task_occurrences','started_at'),
-    ('ai_task_occurrences','finished_at'), ('ai_task_occurrences','retry_at'),
-    ('ai_task_occurrences','error_metadata'), ('ai_task_occurrences','result_metadata'),
-    ('ai_task_occurrences','preparation_metadata'), ('ai_task_occurrences','created_at'),
-    ('ai_task_occurrences','updated_at')
-) AS v(tbl, col)
-LEFT JOIN information_schema.columns c
-    ON c.table_schema = 'public' AND c.table_name = v.tbl AND c.column_name = v.col
-WHERE c.column_name IS NULL
-ORDER BY 1;
-```
+The canonical script is kept **byte-identical** in exactly two repository files —
+`supabase/migrations/20260920000001_reconcile_canonical_schema.sql` (the
+repository migration for the §30 repair) and `supabase/canonical_bootstrap.sql`
+(the convenience copy) — enforced by
+`tests/test_canonical_schema_reconciliation.py`. Its executable statements are
+also embedded, with the migrations' prose comments dropped, as **part 1 of the ONE
+deployment block in §31.3**; that block, not this section, is the SQL the owner
+pastes into the Supabase SQL Editor, so a reader never has to decide which
+fragments to combine. There is therefore exactly ONE reconciled definition of the
+schema and exactly ONE complete deployment artifact; the historical migration
+files stay untouched as history.
 
 ### Script boundaries & uncertainty
 
@@ -5898,7 +5634,8 @@ ORDER BY 1;
   `.table()` call site; a statement simulator that parses the shipped SQL,
   applies it to synthetic empty/legacy/idempotency schemas and fails on any
   column reference it cannot resolve (`tests/test_canonical_schema_reconciliation.py`);
-  the three-way byte-identity test; the internal-consistency test that every
+  the byte-identity test between the two repository copies of the snapshot (and
+  the statement-identity of its §31.3 embed); the internal-consistency test that every
   table's CREATE column set equals its `ADD COLUMN` set equals its drift-report
   set; plus the full repository test suite. See §30.8 for the exact commands
   and their results — and §30.12 for what this validation does NOT prove.
@@ -6080,22 +5817,22 @@ forward-only repair. It is **not** a rewrite of any historical migration — eve
 It contains the **complete** canonical script rather than a narrow
 `ALTER TABLE bot_settings ADD COLUMN value_type`, because a database may be
 missing any of the objects the earlier migrations introduce (several of them are
-explicitly pending, §20). One idempotent script converges all of them. Its
-statements are the same text that appears in:
+explicitly pending, §20). One idempotent script converges all of them.
 
-* the fenced block in the previous section (this document is the canonical
-  reference),
-* `supabase/canonical_bootstrap.sql`,
-* the migration file itself.
-
-All three are kept **byte-identical**; a test enforces it.
+The canonical script is byte-identical in two repository files —
+`supabase/canonical_bootstrap.sql` and the migration file itself (a test enforces
+it) — and its executable statements are embedded, with the migrations' prose
+comments dropped, as part 1 of the ONE deployment block in **§31.3**. That single
+block is the only executable canonical SQL in this document; nothing in §30 is
+meant to be pasted on its own.
 
 The script is the reconciliation **snapshot**, not a living file. A later
 schema change arrives as its own additive migration — the newest is
 `20260921000001_add_saved_items_display_name.sql` (§2) — and the snapshot,
-the convenience copy and this §30 block are never edited to absorb it. The
-tests enforce both halves: the three copies stay byte-identical, and every
-migration newer than the snapshot is additive-only (no `DROP TABLE`,
+the convenience copy and the §31.3 embed are never edited to absorb it. The
+tests enforce both halves: the two byte-identical repository copies stay
+byte-identical (and the §31.3 embed stays statement-identical to the migration),
+and every migration newer than the snapshot is additive-only (no `DROP TABLE`,
 `TRUNCATE`, `DELETE FROM` or `DROP COLUMN` statement).
 
 ### 30.6 Verification: the drift report
@@ -6310,10 +6047,12 @@ this database (§19.5), and creating then dropping it would be pointless churn.
 Nothing in this document has been executed against Supabase by the coding
 agent.
 
-1. Open the Supabase **SQL Editor** as `postgres` and run the **complete**
-   canonical script from the previous section — either paste the fenced block or
-   paste `supabase/canonical_bootstrap.sql` / the migration file; the three are
-   identical. It is one transaction-safe, re-runnable statement batch.
+1. Open the Supabase **SQL Editor** as `postgres` and run the ONE complete setup
+   script in **§31.3** — a single fenced block that begins with the canonical
+   reconciliation snapshot and continues, in order, with the four pending
+   migrations. It is one transaction-safe, re-runnable statement batch.
+   (`supabase/canonical_bootstrap.sql` and the migration file remain the
+   byte-identical convenience copies of the snapshot part.)
 2. Read the output:
    * `WARNING` lines name any constraint that a pre-existing row blocked. Fix
      the named rows and re-run — the guard will then apply the constraint.
@@ -6321,19 +6060,19 @@ agent.
      in it is a column the script could not create (see §30.12).
    * `NOTIFY pgrst, 'reload schema'` has already asked PostgREST to drop its
      stale schema cache, so the API sees the new columns immediately.
-3. Then apply the **additive migrations newer than the snapshot** — currently
-   `20260921000001_add_saved_items_display_name.sql` (idempotent: it adds the
-   nullable `saved_items.display_name` and reloads the PostgREST cache) and
+3. Nothing else has to be applied by hand: the additive migrations newer than
+   the snapshot — `20260921000001_add_saved_items_display_name.sql` (the
+   nullable `saved_items.display_name`, idempotent) and
    `20260922000001_add_saved_items_search_indexes.sql` (the Save V2 resolver's
-   two search indexes on `saved_items`; also idempotent). Each additive
-   migration is self-contained and states its own copy-pasteable SQL; the
-   snapshot is never regenerated to include them, so the trio above stays
-   byte-identical.
+   two search indexes on `saved_items`, idempotent) — are already part 4 and
+   part 5 of the §31.3 block. The snapshot is never regenerated to include them,
+   so the two byte-identical repository copies stay byte-identical.
 4. Nothing else is required: no new table to create by hand, no env var, no
    Render setting, no Supabase Vault change.
-5. §29 (the API Credential Vault) is still a **separate** owner action — with
-   neither applied, the credential panel reports the store as not configured and
-   every provider keeps its deployment key.
+5. §29 (the API Credential Vault) is documented separately, but its two
+   migrations are also part 2 and part 3 of the §31.3 block, so the one paste
+   establishes them too — without it applied, the credential panel reports the
+   store as not configured and every provider keeps its deployment key.
 
 ### 30.12 Limitations — what this validation does NOT prove
 

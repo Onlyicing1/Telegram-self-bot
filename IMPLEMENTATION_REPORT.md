@@ -1,6 +1,132 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — SAVE V2 PART 2: manual + AI Save metadata wiring
+## Latest phase — DATABASE SETUP CONSOLIDATION: ONE complete Supabase setup script
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **DATABASE SETUP CONSOLIDATION** — `DATABASE_ARCHITECTURE.md` now presents exactly ONE user-facing executable SQL artifact for the pending database setup |
+| Type | documentation + test contract only — **no runtime, schema, provider, handler, service or Supabase change** |
+| Starting HEAD | `72e4afd` = `origin/main` (workspace was 19 commits behind; fast-forwarded to `72e4afd` before editing) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **NO** — no new migration file, no schema change, no SQL executed. The five existing migrations are untouched; their SQL is only consolidated into the document. |
+| Telegram AI Settings controls | **not applicable** — this phase adds no setting, panel or persistence behavior |
+| Persistence / runtime config | **not applicable** — unchanged; no `config_store`, no `ai_config`, no engine edit |
+| Supabase / live Telegram | untouched / not exercised (no live verification is claimed) |
+| Tests updated | `tests/test_database_setup_order.py` (rewritten, 24 tests) and `tests/test_canonical_schema_reconciliation.py` (the copy-pinning contract moved) |
+
+### The problem this phase addresses
+
+§31 still described a **two-stage manual workflow**: it told the owner to paste the
+canonical reconciliation block (then in §30.5 / the bootstrap section) *first* and a
+separate "steps A–D" block *immediately after step 0*. It also offered a `cat
+supabase/migrations/… > lifeos_canonical_setup.sql` shell command as the "single
+file" alternative, and the document carried a second complete copy of the
+canonical reconciliation SQL inside its bootstrap section. The owner had to find
+two blocks, in two places, and run them in the right order — the exact failure mode
+this phase removes.
+
+### What changed exactly
+
+The requirement is literal: **ONE fenced SQL block whose contents contain EVERY
+SQL statement required.** The new **§31.3 — "ONE COMPLETE SUPABASE SETUP SCRIPT"**
+holds that single block. It physically contains, in this order:
+
+1. `20260920000001_reconcile_canonical_schema.sql` — the **complete** canonical
+   reconciliation SQL (part 1 of 5), the largest piece, physically inside the block
+2. `20260919000001_create_api_credential_vault.sql` — Vault PART 1 (part 2 of 5)
+3. `20260919000002_credential_vault_management.sql` — Vault PART 2, all five
+   `SECURITY DEFINER` management functions complete and untruncated (part 3 of 5)
+4. `20260921000001_add_saved_items_display_name.sql` — the `display_name` column
+   (part 4 of 5)
+5. `20260922000001_add_saved_items_search_indexes.sql` — `pg_trgm`,
+   `idx_saved_items_display_name_trgm`, `idx_saved_items_tags` and the verification
+   queries (part 5 of 5)
+
+The block is the five migrations' executable SQL, concatenated in order with a
+part banner before each; the migrations' prose comment headers are dropped so the
+artifact is **pure runnable SQL** (this is also what removes the words that made a
+naive placeholder scan ambiguous). Every statement is verbatim from its migration
+and a test pins each one back to its file.
+
+### Exactly ONE executable location
+
+* **§31.3** is the only complete deployment SQL block in the document. The old
+  standalone block in the "Canonical Supabase Bootstrap SQL" section is **removed**
+  and replaced by a short reference to §31.3.
+* **§30.5** no longer claims a second executable canonical block: it states that
+  the canonical script is byte-identical in exactly two repository files
+  (`supabase/canonical_bootstrap.sql` and the migration) and that its statements
+  are embedded as part 1 of the §31.3 block — the only executable canonical SQL.
+* **§30.11** now instructs the owner to run the ONE §31.3 block; its old "then
+  apply the additive migrations separately" step is gone.
+* **§29.10 / §29.14** remain as the object-contract documentation for the Vault
+  SQL and now point at §31.3 (parts 2 and 3) as the executable copy.
+* The `cat supabase/…` bash workflow is **removed**. §31 contains no ```` ```bash ````
+  fence at all.
+
+### Verification against the requested checklist
+
+| Requirement | State |
+|---|---|
+| ONE fenced SQL block, one clear section | §31.3, `#### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT` |
+| Canonical reconciliation SQL physically inside it | yes — part 1 of 5, complete (`BEGIN;` … drift report) |
+| All five migrations included, in order | yes, parts 1–5 in the required order |
+| Vault PART 2 complete (five functions, no truncation) | yes |
+| `display_name` before its index | yes — part 4 before part 5 |
+| Security SQL preserved | `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`, `GRANT`, RLS, `owner_id` scoping, orphan cleanup, constraints, indexes, `NOTIFY` all present verbatim |
+| No destructive statements added | the block introduces none; the only `DELETE`s are the Vault cleanup paths (bounded by `WHERE`) |
+| No second complete deployment block | exactly one (asserted by test) |
+| No shell command / no two-stage workflow / no placeholder | asserted by test |
+
+### Tests and exact results
+
+| Command | Result |
+|---|---|
+| `pytest tests/test_database_setup_order.py -q` | **24 passed** |
+| `pytest tests/test_canonical_schema_reconciliation.py -q` | **30 passed** |
+| `pytest tests/test_credential_management.py tests/test_credential_vault.py tests/test_save_v2_metadata.py` + the two above | **248 passed** |
+| `pytest tests/ -q` (full suite) | **4522 passed, 26 skipped** in 117.67s |
+| `python -m py_compile` on the two changed test files | clean |
+| `git diff --check` | clean |
+
+The new `tests/test_database_setup_order.py` asserts the actual document shape, not
+just that a function was called: (a) exactly one complete deployment block exists
+and it lives in §31; (b) every part is statement-identical to its migration;
+(c) the canonical reconciliation SQL is physically present; (d) the five Vault
+functions are present with their security guarantees; (e) `display_name` precedes
+its index; (f) the block contains none of `see §30.5`, `paste §30.5`, `paste it
+first`, `after step 0`, `cat supabase/`, `run separately`, `[truncated]`, `...`,
+`same as above`, `omitted` and uses no `<placeholder>`; (g) §31 has no bash fence
+and no old workflow wording; (h) the bootstrap section keeps no second block.
+
+### Known limitations (recorded, not hidden)
+
+* The block is large by design (≈120 KB / ≈2156 lines). A small block that
+  referenced another would be wrong; the size is expected.
+* The migrations' prose comment headers are not reproduced inside the block. The
+  prose lives in the migration files and in §29/§30; only comments were dropped,
+  and no statement was altered or removed.
+* Recognition of "one block" is by the block's banner plus the structural
+  "complete deployment" predicate (canonical `saved_items` + `ai_config` +
+  drift report); read-only SQL snippets elsewhere (rollback, cleanup, verification)
+  are not complete deployment artifacts and remain.
+* No live Supabase/Telegram verification — this phase changed documentation and
+  tests only; the SQL was **not** executed.
+
+### Exact next phase
+
+Apply **§31.3** to the live Supabase project as `postgres` (owner action), then
+confirm the drift report returns empty. The report's `missing_canonical_column`
+result set is the success signal; any `WARNING` names a data-guarded constraint a
+pre-existing row blocked.
+
+---
+
+## Previous phase — SAVE V2 PART 2: manual + AI Save metadata wiring
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

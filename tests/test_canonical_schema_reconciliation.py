@@ -13,10 +13,11 @@ observed production failure was:
 These tests pin the class, not the one symptom. No PostgreSQL server is
 available in the build environment, so the shipped SQL is validated two ways:
 
-1. STATIC — the three copies of the canonical script must be byte-identical
-   (migration / convenience copy / DATABASE_ARCHITECTURE.md §30 block), and every
-   table's CREATE column set must equal its `ADD COLUMN IF NOT EXISTS` set and
-   its drift-report set.
+1. STATIC — the two repository copies of the canonical script must be
+   byte-identical (the migration and `supabase/canonical_bootstrap.sql`) and its
+   §31.3 embed must be statement-identical to the migration; every table's CREATE
+   column set must equal its `ADD COLUMN IF NOT EXISTS` set and its drift-report
+   set.
 2. SIMULATED EXECUTION — `_apply()` parses the real statements of the shipped
    script and applies them to a schema model (empty, legacy or already-canonical)
    with the semantics PostgreSQL actually uses:
@@ -681,11 +682,23 @@ def script_text() -> str:
     return MIGRATION.read_text(encoding="utf-8")
 
 
-def doc_block() -> str:
+SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
+
+
+def doc_setup_block() -> str:
+    """The ONE complete deployment block (§31.3); it embeds the snapshot as part 1."""
     blocks = sql_blocks(DOC.read_text(encoding="utf-8"))
-    target = [b for b in blocks if "Canonical Supabase Bootstrap & Reconciliation" in b]
-    assert len(target) == 1, "DATABASE_ARCHITECTURE.md must embed the canonical script exactly once"
+    target = [b for b in blocks if SETUP_BANNER in b]
+    assert len(target) == 1, "DATABASE_ARCHITECTURE.md must embed the setup block exactly once"
     return target[0]
+
+
+def doc_reconciliation_segment() -> str:
+    """Part 1 of the setup block — the canonical snapshot, comment-stripped."""
+    block = doc_setup_block()
+    start = block.index("-- ─── PART 1 of 5")
+    end = block.index("-- ─── PART 2 of 5")
+    return block[start:end]
 
 
 def create_only_statements() -> list[str]:
@@ -763,12 +776,19 @@ def bot_settings_legacy_rows() -> list[dict[str, object]]:
 
 # ─── static contracts ────────────────────────────────────────────────────────
 
-def test_the_three_copies_of_the_canonical_script_are_byte_identical():
-    doc = doc_block().rstrip("\n")
+def test_the_two_repository_copies_of_the_canonical_script_are_byte_identical():
     migration = script_text().rstrip("\n")
     bootstrap = BOOTSTRAP.read_text(encoding="utf-8").rstrip("\n")
-    assert doc == migration, "the §30 block and the migration must be byte-identical"
     assert bootstrap == migration, "canonical_bootstrap.sql and the migration must be byte-identical"
+
+
+def test_the_setup_block_embeds_the_canonical_snapshot_statement_for_statement():
+    embedded = [strip_comments(s) for s in split_statements(doc_reconciliation_segment())]
+    migration = [strip_comments(s) for s in canonical_statements()]
+    assert embedded, "part 1 of the §31.3 block must not be empty"
+    assert embedded == migration, (
+        "part 1 of the §31.3 deployment block must carry every canonical statement, in order"
+    )
 
 
 def test_the_migration_is_forward_only_and_its_successors_stay_additive():
