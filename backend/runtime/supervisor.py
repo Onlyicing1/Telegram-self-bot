@@ -298,6 +298,7 @@ class RuntimeSupervisor:
                 status.get("configured"), status.get("model") or "-",
             )
             await self._apply_persisted_stt_settings()
+            await self._apply_persisted_tts_settings()
         except Exception as exc:  # noqa: BLE001 — engine wiring is never fatal
             trace_exception("MEDIA_ENGINES_PROVISION_FAILED", exc)
             logger.warning("Media engine provisioning failed: %s", exc)
@@ -341,6 +342,44 @@ class RuntimeSupervisor:
         except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
             trace_exception("STT_SETTINGS_APPLY_FAILED", exc)
             logger.warning("STT settings apply failed: %s", exc)
+
+    async def _apply_persisted_tts_settings(self) -> None:
+        """Install the owner's persisted Text-to-Speech selection at startup.
+
+        The owner's stored provider/model/voice triple is resolved by the TTS
+        control plane (``backend/ai/tts_control_plane.parse_tts_config``) and the
+        credential pools are loaded through the SAME call
+        (``backend/services/tts_service.apply_tts_settings_async``) — this is the
+        ONLY conversion site, so the boundary still never reads the store and
+        never learns an owner id. A failed (or unknown) durable read is not
+        treated as "no settings": the boundary simply keeps the default selection
+        rather than having a configured provider dropped because the database
+        blinked. Failures are logged, never fatal.
+        """
+        try:
+            if not self.owner_id:
+                return
+            from backend.ai import config_store
+            from backend.services.tts_service import apply_tts_settings_async
+            config = await config_store.get_config(self.owner_id)
+            if config.get(config_store.DEGRADED_READ_KEY):
+                logger.warning(
+                    "TTS settings: durable AI config unreadable — keeping the "
+                    "default selection",
+                )
+                return
+            status = await apply_tts_settings_async(config)
+            trace(
+                "TTS_SETTINGS_APPLIED",
+                configured=status.get("configured"),
+                provider=status.get("provider") or "-",
+                tts_model=status.get("tts_model") or "-",
+                tts_voice=status.get("tts_voice") or "-",
+                reason=status.get("reason") or "-",
+            )
+        except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
+            trace_exception("TTS_SETTINGS_APPLY_FAILED", exc)
+            logger.warning("TTS settings apply failed: %s", exc)
 
     def _wire_ai_tools(self) -> None:
         try:

@@ -59,6 +59,17 @@ _DEFAULTS: dict[str, Any] = {
     "stt_model": "",
     "stt_language": "",
     "stt_passes": 1,
+    #: Text-to-speech behavior (AI -> Media Analysis -> Text-to-Speech). The
+    #: REGISTERED provider/model/voice triple the owner picked
+    #: (``backend/ai/tts_control_plane.py``), stored exactly like ``stt_model``:
+    #: the DEFAULT selection is stored as the empty string, so "nothing
+    #: configured" and "the default" stay one state. An empty triple is itself
+    #: meaningful (the default provider, its default model, that model's default
+    #: voice), and an unusable stored combination is degraded deterministically by
+    #: the control plane rather than left stale.
+    "tts_provider": "",
+    "tts_model": "",
+    "tts_voice": "",
 }
 
 _fallback_config: dict[int, dict[str, Any]] = {}
@@ -172,6 +183,11 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "stt_model": str(config.get("stt_model") or "").strip() or None,
             "stt_language": str(config.get("stt_language") or "").strip() or None,
             "stt_passes": int(config.get("stt_passes") or _DEFAULTS["stt_passes"]),
+            # TTS behavior: the same "empty string -> NULL" convention, so the
+            # default selection is an absence rather than a duplicate literal.
+            "tts_provider": str(config.get("tts_provider") or "").strip() or None,
+            "tts_model": str(config.get("tts_model") or "").strip() or None,
+            "tts_voice": str(config.get("tts_voice") or "").strip() or None,
             "last_request_at": config.get("last_request_at") or None,
             "last_latency_ms": config.get("last_latency_ms", 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),

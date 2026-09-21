@@ -9,13 +9,27 @@ behavior changes.
         ↓
     deterministic capability decision        this module (fail-closed)
         ↓
-    THIS boundary: input validation, bounds, the ONE provider call under ONE
-    awaited timeout, output validation, the normalized clip, the trace
+    the owner's persisted selection            ``backend/ai/tts_control_plane.py``
+    (provider → model → voice, registry-validated; the default selection when the
+    owner has configured nothing)
+        ↓
+    THIS boundary: input validation, bounds, the ONE bounded attempt plan under
+    ONE awaited timeout, output validation, the normalized clip, the trace
+        ↓
+    the credential pool (``backend/services/tts_credential_pool.py``) and the
+    bounded fallback rotation (``backend/services/tts_fallback.py``), resolved
+    through the ONE provider → engine seam
+    (``backend/services/tts_engine_factory.py``)
         ↓
     the provider adapter (``backend/services/openai_tts_engine.py``): ONE
     documented HTTP request to the provider's speech endpoint
         ↓
     the EXISTING Telegram delivery infrastructure (ONE voice note)
+
+The owner's selection is a CAPABILITY fact, never a hint: an unregistered or
+unimplemented provider/model/voice can never be selected, and a failure that is
+DETERMINISTIC (a refused model or voice, a refused request, a malformed or empty
+response) is never hidden behind a substitute provider.
 
 The provider receives ONLY the text being synthesized and the minimum synthesis
 configuration. There is no parameter on this path that could carry a chat id, a
@@ -133,6 +147,10 @@ FAILURE_REJECTION = "provider_rejection"
 FAILURE_DEADLINE = "deadline"
 #: No provider for this capability is registered on this runtime.
 FAILURE_UNAVAILABLE = "provider_unavailable"
+#: Every eligible provider (and credential) failed. Reported by the fallback
+#: layer so an exhausted rotation is diagnosable as itself rather than being
+#: mistaken for the selected provider's own failure.
+FAILURE_FALLBACK_EXHAUSTED = "fallback_exhausted"
 
 #: Every token above, so a test can prove the taxonomy is closed and that no
 #: classification path can invent a new one.
@@ -156,12 +174,15 @@ FAILURE_CLASSES = frozenset({
     FAILURE_REJECTION,
     FAILURE_DEADLINE,
     FAILURE_UNAVAILABLE,
+    FAILURE_FALLBACK_EXHAUSTED,
 })
 
 #: The classes that are transient BY NATURE (a retry of the SAME request could
-#: legitimately succeed). Honest metadata only: this phase performs NO automatic
-#: retry and NO provider fallback, so nothing here is consumed yet — it exists so
-#: a later phase classifies rather than guesses.
+#: legitimately succeed). Honest metadata only: the boundary itself performs NO
+#: automatic retry, so this set is consumed by the fallback layer — which tries a
+#: DIFFERENT provider or credential, never the same request again — to decide
+#: whether a substitute is even eligible. An exhaustion is deliberately absent:
+#: "every provider failed" is not a transient condition to retry.
 _TRANSIENT_CLASSES = frozenset({
     FAILURE_TIMEOUT,
     FAILURE_TRANSPORT,
@@ -273,18 +294,35 @@ def normalize_request_text(text: Any) -> str:
 # ── Provider resolution (the ONE seam to the adapter) ────────────────────────
 
 
+#: The provisioned selection. ``None`` means "nothing was applied yet", which is
+#: a DIFFERENT state from a selection that happens to be the default: it is the
+#: pre-existing single-provider behaviour, so a runtime that never applied a
+#: persisted settings row behaves exactly as it did before the control plane
+#: existed. Process-local on purpose (the persisted value lives on the owner's
+#: ``ai_config`` row); a restart re-applies it from the store.
+_selected: Any | None = None
+
+
+def current_selection() -> Any:
+    """The provisioned selection, or the registry's default when none was applied."""
+    from backend.ai.tts_control_plane import default_selection
+
+    return _selected if _selected is not None else default_selection()
+
+
 def _engine() -> tuple[Any | None, str]:
-    """``(engine, reason)`` for this runtime's registered TTS provider.
+    """``(engine, reason)`` for the provisioned (or default) selection.
 
-    The adapter is resolved LAZILY and by NAME from ONE module, so this boundary
-    never imports a provider-specific HTTP shape and a provider cannot be
-    substituted for another: exactly one registered capability exists, and a
-    runtime that cannot build it returns ``None`` with a bounded reason rather
-    than falling back to something the owner did not select.
+    The adapter is resolved LAZILY and through ONE seam
+    (``backend/services/tts_engine_factory``), so this boundary never imports a
+    provider-specific HTTP shape and a provider cannot be substituted for
+    another here: a selection this build cannot run returns ``None`` with a
+    bounded reason rather than falling back to something the owner did not
+    select.
     """
-    from backend.services import openai_tts_engine
+    from backend.services import tts_engine_factory
 
-    return openai_tts_engine.build_engine(openai_tts_engine.SPEECH_MODEL)
+    return tts_engine_factory.build_engine(current_selection())
 
 
 def capability_reason() -> str:
@@ -309,22 +347,120 @@ def is_configured() -> bool:
 
 
 def describe() -> dict[str, str]:
-    """The registered capability as plain, non-secret labels for the panel.
+    """The provisioned selection as plain, non-secret labels for the panel.
 
     Never reads or returns a credential: it reports the provider, the model, the
-    voice and the output format this build would use, plus the bounded capability
-    state, so the owner-facing surface states facts that are true.
+    voice, the output format and the Persian capability state this build would
+    use, plus the bounded capability state, so the owner-facing surface states
+    facts that are true. A registered-but-unimplemented provider is never
+    described as runnable and the Persian state is never rendered as a claim.
     """
-    from backend.services import openai_tts_engine
+    from backend.ai.tts_control_plane import persian_label
 
+    selection = current_selection()
+    model_entry = selection.model_entry
     return {
-        "provider": openai_tts_engine.PROVIDER_NAME,
-        "model": openai_tts_engine.SPEECH_MODEL,
-        "voice": openai_tts_engine.DEFAULT_VOICE,
-        "format": openai_tts_engine.RESPONSE_FORMAT,
-        "mime_type": openai_tts_engine.AUDIO_MIME,
+        "provider": selection.provider,
+        "provider_label": selection.provider_label,
+        "model": selection.model,
+        "model_label": selection.model_label,
+        "voice": selection.voice,
+        "voice_label": selection.voice_label,
+        "format": model_entry.output_format if model_entry is not None else "",
+        "mime_type": model_entry.mime_type if model_entry is not None else "",
+        "persian": selection.persian,
+        "persian_label": persian_label(selection.persian),
+        "adjusted": selection.adjusted,
         "reason": capability_reason(),
     }
+
+
+# ── The settings-apply entry points (the ONE seam the surfaces call) ─────────
+
+
+def apply_tts_settings(config: Any) -> dict[str, Any]:
+    """Install the owner's persisted TTS selection onto this boundary.
+
+    The ONE entry point called by the places that own this state: the runtime
+    supervisor at startup (so the persisted values are in effect from the first
+    synthesis) and the Telegram surface immediately after a change (so a change is
+    effective on the NEXT request, with no redeploy and no restart). The caller
+    reads the store; this function only receives plain values, so no Telegram
+    object, owner id, chat id or message id can reach an engine.
+
+    The fallback rotation is derived from the SAME resolved selection, and the
+    credential the selected provider is provisioned with is recorded (never
+    stored, never displayed) so the runtime's first attempt reuses the engine it
+    already has.
+
+    Never raises — a settings change must not be able to break either the panel or
+    startup. Returns a sanitized status dict for the caller's trace; it contains
+    the provider, the model, the voice and a bounded reason, never a credential.
+    """
+    global _selected
+    try:
+        from backend.ai.tts_control_plane import parse_tts_config
+        from backend.services import tts_engine_factory, tts_fallback
+
+        selection = parse_tts_config(config)
+        _selected = selection
+        credential = tts_engine_factory.provisioning_credential(selection)
+        tts_fallback.register_plan(
+            selection,
+            provisioned_credential_id=(
+                credential.credential_id if credential is not None else ""
+            ),
+        )
+        reason = capability_reason()
+        status: dict[str, Any] = {
+            "configured": not reason,
+            "provider": selection.provider,
+            "tts_model": selection.model,
+            "tts_voice": selection.voice,
+            "persian": selection.persian,
+            "adjusted": selection.adjusted,
+            "reason": reason,
+        }
+        if reason:
+            logger.warning(
+                "TTS_ENGINE_UNPROVISIONED provider=%s model=%s voice=%s reason=%s",
+                selection.provider, selection.model, selection.voice, reason,
+            )
+        else:
+            logger.info(
+                "TTS_ENGINE_APPLIED provider=%s model=%s voice=%s",
+                selection.provider, selection.model, selection.voice,
+            )
+        return status
+    except Exception as exc:  # noqa: BLE001 — a settings apply is never fatal
+        logger.warning("TTS_ENGINE_APPLY_FAILED error=%s", type(exc).__name__)
+        return {"configured": False, "reason": type(exc).__name__}
+
+
+async def apply_tts_settings_async(config: Any) -> dict[str, Any]:
+    """Credential-aware settings apply: load the pools, then provision.
+
+    Ordered deliberately, exactly as the Speech-to-Text apply is: the pools are
+    read FIRST, so the selection and its rotation are provisioned against the
+    credentials that will actually be attempted, and a secret backend that is slow
+    or unavailable delays provisioning by at most its own bounded read instead of
+    failing it. Both halves are already never-fatal, so this adds no new failure
+    mode to startup or to the settings panel.
+    """
+    try:
+        from backend.ai.tts_control_plane import canonical_order, parse_tts_config
+        from backend.services import tts_credential_pool
+
+        selection = parse_tts_config(config)
+        targets = canonical_order(selection.provider) or (selection.provider,)
+        counts = await tts_credential_pool.prepare(targets)
+        logger.info(
+            "TTS_CREDENTIAL_PREPARE providers=%s credentials=%s",
+            len(counts), sum(counts.values()),
+        )
+    except Exception as exc:  # noqa: BLE001 — an optional pool is never fatal
+        logger.warning("TTS_CREDENTIAL_PREPARE_FAILED error=%s", type(exc).__name__)
+    return apply_tts_settings(config)
 
 
 # ── The boundary ─────────────────────────────────────────────────────────────
@@ -372,10 +508,12 @@ async def synthesize(
 ) -> SpeechClip:
     """Synthesize ``text`` into ONE bounded clip, or raise :class:`TtsError`.
 
-    The whole contract, in order: validate → resolve the registered provider and
-    its credential → ONE provider call under ONE awaited timeout → validate the
-    audio → return the normalized clip. Nothing else is attempted, no retry loop
-    exists, and no temporary file is created.
+    The whole contract, in order: validate → resolve the provisioned selection's
+    provider and credentials → the ONE bounded attempt plan (the selected
+    provider first, then at most its registered substitutes and the credentials of
+    each, all sharing ONE deadline) → validate the audio → return the normalized
+    clip. Nothing else is attempted, no attempt is ever retried as itself, and no
+    temporary file is created.
 
     Raises:
         TtsError:          a classified failure from the closed taxonomy.
@@ -401,42 +539,33 @@ async def synthesize(
         )
 
     started = time.monotonic()
-    _trace(request_id, "tts_provider_call_started", provider=engine.provider)
-    try:
-        audio = await asyncio.wait_for(
-            engine.speak(normalized, timeout_s=bound), timeout=bound,
+    # The fallback layer is consulted LAZILY: with no registered rotation (an
+    # unconfigured installation, and every legacy single-provider state) it
+    # returns ``None`` and this boundary keeps its exact fail-closed
+    # single-engine behavior.
+    from backend.services import tts_fallback
+
+    plan = tts_fallback.attempt_plan(engine)
+    if plan is None:
+        audio = await _run_engine(engine, normalized, bound, request_id=request_id)
+        producer = engine
+    else:
+        producer, audio = await plan.run(
+            normalized, bound, _run_engine, request_id=request_id,
         )
-    except asyncio.CancelledError:
-        raise
-    except TtsError as exc:
-        _trace(
-            request_id, "tts_provider_call_failed",
-            failure_class=failure_class_of(exc),
-            http_status=exc.http_status or "-",
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            level=logging.WARNING,
-        )
-        raise
-    except asyncio.TimeoutError as exc:
-        _trace(
-            request_id, "tts_provider_call_failed", failure_class=FAILURE_TIMEOUT,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            level=logging.WARNING,
-        )
-        raise TtsError(
-            f"Speech synthesis did not finish within {bound:g}s.",
-            stage=TTS_STAGE_TIMEOUT, failure_class=FAILURE_TIMEOUT,
-        ) from exc
 
     audio = _validate_audio(audio, request_id=request_id)
     clip = SpeechClip(
         audio=audio,
-        mime_type=engine.mime_type,
-        file_name=engine.file_name,
+        # The clip reports the engine that ACTUALLY produced the result: after a
+        # fallback that is the substitute provider, never the selection, so the
+        # caller (and its trace) always knows which provider/model/voice spoke.
+        mime_type=producer.mime_type,
+        file_name=producer.file_name,
         characters=len(normalized),
-        provider=engine.provider,
-        model=engine.model,
-        voice=engine.voice,
+        provider=producer.provider,
+        model=producer.model,
+        voice=producer.voice,
         # The speech response carries no duration metadata and the container is
         # deliberately not parsed here, so the duration stays explicitly unknown
         # rather than guessed. Telegram renders the voice note regardless.
@@ -447,8 +576,60 @@ async def synthesize(
         provider=clip.provider, model=clip.model, voice=clip.voice,
         chars=clip.characters, bytes=len(clip.audio),
         elapsed_ms=int((time.monotonic() - started) * 1000),
+        fallback=producer.provider != engine.provider,
     )
     return clip
+
+
+async def _run_engine(
+    engine: Any, text: str, bound_s: Any, *, request_id: str = "",
+) -> bytes:
+    """ONE bounded provider call, under ONE awaited timeout.
+
+    The attempt primitive the fallback layer drives: it owns the awaited timeout,
+    the per-attempt trace and the classification of a provider failure, and it
+    never retries — a second attempt is a DIFFERENT provider or credential, which
+    is the fallback layer's decision, not this function's. ``bound_s`` is the
+    caller's remaining budget, so every attempt shares one deadline.
+    """
+    try:
+        bound = max(0.001, float(bound_s))
+    except (TypeError, ValueError):
+        bound = TTS_TIMEOUT_S
+    started = time.monotonic()
+    _trace(request_id, "tts_provider_call_started", provider=engine.provider)
+    try:
+        audio = await asyncio.wait_for(
+            engine.speak(text, timeout_s=bound), timeout=bound,
+        )
+    except asyncio.CancelledError:
+        raise
+    except TtsError as exc:
+        _trace(
+            request_id, "tts_provider_call_failed",
+            provider=engine.provider,
+            failure_class=failure_class_of(exc),
+            http_status=exc.http_status or "-",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            level=logging.WARNING,
+        )
+        raise
+    except asyncio.TimeoutError as exc:
+        _trace(
+            request_id, "tts_provider_call_failed",
+            provider=engine.provider, failure_class=FAILURE_TIMEOUT,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            level=logging.WARNING,
+        )
+        raise TtsError(
+            f"Speech synthesis did not finish within {bound:g}s.",
+            stage=TTS_STAGE_TIMEOUT, failure_class=FAILURE_TIMEOUT,
+        ) from exc
+    # The response is returned UNCHANGED: its shape is the output leg's contract
+    # (``_validate_audio`` owns that classification), so a body this runtime
+    # cannot use is refused there rather than raising an unclassified TypeError
+    # here.
+    return audio
 
 
 def _validate_audio(audio: Any, *, request_id: str = "") -> bytes:

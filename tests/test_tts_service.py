@@ -750,11 +750,17 @@ async def test_the_surface_reports_the_registered_capability(monkeypatch):
 
     title, body, _buttons = await module._ai_media_tts_panel_handler(None, "")
 
+    from backend.ai import tts_control_plane as plane
+
+    selection = plane.default_selection()
     assert title == "Text-to-Speech"
-    assert openai_tts_engine.PROVIDER_NAME in body
-    assert openai_tts_engine.SPEECH_MODEL in body
-    assert openai_tts_engine.DEFAULT_VOICE in body
+    assert selection.provider_label in body
+    assert selection.model_label in body
+    assert selection.voice_label in body
     assert str(tts_service.MAX_TTS_INPUT_CHARS) in body
+    # The panel names no environment variable, ever.
+    for name in openai_tts_engine.API_KEY_ENV_VARS:
+        assert name not in body
 
 
 @pytest.mark.asyncio
@@ -772,23 +778,47 @@ async def test_the_surface_says_so_plainly_when_nothing_can_run(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_surface_offers_no_control_that_does_not_exist(monkeypatch):
+async def test_the_surface_offers_only_controls_that_exist(monkeypatch):
+    """Every control is a REGISTERED panel/action, and no state is a fake button.
+
+    The screen became configurable in the TTS control-plane phase, so the previous
+    phase's "offers no control at all" pin is superseded: what must hold now is
+    that each offered control RESOLVES (an unregistered target could never be
+    tapped) and that a read-only state is reported as text rather than as a
+    button that does nothing.
+    """
     from backend.bot.handlers import ai as ai_module
     from backend.bot.handlers import ai_tts_settings as module
+    from backend.helper import get_action, get_panel
 
     monkeypatch.setattr(ai_module, "_nav_buttons", _nav)
     _install(monkeypatch, _FakeEngine())
+    # The screens and their controls are attached through the ONE registry; every
+    # offered target must therefore resolve. The credential surface is linked from
+    # this screen, so it is registered too (it owns the pool this screen reports).
+    from backend.bot.handlers import ai_credentials as credentials_module
 
-    _title, body, buttons = await module._ai_media_tts_panel_handler(None, "")
+    module.register(None, 1)
+    credentials_module.register(None, 1)
 
-    assert "No owner controls" in body
-    # Every button is navigation: this phase registers no action and no input.
-    assert all(
-        getattr(getattr(button, "data", b""), "startswith", lambda _p: False)("panel:")
-        or getattr(button, "data", b"") == b""
+    _title, _body, buttons = await module._ai_media_tts_panel_handler(None, "")
+
+    targets = [
+        (button.data.decode() if isinstance(button.data, bytes) else str(button.data))
         for row in buttons
         for button in (row if isinstance(row, list) else [row])
-    )
+        if getattr(button, "data", b"")
+    ]
+    assert targets, "the control plane screen must offer its choices"
+    for target in targets:
+        if target.startswith("action:"):
+            action_id = target.split(":", 1)[1].split(":", 1)[0]
+            assert get_action(action_id) is not None, f"unregistered action: {target}"
+        elif target.startswith("panel:"):
+            panel_id = target.split(":", 1)[1]
+            assert get_panel(panel_id) is not None, f"unregistered panel: {target}"
+        else:
+            raise AssertionError(f"a control with no registered target: {target!r}")
 
 
 def test_the_status_line_is_one_line_and_never_raises(monkeypatch):

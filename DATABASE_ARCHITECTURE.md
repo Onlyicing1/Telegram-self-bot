@@ -68,7 +68,7 @@
 This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
 complete ordered setup: the canonical reconciliation snapshot first, then the
-four pending migrations, in one fenced block. There is no "step 0", no second
+five pending migrations, in one fenced block. There is no "step 0", no second
 block to paste and no shell workflow. Open this section, copy §31.3, paste it
 into the Supabase SQL Editor as `postgres` and run it.
 
@@ -76,26 +76,27 @@ into the Supabase SQL Editor as `postgres` and run it.
 
 | Order | Migration (`supabase/migrations/`) | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
-| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 5** — the complete canonical reconciliation SQL, physically inside the one deployment block |
-| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 5** (the object contract is also documented in §29.10) |
-| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 5** (documented in §29.14) |
-| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 5** |
-| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 5** |
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 6** — the complete canonical reconciliation SQL, physically inside the one deployment block |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 6** (the object contract is also documented in §29.10) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 6** (documented in §29.14) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 6** |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 6** |
+| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 6** |
 
 No migration file is rewritten, renamed or superseded by this section. The SQL of
-§31.3 is transcribed statement-for-statement from those five files (their prose
+§31.3 is transcribed statement-for-statement from those six files (their prose
 comment headers are dropped so the artifact is pure executable SQL; see §31.3),
 and `tests/test_database_setup_order.py` pins every statement of it back to the
 file it came from, so the combined block cannot drift from the migrations.
 
 ### 31.2 The order, and why it is this order (source-proven)
 
-1. **The reconciliation snapshot runs first (part 1 of 5).** It is the only thing
+1. **The reconciliation snapshot runs first (part 1 of 6).** It is the only thing
    that creates `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the
    AI tables and the two task tables, and it is where every canonical column, the
    four `ai_config` columns and the drifted `panel_settings`/`bot_settings`
    columns are re-established (§30.2, §30.4). Everything after it either writes
-   into those tables (parts 4–5) or is independent of them (parts 2–3).
+   into those tables (parts 4–6) or is independent of them (parts 2–3).
 2. **Vault PART 1 before Vault PART 2 (parts 2–3).** PART 2 adds five functions
    that read `public.api_credentials` and the PART 1 resolution boundary; it
    creates no table of its own. Applied in the wrong order, PART 2 leaves five
@@ -124,15 +125,24 @@ file it came from, so the combined block cannot drift from the migrations.
    deterministic backfills of a column that was just added or was `NULL`), and
    nothing in it creates a Vault secret.
 
+6. **The TTS settings migration runs last (part 6).** It is purely additive: three
+   nullable `ai_config` columns, no default binding, no backfill, no constraint
+   and no index. It depends only on `ai_config` existing (part 1) and is
+   independent of the Vault and Save V2 objects, so any position after part 1 is
+   valid; it is appended LAST so the recorded order of the pre-existing five
+   files is unchanged.
+
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
 > indexes last. The source proves that the search-index migration depends on a
 > fifth file — `20260921000001_add_saved_items_display_name.sql` — which was not in
 > the set, and that applying the index without the column fails. The single block
-> therefore contains five migrations, with the display-name migration placed
+> therefore contains six migrations, with the display-name migration placed
 > immediately before the index migration and every other position unchanged. This
 > is the repository-proven order; it is the only change this audit made to the
-> requested sequence.
+> requested sequence. The sixth file is a LATER schema change carried by its own
+> additive migration — exactly what this document's own rule requires (§30.11) — so
+> it is appended last rather than folded into the snapshot.
 
 ### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT
 
@@ -140,7 +150,7 @@ Copy the entire SQL block below and paste it into the Supabase SQL Editor as
 `postgres`. This block contains the complete ordered setup. No other SQL block in
 this document needs to be executed manually.
 
-The block is the five migrations' executable SQL concatenated in order, with a
+The block is the six migrations' executable SQL concatenated in order, with a
 part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
@@ -153,7 +163,7 @@ and no Vault secret is created.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the four pending migrations.
+-- then the five pending migrations.
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -161,13 +171,14 @@ and no Vault secret is created.
 --   3. 20260919000002_credential_vault_management.sql    (Vault PART 2)
 --   4. 20260921000001_add_saved_items_display_name.sql   (Save V2 column)
 --   5. 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes)
+--   6. 20260923000001_add_ai_config_tts_settings.sql    (TTS settings)
 --
 -- Idempotent and additive: no row, column or existing value is rewritten and no
 -- Vault secret is created. Every statement is verbatim from its migration; the
 -- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── PART 1 of 5 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
+-- ─── PART 1 of 6 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
 BEGIN;
 
@@ -1743,7 +1754,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 2 of 5 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
+-- ─── PART 2 of 6 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
@@ -1866,7 +1877,7 @@ COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 3 of 5 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
+-- ─── PART 3 of 6 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -2272,7 +2283,7 @@ COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 4 of 5 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
+-- ─── PART 4 of 6 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
@@ -2286,7 +2297,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 5 of 5 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
+-- ─── PART 5 of 6 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -2304,6 +2315,21 @@ LEFT JOIN pg_indexes i
     ON i.schemaname = 'public' AND i.indexname = v.idx
 WHERE i.indexname IS NULL
 ORDER BY 1;
+
+-- ─── PART 6 of 6 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
+
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS tts_provider text;
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS tts_model text;
+ALTER TABLE ai_config
+    ADD COLUMN IF NOT EXISTS tts_voice text;
+NOTIFY pgrst, 'reload schema';
+SELECT 'ai_config tts settings' AS check, count(*) AS present
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name   = 'ai_config'
+  AND column_name IN ('tts_provider', 'tts_model', 'tts_voice');
 ```
 
 ### 31.4 Verification after the run
@@ -2313,7 +2339,8 @@ The block's canonical part ends with a drift report that runs **after `COMMIT`**
 line names a data-guarded constraint that a pre-existing row blocked. Its Save V2
 parts each end with their own verification query (`missing_canonical_column` /
 `missing_save_v2_index`: zero rows means the column / both indexes now exist), and
-its Vault parts end with `NOTIFY pgrst, 'reload schema'`. The functions and
+its Vault parts end with `NOTIFY pgrst, 'reload schema'`. Its TTS part ends with
+its own count query over `information_schema.columns`. The functions and
 indexes can be confirmed read-only:
 
 ```sql
@@ -2349,6 +2376,10 @@ repository, which is exactly why every statement in the block is idempotent.
   (`ALTER TABLE saved_items DROP COLUMN IF EXISTS display_name;` and
   `DROP INDEX IF EXISTS idx_saved_items_display_name_trgm, idx_saved_items_tags;`).
   None of them drops `supabase_vault`, deletes a Vault secret, or rewrites a row.
+* **The TTS settings part** — `ALTER TABLE ai_config DROP COLUMN IF EXISTS
+  tts_voice;` / `tts_model` / `tts_provider;` (stated in the migration's own header).
+  Dropping them loses the stored selection only: `get_config` then serves the
+  defaults, i.e. the default provider and its default model and voice.
 * **The reconciliation part** — §30.9. The reconciliation is additive and has no
   safe automatic rollback; the only destructive cleanup in this repository is the
   explicitly OPTIONAL, owner-gated §30.10.
@@ -2771,6 +2802,9 @@ parameters.
 | `stt_model` | `text` | YES | `NULL` | Dedicated Gemini transcription model. Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), edited from AI → Settings → Advanced, consumed at runtime by `services/gemini_media_engine.py` (`stt_settings_from` / `apply_stt_settings`). NULL = the general media model answers the STT instruction. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
 | `stt_language` | `text` | YES | `NULL` | BCP-47 language hint for transcription (e.g. `fa-IR`). Same read/write/consumer path as `stt_model`. NULL = automatic language detection. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
 | `stt_passes` | `integer` | NO | `1` | Bounded number of recognition passes (CHECK `BETWEEN 1 AND 3`; 1 = the single-pass route). Same read/write/consumer path as `stt_model`. Added by `20260917000001_add_ai_config_stt_settings.sql` — pending manual application. |
+| `tts_provider` | `text` | YES | `NULL` | Registered Text-to-Speech provider id (e.g. `openai`). Read/written by `config_store` (`_DEFAULTS` merge + upsert payload), resolved by `backend/ai/tts_control_plane.py`, edited from AI → Media Analysis → Text-to-Speech, and consumed at runtime by `services/tts_service.py` (`apply_tts_settings` / `apply_tts_settings_async`). NULL = the default provider. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
+| `tts_model` | `text` | YES | `NULL` | A model id the selected TTS provider offers. Same read/write/consumer path as `tts_provider`. NULL = that provider's default model. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
+| `tts_voice` | `text` | YES | `NULL` | A voice id the selected model offers. Same read/write/consumer path as `tts_provider`. NULL = that model's default voice. Added by `20260923000001_add_ai_config_tts_settings.sql` — pending manual application. |
 | `last_request_at` | `timestamptz` | YES | `NULL` | Timestamp of the last AI request. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `last_latency_ms` | `real` | YES | `NULL` | Latency of the last AI request in ms. **Currently never persisted** — see [§19](#19-known-inconsistencies). |
 | `created_at` | `timestamptz` | YES | `now()` | When the config row was created |
@@ -4802,7 +4836,7 @@ Two honest exceptions, both documented rather than hidden:
 |---|---|---|
 | Telegram surface | `backend/bot/handlers/ai_credentials.py` | owner-only panels, actions and inputs; renders metadata and a bounded result; **no SQL, no database client, no secret-store call** |
 | Management boundary | `backend/services/credential_service.py` | validation, the bounded reason vocabulary, the non-secret credential handle, the credential test, and the ONLY `db.rpc` calls to the five functions |
-| Discovery | `stt_control_plane` + `tts_service` (through `credential_service.registered_providers()`) | decides which providers the panel may offer, so no imaginary provider can be created |
+| Discovery | `stt_control_plane` + `tts_control_plane` (through `credential_service.registered_providers()`) | decides which providers the panel may offer, so no imaginary provider can be created |
 | Pool refresh | `backend/services/stt_credential_pool.prepare()` | after every successful change, the affected provider's pool is reloaded, so a new key is in effect on the very next request |
 
 #### 29.13.7 Failure behaviour and ENV compatibility
@@ -5780,7 +5814,7 @@ alone.
 | `bot_logs` | 6 | id, owner_id, level, message, context, created_at |
 | `panel_settings` | 16 | key, auto_close_enabled, auto_close_delay, max_deep_save_mb, delete_batch_size, log_retention_days, panel_timeout_seconds, allow_multiple_panels, reuse_existing_panel, language, debug_callbacks, owner_only, dashboard_font, update_stale_seconds, ghost_seen_retention_seconds, updated_at |
 | `bot_settings` | 4 | key, value, value_type, updated_at |
-| `ai_config` | 19 | id, owner_id, provider, model, temperature, max_tokens, system_prompt, history_budget, is_configured, trigger_en, trigger_fa, show_question, stt_model, stt_language, stt_passes, last_request_at, last_latency_ms, created_at, updated_at |
+| `ai_config` | 22 | id, owner_id, provider, model, temperature, max_tokens, system_prompt, history_budget, is_configured, trigger_en, trigger_fa, show_question, stt_model, stt_language, stt_passes, tts_provider, tts_model, tts_voice, last_request_at, last_latency_ms, created_at, updated_at |
 | `ai_sessions` | 10 | id, session_id, owner_id, provider, model, status, total_tokens, message_count, created_at, updated_at |
 | `ai_messages` | 9 | id, session_id, owner_id, role, content, token_count, provider, model, created_at |
 | `ai_memories` | 9 | id, owner_id, tier, category, content, importance, expires_at, metadata, created_at |

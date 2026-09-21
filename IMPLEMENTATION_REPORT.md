@@ -1,6 +1,187 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — SAVE V2 TELEGRAM SYNC: the saved message carries the owner's file name and tags
+## Latest phase — TTS CONTROL PLANE: provider/model/voice selection, credential pool, bounded fallback
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **TTS CONTROL PLANE** — provider selection, model selection, voice selection, credential-pool integration and bounded provider fallback for Text-to-Speech |
+| Type | runtime feature (control plane + credential pool + fallback layer + provider seam + Telegram surface + startup apply) + tests + one additive schema migration |
+| Starting HEAD | `462258b` = `origin/main` (working tree clean on entry; no unrelated changes to preserve) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **YES — one additive migration `supabase/migrations/20260923000001_add_ai_config_tts_settings.sql`**, which is also **§31.3 part 6 of 6** of the ONE setup script. **NOT EXECUTED** — the SQL is not run by this agent and must be applied by the owner (idempotent). Rollback is in the migration header. |
+| STT | **NOT reimplemented, not touched.** No STT file, engine, provider, chunking, consensus, pool, fallback or test was modified. |
+| Live provider verification | **NOT PERFORMED** — no live provider request was made (see below) |
+| Live Telegram verification | **NOT PERFORMED** — no live account was driven in this environment |
+
+### Source audit — what actually existed before this phase
+
+| Inspected | Finding |
+|---|---|
+| `backend/services/tts_service.py` | the ONE TTS boundary: input/output bounds, the closed failure taxonomy, ONE awaited provider call, the normalized `SpeechClip`. Provider resolution was **hard-coded to one module** (`openai_tts_engine.build_engine(SPEECH_MODEL)`) and the voice was **fixed** to `alloy` |
+| `backend/services/openai_tts_engine.py` | the ONE speech adapter: `POST {AI_OPENAI_BASE_URL}/audio/speech`, model allowlist `(gpt-4o-mini-tts,)`, 13 documented voices (a `frozenset`, i.e. **no deterministic order**), credential resolution from `AI_OPENAI_API_KEY` / `OPENAI_API_KEY` |
+| `backend/bot/handlers/ai_tts_settings.py` | a **read-only** screen that explicitly said *"No owner controls"*; it registered no action and no input, and persisted nothing |
+| `backend/ai/config_store.py` | one per-owner `ai_config` row; `_DEFAULTS` merge + one explicit upsert payload. It carried `stt_model`/`stt_language`/`stt_passes` — and **no TTS key at all** |
+| `backend/ai/stt_control_plane.py` + `backend/services/stt_*` | the pattern this phase mirrors: a registry of registered candidates, a credential pool over the one secret boundary, and a bounded provider + credential rotation — all **STT-specific** and untouched |
+| `backend/ai/credential_source.py` | the **provider-agnostic** secret boundary (environment first, then ONE documented Vault RPC `api_credential_pool`). Its own docstring already names `openai` (TTS) as a consumer |
+| `backend/services/credential_service.py` | the owner-facing credential store; `registered_providers()` derived the TTS provider from `tts_service.describe()`, and `refresh_provider()` always reloaded the **STT** pool |
+| `supabase/migrations/` + `DATABASE_ARCHITECTURE.md` §30/§31 | `ai_config` had **no** TTS column; the documented rule is that a later schema change arrives as **its own additive migration**, and §31.3 is the ONE executable setup script |
+| `tests/test_tts_service.py`, `tests/test_tts_openai_engine.py` | 56 + 47 tests covering the boundary, the adapter and the read-only surface |
+
+Missing exactly: provider selection, model selection, voice selection, credential-pool integration, provider fallback, and a settings surface that persists any of them.
+
+### Providers, models and voices actually supported
+
+| Provider | Registered | Implemented | Model | Voices |
+|---|---|---|---|---|
+| `openai` | YES | **YES** | `gpt-4o-mini-tts` (the adapter's own `SUPPORTED_MODELS`) | the adapter's 13 documented voices, in a new deterministic `VOICE_ORDER` (`alloy` default first) |
+| `speechmatics` | YES | **NO — DEFERRED** | the provider exposes **no** model parameter (its own default route, so the registry stores an empty model id rather than inventing a name) | the four voices its documentation lists (`sarah`, `theo`, `megan`, `jack`) |
+
+The registry is the single authority on `provider → model → voice`, and its voice
+list is derived from the adapter's own allowlist, so the two cannot drift. A
+registered-but-unimplemented provider is offered as **information only**: it can
+never be selected, and the panel says *"not available yet"*.
+
+**Why `speechmatics` is deferred (evidence, not preference):** its documentation
+states the output is `wav_16000`/`pcm_16000` **only**, which Telegram voice notes
+cannot carry (this project has no audio-transcoding path by deliberate policy — no
+ffmpeg), and its own FAQ states the service supports **English** only. Wiring it
+would have required either a conversion architecture or a non-voice-note delivery,
+so it is registered as a documented deferral instead of being invented.
+
+### Persian status — explicitly NOT claimed
+
+Every voice carries a closed capability state: `verified` / `unsupported` /
+`not_verified`. On this build **no voice is `verified`** (no live verification is
+recorded), the OpenAI voices are `not_verified` (the provider publishes no
+per-language guarantee), and the Speechmatics voices are `unsupported` **with the
+provider's own documentation as the recorded evidence**. The panel renders the
+state — *"Persian · not verified — live request required"* — so "Persian supported"
+is never printed for a capability that was not verified.
+**Live provider verification required.**
+
+### What was implemented
+
+* **`backend/ai/tts_control_plane.py` (new)** — the capability registry
+  (`TtsProvider` → `TtsModel` → `TtsVoice`), the closed Persian states, the
+  deterministic `canonical_order` (the selection first, then the registered
+  implementations), and `TtsSelection` resolution. An invalid stored triple is
+  degraded **level by level** (provider → its default model → that model's default
+  voice) and the degradation is reported, so a stale combination can never reach a
+  provider; the Telegram writes always persist a **consistent** triple.
+* **`backend/services/tts_credential_pool.py` (new)** — the CREDENTIAL half:
+  deterministic order (environment first, then the Vault in the owner's priority
+  order), per-credential health with a bounded cooldown, and the
+  credential-vs-provider classification. It is **not a second store**: it reads the
+  same `credential_source` boundary and therefore the same Vault RPC and the same
+  environment variables. No `db.rpc(`, no `vault.*`, no secret column.
+* **`backend/services/tts_engine_factory.py` (new)** — the ONE provider → engine
+  seam. It re-validates the model and the voice against the registry, passes only
+  a **pooled** credential explicitly (the deployment's own credential keeps the
+  adapter's existing resolution and its truthful `key_env_var` label), and returns
+  a bounded reason instead of substituting another provider.
+* **`backend/services/tts_fallback.py` (new)** — the bounded attempt plan: the
+  selected provider **always first**, then at most `MAX_PROVIDER_ATTEMPTS = 3`
+  providers and `MAX_TOTAL_ATTEMPTS = 6` attempts **sharing ONE deadline**, with a
+  `MIN_ATTEMPT_S = 8s` floor so a starved attempt is never started. Rotation is
+  deterministic, never random; a credential-specific failure rotates **inside** the
+  provider, a provider-wide failure skips the rest of its keys, and only genuinely
+  transient classes (or the adapter's own `retryable` verdict) authorize a
+  substitute.
+* **`backend/services/tts_service.py`** — the boundary now resolves the
+  **provisioned selection** through the factory, drives the plan under the same ONE
+  awaited timeout, and reports the engine that **actually produced** the clip (after
+  a fallback that is the substitute, never the selection). Added one closed
+  taxonomy token (`fallback_exhausted`) and the settings-apply entry points
+  (`apply_tts_settings` / `apply_tts_settings_async`). No retry loop, no second
+  deadline, no new dependency.
+* **`backend/services/openai_tts_engine.py`** — additive only: `VOICE_ORDER` (the
+  same allowlist as an ordered tuple; the control plane asserts they are equal).
+* **`backend/bot/handlers/ai_tts_settings.py`** — the read-only screen became a
+  compact control panel: the selection, its output format, its Persian state, the
+  credential pool's bounded counts, and the input limit; plus **Model…** and
+  **Voice…** screens and one button per selectable provider, and a link to the
+  existing **API Credentials** surface (credential management is not duplicated).
+  Every choice is a registered `panel:`/`action:` target — never typed input, never
+  an environment-variable name.
+* **`backend/ai/config_store.py`** — three keys on the existing per-owner row
+  (`tts_provider`, `tts_model`, `tts_voice`), empty = the default selection, written
+  in the one explicit upsert payload.
+* **`backend/runtime/supervisor.py`** — `_apply_persisted_tts_settings()` runs at
+  startup beside the STT apply; an unreadable durable read keeps the default
+  selection instead of dropping a configured provider.
+* **`backend/services/credential_service.py`** — discovery now derives the TTS
+  providers from the **registry** (so the credential UI does not change when the
+  selection moves), the environment-presence check knows the TTS provider's own
+  variables, and `refresh_provider()` reloads the pool that actually serves the
+  provider (an STT provider keeps its STT pool).
+* **`supabase/migrations/20260923000001_add_ai_config_tts_settings.sql` (new)** —
+  three nullable `ai_config` columns, additive, idempotent, no CHECK (the registry
+  is the authority on the tokens), with the rollback in its header. It is embedded
+  as **§31.3 part 6 of 6** so the ONE setup script stays complete.
+
+### Settings UI / AI integration
+
+`AI → Media Analysis → Text-to-Speech` shows the current provider · model · voice,
+the output format, the Persian state, the pool counts and the limit; it offers
+provider buttons (registered, implemented, not current), a **Model…** screen (only
+this provider's models) and a **Voice…** screen (only this model's voices). A
+selection change persists a **consistent** triple and is applied to the live
+boundary immediately — **no redeploy, no restart** — and a provider switch can
+never leave the previous provider's model or voice persisted.
+
+The AI path is **unchanged and stays text-only**: `SpeakTool` still accepts exactly
+one bounded `text` argument, with a test pinning that no provider, model, voice,
+credential, endpoint or URL field exists — the model cannot choose any of them, and
+the execution layer remains authoritative.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Focused: `test_tts_control_plane.py` | **48 passed** (new) |
+| Focused: `test_tts_provider_fallback.py` | **42 passed** (new) |
+| TTS regression: `test_tts_service.py` + `test_tts_openai_engine.py` | **103 passed** (2 superseded pins updated, none deleted or weakened) |
+| Credential/vault: `test_credential_management.py` + `test_credential_vault.py` + `test_stt_credential_pool.py` | passed (the "no second credential store" pin was **strengthened**: the TTS pool must reuse the one boundary and must not own storage) |
+| Database docs: `test_database_setup_order.py` + `test_canonical_schema_reconciliation.py` | **55 passed** (the ONE block now pins six parts) |
+| STT regression (all STT/media/AI-settings suites) | **1687 passed, 3 skipped** |
+| **Full suite** | **4716 passed, 26 skipped** |
+| `py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+### Limitations
+
+* The Speechmatics TTS provider is **deferred** (WAV-only output; English-only
+  voices) — registered as information, never selectable.
+* Only ONE provider is implemented, so the provider-fallback axis is exercised by
+  the registry plus test doubles; the machinery, its bounds and its classification
+  are real and covered, but a second **real** provider does not yet exist.
+* No live provider request was made, so no synthesis of real Persian (or any)
+  audio is claimed; every engine in the suite is scripted.
+* The migration is **not applied**: until the owner runs it, the three settings
+  degrade to the in-memory fallback and are lost on restart, exactly as documented
+  for the other pending columns.
+* Credential **health** is process-local and resets on restart (by design, matching
+  the STT pool).
+
+### Deferred work / explicit next stage
+
+* Apply `20260923000001_add_ai_config_tts_settings.sql` (idempotent; §31.3 part 6
+  of 6) against the live Supabase project.
+* Then run a **live** verification: store an OpenAI credential in the API
+  Credentials surface, select a voice from Telegram, and confirm one real voice
+  note; store a second credential and confirm rotation; record whether the
+  selected voice actually speaks Persian (which is what would move a voice from
+  `not_verified` to `verified`).
+* A second real TTS provider remains deferred pending an output format Telegram
+  voice notes can carry.
+* Unchanged from earlier phases: Native Vision, Video/GIF, provider benchmarking,
+  the `ai_preferences` decision and the dead-column cleanup decision.
+
+## Previous phase — SAVE V2 TELEGRAM SYNC: the saved message carries the owner's file name and tags
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

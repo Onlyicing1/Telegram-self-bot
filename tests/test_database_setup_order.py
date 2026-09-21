@@ -2,7 +2,7 @@
 
 DATABASE_ARCHITECTURE.md §31 must give the owner exactly ONE thing to paste: a
 single fenced SQL block that contains the complete ordered setup — the canonical
-reconciliation snapshot first, then the four pending migrations. This module pins
+reconciliation snapshot first, then the five pending migrations. This module pins
 that property so the document cannot regress to a two-stage workflow (a "step 0"
 block plus a second block) or a shell `cat` command.
 
@@ -28,14 +28,19 @@ VAULT_PART1 = "20260919000001_create_api_credential_vault.sql"
 VAULT_PART2 = "20260919000002_credential_vault_management.sql"
 DISPLAY_NAME = "20260921000001_add_saved_items_display_name.sql"
 SEARCH_INDEXES = "20260922000001_add_saved_items_search_indexes.sql"
+TTS_SETTINGS = "20260923000001_add_ai_config_tts_settings.sql"
 
-#: The order §31 documents — verified against the sources, not assumed.
-DOCUMENTED_ORDER = (RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES)
+#: The order §31 documents — verified against the sources, not assumed. The TTS
+#: settings migration is a LATER additive schema change, so it is appended last
+#: (the documented rule: a later change never edits the snapshot).
+DOCUMENTED_ORDER = (
+    RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
+)
 
 #: The banner that marks the ONE complete deployment block.
 SETUP_BANNER = "ONE COMPLETE SUPABASE SETUP SCRIPT"
 
-PART_MARKER = re.compile(r"--[^\n]*\bPART (\d) of 5\b[^\n]*\n")
+PART_MARKER = re.compile(r"--[^\n]*\bPART (\d+) of (\d+)\b[^\n]*\n")
 
 #: The five Vault PART 2 management functions that must be physically present.
 VAULT_FUNCTIONS = (
@@ -123,8 +128,12 @@ def _is_complete_deployment_block(block: str) -> bool:
 def _part_spans(block: str) -> dict[str, str]:
     """The text of each part, keyed by the migration its banner names."""
     marks = list(PART_MARKER.finditer(block))
-    assert [m.group(1) for m in marks] == ["1", "2", "3", "4", "5"], (
-        "the setup block must carry parts 1–5 in that order"
+    total = len(DOCUMENTED_ORDER)
+    assert [m.group(1) for m in marks] == [str(i) for i in range(1, total + 1)], (
+        f"the setup block must carry parts 1–{total} in that order"
+    )
+    assert {m.group(2) for m in marks} == {str(total)}, (
+        "every part banner must state the same total"
     )
     spans: dict[str, str] = {}
     for i, mark in enumerate(marks):
@@ -179,7 +188,8 @@ def test_every_part_banner_names_its_migration_in_order():
     block = _setup_block()
     for index, name in enumerate(DOCUMENTED_ORDER, start=1):
         assert re.search(
-            rf"--[^\n]*PART {index} of 5 — {re.escape(name)}", block
+            rf"--[^\n]*PART {index} of {len(DOCUMENTED_ORDER)} — {re.escape(name)}",
+            block,
         ), f"part {index} must name {name} in its banner"
 
 
@@ -293,7 +303,8 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "five migrations" in flat, "the added fifth migration must be acknowledged"
+    assert "six migrations" in flat, "the added sixth migration must be acknowledged"
+    assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 
 def test_the_section_does_not_pretend_the_sql_was_executed():

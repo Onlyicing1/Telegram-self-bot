@@ -351,14 +351,17 @@ def registered_providers() -> tuple[str, ...]:
     except Exception as exc:  # noqa: BLE001 — discovery is never fatal
         logger.warning("CREDENTIAL_PROVIDER_DISCOVERY_FAILED error=%s", type(exc).__name__)
     try:
-        from backend.services import tts_service
+        from backend.ai.tts_control_plane import provider_ids as tts_provider_ids
 
-        tts_provider = str((tts_service.describe() or {}).get("provider") or "")
+        # The TTS REGISTRY, not the current selection: which providers the owner
+        # may store a credential for must not change because the selection moved.
+        tts_providers = tts_provider_ids()
     except Exception as exc:  # noqa: BLE001 — discovery is never fatal
         logger.warning("CREDENTIAL_TTS_PROVIDER_DISCOVERY_FAILED error=%s", type(exc).__name__)
-        tts_provider = ""
-    if tts_provider and tts_provider not in providers:
-        providers.append(tts_provider)
+        tts_providers = ()
+    for provider in tts_providers:
+        if provider and provider not in providers:
+            providers.append(provider)
     return tuple(providers)
 
 
@@ -399,9 +402,13 @@ def env_credential_present(provider: str) -> bool:
     working through its deployment configuration when no managed credential is
     configured — and it is never presented as provider health.
     """
-    from backend.services.stt_credential_pool import env_var_names
+    from backend.services.stt_credential_pool import env_var_names as stt_env_var_names
 
-    names = env_var_names(provider)
+    names = stt_env_var_names(provider)
+    if not names:
+        from backend.services import tts_credential_pool
+
+        names = tts_credential_pool.env_var_names(provider)
     if not names:
         return False
     from backend.ai import credential_source
@@ -845,12 +852,29 @@ async def refresh_provider(provider: str) -> int:
     """
     from backend.services import stt_credential_pool
 
+    token = str(provider).strip()
     try:
-        counts = await stt_credential_pool.prepare((str(provider).strip(),))
+        # The pool that SERVES the provider is the one that must be reloaded. The
+        # routing answers "which capability executes this provider": a provider the
+        # Speech-to-Text registry can execute is served by the Speech-to-Text pool
+        # (a provider registered for BOTH capabilities keeps its transcription
+        # route), and only a Text-to-Speech-only provider is served by the TTS
+        # pool. Both pools read the SAME secret boundary and the same Vault RPC.
+        from backend.ai.tts_control_plane import get_provider as tts_provider
+        from backend.services.stt_credential_pool import (
+            registered_providers as stt_providers,
+        )
+
+        if token and token not in stt_providers() and tts_provider(token) is not None:
+            from backend.services import tts_credential_pool
+
+            counts = await tts_credential_pool.prepare((token,))
+        else:
+            counts = await stt_credential_pool.prepare((token,))
     except Exception as exc:  # noqa: BLE001 — a refresh is never fatal
         logger.warning("CREDENTIAL_POOL_REFRESH_FAILED error=%s", type(exc).__name__)
         return 0
-    return int(counts.get(str(provider).strip(), 0))
+    return int(counts.get(token, 0))
 
 
 # ── The credential test ────────────────────────────────────────────────────

@@ -116,6 +116,15 @@ SUPPORTED_VOICES = frozenset({
     "sage", "shimmer", "verse", "marin", "cedar",
 })
 
+#: The same allowlist as an ORDERED tuple, so a consumer that must present a
+#: deterministic choice (the TTS control plane's voice list) does not have to
+#: iterate a set. The default voice is first, and the two declarations are
+#: pinned equal by the control plane's own registry build.
+VOICE_ORDER: tuple[str, ...] = (
+    DEFAULT_VOICE, "ash", "ballad", "coral", "echo", "fable", "nova", "onyx",
+    "sage", "shimmer", "verse", "marin", "cedar",
+)
+
 #: The requested output format and the representation it produces. ``opus`` is
 #: the documented low-latency speech format; Telegram's voice-note representation
 #: is an OGG container with Opus audio, so the response is delivered as-is with no

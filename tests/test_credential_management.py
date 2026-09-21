@@ -567,13 +567,27 @@ def test_the_service_never_executes_sql_and_never_reads_the_store_directly():
 
 
 def test_no_second_credential_store_module_exists():
+    """There is ONE secret architecture; the capability pools are not stores.
+
+    The Text-to-Speech phase adds its own POOL (order, health, classification) but
+    no second STORE: the pool must read the one secret boundary
+    (``backend/ai/credential_source.py``, and through it the one Vault RPC) and
+    must not reach a database, a Vault schema or a secret itself.
+    """
     services = REPO / "backend" / "services"
     ai_dir = REPO / "backend" / "ai"
-    assert not (services / "tts_credential_pool.py").exists()
     assert not (services / "tts_credentials.py").exists()
     assert not (services / "stt_credentials.py").exists()
     assert not (services / "credential_vault.py").exists()
     assert not (ai_dir / "tts_credential_source.py").exists()
+
+    pool = (services / "tts_credential_pool.py").read_text(encoding="utf-8")
+    assert "credential_source" in pool, "the TTS pool must reuse the one secret boundary"
+    for forbidden in ("db.rpc(", "get_db(", "vault.", "decrypted_secrets", "create_secret"):
+        assert forbidden not in pool, f"the TTS pool must not own storage: {forbidden}"
+
+    source = (ai_dir / "credential_source.py").read_text(encoding="utf-8")
+    assert source.count("\nVAULT_RPC = ") == 1, "there is exactly ONE Vault RPC contract"
 
 
 def test_the_new_surface_is_wired_into_the_one_router():
