@@ -297,7 +297,12 @@ async def test_each_adapter_receives_only_the_text_and_its_own_configuration(
 
 
 def _install_surface(monkeypatch, store: dict) -> Any:
-    """The Text-to-Speech surface over a fake ``ai_config`` row."""
+    """The Text-to-Speech surface over a fake ``ai_config`` row.
+
+    The selection is stored by the dedicated trio writer, which names ONLY the
+    three TTS keys — the fake mirrors that, so a test can tell a selection write
+    apart from the shared ``ai_config`` upsert.
+    """
     from backend.bot.handlers import ai_tts_settings as module
 
     async def _get_config(_owner: int) -> dict:
@@ -306,6 +311,16 @@ def _install_surface(monkeypatch, store: dict) -> Any:
     async def _save_config(_owner: int, config: dict) -> bool:
         store.clear()
         store.update(config)
+        return True
+
+    async def _save_tts_settings(
+        _owner: int, provider: str, model: str, voice: str,
+    ) -> bool:
+        store.update({
+            plane.STORAGE_KEY_PROVIDER: provider,
+            plane.STORAGE_KEY_MODEL: model,
+            plane.STORAGE_KEY_VOICE: voice,
+        })
         return True
 
     async def _owner_and_config() -> tuple[int, dict]:
@@ -319,6 +334,7 @@ def _install_surface(monkeypatch, store: dict) -> Any:
 
     monkeypatch.setattr(config_store, "get_config", _get_config)
     monkeypatch.setattr(config_store, "save_config", _save_config)
+    monkeypatch.setattr(config_store, "save_tts_settings", _save_tts_settings)
     monkeypatch.setattr(module, "owner_and_config", _owner_and_config)
     monkeypatch.setattr(module, "apply_tts_settings_now", _apply)
     module.applied = applied  # type: ignore[attr-defined]

@@ -1,6 +1,214 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TTS PROVIDER/MODEL/VOICE BINDING FIX: the selected provider is the provider that speaks
+## Latest phase — TTS PART 1 — DURABLE SETTINGS PERSISTENCE: stored, recovered after a restart, and never faked from RAM
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **TTS PART 1 — DURABLE SETTINGS PERSISTENCE** — `tts_provider` / `tts_model` / `tts_voice` are persisted by a dedicated atomic write, recovered at startup, and never reported as stored when they were not |
+| Type | persistence fix (write isolation + an honest read signal) + focused persistence tests + documentation synchronization — **no schema change** |
+| Starting HEAD | `9765769` = `origin/main` (`fix(tts): bind provider model and voice selection to runtime`). The workspace entered this phase at `f9dfd9a` and was fast-forwarded `f9dfd9a..9765769` to `origin/main` before any edit — the ten commits already published (Save V2 management, the TTS provider work) are part of the starting state, and nothing was rewritten. |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database | **NOT touched.** No SQL was executed, Supabase was not contacted, no production data was read or written. The TTS migration's **executable statements are byte-unchanged** — only its prose header was corrected. |
+| STT / OCR / Save / Tasks / RuntimeSupervisor recovery / ProviderManager / provider adapters | **NOT touched** |
+| Live Supabase verification | **NOT PERFORMED** — no Supabase connection is available in this environment, and executing SQL is explicitly forbidden for this phase |
+| Live Telegram / live provider verification | **NOT PERFORMED** — no Telegram account was driven and no byte left the process |
+
+### The observed problem
+
+Selecting a provider, model or voice in AI → Media Analysis → Text-to-Speech
+appeared to work, and the panel reported the new selection — but the three settings
+were not durably stored, and they were gone after a restart.
+
+### Exact root cause (verified against the current source)
+
+There is no second store and no second table, and the control plane, the registry,
+the engine factory and the credential pool are all already provider-scoped. The
+failure is at the **schema boundary of the shared `ai_config` upsert**, and it has
+two distinct halves — the second of which the previous phase's read-path patch
+*concealed* rather than fixed:
+
+1. `20260923000001_add_ai_config_tts_settings.sql` is documented as *pending manual
+   application*, so the live `ai_config` table has **no** `tts_provider` /
+   `tts_model` / `tts_voice` column.
+2. `config_store._save_config_sync` built ONE upsert payload that named those three
+   keys **together with every other AI setting**. PostgREST rejects a payload naming
+   a column the table does not have, and it rejects the **whole statement** (42703:
+   `column "tts_provider" of relation "ai_config" does not exist`). So a missing TTS
+   column destroyed durability for `provider`, `model`, `temperature`,
+   `system_prompt`, `trigger_en`, `trigger_fa`, `show_question` and the STT
+   settings **as well** — a blast radius the TTS keys had introduced.
+3. The exception was caught and the whole config was kept in `_fallback_config`
+   (RAM), so the selection worked for the rest of the process and vanished on
+   restart.
+4. The previous phase then made `get_config` answer a key the row does not carry
+   from that RAM value. That removed the wrong-provider symptom but left the value
+   **indistinguishable from stored state**: every consumer — the panel, the runtime
+   startup hook, the status screen — read a value that no database had accepted, and
+   nothing could tell the two apart.
+
+So the settings were "correct in the UI but not durable", and the failure was
+invisible. Both halves are fixed here: the write is isolated so it cannot damage
+anything else and cannot be damaged by a schema gap, and the read path labels a
+RAM-served value as exactly that.
+
+### What changed (application)
+
+`backend/ai/config_store.py`
+
+* **`TTS_STORAGE_KEYS`** — the trio, declared once as the group that is stored
+  separately (a test pins it against `tts_control_plane.STORAGE_KEYS`).
+* **`_save_tts_sync` / `save_tts_settings(owner_id, provider, model, voice)`** — ONE
+  atomic statement naming only `tts_provider` / `tts_model` / `tts_voice` (+ the
+  timestamps), on the owner's existing `ai_config` row. It returns `True` only when
+  the durable row accepted the write; `False` means session-only and is never
+  presented as durable. The three keys are written together, so a stored triple is
+  always one consistent combination.
+* **The shared payload no longer names a TTS column.** `_save_config_sync` still
+  writes the row (and so `save_config` keeps its exact meaning: *the durable
+  `ai_config` row was written*, which every existing honesty test depends on), and it
+  then delegates the trio to the isolated statement when the incoming config carries
+  it. A missing TTS column can now fail only that one statement.
+* **`SESSION_ONLY_KEY`** — `get_config` reports every key it had to answer from the
+  in-process fallback because the row does not carry it. It is present only when
+  there is such a key (an all-durable config is unchanged), it is never persisted and
+  never part of `_DEFAULTS`, and it is the read-side half of "RAM is not a store".
+
+`backend/bot/handlers/ai_tts_settings.py`
+
+* `persist_selection` writes the triple through `save_tts_settings` and reports the
+  **real durable outcome**.
+* `_selection_is_session_only` + one panel line: the control panel says
+  `! This selection is not stored — it is lost on restart.` instead of implying the
+  selection is stored. The existing `_outcome` notice already refused to announce an
+  unwritten selection as accomplished.
+
+The startup path is unchanged and already correct: `RuntimeSupervisor` calls
+`_apply_persisted_tts_settings` → `config_store.get_config(self.owner_id)` →
+`apply_tts_settings_async`, so the persisted triple is in effect from the first
+synthesis, and an unreadable store keeps the applied selection instead of dropping a
+configured provider.
+
+### Schema and migration status
+
+* **No schema change and no new migration.** `20260923000001_add_ai_config_tts_settings.sql`
+  is correct and is **preserved**: three additive, nullable, default-less `text`
+  columns, no CHECK (the registry is the authority on its tokens), RLS unchanged, no
+  second table and no second configuration store. Only its **prose header** was
+  corrected — it used to describe the whole-upsert degradation this phase removes.
+  Its executable statements are byte-identical, so §31.3 part 6 still matches the
+  migration statement for statement.
+* **Migration status: still PENDING MANUAL APPLICATION.** This phase does not and
+  cannot apply it. The subject/table/column/type/default/nullability/ownership/RLS
+  contract is unchanged and still documented in §7 (`ai_config`) and §31.3 (part 6 of
+  6), and the columns remain compatible with every existing `ai_config` row (additive,
+  nullable, no backfill).
+* **Honest statement of what is now durable:** with the columns present, the
+  persistence path is proven end to end (write → read-after-write → simulated
+  restart → runtime startup). With them **absent**, the live database still cannot
+  store the trio — what changed is that this is now *contained to the trio* and
+  *reported* (session-only), instead of silently taking every other AI setting down
+  with it and presenting RAM as stored state. The owner still has to apply the
+  migration for durability on the live project.
+
+### DATABASE_ARCHITECTURE.md synchronization
+
+* **ONE authoritative comprehensive executable SQL block — confirmed and preserved.**
+  §31.3 carries exactly one complete deployment block (the repository test
+  `test_the_document_carries_exactly_one_setup_block` and
+  `test_no_second_complete_deployment_block_exists` pin it, and a direct check counts
+  **1** complete block), and it **already contains the TTS settings columns** as
+  **part 6 of 6**. **No second "final SQL" block was added, and no second block
+  exists.**
+* The canonical snapshot trio (`supabase/canonical_bootstrap.sql`,
+  `20260920000001_reconcile_canonical_schema.sql`, the §31.3 part 1 embed) is
+  **byte-identity unchanged** — verified after the edit — and the documented rule
+  "a later schema change arrives as its own additive successor rather than by editing
+  the snapshot" is respected.
+* §7 (`ai_config`) was updated to synchronize the document with the code: it now
+  lists the three TTS settings among the columns the base migration does not create,
+  and records the persistence contract (dedicated TTS statement; the shared payload
+  deliberately names no TTS column; `SESSION_ONLY_KEY` for RAM-served keys).
+
+### Tests added
+
+`tests/test_tts_settings_persistence.py` — **23 tests** over the real chain
+(selection action → real `config_store` → a PostgREST-shaped `ai_config` table → real
+`tts_control_plane` → real `tts_service` → the real `RuntimeSupervisor` startup hook),
+with the column sets **derived from the §31.3 block** rather than typed, and a fake
+table that reproduces PostgreSQL's semantics (an unknown column is 42703, `UPDATE`
+merges, `INSERT` establishes the row, `owner_id` is not-null):
+
+1. provider persistence · 2. model persistence · 3. voice persistence ·
+4. read-after-write (the store, not the handler's candidate, is the authority) ·
+5. simulated restart recovers the triple with RAM emptied · 6. runtime startup loads
+it · 7. an explicit provider never reverts to the compiled OpenAI default ·
+8. the stored triple is valid for its provider (all four providers) ·
+9. a provider change leaves no incompatible model or voice · 10. a model change
+leaves no incompatible voice and reports the degradation · 11. the trio is written in
+ONE isolated statement naming no other column · 12. no other `ai_config` write
+carries a TTS key · 13. schema compatibility: every column the store writes is
+created by the authoritative setup block, which creates the TTS columns ·
+14. the store and the control plane name the same three keys · 15. with the migration
+pending, the rest of the configuration still persists (the regression this phase
+fixes) · 16. a pending migration is reported session-only, by the store and by the
+panel · 17. a session-only selection is lost on restart · 18. a failed write is
+reported and never presented as stored · 19. a failed read is never reported as a
+stored default · 20. startup keeps the applied selection when the read fails.
+
+Two existing suites were updated because they modelled a write as a whole-row
+replacement, which is no longer faithful now that a save performs two statements:
+`tests/test_tts_multi_provider.py` (its fake store now receives the dedicated trio
+write) and `tests/test_ai_presentation_redesign.py` (its fake table now merges on
+`UPDATE` the way PostgREST does, and its single-payload assertion now pins the shared
+settings payload plus the isolation of the TTS statement).
+
+### Test results
+
+| Scope | Result |
+|---|---|
+| `tests/test_tts_settings_persistence.py` | **23 passed** |
+| TTS regression (`test_tts_multi_provider`, `test_tts_settings_persistence`, `test_tts_provider_binding`, `test_tts_control_plane`, `test_tts_provider_fallback`) | **214 passed** |
+| Documentation / canonical schema (`test_database_setup_order`, `test_canonical_schema_reconciliation`, `test_tts_settings_persistence`) | **78 passed** |
+| AI config surfaces (`test_ai_presentation_redesign`, `test_ai_stt_settings`) | **172 passed** |
+| Full suite (`pytest tests`) | **4978 passed, 26 skipped** (117.85 s) |
+| `py_compile` on the changed Python files · `git diff --check` | clean |
+
+### Manual Supabase action required
+
+Apply the TTS settings migration — idempotent, additive, no data change. Either run
+the migration file, or simply run the **ONE §31.3 setup block**, which embeds it as
+part 6 of 6:
+
+```sql
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS tts_provider text;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS tts_model    text;
+ALTER TABLE ai_config ADD COLUMN IF NOT EXISTS tts_voice    text;
+NOTIFY pgrst, 'reload schema';
+```
+
+Until it is applied the selection stays session-only, and the panel says so. No SQL
+was executed by this phase.
+
+### Live verification status
+
+**No live database persistence was verified, and none is claimed.** The persistence
+contract is covered by tests that exercise the real configuration path against a
+PostgREST-shaped table for both the pre-migration and the post-migration schema, but
+no statement of the migration was run against any Supabase project, and no Telegram
+or provider call was made.
+
+### Explicitly out of scope (untouched)
+
+Persian TTS quality · audio/codec conversion · ffmpeg · Telegram voice-message
+delivery · STT · OCR · Save · any unrelated TTS architecture.
+
+---
+
+## Previous phase — TTS PROVIDER/MODEL/VOICE BINDING FIX: the selected provider is the provider that speaks
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

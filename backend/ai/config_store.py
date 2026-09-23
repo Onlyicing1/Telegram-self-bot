@@ -6,6 +6,12 @@ and other settings. Uses Supabase when available, with an in-memory
 fallback so the AI config survives across callbacks even when the
 database is unreachable.
 
+The in-memory fallback is a DOCUMENTED DEGRADATION and never a durable store:
+a value it serves is labelled through ``SESSION_ONLY_KEY``, and the settings that
+arrive as their own additive migration (the Text-to-Speech trio,
+``TTS_STORAGE_KEYS``) are written in their own statement so a database without
+those columns can only reject that one write.
+
 All operations are async and use asyncio.to_thread with bounded
 timeouts, matching the pattern in backend/db/client.py.
 """
@@ -34,6 +40,17 @@ _READ_ATTEMPTS = 2
 #: ``_save_config_sync`` builds an explicit column payload — and never part of
 #: ``_DEFAULTS``, so it can never be written back as a real value.
 DEGRADED_READ_KEY = "durable_read_failed"
+
+#: Present on a returned config ONLY when the durable row was read successfully
+#: but does not CARRY some keys, so their value can only come from this process's
+#: in-memory fallback. Those values stay visible (the documented in-memory
+#: degradation) yet are explicitly labelled, so no consumer — and no surface that
+#: displays durable state — can mistake RAM for the database. Absent whenever
+#: every key came from the row, so an all-durable config is unchanged. Never
+#: persisted (``_save_config_sync`` and ``_save_tts_sync`` build explicit column
+#: payloads) and never part of ``_DEFAULTS``, so it can never be written back as
+#: a real value.
+SESSION_ONLY_KEY = "session_only_keys"
 
 _DEFAULTS: dict[str, Any] = {
     "provider": "",
@@ -73,6 +90,28 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 _fallback_config: dict[int, dict[str, Any]] = {}
+
+#: The three ``ai_config`` keys that persist the owner's Text-to-Speech selection
+#: (``backend/ai/tts_control_plane.py``). They are written by their OWN statement
+#: instead of inside the shared payload on purpose: they arrive as a separate
+#: additive migration, so on a database where that migration has not been applied
+#: PostgREST rejects any payload naming them — and a SHARED payload would take
+#: every other AI setting in the same save down with it. Isolating the trio bounds
+#: that rejection to the trio, where it is reported instead of silently losing the
+#: owner's provider, model, triggers and STT settings too.
+#: ``tests/test_tts_settings_persistence.py`` pins the agreement with
+#: ``tts_control_plane.STORAGE_KEYS`` so the two can never drift.
+TTS_STORAGE_KEYS: tuple[str, str, str] = ("tts_provider", "tts_model", "tts_voice")
+
+
+def _tts_values(config: dict[str, Any]) -> dict[str, Any]:
+    """The trio's column values — the writer's existing empty-string → NULL rule.
+
+    Empty is the DEFAULT selection (the default provider, its default model, that
+    model's default voice), so "nothing configured" and "the default" stay one
+    stored state rather than two.
+    """
+    return {key: str(config.get(key) or "").strip() or None for key in TTS_STORAGE_KEYS}
 
 
 def _get_db():
@@ -153,6 +192,19 @@ async def get_config(owner_id: int) -> dict[str, Any]:
                 k: (row[k] if k in row else local.get(k, v))
                 for k, v in _DEFAULTS.items()
             }
+            # A key the row does not carry can only be answered from this
+            # process's RAM — there is nothing durable behind it — so the value
+            # stays visible AND is reported as session-only. That is the whole
+            # difference between a stored setting and a value that merely looks
+            # stored until the next restart.
+            session_only = tuple(k for k in _DEFAULTS if k not in row and k in local)
+            if session_only:
+                merged[SESSION_ONLY_KEY] = session_only
+                logger.warning(
+                    "[AI_CONFIG] get_config owner_id=%s: %d key(s) are session-only "
+                    "(the row does not carry them): %s",
+                    owner_id, len(session_only), ",".join(session_only),
+                )
             logger.info("[AI_CONFIG] get_config OK owner_id=%s provider='%s' model='%s'", owner_id, merged.get("provider", ""), merged.get("model", ""))
             return merged
         if read_failed:
@@ -198,11 +250,10 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
             "stt_model": str(config.get("stt_model") or "").strip() or None,
             "stt_language": str(config.get("stt_language") or "").strip() or None,
             "stt_passes": int(config.get("stt_passes") or _DEFAULTS["stt_passes"]),
-            # TTS behavior: the same "empty string -> NULL" convention, so the
-            # default selection is an absence rather than a duplicate literal.
-            "tts_provider": str(config.get("tts_provider") or "").strip() or None,
-            "tts_model": str(config.get("tts_model") or "").strip() or None,
-            "tts_voice": str(config.get("tts_voice") or "").strip() or None,
+            # TTS behavior is deliberately ABSENT here: the trio is written in its
+            # own statement below (``_save_tts_sync`` / ``TTS_STORAGE_KEYS``), so
+            # this payload stays writable on a database whose ``ai_config``
+            # predates the TTS migration.
             "last_request_at": config.get("last_request_at") or None,
             "last_latency_ms": config.get("last_latency_ms", 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -212,6 +263,20 @@ def _save_config_sync(owner_id: int, config: dict[str, Any]) -> bool:
         else:
             payload["created_at"] = datetime.now(timezone.utc).isoformat()
             db.table("ai_config").insert(payload).execute()
+        # The TTS trio rides in its own statement, never in ``payload`` above, so
+        # a schema without those columns rejects only the trio. This return value
+        # keeps its exact meaning — the durable ``ai_config`` ROW was written —
+        # because that is what every other caller's honesty depends on (a toggle
+        # that reports "not saved" while the row really was written would be its
+        # own lie). The trio's own durability is reported by ``save_tts_settings``
+        # and, on the read path, by ``SESSION_ONLY_KEY``.
+        if any(key in config for key in TTS_STORAGE_KEYS):
+            if not _save_tts_sync(owner_id, config):
+                logger.warning(
+                    "[AI_CONFIG] save_config owner_id=%s: the ai_config row was written, "
+                    "but the TTS selection was NOT stored — it stays session-only",
+                    owner_id,
+                )
         _fallback_config[owner_id] = dict(config)
         logger.info("[AI_CONFIG] save_config OK owner_id=%s provider='%s' model='%s'", owner_id, payload["provider"], payload["model"])
         return True
@@ -240,6 +305,68 @@ async def save_config(owner_id: int, config: dict[str, Any]) -> bool:
         logger.warning("[AI_CONFIG] save_config failed for owner_id=%s: %s — fallback only (NOT durable)", owner_id, exc)
         _fallback_config[owner_id] = dict(config)
         return False
+
+
+def _save_tts_sync(owner_id: int, config: dict[str, Any]) -> bool:
+    """Write ONLY the TTS trio, in ONE statement, on the owner's ``ai_config`` row.
+
+    Never names another column, so this is the one write a database without the
+    TTS columns can reject without touching anything else in the row. Returns
+    whether the durable row accepted it.
+    """
+    db = _get_db()
+    if not db:
+        logger.info(
+            "[AI_CONFIG] DB unavailable — TTS selection not stored owner_id=%s (NOT durable)",
+            owner_id,
+        )
+        return False
+    payload = _tts_values(config)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        existing = db.table("ai_config").select("id").eq("owner_id", owner_id).maybe_single().execute()
+        if existing and existing.data:
+            db.table("ai_config").update(payload).eq("owner_id", owner_id).execute()
+        else:
+            payload["owner_id"] = owner_id
+            payload["created_at"] = datetime.now(timezone.utc).isoformat()
+            db.table("ai_config").insert(payload).execute()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[AI_CONFIG] TTS settings write REJECTED for owner_id=%s: %s — the trio is "
+            "session-only until the ai_config TTS columns exist "
+            "(20260923000001_add_ai_config_tts_settings.sql)",
+            owner_id, exc,
+        )
+        return False
+
+
+async def save_tts_settings(owner_id: int, provider: str, model: str, voice: str) -> bool:
+    """Persist the Text-to-Speech selection trio, and nothing else.
+
+    ONE atomic statement carrying exactly ``tts_provider``/``tts_model``/
+    ``tts_voice`` (plus ``updated_at``), so the stored triple is always one valid
+    combination rather than three independently-racing keys, and so a schema
+    without those columns can only reject THIS write.
+
+    Returns True only when the durable row accepted the write. False means the
+    values are session-only: still visible to this process through the in-memory
+    fallback (the documented degradation), reported by ``get_config`` through
+    ``SESSION_ONLY_KEY``, and lost on restart. RAM is never presented as durable
+    state by this call.
+    """
+    config = dict(zip(TTS_STORAGE_KEYS, (provider, model, voice)))
+    try:
+        saved = await _run_sync(_save_tts_sync, owner_id, config)
+    except Exception as exc:
+        logger.warning(
+            "[AI_CONFIG] save_tts_settings failed for owner_id=%s: %s — fallback only (NOT durable)",
+            owner_id, exc,
+        )
+        saved = False
+    _fallback_config.setdefault(owner_id, {}).update(config)
+    return saved
 
 
 async def update_provider(owner_id: int, provider: str, model: str = "") -> bool:

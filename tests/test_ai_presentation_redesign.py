@@ -474,6 +474,7 @@ class _FakeTable:
         self._payloads = payloads
         self._owner = None
         self._payload = None
+        self._op = ""
 
     def select(self, *_a):
         return self
@@ -486,10 +487,12 @@ class _FakeTable:
         return self
 
     def update(self, payload=None):
+        self._op = "update"
         self._payload = payload
         return self
 
     def insert(self, payload):
+        self._op = "insert"
         self._payload = payload
         return self
 
@@ -498,11 +501,17 @@ class _FakeTable:
             data = None
 
         if self._payload is not None:
-            self._payloads.append(dict(self._payload))
+            payload = dict(self._payload)
+            self._payloads.append(dict(payload))
             owner = self._owner
             if owner is None:
-                owner = self._payload.get("owner_id")  # insert path: no eq() chain
-            self._store[owner] = dict(self._payload)
+                owner = payload.get("owner_id")  # insert path: no eq() chain
+            if self._op == "insert":
+                self._store[owner] = payload
+            else:
+                # PostgREST UPDATE touches only the columns it names and leaves
+                # the rest of the row intact; only INSERT establishes a row.
+                self._store.setdefault(owner, {}).update(payload)
         else:
             row = self._store.get(self._owner)
             _Result.data = dict(row) if row else None
@@ -856,6 +865,7 @@ class _ToggleTable:
         self._payloads = payloads
         self._owner = None
         self._payload = None
+        self._op = ""
 
     def select(self, *_a):
         return self
@@ -868,12 +878,14 @@ class _ToggleTable:
         return self
 
     def update(self, payload=None):
+        self._op = "update"
         if self._fail_write:
             raise RuntimeError("PGRST204: Could not find the 'show_question' column")
         self._payload = payload
         return self
 
     def insert(self, payload):
+        self._op = "insert"
         if self._fail_write:
             raise RuntimeError("PGRST204: Could not find the 'show_question' column")
         self._payload = payload
@@ -884,9 +896,14 @@ class _ToggleTable:
             data = None
 
         if self._payload is not None:
-            self._payloads.append(dict(self._payload))
-            owner = self._owner if self._owner is not None else self._payload.get("owner_id")
-            self._store[owner] = dict(self._payload)
+            payload = dict(self._payload)
+            self._payloads.append(dict(payload))
+            owner = self._owner if self._owner is not None else payload.get("owner_id")
+            if self._op == "insert":
+                self._store[owner] = payload
+            else:
+                # PostgREST UPDATE merges the named columns into the row.
+                self._store.setdefault(owner, {}).update(payload)
             self._payload = None
         else:
             row = self._store.get(self._owner)
@@ -1004,9 +1021,18 @@ async def test_toggle_uses_one_owner_and_the_authoritative_config_row():
             await ai_mod._ai_toggle_show_question_action(None, "", owner)
     # exactly one durable row was written, for the resolved owner
     assert set(db.store) == {owner}
-    payloads = [p for p in db.payloads if "owner_id" in p]
-    assert len(payloads) == 1 and payloads[0]["owner_id"] == owner
-    assert payloads[0]["show_question"] is True
+    settings = [p for p in db.payloads if "show_question" in p]
+    assert len(settings) == 1 and settings[0]["owner_id"] == owner
+    assert settings[0]["show_question"] is True
+    # The TTS selection is written in its OWN statement and names no other
+    # column, so a schema without those columns cannot reject this one.
+    from backend.ai.config_store import TTS_STORAGE_KEYS
+
+    for payload in db.payloads:
+        if set(payload) & set(TTS_STORAGE_KEYS):
+            assert set(payload) <= set(TTS_STORAGE_KEYS) | {
+                "owner_id", "created_at", "updated_at",
+            }, sorted(payload)
     # the other owner's row is untouched by the toggle
     with patch.object(config_store, "_get_db", lambda: db):
         assert (await config_store.get_config(other_owner))["show_question"] is False

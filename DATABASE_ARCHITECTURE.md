@@ -2772,15 +2772,29 @@ parameters.
 > **Current status:** The `ai_config` table is referenced by
 > `backend/ai/config_store.py` but may not exist in the live database.
 > The initial migration (`20260805075707`) creates the base columns but
-> does NOT include `trigger_en`, `trigger_fa`, `show_question` or the
+> does NOT include `trigger_en`, `trigger_fa`, `show_question`, the
 > three Gemini STT settings (`stt_model`, `stt_language`,
-> `stt_passes`). Migrations
+> `stt_passes`) or the three Text-to-Speech settings (`tts_provider`,
+> `tts_model`, `tts_voice`). Migrations
 > `20260827000002_add_ai_config_trigger_columns.sql`,
-> `20260913000000_add_ai_config_show_question.sql` and
-> `20260917000001_add_ai_config_stt_settings.sql` (all idempotent) add
-> them — pending manual application. Until they are applied, the
-> runtime silently falls back to in-memory storage when the table or
-> columns are missing. See
+> `20260913000000_add_ai_config_show_question.sql`,
+> `20260917000001_add_ai_config_stt_settings.sql` and
+> `20260923000001_add_ai_config_tts_settings.sql` (all idempotent, all
+> embedded in the §31.3 setup block) add them — pending manual
+> application.
+>
+> **Persistence contract while they are pending:** the Text-to-Speech
+> selection is written by ONE dedicated statement
+> (`config_store.save_tts_settings`, `TTS_STORAGE_KEYS`) that names only
+> `tts_provider` / `tts_model` / `tts_voice`, so a table without those
+> columns rejects only that write — never the shared upsert, whose
+> payload deliberately names no TTS column (a shared payload naming a
+> missing column is rejected as a WHOLE statement, 42703, and would take
+> `provider`, `model`, `trigger_en`, `trigger_fa`, `show_question` and
+> the STT settings with it). An unwritten trio is never presented as
+> stored: `save_config` / `save_tts_settings` report whether the durable
+> row was written, and `get_config` labels every key it answered from the
+> in-process fallback through `SESSION_ONLY_KEY`. See
 > [§19 Known Inconsistencies](#19-known-inconsistencies).
 
 ### Columns

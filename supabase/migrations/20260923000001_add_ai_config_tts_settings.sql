@@ -12,11 +12,16 @@ triple the owner picked.
 - `tts_voice`    — a voice id that model offers, or NULL for that model's default
                    voice.
 
-`backend/ai/config_store.py` persists all three keys in every `ai_config` upsert
-payload and merges them in `get_config` with the defaults above, so before this
-column set exists the whole upsert degrades to the in-memory fallback exactly as
-documented for the trigger columns and the STT settings columns (see §19.1) — the
-settings are then lost on restart.
+`backend/ai/config_store.py` persists all three keys in ONE dedicated statement
+(`save_tts_settings`, keying on `TTS_STORAGE_KEYS`) and merges them in
+`get_config` with the defaults above. The trio is deliberately NOT part of the
+shared `ai_config` upsert payload: a column named by a shared payload is rejected
+with the WHOLE statement (42703), which would take the owner's provider, model,
+triggers and STT settings down with it (see §19.1). Because the write is isolated,
+a database without these columns fails only here — the store then reports the
+selection as session-only (`SESSION_ONLY_KEY`, `get_config`) instead of presenting
+RAM as durable state, and the selection is lost on restart until this migration is
+applied.
 
 The columns are additive and non-breaking: every existing read path keeps its
 behavior through the `get_config` defaults merge (an empty triple is the DEFAULT

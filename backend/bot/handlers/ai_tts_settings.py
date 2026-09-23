@@ -48,6 +48,9 @@ from __future__ import annotations
 import logging
 
 from backend.ai.tts_control_plane import (
+    STORAGE_KEY_MODEL,
+    STORAGE_KEY_PROVIDER,
+    STORAGE_KEY_VOICE,
     TTS_PROVIDERS,
     TtsSelection,
     get_provider,
@@ -85,6 +88,22 @@ def _selection_of(config: dict) -> TtsSelection:
     return parse_tts_config({} if _unreadable(config) else config)
 
 
+def _selection_is_session_only(config: dict) -> bool:
+    """True when the store served the selection from RAM, not from the row.
+
+    ``config_store.get_config`` reports every key it had to answer from this
+    process's in-memory fallback. A selection reported there was never written to
+    the durable row, so the panel says so instead of implying it is stored.
+    """
+    from backend.ai.config_store import SESSION_ONLY_KEY
+
+    session_only = tuple(config.get(SESSION_ONLY_KEY) or ())
+    return any(
+        key in session_only
+        for key in (STORAGE_KEY_PROVIDER, STORAGE_KEY_MODEL, STORAGE_KEY_VOICE)
+    )
+
+
 async def owner_and_config() -> tuple[int, dict]:
     """The owner id and their persisted AI config, through the existing surface."""
     from backend.bot.handlers.ai import _get_owner_id, _get_saved_config
@@ -99,15 +118,24 @@ async def owner_and_config() -> tuple[int, dict]:
 async def persist_selection(owner_id: int, selection: TtsSelection) -> bool:
     """Persist a CONSISTENT triple on the owner's existing ``ai_config`` row.
 
-    ONE read and ONE write through the existing store (never a key-by-key update
-    loop that could leave a half-applied triple behind), so the stored triple is
-    always a valid combination for the provider it names.
-    """
-    from backend.ai.config_store import get_config, save_config
+    ONE write of the three keys in ONE statement through the existing store (never
+    a key-by-key update loop that could leave a half-applied triple behind, and
+    never a second store), so the stored triple is always a valid combination for
+    the provider it names. The write names no other column, so it can neither be
+    broken by, nor break, any other AI setting.
 
-    config = await get_config(owner_id)
-    config.update(selection.storage_values())
-    return await save_config(owner_id, config)
+    Returns whether the durable row accepted it; False means the selection is
+    session-only and the caller must say so.
+    """
+    from backend.ai.config_store import save_tts_settings
+
+    values = selection.storage_values()
+    return await save_tts_settings(
+        owner_id,
+        values[STORAGE_KEY_PROVIDER],
+        values[STORAGE_KEY_MODEL],
+        values[STORAGE_KEY_VOICE],
+    )
 
 
 async def apply_tts_settings_now(owner_id: int) -> bool:
@@ -216,7 +244,9 @@ def _provider_buttons(selection: TtsSelection) -> list[tuple[str, str]]:
     ]
 
 
-def _tts_body_and_buttons(selection: TtsSelection, config_unreadable: bool) -> tuple[str, list]:
+def _tts_body_and_buttons(
+    selection: TtsSelection, config_unreadable: bool, session_only: bool = False,
+) -> tuple[str, list]:
     from backend.bot.handlers.ai import _nav_buttons
     from backend.services import tts_service
 
@@ -229,6 +259,9 @@ def _tts_body_and_buttons(selection: TtsSelection, config_unreadable: bool) -> t
     lines = ["**Text-to-Speech**", ""]
     if config_unreadable:
         lines.append("! Current selection unavailable (database read failed).")
+        lines.append("")
+    if session_only:
+        lines.append("! This selection is not stored — it is lost on restart.")
         lines.append("")
     if not capability.get("reason"):
         lines.append("Speaks text as a voice message when you ask for it.")
@@ -265,7 +298,8 @@ async def _ai_media_tts_panel_handler(event, extra: str) -> tuple[str, str, list
         config = {}
     unreadable = _unreadable(config)
     selection = _selection_of(config)
-    body, buttons = _tts_body_and_buttons(selection, unreadable)
+    session_only = _selection_is_session_only(config)
+    body, buttons = _tts_body_and_buttons(selection, unreadable, session_only)
     return "Text-to-Speech", body, buttons
 
 
