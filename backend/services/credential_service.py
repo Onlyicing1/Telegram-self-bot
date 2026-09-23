@@ -178,6 +178,7 @@ _METADATA_FIELDS = ("credential_id", "provider", "label", "enabled", "priority")
 _PROVIDER_LABELS: dict[str, str] = {
     "gemini": "Gemini",
     "groq": "Groq",
+    "grok": "Grok (xAI)",
     "speechmatics": "Speechmatics",
     "openai": "OpenAI",
 }

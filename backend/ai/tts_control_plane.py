@@ -10,7 +10,8 @@ separate from its EXECUTION half (``backend/services/tts_service.py``):
         ↓
     ``backend/services/tts_engine_factory``: the ONE provider → engine seam
         ↓
-    the provider adapters (``openai_tts_engine``, ``speechmatics_tts_engine``)
+    the provider adapters (``openai_tts_engine``, ``gemini_tts_engine``,
+    ``grok_tts_engine``, ``speechmatics_tts_engine``)
         ↓
     the EXISTING TTS boundary (``backend/services/tts_service.py``)
 
@@ -29,7 +30,15 @@ plane keeps them apart:
   never become a selection. ``implemented`` distinguishes "this project knows the
   capability exists" from "this project can run it today"; a registered-but-
   unimplemented provider is DATA (a documented deferral) and can never be
-  selected as active.
+  selected as active. Every provider registered today HAS its own adapter, so
+  ``implemented`` is ``True`` for all of them; the flag and its fail-closed
+  handling remain because they are the mechanism that keeps a provider without an
+  execution path unreachable.
+
+THE PROVIDER DECLARATIONS ARE THE ADAPTERS'. A provider's models, voices, output
+format and MIME type are read from the adapter module that owns them (never
+re-typed here), so the registry and what the adapter will actually accept cannot
+drift — the registry build asserts the two agree and raises if they ever do not.
 * **Credential** — where the provider's API key lives is NOT part of the
   registry and is NOT part of its state. A key existing is not evidence that a
   provider answers; only a real request can say that.
@@ -121,6 +130,18 @@ class TtsVoice:
     note: str = ""
 
 
+#: The containers Telegram DOCUMENTS for a voice message (Telegram Bot API,
+#: ``sendVoice``): an OGG/Opus file, MP3, or M4A. The runtime does not transcode
+#: by design, so this set is the honest answer to "can this model's output be a
+#: voice note" without a conversion layer: a provider whose container is absent
+#: is still a real adapter, but its voice-note delivery is not something this
+#: build can claim. The derived property below can never drift from the MIME the
+#: adapter actually declares.
+VOICE_NOTE_MIME_TYPES = frozenset({
+    "audio/ogg", "audio/opus", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a",
+})
+
+
 @dataclass(frozen=True)
 class TtsModel:
     """ONE model a registered provider offers, with the voices it accepts.
@@ -146,6 +167,11 @@ class TtsModel:
     @property
     def is_provider_default(self) -> bool:
         return not self.model_id
+
+    @property
+    def voice_note_compatible(self) -> bool:
+        """Whether this model's declared container is a documented voice note."""
+        return self.mime_type in VOICE_NOTE_MIME_TYPES
 
     @property
     def default_voice_id(self) -> str:
@@ -187,61 +213,145 @@ class TtsProvider:
         return "Ready" if self.implemented else "Not available yet"
 
 
-def _openai_output_format() -> str:
-    """The OpenAI adapter's OWN requested output format (one declaration)."""
-    from backend.services import openai_tts_engine
-
-    return openai_tts_engine.RESPONSE_FORMAT
-
-
-def _openai_mime_type() -> str:
-    """The MIME type the OpenAI adapter's output is delivered as."""
-    from backend.services import openai_tts_engine
-
-    return openai_tts_engine.AUDIO_MIME
+#: The adapter module that OWNS a provider's capability declarations. Bounded on
+#: purpose: an unknown token raises at registry-build time, so a provider can
+#: never be registered without an execution path behind it.
+_ADAPTERS: dict[str, str] = {
+    "openai": "openai_tts_engine",
+    "gemini": "gemini_tts_engine",
+    "grok": "grok_tts_engine",
+    "speechmatics": "speechmatics_tts_engine",
+}
 
 
-def _openai_voices() -> tuple[TtsVoice, ...]:
-    """The voices the speech endpoint documents, in its own documented order.
+def adapter_for(provider: str) -> Any:
+    """The adapter module of ONE registered provider (never a second table)."""
+    import importlib
 
-    The allowlist itself is the adapter's (``openai_tts_engine.SUPPORTED_VOICES``)
-    so the two can never drift; the ORDER and the Persian state live here, and a
-    voice the adapter does not accept is refused at import time rather than
-    becoming an offer the adapter would reject.
+    module_name = _ADAPTERS.get(str(provider or "").strip())
+    if not module_name:
+        raise RuntimeError(f"no TTS adapter declares provider `{provider}`")
+    return importlib.import_module(f"backend.services.{module_name}")
+
+
+def _declared_output_format(adapter: Any) -> str:
+    """The provider's OWN declared output format (one declaration).
+
+    ``openai_tts_engine`` names the value it asks its endpoint for
+    ``RESPONSE_FORMAT``; the other adapters name the same fact ``OUTPUT_FORMAT``.
+    Both spellings are read so the registry never re-types a provider's format.
     """
-    from backend.services import openai_tts_engine
+    return str(
+        getattr(adapter, "OUTPUT_FORMAT", "") or getattr(adapter, "RESPONSE_FORMAT", "")
+    )
 
-    order = tuple(openai_tts_engine.VOICE_ORDER)
-    supported = openai_tts_engine.SUPPORTED_VOICES
+
+def _voices(
+    adapter: Any,
+    *,
+    persian: str,
+    note: str = "",
+    notes: Mapping[str, str] | None = None,
+) -> tuple[TtsVoice, ...]:
+    """The provider's documented voices, in the ADAPTER's own documented order.
+
+    The allowlist itself is the adapter's (``SUPPORTED_VOICES``) so the two can
+    never drift; the ORDER and the Persian capability state live here, and the two
+    declarations are asserted equal at import time, so a voice the adapter would
+    reject can never become an offer.
+    """
+    order = tuple(adapter.VOICE_ORDER)
+    supported = adapter.SUPPORTED_VOICES
     if set(order) != set(supported):
         raise RuntimeError(
-            "openai_tts_engine.VOICE_ORDER must cover exactly SUPPORTED_VOICES"
+            f"{adapter.PROVIDER_NAME}.VOICE_ORDER must cover exactly SUPPORTED_VOICES"
         )
-    #: No per-voice Persian guarantee is published by the provider, so every
-    #: entry states exactly that. It is NEVER presented as support.
+    if not order:
+        raise RuntimeError(f"{adapter.PROVIDER_NAME} declares no voice")
+    #: The first entry IS the provider's documented default, so the model's
+    #: default voice is the provider's own and not one this project picked.
+    if order[0] != str(adapter.DEFAULT_VOICE):
+        raise RuntimeError(
+            f"{adapter.PROVIDER_NAME}.VOICE_ORDER must start with DEFAULT_VOICE"
+        )
+    per_voice = notes or {}
     return tuple(
         TtsVoice(
             voice_id=voice_id,
             label=voice_id.title(),
-            persian=PERSIAN_NOT_VERIFIED,
-            note="provider publishes no per-language guarantee for this voice",
+            persian=persian,
+            note=per_voice.get(voice_id, note),
         )
         for voice_id in order
     )
 
 
-def _speechmatics_voices() -> tuple[TtsVoice, ...]:
-    """The four voices Speechmatics' own TTS documentation lists.
+def _models(
+    adapter: Any,
+    *,
+    voices: tuple[TtsVoice, ...],
+    labels: Mapping[str, str] | None = None,
+    note: str = "",
+) -> tuple[TtsModel, ...]:
+    """The provider's registered models, each carrying the SAME voice set.
 
-    Recorded (with their accents) so the deferral is explicit and inspectable
-    rather than a missing entry.
+    A provider that exposes no model parameter registers ONE model whose id is
+    the explicit empty string: the provider's own route, never an invented model
+    name. Format and MIME come from the adapter, so the panel states what the
+    request will actually produce.
     """
-    return (
-        TtsVoice("sarah", "Sarah · English (UK)", PERSIAN_UNSUPPORTED, "documented as English (UK)"),
-        TtsVoice("theo", "Theo · English (UK)", PERSIAN_UNSUPPORTED, "documented as English (UK)"),
-        TtsVoice("megan", "Megan · English (US)", PERSIAN_UNSUPPORTED, "documented as English (US)"),
-        TtsVoice("jack", "Jack · English (US)", PERSIAN_UNSUPPORTED, "documented as English (US)"),
+    output_format = _declared_output_format(adapter)
+    mime_type = str(getattr(adapter, "AUDIO_MIME", ""))
+    declared = tuple(getattr(adapter, "SUPPORTED_MODELS", ()) or ("",))
+    per_model = labels or {}
+    return tuple(
+        TtsModel(
+            model_id=model_id,
+            label=per_model.get(model_id, model_id or "provider default"),
+            voices=voices,
+            implemented=True,
+            note=note,
+            output_format=output_format,
+            mime_type=mime_type,
+        )
+        for model_id in declared
     )
+
+
+#: One note per known model id, so the panel names a model the way the provider
+#: does. An id absent here falls back to the id itself (or the provider-default
+#: wording), never to an invented name.
+_MODEL_LABELS: dict[str, str] = {
+    "gpt-4o-mini-tts": "gpt-4o-mini-tts",
+    "gemini-3.1-flash-tts-preview": "Gemini 3.1 Flash TTS (preview)",
+    "gemini-2.5-flash-preview-tts": "Gemini 2.5 Flash TTS (preview)",
+    "gemini-2.5-pro-preview-tts": "Gemini 2.5 Pro TTS (preview)",
+}
+
+#: The Persian evidence recorded beside each provider's voices. NEITHER Gemini nor
+#: Grok is promoted to ``verified``: the first documents ``fa`` among its TTS
+#: languages (documented support, no recorded live verification), the second does
+#: not list Persian at all and only says additional languages are possible with
+#: varying accuracy. Speechmatics states plainly that it supports English.
+_OPENAI_PERSIAN_NOTE = "provider publishes no per-language guarantee for this voice"
+_GEMINI_PERSIAN_NOTE = (
+    "the provider documents Persian (fa) among its TTS models' supported "
+    "languages; no live voice-quality verification is recorded for this build, "
+    "so it is not claimed as verified"
+)
+_GROK_PERSIAN_NOTE = (
+    "not in the provider's documented 20-language list — it documents additional "
+    "languages with varying accuracy; a live request is required to establish it"
+)
+_SPEECHMATICS_PERSIAN_NOTE = (
+    "the provider's own documentation states it supports English only"
+)
+_SPEECHMATICS_VOICE_NOTES: dict[str, str] = {
+    "sarah": "documented English (UK) — " + _SPEECHMATICS_PERSIAN_NOTE,
+    "theo": "documented English (UK) — " + _SPEECHMATICS_PERSIAN_NOTE,
+    "megan": "documented English (US) — " + _SPEECHMATICS_PERSIAN_NOTE,
+    "jack": "documented English (US) — " + _SPEECHMATICS_PERSIAN_NOTE,
+}
 
 
 def _build_providers() -> tuple[TtsProvider, ...]:
@@ -250,45 +360,99 @@ def _build_providers() -> tuple[TtsProvider, ...]:
     Deterministic by construction: a tuple literal, never a set or a dict scan,
     so every consumer sees the same sequence on every process. The active
     provider is always tried FIRST; this order is the tail.
+
+    Every entry has its own adapter, so every entry is ``implemented``: OpenAI
+    (the pre-existing adapter, unchanged), Gemini, Grok (xAI) and Speechmatics.
+    The providers are absent from one another's capability space by construction —
+    a model or voice is only ever looked up INSIDE the provider that declares it.
     """
-    default_model = DEFAULT_MODEL_ID
+    openai_voices = _voices(
+        adapter_for("openai"),
+        persian=PERSIAN_NOT_VERIFIED,
+        note=_OPENAI_PERSIAN_NOTE,
+    )
+    gemini_voices = _voices(
+        adapter_for("gemini"),
+        persian=PERSIAN_NOT_VERIFIED,
+        note=_GEMINI_PERSIAN_NOTE,
+    )
+    grok_voices = _voices(
+        adapter_for("grok"),
+        persian=PERSIAN_NOT_VERIFIED,
+        note=_GROK_PERSIAN_NOTE,
+    )
+    speechmatics_voices = _voices(
+        adapter_for("speechmatics"),
+        persian=PERSIAN_UNSUPPORTED,
+        note=_SPEECHMATICS_PERSIAN_NOTE,
+        notes=_SPEECHMATICS_VOICE_NOTES,
+    )
     return (
         TtsProvider(
             provider=DEFAULT_PROVIDER_ID,
             label="OpenAI",
-            models=(
-                TtsModel(
-                    model_id=default_model,
-                    label="gpt-4o-mini-tts",
-                    voices=_openai_voices(),
-                    implemented=True,
-                    note="the documented speech model of the existing OpenAI adapter",
-                    output_format=_openai_output_format(),
-                    mime_type=_openai_mime_type(),
-                ),
+            models=_models(
+                adapter_for("openai"),
+                voices=openai_voices,
+                labels=_MODEL_LABELS,
+                note="the documented speech model of the existing OpenAI adapter",
             ),
             implemented=True,
             note="the existing OpenAI speech adapter",
         ),
         TtsProvider(
-            provider="speechmatics",
-            label="Speechmatics",
-            models=(
-                TtsModel(
-                    model_id="",
-                    label="Speechmatics TTS (preview)",
-                    voices=_speechmatics_voices(),
-                    implemented=False,
-                    note="the provider exposes no model parameter — this is its own default route",
-                    output_format="wav_16000",
-                    mime_type="audio/wav",
+            provider="gemini",
+            label="Gemini",
+            models=_models(
+                adapter_for("gemini"),
+                voices=gemini_voices,
+                labels=_MODEL_LABELS,
+                note=(
+                    "a documented Gemini TTS model; the provider returns raw PCM, "
+                    "which the adapter wraps in a WAVE container (no transcode)"
                 ),
             ),
-            implemented=False,
+            implemented=True,
             note=(
-                "DEFERRED: documented output is WAV/PCM only, which Telegram voice "
-                "notes cannot carry (this project has no audio-transcoding path by "
-                "policy), and its documented voices are English-only"
+                "the Gemini Interactions API text-to-speech models (documented "
+                "30 prebuilt voices; Persian is among the documented languages)"
+            ),
+        ),
+        TtsProvider(
+            provider="grok",
+            label="Grok (xAI)",
+            models=_models(
+                adapter_for("grok"),
+                voices=grok_voices,
+                labels=_MODEL_LABELS,
+                note=(
+                    "the provider exposes no model parameter — this is its own "
+                    "default route"
+                ),
+            ),
+            implemented=True,
+            note=(
+                "the xAI /v1/tts service (documented 28 voices that can speak every "
+                "language the service supports; MP3 output)"
+            ),
+        ),
+        TtsProvider(
+            provider="speechmatics",
+            label="Speechmatics",
+            models=_models(
+                adapter_for("speechmatics"),
+                voices=speechmatics_voices,
+                labels=_MODEL_LABELS,
+                note=(
+                    "the provider exposes no model parameter — this is its own "
+                    "default route"
+                ),
+            ),
+            implemented=True,
+            note=(
+                "the Speechmatics TTS preview service (documented 4 English voices, "
+                "complete WAV output). Its own documentation states English only, "
+                "so its voices record Persian as NOT supported"
             ),
         ),
     )

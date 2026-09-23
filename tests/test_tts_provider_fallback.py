@@ -132,6 +132,21 @@ def _inject_provider(monkeypatch, provider: str = SUBSTITUTE, *, implemented: bo
     return entry
 
 
+def _bound_rotation(monkeypatch, *providers: str) -> None:
+    """Fix the rotation's CONTENTS to an explicit provider set.
+
+    The cases below pin the rotation MECHANISM — order, shared budget, cooldown,
+    credential-vs-provider classification — with the selected provider plus one
+    scripted substitute, which is the two-entry rotation they were written
+    against. The REAL four-provider rotation is covered by
+    ``tests/test_tts_multi_provider.py``.
+    """
+    entries = tuple(plane.get_provider(provider) for provider in providers)
+    assert all(entries), providers
+    monkeypatch.setattr(plane, "TTS_PROVIDERS", entries)
+    monkeypatch.setattr(plane, "_BY_PROVIDER", {p.provider: p for p in entries})
+
+
 def _rows(*specs: tuple[str, str, int]) -> tuple[dict[str, Any], ...]:
     return tuple(
         {"credential_id": identifier, "secret": secret, "priority": priority, "enabled": True}
@@ -313,6 +328,7 @@ async def test_no_registered_rotation_keeps_the_single_engine_path(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_transient_failure_falls_back_to_the_next_provider(monkeypatch):
     _inject_provider(monkeypatch)
+    _bound_rotation(monkeypatch, PROVIDER, SUBSTITUTE)
     selected = _Engine(PROVIDER, MODEL, VOICE, _error(FAILURE_TIMEOUT, retryable=True))
     factory = _Factory({(SUBSTITUTE, ""): SUBSTITUTE_AUDIO})
     monkeypatch.setattr(tts_engine_factory, "build_engine_for", factory.build_engine_for)
@@ -371,6 +387,7 @@ async def test_a_credential_failure_rotates_inside_the_provider(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_provider_failure_never_burns_the_rest_of_the_pool(monkeypatch):
+    _bound_rotation(monkeypatch, PROVIDER)
     _set_env(monkeypatch, SECRET_ENV)
 
     async def _fetch(_provider: str) -> tuple:
@@ -423,6 +440,7 @@ async def test_a_single_runnable_provider_keeps_its_own_failure_identity(monkeyp
 @pytest.mark.asyncio
 async def test_an_unbuildable_substitute_is_skipped_and_never_counted(monkeypatch):
     _inject_provider(monkeypatch)
+    _bound_rotation(monkeypatch, PROVIDER, SUBSTITUTE)
     selected = _Engine(PROVIDER, MODEL, VOICE, _error(FAILURE_TRANSPORT, retryable=True))
     factory = _Factory(default=None)  # nothing buildable
     monkeypatch.setattr(tts_engine_factory, "build_engine_for", factory.build_engine_for)
@@ -478,6 +496,7 @@ async def test_the_attempt_ceiling_is_finite(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_provider_in_cooldown_leaves_the_fallback_rotation(monkeypatch):
     _inject_provider(monkeypatch)
+    _bound_rotation(monkeypatch, PROVIDER, SUBSTITUTE)
     selected = _Engine(PROVIDER, MODEL, VOICE, _error(FAILURE_TRANSPORT, retryable=True))
     factory = _Factory(default=_error(FAILURE_TRANSPORT, retryable=True))
     monkeypatch.setattr(tts_engine_factory, "build_engine_for", factory.build_engine_for)

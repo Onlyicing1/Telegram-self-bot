@@ -1,6 +1,218 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TTS CONTROL PLANE: provider/model/voice selection, credential pool, bounded fallback
+## Latest phase — MULTI-PROVIDER TTS: Gemini, Grok and Speechmatics are real adapters, not registry entries
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **MULTI-PROVIDER TTS** — real provider adapters behind the EXISTING TTS control plane (`gemini`, `grok`, `speechmatics`), completing the provider layer the previous phase left registry-only |
+| Type | runtime feature (three new provider adapters + the registry/`factory`/pool seam they plug into) + tests + report — **no schema change** |
+| Starting HEAD | `c0b7dcc` `feat(tts): add provider selection and credential fallback` (= `origin/main`) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database migration required | **NO new migration.** The previous phase's `supabase/migrations/20260923000001_add_ai_config_tts_settings.sql` (three `ai_config` settings columns) is **unchanged and still NOT EXECUTED by this agent** — the owner must apply it (idempotent; §31.3 part 6 of the ONE setup script). Wiring more providers needs no new column: the provider/model/voice triple already exists. `DATABASE_ARCHITECTURE.md` was **not touched**. |
+| TTS control plane | **NOT redesigned.** The registry, the credential pool, the bounded fallback, the Telegram panel, the settings persistence and the AI `SpeakTool` are the previous phase's, unchanged in shape. |
+| STT / OCR / Vision / Video-GIF / Save V2 / Dispatcher / ProviderManager / ToolExecutor / RuntimeSupervisor | **NOT touched.** |
+| Live provider verification | **NOT PERFORMED** — no live provider request was made; no real API key was used and no byte left the process (every test scripts the HTTP transport). |
+| Live Telegram verification | **NOT PERFORMED** — no live account was driven in this environment. |
+
+### The rule this phase enforces
+
+A provider counts as **implemented** only when its own adapter exists AND the
+application can construct and **invoke** it through the existing control plane.
+Existing in a registry, appearing in the UI, carrying model/voice metadata, being
+covered by a mock and being called "registered" are each **insufficient**. Every
+provider below is now implemented by that definition: each has an adapter module,
+a `build_engine` entry point, and a `tests/test_tts_multi_provider.py` case that
+drives the REAL adapter end-to-end through `tts_service.synthesize` and asserts the
+returned clip's provider, model, voice, MIME type and file name.
+
+### Provider API audit — findings recorded (the required per-provider answers)
+
+Each finding below is the reason the adapter is shaped the way it is; the adapter
+docstring is the same record, beside the code it describes.
+
+**Google Gemini (`gemini`) — IMPLEMENTED**
+
+1. Offers TTS: **yes** — the Gemini API documents text-to-speech generation.
+2. API: `POST https://generativelanguage.googleapis.com/v1beta/interactions` with an
+   `"response_format": {"type": "audio"}` request; the response is a *completed
+   interaction* whose `model_output` step carries the audio block.
+3. Auth: the `x-goog-api-key` header.
+4. Models (registered): `gemini-3.1-flash-tts-preview` (default), `gemini-2.5-flash-preview-tts`,
+   `gemini-2.5-pro-preview-tts` — a **closed** allowlist; an unregistered string is refused.
+5. Voices: the **30 documented prebuilt voices** (`Kore` first, the provider's own
+   single-speaker examples use it), also closed.
+6. Output: **raw PCM** (24 kHz, 16-bit, mono). No container is returned.
+7. Telegram voice message: PCM is not a voice-note container, so the adapter wraps the
+   provider's bytes in a **RIFF/WAVE header written with `struct`** — a 44-byte header,
+   **not a transcode**. The clip is a self-describing `audio/wav` file Telegram carries as
+   audio; the registry marks it ``voice_note = not_documented`` so the surface states the
+   delivery caveat instead of promising a voice note.
+8. Persian: the provider's own docs list Persian (`fa`) among its TTS models' languages →
+   recorded as ``not_verified`` **with that evidence**, never promoted to `verified`
+   without a live request.
+9. Limitations: no model-parameter-per-voice; a preview-tier service; WAV delivery for a
+   voice note is unproven live.
+10. ffmpeg/heavyweight layer: **none** — `struct` only, no new dependency.
+
+**xAI Grok (`grok`) — IMPLEMENTED**
+
+1. Offers TTS: **yes** — xAI documents a Text to Speech service.
+2. API: `POST https://api.x.ai/v1/tts`; the accepted body **is** the audio (not a JSON
+   envelope, unless timestamps are requested — this adapter never requests them).
+3. Auth: `Authorization: Bearer <key>`.
+4. Models: the endpoint exposes **no model parameter**, so the registered model is the
+   explicit empty string — the provider's own default route, **never an invented model name**.
+5. Voices: the **28 documented ids** (`eve` first — the provider's documented default),
+   closed.
+6. Output: **MP3** (the provider's documented default written out explicitly at
+   24 kHz / 128 kbps), requested through the documented `output_format` object.
+7. Telegram voice message: **yes** — MP3 is a documented voice-note container, so the bytes
+   are delivered as-is; registry ``voice_note = yes``.
+8. Persian: **not in the provider's documented 20-language list** (it documents additional
+   languages "with varying accuracy") → ``not_verified`` with that evidence; a live request
+   is required to establish it.
+9. Limitations: no model selection; language is set to the documented `auto` (the adapter
+   never guesses the language of the owner's text).
+10. ffmpeg/heavyweight layer: **none** — MP3 delivered unchanged.
+
+**Speechmatics (`speechmatics`) — IMPLEMENTED (the previous phase's deferral, corrected)**
+
+1. Offers TTS: **yes** — the Speechmatics TTS preview service.
+2. API: `POST https://preview.tts.speechmatics.com/generate/{voice}?output_format=wav_16000`
+   with body `{"text": …}`; the response is the audio file itself.
+3. Auth: `Authorization: Bearer <key>` — the **same** credential the Speechmatics STT
+   adapter declares (`AI_SPEECHMATICS_API_KEY`), so one credential serves both directions.
+4. Models: no model parameter → the explicit empty string (the provider's own route).
+5. Voices: the **4 documented ids** (`sarah`, `theo`, `megan`, `jack`), closed.
+6. Output: **`wav_16000`** — a *complete WAV file with headers* (16 kHz, 16-bit signed,
+   mono), sent explicitly so the request cannot drift with a provider-side default change.
+7. Telegram voice message: a complete WAV clip is delivered as-is; the registry records
+   ``voice_note = not_documented`` (`audio/wav` is not one of the documented voice-note
+   containers) so the surface states the caveat.
+8. Persian: the provider's own documentation states it supports **English** and all four
+   voices are English (UK/US) → ``unsupported`` **with the accent recorded beside each voice**.
+9. Correcting the deferral: the previous phase deferred Speechmatics because it read WAV as
+   unusable for voice notes. The provider's `wav_16000` is in fact a **self-describing WAV
+   file**, which is a container Telegram carries, so the adapter is implemented rather than
+   left deferred — the earlier reasoning is corrected here, not carried forward.
+10. ffmpeg/heavyweight layer: **none** — WAV delivered unchanged.
+
+**OpenAI (`openai`) — unchanged, still the default**
+
+The pre-existing adapter (`POST {AI_OPENAI_BASE_URL}/audio/speech`, model
+`gpt-4o-mini-tts`, 13 documented voices, `opus` in an OGG container) is untouched and
+remains the default selection. It is the only provider whose output Telegram documents
+as a voice note, which is why the default selection is still OpenAI.
+
+### Providers, models and voices now registered
+
+| Provider | Registered | Implemented | Models | Voices | Container | Voice-note |
+|---|---|---|---|---|---|---|
+| `openai` | YES | **YES** | `gpt-4o-mini-tts` | 13 | `opus` / `audio/ogg` | **yes** |
+| `gemini` | YES | **YES** | 3 (`gemini-3.1-flash-tts-preview` default) | 30 | `wav` / `audio/wav` | not_documented |
+| `grok` | YES | **YES** | `` (provider default route) | 28 | `mp3` / `audio/mpeg` | **yes** |
+| `speechmatics` | YES | **YES** | `` (provider default route) | 4 | `wav_16000` / `audio/wav` | not_documented |
+
+`provider_ids()` is the deterministic tuple `(openai, gemini, grok, speechmatics)` and
+equals `implemented_provider_ids()`. **The registry is derived from the adapters**, not
+re-typed: each provider's models, voices, output format and MIME type are read from the
+adapter module that owns them, and the registry build **asserts** the two agree (it raises
+if `VOICE_ORDER` and `SUPPORTED_VOICES` diverge, or if `VOICE_ORDER[0]` is not
+`DEFAULT_VOICE`), so an offer the adapter would reject can never be rendered.
+
+Persian is **never overclaimed**: no voice on this build is `verified`. Gemini is
+`not_verified` (documented `fa`, no live verification recorded), Grok is `not_verified`
+(no documented Persian), Speechmatics is `unsupported` (documented English-only).
+
+### What was implemented
+
+* **`backend/services/gemini_tts_engine.py` (new)** — the Gemini speech adapter: ONE
+  `httpx.AsyncClient` POST, closed model/voice sets, the documented `x-goog-api-key`
+  header, base64 audio extraction from the completed interaction (last audio block wins —
+  never a concatenation that could interleave two blocks), and the PCM→RIFF/WAVE header
+  wrap. Credential variables are the ones the repository **already** declares for Gemini
+  (`AI_GEMINI_API_KEY` / `GEMINI_API_KEY`), pinned equal to the media engine's by a test.
+* **`backend/services/grok_tts_engine.py` (new)** — the xAI Grok adapter: ONE POST to
+  `/v1/tts`, the 28 documented voices, the documented `output_format` object at its own
+  documented default, `language: auto`, and the raw response body as the audio. Credential
+  variables follow the project's `AI_<PROVIDER>_API_KEY` convention (`AI_XAI_API_KEY` /
+  `XAI_API_KEY`).
+* **`backend/services/speechmatics_tts_engine.py` (new)** — the Speechmatics adapter: ONE
+  POST to `/generate/{voice}?output_format=wav_16000`, the 4 documented voices, WAV body,
+  and the **shared** `AI_SPEECHMATICS_API_KEY` credential.
+* **`backend/ai/tts_control_plane.py`** — the registry now derives every provider's
+  capability from its adapter through ONE `adapter_for(provider)` seam
+  (`_ADAPTERS`: openai→`openai_tts_engine`, gemini→`gemini_tts_engine`,
+  grok→`grok_tts_engine`, speechmatics→`speechmatics_tts_engine`). An unknown provider token
+  raises at registry-build time, so a provider can never be registered without an execution
+  path. Added `implemented_provider_ids()`, the `VOICE_NOTE_MIME_TYPES` set and the derived
+  `TtsModel.voice_note_compatible`. The deferral mechanism (`implemented=False` → never
+  selectable) remains, exercised by a test double.
+* **`backend/services/tts_engine_factory.py`** — ONE bounded dispatch over the registered
+  providers, adding the `gemini`, `grok` and `speechmatics` branches to the existing
+  `openai` one. The model and voice are re-validated against the registry here too, so a
+  foreign model/voice can never reach any request body.
+* **`backend/services/tts_credential_pool.py`** — `env_var_names()` and
+  `registered_providers()` now resolve through the control plane's ONE provider→adapter
+  seam (never a hard-coded list, never an environment sweep) and are filtered to
+  **implemented** providers.
+* **`backend/services/tts_service.py`** — additive: `describe()` reports the selected
+  container's `voice_note` capability (`yes` / `not_documented`).
+* **`backend/services/credential_service.py`** — the owner-facing label map gains
+  `grok` → "Grok (xAI)", so the API Credentials surface names the new provider.
+* **`backend/bot/handlers/ai_tts_settings.py`** — the panel states the delivery caveat when
+  the selected container is not a documented voice note.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Cross-provider: `test_tts_multi_provider.py` | **53 passed** (new — real registry, real factory seam, real adapters; only HTTP and the secret backend are doubles) |
+| Adapter: `test_tts_gemini_engine.py` | **55 passed** (new) |
+| Adapter: `test_tts_grok_engine.py` | **43 passed** (new) |
+| Adapter: `test_tts_speechmatics_engine.py` | **40 passed** (new) |
+| Control plane: `test_tts_control_plane.py` | **50 passed** (updated: the "unimplemented provider" cases now use a test double because every real provider is implemented) |
+| Fallback: `test_tts_provider_fallback.py` | **42 passed** (updated: the rotation mechanism is pinned with an explicit provider set; the full four-provider rotation lives in the multi-provider suite) |
+| Regression: `test_tts_service.py` + `test_tts_openai_engine.py` | **98 passed** (none deleted or weakened) |
+| **All TTS suites** (`tests/test_tts_*.py`) | **381 passed** |
+| Credential/vault + STT pool + database docs + AI settings + direct STT | **368 passed** ("no second credential store" and the secret-leak pins held) |
+| **Full suite** | **4909 passed, 26 skipped** |
+| `py_compile` on every changed/new Python file | clean |
+| `git diff --check` | clean |
+
+`requirements.txt` is **unchanged**: the adapters use `httpx`, already pinned at `0.27.0`.
+
+### Limitations
+
+* **No live provider request was made**, so no real synthesis through Gemini, Grok or
+  Speechmatics is claimed, and no real Persian audio is claimed. Every adapter is exercised
+  against a scripted HTTP transport that reproduces the provider's documented response shape.
+* **Voice-note delivery for Gemini and Speechmatics is unproven live.** Both produce WAV
+  containers the registry marks `voice_note = not_documented`; a live send is required to
+  confirm Telegram's treatment of a WAV clip.
+* **No voice is `verified` for Persian.** Gemini records its documented `fa` support without
+  claiming it; Grok and Speechmatics remain `not_verified` / `unsupported`.
+* The three `ai_config` TTS settings columns still require the owner to apply
+  `20260923000001_add_ai_config_tts_settings.sql`; until then the selection degrades to the
+  in-memory fallback and is lost on restart.
+* Credential health remains process-local (by design, matching the STT pool).
+
+### Deferred work / explicit next stage
+
+* Apply `20260923000001_add_ai_config_tts_settings.sql` (idempotent; §31.3 part 6 of 6).
+* Run a **live** verification per provider: store a credential in the API Credentials
+  surface, select the provider/model/voice from Telegram, and confirm one real clip.
+  Record whether the selected voice actually speaks Persian (that is what would move a
+  voice from `not_verified` to `verified`), and confirm the actual Telegram treatment of
+  the Gemini and Speechmatics WAV containers for voice-note delivery.
+* Unchanged from earlier phases: Native Vision, Video/GIF, provider benchmarking, the
+  `ai_preferences` decision and the dead-column cleanup decision.
+
+## Previous phase — TTS CONTROL PLANE: provider/model/voice selection, credential pool, bounded fallback
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

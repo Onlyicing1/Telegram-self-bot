@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 
 from backend.ai import config_store, tts_control_plane as plane
+from backend.ai.tts_control_plane import adapter_for
 from backend.services import openai_tts_engine, tts_service
 
 OWNER = 7283627550
@@ -193,6 +194,23 @@ def _nav(_builder):
     return None
 
 
+def _button_datas(rows: Any) -> list[str]:
+    """Every rendered button's callback payload, flattened (order preserved)."""
+    return [
+        str(getattr(button, "data", ""))
+        for row in rows
+        for button in (row if isinstance(row, list) else [row])
+    ]
+
+
+def _relabel_unimplemented(entry: plane.TtsProvider) -> plane.TtsProvider:
+    """The same double, marked unimplemented for the SURFACE's own registry."""
+    return plane.TtsProvider(
+        provider=entry.provider, label=entry.label, models=entry.models,
+        implemented=False, note=entry.note,
+    )
+
+
 # ══ 1. The registry ══════════════════════════════════════════════════════════
 
 
@@ -219,12 +237,31 @@ def test_the_default_model_is_the_adapters_own_model():
     assert MODEL in openai_tts_engine.SUPPORTED_MODELS
 
 
-def test_a_registered_unimplemented_provider_is_never_selectable():
-    assert plane.get_provider("speechmatics") is not None
-    assert plane.get_provider("speechmatics").implemented is False
-    model = plane.get_provider("speechmatics").default_model_id
-    voice = plane.voice_ids("speechmatics", model)[0]
-    assert plane.is_selectable("speechmatics", model, voice) is False
+def test_a_registered_unimplemented_provider_is_never_selectable(monkeypatch):
+    """The deferral mechanism still holds for a provider with no execution path.
+
+    Every provider registered on this build HAS its own adapter, so the state is
+    exercised with a double: the flag, not the provider's name, is what keeps an
+    unimplemented entry unreachable.
+    """
+    _inject_provider(monkeypatch, "notbuilt", implemented=False)
+    assert plane.get_provider("notbuilt") is not None
+    assert plane.get_provider("notbuilt").implemented is False
+    model = plane.get_provider("notbuilt").default_model_id
+    voice = plane.voice_ids("notbuilt", model)[0]
+    assert plane.is_selectable("notbuilt", model, voice) is False
+
+
+def test_every_registered_provider_has_its_own_adapter():
+    """Registered means executable: no provider is offered as "not available yet".
+
+    A registered provider with no adapter would be an offer this build cannot
+    perform, so the registry and the adapters must agree exactly.
+    """
+    for provider in plane.TTS_PROVIDERS:
+        assert provider.implemented is True, provider.provider
+        assert adapter_for(provider.provider) is not None
+    assert plane.implemented_provider_ids() == plane.provider_ids()
 
 
 # ══ 2. provider → model → voice validation ═══════════════════════════════════
@@ -243,10 +280,14 @@ def test_an_unregistered_provider_is_refused():
 
 def test_a_model_of_another_provider_is_refused():
     _provider = plane.get_provider(PROVIDER)
-    other = plane.get_provider("speechmatics")
+    other = plane.get_provider("gemini")
     assert other is not None
-    assert _provider.model(other.default_model_id) is None
-    assert plane.is_selectable(PROVIDER, other.default_model_id, VOICE) is False
+    foreign_model = other.default_model_id
+    assert _provider.model(foreign_model) is None
+    assert plane.is_selectable(PROVIDER, foreign_model, VOICE) is False
+    # ...and the reverse direction, with a voice that is registered elsewhere.
+    assert plane.is_selectable("gemini", MODEL, VOICE) is False
+    assert plane.is_selectable("gemini", foreign_model, VOICE) is False
 
 
 def test_an_unregistered_voice_is_refused():
@@ -315,8 +356,9 @@ def test_an_unknown_provider_degrades_to_the_default_and_says_so():
     assert "unknown provider `skynet`" in selection.adjusted
 
 
-def test_an_unimplemented_provider_degrades_to_the_default_and_says_so():
-    selection = plane.resolve("speechmatics", "", "")
+def test_an_unimplemented_provider_degrades_to_the_default_and_says_so(monkeypatch):
+    _inject_provider(monkeypatch, "notbuilt", implemented=False)
+    selection = plane.resolve("notbuilt", "", "")
     assert selection.provider == PROVIDER
     assert "not available on this runtime" in selection.adjusted
 
@@ -501,11 +543,29 @@ async def test_the_panel_shows_the_current_selection_and_its_capability(monkeypa
 
 @pytest.mark.asyncio
 async def test_the_panel_offers_a_switch_only_for_a_provider_that_can_run(monkeypatch, store):
-    module = _install_surface(monkeypatch)
-    _title, body, _buttons = await module._ai_media_tts_panel_handler(None, "")
+    """The screen offers a control per RUNNABLE provider and none for the rest.
 
-    assert "not available yet" in body
+    Every provider registered on this build has an adapter, so the "cannot run"
+    state is exercised with an unimplemented double appended to the surface's own
+    registry: the flag, not a provider name, is what withholds the control.
+    """
+    module = _install_surface(monkeypatch)
+    entry = _inject_provider(monkeypatch, "notbuilt", implemented=False)
+    monkeypatch.setattr(
+        module, "TTS_PROVIDERS", module.TTS_PROVIDERS + (_relabel_unimplemented(entry),),
+    )
+
+    _title, body, buttons = await module._ai_media_tts_panel_handler(None, "")
+
     assert "No owner controls" not in body
+    # The unimplemented entry is reported as a state and offered no control...
+    assert "not available yet" in body
+    datas = _button_datas(buttons)
+    assert not any("notbuilt" in data for data in datas)
+    # ...and every provider that CAN run is offered.
+    for provider in plane.implemented_provider_ids():
+        if provider != PROVIDER:
+            assert any(provider in data for data in datas), provider
 
 
 def test_the_model_and_voice_screens_are_registered_under_the_panel(monkeypatch):
@@ -601,8 +661,9 @@ async def test_switching_provider_persists_a_consistent_triple(monkeypatch, stor
 @pytest.mark.asyncio
 async def test_an_unimplemented_provider_switch_changes_nothing(monkeypatch, store):
     module = _install_surface(monkeypatch)
+    _inject_provider(monkeypatch, "notbuilt", implemented=False)
 
-    _title, body, _buttons = await module._ai_tts_select_action(None, "speechmatics", 0)
+    _title, body, _buttons = await module._ai_tts_select_action(None, "notbuilt", 0)
 
     assert "not available on this runtime" in body
     reloaded = plane.parse_tts_config(await config_store.get_config(OWNER))
@@ -657,11 +718,21 @@ def test_the_default_selection_produces_the_telegram_voice_format():
     assert described["format"] == openai_tts_engine.RESPONSE_FORMAT
 
 
-def test_the_deferred_provider_records_why_it_is_deferred():
-    entry = plane.get_provider("speechmatics")
-    assert entry is not None
+def test_a_deferred_provider_records_why_it_is_deferred(monkeypatch):
+    """The deferral RECORD is still required when a provider has no adapter."""
+    entry = _inject_provider(monkeypatch, "notbuilt", implemented=False)
     assert not entry.implemented
-    assert "WAV" in entry.note and "English-only" in entry.note
+    assert entry.note
+
+
+def test_every_implemented_provider_states_its_documented_capability():
+    """A runnable provider must say what it is, in its own registry note."""
+    for provider in plane.TTS_PROVIDERS:
+        assert provider.note, provider.provider
+        for model in provider.models:
+            assert model.output_format, f"{provider.provider}: no output format"
+            assert model.mime_type, f"{provider.provider}: no MIME type"
+            assert model.voices, f"{provider.provider}: no voices"
 
 
 # ══ 9. The AI tool accepts bounded text only ═════════════════════════════════

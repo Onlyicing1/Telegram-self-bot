@@ -173,6 +173,11 @@ def _selection_lines(selection: TtsSelection, capability: dict) -> list[str]:
     ]
     if capability.get("mime_type"):
         lines.append(f"Output · {capability.get('format') or '-'} ({capability['mime_type']})")
+        if capability.get("voice_note") == "not_documented":
+            lines.append(
+                "! Telegram documents voice messages as OGG/Opus, MP3 or M4A — "
+                "this container needs live delivery verification."
+            )
     lines.append(f"Persian · {selection.persian_label()}")
     lines.append(_pool_line(selection.provider))
     lines.append(

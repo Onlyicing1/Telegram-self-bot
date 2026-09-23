@@ -87,10 +87,32 @@ def build_engine_for(
     if get_voice(provider, model, voice) is None:
         return None, FAILURE_UNSUPPORTED_VOICE
 
+    # ONE bounded dispatch over the registered providers, so a provider's adapter
+    # is the only place its request shape lives. An entry without a branch here
+    # resolves to no engine and the boundary keeps its fail-closed behavior
+    # instead of synthesizing with a provider the owner did not select.
     if entry.provider == "openai":
         from backend.services import openai_tts_engine
 
         return openai_tts_engine.build_engine(
+            model, voice=voice, api_key=explicit_key(credential),
+        )
+    if entry.provider == "gemini":
+        from backend.services import gemini_tts_engine
+
+        return gemini_tts_engine.build_engine(
+            model, voice=voice, api_key=explicit_key(credential),
+        )
+    if entry.provider == "grok":
+        from backend.services import grok_tts_engine
+
+        return grok_tts_engine.build_engine(
+            model, voice=voice, api_key=explicit_key(credential),
+        )
+    if entry.provider == "speechmatics":
+        from backend.services import speechmatics_tts_engine
+
+        return speechmatics_tts_engine.build_engine(
             model, voice=voice, api_key=explicit_key(credential),
         )
     return None, REASON_NOT_IMPLEMENTED

@@ -90,14 +90,24 @@ def env_var_names(provider: str) -> tuple[str, ...]:
 
     Taken from the ADAPTER that owns them (never a second table, never an
     environment sweep), so the deployment's single key keeps working as the
-    pool's first credential and a presence check can report the truth.
+    pool's first credential and a presence check can report the truth. The
+    adapter is resolved through the control plane's ONE provider → adapter seam,
+    so a provider added there is pooled here without a second list to maintain.
     """
     token = str(provider or "").strip()
-    if token == "openai":
-        from backend.services import openai_tts_engine
+    if not token:
+        return ()
+    try:
+        from backend.ai.tts_control_plane import adapter_for
 
-        return tuple(openai_tts_engine.API_KEY_ENV_VARS)
-    return ()
+        adapter = adapter_for(token)
+    except Exception as exc:  # noqa: BLE001 — an unknown provider declares nothing
+        logger.warning(
+            "TTS_CREDENTIAL_ENV_LOOKUP_FAILED provider=%s error=%s",
+            token or "-", type(exc).__name__,
+        )
+        return ()
+    return tuple(str(name) for name in (getattr(adapter, "API_KEY_ENV_VARS", ()) or ()))
 
 
 def registered_providers() -> tuple[str, ...]:
@@ -105,11 +115,12 @@ def registered_providers() -> tuple[str, ...]:
 
     Derived from the control plane — never from a hard-coded list here and never
     from the environment — so a pool can only ever hold credentials for a provider
-    the registry knows about.
+    the registry knows about. A provider with no execution path is filtered out:
+    a credential for something this build cannot run is not a usable credential.
     """
-    from backend.ai.tts_control_plane import provider_ids
+    from backend.ai.tts_control_plane import implemented_provider_ids
 
-    return provider_ids()
+    return implemented_provider_ids()
 
 
 # ── Loading (bounded, explicit, never fatal) ──

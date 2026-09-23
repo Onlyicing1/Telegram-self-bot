@@ -368,6 +368,12 @@ def describe() -> dict[str, str]:
         "voice_label": selection.voice_label,
         "format": model_entry.output_format if model_entry is not None else "",
         "mime_type": model_entry.mime_type if model_entry is not None else "",
+        # A capability FACT, not a promise: the selected container is a documented
+        # Telegram voice-message container or it is not. Reported so a surface can
+        # say so instead of discovering it at delivery time.
+        "voice_note": (
+            "yes" if model_entry.voice_note_compatible else "not_documented"
+        ) if model_entry is not None else "",
         "persian": selection.persian,
         "persian_label": persian_label(selection.persian),
         "adjusted": selection.adjusted,
