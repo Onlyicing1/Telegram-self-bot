@@ -128,16 +128,31 @@ def _get_config_sync(owner_id: int) -> tuple[dict[str, Any] | None, bool]:
 async def get_config(owner_id: int) -> dict[str, Any]:
     """Get the AI config for an owner. Returns defaults if not found.
 
-    A stored row always wins. When the durable read FAILS and this process
-    knows no value for the owner, the result carries ``DEGRADED_READ_KEY`` so
-    callers can tell "the database could not be read" apart from "the row
-    says the default" — a persisted preference must never be silently
-    downgraded to the compiled default by a read error.
+    A stored row always wins for every key the row actually carries. When the
+    durable read FAILS and this process knows no value for the owner, the result
+    carries ``DEGRADED_READ_KEY`` so callers can tell "the database could not be
+    read" apart from "the row says the default" — a persisted preference must
+    never be silently downgraded to the compiled default by a read error.
+
+    A key the row does NOT CARRY is a different case, and the one that bound a
+    selected Text-to-Speech provider to OpenAI: the owner's ``ai_config`` row
+    exists, but this deployment has no column for that setting yet, so the write
+    was rejected and the value reached only this process. Reporting the compiled
+    default there silently discards an explicit owner selection, and a surface
+    that re-reads the store then disagrees with the notice it just showed. So a
+    key absent from an EXISTING row falls back to what this process last wrote,
+    then to the compiled default — the documented in-memory degradation, applied
+    where it actually applies. With no row at all there is no owner state to
+    preserve, and the compiled default remains the answer.
     """
+    local = _fallback_config.get(owner_id) or {}
     try:
         row, read_failed = await _run_sync(_get_config_sync, owner_id)
         if row:
-            merged = {k: row.get(k, v) for k, v in _DEFAULTS.items()}
+            merged = {
+                k: (row[k] if k in row else local.get(k, v))
+                for k, v in _DEFAULTS.items()
+            }
             logger.info("[AI_CONFIG] get_config OK owner_id=%s provider='%s' model='%s'", owner_id, merged.get("provider", ""), merged.get("model", ""))
             return merged
         if read_failed:

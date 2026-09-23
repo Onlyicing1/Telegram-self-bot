@@ -1,6 +1,165 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — MULTI-PROVIDER TTS: Gemini, Grok and Speechmatics are real adapters, not registry entries
+## Latest phase — TTS PROVIDER/MODEL/VOICE BINDING FIX: the selected provider is the provider that speaks
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **TTS PROVIDER/MODEL/VOICE BINDING FIX** — an explicit provider selection now binds to the runtime adapter, the model and voice selectors, the credential pool and the executed request |
+| Type | bug fix (persistence read path + an honest panel notice) + regression tests — **no schema change, no architecture change** |
+| Starting HEAD | `d8c6a4f` = `origin/main` (working tree clean on entry) |
+| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Database | **NOT touched.** No SQL executed, no migration added or changed, Supabase unmodified, `DATABASE_ARCHITECTURE.md` unmodified. The source audit proved the EXISTING migration (`20260923000001_add_ai_config_tts_settings.sql`) already represents provider/model/voice, so application code was fixed instead. |
+| STT / OCR / Save / Tasks / RuntimeSupervisor / ProviderManager / adapters | **NOT touched.** The three provider adapters, the registry, the engine factory, the credential pool and the fallback were audited and found **already correctly provider-scoped** — they are unchanged. |
+| Live Telegram verification | **NOT PERFORMED** — no live account was driven in this environment |
+| Live provider verification | **NOT PERFORMED** — no live API key was used and no byte left the process |
+
+### The observed bug
+
+In a live Telegram test the owner switched Text-to-Speech to **Speechmatics**: the
+panel reported Speechmatics, yet generation still behaved as OpenAI and the model
+selector still listed OpenAI's `gpt-4o-mini-tts`. Treated as a functional binding
+failure, not a cosmetic one.
+
+### Exact root cause
+
+Not in the registry, not in the factory, and not in any adapter — all of those are
+provider-scoped and were verified as such. The failure was in the **persistence
+read path**, and the chain is fully deterministic:
+
+1. `ai_tts_settings._ai_tts_select_action` resolves a *valid* Speechmatics triple
+   and calls `persist_selection` → `config_store.save_config`.
+2. `_save_config_sync` builds ONE upsert payload that names
+   `tts_provider` / `tts_model` / `tts_voice`. On the live database those columns
+   do **not** exist yet (`20260923000001_add_ai_config_tts_settings.sql` is
+   documented as *pending manual application*), so PostgREST rejects the **whole
+   upsert**: `column "tts_provider" does not exist in "ai_config"`.
+3. The exception is caught, the value is written **only** to the in-process
+   `_fallback_config`, and `save_config` returns `False` — which `persist_selection`
+   handed to a caller that ignored it.
+4. `config_store.get_config` — the ONLY read used by the panel, by
+   `apply_tts_settings_now` and by supervisor startup — returned
+   `{k: row.get(k, v) for k, v in _DEFAULTS.items()}` whenever a durable row
+   existed. The owner's row exists but carries no TTS key, so **every read yielded
+   `tts_provider = ""` → the compiled default → OpenAI**.
+5. `tts_service.apply_tts_settings` therefore installed **OpenAI** as `_selected`,
+   `_engine()` → `build_engine` → the OpenAI adapter, and the credential pool
+   resolved **OpenAI** credentials. The model panel, which re-reads the store, listed
+   OpenAI's model — symptom 4 of the report.
+6. The success notice was built from the **candidate** the handler had computed, not
+   from any re-read state, so the UI kept claiming Speechmatics — symptom 1.
+
+Two sources of truth: the notice read the computed candidate, the runtime read the
+store. The store silently reported the default.
+
+### Investigation answers (the 18 requested, traced callback → adapter)
+
+| # | Finding |
+|---|---|
+| 1-4 | provider/model/voice persist to `ai_config.tts_provider` / `tts_model` / `tts_voice`; selecting Speechmatics stored `("speechmatics", "", "sarah")` — **in RAM only**, the durable write was rejected |
+| 5 | the callback payload is the registry's own provider token (`action:ai_tts_select:<provider>`); model and voice are resolved from THAT provider in the same write |
+| 6 | the control plane reads exactly those three keys via `parse_tts_config` → `resolve` |
+| 7-9 | ONE registry, `tts_control_plane`; the model panel iterates `get_provider(selection.provider).models`, the voice panel `selection.model_entry.voices` — **both already provider-scoped**; they showed OpenAI only because the read said `provider = ""` |
+| 10 | `tts_engine_factory.build_engine_for` dispatches on `entry.provider` after re-validating model+voice against the registry — correct |
+| 11-13 | OpenAI is not hard-coded in the runtime; it is the DEFAULT, and it overrode the persisted value only because that value never reached a read |
+| 14-15 | model and voice selection are provider/model-scoped, not global — verified by the registry API and its tests |
+| 16 | fallback is NOT invoked for a healthy selected provider; it needs a runtime failure first (unchanged) |
+| 17 | `tts_credential_pool` resolves per provider from each adapter's own `API_KEY_ENV_VARS` — correct; it resolved OpenAI only because the selection was OpenAI |
+| 18 | the request carried the OpenAI model/voice because `_selected` was the OpenAI selection |
+
+### What was fixed
+
+* **`backend/ai/config_store.py`** — `get_config` no longer discards an explicit
+  owner selection when the row cannot carry it. A key the row **carries** is still
+  authoritative (unchanged); a key **absent from an existing row** — a setting this
+  deployment has no column for — now falls back to what this process last wrote,
+  then to the compiled default. Deliberately scoped: with **no row at all** the
+  compiled default is still returned, which preserves the pre-existing contract
+  pinned by `test_toggle_failure_is_honest_neither_silent_nor_false_success`
+  (a failed write must never be reported as durable state).
+* **`backend/bot/handlers/ai_tts_settings.py`** — `_outcome(saved, …)` makes the
+  notice honest: when `persist_selection` did NOT write the durable row, the panel
+  says the choice is active for this session and lost on restart, instead of
+  announcing an unsaved selection as an accomplished fact.
+
+Nothing else changed: registry, factory, credential pool, fallback, the three
+adapters, STT and the schema are untouched.
+
+### Credential resolution and fallback (audited, unchanged)
+
+* **Credentials are provider-scoped**: each adapter declares its own
+  `API_KEY_ENV_VARS`, the pool reads them through `adapter_for()`, and a credential
+  of one provider is never handed to another. It had been resolving OpenAI only
+  because the selection resolved to OpenAI.
+* **Fallback semantics were already correct and are unchanged**: the selected
+  provider always attempts first; a substitute is attempted only after a runtime
+  failure classified as eligible; and a fallback NEVER rewrites the persisted
+  provider — the configuration stays Speechmatics and the panel keeps showing it,
+  while the resulting clip honestly reports the provider that actually spoke.
+
+### Tests added
+
+**`tests/test_tts_provider_binding.py` — 46 tests**, covering all 21 required
+scenarios (model-list per provider ×4, model/voice clearing on switch, persistence
+round-trip, factory resolution ×4, credential scoping ×3, no-silent-fallback,
+fallback-does-not-rewrite, cross-provider model and voice rejection, UI option
+derivation, execution path, and the end-to-end case).
+
+The suite refuses to mock the seam where the bug lives. It runs the **real**
+`config_store` against a PostgREST-shaped fake `ai_config` table, then the real
+control plane, real registry, real factory, real credential pool, real
+`tts_service` and the real provider adapter. Only two doubles exist: the table's
+**column set** and the outbound HTTP transport. Every test runs **twice**:
+
+* `with_tts_columns` — the schema after the existing migration is applied;
+* `live_no_tts_columns` — the schema as it is today (migration pending), i.e. the
+  state the live Telegram test actually ran against.
+
+The seed row models a real owner whose `ai_config` row predates the TTS payload, so
+the reproduction is the observed one rather than a synthetic empty-store case.
+
+**Load-bearing proof:** reverting only the one read-path expression
+(`row.get(k, v)`) makes the end-to-end test fail with the exact reported symptom —
+`AssertionError: assert 'openai' == 'speechmatics'` — and it passes with the fix.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| New binding suite `test_tts_provider_binding.py` | **46 passed** (both schema states) |
+| STT regression (`test_stt_*`, `test_ai_stt_settings`, `test_media_direct_stt`) | **405 passed, 2 skipped** — STT untouched and unaffected |
+| TTS regression (`tests/test_tts_*.py`) | **427 passed** |
+| Credential/vault + database-docs + AI settings UX | **232 passed** (the "no second credential store", secret-leak and migration-order pins all held) |
+| **Full suite** | **4955 passed, 26 skipped** |
+| `py_compile` on every changed file | clean |
+| `git diff --check` | clean |
+| Files changed | **3** — `backend/ai/config_store.py`, `backend/bot/handlers/ai_tts_settings.py`, new `tests/test_tts_provider_binding.py` |
+
+### Live-verification status (not claimed)
+
+* **No live Telegram run and no live provider request were performed** in this
+  environment. Every adapter call in the tests uses a scripted HTTP transport.
+* The binding is proven at the application layer against the real production chain,
+  including the real schema shape; it is **not** claimed as verified on a live
+  account or a live provider.
+* Persian remains unverified for every voice (unchanged from previous phases).
+
+### Remaining requirement — durability
+
+The fix makes an explicit selection **take effect immediately and stay effective
+for the process**, and makes the panel say so honestly. It does **not** make the
+setting survive a restart, because the columns still do not exist. Applying the
+existing idempotent migration
+`supabase/migrations/20260923000001_add_ai_config_tts_settings.sql` (also §31.3
+part 6 of 6 of the ONE setup script) is a **manual owner action** — SQL was
+deliberately not executed by this agent. Once applied, the same path becomes a
+normal durable write and the "Saved only for this session" notice disappears on
+its own.
+
+## Previous phase — MULTI-PROVIDER TTS: Gemini, Grok and Speechmatics are real adapters, not registry entries
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 

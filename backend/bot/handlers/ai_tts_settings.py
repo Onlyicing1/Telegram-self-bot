@@ -392,6 +392,23 @@ async def _ai_media_tts_voice_inline_builder(event, extra: str) -> list:
 # ── Selection actions (an explicit finite choice, never typed input) ─────────
 
 
+def _outcome(saved: bool, success: str) -> str:
+    """The notice for ONE selection write — honest about durable persistence.
+
+    ``persist_selection`` reports whether the durable row was actually written.
+    Reporting ``success`` unconditionally is what let a surface announce
+    "Text-to-Speech now uses Speechmatics" while every re-read of the store still
+    said OpenAI, so an unwritten selection is stated as exactly what it is: active
+    for this process, not saved.
+    """
+    if saved:
+        return success
+    return (
+        f"{success}\n⚠ Saved only for this session — the settings row was not "
+        "updated, so the choice is lost on restart."
+    )
+
+
 async def _ai_tts_select_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
     """Make a REGISTERED provider the active one, with ITS default model/voice.
 
@@ -415,12 +432,13 @@ async def _ai_tts_select_action(event, extra: str, chat_id: int) -> tuple[str, s
         entry.default_model_id,
         model.default_voice_id if model is not None else "",
     )
-    await persist_selection(owner, candidate)
+    saved = await persist_selection(owner, candidate)
     await apply_tts_settings_now(owner)
-    return await _tts_panel_with_notice(
+    return await _tts_panel_with_notice(_outcome(
+        saved,
         f"✓ Text-to-Speech now uses {entry.label} · {candidate.model_label} · "
-        f"{candidate.voice_label}"
-    )
+        f"{candidate.voice_label}",
+    ))
 
 
 async def _ai_tts_select_model_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -436,11 +454,11 @@ async def _ai_tts_select_model_action(event, extra: str, chat_id: int) -> tuple[
             f"× {model.label} is registered but not available on this runtime yet."
         )
     candidate = resolve(selection.provider, model.model_id, model.default_voice_id)
-    await persist_selection(owner, candidate)
+    saved = await persist_selection(owner, candidate)
     await apply_tts_settings_now(owner)
-    return await _tts_panel_with_notice(
-        f"✓ Text-to-Speech now uses {entry.label} · {model.label} · {candidate.voice}"
-    )
+    return await _tts_panel_with_notice(_outcome(
+        saved, f"✓ Text-to-Speech now uses {entry.label} · {model.label} · {candidate.voice}",
+    ))
 
 
 async def _ai_tts_select_voice_action(event, extra: str, chat_id: int) -> tuple[str, str, list] | None:
@@ -452,11 +470,11 @@ async def _ai_tts_select_voice_action(event, extra: str, chat_id: int) -> tuple[
     if voice is None:
         return await _tts_panel_with_notice("× Unknown voice for this model — nothing changed.")
     candidate = resolve(selection.provider, selection.model, voice.voice_id)
-    await persist_selection(owner, candidate)
+    saved = await persist_selection(owner, candidate)
     await apply_tts_settings_now(owner)
-    return await _tts_panel_with_notice(
-        f"✓ Voice set to {voice.label} · Persian {candidate.persian_label()}"
-    )
+    return await _tts_panel_with_notice(_outcome(
+        saved, f"✓ Voice set to {voice.label} · Persian {candidate.persian_label()}",
+    ))
 
 
 def register(client=None, owner_id: int = 0) -> None:
