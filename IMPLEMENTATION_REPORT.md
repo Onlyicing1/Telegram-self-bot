@@ -11,7 +11,7 @@ Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 | Phase name | **TTS PART 1 — DURABLE SETTINGS PERSISTENCE** — `tts_provider` / `tts_model` / `tts_voice` are persisted by a dedicated atomic write, recovered at startup, and never reported as stored when they were not |
 | Type | persistence fix (write isolation + an honest read signal) + focused persistence tests + documentation synchronization — **no schema change** |
 | Starting HEAD | `9765769` = `origin/main` (`fix(tts): bind provider model and voice selection to runtime`). The workspace entered this phase at `f9dfd9a` and was fast-forwarded `f9dfd9a..9765769` to `origin/main` before any edit — the ten commits already published (Save V2 management, the TTS provider work) are part of the starting state, and nothing was rewritten. |
-| Implementation commit | the single phase commit that contains this report (`git log -1 --format=%H` re-verifies it) |
+| Implementation commit | `afbc5710f99fd1e8ea98d172356d7874dbda4ee3` — `fix(tts): persist provider model and voice settings` |
 | Database | **NOT touched.** No SQL was executed, Supabase was not contacted, no production data was read or written. The TTS migration's **executable statements are byte-unchanged** — only its prose header was corrected. |
 | STT / OCR / Save / Tasks / RuntimeSupervisor recovery / ProviderManager / provider adapters | **NOT touched** |
 | Live Supabase verification | **NOT PERFORMED** — no Supabase connection is available in this environment, and executing SQL is explicitly forbidden for this phase |
