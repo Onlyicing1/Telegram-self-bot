@@ -7,7 +7,15 @@ This module owns ONE AI sub-surface and everything behind it:
         ├── Text recognition       (``ai_media_ocr``)
         ├── Speech-to-Text         (``ai_media_stt``)
         │   └── STT Settings       (``ai_media_stt_settings``)
-        └── Text-to-Speech         (``ai_media_tts``, see ``ai_tts_settings``)
+        └── Text-to-Speech         (``ai_media_tts`` — FROZEN: fully
+                                    implemented and registered in
+                                    ``ai_tts_settings``, but deliberately
+                                    absent from this hub's visible rows)
+
+Text-to-Speech is FROZEN by project decision, not deleted: the implementation,
+adapters, persistence and tests all stay, and the frozen module keeps its panel
+registration for future reactivation. This hub simply offers no row into it, so
+no visible TTS entry point exists in the Telegram UI.
 
 The Speech-to-Text screen is a compact control panel: the active candidate and
 its state, the ordered provider list with each candidate's own state, ONE global
@@ -201,23 +209,20 @@ async def _ai_media_panel_handler(event, extra: str) -> tuple[str, str, list] | 
     ocr_ready = _ocr_ready()
 
     from backend.bot.handlers.ai_credentials import hub_line as credentials_line
-    from backend.bot.handlers.ai_tts_settings import tts_status_line
 
     lines = [
         "**Media Analysis**",
         "",
-        "Reads what the messages you reply to actually contain — and speaks text back.",
+        "Reads what the messages you reply to actually contain.",
         "",
         f"Text recognition · {'Ready' if ocr_ready else 'Not configured'}",
         stt_selection_line(config),
-        tts_status_line(),
         await credentials_line(_owner),
     ]
 
     builder = InlinePanelBuilder()
     builder.add_row("Text recognition (OCR)", "panel:ai_media_ocr")
     builder.add_row("Speech-to-Text", "panel:ai_media_stt")
-    builder.add_row("Text-to-Speech", "panel:ai_media_tts")
     builder.add_row("API Credentials", "panel:ai_cred")
     _nav_buttons(builder)
     return "Media Analysis", "\n".join(lines), builder.build()

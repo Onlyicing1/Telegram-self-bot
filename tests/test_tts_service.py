@@ -835,7 +835,12 @@ def test_the_status_line_is_one_line_and_never_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_media_analysis_hub_lists_text_to_speech(monkeypatch):
+async def test_the_media_analysis_hub_hides_the_frozen_text_to_speech(monkeypatch):
+    """TTS is FROZEN: the hub offers no row and no status line into it.
+
+    The implementation stays registered behind the hidden panel (frozen, not
+    deleted) — only the visible entry point is gone.
+    """
     from backend.bot.handlers import ai as ai_module
     from backend.bot.handlers import ai_stt_settings as hub
     from backend.bot.handlers import ai_tts_settings as module
@@ -850,13 +855,13 @@ async def test_the_media_analysis_hub_lists_text_to_speech(monkeypatch):
     title, body, buttons = await hub._ai_media_panel_handler(None, "")
 
     assert title == "Media Analysis"
-    assert module.tts_status_line() in body
+    assert module.tts_status_line() not in body
     datas = []
     for row in buttons:
         for button in (row if isinstance(row, list) else [row]):
             data = getattr(button, "data", b"")
             datas.append(data.decode() if isinstance(data, bytes) else str(data))
-    assert "panel:ai_media_tts" in datas
+    assert "panel:ai_media_tts" not in datas
 
 
 def test_the_module_documents_the_media_analysis_tree():

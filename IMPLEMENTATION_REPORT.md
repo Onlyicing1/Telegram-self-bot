@@ -1,5 +1,79 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## TTS STATUS — FROZEN / DEFERRED
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+| Item | Value |
+|---|---|
+| Status | **FROZEN / DEFERRED** — hidden from the Telegram UI, fully preserved for future reactivation. NOT fixed, NOT production-ready, NOT deleted. |
+| Reason for freezing | Live testing showed the current TTS provider pipeline is not useful or reliable enough for the project's current needs. Per the phase decision, no further TTS quality or provider debugging effort is spent in this phase. |
+| Live-test status | Live Telegram/provider testing was NOT performed by this phase and previously was NOT performed either (all Part 1/Part 2 evidence came from tests over the real code path with faked transports). The freeze decision is the recorded outcome of the owner's own live evaluation. |
+| Type | UI freeze only — **no backend behavior change, no schema change, no deletion** |
+| Starting HEAD | `8aab7f2` = `origin/main` (`fix(tts): deliver native telegram voice messages`) |
+| Implementation commit | the single phase commit `chore(tts): freeze tts and hide from user interface` — the commit that contains this section (a document cannot contain its own commit's SHA; see `git log` for the hash) |
+| Database | **NOT touched.** No SQL executed, no Supabase contact, no column deleted, no migration removed, no `DATABASE_ARCHITECTURE.md` change. The `ai_config` TTS columns and migration `20260923000001_add_ai_config_tts_settings.sql` remain exactly as Part 1 left them. |
+
+### What remains preserved (nothing was deleted)
+
+* `backend/services/tts_service.py` — the bounded synthesis boundary, failure taxonomy, `SpeechClip`
+* All four provider adapters — `openai_tts_engine.py`, `gemini_tts_engine.py`, `grok_tts_engine.py`, `speechmatics_tts_engine.py`
+* `backend/ai/tts_control_plane.py` — the capability registry and provider/model/voice selection
+* `backend/ai/config_store.py` — TTS persistence (`TTS_STORAGE_KEYS`, `save_tts_settings`, isolation and honest read signals)
+* `backend/ai/tools/speech.py` — the `text_to_speech` tool (still registered and functional; nothing in the UI invites the owner to trigger it, and it is not referenced by any visible surface)
+* `backend/telegram_api/media.py::send_voice` — the native voice-note transfer
+* `backend/bot/handlers/ai_tts_settings.py` — the TTS module, still registering its panels/builders/actions at startup
+* `supabase/migrations/20260923000001_add_ai_config_tts_settings.sql` and its documented schema in `DATABASE_ARCHITECTURE.md` (§7, §31.3 part 6)
+* Every existing TTS test file — none deleted
+
+### What was hidden from the UI (the complete visible surface)
+
+The TTS visible surface was exactly the Media Analysis hub
+(`backend/bot/handlers/ai_stt_settings.py::_ai_media_panel_handler`). Three rows
+were removed from it:
+
+1. the button `Text-to-Speech → panel:ai_media_tts` (the ONLY navigation entry into the TTS panel);
+2. the hub status line `Text-to-Speech · <provider> <model> · <state>` (`tts_status_line()` call);
+3. the intro phrase "— and speaks text back", which advertised the hidden capability.
+
+No other UI was modified. There was no TTS entry in AI Settings, AI Advanced,
+or any other panel; no TTS action button exists outside the now-unreachable
+panel; and the hidden panel itself is unchanged — it would still render
+correctly if addressed, so no dead or broken screen exists.
+
+### Future reactivation requirements
+
+1. Restore the three removed rows in `_ai_media_panel_handler` (the diff of this
+   phase shows them exactly).
+2. Apply migration `20260923000001_add_ai_config_tts_settings.sql` if not yet applied
+   (the panel degrades to an honest session-only notice until then — Part 1 behavior).
+3. Complete the live-verification Part 1/Part 2 deliberately deferred: a real
+   provider round trip and a real delivered voice message.
+4. Address the freeze reason itself (usefulness/reliability) before re-exposing.
+
+### Exact files changed
+
+| File | Change |
+|---|---|
+| `backend/bot/handlers/ai_stt_settings.py` | the three visible hub rows/status line/phrase removed; module docstring records the freeze |
+| `tests/test_ai_stt_settings.py` | +4 freeze tests (no TTS row/status/phrase; unrelated hub entries intact; TTS module still registered; frozen panel still renders) |
+| `tests/test_tts_service.py` | ONE test updated to the frozen contract (`test_the_media_analysis_hub_hides_the_frozen_text_to_speech`, formerly `…_lists_text_to_speech`) |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Tests run and exact results
+
+| Check | Result |
+|---|---|
+| Focused UI/menu + TTS + credentials suites | **614 passed in 1.47s** |
+| Full suite `.venv/bin/python -m pytest tests -q` | **4982 passed, 26 skipped, 2 warnings in 118.00s** |
+| `py_compile` on changed Python files | clean (exit 0) |
+| `git diff --check` | clean |
+
+The freeze tests prove: TTS is not exposed in the normal menu; the OCR, STT and
+API Credentials rows still appear; the TTS module still registers its panels,
+builders and actions (frozen ≠ deleted); and the frozen panel still renders when
+addressed directly. Existing TTS backend and persistence tests all still pass.
+
 ## Previous finalization — TTS PART 2 — AUDIO PIPELINE + NATIVE TELEGRAM VOICE DELIVERY
 
 > Finalization note (added later, no code change): PART 2 was implemented and

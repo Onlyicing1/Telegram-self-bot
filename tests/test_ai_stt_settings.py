@@ -1134,3 +1134,97 @@ async def test_startup_keeps_the_bootstrap_settings_when_the_store_is_unreadable
     await supervisor._apply_persisted_stt_settings()
 
     assert _stt_engine_settings()[0] == "gemini-2.5-pro"  # bootstrap kept
+
+
+# ── 9. TTS freeze — hidden from the UI, implementation preserved ────────
+
+
+@pytest.mark.asyncio
+async def test_the_frozen_media_hub_offers_no_tts_row_or_status_line(monkeypatch):
+    """TTS is frozen: no button, no menu entry and no status line may remain."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    title, body, buttons = await module._ai_media_panel_handler(None, "")
+
+    assert title == "Media Analysis"
+    datas = [d for _, d in _flatten(buttons)]
+    assert "panel:ai_media_tts" not in datas
+    for label, data in _flatten(buttons):
+        assert "tts" not in data.lower(), f"visible TTS callback: {data}"
+        assert "text-to-speech" not in label.lower(), f"visible TTS label: {label}"
+    assert "Text-to-Speech · " not in body
+    assert "speaks text back" not in body
+
+
+@pytest.mark.asyncio
+async def test_the_frozen_media_hub_keeps_the_other_capability_rows(monkeypatch):
+    """Freezing TTS must not disturb the unrelated hub entries."""
+    from backend.bot.handlers import ai_stt_settings as module
+
+    _patch_ai(monkeypatch)
+    _title, body, buttons = await module._ai_media_panel_handler(None, "")
+
+    datas = [d for _, d in _flatten(buttons)]
+    assert "panel:ai_media_ocr" in datas
+    assert "panel:ai_media_stt" in datas
+    assert "panel:ai_cred" in datas
+    assert "Text recognition · " in body
+    assert "Speech-to-Text · " in body
+    assert "API Credentials · " in body
+
+
+def test_the_tts_module_stays_registered_for_future_reactivation():
+    """Frozen ≠ deleted: the panels, builders and actions remain registered."""
+    import backend.bot.handlers.ai_tts_settings as module
+
+    panels: list[tuple[str, str]] = []
+    actions: list[str] = []
+    builders: list[str] = []
+
+    original_panel = module.register_panel
+    original_builder = module.register_inline_builder
+    original_action = module.register_action
+    try:
+        module.register_panel = (  # type: ignore[method-assign]
+            lambda panel_id, handler, parent="menu", title="": panels.append((panel_id, parent))
+        )
+        module.register_inline_builder = (  # type: ignore[method-assign]
+            lambda panel_id, handler: builders.append(panel_id)
+        )
+        module.register_action = (  # type: ignore[method-assign]
+            lambda action_id, handler: actions.append(action_id)
+        )
+        module.register(None, 1)
+    finally:
+        module.register_panel = original_panel  # type: ignore[method-assign]
+        module.register_inline_builder = original_builder  # type: ignore[method-assign]
+        module.register_action = original_action  # type: ignore[method-assign]
+
+    assert ("ai_media_tts", "ai_media") in panels
+    assert ("ai_media_tts_model", "ai_media_tts") in panels
+    assert ("ai_media_tts_voice", "ai_media_tts") in panels
+    assert sorted(builders) == ["ai_media_tts", "ai_media_tts_model", "ai_media_tts_voice"]
+    assert sorted(actions) == ["ai_tts_select", "ai_tts_select_model", "ai_tts_select_voice"]
+
+
+def test_the_frozen_tts_panel_still_renders_when_addressed_directly(monkeypatch):
+    """The frozen panel must never become a broken screen."""
+    import backend.bot.handlers.ai_tts_settings as module
+
+    from backend.bot.handlers import ai as ai_module
+
+    async def _config(_owner):
+        return {}
+
+    async def _owner():
+        return 1
+
+    monkeypatch.setattr(ai_module, "_get_owner_id", _owner)
+    monkeypatch.setattr(ai_module, "_get_saved_config", _config)
+
+    body, buttons = module._tts_body_and_buttons(
+        module.parse_tts_config({}), config_unreadable=False, session_only=False,
+    )
+    assert body.startswith("**Text-to-Speech**")
+    assert buttons  # the frozen panel still renders its control rows
