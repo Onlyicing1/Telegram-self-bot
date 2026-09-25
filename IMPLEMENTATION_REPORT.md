@@ -1,5 +1,129 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## Previous finalization — TTS PART 2 — AUDIO PIPELINE + NATIVE TELEGRAM VOICE DELIVERY
+
+> Finalization note (added later, no code change): PART 2 was implemented and
+> published across the three TTS commits recorded below. This section
+> consolidates the phase record with the final verification evidence
+> (focused, regression and full-suite runs) — nothing in the implementation was
+> rewritten and no file outside this report was touched during finalization.
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+
+### Phase identity
+
+| Item | Value |
+|---|---|
+| Phase name | **TTS PART 2 — AUDIO PIPELINE + NATIVE TELEGRAM VOICE DELIVERY**: TEXT → TTS provider → valid audio payload → correct container handling → Telegram native voice-message send; the final result is a Telegram voice message |
+| Type | verification finalization of already-committed work — **no implementation change** |
+| Starting HEAD (finalization) | `5c07615` = `origin/main` |
+| Implementation commits | `88ccfa2` `feat(tts): speak text through a bounded synthesis boundary` (M3.0 foundation: the boundary, the OpenAI adapter, the `text_to_speech` tool, the bounded `send_voice` transfer); `d8c6a4f` `feat(tts): complete provider implementation` (Gemini/Grok/Speechmatics adapters, the control plane, +4949 lines incl. 970-line multi-provider suite); `c0b7dcc` `feat(tts): add provider selection and credential fallback` — all on `origin/main` before finalization |
+| Finalization commit | the single commit that contains this report update |
+| Database | **NOT touched** by Part 2. No SQL, no Supabase contact, no new table, no `DATABASE_ARCHITECTURE.md` change (no schema change exists to document). Part 1's database work remains untouched. |
+| STT / OCR / Save / Provider selection policy / ProviderManager architecture | **NOT touched** |
+| Live Telegram verification | **NOT PERFORMED** |
+
+### Implementation status (verified against current source, not assumed)
+
+The full pipeline is present and committed:
+
+```
+text (≤ MAX_TTS_INPUT_CHARS = 1000, refused — never truncated — beyond that)
+  → tts_service.synthesize        the ONE bounded boundary (60 s wall clock,
+                                  closed 19-class failure taxonomy, TtsError)
+  → adapter (openai | gemini | grok | speechmatics)   the real HTTP call
+  → SpeechClip (audio bytes, mime_type, voice, model, characters)
+  → output validation (empty → empty_audio; > 5 MiB → output_too_large;
+                                  no container guessing)
+  → SpeakTool / TelegramAPI.send_voice   the native voice-note transfer
+  → client.send_file(..., voice_note=True, force_document=False)
+```
+
+`backend/telegram_api/media.py::send_voice` uses **Telegram's own voice-note
+semantics** (`voice_note=True`, `force_document=False`) with a module-level
+`VOICE_NOTE_MIME = "audio/ogg"` ceiling and `MEDIA_UPLOAD_TIMEOUT_S = 120`. The
+send is never a document upload and never an accidental text send.
+
+### Provider output status (each adapter's ACTUAL declared output)
+
+| Provider | Status | Output | MIME | Conversion required | Voice-note compatible |
+|---|---|---|---|---|---|
+| OpenAI | implemented | `opus` (`RESPONSE_FORMAT`) | `audio/ogg` | none — OGG/Opus delivered as-is | **yes** (documented container) |
+| Gemini | implemented | raw PCM 24 kHz/16-bit/mono | `audio/wav` | none — a 44-byte RIFF/WAVE header is written with `struct` (a container wrap, **not a transcode**) | `not_documented` (WAV carried as audio; caveat stated, not promised) |
+| Grok | implemented | MP3 24 kHz/128 kbps (documented `output_format` object) | `audio/mpeg` | none — delivered unchanged | **yes** (documented container) |
+| Speechmatics | implemented | complete WAV file (`wav_16000`, headers included) | `audio/wav` | none — delivered unchanged | `not_documented` (same WAV caveat) |
+
+All four are real HTTP adapters (registry `voice_note` compatibility is DERIVED
+from the declared MIME via `VOICE_NOTE_MIME_TYPES` — it can never drift). The
+runtime transcodes nothing and adds no ffmpeg/heavyweight dependency.
+
+### Conversion behavior
+
+Only Gemini touches its bytes, and only to CONTAIN them: `wrap_pcm_as_wav`
+writes a 44-byte header in pure `struct` and appends the provider's PCM. No
+resampling, no codec change, no container negotiation, no third-party converter.
+Incompatible-for-voice-note formats are not silently transcoded — they are
+delivered as the container the provider produced and the capability registry
+states the caveat.
+
+### Telegram delivery behavior
+
+Exactly ONE voice message per request, through `TelegramAPI.send_voice`; the
+destination is trusted runtime context (`extra["chat_id"]`, fallback owner
+chat), never model output; the result carries bounded synthesis facts and never
+the chat id. Malformed/empty audio fails honestly as a classified `TtsError`
+(`malformed_response` / `empty_audio`); a failed transfer returns a failed
+`ToolResult` ("The voice message could not be sent to Telegram."); temporary
+resources: **none by construction** (bounded resident bytes, asserted by test).
+
+### Files changed by the implementation (already published)
+
+`88ccfa2`: `backend/services/tts_service.py` + `backend/services/openai_tts_engine.py`
++ `backend/ai/tools/speech.py` + `backend/bot/handlers/ai_tts_settings.py` (NEW);
+`backend/ai/tools/registry.py`, `backend/telegram_api/media.py` (`send_voice` +
+`VOICE_NOTE_MIME` + upload ceiling), `backend/telegram_api/api.py` (facade),
+`backend/bot/handlers/ai_stt_settings.py` (hub row).
+
+`d8c6a4f`: `gemini_tts_engine.py`, `grok_tts_engine.py`,
+`speechmatics_tts_engine.py` (NEW, 1837 lines); `tts_control_plane.py` (registry
+capabilities + credential pool), `tts_engine_factory.py`, `tts_credential_pool.py`,
+`tts_service.py` (+6), `ai_tts_settings.py` (+5), `credential_service.py` (+1).
+
+### Tests run during finalization
+
+* Focused Part 2 suite: `test_tts_service.py`, `test_tts_multi_provider.py`,
+  `test_tts_openai_engine.py`, `test_tts_gemini_engine.py`,
+  `test_tts_grok_engine.py`, `test_tts_speechmatics_engine.py`,
+  `test_tts_control_plane.py`, `test_tts_provider_binding.py`,
+  `test_tts_provider_fallback.py`, `test_tts_settings_persistence.py`,
+  `test_media_scope_and_delivery.py`
+* TTS regression + full suite: `.venv/bin/python -m pytest tests -q`
+* `py_compile` on all nine changed/verified Python files
+* `git diff --check`
+
+### Exact test results
+
+| Check | Result |
+|---|---|
+| Focused Part 2 suite | **475 passed in 1.48s** |
+| Full suite | **4978 passed, 26 skipped, 2 warnings in 118.22s** |
+| `py_compile` | clean (exit 0) |
+| `git diff --check` | clean |
+
+### Remaining limitations
+
+1. LIVE VERIFICATION: NOT PERFORMED — no Telegram account was driven, no provider
+   was called live, and no voice message was actually delivered or played. Every
+   delivery claim above is proven by tests over the real code path with faked
+   transports, not by a live Telegram round trip.
+2. WAV containers (Gemini, Speechmatics) are delivered as-is; whether Telegram
+   renders them as playable voice notes is a live-verification question the
+   registry answers with `not_documented` rather than a promise.
+3. Persian pronunciation/quality is explicitly out of Part 2 scope and was not
+   touched; per-provider Persian support remains `not_verified`.
+4. No conversion layer exists by design; a provider whose container Telegram
+   rejects outright would need a future transcode phase (not started).
+
 ## Latest phase — TTS PART 1 — DURABLE SETTINGS PERSISTENCE: stored, recovered after a restart, and never faked from RAM
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
