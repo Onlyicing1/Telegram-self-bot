@@ -8,7 +8,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from backend.ai.database.task_repository import TaskRecord, TaskRepository, TODO_SCHEDULE_TYPE
+from backend.ai.database.task_repository import (
+    MAX_STEPS_PER_ADD,
+    MAX_STEPS_PER_TODO,
+    TaskRecord,
+    TaskRepository,
+    TODO_SCHEDULE_TYPE,
+    normalize_step_title,
+)
 from backend.ai.preparation_policy import CONTENT_FIELDS
 from backend.ai.scheduling import (
     ScheduleError,
@@ -240,7 +247,13 @@ class TaskCreationService:
         #: (unit/service harness) may inject the real one explicitly.
         self._tool_registry = tool_registry
 
-    async def create_todo(self, label: str, timezone: str, reference: datetime) -> TaskRecord:
+    async def create_todo(
+        self,
+        label: str,
+        timezone: str,
+        reference: datetime,
+        steps: list[Any] | tuple[Any, ...] = (),
+    ) -> TaskRecord:
         """Create ONE basic Todo through the SAME creation/persistence path.
 
         A todo is the ONE unscheduled row this table stores: a title, the
@@ -250,14 +263,33 @@ class TaskCreationService:
         a scheduled task, so there is no second creation path, no second
         candidate shape and no second persistence call.
 
+        ``steps`` creates the todo's ordered step list in the SAME operation:
+        the steps are appended in the order given, in one repository call, and
+        a failure removes the todo again instead of leaving a half-created
+        structure (there is no generalized transaction framework here — the
+        compensating delete is the existing CAS-guarded row removal).
+
         The title is REQUIRED and never invented: a blank title is rejected
-        here instead of being filled with a placeholder.
+        here instead of being filled with a placeholder. The same holds for
+        every step title.
         """
         text = " ".join(str(label or "").split())
         if not text or len(text) > MAX_TODO_TITLE_CHARS:
             raise TaskCreationError(
                 "a todo needs a title of at most "
                 f"{MAX_TODO_TITLE_CHARS} characters"
+            )
+        try:
+            cleaned = [normalize_step_title(step) for step in steps]
+        except ValueError as exc:
+            raise TaskCreationError(str(exc)) from exc
+        if len(cleaned) > MAX_STEPS_PER_ADD:
+            raise TaskCreationError(
+                f"at most {MAX_STEPS_PER_ADD} steps can be created at once"
+            )
+        if len(cleaned) > MAX_STEPS_PER_TODO:
+            raise TaskCreationError(
+                f"a todo holds at most {MAX_STEPS_PER_TODO} steps"
             )
         zone = str(timezone or "").strip() or "UTC"
         candidate = {
@@ -269,7 +301,33 @@ class TaskCreationService:
             "notification_destination": {},
             "next_run_at": None,
         }
-        return await self.create(candidate, reference)
+        task = await self.create(candidate, reference)
+        if not cleaned:
+            return task
+        try:
+            await self.repository.create_steps(self.owner_id, task.id, cleaned)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # ALL-OR-NOTHING: the todo and its steps are ONE structure. The
+            # todo row is removed again under its own CAS version rather than
+            # leaving a todo without the steps the owner asked for.
+            try:
+                await self.repository.delete_task(
+                    self.owner_id, task.id, task.version
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "TODO_STEPS_ROLLBACK_FAILED todo_id=%s — the todo may exist "
+                    "without its steps",
+                    task.id,
+                )
+            raise TaskCreationError(
+                "the todo was not created: its steps could not be saved"
+            ) from exc
+        return task
 
     async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
         started = time.perf_counter()

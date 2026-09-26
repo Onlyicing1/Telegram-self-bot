@@ -1,262 +1,278 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TODO PART 1 — BASIC TODO LIST on the existing durable task foundation
+## Latest phase — TODO PART 2 — MULTI-STEP TODOS (ordered, independently completable steps)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
-Starting HEAD `ee5967f` = `origin/main` (`chore(tts): freeze tts and hide from user interface`).
+Starting HEAD `9f7c09b` = `origin/main` (Part 1 landed by the owner: `feat(todo): add basic todo list` + canonical setup reconciliation).
 
-### Part 1 objective
+### Part 2 objective
 
-Make the existing durable task foundation usable as a SIMPLE Todo List from
-Telegram: create / list / inspect / edit / complete / reopen / delete a basic
-todo, with a manual Glass UI and basic Persian/English natural-language
-support. This is explicitly NOT a premium task manager: no priority, no
-categories, no projects, no calendar, no reminder engine, no workflow engine,
-no subtasks and no multi-step tasks (Part 2+). Everything reuses the existing
-`ai_tasks` / `ai_task_occurrences` foundation — TaskRepository CAS versioning,
-`TaskCreationService`, `TaskManagementService`, the AI tool layer and Taskloom
-conventions. No new table, no new repository, no new state model, no parallel
-database.
+Add the ONLY new concept of this phase to the Part 1 Todo system: ONE Todo may
+contain an ordered list of steps that can be completed one by one. No rewrite
+of Part 1, no second UI, no premium task manager: no priorities, categories,
+projects, calendar, reminders, recurrence, dependencies between arbitrary
+tasks, task graphs, workflow engine, Kanban, analytics, deadlines or background
+execution. Part 2 ends at "one Todo can contain ordered, independently
+completable steps" — question+command mixing, conversational continuation and
+multi-turn planning stay out (they belong to later phases).
 
-### Audit conclusion (what already existed and was reused)
+### Audit conclusion (what Part 1 actually is — source-verified, not assumed)
 
-| Existing foundation | Where | Reused how |
+Part 1 lives entirely on the existing durable task foundation:
+
+* a Todo IS an `ai_tasks` row with `schedule_type = 'todo'` (added by
+  `20260926000001_add_todo_schedule_type.sql`), CAS `version`, owner-scoped;
+* `backend/ai/database/task_repository.py` (InMemory + Supabase) is the single
+  store; `TaskCreationService.create_todo` / `TaskManagementService` hold the
+  lifecycle; `tests/test_canonical_schema_reconciliation.py` freezes the
+  canonical snapshot trio (byte-identical, forward-only successors);
+* `todo_tools.py` + `task_management_tools.py` + `actions.py` +
+  `prompt/template.py` are the AI surface; `bot/handlers/todo.py` is the
+  manual Glass UI reached from `Menu`;
+* `20260927000001` sorts after the newest successor
+  `20260922000001_add_saved_items_search_indexes.sql`.
+
+Part 1 could NOT represent steps: `ai_tasks` has no parent/child notion, and
+folding a step into a second `ai_tasks` row would make it a schedulable task
+(schedule, actions, occurrences, CAS parent transitions, list pollution) —
+a workflow engine by accident. A dedicated child table is the smallest correct
+architecture, and `ai_tasks` was NOT reused for steps.
+
+### Architecture chosen (and why)
+
+ONE new table `todo_steps` — the ordered children of ONE todo:
+
+    ai_tasks (schedule_type = 'todo')  1 ─── * todo_steps (ordered by position)
+
+* **Not `ai_tasks` reuse**: a step is not a task — no schedule, no action, no
+  occurrence, no notification destination, never claimed/executed/scheduled,
+  never returned by any task query. Taskloom and the scheduler are untouched.
+* **Not a JSON column on `ai_tasks`**: steps need stable identity, per-step
+  CAS versions and per-step completion timestamps; a JSON blob would rebuild
+  all of that in code with no constraint protection.
+* **`ON DELETE CASCADE`** (not RESTRICT): a step has no history value outside
+  its parent, so deleting the Todo removes its steps in the same statement —
+  no orphan is possible and NO cleanup worker exists. (The occurrence table
+  keeps RESTRICT because occurrences ARE execution history.)
+* **`UNIQUE (task_id, position)`** is the only index (≤50 steps per todo);
+  positions are 1-based and never renumbered — the user-facing step NUMBER is
+  the ordinal in position order, always contiguous even after a delete.
+* **CAS on the step** (`version >= 1`, same philosophy as `ai_tasks.version`):
+  a stale step mutation fails closed and writes nothing.
+* **Status = `active` | `completed`** with a CHECK binding
+  `(status='completed') = (completed_at IS NOT NULL)`; deliberately no
+  BLOCKED/CANCELLED/PAUSED/IN_PROGRESS — nothing in this architecture can
+  produce one.
+* **Atomic multi-step creation**: `TaskCreationService.create_todo(..., steps=)`
+  creates the todo row, then appends ALL steps in ONE multi-row INSERT (a
+  single PostgreSQL statement — all rows or none); if that fails the todo row
+  is removed again under its own CAS version (compensating delete), so either
+  the Todo + its steps exist or neither does. No generalized transaction
+  framework was added.
+
+### Database changes
+
+| Item | Value |
+|---|---|
+| Migration | `supabase/migrations/20260927000001_add_todo_steps.sql` (NEW, additive, idempotent, `NOTIFY pgrst` + verification query) |
+| Table | `todo_steps`: `id bigserial PK`, `task_id bigint NOT NULL REFERENCES ai_tasks(id) ON DELETE CASCADE`, `owner_id bigint NOT NULL` (denormalized; every read/write filters by it), `position integer NOT NULL CHECK > 0`, `title text NOT NULL CHECK nonblank ≤ 256`, `status text NOT NULL DEFAULT 'active' CHECK active/completed`, `version integer NOT NULL DEFAULT 1 CHECK >= 1`, `completed_at timestamptz NULL`, `created_at/updated_at timestamptz NOT NULL DEFAULT now()` |
+| Constraints | `todo_steps_position_positive`, `todo_steps_title_not_blank`, `todo_steps_status_check`, `todo_steps_version_check`, `todo_steps_completed_state`, `todo_steps_task_position_key UNIQUE (task_id, position)` |
+| RLS | ENABLED; `anon`/`authenticated` get SELECT only (same dashboard boundary as every other table); writes are service-role only |
+| Frozen trio | `canonical_bootstrap.sql`, `20260920000001_reconcile_canonical_schema.sql`, §30 block — byte-untouched; `todo_steps` is a SUCCESSOR table, never folded into the snapshot (enforced by test) |
+
+**Manual Supabase action required (NOT executed by the agent).** Apply the ONE
+complete setup script in DATABASE_ARCHITECTURE.md §31.3 (now parts 1–8; part 8
+is this migration) or the migration file alone. Until it is applied the
+application keeps every Part 1 behaviour and reports step persistence
+honestly (durable-vs-fallback classification, same as tasks). Nothing was run
+against Supabase; no live database was contacted.
+
+### Step lifecycle
+
+`active` → `completed` (`complete_step`, sets `completed_at`, CAS version+1)
+→ `active` (`reopen_step`, clears `completed_at`, CAS version+1). Rename
+(`rename_step`) and delete (`delete_step`) are CAS-guarded; a delete never
+touches the parent and never renumbers survivors. All service operations
+refuse a step of a `completed` todo (reopen the todo first) and refuse to
+create/edit steps on a completed todo. Bounds: ≤50 steps per todo,
+≤20 per single add, title ≤256 chars, never invented.
+
+### Parent Todo behavior (explicit, never silent)
+
+* Plain Todo completion is **REFUSED** while a step still remains; the refusal
+  names what is left (count + next step title) — covered by tests.
+* The Todo detail offers an explicit **Complete all (n/m)** button /
+  `task_transition complete_steps:true` / `complete_todo_with_steps`: the
+  remaining steps are completed first (each under its own CAS version), then
+  the Todo completes under its own version — the pair can never disagree.
+* Reopening a Todo never touches its steps. The parent is never silently
+  auto-completed and never auto-reopened.
+* Every surface shows `Progress: n / m steps completed` and `Next: <first
+  remaining step>` from ONE service read (`step_progress`), so the detail
+  panel, the steps panel and the AI tools can never disagree.
+
+### AI integration (same spine, no bypass)
+
+AI → Dispatcher → ToolRegistry → ToolExecutor → TaskManagementService /
+TaskCreationService → TaskRepository → Database. Five NEW tools in
+`backend/ai/tools/todo_step_tools.py`:
+
+| Tool | Purpose | Addressing |
 |---|---|---|
-| Durable owner-scoped task rows, version/CAS, occurrence history | `backend/ai/database/task_repository.py` (InMemory + Supabase), `ai_tasks`/`ai_task_occurrences` | the todo IS a task row; every mutation goes through the same CAS paths |
-| Task creation (validation, bounded label, timezone) | `backend/ai/task_creation.py::TaskCreationService.create` | `create_todo` builds the one unscheduled candidate and calls the SAME `create` |
-| Task lifecycle transitions | `TaskManagementService.set_status` | complete = `set_status("completed")`; reopen = `set_status("active")` restricted to todos |
-| Deletion (real row removal, CAS, owner-scoped, `TaskDeletionResult`) | `TaskManagementService.delete` / `TaskRepository.delete_task` | todo delete uses the exact same service delete with its real outcome reporting |
-| Listing/inspection | `TaskManagementService.snapshot`, `task_management_interface` | `list_todos` filters `snapshot(todos_only=True)`; `todo_detail_text` renders a todo's basic facts |
-| AI execution spine | Dispatcher → ToolRegistry → ToolExecutor → service → repository | three new tools registered in the same registry; the JSON action path maps through the same tools |
-| Glass UI machinery | `backend/helper` panel/action/input registries | new `todo` module registers through the same registries, reached from `Menu` |
+| `todo_step_add` | append 1..n ordered steps (all or nothing) | todo by id or query |
+| `todo_step_list` | steps + progress + next step | todo by id or query |
+| `todo_step_transition` | complete / reopen ONE step | todo by id or query; step by number (`step`) or own words (`step_query`) |
+| `todo_step_edit` | rename ONE step (never the todo) | same as above + `title` |
+| `todo_step_delete` | remove ONE step (never the todo) | same as above |
 
-### What was implemented
+Extended: `todo_add` accepts `steps` (multi-step creation in ONE call);
+`task_transition` accepts `complete_steps: true` (only with
+`action_status "completed"`); `task_management_tools.py` carries both.
+`registry.py` registers the five tools (**total 54**); `executor.py` adds
+their status labels. Deterministic resolution reused/extended: the todo
+resolver (0/1/N) is unchanged; step resolution is scoped INSIDE the selected
+parent todo (never across owners, never across todos) with the same tiers —
+ordinal, all-tokens substring, title-in-sentence — and 0 = honest not-found,
+1 = operate, 2+ = candidate list, never a guess.
 
-**Database migration** — `supabase/migrations/20260926000001_add_todo_schedule_type.sql`
-(NEW). The current `ai_tasks` constraints could not express an unscheduled
-todo: `ai_tasks_schedule_type_check` allowed only the five scheduled types, and
-`ai_tasks_actions_count` required 1–5 actions. The migration widens exactly
-those two constraints and nothing else (no table, no column, no index, no
-policy, no grant, no row change, no backfill):
+**JSON action path** — `actions.py`: `todo_step_add/list/transition/edit/delete`
+in `ACTION_NAMES` + `EXECUTABLE_ACTION_NAMES`, `_validate_todo_step_action`
+(bounded titles/queries, `step` XOR `step_query`, no `expected_version` on
+step actions), `steps` + `complete_steps` in `ALLOWED_FIELDS` (todo_add /
+task_transition only), and `resolve_tool_calls` mapping everything onto the
+SAME tools. **Prompt** — `template.py`: the task paragraph and the JSON
+schema/examples now document the step tools, the multi-step `todo_add`, the
+`complete_steps` escape hatch and the ambiguity rule (never pick among
+candidates), with Persian examples.
 
-```sql
-ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
-ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
-    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event', 'todo'));
+### Manual Telegram UI (extended, not a second system)
 
-ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_actions_count;
-ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
-    (schedule_type = 'todo' AND jsonb_array_length(actions) BETWEEN 0 AND 5)
-    OR (schedule_type <> 'todo' AND jsonb_array_length(actions) BETWEEN 1 AND 5)
-);
+`backend/bot/handlers/todo.py`, same panel/action/input registries:
 
-NOTIFY pgrst, 'reload schema';
-```
-
-**Manual Supabase action required (NOT executed by the agent).** The schema
-change is owner-applied, idempotent, and additive: until it runs, every
-scheduled task keeps working unchanged and a todo *create* fails at the old
-CHECK with an honest error instead of a silent loss. Nothing was executed
-against Supabase and no live database was contacted.
-
-**Repository** — `backend/ai/database/task_repository.py`: `TODO_SCHEDULE_TYPE`,
-`SCHEDULE_TYPES` extended; `is_todo_schedule_type`; `_validate_json_payload`
-gains `allow_empty_array` (todo: 0–5 actions, scheduled: 1–5); `_validate_task_input`
-rejects `next_run_at` on a todo and permits `actions == []` only for one; the
-reopen edge `completed -> active` exists ONLY for a todo via
-`_task_status_transition_allowed` (a completed scheduled task stays terminal in
-BOTH repositories — in-memory and Supabase).
-
-**Creation** — `backend/ai/task_creation.py`: `MAX_TODO_TITLE_CHARS = 256`;
-`create_todo(label, timezone, reference)` normalizes the title, refuses to
-invent one, builds the candidate `{schedule_type:"todo", schedule:{}, actions:[],
-notification_destination:{}, next_run_at:None}` and calls the SAME `create()`;
-todo excluded from the schedule/timezone-match requirement; `initial = None`.
-
-**Management** — `backend/ai/task_management.py`: `list_todos(status)`,
-`snapshot(..., todos_only=False)`, `reopen(task_id, expected_version)`,
-`edit_todo_title(task_id, expected_version, label)` (CAS, todo-only), and THE
-ONE deterministic todo title resolver: `resolve_todos(query, limit=8)` with
-tiered matching (1. whole query coerced to an id → that todo; 2. every query
-token a substring of the normalized title; 3. the whole normalized title (≥3
-chars) inside the query), NFKC+normalization shared with semantic delete,
-deterministic ordering (`created_at DESC`, then id), bounded candidates
-(`MAX_TODO_CANDIDATES = 8`, `MAX_TODO_QUERY_CHARS = 128`,
-`MAX_TODO_QUERY_TOKENS = 12`), and outcomes NOT_FOUND / UNIQUE / AMBIGUOUS;
-`resolve_todo_target(task_id=0, query="")` refuses both/neither. `set_status`
-raises `ValueError` for reopening a completed scheduled task and for pausing a
-todo (a todo is completed or reopened, never paused).
-
-**Interface** — `backend/ai/task_management_interface.py::todo_detail_text`:
-Title / Status / Created / Updated / Version / `Type: Todo (unscheduled)`.
-
-**AI tools** — `backend/ai/tools/todo_tools.py` (NEW):
-`resolve_todo_argument` (refuses id+query together; requires the explicit
-version on the id path; stale version → refusal with the current version;
-returns `(task, None)` or `(None, ToolResult)`), and
-`TodoAddTool` (`todo_add`, READ_WRITE — a blank title asks for the title
-instead of inventing one),
-`TodoFindTool` (`todo_find`, READ_ONLY — unique match renders the detail text,
-0/2+ matches report honestly),
-`TodoEditTool` (`todo_edit`, READ_WRITE — by id+version or by title reference).
-All report `durable` through the shared fallback classification. All go through
-ToolRegistry → ToolExecutor → service → repository; the AI never touches the
-database, Supabase or Telegram directly.
-`backend/ai/tools/task_management_tools.py`: `task_transition` and `task_delete`
-gain the `query` parameter and resolve a title-addressed todo through the SAME
-resolver (reading the current version itself); `task_transition` reports
-"reopened" when the prior status was completed; descriptions updated
-(todo-aware). `backend/ai/tools/registry.py` registers the three tools
-(**total 49**); `backend/ai/tools/executor.py` adds their status labels.
-
-**JSON action path** — `backend/ai/actions.py`: `todo_add` / `todo_find` /
-`todo_edit` added to `ACTION_NAMES` + `EXECUTABLE_ACTION_NAMES`; `title` in
-`ALLOWED_FIELDS` (todo_add/todo_edit only); `query` accepted by
-task_transition/task_delete; `_validate_todo_action` and the query branch of
-`_validate_task_lifecycle_action` (id+version XOR query, bounded title/query);
-`resolve_tool_calls` maps all of them onto the SAME tools.
-
-**Prompt** — `backend/ai/prompt/template.py`: the task-management paragraph and
-the JSON schema/examples now cover todos: add/find/rename/complete/reopen/
-delete by the owner's own words, with the ambiguity rule stated to the model —
-0 matches means nothing was found, 2+ matches mean the owner MUST be asked
-(the model is never allowed to pick among candidates).
-
-**Manual Glass UI** — `backend/bot/handlers/todo.py` (NEW, registered in
-`backend/bot/router.py`; `Menu` gains the row `📋 Todo` in
-`backend/bot/handlers/misc.py`):
-
-* `panel:todo` — active todos (numbered), the completed count, degraded-read
-  note when the store fell back, `➕ Add` (input `todo:new`), `✅ Completed`
-  (`panel:todo_done`), back to `Menu`.
-* `panel:todo_done` — completed todos.
-* `panel:todo_task` — the detail view for ONE todo (id from the callback
-  extra, owner-scoped): active todo offers `✓ Complete`, `✏️ Edit`
-  (input `todo_task:edit`, carrying `task_id:version`), `🗑 Delete`;
-  completed todo offers `↩️ Reopen`, `🗑 Delete`.
-* `action:todo_complete` / `todo_reopen` / `todo_delete` — each performs the
-  service mutation under the version captured when the panel was rendered; a
-  stale version fails closed (nothing changes) and the refreshed panel shows
-  the current state; delete reports the real `TaskDeletionResult` outcome
-  (deleted / not found / stale).
-* Inputs ask for a missing title instead of inventing one; responses edit in
-  place (zero message spam), matching the repository's panel conventions.
+* Todo detail (`panel:todo_task`) gains the progress line, `Next:` step, a
+  `🧩 Steps (n/m)` row opening the new `panel:todo_steps`, an explicit
+  `✓ Complete all (n/m)` button while steps remain (plain `✓ Complete` is
+  replaced by it and refuses otherwise), and `🧩 Add steps` for a stepless
+  todo.
+* `panel:todo_steps` — the ordered list (`✓ 1. done`, `○ 2. remaining`),
+  progress line, `Next:`, per-step actions (`✓ Complete` / `↩️ Reopen`,
+  `✏️ Edit`, `🗑`), pagination, `➕ Add step` (input `todo_steps:add` — one
+  title per line adds SEVERAL at once, in order, all or nothing) and
+  `← Todo`. Adding steps is only offered while the todo is active.
+* Inputs `todo_steps:add` / `todo_steps:edit` carry the todo id (add) or the
+  step `id:version` (edit — a real CAS rename under the version the panel was
+  drawn with); responses edit in place; the typed message is deleted;
+  an expired input is refused instead of guessing a target.
+* Reordering: NOT implemented — positions are append-only by design
+  (append + delete covers the real need; renumbering would fight the
+  stable-position invariant). Documented here as deferred, honestly.
 
 ### Files changed (exact)
 
 | File | Change |
 |---|---|
-| `supabase/migrations/20260926000001_add_todo_schedule_type.sql` | NEW — the two widened `ai_tasks` constraints |
-| `backend/ai/database/task_repository.py` | todo schedule type + validation + todo-only reopen edge (both repositories) |
-| `backend/ai/task_creation.py` | `MAX_TODO_TITLE_CHARS`, `create_todo` through the same `create()` |
-| `backend/ai/task_management.py` | todo ops (list/reopen/edit) + the deterministic resolver + todo guards |
-| `backend/ai/task_management_interface.py` | `todo_detail_text` |
-| `backend/ai/tools/todo_tools.py` | NEW — `todo_add`, `todo_find`, `todo_edit`, `resolve_todo_argument` |
-| `backend/ai/tools/task_management_tools.py` | `query` path for task_transition/task_delete; reopen verb; todo-aware descriptions |
-| `backend/ai/tools/registry.py` | registers the three todo tools (49 total) |
-| `backend/ai/tools/executor.py` | status labels for the three tools |
-| `backend/ai/actions.py` | todo actions + `query` on the lifecycle actions + validation/mapping |
-| `backend/ai/prompt/template.py` | todo exposure in the task paragraph, schema and examples |
-| `backend/bot/handlers/todo.py` | NEW — the Todo Glass UI module |
-| `backend/bot/router.py` | registers the todo module |
-| `backend/bot/handlers/misc.py` | `Menu` gains the `📋 Todo` row |
-| `DATABASE_ARCHITECTURE.md` | §31 (audit row 7, order rationale, §31.3 part 7 of 7 with the migration's statements verbatim, §31.4, §31.5 reversal), §15 (schedule_type `todo`, conditional actions count, the Todo row shape), §20 (migration row 18, NOT APPLIED — owner action required) |
-| `tests/test_todo_lifecycle.py` | NEW — 11 tests |
-| `tests/test_todo_resolver.py` | NEW — 12 tests |
-| `tests/test_todo_tools.py` | NEW — 14 tests |
-| `tests/test_todo_ui.py` | NEW — 20 tests |
-| `tests/test_capability_exposure_tools.py` | delete params + registration count 46→49 + todo names |
-| `tests/test_database_setup_order.py` | `TODO_SCHEDULE_TYPE` appended to `DOCUMENTED_ORDER`, part-7 content pin, "seven migrations" |
-| `tests/test_canonical_schema_reconciliation.py` | the §31.3 segment markers `PART 1 of 7` / `PART 2 of 7` |
-| `tests/test_memory_tools.py`, `tests/test_tool_health_audit.py` | registry count 49 + the three todo tools in `EXPECTED_TOOLS` |
+| `supabase/migrations/20260927000001_add_todo_steps.sql` | NEW — the `todo_steps` table (additive successor migration) |
+| `backend/ai/database/task_repository.py` | `TodoStepRecord`, `STEP_STATUSES`/bounds/`normalize_step_title`/`_validate_step_input`/`_step_from_row`, step interface + InMemory and Supabase implementations (create/list/get/update/delete), fallback classification |
+| `backend/ai/task_management.py` | `TodoStepCandidate/TodoStepTarget/StepProgress`, `step_progress_of`, `list_steps/step_progress/add_steps/get_step/complete_step/reopen_step/rename_step/delete_step/resolve_step/complete_todo_with_steps`, the completion guard in `set_status` |
+| `backend/ai/task_creation.py` | `create_todo(..., steps=)` with the atomic all-or-nothing creation |
+| `backend/ai/task_management_interface.py` | `steps_block_text`, `step_ordinal`, `todo_detail_text` progress/next lines |
+| `backend/ai/tools/todo_step_tools.py` | NEW — the five step tools |
+| `backend/ai/tools/todo_tools.py` | `todo_add` accepts `steps` |
+| `backend/ai/tools/task_management_tools.py` | `task_transition` accepts `complete_steps` |
+| `backend/ai/tools/registry.py`, `backend/ai/tools/executor.py` | five new tools registered (54 total) + status labels |
+| `backend/ai/actions.py` | step actions in the JSON path + validation + mapping |
+| `backend/ai/prompt/template.py` | step vocabulary in the task paragraph + schema/examples |
+| `backend/bot/handlers/todo.py` | steps panel, per-step actions, add/edit inputs, detail progress + Complete all |
+| `DATABASE_ARCHITECTURE.md` | §15 (`todo_steps` subsection + lifecycle semantics), §17 (two enforced relationships), §20 row 19, §30.5/§30.11 (29 migrations, parts 4/5/7/8), §31 intro/§31.1 (rows 1–8, 29 files), §31.1.1, §31.2 (order rule 8), §31.3 ONE block parts 1–8 (part 8 verbatim), §31.4, §31.5, §31.6 |
+| `tests/test_todo_steps.py` | NEW — 23 tests (model/lifecycle/resolution/CAS/parent guard/isolation/orphans) |
+| `tests/test_todo_steps_tools.py` | NEW — 18 tests (five tools + registry/executor + JSON actions) |
+| `tests/test_todo_ui.py` | +10 step tests (panels/actions/inputs/stale/complete-all) — 30 total |
+| `tests/test_capability_exposure_tools.py`, `tests/test_memory_tools.py`, `tests/test_tool_health_audit.py` | registry count → 54 + the five step tools in `EXPECTED_TOOLS` |
+| `tests/test_database_setup_order.py` | `TODO_STEPS` appended to `DOCUMENTED_ORDER` (8 parts), part-8 content pin, "eight migrations", 29-file audit |
+| `tests/test_canonical_schema_reconciliation.py` | `SUCCESSOR_TABLES` (`todo_steps` documented but never canonical), `PART 1 of 8` markers |
 | `IMPLEMENTATION_REPORT.md` | this section |
 
 ### Security / ownership
 
-Every path is owner-scoped end to end: the handler fires only on the owner's
-outgoing messages; tools are constructed with the runtime `owner_id` and every
-repository call filters by it (verified by tests that a second owner cannot
-read, transition, edit or delete another owner's todo); the resolver searches
-only the owner's rows; ids supplied by the model are validated against the
-owner's rows and never trusted for authorization; CAS versions make a stale
-mutation a no-op that reports the current state; deletion stays the existing
-real-row-removal operation with its occurrence cascade under
-`ON DELETE RESTRICT`; RLS/service-role posture unchanged; no new env var, no
-new secret, no schema grant change.
+Every step operation is owner-scoped end to end: the handler fires only on the
+owner's outgoing messages; tools are constructed with the runtime `owner_id`
+and every repository call filters by it (`owner_id` is in EVERY WHERE clause,
+including `update_step`/`delete_step`); step resolution is scoped inside the
+owner's own parent todo; ids supplied by the model are validated against the
+owner's rows and never trusted for authorization; a foreign or unknown step id
+is indistinguishable from not-found; CAS versions make a stale mutation a
+no-op that reports the current state; RLS stays SELECT-only for
+`anon`/`authenticated`; no new env var, no new secret, no grant change.
 
 ### Tests added and executed (exact)
 
 | Suite | Result |
 |---|---|
-| `tests/test_todo_lifecycle.py` + `test_todo_resolver.py` + `test_todo_tools.py` + `test_todo_ui.py` | **57 passed** (focused run: 57 passed in 0.44s) |
-| `tests/test_capability_exposure_tools.py` | **22 passed** |
-| `tests/test_database_setup_order.py` | **24 passed** |
-| Task regression (`-k "task or todo"`: all task/taskloom suites + todo) | **895 passed, 0 failed in 5.34s** |
-| Full suite `.venv/bin/python -m pytest tests -q` | **5041 passed, 26 skipped, 2 warnings in 121.76s** |
+| `tests/test_todo_steps.py` (lifecycle/resolution/CAS/orphans/isolation/parent guard) | **23 passed** |
+| `tests/test_todo_steps_tools.py` (five tools, registry, executor, JSON actions) | **18 passed** |
+| `tests/test_todo_ui.py` (Part 1 UI regression + 10 new step tests) | **30 passed** |
+| Part 1 Todo regression (`test_todo_lifecycle` + `test_todo_resolver` + `test_todo_tools` + `test_todo_ui`) | **passed** |
+| DB contract suites (`test_database_setup_order.py` + `test_canonical_schema_reconciliation.py`) | **26 + 43 passed** |
+| Full suite `.venv/bin/python -m pytest tests -q` | **5094 passed, 26 skipped, 0 failed in 118.15s** |
 | `py_compile` on every changed Python file | clean (exit 0) |
 | `git diff --check` | clean |
 
-Coverage of the required test areas: 1 create, 2 owner isolation
-(lifecycle/tools/UI), 3 list active, 4 list completed, 5 inspect, 6 edit,
-7 complete, 8 reopen, 9 delete, 10 stale edit rejection, 11 stale transition
-rejection, 12 ambiguous resolution, 13 zero-match, 14 single-match,
-15 multi-match, 16 tool registration (49 tools), 17 ToolExecutor path (native
-tools AND the JSON action path), 18 manual callback/navigation behavior,
-19–21 existing task_list/task_inspect/task_transition regression (the task
-regression batch, 895 passed, includes `test_task_repository.py`'s
-terminal-transition invariant).
-
-A regression found and fixed during validation: widening the repository's
-transition table alone let a completed SCHEDULED task reactivate; the guard is
-now `_task_status_transition_allowed` (reopen edge granted to a todo only),
-covered by `test_a_todo_is_never_pausable_and_a_scheduled_task_is_never_reopenable`
-and the pre-existing repository invariant test.
+Required test areas covered: create with zero steps, create with multiple
+steps (atomic, incl. failure → no half-created todo), ordered persistence,
+list steps, inspect with progress, complete one, reopen one, edit step title,
+delete step, parent deletion leaves no orphan steps (CASCADE semantics),
+owner isolation (repository + tools + UI), ambiguous todo resolution (Part 1
+regression), ambiguous step resolution, zero-match, single-match, multi-step
+AI tool path, ToolRegistry registration, ToolExecutor path, JSON action path,
+manual UI, stale mutation fail-closed (step transition/edit/delete/complete-all),
+Part 1 regression, task regression (full suite includes all 33 `test_task_*`
+suites).
 
 ### Validation results
 
 | Check | Result |
 |---|---|
-| Focused Todo suites | 57 passed |
-| Capability/audit/setup-order suites | passed (22 + 24 + audit/memory/canonical suites) |
-| Task regression batch | 895 passed |
-| Full suite | 5041 passed, 26 skipped |
+| Focused Todo suites (Part 1 + Part 2) | 167 passed (incl. DB/doc contract suites) |
+| Full suite | 5094 passed, 26 skipped, 0 failed |
 | `py_compile` (all changed Python files) | clean |
 | `git diff --check` | clean |
-| Manual smoke of the full lifecycle (create → list → detail → complete → completed list → reopen → delete, incl. a CAS-stale delete) | executed against the real service/repository in-process; all steps behaved as specified |
 
 ### Limitations and honest boundaries
 
 1. **No live Telegram verification** was performed: no Telegram client was
    driven, no message was sent, no panel was opened in a real chat. The UI is
    proven by tests over the real handler code path with faked event objects.
-2. **No live Supabase verification** was performed: no SQL was executed against
-   any database. The migration is applied manually by the owner; until then a
-   todo create fails honestly at the old CHECK constraint.
-3. The scheduler never runs a todo (no `next_run_at`, no actions) — verified by
-   test; a todo produces no occurrence, so occurrence history for todos is
-   empty by design.
-4. The AI trigger word (default `Nova`) remains the activation path; Persian
-   support rides the existing trigger/translation conventions plus the
-   resolver's Persian spelling-variant normalization — no new NLP layer.
+2. **No live Supabase verification** was performed: no SQL was executed
+   against any database. The migration is applied manually by the owner;
+   until then step persistence uses the in-memory fallback and is reported as
+   not-durable (never faked).
+3. The Supabase step path relies on the repository's existing
+   `asyncio.to_thread` + timeout wrapper and the fallback classification; the
+   multi-row INSERT is atomic per statement, and `create_todo(steps=...)`
+   keeps todo+steps all-or-nothing via the compensating CAS delete (logged
+   loudly if the compensation itself fails).
+4. **Reordering is deferred** (append-only positions by design). A step is
+   completed inside a completed todo only after the todo is reopened; there
+   is no silent parent auto-completion and no notification, reminder or
+   scheduling of any kind.
 
-### Intentionally NOT implemented (Part 2+)
+### Intentionally NOT implemented (Part 3+)
 
-Multi-step tasks (`parent_task_id`, `task_steps`, `task_dependencies`,
-execution plans, action chains, task graphs), question+command mixing,
-multi-turn task completion, the conversational planner, priorities,
-categories, projects, due dates, reminders, recurring todos. No speculative
-abstraction for Part 2 was added; the todo reuses the task row shape directly.
+Question + command mixing, conversational continuation, multi-turn planning,
+autonomous execution plans, arbitrary action chains, workflow graphs,
+reordering, priorities, categories, projects, calendar, reminders, recurring
+todos, deadlines, analytics, external integrations.
 
 ### Git
 
 | Item | Value |
 |---|---|
 | Branch | `main` |
-| Commit | `feat(todo): add basic todo list` — the single commit containing this section (the SHA is in `git log`; a document cannot contain its own commit hash) |
-| Starting HEAD | `ee5967f` |
+| Commit | `feat(todo): add multi-step todos` — the single commit containing this section (the SHA is in `git log`; a document cannot contain its own commit hash) |
+| Starting HEAD | `9f7c09b` |
 | Push | `git push origin main` |
 | Remote verification | `git fetch origin`; local HEAD == `origin/main` after push |
-| Working tree | clean of tracked changes after the commit; the pre-existing untracked nested repo `telegram-self-bot/` untouched and never staged |
+| Working tree | clean of tracked changes after the commit |
 
 ---
 

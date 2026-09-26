@@ -30,14 +30,15 @@ DISPLAY_NAME = "20260921000001_add_saved_items_display_name.sql"
 SEARCH_INDEXES = "20260922000001_add_saved_items_search_indexes.sql"
 TTS_SETTINGS = "20260923000001_add_ai_config_tts_settings.sql"
 TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
+TODO_STEPS = "20260927000001_add_todo_steps.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
-#: settings migration and the Todo schedule type are LATER additive schema
-#: changes, so they are appended last, newest last (the documented rule: a later
-#: change never edits the snapshot).
+#: settings migration, the Todo schedule type and the Todo steps table are LATER
+#: additive schema changes, so they are appended last, newest last (the
+#: documented rule: a later change never edits the snapshot).
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
-    TODO_SCHEDULE_TYPE,
+    TODO_SCHEDULE_TYPE, TODO_STEPS,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -235,9 +236,7 @@ def test_the_display_name_column_precedes_its_index():
 def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
     """The newest additive migration closes the block, and it is complete in it."""
     spans = _part_spans(_setup_block())
-    assert list(spans)[-1] == TODO_SCHEDULE_TYPE, (
-        "the Todo schedule type is the newest additive change, so it is applied last"
-    )
+    assert TODO_SCHEDULE_TYPE in spans, "the Todo schedule type must stay embedded"
     part = spans[TODO_SCHEDULE_TYPE]
     assert "DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check" in part
     assert "'todo'" in part, "the widened schedule_type enum must name the Todo type"
@@ -248,6 +247,36 @@ def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
     assert "jsonb_array_length(actions) BETWEEN 1 AND 5" in part, (
         "every scheduled row must keep the 1-5 action guarantee"
     )
+
+
+def test_the_todo_steps_part_is_last_and_carries_the_whole_table():
+    """The multi-step table is the newest additive change and closes the block."""
+    spans = _part_spans(_setup_block())
+    assert list(spans)[-1] == TODO_STEPS, (
+        "the Todo steps table is the newest additive change, so it is applied last"
+    )
+    part = spans[TODO_STEPS]
+    for needle in (
+        "CREATE TABLE IF NOT EXISTS todo_steps",
+        "REFERENCES ai_tasks(id) ON DELETE CASCADE",
+        "CONSTRAINT todo_steps_task_position_key",
+        "UNIQUE (task_id, position)",
+        "CHECK (status IN ('active', 'completed'))",
+        "ENABLE ROW LEVEL SECURITY",
+        "anon_select_todo_steps",
+        "NOTIFY pgrst, 'reload schema'",
+    ):
+        assert needle in part, f"the Todo steps part is missing {needle!r}"
+    # The parent table must exist before the steps table can reference it.
+    assert block_index(spans, TODO_STEPS) > block_index(spans, RECONCILE), (
+        "the steps table must come after the snapshot that creates ai_tasks"
+    )
+
+
+def block_index(spans: dict[str, str], name: str) -> int:
+    """Position of one part within the documented order (for ordering claims)."""
+    order = list(spans)
+    return order.index(name)
 
 
 def test_the_vault_part_two_follows_part_one():
@@ -307,15 +336,15 @@ def test_the_setup_block_creates_no_secret_value():
 # ─── 4. the audited order and honest reporting ───────────────────────────────
 
 def test_the_audited_order_is_recorded_in_the_audit_table():
-    """§31.1 names every embedded migration, and its PART-7 table keeps the order.
+    """§31.1 names every embedded migration, and its PART-8 table keeps the order.
 
     The audit now also classifies the 21 pre-reconciliation migrations, so the
-    order contract is checked against the table of the seven EMBEDDED parts
+    order contract is checked against the table of the eight EMBEDDED parts
     (the second table in §31.1), not against the whole prose.
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 28 migrations" in _flat(audit) or "28 files" in audit, (
+    assert "all 29 migrations" in _flat(audit) or "29 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]
@@ -334,8 +363,9 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "seven migrations" in flat, "the added sixth and seventh migrations must be acknowledged"
+    assert "eight migrations" in flat, "the sixth, seventh and eighth migrations must be acknowledged"
     assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
+    assert "add_todo_steps" in flat, "the Todo steps table must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 

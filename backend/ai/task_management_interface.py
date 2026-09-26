@@ -131,25 +131,83 @@ def _list_header(status: str | None) -> list[str]:
     return lines
 
 
-def todo_detail_text(task: object) -> str:
+def step_ordinal(steps: list, step: object) -> int:
+    """The 1-based ORDINAL of one step in position order (0 when absent).
+
+    This ordinal is what every surface calls "step 2": positions are never
+    renumbered, so the displayed numbers stay contiguous while the stored
+    ``position`` remains a stable ordering key.
+    """
+    for index, candidate in enumerate(steps, start=1):
+        if int(getattr(candidate, "id", 0) or 0) == int(getattr(step, "id", 0) or 0):
+            return index
+    return 0
+
+
+def steps_block_text(
+    task: object, steps: list, progress: object | None = None
+) -> str:
+    """The compact steps view of ONE todo: progress, the ordered list, next.
+
+    Rendered at most as a short mobile block — this is a hand-managed step
+    list, not a project dashboard. A step's mark is its own state: ✓ completed,
+    ○ still remaining.
+    """
+    from backend.ai.task_management import step_progress_of
+
+    progress = progress or step_progress_of(steps)
+    title = " ".join(str(getattr(task, "label", "") or "").split()) or "Untitled"
+    lines = [
+        f"Todo #{getattr(task, 'id', '?')} — {title}",
+        f"Progress: {progress.label}",
+        "",
+    ]
+    if not steps:
+        lines.append("_No steps yet._")
+        return "\n".join(lines)
+    lines.append("Steps:")
+    for index, step in enumerate(steps, start=1):
+        mark = "✓" if str(getattr(step, "status", "")) == "completed" else "○"
+        step_title = " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
+        lines.append(f"{mark} {index}. {step_title}")
+    next_step = getattr(progress, "next_step", None)
+    if next_step is not None:
+        ordinal = step_ordinal(steps, next_step)
+        next_title = " ".join(str(getattr(next_step, "title", "") or "").split())
+        lines.extend(["", f"Next: {ordinal}. {next_title}"])
+    return "\n".join(lines)
+
+
+def todo_detail_text(task: object, progress: object | None = None) -> str:
     """The detail block for ONE todo — only what a basic todo really has.
 
     No schedule, destination, occurrence or action line: a todo has none of
     them, and printing an empty one would suggest a feature that does not
     exist. Created/updated/version are the existing durable facts.
+
+    ``progress`` adds the step summary when the caller already read the todo's
+    steps (the detail view does; a caller that has no step context omits the
+    argument and the block is unchanged).
     """
     title = " ".join(str(getattr(task, "label", "") or "").split()) or "Untitled"
-    return "\n".join(
-        [
-            f"Todo #{getattr(task, 'id', '?')}",
-            f"Title: {title}",
-            f"Status: {_status_text(getattr(task, 'status', ''))}",
-            f"Created: {_format_datetime(getattr(task, 'created_at', None), empty='Unknown')}",
-            f"Updated: {_format_datetime(getattr(task, 'updated_at', None), empty='Unknown')}",
-            f"Version: v{getattr(task, 'version', '?')}",
-            "Type: Todo (unscheduled)",
-        ]
-    )
+    lines = [
+        f"Todo #{getattr(task, 'id', '?')}",
+        f"Title: {title}",
+        f"Status: {_status_text(getattr(task, 'status', ''))}",
+        f"Created: {_format_datetime(getattr(task, 'created_at', None), empty='Unknown')}",
+        f"Updated: {_format_datetime(getattr(task, 'updated_at', None), empty='Unknown')}",
+        f"Version: v{getattr(task, 'version', '?')}",
+        "Type: Todo (unscheduled)",
+    ]
+    if progress is not None:
+        lines.append(f"Progress: {getattr(progress, 'label', '0 / 0 steps completed')}")
+        next_step = getattr(progress, "next_step", None)
+        if next_step is None:
+            lines.append("Steps: none remaining" if int(getattr(progress, "total", 0)) else "Steps: none yet")
+        else:
+            next_title = " ".join(str(getattr(next_step, "title", "") or "").split())
+            lines.append(f"Next: {next_title}")
+    return "\n".join(lines)
 
 
 async def list_text(

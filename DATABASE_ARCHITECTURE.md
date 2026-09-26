@@ -69,24 +69,25 @@ This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
 CURRENT canonical setup for the database the current code expects: the
 complete ordered setup, the canonical reconciliation snapshot first, then the
-six later additive migrations, in one fenced block. There is no "step 0", no
+seven later additive migrations, in one fenced block. There is no "step 0", no
 second block to paste and no shell workflow. Open this section, copy §31.3,
 paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-all 28 repository migrations — including the Todo migration
-`20260926000001_add_todo_schedule_type.sql`.
+all 29 repository migrations — including the two Todo migrations
+`20260926000001_add_todo_schedule_type.sql` and
+`20260927000001_add_todo_steps.sql`.
 
-### 31.1 Reconciliation audit — all 28 migrations, classified against the canonical script
+### 31.1 Reconciliation audit — all 29 migrations, classified against the canonical script
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (28 files)**, not against the list any earlier document
+`supabase/migrations/` (29 files)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
 seven embedded parts) and `tests/test_canonical_schema_reconciliation.py`
 (column/constraint/seed equivalence for the snapshot).
 
-**The seven migrations whose SQL is embedded verbatim (parts 1–7 of §31.3):**
+**The eight migrations whose SQL is embedded verbatim (parts 1–8 of §31.3):**
 
 | Order | Migration | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
@@ -96,7 +97,8 @@ seven embedded parts) and `tests/test_canonical_schema_reconciliation.py`
 | 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 7** |
 | 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 7** |
 | 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 7** |
-| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 7** (the row shape is documented in §15) |
+| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 8** (the row shape is documented in §15) |
+| 8 | `20260927000001_add_todo_steps.sql` | The ONE new object of the multi-step phase: the `todo_steps` table — the ordered steps of ONE todo (`task_id` → `ai_tasks(id)` `ON DELETE CASCADE`; denormalized `owner_id`; 1-based `position` with `UNIQUE (task_id, position)`; nonblank ≤256-char `title`; `status` CHECK `active`/`completed`; CAS `version`; `completed_at` bound to the status; timestamps) + `RLS` + SELECT-only `anon`/`authenticated` policy + `NOTIFY pgrst` + a `SELECT`-based verification query. Additive: no existing table, column, index, policy, grant or row is touched | **§31.3, part 8 of 8** (the table is documented in §15) |
 
 **The other 21 migrations — the history the reconciliation snapshot already
 absorbs.** The snapshot of part 1 was audited against this entire history: its
@@ -142,9 +144,10 @@ migration creates them.
 
 1. **What was already present.** The complete canonical reconciliation SQL
    (part 1), the two Vault migrations (parts 2–3), the two Save V2 migrations
-   (parts 4–5) and the TTS settings migration (part 6) — all embedded
-   statement-for-statement, and the Todo migration's SQL (part 7) was already
-   present from the Part 1 phase.
+   (parts 4–5), the TTS settings migration (part 6) and the Todo schedule-type
+   migration (part 7) — all embedded statement-for-statement; part 8
+   (`20260927000001_add_todo_steps.sql`) was added by the multi-step phase and
+   is embedded the same way.
 2. **What was missing.** Nothing was missing from the *block* after the Part 1
    phase. What the previous §31 **prose** lacked was the audit trail: the
    earlier §31.1 listed only the seven embedded migrations and was silent on
@@ -160,23 +163,25 @@ migration creates them.
    the script carries the final constraint, never the obsolete one, which is
    exactly the migration-equivalence requirement.
 5. **What was added.** The §31.1 matrix row set above (21 historical
-   classifications + the seven embedded parts) and this note. No SQL was
-   added or removed in this pass: the block already contained every
-   migration's effective change, verified by the audit.
+   classifications + the eight embedded parts) and this note. The only SQL
+   added since the reconciliation audit is part 8 — the additive
+   `todo_steps` table of the multi-step phase, embedded verbatim from its
+   migration file.
 6. **What was corrected.** Documentation only: the §31 intro, §31.1 and §20
-   now state the current count (28 migration files; 7 embedded parts; 16
-   canonical tables) and the reconciliation claim explicitly.
+   now state the current count (29 migration files; 8 embedded parts; 16
+   canonical tables + `todo_steps`) and the reconciliation claim explicitly.
 7. **Todo-specific database changes.** Part 7 of §31.3 carries
    `20260926000001_add_todo_schedule_type.sql` in full:
    `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum, and
    `ai_tasks_actions_count` re-added as the CONDITIONAL check
-   (`schedule_type = 'todo'` → 0–5 actions; otherwise 1–5). The final
-   `ai_tasks` schema therefore accepts the unscheduled, zero-action Todo row
-   the current implementation writes (`backend/ai/database/task_repository.py`)
-   while every scheduled task keeps the original guarantees. The row shape is
-   documented in §15; no additional Todo field, no `task_steps`, no
-   `parent_task_id`, no dependency/workflow/reminder object exists anywhere
-   in the script.
+   (`schedule_type = 'todo'` → 0–5 actions; otherwise 1–5). Part 8 carries
+   `20260927000001_add_todo_steps.sql`: the `todo_steps` table — the ordered,
+   owner-scoped, CAS-guarded steps of ONE todo, `ON DELETE CASCADE` so a step
+   can never be orphaned. The final schema therefore accepts the unscheduled,
+   zero-action Todo row AND its ordered steps while every scheduled task keeps
+   the original guarantees. The row shape and the step table are documented in
+   §15; no `parent_task_id`, no dependency/workflow/reminder object exists
+   anywhere in the script, and a step is never an `ai_tasks` row.
 8. **One script.** §31.3 is ONE fenced SQL block (banner
    `ONE COMPLETE SUPABASE SETUP SCRIPT`), self-contained for a fresh
    database: extensions, all 16 canonical tables + `api_credentials`, every
@@ -240,6 +245,17 @@ migration creates them.
    enum), and reports the affected operation honestly instead of pretending it
    was persisted.
 
+8. **The Todo steps table runs last (part 8).** It is the one new object of the
+   multi-step phase: `CREATE TABLE IF NOT EXISTS todo_steps` with
+   `task_id bigint NOT NULL REFERENCES ai_tasks(id) ON DELETE CASCADE`. It
+   depends on exactly two things: `ai_tasks` existing (part 1) and the
+   schedule-type enum of part 7 being in place so the parent rows the table's
+   comments describe are legal. It touches no existing table, column, index,
+   policy or grant, so any position after part 7 is valid; it is appended last,
+   newest last, like every LATER schema change before it (§30.11). Without it
+   the application keeps every Part 1 Todo behaviour and reports step
+   operations as not-durable instead of pretending they persisted.
+
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
 > indexes last. The source proves that the search-index migration depends on a
@@ -251,8 +267,9 @@ migration creates them.
 > requested sequence. The sixth file is a LATER schema change carried by its own
 > additive migration — exactly what this document's own rule requires (§30.11) — so
 > it is appended last rather than folded into the snapshot. The seventh file
-> (`20260926000001_add_todo_schedule_type.sql`, the basic Todo row) is appended
-> the same way, for the same reason.
+> (`20260926000001_add_todo_schedule_type.sql`, the basic Todo row) and the
+> eighth file (`20260927000001_add_todo_steps.sql`, the ordered steps of one
+> todo) are appended the same way, for the same reason.
 
 ### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT
 
@@ -260,7 +277,7 @@ Copy the entire SQL block below and paste it into the Supabase SQL Editor as
 `postgres`. This block contains the complete ordered setup. No other SQL block in
 this document needs to be executed manually.
 
-The block is the seven migrations' executable SQL concatenated in order, with a
+The block is the eight migrations' executable SQL concatenated in order, with a
 part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
@@ -268,7 +285,7 @@ from. It is idempotent and additive: no row, column or existing value is rewritt
 and no Vault secret is created. On a FRESH Supabase database the block is the
 complete setup: part 1 creates every canonical table in its final shape (the
 shape the 21 pre-reconciliation migrations converge to — see §31.1) and parts
-2–7 add the Vault, Save V2, TTS and Todo objects. No placeholder, no omitted
+2–8 add the Vault, Save V2, TTS and Todo objects. No placeholder, no omitted
 section and no comment form like "add the remaining tables here" appears in it.
 
 ```sql
@@ -277,7 +294,7 @@ section and no comment form like "add the remaining tables here" appears in it.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the six pending migrations.
+-- then the seven pending migrations.
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -287,13 +304,14 @@ section and no comment form like "add the remaining tables here" appears in it.
 --   5. 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes)
 --   6. 20260923000001_add_ai_config_tts_settings.sql     (TTS settings)
 --   7. 20260926000001_add_todo_schedule_type.sql         (basic Todo items)
+--   8. 20260927000001_add_todo_steps.sql                 (multi-step todo steps)
 --
 -- Idempotent and additive: no row, column or existing value is rewritten and no
 -- Vault secret is created. Every statement is verbatim from its migration; the
 -- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── PART 1 of 7 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
+-- ─── PART 1 of 8 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
 BEGIN;
 
@@ -1869,7 +1887,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 2 of 7 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
+-- ─── PART 2 of 8 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
@@ -1992,7 +2010,7 @@ COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 3 of 7 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
+-- ─── PART 3 of 8 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -2398,7 +2416,7 @@ COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 4 of 7 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
+-- ─── PART 4 of 8 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
@@ -2412,7 +2430,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 5 of 7 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
+-- ─── PART 5 of 8 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -2431,7 +2449,7 @@ LEFT JOIN pg_indexes i
 WHERE i.indexname IS NULL
 ORDER BY 1;
 
--- ─── PART 6 of 7 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
+-- ─── PART 6 of 8 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
 
 ALTER TABLE ai_config
     ADD COLUMN IF NOT EXISTS tts_provider text;
@@ -2446,7 +2464,7 @@ WHERE table_schema = 'public'
   AND table_name   = 'ai_config'
   AND column_name IN ('tts_provider', 'tts_model', 'tts_voice');
 
--- ─── PART 7 of 7 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
+-- ─── PART 7 of 8 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
 
 ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
 
@@ -2461,6 +2479,57 @@ ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
 );
 
 NOTIFY pgrst, 'reload schema';
+
+
+-- ─── PART 8 of 8 — 20260927000001_add_todo_steps.sql (multi-step todo steps) ───
+
+CREATE TABLE IF NOT EXISTS todo_steps (
+    id           bigserial   PRIMARY KEY,
+    task_id      bigint      NOT NULL REFERENCES ai_tasks(id) ON DELETE CASCADE,
+    owner_id     bigint      NOT NULL,
+    position     integer     NOT NULL,
+    title        text        NOT NULL,
+    status       text        NOT NULL DEFAULT 'active',
+    version      integer     NOT NULL DEFAULT 1,
+    completed_at timestamptz,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT todo_steps_position_positive
+        CHECK (position > 0),
+    CONSTRAINT todo_steps_title_not_blank
+        CHECK (length(btrim(title)) > 0 AND length(title) <= 256),
+    CONSTRAINT todo_steps_status_check
+        CHECK (status IN ('active', 'completed')),
+    CONSTRAINT todo_steps_version_check
+        CHECK (version >= 1),
+    CONSTRAINT todo_steps_completed_state
+        CHECK ((status = 'completed') = (completed_at IS NOT NULL)),
+    CONSTRAINT todo_steps_task_position_key
+        UNIQUE (task_id, position)
+);
+ALTER TABLE todo_steps ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON todo_steps TO anon, authenticated;
+DROP POLICY IF EXISTS "anon_insert_todo_steps" ON todo_steps;
+DROP POLICY IF EXISTS "anon_update_todo_steps" ON todo_steps;
+DROP POLICY IF EXISTS "anon_delete_todo_steps" ON todo_steps;
+DROP POLICY IF EXISTS "anon_select_todo_steps" ON todo_steps;
+CREATE POLICY "anon_select_todo_steps" ON todo_steps FOR SELECT
+    TO anon, authenticated USING (true);
+COMMENT ON TABLE todo_steps IS
+    'The ordered steps of ONE todo (ai_tasks row with schedule_type = ''todo''). A step is not a task: it has no schedule, no action and no occurrence, and it is never executed or scheduled.';
+COMMENT ON COLUMN todo_steps.task_id IS
+    'Parent todo. ON DELETE CASCADE: deleting the todo deletes its steps, so a step can never be orphaned.';
+COMMENT ON COLUMN todo_steps.position IS
+    '1-based order inside the parent todo. Never renumbered; UNIQUE (task_id, position) makes a duplicated order impossible.';
+COMMENT ON COLUMN todo_steps.status IS
+    'active (still remaining) or completed. No other state exists in this architecture.';
+COMMENT ON COLUMN todo_steps.version IS
+    'Compare-and-set counter; a stale step mutation fails and writes nothing.';
+NOTIFY pgrst, 'reload schema';
+SELECT 'todo_steps' AS check, count(*) AS present
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name   = 'todo_steps';
 ```
 
 ### 31.4 Verification after the run
@@ -2471,9 +2540,11 @@ line names a data-guarded constraint that a pre-existing row blocked. Its Save V
 parts each end with their own verification query (`missing_canonical_column` /
 `missing_save_v2_index`: zero rows means the column / both indexes now exist), and
 its Vault parts end with `NOTIFY pgrst, 'reload schema'`. Its TTS part ends with
-its own count query over `information_schema.columns`, and its Todo part ends with
-`NOTIFY pgrst, 'reload schema'` alone: it adds no column and no index, so
-there is nothing for it to count. The functions and
+its own count query over `information_schema.columns`, its Todo schedule-type
+part ends with `NOTIFY pgrst, 'reload schema'` alone (it adds no column and no
+index, so there is nothing for it to count), and its Todo steps part ends with
+its own count query over `information_schema.tables` (zero rows would mean the
+table was not created). The functions and
 indexes can be confirmed read-only:
 
 ```sql
@@ -2519,6 +2590,10 @@ repository, which is exactly why every statement in the block is idempotent.
   zero-action row exists. The two `DROP CONSTRAINT IF EXISTS` / `ADD
   CONSTRAINT` pairs in the migration's own header (`… todo_schedule_type.sql`,
   *Rollback*) restore the exact pre-migration constraints. No row is deleted.
+* **The Todo steps part** — `DROP TABLE IF EXISTS todo_steps;` (stated in the
+  migration's own header). It destroys the step rows only: the Todos
+  themselves are untouched and keep working, and only their step lists are
+  lost. No other table, column, policy or grant is affected.
 * **The reconciliation part** — §30.9. The reconciliation is additive and has no
   safe automatic rollback; the only destructive cleanup in this repository is the
   explicitly OPTIONAL, owner-gated §30.10.
@@ -2530,9 +2605,12 @@ repository, which is exactly why every statement in the block is idempotent.
 * It does not assert the live database state, and it does not change §29 or §30:
   the per-object contracts, the byte-identical snapshot copies and the
   credential-vault documentation all stay exactly as they were.
-* It changes no runtime behaviour, provider, handler, service, dependency or
-  environment variable, and it adds no table, no column, no configuration store
-  and no second secret path of its own.
+* Its §31.1/§31.2 documentation and the part 8 embed change no runtime
+  behaviour, provider, handler, service, dependency or environment variable,
+  and add no configuration store and no second secret path. The ONE table the
+  block's Todo steps part creates (`todo_steps`) is the documented additive
+  schema change of the multi-step phase itself (§15), not a change this
+  documentation pass introduced silently.
 * The §31.1 reconciliation matrix is documentation derived from the repository
   files (migrations, source, tests); it was verified statically — statement
   identity and semantic equivalence — and **no SQL was executed against any
@@ -3396,9 +3474,74 @@ migration's widened `ai_tasks_schedule_type_check` is what makes the row legal,
 and its conditional `ai_tasks_actions_count` is what makes the empty `actions`
 legal without relaxing the 1–5 guarantee for scheduled tasks.
 
-Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no action or step table exists.
+Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no dependency, workflow or reminder object exists — the ONLY Todo-child table is `todo_steps` (below), added by the multi-step phase.
 
 RLS is enabled. The migration grants SELECT to `anon` and `authenticated` and adds no public write policy. Backend access uses the service-role client and repository methods must still filter by `owner_id`. Retain task definitions until explicit owner deletion/terminal cleanup policy is approved.
+
+### Todo steps (`todo_steps` — the multi-step Todo table)
+
+The multi-step phase adds exactly ONE new object: a Todo may own an ordered
+list of steps, each either still remaining (`active`) or `completed`. The
+table exists in the repository migration
+`supabase/migrations/20260927000001_add_todo_steps.sql`; live Supabase
+application is a separate manual deployment step and has not been verified.
+
+A step is NOT a task: it has no schedule, no action, no occurrence and no
+notification destination, it is never claimed or executed, and it is never
+returned by any task query. The durable-task tables and the Taskloom
+scheduler are untouched.
+
+    ai_tasks (schedule_type = 'todo')  1 ─── * todo_steps (ordered by position)
+
+| Column | Type | Nullable | Default / constraint |
+|---|---|---:|---|
+| `id` | `bigserial` | NO | PRIMARY KEY — stable step identity |
+| `task_id` | `bigint` | NO | The parent Todo; REFERENCES `ai_tasks(id)` **ON DELETE CASCADE** — deleting the Todo deletes its steps in the same statement, so a step can never be orphaned and no cleanup worker exists |
+| `owner_id` | `bigint` | NO | Denormalized owning Telegram user; every repository read/write filters by it (owner isolation is enforced in the repository/service, never by trusting an id from the AI) |
+| `position` | `integer` | NO | 1-based order inside the parent; never renumbered; `UNIQUE (task_id, position)` (`todo_steps_task_position_key`) makes a duplicated order structurally impossible; the user-facing step NUMBER is the ordinal in position order, always contiguous |
+| `title` | `text` | NO | The owner's own words; CHECK nonblank, ≤256 characters (the same bound as `ai_tasks.label`) |
+| `status` | `text` | NO | `'active'`; CHECK `active`, `completed` — deliberately no BLOCKED/CANCELLED/PAUSED/IN_PROGRESS, because nothing in this architecture can produce one |
+| `version` | `integer` | NO | `1`; CHECK `>= 1` — the same compare-and-set counter `ai_tasks.version` uses; a stale mutation fails closed and writes nothing |
+| `completed_at` | `timestamptz` | YES | Set when completed, NULL while active; CHECK `(status = 'completed') = (completed_at IS NOT NULL)` so the pair can never disagree |
+| `created_at` / `updated_at` | `timestamptz` | NO | `now()` |
+
+`UNIQUE (task_id, position)` is the ONLY index: it serves the ordered per-Todo
+read and the parent-key lookup `ON DELETE CASCADE` uses, and a Todo holds at
+most 50 steps, so no additional owner/task index is warranted. There is no
+`ON DELETE RESTRICT` choice here on purpose — an occurrence is execution
+history the repository deliberately deletes first (§16), while a step has no
+history value outside its parent.
+
+RLS is enabled with SELECT granted to `anon` and `authenticated` and no public
+write policy — the same read-only dashboard boundary every other table has.
+Every write goes through the backend's service-role client.
+
+**Parent/step lifecycle semantics** (application-enforced,
+`backend/ai/task_management.py`):
+
+* Creating a Todo with steps is one service operation backed by an atomic
+  repository path — Supabase writes run in one transaction (a step-insert
+  failure rolls the whole creation back), and the in-memory fallback uses a
+  compensating delete — so a Todo is never left half-created: either the
+  Todo and all its requested steps exist, or neither does.
+* Plain Todo completion is REFUSED while a step still remains; the Todo
+  detail offers an explicit **Complete all (n/m)** button that completes the
+  remaining steps and the Todo together under the Todo's CAS version.
+  Reopening a Todo never touches its steps.
+* Step completion/reopen/rename/delete each carry the step's own CAS
+  `version`; step operations are refused while the parent Todo is
+  `completed`, and completing a Todo that has remaining steps without the
+  explicit operation is refused.
+* Editing a Todo's title never renames a step; editing a step's title never
+  renames the Todo. Deleting one step never deletes the Todo and never
+  renumbers the survivors' `position` (the displayed ordinal is computed in
+  position order).
+
+Repository: `backend/ai/database/task_repository.py` (Supabase +
+`InMemoryTaskRepository` fallback, `TodoStepRecord`); service:
+`backend/ai/task_management.py` (`TaskManagementService` step operations +
+deterministic step resolution); manual UI: `backend/bot/handlers/todo.py`
+(`todo_steps` panel); AI tools: `backend/ai/tools/todo_step_tools.py`.
 
 ## 16. ai_task_occurrences
 
@@ -3431,8 +3574,10 @@ RLS is enabled. SELECT is granted to `anon` and `authenticated`; no public write
 
 ## 17. Relationships
 
-The task foundation is the one intentional enforced relationship. The
-following logical relationships exist without foreign keys:
+The task foundation and the Todo steps table are the two intentional enforced
+relationships (`ai_task_occurrences.task_id` → `ai_tasks.id` RESTRICT;
+`todo_steps.task_id` → `ai_tasks.id` CASCADE, §15). The following logical
+relationships exist without foreign keys:
 
 - `ai_messages.session_id` → `ai_sessions.session_id` (logical)
 - `ai_tool_history.session_id` → `ai_sessions.session_id` (logical)
@@ -4035,6 +4180,7 @@ migration. No code change needed.
 | 16 | `20260921000001_add_saved_items_display_name.sql` | Adds the nullable, default-less `display_name text` to `saved_items` (`ADD COLUMN IF NOT EXISTS`) — the owner-facing saved-item name — and reloads the PostgREST schema cache. Additive successor to #15: it touches no other table, creates no competing definition of `saved_items`, rewrites no row and changes no existing value (`tags` needs no DDL; only its producer changed) | **NOT APPLIED — owner action required.** Apply it BEFORE any Save surface starts writing a name (§2, *User-facing metadata*). On a database that has not run #15 it is safe only if `saved_items` already exists — #15 creates the table |
 | 17 | `20260922000001_add_saved_items_search_indexes.sql` | The Save V2 resolver's two search indexes on `saved_items`: `idx_saved_items_display_name_trgm` (GIN trigram for the `display_name ILIKE '%token%'` prefilter; enables `pg_trgm` itself) and `idx_saved_items_tags` (GIN for whole-tag containment `tags.cs.{…}`). Additive successor to #15/#16: indexes only — no column, no row, no `save_code` change; idempotent; reloads the PostgREST schema cache | **NOT APPLIED — owner action required** (§2 index table). Safe on any database that already has `saved_items` (created by #15 or earlier migrations) |
 | 18 | `20260926000001_add_todo_schedule_type.sql` | Widens exactly two existing `ai_tasks` constraints for the basic Todo item: `ai_tasks_schedule_type_check` gains `'todo'`, and `ai_tasks_actions_count` becomes conditional so a `'todo'` row stores 0–5 actions (0 in practice) while every scheduled row keeps 1–5. No table, no column, no index, no policy, no grant, no row and no backfill; ends with `NOTIFY pgrst, 'reload schema'` | **NOT APPLIED — owner action required** (§31.3, part 7 of 7; the row shape is documented in §15). Until it runs, the legacy enum and actions count still hold: a Todo *create* is rejected by the old CHECK and the application reports that honestly, while every scheduled task keeps working unchanged |
+| 19 | `20260927000001_add_todo_steps.sql` | Creates the ONE new table of the multi-step phase: `todo_steps` — the ordered steps of ONE todo. `task_id` REFERENCES `ai_tasks(id)` `ON DELETE CASCADE` (a step can never be orphaned), denormalized `owner_id` (every repository read/write filters by it), 1-based `position` with `UNIQUE (task_id, position)` (never renumbered), nonblank ≤256-char `title`, `status` CHECK `active`/`completed` (no other state exists), CAS `version` (a stale mutation writes nothing), `completed_at` bound to the status, timestamps; RLS + SELECT-only `anon`/`authenticated`; ends with `NOTIFY pgrst` and a verification query. Additive: no existing table, column, index, policy, grant or row is touched | **NOT APPLIED — owner action required** (§31.3, part 8 of 8; the table is documented in §15). Without it the application keeps every Part 1 Todo behaviour and reports step operations as not-durable instead of pretending they persisted |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,
@@ -6016,7 +6162,7 @@ code does not have.
 forward-only repair. It is **not** a rewrite of any historical migration — every
 `202607…`–`20260919…` file is byte-untouched, and the repair is followed in
 `supabase/migrations/` only by additive successors (the newest is
-`20260921000001_add_saved_items_display_name.sql`, §2).
+`20260927000001_add_todo_steps.sql`, §15).
 
 It contains the **complete** canonical script rather than a narrow
 `ALTER TABLE bot_settings ADD COLUMN value_type`, because a database may be
@@ -6026,14 +6172,17 @@ explicitly pending, §20). One idempotent script converges all of them.
 The canonical script is byte-identical in two repository files —
 `supabase/canonical_bootstrap.sql` and the migration file itself (a test enforces
 it) — and its executable statements are embedded, with the migrations' prose
-comments dropped, as part 1 of the ONE deployment block in **§31.3**. That single
+comments dropped, as part 1 of the ONE deployment block in **§31.3**; the
+additive successors that follow the snapshot (the Vault parts, the Save V2
+parts, TTS, and the two Todo parts) are embedded the same way, newest last. That single
 block is the only executable canonical SQL in this document; nothing in §30 is
 meant to be pasted on its own.
 
 The script is the reconciliation **snapshot**, not a living file. A later
 schema change arrives as its own additive migration — the newest is
-`20260921000001_add_saved_items_display_name.sql` (§2) — and the snapshot,
-the convenience copy and the §31.3 embed are never edited to absorb it. The
+`20260927000001_add_todo_steps.sql` (§15) — and the snapshot,
+the convenience copy are never edited to absorb it; the successor is appended
+to the §31.3 block as its own part instead. The
 tests enforce both halves: the two byte-identical repository copies stay
 byte-identical (and the §31.3 embed stays statement-identical to the migration),
 and every migration newer than the snapshot is additive-only (no `DROP TABLE`,
@@ -6253,8 +6402,9 @@ agent.
 
 1. Open the Supabase **SQL Editor** as `postgres` and run the ONE complete setup
    script in **§31.3** — a single fenced block that begins with the canonical
-   reconciliation snapshot and continues, in order, with the four pending
-   migrations. It is one transaction-safe, re-runnable statement batch.
+   reconciliation snapshot and continues, in order, with the seven pending
+   migrations (Vault ×2, Save V2 ×2, TTS, Todo schedule type, Todo steps). It is
+   one transaction-safe, re-runnable statement batch.
    (`supabase/canonical_bootstrap.sql` and the migration file remain the
    byte-identical convenience copies of the snapshot part.)
 2. Read the output:
@@ -6266,10 +6416,13 @@ agent.
      stale schema cache, so the API sees the new columns immediately.
 3. Nothing else has to be applied by hand: the additive migrations newer than
    the snapshot — `20260921000001_add_saved_items_display_name.sql` (the
-   nullable `saved_items.display_name`, idempotent) and
+   nullable `saved_items.display_name`, idempotent),
    `20260922000001_add_saved_items_search_indexes.sql` (the Save V2 resolver's
-   two search indexes on `saved_items`, idempotent) — are already part 4 and
-   part 5 of the §31.3 block. The snapshot is never regenerated to include them,
+   two search indexes on `saved_items`, idempotent),
+   `20260926000001_add_todo_schedule_type.sql` (the basic Todo row's two
+   widened constraints) and `20260927000001_add_todo_steps.sql` (the
+   `todo_steps` table of the multi-step phase) — are already parts 4, 5, 7 and
+   8 of the §31.3 block. The snapshot is never regenerated to include them,
    so the two byte-identical repository copies stay byte-identical.
 4. Nothing else is required: no new table to create by hand, no env var, no
    Render setting, no Supabase Vault change.

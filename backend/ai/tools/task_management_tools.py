@@ -122,8 +122,10 @@ class TaskInspectTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Inspect one scheduled task by id: label, status, version, "
-            "schedule, timezone, and recent occurrences."
+            "Inspect one task by id: label, status, version, schedule, "
+            "timezone, and recent occurrences. A TODO instead reports its "
+            "ordered steps: how many are completed, the numbered list and "
+            "which step is next."
         )
 
     @property
@@ -158,6 +160,35 @@ class TaskInspectTool(Tool):
             return ToolResult(success=False, message="A positive task_id is required.")
         try:
             service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            # A todo reports what a todo really has: its step progress. The
+            # scheduled-task rendering below is unchanged.
+            todo = await service.owner_todo(task_id)
+            if todo is not None:
+                from backend.ai.task_management import step_progress_of
+                from backend.ai.task_management_interface import (
+                    steps_block_text,
+                    todo_detail_text,
+                )
+
+                steps = list(await service.list_steps(todo.id) or [])
+                progress = step_progress_of(steps)
+                message = (
+                    f"{todo_detail_text(todo, progress)}\n\n"
+                    f"{steps_block_text(todo, steps, progress)}"
+                )
+                return ToolResult(
+                    success=True,
+                    message=message,
+                    data={
+                        "task_id": int(todo.id),
+                        "title": str(todo.label),
+                        "status": str(todo.status),
+                        "version": int(todo.version),
+                        "steps_total": int(progress.total),
+                        "steps_completed": int(progress.completed),
+                        "steps_remaining": int(progress.remaining),
+                    },
+                )
             result = await inspect_text(service, task_id)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task inspect failed: {exc}")
@@ -202,8 +233,11 @@ class TaskTransitionTool(Tool):
             "again. Requires the task's CURRENT version (from task_list, "
             "task_inspect or todo_find) — a stale version fails and nothing "
             "changes. A todo may instead be addressed by a title reference "
-            "(query), which resolves only when exactly one todo matches. Use "
-            "task_delete to remove a task permanently."
+            "(query), which resolves only when exactly one todo matches. "
+            "A todo that still has steps cannot be completed with "
+            "action='completed' alone: either finish those steps first, or pass "
+            "complete_steps=true to complete the todo TOGETHER with the steps "
+            "it still has. Use task_delete to remove a task permanently."
         )
 
     @property
@@ -230,6 +264,16 @@ class TaskTransitionTool(Tool):
                     "Instead of task_id/expected_version, for a TODO: the "
                     "owner's own title reference; it resolves only when "
                     "exactly one todo matches."
+                ),
+            },
+            "complete_steps": {
+                "type": "boolean",
+                "description": (
+                    "For a TODO completed with action='completed': also complete "
+                    "the steps it still has, so the todo is never reported as "
+                    "finished while one of its steps remains. Never completes a "
+                    "todo silently — without it the request is refused and names "
+                    "what is left."
                 ),
             },
         }
@@ -293,6 +337,7 @@ class TaskTransitionTool(Tool):
                 ),
             )
 
+        complete_steps = bool(arguments.get("complete_steps"))
         service = None
         prior_status = ""
         try:
@@ -303,7 +348,16 @@ class TaskTransitionTool(Tool):
                 # every transition.
                 prior = await service.repository.get_task(service.owner_id, task_id)
                 prior_status = str(getattr(prior, "status", "") or "")
-            task = await service.set_status(task_id, status, expected_version=version)
+            if status == "completed" and complete_steps:
+                # The ONE operation that finishes a todo AND the steps it still
+                # has; plain completion stays refused while a step remains.
+                task = await service.complete_todo_with_steps(task_id, version)
+            else:
+                task = await service.set_status(task_id, status, expected_version=version)
+        except ValueError as exc:
+            # A refusal the owner must read ("a todo is completed or reopened, "
+            # never paused" / "Todo #12 is not complete: 2 of 3 steps remain").
+            return ToolResult(success=False, message=str(exc))
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task transition failed: {exc}")
         if task is None:

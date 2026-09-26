@@ -68,6 +68,12 @@ CANONICAL_TABLES = (
 # Tables the canonical contract deliberately does NOT contain (§30.2).
 NON_CANONICAL_TABLES = ("ai_preferences",)
 
+#: Tables created AFTER the frozen reconciliation snapshot by their own additive
+#: successor migrations. They are part of the current documented schema (§31.3
+#: parts after part 1; §15 for todo_steps) but are deliberately NOT in the
+#: canonical snapshot and must never be folded back into it.
+SUCCESSOR_TABLES = ("todo_steps",)
+
 # Identifiers that are SQL keywords/functions, not columns.
 _NON_COLUMN_TOKENS = {
     "select", "from", "where", "and", "or", "not", "null", "is", "in", "between",
@@ -696,8 +702,8 @@ def doc_setup_block() -> str:
 def doc_reconciliation_segment() -> str:
     """Part 1 of the setup block — the canonical snapshot, comment-stripped."""
     block = doc_setup_block()
-    start = block.index("-- ─── PART 1 of 7")
-    end = block.index("-- ─── PART 2 of 7")
+    start = block.index("-- ─── PART 1 of 8")
+    end = block.index("-- ─── PART 2 of 8")
     return block[start:end]
 
 
@@ -1181,8 +1187,15 @@ def test_no_migration_creates_a_table_that_the_documentation_does_not_classify()
     created: set[str] = set()
     for path in MIGRATIONS_DIR.glob("*.sql"):
         created |= set(declared_column_sets(path.read_text(encoding="utf-8")))
-    known = set(CANONICAL_TABLES) | set(NON_CANONICAL_TABLES)
+    known = set(CANONICAL_TABLES) | set(NON_CANONICAL_TABLES) | set(SUCCESSOR_TABLES)
     assert created <= known, f"undocumented tables created by migrations: {sorted(created - known)}"
+    # A successor table must stay OUT of the frozen snapshot: it belongs to its
+    # own additive migration and its own §31.3 part, never to part 1.
+    for table in SUCCESSOR_TABLES:
+        assert table not in declared_column_sets(script_text()), (
+            f"{table} must stay a successor table, not a canonical one"
+        )
+        assert table in DOC.read_text(encoding="utf-8"), f"{table} must be documented"
 
 
 def test_the_reconciliation_script_keeps_the_documented_security_model():

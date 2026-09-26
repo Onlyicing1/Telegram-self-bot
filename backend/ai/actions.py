@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.ai.database.task_repository import MAX_STEPS_PER_ADD
 from backend.ai.persian import coerce_int, normalize_digits
 from backend.ai.semantic_delete import parse_structural_predicate, spec_from_dict
 from backend.ai.tools.message import MAX_SEND_TEXT_CHARS
@@ -50,6 +51,11 @@ ACTION_NAMES = frozenset({
     "todo_add",
     "todo_find",
     "todo_edit",
+    "todo_step_add",
+    "todo_step_list",
+    "todo_step_transition",
+    "todo_step_edit",
+    "todo_step_delete",
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
@@ -83,6 +89,11 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "todo_add",
     "todo_find",
     "todo_edit",
+    "todo_step_add",
+    "todo_step_list",
+    "todo_step_transition",
+    "todo_step_edit",
+    "todo_step_delete",
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
@@ -122,7 +133,8 @@ ALLOWED_FIELDS = frozenset({
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
     "task_id", "action_status", "expected_version", "save_code", "status",
-    "display_name", "file_name", "tags", "title",
+    "display_name", "file_name", "tags", "title", "steps", "complete_steps",
+    "step", "step_query",
 })
 
 # The Save actions — the ones that may carry the owner's saved-item metadata
@@ -212,6 +224,13 @@ class ActionParseResult:
     display_name: str = ""
     file_name: str = ""
     tags: list[str] | None = None
+    # Multi-step Todos: the ordered step titles a create/add carries, the step
+    # reference (its 1-based number, or its own words), and the explicit flag
+    # that completes a todo TOGETHER with the steps it still has.
+    steps: list[str] | None = None
+    step: int | None = None
+    step_query: str = ""
+    complete_steps: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -365,10 +384,18 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
     # ``title`` is the owner's own words for a todo — a create or a rename.
     # Nothing else can carry it: a task's own content lives in its actions.
-    if "title" in raw and action not in ("todo_add", "todo_edit"):
+    if "title" in raw and action not in (
+        "todo_add",
+        "todo_edit",
+        "todo_step_add",
+        "todo_step_edit",
+    ):
         return ActionParseResult(
             kind=KIND_INVALID,
-            error="'title' is only valid for the todo_add/todo_edit actions.",
+            error=(
+                "'title' is only valid for the todo_add/todo_edit and "
+                "todo_step_add/todo_step_edit actions."
+            ),
         )
 
     # ``save_code`` is only meaningful for the saved-item actions. It is
@@ -388,7 +415,20 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     # ``task_id``/``expected_version``/``action`` status fields are only
     # meaningful for the task lifecycle actions.
     _TASK_ONLY_FIELDS = ("task_id", "expected_version")
-    if action not in ("task_inspect", "task_transition", "task_delete", "todo_edit"):
+    # The multi-step Todo actions address their PARENT todo by the same id, so
+    # ``task_id`` is valid for them too (``expected_version`` is not: a step
+    # carries its own CAS version, read by the resolver).
+    if action not in (
+        "task_inspect",
+        "task_transition",
+        "task_delete",
+        "todo_edit",
+        "todo_step_add",
+        "todo_step_list",
+        "todo_step_transition",
+        "todo_step_edit",
+        "todo_step_delete",
+    ):
         for field_name in _TASK_ONLY_FIELDS:
             if field_name in raw:
                 return ActionParseResult(
@@ -398,6 +438,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
                         "task_inspect/task_transition/todo_edit actions."
                     ),
                 )
+    # A step mutation never carries a todo version: the resolver reads the
+    # todo and the step it belongs to, and the write is guarded by the STEP's
+    # own version.
+    if "expected_version" in raw and action.startswith("todo_step_"):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'expected_version' is not used by the todo_step actions.",
+        )
 
     # ``status`` is only meaningful for the task_list action (an optional
     # status filter on the read). The lifecycle actions express their target
@@ -413,6 +461,15 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
     if action in ("todo_add", "todo_find", "todo_edit"):
         return _validate_todo_action(action, raw)
+
+    if action in (
+        "todo_step_add",
+        "todo_step_list",
+        "todo_step_transition",
+        "todo_step_edit",
+        "todo_step_delete",
+    ):
+        return _validate_todo_step_action(action, raw)
 
     if action in _SAVE_ITEM_ACTIONS:
         return _validate_saved_item_action(action, raw)
@@ -674,14 +731,28 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 # ── Task lifecycle + saved-item retrieval actions ──
 
 _TASK_INSPECT_FIELDS = frozenset({"action", "task_id"})
-_TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version", "query"})
+# ``complete_steps`` completes a todo TOGETHER with the steps it still has —
+# never silently, and never without the explicit flag.
+_TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version", "query", "complete_steps"})
 _TASK_DELETE_FIELDS = frozenset({"action", "task_id", "expected_version", "query"})
 # The basic Todo actions. ``title`` is the owner's own words for the todo (a
 # create or a rename) and ``query`` is a TITLE REFERENCE the deterministic
-# resolver turns into 0/1/N candidates — never a guess.
-_TODO_ADD_FIELDS = frozenset({"action", "title"})
+# resolver turns into 0/1/N candidates — never a guess. ``steps`` creates the
+# todo's ordered steps in the SAME operation (all or nothing).
+_TODO_ADD_FIELDS = frozenset({"action", "title", "steps"})
 _TODO_FIND_FIELDS = frozenset({"action", "query"})
 _TODO_EDIT_FIELDS = frozenset({"action", "title", "task_id", "expected_version", "query"})
+# The step actions. The PARENT todo is addressed exactly like the todo actions
+# above (``task_id`` or the owner's own words in ``query``); the STEP is
+# addressed by its 1-based number (``step``) or by its own words
+# (``step_query``) — scoped to that parent only.
+_TODO_STEP_ADD_FIELDS = frozenset({"action", "steps", "title", "task_id", "query"})
+_TODO_STEP_LIST_FIELDS = frozenset({"action", "task_id", "query"})
+_TODO_STEP_TRANSITION_FIELDS = frozenset({"action", "action_status", "step", "step_query", "task_id", "query"})
+_TODO_STEP_EDIT_FIELDS = frozenset({"action", "title", "step", "step_query", "task_id", "query"})
+_TODO_STEP_DELETE_FIELDS = frozenset({"action", "step", "step_query", "task_id", "query"})
+# The step vocabulary: a step is completed or reopened, nothing else.
+_STEP_STATUS_VOCABULARY = frozenset({"completed", "active"})
 # The todo title bound — the SAME 256-character bound the task service and the
 # repository enforce for every label.
 _MAX_TODO_TITLE_CHARS = 256
@@ -746,6 +817,16 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
             error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
         )
 
+    # ``complete_steps`` finishes a todo together with its remaining steps; it
+    # is an explicit boolean and is only meaningful for a completion, so it can
+    # never silently ride along with a pause/resume/reopen.
+    complete_steps = raw.get("complete_steps")
+    if complete_steps is not None and not isinstance(complete_steps, bool):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'complete_steps' must be true or false.",
+        )
+
     # A todo can be addressed by the OWNER'S OWN WORDS instead of an id: the
     # tool's deterministic resolver then decides which todo (0 matches ->
     # nothing was found, 2 or more -> the candidate list). No id or version is
@@ -784,12 +865,18 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
                     "(allowed: paused, active, completed)."
                 ),
             )
+        if complete_steps and status.strip().lower() != "completed":
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="'complete_steps' is only valid with action_status 'completed'.",
+            )
         return ActionParseResult(
             kind=KIND_EXECUTABLE,
             action=action,
             target="schedule",
             query=query,
             action_status=status.strip().lower(),
+            complete_steps=bool(complete_steps),
         )
 
     task_id = coerce_int(raw.get("task_id"))
@@ -831,6 +918,11 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
                 "(allowed: paused, active, completed)."
             ),
         )
+    if complete_steps and status.strip().lower() != "completed":
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'complete_steps' is only valid with action_status 'completed'.",
+        )
     version = coerce_int(raw.get("expected_version"))
     if version is None or version <= 0:
         return ActionParseResult(
@@ -844,6 +936,7 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
         task_id=task_id,
         action_status=status.strip().lower(),
         expected_version=version,
+        complete_steps=bool(complete_steps),
     )
 
 
@@ -896,7 +989,15 @@ def _validate_todo_action(action: str, raw: dict[str, Any]) -> ActionParseResult
             error=f"'title' for {action} must be at most {_MAX_TODO_TITLE_CHARS} characters.",
         )
     if action == "todo_add":
-        return ActionParseResult(kind=KIND_EXECUTABLE, action=action, text=title)
+        # A multi-step request creates the todo AND its ordered steps in ONE
+        # validated action; the steps are the owner's own words (never
+        # invented) and there is no half-created structure (see the tool).
+        steps = _step_titles(raw.get("steps"), action)
+        if isinstance(steps, ActionParseResult):
+            return steps
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE, action=action, text=title, steps=steps
+        )
 
     # A rename addresses ONE todo: by id with the CAS version, or by a title
     # reference — never by both and never by neither.
@@ -930,6 +1031,220 @@ def _validate_todo_action(action: str, raw: dict[str, Any]) -> ActionParseResult
         text=title,
         task_id=task_id,
         expected_version=version,
+    )
+
+
+def _step_titles(raw_steps: Any, action: str) -> list[str] | ActionParseResult:
+    """Validate the ordered step titles ONE create/add action carries.
+
+    Returns the normalized titles, or the refusal to return unchanged, so both
+    the create and the add path share ONE bound and one wording for every
+    rejection. Step titles are the owner's own words — never invented, never
+    filled in with a placeholder — and the list is applied all-or-nothing.
+    """
+    if raw_steps is None:
+        return []
+    if not isinstance(raw_steps, list):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"'steps' for {action} must be a list of titles.",
+        )
+    # An explicitly empty list means "no steps asked for": for a CREATE that is
+    # the same todo a request without steps makes (the caller's own emptiness
+    # check below decides whether the action needs titles at all).
+    if len(raw_steps) > MAX_STEPS_PER_ADD:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                f"'steps' for {action} must hold at most "
+                f"{MAX_STEPS_PER_ADD} entries."
+            ),
+        )
+    titles: list[str] = []
+    for entry in raw_steps:
+        if not isinstance(entry, str) or not entry.strip():
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    f"Every entry of 'steps' for {action} must be a "
+                    "nonblank title."
+                ),
+            )
+        text = " ".join(entry.split())
+        if len(text) > _MAX_TODO_TITLE_CHARS:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    f"Every entry of 'steps' for {action} must be at most "
+                    f"{_MAX_TODO_TITLE_CHARS} characters."
+                ),
+            )
+        titles.append(text)
+    return titles
+
+
+def _validate_todo_step_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
+    """Validate one multi-step Todo action object.
+
+    The PARENT todo is addressed exactly like every other Todo action — its id
+    (``task_id``) or the owner's own words (``query``), which the shared
+    deterministic resolver turns into 0/1/N candidates. The STEP is addressed
+    INSIDE that todo by its 1-based number (``step``) or by its own words
+    (``step_query``), so a step of another todo is never in scope. Nothing is
+    guessed, no id is invented, and an ambiguous reference can never reach a
+    mutation: the tools read the real rows and refuse to choose.
+    """
+    allowed = {
+        "todo_step_add": _TODO_STEP_ADD_FIELDS,
+        "todo_step_list": _TODO_STEP_LIST_FIELDS,
+        "todo_step_transition": _TODO_STEP_TRANSITION_FIELDS,
+        "todo_step_edit": _TODO_STEP_EDIT_FIELDS,
+        "todo_step_delete": _TODO_STEP_DELETE_FIELDS,
+    }[action]
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
+        )
+
+    query = raw.get("query")
+    query = query.strip() if isinstance(query, str) else ""
+    if len(query) > _MAX_TODO_QUERY_CHARS:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"'query' for {action} must be at most {_MAX_TODO_QUERY_CHARS} characters.",
+        )
+    task_id = coerce_int(raw.get("task_id"))
+    if task_id is not None and (task_id <= 0 or query):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Provide either 'task_id' or 'query' for {action}, not both.",
+        )
+
+    step = coerce_int(raw.get("step"))
+    step_query = raw.get("step_query")
+    step_query = step_query.strip() if isinstance(step_query, str) else ""
+    if step is not None and (step <= 0 or step_query):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Provide either 'step' or 'step_query' for {action}, not both.",
+        )
+    if len(step_query) > _MAX_TODO_QUERY_CHARS:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"'step_query' for {action} must be at most {_MAX_TODO_QUERY_CHARS} characters.",
+        )
+    if (
+        action in ("todo_step_transition", "todo_step_edit", "todo_step_delete")
+        and step is None
+        and not step_query
+    ):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                f"Which step? 'step' (its number) or 'step_query' is required "
+                f"for {action}."
+            ),
+        )
+
+    if action == "todo_step_add":
+        titles: list[str] = []
+        title = raw.get("title")
+        if title is not None:
+            if not isinstance(title, str) or not title.strip():
+                return ActionParseResult(
+                    kind=KIND_INVALID,
+                    error="Missing or invalid 'title' for todo_step_add.",
+                )
+            text = " ".join(title.split())
+            if len(text) > _MAX_TODO_TITLE_CHARS:
+                return ActionParseResult(
+                    kind=KIND_INVALID,
+                    error=(
+                        f"'title' for todo_step_add must be at most "
+                        f"{_MAX_TODO_TITLE_CHARS} characters."
+                    ),
+                )
+            titles.append(text)
+        from_list = _step_titles(raw.get("steps"), action)
+        if isinstance(from_list, ActionParseResult):
+            return from_list
+        titles.extend(from_list)
+        if not titles:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Missing 'steps' (or 'title') for todo_step_add.",
+            )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            steps=titles,
+            task_id=task_id,
+            query=query,
+        )
+
+    if action == "todo_step_list":
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE, action=action, task_id=task_id, query=query
+        )
+
+    if action == "todo_step_edit":
+        title = raw.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Missing or invalid 'title' for todo_step_edit.",
+            )
+        text = " ".join(title.split())
+        if len(text) > _MAX_TODO_TITLE_CHARS:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    f"'title' for todo_step_edit must be at most "
+                    f"{_MAX_TODO_TITLE_CHARS} characters."
+                ),
+            )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            text=text,
+            step=step,
+            step_query=step_query,
+            task_id=task_id,
+            query=query,
+        )
+
+    if action == "todo_step_delete":
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            step=step,
+            step_query=step_query,
+            task_id=task_id,
+            query=query,
+        )
+
+    status = raw.get("action_status")
+    if (
+        not isinstance(status, str)
+        or status.strip().lower() not in _STEP_STATUS_VOCABULARY
+    ):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                "Invalid 'action_status' for todo_step_transition "
+                "(allowed: completed, active)."
+            ),
+        )
+    return ActionParseResult(
+        kind=KIND_EXECUTABLE,
+        action=action,
+        action_status=status.strip().lower(),
+        step=step,
+        step_query=step_query,
+        task_id=task_id,
+        query=query,
     )
 
 
@@ -1109,6 +1424,29 @@ def _save_metadata_arguments(result: ActionParseResult) -> dict[str, Any]:
     return arguments
 
 
+def _parent_arguments(result: ActionParseResult) -> dict[str, Any]:
+    """The parent-todo addressing arguments (its id, or the owner's own words).
+
+    A title reference travels verbatim; the tool's deterministic resolver then
+    answers 0/1/N and refuses to choose among several matches.
+    """
+    if result.query:
+        return {"query": result.query}
+    if result.task_id:
+        return {"task_id": int(result.task_id)}
+    return {}
+
+
+def _step_arguments(result: ActionParseResult) -> dict[str, Any]:
+    """The parent todo PLUS the step reference (1-based number or own words)."""
+    arguments = _parent_arguments(result)
+    if result.step is not None:
+        arguments["step"] = int(result.step)
+    if result.step_query:
+        arguments["step_query"] = result.step_query
+    return arguments
+
+
 def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
     """Resolve a validated action into concrete tool calls for the ToolExecutor.
 
@@ -1187,20 +1525,24 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
 
     if action == "task_transition":
         # A title reference resolves inside the tool (deterministically, and
-        # only for a todo); an id keeps its explicit CAS version.
+        # only for a todo); an id keeps its explicit CAS version. The explicit
+        # ``complete_steps`` flag travels with the completion (never implied).
         if result.query:
-            return [{
-                "name": "task_transition",
-                "arguments": {"query": result.query, "action": result.action_status},
-            }]
-        return [{
-            "name": "task_transition",
-            "arguments": {
-                "task_id": result.task_id,
+            transition_arguments: dict[str, Any] = {
+                "query": result.query,
                 "action": result.action_status,
-                "expected_version": result.expected_version,
-            },
-        }]
+            }
+            if result.complete_steps:
+                transition_arguments["complete_steps"] = True
+            return [{"name": "task_transition", "arguments": transition_arguments}]
+        transition_arguments = {
+            "task_id": result.task_id,
+            "action": result.action_status,
+            "expected_version": result.expected_version,
+        }
+        if result.complete_steps:
+            transition_arguments["complete_steps"] = True
+        return [{"name": "task_transition", "arguments": transition_arguments}]
 
     if action == "task_delete":
         # Deletion is a REAL row removal through the dedicated tool/service
@@ -1218,10 +1560,36 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         }]
 
     if action == "todo_add":
-        return [{"name": "todo_add", "arguments": {"title": result.text}}]
+        # A multi-step create travels as ONE call: the title AND the ordered
+        # steps, so the todo and its steps are created together (all or none).
+        add_arguments = {"title": result.text}
+        if result.steps:
+            add_arguments["steps"] = list(result.steps)
+        return [{"name": "todo_add", "arguments": add_arguments}]
 
     if action == "todo_find":
         return [{"name": "todo_find", "arguments": {"query": result.query}}]
+
+    if action == "todo_step_add":
+        step_add_arguments: dict[str, Any] = {"steps": list(result.steps or [])}
+        step_add_arguments.update(_parent_arguments(result))
+        return [{"name": "todo_step_add", "arguments": step_add_arguments}]
+
+    if action == "todo_step_list":
+        return [{"name": "todo_step_list", "arguments": _parent_arguments(result)}]
+
+    if action == "todo_step_transition":
+        step_arguments = _step_arguments(result)
+        step_arguments["action"] = result.action_status
+        return [{"name": "todo_step_transition", "arguments": step_arguments}]
+
+    if action == "todo_step_edit":
+        step_edit_arguments = _step_arguments(result)
+        step_edit_arguments["title"] = result.text
+        return [{"name": "todo_step_edit", "arguments": step_edit_arguments}]
+
+    if action == "todo_step_delete":
+        return [{"name": "todo_step_delete", "arguments": _step_arguments(result)}]
 
     if action == "todo_edit":
         # The new title travels verbatim; the target is either the id with its

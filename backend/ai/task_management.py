@@ -10,11 +10,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.ai.database.task_repository import (
+    MAX_STEPS_PER_ADD,
+    MAX_STEPS_PER_TODO,
     TASK_STATUSES,
     TaskDeletionResult,
     TaskRecord,
     TaskRepository,
+    TodoStepRecord,
     is_todo_schedule_type,
+    normalize_step_title,
 )
 from backend.ai.scheduling import ScheduleError, advance_interval, next_occurrence, parse_schedule
 from backend.ai.task_creation import MAX_TODO_TITLE_CHARS, initial_next_run
@@ -140,6 +144,106 @@ def format_todo_resolution(resolution: TodoResolution) -> str:
         )
     if resolution.overflowed:
         lines.append("…and more")
+    return "\n".join(lines)
+
+
+# ── The ordered steps of ONE todo ───────────────────────────────────────────
+#
+# A step is resolved INSIDE an already-resolved parent todo, so the steps of
+# another todo (and every other owner's steps) are never in scope. The two
+# addressing modes are the same two the todo resolver uses — identity (the
+# 1-based ORDINAL in position order) and the owner's own words — and the same
+# 0/1/N contract applies: an ambiguous reference is answered with the candidate
+# list and never narrowed by a guess.
+STEP_TARGET_OK = "ok"
+STEP_TARGET_NOT_FOUND = "not_found"
+STEP_TARGET_AMBIGUOUS = "ambiguous"
+STEP_TARGET_INVALID = "invalid"
+
+# The bounded candidate list a clarification shows (mirrors the todo cap).
+MAX_STEP_CANDIDATES = 8
+_MAX_STEP_QUERY_CHARS = 128
+_MAX_STEP_QUERY_TOKENS = 12
+# Positions are never renumbered, so an append is the only ordering operation:
+# the lock serializes the position computation process-wide (one loop, one
+# owner) so two concurrent adds cannot both claim the same next position. The
+# UNIQUE (task_id, position) constraint stays the structural backstop.
+_STEP_MUTATION_LOCK = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class TodoStepCandidate:
+    """One step the owner can act on: identity, ordinal, title, version."""
+
+    step_id: int
+    ordinal: int
+    title: str
+    status: str
+    version: int
+
+
+@dataclass(frozen=True)
+class TodoStepTarget:
+    """The resolver's answer for a step mutation: one step, or why not.
+
+    Only ``ok`` carries a ``step`` (the freshly read record, so the caller's
+    CAS update uses the CURRENT version). ``message`` is the owner-facing
+    rendering of a refusal and is empty on success.
+    """
+
+    status: str
+    task_id: int = 0
+    step: TodoStepRecord | None = None
+    ordinal: int = 0
+    message: str = ""
+    candidates: tuple[TodoStepCandidate, ...] = ()
+
+
+@dataclass(frozen=True)
+class StepProgress:
+    """How far ONE todo's ordered steps are — the single progress source.
+
+    ``label`` is the compact line every surface renders, and ``next_step`` is
+    the first step still remaining in position order (None when none remain).
+    """
+
+    total: int = 0
+    completed: int = 0
+    next_step: TodoStepRecord | None = None
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.total - self.completed)
+
+    @property
+    def label(self) -> str:
+        return f"{self.completed} / {self.total} steps completed"
+
+
+def step_progress_of(steps: list[TodoStepRecord]) -> StepProgress:
+    """Compute the progress of an ALREADY read step list (no second read)."""
+    completed = sum(1 for step in steps if str(step.status) == "completed")
+    next_step = next(
+        (step for step in steps if str(step.status) != "completed"), None
+    )
+    return StepProgress(total=len(steps), completed=completed, next_step=next_step)
+
+
+def step_candidate_label(candidate: TodoStepCandidate) -> str:
+    """One candidate's display title (never invented, never truncated)."""
+    return " ".join(str(candidate.title or "").split()) or f"Step {candidate.ordinal}"
+
+
+def format_step_resolution(target: TodoStepTarget) -> str:
+    """Owner-facing rendering of a 0- or N-candidate step resolution."""
+    if target.status != STEP_TARGET_AMBIGUOUS:
+        return target.message
+    lines = [target.message]
+    for candidate in target.candidates:
+        lines.append(
+            f"{candidate.ordinal}. {step_candidate_label(candidate)} "
+            f"· {candidate.status}"
+        )
     return "\n".join(lines)
 
 
@@ -277,6 +381,271 @@ class TaskManagementService:
         occurrences = await self.repository.list_occurrences(self.owner_id, task_id, occurrence_limit)
         return TaskView(task, occurrences)
 
+    async def owner_todo(self, task_id: Any) -> TaskRecord | None:
+        """The owner's todo with this id, or None (never a scheduled task).
+
+        Every step operation starts here, so a step can only ever be reached
+        through ITS OWN parent todo, read under the owner's scope.
+        """
+        identifier = _coerce_positive_int(task_id)
+        if identifier is None:
+            return None
+        task = await self.repository.get_task(self.owner_id, identifier)
+        if task is None or not is_todo_schedule_type(task.schedule_type):
+            return None
+        return task
+
+    async def list_steps(self, task_id: Any) -> list[TodoStepRecord] | None:
+        """The owner's steps of ONE todo, in position order.
+
+        ``None`` means the id is not one of the owner's todos (missing, a
+        scheduled task, or another owner's row) — never an empty list, so a
+        caller can never render "no steps" for a todo it may not see.
+        """
+        task = await self.owner_todo(task_id)
+        if task is None:
+            return None
+        return await self.repository.list_steps(self.owner_id, task.id)
+
+    async def step_progress(self, task_id: Any) -> StepProgress | None:
+        """Progress of ONE todo's steps, or None when it is not the owner's."""
+        steps = await self.list_steps(task_id)
+        if steps is None:
+            return None
+        return step_progress_of(steps)
+
+    async def add_steps(self, task_id: Any, titles: list[Any]) -> list[TodoStepRecord] | None:
+        """Append steps to ONE todo, in the order given — all of them or none.
+
+        Refused on a COMPLETED todo: adding work to a finished todo would
+        create exactly the state the lifecycle forbids (a completed todo with a
+        remaining step), so the owner reopens it first and the message says so.
+        Returns ``None`` when the id is not the owner's todo; a rejected title
+        raises instead of storing a placeholder.
+        """
+        task = await self.owner_todo(task_id)
+        if task is None:
+            return None
+        if str(task.status) != "active":
+            raise ValueError(
+                f"Todo #{task.id} is completed — reopen it before adding steps"
+            )
+        cleaned = [normalize_step_title(title) for title in titles]
+        if not cleaned:
+            raise ValueError("at least one step is required")
+        if len(cleaned) > MAX_STEPS_PER_ADD:
+            raise ValueError(f"at most {MAX_STEPS_PER_ADD} steps can be added at once")
+        existing = await self.repository.list_steps(self.owner_id, task.id)
+        if len(existing) + len(cleaned) > MAX_STEPS_PER_TODO:
+            raise ValueError(f"a todo holds at most {MAX_STEPS_PER_TODO} steps")
+        async with _STEP_MUTATION_LOCK:
+            return await self.repository.create_steps(self.owner_id, task.id, cleaned)
+
+    async def get_step(self, step_id: Any) -> TodoStepRecord | None:
+        """Read ONE owner-scoped step (the parent is checked by the callers)."""
+        identifier = _coerce_positive_int(step_id)
+        if identifier is None:
+            return None
+        return await self.repository.get_step(self.owner_id, identifier)
+
+    async def set_step_status(
+        self, step_id: Any, status: str, expected_version: int
+    ) -> TodoStepRecord | None:
+        """Complete or reopen ONE step under its own CAS version.
+
+        A COMPLETED todo's step can never be reopened: that would leave the
+        finished todo with remaining work, which is the one state the todo
+        lifecycle forbids. Completing is always allowed (it can only reduce
+        what remains). Returns ``None`` for a missing/foreign step or a stale
+        version — nothing is written in either case.
+        """
+        if status not in ("active", "completed"):
+            raise ValueError("a step is completed or reopened, never anything else")
+        step = await self.get_step(step_id)
+        if step is None:
+            return None
+        if status == "active":
+            task = await self.owner_todo(step.task_id)
+            if task is not None and str(task.status) != "active":
+                raise ValueError(
+                    f"Todo #{task.id} is completed — reopen the todo first"
+                )
+        return await self.repository.update_step(
+            self.owner_id, step.id, expected_version, {"status": status}
+        )
+
+    async def complete_step(
+        self, step_id: Any, expected_version: int
+    ) -> TodoStepRecord | None:
+        return await self.set_step_status(step_id, "completed", expected_version)
+
+    async def reopen_step(
+        self, step_id: Any, expected_version: int
+    ) -> TodoStepRecord | None:
+        return await self.set_step_status(step_id, "active", expected_version)
+
+    async def rename_step(
+        self, step_id: Any, expected_version: int, title: Any
+    ) -> TodoStepRecord | None:
+        """Rename ONE step — the parent todo's title is never touched."""
+        text = normalize_step_title(title)
+        step = await self.get_step(step_id)
+        if step is None:
+            return None
+        return await self.repository.update_step(
+            self.owner_id, step.id, expected_version, {"title": text}
+        )
+
+    async def delete_step(self, step_id: Any, expected_version: int) -> bool:
+        """Remove ONE step under CAS; the parent todo always survives it."""
+        identifier = _coerce_positive_int(step_id)
+        if identifier is None:
+            return False
+        return await self.repository.delete_step(
+            self.owner_id, identifier, expected_version
+        )
+
+    async def resolve_step(
+        self, task_id: Any, *, number: Any = None, query: Any = ""
+    ) -> TodoStepTarget:
+        """Resolve ONE step WITHIN one owner-scoped todo, or refuse explicitly.
+
+        Deterministic, in the same three tiers as the todo resolver: the
+        ordinal is identity, an all-tokens substring match comes next, and the
+        whole title occurring inside the owner's sentence last. 0 matches is an
+        honest not-found, 2 or more is the candidate list — never a guess.
+        """
+        task = await self.owner_todo(task_id)
+        if task is None:
+            return TodoStepTarget(
+                status=STEP_TARGET_NOT_FOUND,
+                message=f"No todo found for #{task_id}.",
+            )
+        steps = await self.repository.list_steps(self.owner_id, task.id)
+        ordinal = _coerce_positive_int(number)
+        raw_query = " ".join(str(query or "").split())
+        if ordinal is not None and raw_query:
+            return TodoStepTarget(
+                status=STEP_TARGET_INVALID,
+                task_id=task.id,
+                message="Provide either a step number or a title — not both.",
+            )
+        if ordinal is None and not raw_query:
+            return TodoStepTarget(
+                status=STEP_TARGET_INVALID,
+                task_id=task.id,
+                message="A step number or a step title is required.",
+            )
+        if not steps:
+            return TodoStepTarget(
+                status=STEP_TARGET_NOT_FOUND,
+                task_id=task.id,
+                message=f"Todo #{task.id} has no steps yet.",
+            )
+
+        # ``position`` values are never renumbered, so the user-facing step
+        # NUMBER is the ordinal in position order — always contiguous.
+        ordered = list(steps)
+        if ordinal is not None:
+            if ordinal > len(ordered):
+                return TodoStepTarget(
+                    status=STEP_TARGET_NOT_FOUND,
+                    task_id=task.id,
+                    message=(
+                        f"Todo #{task.id} has no step {ordinal} "
+                        f"(it has {len(ordered)})."
+                    ),
+                )
+            matched = [ordered[ordinal - 1]]
+        else:
+            if len(raw_query) > _MAX_STEP_QUERY_CHARS:
+                return TodoStepTarget(
+                    status=STEP_TARGET_NOT_FOUND,
+                    task_id=task.id,
+                    message=f"No step found matching '{raw_query}'.",
+                )
+            normalized = _normalize_todo_text(raw_query)
+            tokens = [token for token in normalized.split() if token][
+                :_MAX_STEP_QUERY_TOKENS
+            ]
+            matched = [
+                step
+                for step in ordered
+                if tokens
+                and all(
+                    token in _normalize_todo_text(step.title) for token in tokens
+                )
+            ]
+            if not matched:
+                matched = [
+                    step
+                    for step in ordered
+                    if len(_normalize_todo_text(step.title)) >= _MIN_TITLE_IN_QUERY_CHARS
+                    and _normalize_todo_text(step.title) in normalized
+                ]
+        if not matched:
+            return TodoStepTarget(
+                status=STEP_TARGET_NOT_FOUND,
+                task_id=task.id,
+                message=(
+                    f"No step matching '{raw_query}' in Todo #{task.id}."
+                ),
+            )
+
+        ordinals = {id(step): index for index, step in enumerate(ordered, start=1)}
+        if len(matched) == 1:
+            step = matched[0]
+            return TodoStepTarget(
+                status=STEP_TARGET_OK,
+                task_id=task.id,
+                step=step,
+                ordinal=ordinals[id(step)],
+            )
+        candidates = tuple(
+            TodoStepCandidate(
+                step_id=int(step.id),
+                ordinal=ordinals[id(step)],
+                title=str(step.title),
+                status=str(step.status),
+                version=int(step.version),
+            )
+            for step in matched[:MAX_STEP_CANDIDATES]
+        )
+        return TodoStepTarget(
+            status=STEP_TARGET_AMBIGUOUS,
+            task_id=task.id,
+            message=(
+                f"{len(matched)} steps match '{raw_query}' in Todo #{task.id} "
+                "— which one do you mean?"
+            ),
+            candidates=candidates,
+        )
+
+    async def complete_todo_with_steps(
+        self, task_id: int, expected_version: int
+    ) -> TaskRecord | None:
+        """Complete ONE todo together with the steps still remaining on it.
+
+        This is the explicit escape hatch for a todo whose last steps the owner
+        does not want to tick off one by one; plain completion stays refused
+        while a step remains (see ``set_status``). Ordering is deliberate: the
+        steps are attached to the todo's life FIRST, each under its own CAS
+        version, so the parent can never be marked completed while a step is
+        still remaining — and if a step changed meanwhile, the completion is
+        refused with an honest message instead of leaving the pair disagreeing.
+        Returns ``None`` for a missing/foreign todo or a stale todo version.
+        """
+        task = await self.owner_todo(task_id)
+        if task is None or task.version != expected_version:
+            return None
+        for step in await self.repository.list_steps(self.owner_id, task.id):
+            if str(step.status) == "completed":
+                continue
+            await self.repository.update_step(
+                self.owner_id, step.id, step.version, {"status": "completed"}
+            )
+        return await self.set_status(task.id, "completed", expected_version)
+
     async def set_status(self, task_id: int, status: str, expected_version: int) -> TaskRecord | None:
         task = await self.repository.get_task(self.owner_id, task_id)
         if task is None:
@@ -297,6 +666,22 @@ class TaskManagementService:
             # hide it from every todo surface while leaving it un-finishable,
             # so the pause verb is refused here instead of producing it.
             raise ValueError("a todo is completed or reopened, never paused")
+        if status == "completed" and is_todo_schedule_type(task.schedule_type):
+            # A todo is NEVER fully completed while one of its steps is still
+            # remaining. The refusal names what is left (and the next step), so
+            # the owner either finishes the steps or completes the todo together
+            # with them (complete_todo_with_steps) — the parent is never
+            # silently auto-completed and never left lying about its state.
+            steps = await self.repository.list_steps(self.owner_id, task_id)
+            remaining = [s for s in steps if str(s.status) != "completed"]
+            if remaining:
+                next_title = " ".join(str(remaining[0].title).split())
+                raise ValueError(
+                    f"Todo #{task_id} is not complete: {len(remaining)} of "
+                    f"{len(steps)} steps remain (next: {next_title}). Complete "
+                    "them first, or finish the todo together with its remaining "
+                    "steps."
+                )
         updates: dict[str, Any] = {"status": status}
         if (
             status in _NEXT_RUN_CLEAR_STATUSES

@@ -30,6 +30,23 @@ MAX_PAYLOAD_BYTES = 32768
 MAX_METADATA_BYTES = 8192
 MAX_ATTEMPTS = 3
 DB_TIMEOUT = 10.0
+# ── Todo steps (multi-step todos) ────────────────────────────────────────────
+# A step belongs to exactly ONE todo (an ``ai_tasks`` row with
+# ``schedule_type='todo'``) and is ordered inside it by ``position``. A step is
+# NOT a task: it has no schedule, no action and no occurrence, so no scheduler
+# query, occurrence path or Taskloom surface can ever reach one. The states are
+# deliberately minimal — a step is still remaining, or it is completed.
+STEP_STATUSES = frozenset({"active", "completed"})
+# The two bounds the boundary enforces. The title bound mirrors
+# ``ai_tasks.label``; the per-todo bound keeps a todo a by-hand list rather
+# than a project plan, and ``MAX_STEPS_PER_ADD`` bounds ONE call (one panel
+# message / one model request).
+MAX_STEP_TITLE_CHARS = 256
+MAX_STEPS_PER_TODO = 50
+MAX_STEPS_PER_ADD = 20
+# A step is addressed by its ORDINAL in position order (1-based), not by the
+# raw ``position`` value: positions are never renumbered, so the ordinal is the
+# contiguous, user-visible step number while ``position`` stays stable.
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "expired", "deleted"})
 _TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired"})
 # Outcomes of a real (row-removing) task deletion. ``DELETION_DELETED`` is the
@@ -247,6 +264,25 @@ def _validate_occurrence_input(data):
             validate_prepared_action(preparation.get("action"))
     _validate_json_payload(data.get("action_snapshot"), array=True); _validate_json_payload(data.get("error_metadata", {}), metadata=True); _validate_json_payload(data.get("result_metadata", {}), metadata=True)
     if data.get("status") == "retry_pending" and data.get("retry_at") is None: raise ValueError("retry_pending requires retry_at")
+def normalize_step_title(value) -> str:
+    """The owner's own words for a step, whitespace-collapsed and bounded.
+
+    Shared by BOTH boundaries that store a step title (creating a todo with its
+    steps, and adding or renaming one later), so a step title can never be
+    stored in two different forms. A blank or over-long title is rejected here
+    instead of being stored as a placeholder.
+    """
+    text = " ".join(str(value or "").split())
+    if not text or len(text) > MAX_STEP_TITLE_CHARS: raise ValueError(f"a step needs a title of at most {MAX_STEP_TITLE_CHARS} characters")
+    return text
+def _validate_step_input(data):
+    if not isinstance(data.get("owner_id"), int): raise ValueError("owner_id must be an integer")
+    if not isinstance(data.get("task_id"), int) or data["task_id"] <= 0: raise ValueError("task_id must be a positive integer")
+    if not isinstance(data.get("position"), int) or data["position"] <= 0: raise ValueError("position must be positive")
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip() or len(title) > MAX_STEP_TITLE_CHARS: raise ValueError("a step needs a nonblank bounded title")
+    if data.get("status", "active") not in STEP_STATUSES: raise ValueError("invalid step status")
+    if not isinstance(data.get("version", 1), int) or data["version"] < 1: raise ValueError("version must be positive")
 def _parse_dt(value):
     if value is None or (not isinstance(value, datetime) and not str(value).strip()): return None
     if isinstance(value, datetime): parsed = value
@@ -279,6 +315,13 @@ class TaskRecord:
 class OccurrenceRecord:
     id: int; task_id: int; owner_id: int; occurrence_key: str; definition_version: int; action_snapshot: list[dict[str, Any]]; scheduled_for: datetime; attempt: int = 1; status: str = "claimed"; claimed_at: datetime | None = None; started_at: datetime | None = None; finished_at: datetime | None = None; retry_at: datetime | None = None; error_metadata: dict[str, Any] = field(default_factory=dict); result_metadata: dict[str, Any] = field(default_factory=dict); created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); preparation_metadata: dict[str, Any] = field(default_factory=dict)
     def as_dict(self): return _copy(self.__dict__)
+@dataclass
+class TodoStepRecord:
+    """One ordered step of ONE todo (never a task of its own)."""
+    id: int; task_id: int; owner_id: int; position: int; title: str; status: str = "active"; version: int = 1; completed_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now)
+    def as_dict(self): return _copy(self.__dict__)
+    @property
+    def completed(self) -> bool: return self.status == "completed"
 
 def _task_from_row(row):
     value = {**row, "id": int(row["id"]), "owner_id": int(row["owner_id"]), "version": int(row.get("version", 1))}
@@ -291,6 +334,12 @@ def _occurrence_from_row(row):
     for key in ("scheduled_for", "claimed_at", "started_at", "finished_at", "retry_at", "created_at", "updated_at"): value[key] = _parse_dt(value.get(key))
     value["action_snapshot"] = list(value.get("action_snapshot") or []); value["error_metadata"] = dict(value.get("error_metadata") or {}); value["result_metadata"] = dict(value.get("result_metadata") or {}); value["preparation_metadata"] = dict(value.get("preparation_metadata") or {}); _validate_occurrence_input(value)
     return OccurrenceRecord(**{key: value[key] for key in OccurrenceRecord.__dataclass_fields__})
+
+def _step_from_row(row):
+    value = {**row, "id": int(row["id"]), "task_id": int(row["task_id"]), "owner_id": int(row["owner_id"]), "position": int(row["position"]), "version": int(row.get("version", 1)), "status": row.get("status", "active")}
+    for key in ("completed_at", "created_at", "updated_at"): value[key] = _parse_dt(value.get(key))
+    _validate_step_input(value)
+    return TodoStepRecord(**{key: value[key] for key in TodoStepRecord.__dataclass_fields__})
 
 class TaskRepository:
     async def create_task(self, owner_id, data): raise NotImplementedError
@@ -311,10 +360,19 @@ class TaskRepository:
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
     async def next_run_hint(self, owner_id): raise NotImplementedError
     async def discard_unstarted_occurrences(self, owner_id, task_id, reference): raise NotImplementedError
+    # Todo steps: the ordered children of ONE todo. ``create_steps`` appends the
+    # whole list or nothing, and every mutation is owner-scoped and CAS-guarded
+    # on the STEP's own version (a step is not the todo, so a step edit never
+    # invalidates the todo's version — and vice versa).
+    async def create_steps(self, owner_id, task_id, titles): raise NotImplementedError
+    async def list_steps(self, owner_id, task_id): raise NotImplementedError
+    async def get_step(self, owner_id, step_id): raise NotImplementedError
+    async def update_step(self, owner_id, step_id, expected_version, updates): raise NotImplementedError
+    async def delete_step(self, owner_id, step_id, expected_version): raise NotImplementedError
 
 class InMemoryTaskRepository(TaskRepository):
     def __init__(self, id_floor: int = 0):
-        self._tasks={}; self._occurrences={}; self._next_occurrence_id=1
+        self._tasks={}; self._occurrences={}; self._steps={}; self._next_occurrence_id=1; self._next_step_id=1
         # Provisional task ids start above ``id_floor``: when this repository
         # acts as the degraded store beside Supabase it must never reuse an id
         # the durable PostgreSQL sequence already issued, nor restart its
@@ -384,6 +442,11 @@ class InMemoryTaskRepository(TaskRepository):
         # ON DELETE RESTRICT): they go with the row they belong to, exactly as
         # the durable store must delete them before it can remove the task.
         for key in [k for k,occ in self._occurrences.items() if occ.task_id==task_id and occ.owner_id==owner_id]: del self._occurrences[key]
+        # Steps are the todo's OWN children (todo_steps.task_id is
+        # ON DELETE CASCADE): the durable store removes them in the same
+        # statement, so the degraded store mirrors that exactly — no step row
+        # may outlive the todo it belongs to.
+        for key in [k for k,step in self._steps.items() if step.task_id==task_id and step.owner_id==owner_id]: del self._steps[key]
         return TaskDeletionResult(DELETION_DELETED,task_id,task=_copy(r))
     async def create_occurrence(self, owner_id, data):
         payload={**data,"owner_id":owner_id};task=self._tasks.get(payload.get("task_id"))
@@ -412,6 +475,52 @@ class InMemoryTaskRepository(TaskRepository):
         r.status=status;r.updated_at=_now()
         if status in _TERMINAL_OCCURRENCE_STATUSES:r.finished_at=r.finished_at or r.updated_at
         return _copy(r)
+    def _task_steps(self, owner_id, task_id):
+        """The owner's steps of ONE todo, in position order (never renumbered)."""
+        return sorted((r for r in self._steps.values() if r.owner_id==owner_id and r.task_id==task_id), key=lambda r:(r.position,r.id))
+    async def create_steps(self, owner_id, task_id, titles):
+        """Append steps to ONE todo in the order given — all of them or none.
+
+        Every row is validated BEFORE the store is touched, so a rejected
+        title leaves no step behind (the durable path gets the same guarantee
+        from ONE multi-row INSERT statement). Positions continue from the
+        current maximum; they are never reused and never renumbered.
+        """
+        titles=list(titles)
+        task=self._tasks.get(int(task_id))
+        if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
+        position=max([r.position for r in self._task_steps(owner_id,int(task_id))] or [0])
+        if position+len(titles)>MAX_STEPS_PER_TODO:raise ValueError(f"a todo holds at most {MAX_STEPS_PER_TODO} steps")
+        prepared=[]
+        for index,title in enumerate(titles):
+            payload={"owner_id":owner_id,"task_id":int(task_id),"position":position+index+1,"title":title,"status":"active","version":1}
+            _validate_step_input(payload); prepared.append(payload)
+        stored=[]
+        for payload in prepared:
+            r=TodoStepRecord(self._next_step_id,payload["task_id"],owner_id,payload["position"],str(payload["title"]).strip())
+            self._steps[r.id]=r; self._next_step_id+=1; stored.append(_copy(r))
+        return stored
+    async def list_steps(self, owner_id, task_id):
+        return [_copy(r) for r in self._task_steps(owner_id,int(task_id))]
+    async def get_step(self, owner_id, step_id):
+        r=self._steps.get(step_id); return _copy(r) if r and r.owner_id==owner_id else None
+    async def update_step(self, owner_id, step_id, expected_version, updates):
+        """CAS-guarded step edit; the status/completed_at pair always agrees."""
+        r=self._steps.get(step_id)
+        if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
+        for key in ("id","task_id","owner_id","position","created_at"):
+            if key in updates:raise ValueError("immutable step field")
+        target=str(updates.get("status",r.status))
+        if target not in STEP_STATUSES:raise ValueError("invalid step status")
+        merged={**r.as_dict(),**updates,"status":target};_validate_step_input(merged)
+        r.title=str(merged["title"]).strip();r.status=target;r.completed_at=(r.completed_at or _now()) if target=="completed" else None
+        r.version+=1;r.updated_at=_now()
+        return _copy(r)
+    async def delete_step(self, owner_id, step_id, expected_version):
+        """Remove ONE step under CAS. Returns True only on a real removal."""
+        r=self._steps.get(step_id)
+        if not r or r.owner_id!=owner_id or r.version!=expected_version:return False
+        del self._steps[step_id];return True
 
 class SupabaseTaskRepository(TaskRepository):
     def __init__(self, client, fallback=None, timeout=DB_TIMEOUT):
@@ -793,6 +902,73 @@ class SupabaseTaskRepository(TaskRepository):
                 self._degrade("Supabase occurrence transition failed; using fallback: %s",exc)
                 return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
         row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+    def _step_payload(self, owner_id, payload):
+        value={**payload,"owner_id":owner_id};_validate_step_input(value);return {k:_serialize(v) for k,v in value.items() if k not in {"id","created_at","updated_at"}}
+    async def create_steps(self, owner_id, task_id, titles):
+        """Append steps to ONE todo in ONE statement (all rows or none).
+
+        One multi-row INSERT is a single PostgreSQL statement, so a rejected
+        title or a transport failure leaves the todo with NO half-added step
+        list. Positions continue from the current maximum inside the caller's
+        serialized section (see ``TaskManagementService.add_steps``), and the
+        ``UNIQUE (task_id, position)`` constraint makes a duplicated order
+        structurally impossible even if that serialization is ever removed.
+        """
+        titles=list(titles)
+        try:
+            existing=await self.list_steps(owner_id,int(task_id))
+            position=max([r.position for r in existing] or [0])
+            if position+len(titles)>MAX_STEPS_PER_TODO:raise ValueError(f"a todo holds at most {MAX_STEPS_PER_TODO} steps")
+            payloads=[self._step_payload(owner_id,{"task_id":int(task_id),"position":position+index+1,"title":title,"status":"active","version":1}) for index,title in enumerate(titles)]
+            if not payloads:return []
+            logger.info("TODO_STEP_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s task_id=%s count=%s", type(self).__name__, owner_id, task_id, len(payloads))
+            result=await self._run(lambda:self._client.table("todo_steps").insert(payloads).execute());rows=getattr(result,"data",None)
+            if not rows or len(rows)!=len(payloads):raise RuntimeError("Supabase step insert returned no rows")
+            self._mark_supabase_ok()
+            return [_step_from_row(row) for row in rows]
+        except (ValueError,TypeError):raise
+        except Exception as exc:
+            self._degrade("Supabase step insert failed; using fallback: %s",exc)
+            return [self._annotate_fallback(record) for record in await self._fallback.create_steps(owner_id,int(task_id),titles)]
+    async def list_steps(self, owner_id, task_id):
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").select("*").eq("owner_id",owner_id).eq("task_id",task_id).order("position").execute());self._mark_supabase_ok()
+            return [_step_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase step list failed; using fallback: %s",exc);return await self._fallback.list_steps(owner_id,task_id)
+    async def get_step(self, owner_id, step_id):
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").select("*").eq("id",step_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _step_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except Exception as exc:self._degrade("Supabase step read failed; using fallback: %s",exc);return await self._fallback.get_step(owner_id,step_id)
+    async def update_step(self, owner_id, step_id, expected_version, updates):
+        current=await self.get_step(owner_id,step_id)
+        if current is None or current.version!=expected_version:return None
+        for key in ("id","task_id","owner_id","position","created_at"):
+            if key in updates:raise ValueError("immutable step field")
+        target=str(updates.get("status",current.status))
+        if target not in STEP_STATUSES:raise ValueError("invalid step status")
+        merged={**current.as_dict(),**updates,"status":target};_validate_step_input(merged)
+        outgoing={k:_serialize(v) for k,v in updates.items() if k!="status"}
+        outgoing["status"]=target
+        outgoing["completed_at"]=_serialize((current.completed_at or _now()) if target=="completed" else None)
+        outgoing["version"]=expected_version+1
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").update(outgoing).eq("id",step_id).eq("owner_id",owner_id).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _step_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError):raise
+        except Exception as exc:self._degrade("Supabase step update failed; using fallback: %s",exc);return self._annotate_fallback(await self._fallback.update_step(owner_id,step_id,expected_version,updates))
+    async def delete_step(self, owner_id, step_id, expected_version):
+        """Remove ONE step under CAS; False means nothing was removed."""
+        current=await self.get_step(owner_id,step_id)
+        if current is None or current.version!=expected_version:return False
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").delete().eq("id",step_id).eq("owner_id",owner_id).eq("version",expected_version).execute())
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase step delete failed; using fallback: %s",exc)
+            return await self._fallback.delete_step(owner_id,step_id,expected_version)
+        rows=getattr(result,"data",None);self._mark_supabase_ok()
+        return bool(rows)
 
 def get_task_repository():
     """Return the process-wide task repository (single authority).

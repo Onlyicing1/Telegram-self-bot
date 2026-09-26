@@ -168,7 +168,10 @@ class TodoAddTool(Tool):
             "(no schedule, no reminder, no automatic action). Use this when "
             "the owner says to add/create a todo or task WITHOUT a time, "
             "interval, or recurring cadence; a timed/recurring request is "
-            "create_task instead. The title must be the owner's own words — "
+            "create_task instead. When the owner asks for a todo WITH steps "
+            "(\"three steps: …\"), pass them in 'steps' IN THE SAME CALL — the "
+            "todo and its ordered steps are created together, all or nothing. "
+            "The title and every step title must be the owner's own words — "
             "never invented."
         )
 
@@ -178,6 +181,15 @@ class TodoAddTool(Tool):
             "title": {
                 "type": "string",
                 "description": "The todo's title, exactly as the owner meant it.",
+            },
+            "steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional ordered steps of this todo, in the owner's order. "
+                    "They are created in the SAME operation as the todo: either "
+                    "the todo and all of its steps exist, or nothing does."
+                ),
             },
         }
 
@@ -191,7 +203,7 @@ class TodoAddTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the created todo id/title/version in message and data"
+        return "ToolResult with the created todo id/title/version (and its steps) in message and data"
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.ai.task_creation import TaskCreationError, TaskCreationService
@@ -209,13 +221,20 @@ class TodoAddTool(Tool):
             return ToolResult(
                 success=False, message="Owner identity is unavailable; no todo was added."
             )
+        raw_steps = arguments.get("steps")
+        if raw_steps is not None and not isinstance(raw_steps, (list, tuple)):
+            return ToolResult(
+                success=False,
+                message="'steps' must be a list of step titles.",
+            )
+
         from backend.ai.database.manager import get_repository_manager
 
         timezone_name = str(getattr(context, "tz_str", "") or "").strip() or "UTC"
         try:
             service = TaskCreationService(get_repository_manager().task, owner_id)
             task = await service.create_todo(
-                title, timezone_name, datetime.now(timezone.utc)
+                title, timezone_name, datetime.now(timezone.utc), steps=raw_steps or ()
             )
         except TaskCreationError as exc:
             return ToolResult(success=False, message=f"Todo was not added: {exc}")
@@ -229,6 +248,30 @@ class TodoAddTool(Tool):
             "version": int(task.version),
         }
         message = f"📋 Todo #{task.id} added — {task.label}"
+        if raw_steps:
+            # Read the steps back so the reported numbers and titles are the
+            # STORED ones — never the request echoed as if it had been saved.
+            stored_steps: list[Any] = []
+            try:
+                stored_steps = list(await _todo_service(owner_id).list_steps(task.id) or [])
+            except Exception:  # noqa: BLE001
+                stored_steps = []
+            if stored_steps:
+                data["steps"] = [
+                    {
+                        "step_id": int(step.id),
+                        "step": index,
+                        "title": str(step.title),
+                        "status": str(step.status),
+                        "version": int(step.version),
+                    }
+                    for index, step in enumerate(stored_steps, start=1)
+                ]
+                listing = "\n".join(
+                    f"{index}. {entry['title']}"
+                    for index, entry in enumerate(data["steps"], start=1)
+                )
+                message = f"{message}\n{len(stored_steps)} steps:\n{listing}"
         fallback_backend = str(getattr(task, "fallback_backend", "") or "")
         if fallback_backend:
             # A degraded write is NOT a durable write: the todo exists in the
@@ -320,26 +363,36 @@ class TodoFindTool(Tool):
         if resolution.status == TODO_RESOLUTION_UNIQUE:
             candidate = resolution.candidates[0]
             view = None
+            progress = None
             try:
                 view = await service.inspect(candidate.task_id)
+                # The detail a todo find returns carries its step summary: how
+                # many steps exist, how many are done, and which one is next.
+                progress = await service.step_progress(candidate.task_id)
             except Exception:  # noqa: BLE001
                 view = None
             message = (
-                todo_detail_text(view.task)
+                todo_detail_text(view.task, progress)
                 if view is not None
                 else format_todo_resolution(resolution)
             )
-            return ToolResult(
-                success=True,
-                message=message,
-                data={
-                    "outcome": "unique",
-                    "task_id": int(candidate.task_id),
-                    "label": str(candidate.label),
-                    "status": str(candidate.status),
-                    "version": int(candidate.version),
-                },
-            )
+            data: dict[str, Any] = {
+                "outcome": "unique",
+                "task_id": int(candidate.task_id),
+                "label": str(candidate.label),
+                "status": str(candidate.status),
+                "version": int(candidate.version),
+            }
+            if progress is not None:
+                data["steps_total"] = int(progress.total)
+                data["steps_completed"] = int(progress.completed)
+                data["steps_remaining"] = int(progress.remaining)
+                data["next_step"] = (
+                    " ".join(str(progress.next_step.title).split())
+                    if progress.next_step is not None
+                    else None
+                )
+            return ToolResult(success=True, message=message, data=data)
         return ToolResult(
             success=False,
             message=format_todo_resolution(resolution),

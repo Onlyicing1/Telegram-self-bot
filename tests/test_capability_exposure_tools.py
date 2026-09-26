@@ -469,7 +469,17 @@ async def test_new_tools_are_provider_schema_visible():
 def test_no_duplicate_registrations():
     registry, _ctx, _executor = make_chain()
     names = registry.list_names()
-    assert len(names) == len(set(names)) == 49
-    # The basic Todo surface (Part 1) is registered exactly once each.
+    # The count is a deliberate tripwire: a new tool must be registered ONCE,
+    # and this number is updated together with the tool that changed it — the
+    # basic Todo surface (Part 1) and the ordered Todo-step surface (Part 2).
+    assert len(names) == len(set(names)) == 54
     for name in ("todo_add", "todo_find", "todo_edit"):
+        assert name in names
+    for name in (
+        "todo_step_add",
+        "todo_step_list",
+        "todo_step_transition",
+        "todo_step_edit",
+        "todo_step_delete",
+    ):
         assert name in names

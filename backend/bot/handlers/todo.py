@@ -36,9 +36,14 @@ from backend.helper import (
 logger = logging.getLogger(__name__)
 
 _MAX_LIST_ROWS = 4
+# The step panel shows fewer rows than the todo list: every step needs TWO rows
+# (its title, then its actions), so a short page is what keeps the panel
+# readable on a phone.
+_MAX_STEP_ROWS = 3
 _LIST_PANEL = "todo"
 _DONE_PANEL = "todo_done"
 _DETAIL_PANEL = "todo_task"
+_STEPS_PANEL = "todo_steps"
 # The owner's configured timezone (the same value the runtime registers every
 # handler with). A todo has no schedule, so this only records the owner's own
 # zone on the row — it is never used to invent a time.
@@ -191,18 +196,36 @@ async def _todo_detail_panel(event, extra: str) -> tuple[str, str, list] | None:
         return "Todo", "× Todo not found.", []
 
     task = view.task
-    lines = [todo_detail_text(task)]
+    # ONE progress read drives the summary line, the step button and the
+    # completion button: the todo detail can never disagree with its own list.
+    progress = await service.step_progress(task.id)
+    lines = [todo_detail_text(task, progress)]
     if bool(getattr(service.repository, "fallback_active", False)):
         lines.append("")
         lines.append(fallback_note(str(getattr(service.repository, "fallback_reason", "") or "")))
 
     builder = InlinePanelBuilder()
     if str(task.status) == "active":
-        builder.add_row("✓ Complete", f"action:todo_complete:{task.id}:{task.version}")
+        if progress is not None and progress.remaining:
+            # Plain completion is refused while a step remains; the labelled
+            # button is the explicit way to finish both together.
+            builder.add_row(
+                f"✓ Complete all ({progress.completed}/{progress.total})",
+                f"action:todo_complete_all:{task.id}:{task.version}",
+            )
+        else:
+            builder.add_row("✓ Complete", f"action:todo_complete:{task.id}:{task.version}")
         builder.add_row("✏️ Edit", f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
     elif str(task.status) == "completed":
         builder.add_row("↩️ Reopen", f"action:todo_reopen:{task.id}:{task.version}")
         builder.add_row("✏️ Edit", f"input:{_DETAIL_PANEL}:edit:{task.id}:{task.version}")
+    if progress is not None and progress.total:
+        builder.add_row(
+            f"🧩 Steps ({progress.completed}/{progress.total})",
+            f"panel:{_STEPS_PANEL}:{task.id}",
+        )
+    else:
+        builder.add_row("🧩 Add steps", f"input:{_STEPS_PANEL}:add:{task.id}")
     builder.add_row("🗑 Delete", f"action:todo_delete:{task.id}:{task.version}")
     builder.add_row("⟳ Refresh", f"panel:{_DETAIL_PANEL}:{task.id}")
     _nav(builder)
@@ -213,6 +236,89 @@ async def _todo_detail_inline_builder(event, extra: str) -> list:
     result = await _todo_detail_panel(event, extra)
     if result is None:
         return [render("Todo", "Error loading panel.", [])]
+    title, body, buttons = result
+    return [render(title, body, buttons)]
+
+
+async def _todo_steps_panel(event, extra: str) -> tuple[str, str, list] | None:
+    """LEVEL 3 — the ordered steps of ONE todo: complete, edit, delete.
+
+    The panel adds no state of its own: the list, the ✓/○ marks, the progress
+    line and the next step all come from the same service read the tools and
+    the AI use, so the four surfaces can never disagree about a step.
+    """
+    from backend.ai.task_management import step_progress_of
+    from backend.ai.task_management_interface import fallback_note, steps_block_text
+
+    parts = (extra or "").split(":")
+    try:
+        task_id = int(parts[0])
+    except (TypeError, ValueError, IndexError):
+        return "Todo", "× Invalid todo id.", []
+
+    service = _service(_owner())
+    steps = await service.list_steps(task_id)
+    if steps is None:
+        return "Todo", "× Todo not found.", []
+
+    try:
+        page = max(0, int(parts[1])) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        page = 0
+    page_count = max(1, (len(steps) + _MAX_STEP_ROWS - 1) // _MAX_STEP_ROWS)
+    page = min(page, page_count - 1)
+    visible = steps[page * _MAX_STEP_ROWS:(page + 1) * _MAX_STEP_ROWS]
+    offset = page * _MAX_STEP_ROWS
+    progress = step_progress_of(steps)
+
+    task = await service.owner_todo(task_id)
+    lines = [steps_block_text(task, steps, progress)]
+    if bool(getattr(service.repository, "fallback_active", False)):
+        lines.append("")
+        lines.append(fallback_note(str(getattr(service.repository, "fallback_reason", "") or "")))
+
+    builder = InlinePanelBuilder()
+    for index, step in enumerate(visible, start=offset + 1):
+        step_title = " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
+        mark = "✓" if str(getattr(step, "status", "")) == "completed" else "○"
+        label = f"{mark} {index}. {step_title[:26] + ('…' if len(step_title) > 26 else '')}"
+        builder.add_row(label, f"panel:{_STEPS_PANEL}:{task_id}:{page}")
+        if str(getattr(step, "status", "")) == "completed":
+            builder.add_buttons(
+                ("↩️ Reopen", f"action:todo_step_reopen:{step.id}:{step.version}"),
+                ("✏️ Edit", f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
+                ("🗑", f"action:todo_step_delete:{step.id}:{step.version}"),
+            )
+        else:
+            builder.add_buttons(
+                ("✓ Complete", f"action:todo_step_complete:{step.id}:{step.version}"),
+                ("✏️ Edit", f"input:{_STEPS_PANEL}:edit:{step.id}:{step.version}"),
+                ("🗑", f"action:todo_step_delete:{step.id}:{step.version}"),
+            )
+    if page_count > 1:
+        builder.add_row(
+            "❮" if page > 0 else "·",
+            f"panel:{_STEPS_PANEL}:{task_id}:{page - 1}" if page > 0 else f"panel:{_STEPS_PANEL}:{task_id}",
+        )
+        builder.add_row(
+            f"{page + 1} / {page_count}",
+            f"panel:{_STEPS_PANEL}:{task_id}:{page + 1}" if page + 1 < page_count else f"panel:{_STEPS_PANEL}:{task_id}:{page}",
+        )
+        if page + 1 < page_count:
+            builder.add_row("❯", f"panel:{_STEPS_PANEL}:{task_id}:{page + 1}")
+    # Adding steps is only offered while the todo is active: a completed todo
+    # accepts no new work until it is reopened (the service refuses otherwise).
+    if str(getattr(task, "status", "")) == "active":
+        builder.add_row("➕ Add step", f"input:{_STEPS_PANEL}:add:{task_id}")
+    builder.add_row("← Todo", f"panel:{_DETAIL_PANEL}:{task_id}")
+    _nav(builder)
+    return f"Steps of Todo #{task_id}", "\n".join(lines), builder.build()
+
+
+async def _todo_steps_inline_builder(event, extra: str) -> list:
+    result = await _todo_steps_panel(event, extra)
+    if result is None:
+        return [render("Steps", "Error loading panel.", [])]
     title, body, buttons = result
     return [render(title, body, buttons)]
 
@@ -311,6 +417,218 @@ async def _delete_action(event, extra: str, chat_id: int):
         return "Todo", notice.rstrip(), []
     title, body, buttons = refreshed
     return title, notice + body, buttons
+
+
+_STEP_VERB_PAST = {"complete_step": "completed", "reopen_step": "reopened"}
+
+
+def _step_title_of(step) -> str:
+    return " ".join(str(getattr(step, "title", "") or "").split()) or "Untitled"
+
+
+async def _step_mutate(extra: str, verb: str) -> tuple[str, str, list] | None:
+    """Shared CAS step mutation → refreshed step panel (nothing on a stale one)."""
+    parsed = _parse_action_extra(extra)
+    if parsed is None:
+        return "Steps", "× Invalid action arguments.", []
+    step_id, version = parsed
+    service = _service(_owner())
+    try:
+        step = await getattr(service, verb)(step_id, version)
+    except ValueError as exc:
+        # A refusal the owner must read (a step of a completed todo cannot be
+        # reopened before the todo itself is reopened).
+        return "Steps", f"× {exc}", []
+    except Exception:
+        logger.exception("Todo step %s failed for step %s", verb, step_id)
+        return "Steps", "× Operation failed; no change was confirmed.", []
+    if step is None:
+        return (
+            "Steps",
+            "× Step not found, or it changed since this panel was drawn "
+            "(version is stale). Nothing was changed.",
+            [],
+        )
+    notice = (
+        f"✓ Step {_STEP_VERB_PAST.get(verb, verb)} — {_step_title_of(step)}\n\n"
+    )
+    result = await _todo_steps_panel(None, str(int(step.task_id)))
+    if result is None:
+        return "Steps", notice.rstrip(), []
+    title, body, buttons = result
+    return title, notice + body, buttons
+
+
+async def _step_complete_action(event, extra: str, chat_id: int):
+    return await _step_mutate(extra, "complete_step")
+
+
+async def _step_reopen_action(event, extra: str, chat_id: int):
+    return await _step_mutate(extra, "reopen_step")
+
+
+async def _step_delete_action(event, extra: str, chat_id: int):
+    """Remove ONE step for real — the parent todo always survives it."""
+    parsed = _parse_action_extra(extra)
+    if parsed is None:
+        return "Steps", "× Invalid action arguments.", []
+    step_id, version = parsed
+    service = _service(_owner())
+    step = None
+    try:
+        step = await service.get_step(step_id)
+    except Exception:
+        logger.exception("Todo step read failed for step %s", step_id)
+    task_id = int(getattr(step, "task_id", 0) or 0)
+    try:
+        removed = await service.delete_step(step_id, version)
+    except Exception:
+        logger.exception("Todo step delete failed for step %s", step_id)
+        return "Steps", "× Operation failed; no change was confirmed.", []
+    if not removed:
+        current = await service.get_step(step_id)
+        if current is not None:
+            return "Steps", "× Version is stale; nothing was deleted.", []
+        return "Steps", "× Step not found, so nothing was deleted.", []
+    notice = "🗑 Step removed — the todo itself is untouched\n\n"
+    if task_id <= 0:
+        return "Steps", notice.rstrip(), []
+    result = await _todo_steps_panel(None, str(task_id))
+    if result is None:
+        return "Steps", notice.rstrip(), []
+    title, body, buttons = result
+    return title, notice + body, buttons
+
+
+async def _complete_all_action(event, extra: str, chat_id: int):
+    """Complete a todo TOGETHER with the steps it still has.
+
+    The explicit path for finishing a multi-step todo in one action: plain
+    completion refuses while a step remains, and the service completes the
+    remaining steps first so the pair can never disagree.
+    """
+    parsed = _parse_action_extra(extra)
+    if parsed is None:
+        return "Todo", "× Invalid action arguments.", []
+    task_id, version = parsed
+    service = _service(_owner())
+    try:
+        task = await service.complete_todo_with_steps(task_id, version)
+    except ValueError as exc:
+        return f"Todo #{task_id}", f"× {exc}", []
+    except Exception:
+        logger.exception("Todo complete-all failed for todo %s", task_id)
+        return f"Todo #{task_id}", "× Operation failed; no change was confirmed.", []
+    if task is None:
+        return (
+            f"Todo #{task_id}",
+            "× Todo not found, or it changed since this panel was drawn "
+            "(version is stale). Nothing was changed.",
+            [],
+        )
+    notice = (
+        f"✓ Todo #{task.id} completed with its remaining steps · v{task.version}\n\n"
+    )
+    result = await _todo_detail_panel(None, str(task_id))
+    if result is None:
+        return f"Todo #{task_id}", notice.rstrip(), []
+    title, body, buttons = result
+    return title, notice + body, buttons
+
+
+async def _steps_add_input_handler(
+    text: str, chat_id: int, msg_id: int, inline_chat_id: int, inline_msg_id: int
+) -> None:
+    """Append the typed titles as ordered steps — one per line, all or nothing."""
+    from backend.helper.input_state import get_pending
+
+    pending = get_pending(_owner()) or {}
+    parts = str(pending.get("extra") or "").split(":")
+    task_id = 0
+    for part in parts:
+        try:
+            task_id = int(part)
+            break
+        except (TypeError, ValueError):
+            continue
+    titles = [" ".join(line.split()) for line in str(text or "").splitlines()]
+    titles = [title for title in titles if title]
+    notice = ""
+    if task_id <= 0:
+        notice = "× This step input expired; open the todo again."
+    elif not titles:
+        notice = "× A step needs a title."
+    else:
+        try:
+            added = await _service(_owner()).add_steps(task_id, titles)
+        except ValueError as exc:
+            notice = f"× {exc}"
+        except Exception:
+            logger.exception("Todo steps add failed for todo %s", task_id)
+            notice = "× Steps were not added; no change was confirmed."
+        else:
+            if added is None:
+                notice = "× That todo was not found."
+            elif len(added) == 1:
+                notice = f"✓ Step added — {_step_title_of(added[0])}"
+            else:
+                notice = f"✓ {len(added)} steps added"
+    await _finish_input(
+        notice,
+        chat_id,
+        msg_id,
+        inline_chat_id,
+        inline_msg_id,
+        panel_id=_STEPS_PANEL,
+        extra=str(task_id) if task_id > 0 else "",
+    )
+
+
+async def _steps_edit_input_handler(
+    text: str, chat_id: int, msg_id: int, inline_chat_id: int, inline_msg_id: int
+) -> None:
+    """Rename ONE step under the version that opened this input (CAS).
+
+    The todo's own title is never touched by this input: only the step row it
+    was opened for changes.
+    """
+    from backend.helper.input_state import get_pending
+
+    pending = get_pending(_owner()) or {}
+    raw_extra = str(pending.get("extra") or "")
+    if raw_extra.startswith("edit:"):
+        raw_extra = raw_extra[len("edit:"):]
+    parsed = _parse_action_extra(raw_extra)
+    title = " ".join(str(text or "").split())
+    step = None
+    if parsed is None:
+        notice = "× This step edit expired; open the step again."
+    elif not title:
+        notice = "× A step needs a title."
+    else:
+        step_id, version = parsed
+        try:
+            step = await _service(_owner()).rename_step(step_id, version, title)
+        except ValueError as exc:
+            notice = f"× {exc}"
+        except Exception:
+            logger.exception("Todo step edit failed for step %s", step_id)
+            notice = "× Step was not changed; no change was confirmed."
+        else:
+            notice = (
+                f"✓ Step is now — {_step_title_of(step)}"
+                if step is not None
+                else "× Step changed since this panel was drawn; open it again and retry."
+            )
+    await _finish_input(
+        notice,
+        chat_id,
+        msg_id,
+        inline_chat_id,
+        inline_msg_id,
+        panel_id=_STEPS_PANEL,
+        extra=str(int(getattr(step, "task_id", 0) or 0)) if step is not None else "",
+    )
 
 
 async def _finish_input(
@@ -427,6 +745,17 @@ _INPUT_PROMPTS = {
     "edit": "**New title**\n\nSend what this todo should say instead.\n\n_Reply below._",
 }
 
+# The step inputs have their own prompts: adding a step accepts SEVERAL titles
+# at once (one per line, appended in that order, all or nothing), while the
+# edit renames exactly one step.
+_STEPS_INPUT_PROMPTS = {
+    "add": (
+        "**New step(s)**\n\nSend the step's title — one step per line to add "
+        "several at once, in order.\n\n_Reply below._"
+    ),
+    "edit": "**New step title**\n\nSend what this step should say instead.\n\n_Reply below._",
+}
+
 
 def register(client, owner_id: int, tz_str: str) -> None:
     global _DEFAULT_TZ
@@ -438,9 +767,15 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_inline_builder(_DONE_PANEL, _todo_done_inline_builder)
         register_panel(_DETAIL_PANEL, _todo_detail_panel, parent=_LIST_PANEL, title="Todo")
         register_inline_builder(_DETAIL_PANEL, _todo_detail_inline_builder)
+        register_panel(_STEPS_PANEL, _todo_steps_panel, parent=_DETAIL_PANEL, title="Steps")
+        register_inline_builder(_STEPS_PANEL, _todo_steps_inline_builder)
         register_action("todo_complete", _complete_action)
         register_action("todo_reopen", _reopen_action)
         register_action("todo_delete", _delete_action)
+        register_action("todo_complete_all", _complete_all_action)
+        register_action("todo_step_complete", _step_complete_action)
+        register_action("todo_step_reopen", _step_reopen_action)
+        register_action("todo_step_delete", _step_delete_action)
         register_input(_LIST_PANEL, "new", {
             "handler": _add_input_handler,
             "prompt": _INPUT_PROMPTS["new"],
@@ -449,6 +784,16 @@ def register(client, owner_id: int, tz_str: str) -> None:
         register_input(_DETAIL_PANEL, "edit", {
             "handler": _edit_input_handler,
             "prompt": _INPUT_PROMPTS["edit"],
+            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+        })
+        register_input(_STEPS_PANEL, "add", {
+            "handler": _steps_add_input_handler,
+            "prompt": _STEPS_INPUT_PROMPTS["add"],
+            "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
+        })
+        register_input(_STEPS_PANEL, "edit", {
+            "handler": _steps_edit_input_handler,
+            "prompt": _STEPS_INPUT_PROMPTS["edit"],
             "extra_rows": (("✕ Cancel", f"panel:{_LIST_PANEL}"),),
         })
         logger.info("Todo panels registered OK")

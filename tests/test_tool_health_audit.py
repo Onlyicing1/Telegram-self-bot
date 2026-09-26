@@ -139,6 +139,11 @@ EXPECTED_TOOLS = {
     "todo_add": PermissionLevel.READ_WRITE,
     "todo_find": PermissionLevel.READ_ONLY,
     "todo_edit": PermissionLevel.READ_WRITE,
+    "todo_step_add": PermissionLevel.READ_WRITE,
+    "todo_step_list": PermissionLevel.READ_ONLY,
+    "todo_step_transition": PermissionLevel.READ_WRITE,
+    "todo_step_edit": PermissionLevel.READ_WRITE,
+    "todo_step_delete": PermissionLevel.READ_WRITE,
     "retrieve_save": PermissionLevel.READ_WRITE,
     "preview_save": PermissionLevel.READ_ONLY,
     "delete_save": PermissionLevel.DANGEROUS,
@@ -160,7 +165,7 @@ def test_registry_contains_exactly_the_expected_tools():
         f"registry mismatch: missing={set(EXPECTED_TOOLS) - names} "
         f"extra={names - set(EXPECTED_TOOLS)}"
     )
-    assert len(registry.list()) == 49
+    assert len(registry.list()) == 54
 
 
 @pytest.mark.asyncio
