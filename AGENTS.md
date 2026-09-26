@@ -340,6 +340,19 @@ error.
   `claimed` occurrences (pre-created, never started); anything past-due
   resolves through the interrupted → retry/failed contract, so restart can
   never duplicate or spam executions.
+- **Durable action chains**: a task's ordered `actions` execute
+  SEQUENTIALLY through the same single `ToolExecutor`; a failure stops the
+  chain (later actions are never run). One argument value may reference a
+  declared, bounded output field of an EARLIER action of the same occurrence —
+  `{"$ref": {"action": 1, "field": "save_code"}}` — validated at creation
+  against the tool's `consumable_output_fields` declaration
+  (`backend/ai/tools/base.py`), re-proved before execution, and resolved
+  deterministically by the coordinator from the occurrence's own bounded
+  per-action run record (`backend/ai/task_contract.py`; no schema change, no
+  cross-task/cross-occurrence visibility, everything unknown fails closed).
+  An action already recorded `succeeded` is never replayed on a retry: the
+  chain resumes at the action that did not succeed. Waiting/branching/
+  multi-turn continuation are later phases, not part of this mechanism.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.

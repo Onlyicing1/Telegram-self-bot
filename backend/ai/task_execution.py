@@ -13,13 +13,20 @@ import re
 
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.task_contract import (
+    ACTION_RUNS_KEY,
     SCHEDULED_OCCURRENCE_EXTRA,
     PreparedAction,
     TaskContractError,
+    action_reference_error,
+    action_runs_from_metadata,
+    bounded_action_output,
+    build_action_run,
+    resolve_action_arguments,
     validate_prepared_action,
 )
+from backend.ai.tools.base import declared_consumable_output_fields
 from backend.ai.tools.context import ToolContext
-from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.executor import ToolExecutionResult, ToolExecutor
 from backend.ai.tools.registry import ToolRegistry
 from backend.ai.preparation_policy import (
     CONTENT_FIELDS,
@@ -275,6 +282,59 @@ class TaskExecutionResult:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass
+class _ChainOutcome:
+    """The result of executing one occurrence's ordered action chain."""
+    results: list[ToolExecutionResult]
+    runs: list[dict[str, Any]]
+    failed_position: int | None = None
+    failure: Any = ""
+    skipped: int = 0
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for run in self.runs if run["status"] == "succeeded")
+
+
+def _ordered_runs(state: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The recorded runs in action order (positions are validated 1-based)."""
+    return [state[position] for position in sorted(state)]
+
+
+def _recorded_runs(occurrence: OccurrenceRecord) -> tuple[list[dict[str, Any]], str]:
+    """``(runs, error)`` — the durable per-action state of THIS occurrence.
+
+    The record is occurrence-scoped by construction (it lives in the
+    occurrence's own bounded metadata), so one task can never read another
+    task's, another occurrence's, or the owner's previous run's result. A
+    malformed record is reported so the caller fails closed instead of
+    replaying side effects it cannot account for.
+    """
+    for metadata in (occurrence.error_metadata, occurrence.result_metadata):
+        if isinstance(metadata, dict) and ACTION_RUNS_KEY in metadata:
+            try:
+                return action_runs_from_metadata(metadata)[0], ""
+            except (TaskContractError, TypeError, ValueError) as exc:
+                return [], f"invalid_action_record: {exc}"
+    return [], ""
+
+
+def _run_record_mismatch(
+    runs: list[dict[str, Any]], calls: list[dict[str, Any]]
+) -> str:
+    """The recorded runs must describe THIS action snapshot, position by
+    position: a record that names another tool is a stale definition, and the
+    occurrence fails closed instead of trusting it."""
+    for run in runs:
+        position = run["position"]
+        if position > len(calls) or calls[position - 1]["name"] != run["tool"]:
+            return (
+                f"invalid_action_record: action {position} was recorded for a "
+                "different tool than the occurrence's action"
+            )
+    return ""
+
+
 def _bounded_metadata(value: dict[str, Any]) -> dict[str, Any]:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if len(encoded.encode()) > MAX_METADATA_BYTES:
@@ -377,7 +437,32 @@ class TaskExecutionCoordinator:
         # the SAME ToolExecutor below; the model is never an execution
         # authority and can never change the task's tool names.
         instruction = getattr(task, "ai_instruction", None) if task is not None else None
-        if isinstance(instruction, str) and instruction.strip():
+        generation_authorized = isinstance(instruction, str) and bool(instruction.strip())
+
+        # Action-chain contract, re-proved BEFORE anything executes: a stored
+        # reference that cannot resolve deterministically fails the whole
+        # occurrence closed instead of running a partial chain with a guess.
+        reference_error = action_reference_error(
+            actions,
+            self.executor._registry,
+            generation_authorized=generation_authorized,
+        )
+        if reference_error:
+            return await self._fail(
+                occurrence, f"invalid_action_reference: {reference_error}", 0, 0
+            )
+
+        # Durable per-action state: written as each action completes, read back
+        # on a retry so a succeeded side effect is never repeated and a failed
+        # action resumes where it stopped.
+        prior_runs, record_error = _recorded_runs(occurrence)
+        if record_error:
+            return await self._fail(occurrence, record_error, 0, 0)
+        mismatch = _run_record_mismatch(prior_runs, calls)
+        if mismatch:
+            return await self._fail(occurrence, mismatch, 0, 0)
+
+        if generation_authorized:
             try:
                 prepared = self._prepared_from_metadata(occurrence, task)
                 if prepared is not None:
@@ -398,41 +483,43 @@ class TaskExecutionCoordinator:
             except Exception as exc:
                 return await self.handle_failure(occurrence, exc, action_count=len(calls))
 
+        # The live per-action state of THIS attempt: seeded from the durable
+        # record, updated as each action completes, and readable by the failure
+        # path even when the chain is cut short by a timeout or an exception.
+        state: dict[int, dict[str, Any]] = {run["position"]: run for run in prior_runs}
         started = time.perf_counter()
         try:
-            result = await asyncio.wait_for(
-                self.executor.execute_calls(
-                    execution_calls,
-                    owner_id=self.owner_id,
-                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
-                    context_override=execution_context,
+            outcome = await asyncio.wait_for(
+                self._execute_chain(
+                    occurrence, calls, execution_calls, state, execution_context
                 ),
                 timeout=MAX_EXECUTION_SECONDS,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return await self.handle_failure(occurrence, exc, action_count=len(calls))
+            return await self.handle_failure(
+                occurrence, exc, action_count=len(calls),
+                runs=_ordered_runs(state) or None,
+            )
 
-        successful = sum(item.success for item in result)
-        failed = next((item for item in result if not item.success), None)
+        successful = outcome.succeeded
         duration_ms = round((time.perf_counter() - started) * 1000, 1)
         metadata = _bounded_metadata({
             "action_count": len(calls),
             "successful_action_count": successful,
             "duration_ms": duration_ms,
-            "terminal_status": "succeeded" if failed is None else "failed",
+            "terminal_status": "succeeded" if outcome.failed_position is None else "failed",
+            "actions": outcome.runs,
         })
-        if failed is not None:
-            failure = failed.error or failed.message or "action_failed"
-            if failure == "timeout" or failed.message.lower().startswith("timeout"):
-                failure = TimeoutError(failed.message or "tool timed out")
+        if outcome.failed_position is not None:
             return await self.handle_failure(
                 occurrence,
-                failure,
+                outcome.failure,
                 successful=successful,
                 action_count=len(calls),
                 metadata=metadata,
+                runs=outcome.runs,
             )
         updated = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,
@@ -441,8 +528,134 @@ class TaskExecutionCoordinator:
         )
         if updated is None:
             return TaskExecutionResult(False, "unknown", len(calls), successful, "state_persist_failed", metadata)
-        await self._deliver_result(task, result, execution_context, occurrence.occurrence_key)
+        await self._deliver_result(task, outcome.results, execution_context, occurrence.occurrence_key)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
+
+    async def _execute_chain(
+        self,
+        occurrence: OccurrenceRecord,
+        calls: list[dict[str, Any]],
+        execution_calls: list[dict[str, Any]],
+        state: dict[int, dict[str, Any]],
+        execution_context: ToolContext,
+    ) -> _ChainOutcome:
+        """Run ONE occurrence's ordered actions as a durable chain.
+
+        Sequential by construction: action N+1 is not even resolved until
+        action N has SUCCEEDED, so a failure stops the chain (later actions are
+        recorded ``pending`` and never run). Each action's call still goes
+        through the single ToolExecutor (never ``tool.execute()`` directly),
+        its arguments may reference a declared output field of an EARLIER
+        action of this same occurrence (resolved here, deterministically), and
+        its bounded result/state is persisted through the occurrence's own
+        metadata before the next action starts. An action already recorded
+        ``succeeded`` in an earlier attempt is NOT re-executed: its recorded
+        output stays available to later references.
+        """
+        registry = self.executor._registry
+        results: list[ToolExecutionResult] = []
+        skipped = 0
+        failed_position: int | None = None
+        failure: Any = ""
+        for position, call in enumerate(calls, start=1):
+            name = call["name"]
+            recorded = state.get(position)
+            if recorded is not None and recorded["status"] == "succeeded":
+                skipped += 1
+                continue
+            arguments = execution_calls[position - 1].get("arguments", {})
+            resolved, reason = resolve_action_arguments(arguments, _ordered_runs(state))
+            if reason:
+                state[position] = build_action_run(position, name, "failed", error=reason)
+                failed_position, failure = position, reason
+                break
+            state[position] = build_action_run(position, name, "running")
+            await self._persist_runs(occurrence, state)
+            result = (await self.executor.execute_calls(
+                [{"name": name, "arguments": resolved}],
+                owner_id=self.owner_id,
+                session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                context_override=execution_context,
+            ))[0]
+            results.append(result)
+            if not result.success:
+                failure = self._action_failure(result)
+                state[position] = build_action_run(
+                    position, name, "failed", error=str(failure)
+                )
+                failed_position = position
+                break
+            tool = registry.get(name)
+            state[position] = build_action_run(
+                position, name, "succeeded",
+                output=bounded_action_output(
+                    result.data,
+                    declared_consumable_output_fields(tool) if tool is not None else (),
+                ),
+            )
+            await self._persist_runs(occurrence, state)
+        # Actions the chain never reached are recorded explicitly pending, so
+        # the occurrence always carries the full per-action state.
+        for position, call in enumerate(calls, start=1):
+            state.setdefault(position, build_action_run(position, call["name"], "pending"))
+        if skipped:
+            logger.info(
+                "TASK_CHAIN_RESUMED task_id=%s occurrence_key=%s attempt=%s "
+                "already_succeeded=%s executed=%s",
+                occurrence.task_id, occurrence.occurrence_key, occurrence.attempt,
+                skipped, len(results),
+            )
+        return _ChainOutcome(
+            results=results,
+            runs=_ordered_runs(state),
+            failed_position=failed_position,
+            failure=failure,
+            skipped=skipped,
+        )
+
+    @staticmethod
+    def _action_failure(result: ToolExecutionResult) -> str | BaseException:
+        """The failure reason of ONE action, classified as before.
+
+        A timeout keeps its retryable classification; every other tool failure
+        keeps the existing deterministic (non-retryable) outcome.
+        """
+        failure: str | BaseException = result.error or result.message or "action_failed"
+        if failure == "timeout" or str(result.message or "").lower().startswith("timeout"):
+            return TimeoutError(result.message or "tool timed out")
+        return failure
+
+    async def _persist_runs(
+        self, occurrence: OccurrenceRecord, state: dict[int, dict[str, Any]]
+    ) -> None:
+        """Persist the bounded per-action record while the chain runs.
+
+        Written on the occurrence's OWN bounded metadata (no schema change) so
+        a restart or retry can never replay a side effect the record already
+        accounts for. A failed audit write is logged and never invents
+        success; the next action's write — or the terminal transition, which
+        always carries the complete record — retries it.
+        """
+        try:
+            updated = await self.repository.transition_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+                "running", result_metadata=_bounded_metadata({
+                    ACTION_RUNS_KEY: _ordered_runs(state),
+                }),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "TASK_ACTION_RECORD_PERSIST_FAILED task_id=%s occurrence_key=%s exception=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+            )
+            return
+        if updated is None:
+            logger.warning(
+                "TASK_ACTION_RECORD_PERSIST_SKIPPED task_id=%s occurrence_key=%s status=%s",
+                occurrence.task_id, occurrence.occurrence_key, occurrence.status,
+            )
 
     async def prepare_ahead(self, occurrence: OccurrenceRecord) -> list[dict[str, Any]] | None:
         """Prepare AI arguments BEFORE the occurrence is due (no side effects).
@@ -746,8 +959,16 @@ class TaskExecutionCoordinator:
         successful: int = 0,
         action_count: int = 0,
         metadata: dict[str, Any] | None = None,
+        runs: list[dict[str, Any]] | None = None,
     ) -> TaskExecutionResult:
         decision = classify_failure(error)
+        error_metadata = _bounded_metadata({
+            "error_class": decision.reason,
+            "attempt": occurrence.attempt,
+            "action_count": action_count,
+            "successful_action_count": successful,
+            **({ACTION_RUNS_KEY: runs} if runs else {}),
+        })
         if decision.classification == FailureClass.RETRYABLE and can_retry(occurrence.attempt):
             retry_at = occurrence.updated_at + retry_delay(occurrence.attempt)
             updated = await self.repository.transition_occurrence(
@@ -757,12 +978,7 @@ class TaskExecutionCoordinator:
                 "retry_pending",
                 retry_at=retry_at,
                 attempt=occurrence.attempt + 1,
-                error_metadata=_bounded_metadata({
-                    "error_class": decision.reason,
-                    "attempt": occurrence.attempt,
-                    "action_count": action_count,
-                    "successful_action_count": successful,
-                }),
+                error_metadata=error_metadata,
             )
             return TaskExecutionResult(
                 False,
@@ -772,7 +988,9 @@ class TaskExecutionCoordinator:
                 decision.reason,
                 metadata,
             )
-        return await self._fail(occurrence, decision.reason, successful, action_count, metadata)
+        return await self._fail(
+            occurrence, decision.reason, successful, action_count, metadata, runs
+        )
 
     async def _fail(
         self,
@@ -781,6 +999,7 @@ class TaskExecutionCoordinator:
         successful: int,
         count: int,
         metadata: dict[str, Any] | None = None,
+        runs: list[dict[str, Any]] | None = None,
     ) -> TaskExecutionResult:
         safe_error = str(error)[:512]
         error_metadata = _bounded_metadata({
@@ -788,6 +1007,7 @@ class TaskExecutionCoordinator:
             "attempt": occurrence.attempt,
             "action_count": count,
             "successful_action_count": successful,
+            **({ACTION_RUNS_KEY: runs} if runs else {}),
         })
         updated = await self.repository.transition_occurrence(
             self.owner_id, occurrence.task_id, occurrence.occurrence_key,

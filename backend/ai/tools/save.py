@@ -50,6 +50,22 @@ def _save_metadata(
     return metadata, ""
 
 
+def _save_data(result: Any, *, mode: str, **extra: Any) -> dict[str, Any]:
+    """The structured half of a Deep Save result.
+
+    ``save_code`` is the item's identity and is exposed whenever the pipeline
+    reported one (``save_service.SaveOutcome``); a mocked/legacy string simply
+    carries none, and nothing is ever scraped out of the human-readable text.
+    ``mode`` stays the two-token contract it always was.
+    """
+    data: dict[str, Any] = {"mode": mode}
+    data.update(extra)
+    save_code = getattr(result, "save_code", "")
+    if isinstance(save_code, str) and save_code:
+        data["save_code"] = save_code
+    return data
+
+
 class SaveTool(Tool):
     """Deep-save a replied message to Saved Messages.
 
@@ -112,7 +128,11 @@ class SaveTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with save_code and confirmation message in data"
+        return "ToolResult with the new item's save_code in data plus the confirmation message"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     @property
     def long_running(self) -> bool:
@@ -146,7 +166,7 @@ class SaveTool(Tool):
             )
             # Services report failures as "❌ ..."/"⚠️ ..." strings — only a
             # success string means the save actually happened.
-            return result_from_service(result, data={"mode": "deep"})
+            return result_from_service(result, data=_save_data(result, mode="deep"))
         except Exception as exc:
             return ToolResult(success=False, message=f"Save failed: {exc}")
 
@@ -246,7 +266,11 @@ class SaveByLinkTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with save_code and confirmation message in data"
+        return "ToolResult with the new item's save_code in data plus the confirmation message"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     @property
     def long_running(self) -> bool:
@@ -285,7 +309,7 @@ class SaveByLinkTool(Tool):
                 client, context.owner_id, link, context.tz_str, metadata=metadata
             )
             return result_from_service(
-                result, data={"mode": "deep", "source": "telegram_link"}
+                result, data=_save_data(result, mode="deep", source="telegram_link")
             )
         except Exception as exc:
             return ToolResult(success=False, message=f"Link save failed: {exc}")

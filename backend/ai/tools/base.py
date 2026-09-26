@@ -184,6 +184,21 @@ the existing service layer and return a ``ToolResult``.
         """
         ...
 
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        """``ToolResult.data`` keys a LATER action may reference (optional).
+
+        Durable action chains consume a previous action's result through an
+        explicit, bounded reference (see ``backend.ai.task_contract``), and a
+        reference may only name a field the tool DECLARES here. Declare only
+        stable identities the tool really returns (e.g. ``save_code``); a
+        declared field whose value is missing, blank or beyond the bounded
+        text size is simply absent from the recorded output, and a reference
+        to it fails the referencing action closed. Omit the property when the
+        tool returns no chainable value.
+        """
+        ...
+
     async def execute(self, context: "ToolContext", arguments: dict[str, Any]) -> ToolResult:
         """Perform the action and return a structured result.
 
@@ -225,3 +240,14 @@ def declared_any_arguments(tool: Tool) -> tuple[str, ...]:
 def requires_reply_context(tool: Tool) -> bool:
     """True when ``tool`` declares an immediate replied-message dependency."""
     return bool(getattr(tool, "requires_reply_context", False))
+
+
+def declared_consumable_output_fields(tool: Tool) -> tuple[str, ...]:
+    """The ``data`` keys ``tool`` declares as chainable (empty by default).
+
+    The single source of truth both the task-creation reference validation and
+    the execution-time output extraction read, so a tool's chainable contract
+    cannot drift between the two boundaries.
+    """
+    declared = getattr(tool, "consumable_output_fields", ()) or ()
+    return tuple(str(name) for name in declared)

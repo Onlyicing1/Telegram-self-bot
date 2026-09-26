@@ -186,7 +186,11 @@ class RenameSaveTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the rename confirmation or honest failure"
+        return "ToolResult with the item's save_code in data plus the rename confirmation or honest failure"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
@@ -341,7 +345,11 @@ class UpdateSaveTagsTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the updated tag list or honest failure"
+        return "ToolResult with the item's save_code in data plus the updated tag list or honest failure"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
@@ -460,7 +468,11 @@ class RetrieveSaveTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the retrieval confirmation or honest failure"
+        return "ToolResult with the item's save_code in data plus the retrieval confirmation or honest failure"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
@@ -610,7 +622,11 @@ class PreviewSaveTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the item's metadata text in message"
+        return "ToolResult with the item's save_code in data and its metadata text in message"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service
@@ -686,7 +702,11 @@ class DeleteSaveTool(Tool):
 
     @property
     def return_type(self) -> str:
-        return "ToolResult with the deletion confirmation or honest failure"
+        return "ToolResult with the item's save_code in data plus the deletion confirmation or honest failure"
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        return ("save_code",)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
         from backend.services import retrieve_service

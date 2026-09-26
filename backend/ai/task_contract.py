@@ -270,6 +270,332 @@ class AIInstruction:
         return {"kind": "ai_instruction", "version": self.version, "text": self.text}
 
 
+# ── Durable action chains ───────────────────────────────────────────────────
+# A durable task's ordered actions may pass a bounded result forward: one
+# argument value may be a REFERENCE to a declared output field of an EARLIER
+# action in the same occurrence —
+#
+#     {"$ref": {"action": 1, "field": "save_code"}}
+#
+# The reference is DATA in the task definition, never model-resolved: it is
+# validated at creation against the referenced tool's declared consumable
+# output fields, re-proved before any execution, and resolved deterministically
+# by the TaskExecutionCoordinator from the bounded per-action runs the
+# occurrence already recorded. Everything unknown fails closed: a reference may
+# only name an earlier position of THIS occurrence, can never reach another
+# task's or another occurrence's result, and is never guessed or substituted.
+REFERENCE_KEY = "$ref"
+#: Occurrence-metadata key holding the bounded per-action run records.
+ACTION_RUNS_KEY = "actions"
+ACTION_RUN_STATUSES = frozenset({"pending", "running", "succeeded", "failed"})
+MAX_REFERENCE_FIELD_CHARS = 64
+MAX_ACTION_OUTPUT_FIELDS = 3
+MAX_ACTION_OUTPUT_TEXT_CHARS = 128
+MAX_ACTION_ERROR_CHARS = 256
+#: The whole runs list must fit the occurrence's bounded metadata convention
+#: with room for its counters; the per-run bounds below make that structural.
+MAX_ACTION_RUNS_BYTES = 6144
+
+
+def is_action_reference(value: Any) -> bool:
+    """True when a value claims the reserved reference namespace."""
+    return isinstance(value, dict) and REFERENCE_KEY in value
+
+
+def validate_action_reference(value: Any) -> dict[str, Any]:
+    """The ONE accepted reference shape, normalized. Fails closed."""
+    if not isinstance(value, dict) or set(value) != {REFERENCE_KEY}:
+        raise TaskContractError("a reference must contain only '$ref'")
+    target = value[REFERENCE_KEY]
+    if not isinstance(target, dict) or set(target) != {"action", "field"}:
+        raise TaskContractError("a reference must name exactly an action and a field")
+    position = target["action"]
+    if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+        raise TaskContractError("a reference action must be a positive action number")
+    field = target["field"]
+    if not isinstance(field, str) or not field.strip() or len(field) > MAX_REFERENCE_FIELD_CHARS:
+        raise TaskContractError("a reference field must be a bounded nonblank name")
+    return {REFERENCE_KEY: {"action": position, "field": field.strip()}}
+
+
+def _reserved_key_error(value: Any, argument: str) -> str | None:
+    """Refuse any ``$``-prefixed key nested below an argument value.
+
+    Only a WHOLE argument value may be a reference; a reserved key buried in
+    a list/object is refused here, so no object traversal or expression
+    language can ever grow out of the reference shape.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).startswith("$"):
+                return (
+                    f"argument '{argument}' nests a reserved '{key}' key; only a "
+                    "whole argument value may be a reference"
+                )
+            error = _reserved_key_error(item, argument)
+            if error:
+                return error
+    elif isinstance(value, list):
+        for item in value:
+            error = _reserved_key_error(item, argument)
+            if error:
+                return error
+    return None
+
+
+def _action_references(action: Any) -> tuple[dict[str, dict[str, Any]], str]:
+    """``(references by argument, error)`` for one action."""
+    if not isinstance(action, dict):
+        return {}, "each action must be an object"
+    arguments = action.get("arguments", action.get("parameters", {}))
+    if not isinstance(arguments, dict):
+        return {}, "action arguments must be objects"
+    references: dict[str, dict[str, Any]] = {}
+    for argument, value in arguments.items():
+        if is_action_reference(value):
+            try:
+                references[str(argument)] = validate_action_reference(value)
+            except TaskContractError as exc:
+                return {}, f"argument '{argument}': {exc}"
+            continue
+        error = _reserved_key_error(value, str(argument))
+        if error:
+            return {}, error
+    return references, ""
+
+
+def _declared_fields(tool: Any) -> tuple[str, ...]:
+    """The tool's declared consumable output fields (one shared definition)."""
+    from backend.ai.tools.base import declared_consumable_output_fields
+
+    return declared_consumable_output_fields(tool)
+
+
+def action_reference_error(
+    actions: Any, registry: Any | None, *, generation_authorized: bool = False
+) -> str | None:
+    """Reject an action list whose references could never resolve.
+
+    Enforced at task creation AND re-proved before any execution: a reference
+    to the action's own position or a later one, to a position that does not
+    exist, to an unregistered tool, or to a field that tool does not declare
+    as chainable is refused — as is a reference on a task whose arguments are
+    generated per occurrence (the model would be free to drop it). A missing
+    registry skips only the tool/field checks (the execution boundary still
+    fails the occurrence closed); the position rule is always enforced.
+    """
+    if not isinstance(actions, list) or not actions:
+        return None
+    has_registry = registry is not None and hasattr(registry, "get")
+    for position, action in enumerate(actions, start=1):
+        references, error = _action_references(action)
+        if error:
+            return error
+        if not references:
+            continue
+        if generation_authorized:
+            return (
+                f"action {position} carries a result reference, which cannot be "
+                "combined with per-occurrence generated arguments"
+            )
+        for argument, reference in references.items():
+            target = reference[REFERENCE_KEY]
+            target_position = target["action"]
+            if target_position >= position:
+                return (
+                    f"action {position} argument '{argument}' references action "
+                    f"{target_position}, which is not an earlier action of the same task"
+                )
+            if not has_registry:
+                continue
+            target_action = actions[target_position - 1]
+            target_name = target_action.get("name") if isinstance(target_action, dict) else None
+            tool = registry.get(target_name) if isinstance(target_name, str) else None
+            if tool is None:
+                return (
+                    f"action {position} argument '{argument}' references an "
+                    "action whose tool is not registered"
+                )
+            if target["field"] not in _declared_fields(tool):
+                return (
+                    f"action {position} argument '{argument}' references field "
+                    f"'{target['field']}', which action {target_position}'s tool "
+                    "does not declare as chainable"
+                )
+    return None
+
+
+def actions_need_resolution(calls: Any) -> bool:
+    """True when at least one argument value is a reference to resolve."""
+    if not isinstance(calls, list):
+        return False
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        arguments = call.get("arguments")
+        if isinstance(arguments, dict) and any(is_action_reference(v) for v in arguments.values()):
+            return True
+    return False
+
+
+def bounded_action_output(data: Any, fields: Any) -> dict[str, Any]:
+    """The declared, chainable, bounded subset of one tool's ``ToolResult.data``.
+
+    Exactly the declared fields, each must be a bounded scalar (a nonblank
+    string within ``MAX_ACTION_OUTPUT_TEXT_CHARS``, a number, or a boolean);
+    anything else — a missing key, a blank/oversized string, a nested object,
+    a null — is omitted rather than coerced, so a reference to it fails the
+    referencing action closed instead of executing with an invented value.
+    The field/​size bounds make the whole record structurally fit its budget.
+    """
+    if not isinstance(data, dict) or not isinstance(fields, (list, tuple)):
+        return {}
+    output: dict[str, Any] = {}
+    for field in list(fields)[:MAX_ACTION_OUTPUT_FIELDS]:
+        name = str(field)
+        value = data.get(name)
+        if isinstance(value, bool):
+            output[name] = value
+        elif isinstance(value, int):
+            output[name] = value
+        elif isinstance(value, float):
+            if value == value and value not in (float("inf"), float("-inf")):
+                output[name] = value
+        elif isinstance(value, str):
+            if value.strip() and len(value) <= MAX_ACTION_OUTPUT_TEXT_CHARS:
+                output[name] = value
+    return output
+
+
+def build_action_run(
+    position: int,
+    tool: str,
+    status: str,
+    *,
+    output: dict[str, Any] | None = None,
+    error: str = "",
+) -> dict[str, Any]:
+    """One bounded per-action run record, validated as it is built."""
+    value: dict[str, Any] = {"position": position, "tool": tool, "status": status}
+    if status == "succeeded":
+        value["output"] = dict(output or {})
+    elif status == "failed":
+        value["error"] = " ".join(str(error or "").split())[:MAX_ACTION_ERROR_CHARS]
+    return validate_action_run(value)
+
+
+def validate_action_run(value: Any) -> dict[str, Any]:
+    """Normalize ONE action run record; every deviation fails closed."""
+    if not isinstance(value, dict):
+        raise TaskContractError("an action run must be an object")
+    allowed = {"position", "tool", "status", "output", "error"}
+    if set(value) - allowed:
+        raise TaskContractError("an action run carries unsupported fields")
+    position = value.get("position")
+    if isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= MAX_ACTIONS:
+        raise TaskContractError("an action run needs a bounded 1-based position")
+    tool = value.get("tool")
+    if not isinstance(tool, str) or not tool.strip() or len(tool) > MAX_TOOL_NAME_CHARS:
+        raise TaskContractError("an action run needs a bounded tool name")
+    status = value.get("status")
+    if status not in ACTION_RUN_STATUSES:
+        raise TaskContractError("invalid action run status")
+    output = value.get("output")
+    error = value.get("error")
+    if output is not None and status != "succeeded":
+        raise TaskContractError("only a succeeded action carries an output")
+    if error is not None and status != "failed":
+        raise TaskContractError("only a failed action carries an error")
+    normalized = {"position": position, "tool": tool.strip(), "status": status}
+    if status == "succeeded":
+        if not isinstance(output, dict) or len(output) > MAX_ACTION_OUTPUT_FIELDS:
+            raise TaskContractError("an action output must be a bounded object")
+        normalized["output"] = bounded_action_output(output, tuple(output))
+    elif status == "failed":
+        if not isinstance(error, str):
+            raise TaskContractError("an action error must be text")
+        normalized["error"] = " ".join(error.split())[:MAX_ACTION_ERROR_CHARS]
+    if len(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_ACTION_RUNS_BYTES:
+        raise TaskContractError("an action run exceeds its bounded size")
+    return normalized
+
+
+def validate_action_runs(value: Any) -> list[dict[str, Any]]:
+    """Normalize the bounded per-action run records of ONE occurrence."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_ACTIONS:
+        raise TaskContractError("action runs must be a bounded list")
+    runs = [validate_action_run(item) for item in value]
+    positions = [run["position"] for run in runs]
+    if len(set(positions)) != len(positions):
+        raise TaskContractError("action run positions must be unique")
+    if len(json.dumps(runs, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_ACTION_RUNS_BYTES:
+        raise TaskContractError("action runs exceed their bounded size")
+    return sorted(runs, key=lambda run: run["position"])
+
+
+def action_runs_from_metadata(metadata: Any) -> tuple[list[dict[str, Any]], bool]:
+    """``(runs, recorded)`` for an occurrence's metadata.
+
+    ``recorded`` is False only when no run records were ever written (a fresh
+    occurrence, or a row created before action chains existed). A malformed
+    record raises, so the caller can fail closed instead of replaying side
+    effects it cannot account for.
+    """
+    if not isinstance(metadata, dict):
+        return [], False
+    if ACTION_RUNS_KEY not in metadata:
+        return [], False
+    return validate_action_runs(metadata.get(ACTION_RUNS_KEY)), True
+
+
+def resolve_action_arguments(
+    arguments: Any, runs: Any
+) -> tuple[dict[str, Any], str]:
+    """Resolve a call's references from THIS occurrence's recorded runs.
+
+    Returns ``(resolved_arguments, "")``, or ``({}, reason)`` when anything is
+    unknown. Only a run of the same occurrence that is recorded ``succeeded``
+    and whose bounded output carries the named field resolves; every other
+    case fails closed with a deterministic reason — never a guess, never null.
+    """
+    if not isinstance(arguments, dict):
+        return {}, "action_arguments_invalid"
+    try:
+        recorded = validate_action_runs(runs)
+    except (TaskContractError, TypeError, ValueError):
+        return {}, "action_record_invalid"
+    by_position = {run["position"]: run for run in recorded}
+    resolved: dict[str, Any] = {}
+    for argument, value in arguments.items():
+        if not is_action_reference(value):
+            nested = _reserved_key_error(value, str(argument))
+            if nested:
+                return {}, f"invalid_reference ({nested})"
+            resolved[argument] = value
+            continue
+        try:
+            reference = validate_action_reference(value)
+        except TaskContractError:
+            return {}, f"invalid_reference (argument '{argument}')"
+        target = reference[REFERENCE_KEY]
+        run = by_position.get(target["action"])
+        if run is None or run["status"] != "succeeded":
+            return {}, (
+                f"reference_target_not_succeeded (argument '{argument}', "
+                f"action {target['action']})"
+            )
+        output = run.get("output")
+        if not isinstance(output, dict) or target["field"] not in output:
+            return {}, (
+                f"reference_field_unavailable (argument '{argument}', "
+                f"field '{target['field']}')"
+            )
+        resolved[argument] = output[target["field"]]
+    return resolved, ""
+
+
 @dataclass(frozen=True)
 class PreparedAction:
     definition_version: int

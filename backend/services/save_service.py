@@ -441,6 +441,26 @@ def _upload_kwargs_for_media(media, mime_type: str | None, file_name: str | None
     return {"force_document": False}
 
 
+class SaveOutcome(str):
+    """The Deep Save result text, carrying the new item's structured identity.
+
+    Subclasses ``str`` so every existing caller (handlers, panels, tests)
+    keeps receiving exactly the text it received before, while the AI tool
+    boundary can expose ``save_code`` through ``ToolResult.data`` instead of
+    re-parsing human-readable confirmation text. ``saved`` is True only when
+    the whole pipeline really persisted the item.
+    """
+
+    save_code: str
+    saved: bool
+
+    def __new__(cls, text: str, *, save_code: str = "", saved: bool = False) -> "SaveOutcome":
+        outcome = super().__new__(cls, text)
+        outcome.save_code = str(save_code or "")
+        outcome.saved = bool(saved)
+        return outcome
+
+
 def build_confirmation(
     save_code: str,
     media_type: str,
@@ -779,7 +799,11 @@ async def execute_save(
         "origin_msg_id": origin_msg_id,
     })
     logger.info("[SAVE] completed: %s", save_code)
-    return build_confirmation(save_code, media_type, file_name)
+    return SaveOutcome(
+        build_confirmation(save_code, media_type, file_name),
+        save_code=save_code,
+        saved=True,
+    )
 
 
 async def execute_link_save(

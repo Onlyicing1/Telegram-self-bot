@@ -24,7 +24,12 @@ from backend.ai.scheduling import (
     parse_schedule,
 )
 from backend.ai.task_candidate import TaskCandidate
-from backend.ai.task_contract import AIInstruction, validate_ai_instruction
+from backend.ai.task_contract import (
+    AIInstruction,
+    action_reference_error,
+    is_action_reference,
+    validate_ai_instruction,
+)
 from backend.ai.task_trace import bound_text, task_trace
 from backend.ai.tools.base import (
     declared_any_arguments,
@@ -178,6 +183,13 @@ def _action_eligibility_error(
             if generation_authorized and argument in CONTENT_FIELDS:
                 continue
             return f"action '{name}' requires the '{argument}' argument"
+        if is_action_reference(value):
+            # A reference is resolved at execution from a PREVIOUS action's
+            # recorded result, so the tool's declared enum/minimum applies to
+            # the resolved value then — never to the placeholder. The
+            # reference shape itself is validated by ``action_reference_error``
+            # over the whole action list right after this loop.
+            continue
         spec = schema.get(argument) if isinstance(schema, dict) else None
         if isinstance(spec, dict):
             error = _declared_constraint_error(name, argument, value, spec)
@@ -375,6 +387,12 @@ class TaskCreationService:
                 if eligibility_error:
                     _creation_trace("action_ineligible", reason=eligibility_error)
                     raise _invalid(eligibility_error)
+            reference_error = action_reference_error(
+                actions, registry, generation_authorized=generation_authorized
+            )
+            if reference_error:
+                _creation_trace("action_ineligible", reason=reference_error)
+                raise _invalid(reference_error)
         if (
             candidate.get("timezone") != candidate["schedule"].get("timezone")
             and candidate["schedule_type"] not in ("interval", "event", TODO_SCHEDULE_TYPE)

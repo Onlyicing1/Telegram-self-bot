@@ -1,6 +1,251 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TODO PART 2 — MULTI-STEP TODOS (ordered, independently completable steps)
+## Latest phase — TODO PART 3A — DURABLE ACTION CHAINS + BOUNDED RESULT PASSING
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `7c0476d` = `origin/main` (`docs(todo): investigate agent workflow architecture`).
+The `INVESTIGATION.md` of that commit is the architectural basis of this phase;
+nothing in it is contradicted here.
+
+### Phase objective
+
+Make an existing durable task's ordered `actions` behave as a real execution
+chain: each action runs in order through the single `ToolExecutor`, an action
+may consume a **declared, bounded output field of an earlier action of the same
+occurrence**, and every action's state is durable so a retry resumes where the
+chain stopped instead of replaying a side effect that already happened.
+
+    TASK → ACTION 1 → structured result → ACTION 2 consumes it → … → durable completion
+
+Explicitly NOT in this phase (they remain later phases): waiting / “at 18:00”,
+branching and conditions, question+answer continuation, multi-turn task
+continuation, autonomous replanning, DAGs, any second scheduler/executor/
+repository, any change to `todo_steps`, any new table or migration.
+
+### Architecture implemented
+
+* **One workflow = one `ai_tasks` row.** `actions` (1–5, validated at creation)
+  was already the ordered list; nothing replaced it.
+* **One execution authority.** `TaskExecutionCoordinator.execute` now runs the
+  occurrence's actions through a per-action loop
+  (`_execute_chain`) that still calls `ToolExecutor.execute_calls` — one batch
+  per action — and never `tool.execute()` directly. `ToolRegistry` stays the
+  capability allowlist (the pre-flight registry lookup and the reference
+  target lookup both read it).
+* **One scheduler / lifecycle.** `TaskScheduler`, the claim CAS and
+  `RuntimeSupervisor` are untouched; no new timer, worker or boundary exists.
+* **Sequential by construction.** Action N+1 is not even argument-resolved
+  until action N has succeeded, so a failure stops the chain (later actions are
+  recorded `pending` and never run). Names are all pre-validated *before* the
+  first action, so an unregistered action fails the occurrence with zero side
+  effects.
+
+### Action execution flow (exact)
+
+    claim_occurrence (existing CAS)
+      → execute()
+         1. validate every action (name/arguments/registry)   [before anything runs]
+         2. action_reference_error(actions, registry)         [fail closed]
+         3. read the occurrence's durable per-action record (fresh attempt: none)
+         4. re-prove the record matches this action snapshot
+         → for each action, in order:
+              recorded `succeeded`? → SKIP (never re-execute; output stays usable)
+              resolve_action_arguments(...)  → any unresolvable reference: FAIL now
+              record `running`; persist                                   (existing bounded metadata)
+              ToolExecutor.execute_calls([{name, arguments: resolved}])   (sole executor)
+              record `succeeded` + bounded declared output | `failed` + error
+              persist; continue
+         → actions never reached are recorded `pending`
+         → success: occurrence `succeeded` + result_metadata{counts, actions:[…]}
+           failure: existing classify_failure → `retry_pending`(timeout) / `failed`,
+                    error_metadata{error_class, counts, actions:[…]}
+
+### Action state model
+
+Per-action run record (bounded object inside the occurrence's own metadata):
+
+    {"position": 1, "tool": "web_search", "status": "succeeded", "output": {…}}
+    {"position": 2, "tool": "update_save_tags", "status": "failed", "error": "…"}
+    {"position": 3, "tool": "retrieve_save", "status": "pending"}
+
+Statuses: `pending`, `running`, `succeeded`, `failed` — and nothing else. No
+`blocked`/`paused`/`waiting` state was introduced (nothing can produce one).
+`output` exists only on `succeeded`, `error` only on `failed`; the occurrence's
+own statuses/attempts/retry contract are unchanged.
+
+### Structured result contract
+
+`ToolResult.data` stays the tool's full structured payload; only the fields a
+tool **declares** via the new optional `consumable_output_fields` property
+(`backend/ai/tools/base.py`) become chainable, through
+`bounded_action_output(data, fields)`: at most 3 fields, each a nonblank string
+≤ 128 characters, a finite number or a boolean. A declared value that is
+missing, blank, oversized, nested or null is **omitted, never coerced**, and a
+reference to it fails the referencing action closed. Declarations added:
+`save`/`save_by_link` → `save_code`; `update_save_tags`/`rename_save`/
+`retrieve_save`/`preview_save`/`delete_save` → `save_code`; `web_search` →
+`top_title`, `top_url` (a bounded projection of the FIRST result; the full
+result list stays exactly where it was and is not chainable).
+
+### Reference mechanism
+
+Exactly one shape, as a WHOLE argument value:
+
+    {"$ref": {"action": 1, "field": "save_code"}}
+
+No string placeholders, no expression language, no object traversal, no
+recursion: `action` is a 1-based position of an EARLIER action of the same
+occurrence, `field` must be one the referenced tool declares, and the resolved
+value comes only from that action's recorded bounded output. Resolution happens
+in the coordinator (`resolve_action_arguments`) — never in the model, never from
+the database, never from a file or an RPC.
+
+### Validation rules (all fail closed)
+
+Rejected at **creation** (`action_reference_error`, wired into
+`TaskCreationService.create`, with the reason traced as `action_ineligible`):
+malformed reference (missing/extra keys, non-integer or non-positive `action`,
+blank/oversized `field`), a reference to the action itself or a **later**
+action, to a position that does not exist, to an unregistered tool, or to a
+field that tool does not declare as chainable; a `$`-prefixed key **nested**
+anywhere below an argument value; and any reference on a task that carries an
+`ai_instruction` (per-occurrence generation could silently drop it).
+Re-proved at **execution** before anything runs; unresolved references fail the
+occurrence with `invalid_action_reference` (or the per-argument reasons below)
+and execute nothing. Runtime reasons: `reference_target_not_succeeded`,
+`reference_field_unavailable`, `invalid_reference`, `action_record_invalid`,
+`action_arguments_invalid` — the referencing action never runs on a guess.
+
+### Persistence (no schema change)
+
+No migration, no new table, no `DATABASE_ARCHITECTURE.md` change: the record
+lives in the occurrence's existing bounded metadata (`result_metadata` while the
+chain runs and on success, `error_metadata` on a failure), validated by the new
+contract (`MAX_ACTION_RUNS_BYTES = 6144`, inside the repository's existing
+8192-byte metadata bound) and readable only with the occurrence itself — no
+schema, RLS, canonical snapshot or §31 setup-script change was needed, and **no
+SQL was executed and no Supabase object was contacted**.
+
+### Retry / resume behavior
+
+* A **succeeded action is never re-executed on a retry**; the record already
+  accounts for the side effect and its output stays available to later
+  references (`TASK_CHAIN_RESUMED` log line).
+* The chain **resumes at the action that did not succeed** (`failed`/`pending`),
+  with the recorded outputs of earlier actions intact.
+* Retry/backoff/attempt contract is unchanged (`MAX_ATTEMPTS = 3`; only
+  timeouts remain retryable; a permanent tool failure is terminal).
+* A malformed or mismatched record fails the occurrence closed **before any
+  execution** (`invalid_action_record`) rather than replaying anything.
+* The untouched restart contract still wins: a `running` occurrence is failed by
+  recovery as `restart_side_effect_uncertain` and never retried, and a never-
+  started past-due `claimed` occurrence still resolves through
+  `interrupted → retry/failed`. A record never crosses occurrences: a new
+  boundary of the same task re-runs its actions normally.
+
+### Save result contract (the D-4 fix)
+
+`save_service.execute_save`/`execute_link_save` now return a `SaveOutcome` — a
+`str` subclass carrying `save_code` and `saved` — so every existing caller
+(panels, handlers, tests) keeps receiving the identical confirmation text while
+`SaveTool`/`SaveByLinkTool` expose `data["save_code"]`. Nothing is scraped out
+of human-readable text, and a mocked/legacy plain-string result still yields the
+byte-identical `data == {"mode": "deep"}` contract.
+
+### Security / ownership
+
+Owner scoping is unchanged (every repository read/write filters by `owner_id`;
+a foreign owner gets `owner_mismatch` and executes nothing). References can only
+read a record that lives inside the SAME occurrence (same owner + task +
+occurrence) — there is no cross-task, cross-occurrence or cross-owner path, and
+the resolver is not an authorization surface. The model still cannot resolve a
+reference, choose a tool, reach a destination, or bypass the registry/executor;
+SQL, RPC, shell, filesystem and arbitrary HTTP access are exactly as
+unavailable as before.
+
+### Files changed
+
+Backend: `backend/ai/task_contract.py` (reference + run-record contract),
+`backend/ai/task_execution.py` (chain loop, records, resume),
+`backend/ai/task_creation.py` (creation-time reference validation),
+`backend/ai/tools/base.py` (declaration + helper),
+`backend/ai/tools/save.py`, `backend/ai/tools/retrieve_save.py`,
+`backend/ai/tools/websearch.py` (chainable outputs),
+`backend/services/save_service.py` (`SaveOutcome`).
+Tests: `tests/test_task_action_chains.py` (new, 38 tests).
+Docs: `AGENTS.md` (§9), this report.
+**No migration was added and no database object was touched.**
+
+### Tests added and executed (exact)
+
+The new suite pins, among others: single-action tasks still work; multi-action
+ordering and sequentiality (a start/end event trace proves action 2 does not
+begin before action 1 ends); the declared subset of `data` is what gets
+recorded; reference resolution drives a downstream argument; the
+SEARCH → SAVE → TAG end-to-end chain (real registry + real executor + real
+coordinator, service doubles mirroring the real tool names/contracts); every
+unresolvable/malformed/nested/forward/self reference rejection; oversized values
+are not chainable and fail closed; occurrence-scoped records; record mismatch
+and malformed records fail closed with zero executions; a failure stops the
+chain and marks later actions `pending`; a retry resumes at the failed action
+without replaying action 1 and consumes its recorded output; a mid-flight
+`running` occurrence is failed by recovery and never replayed; owner isolation;
+unregistered actions fail before anything runs; every action goes through the
+single executor (one batch per action); reference-free chains keep the existing
+metadata contract; `save_code` is in `data`; the real pipeline result is still a
+`str`; and two REAL tools (`rename_save` → `update_save_tags`) chain a resolved
+identity into a real tag write.
+
+### Validation results
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_task_action_chains.py -q` | **38 passed** |
+| `python3 -m pytest tests/ -q -k "task or todo or save or tool or scheduler or ai_actions"` | **1721 passed**, 3437 deselected |
+| `python3 -m pytest tests/ -q -p no:randomly` (full suite) | **5132 passed, 26 skipped** |
+| `python3 -m py_compile` on every changed Python file | clean |
+
+No live Telegram and no live Supabase verification was performed: everything
+above is offline (in-memory DB fallback, faked Telegram/HTTP boundaries),
+exactly as the existing suites are.
+
+### Limitations and honest boundaries
+
+* **No waiting**: all actions of an occurrence run at its single boundary
+  (Phase 3B owns “then at 18:00”).
+* **No branching**: no conditions, no alternative action lists, no
+  question+answer continuation.
+* **Skipping is unconditional**: a succeeded action is never re-run by a retry,
+  and there is no “safe to re-run” declaration; re-running a chain means
+  creating a new task (a new occurrence).
+* **Delivery on a resumed attempt** contains the messages of the actions
+  executed in that attempt (the earlier attempt’s messages are not re-sent; the
+  record holds only the bounded declared fields).
+* **Reply-based `save` stays ineligible** for durable tasks by design
+  (`requires_reply_context`), so a durable SAVE half uses the identity-producing
+  tools (`save_by_link`, or the saved-item management tools).
+* **Bounded by contract**: 3 declared fields × 128 characters per action; a
+  longer/nested value is simply not chainable and the reference fails closed.
+* **AI-authored chains stay reference-free**: prompting was not redesigned, so
+  the model proposes the existing ordered action lists while the reference
+  contract is *validated*, not generated. Producing a reference-bearing chain
+  from a natural-language request is a later phase.
+
+### Intentionally NOT implemented (Phase 3B+)
+
+Continuation boundary / delayed delivery, conditional execution, owner-answer
+resumption, autonomous replanning, per-action retry beyond the resume rule, any
+new table/migration, any scheduler/executor/repository change, any `todo_steps`
+change, any new UI.
+
+### Git
+
+Commit `feat(todo): add durable action chains` on `main`, pushed to `origin/main`;
+local HEAD == `origin/main` verified after `git fetch`.
+
+---
+
+## TODO PART 2 — MULTI-STEP TODOS (ordered, independently completable steps)
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `9f7c09b` = `origin/main` (Part 1 landed by the owner: `feat(todo): add basic todo list` + canonical setup reconciliation).
