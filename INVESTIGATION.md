@@ -610,6 +610,25 @@ The smallest models that could express it — to be decided by the owner (§23),
 Either way: **do not add a scheduler**, **do not add a timer service**, and
 **do not** turn `prepare-ahead` into a generic delayed-execution mechanism.
 
+**Source-verified correction (Phase 3B, implemented).** The "durable
+next-action index" and the *second occurrence* turned out to be unnecessary.
+The wait is one optional reserved field on the action itself —
+`not_before`, an ISO-8601 timestamp, preserved by the candidate boundary,
+resolved and bounded at creation against the task's own timezone (stored as an
+absolute UTC instant) and re-proved before any execution. The occurrence then
+parks on that instant through the eligibility pair it already has:
+`status="retry_pending"` + `retry_at=<boundary>`, the one non-terminal state the
+schema CHECK, the claim CAS, `list_due_retry_occurrences` and the recovery
+exemption all already agree on — so no new status, no new column, no second
+occurrence, no migration, and the wake loop stays generic (it selects the
+occurrence by instant, never by meaning). Resume needs no index either: the
+stored action list is re-walked and the Phase 3A per-action run record (which
+the park writes to both metadata channels) skips every action already recorded
+`succeeded`. The waiting action itself stays `pending` and is never marked
+succeeded by the wait, and because a parked occurrence is `retry_pending` —
+never `running` — a wait can never be mistaken for a running action or resolved
+as `restart_side_effect_uncertain`.
+
 ---
 
 ## 13. Ownership / security boundaries

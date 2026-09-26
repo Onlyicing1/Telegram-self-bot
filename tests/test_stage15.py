@@ -28,7 +28,7 @@ class Coordinator:
     def __init__(self):
         self.seen = []
 
-    async def execute(self, occurrence):
+    async def execute(self, occurrence, *, now=None):
         self.seen.append(occurrence)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 MAX_ACTIONS = 5
@@ -594,6 +595,122 @@ def resolve_action_arguments(
             )
         resolved[argument] = output[target["field"]]
     return resolved, ""
+
+
+# ── Durable wait boundaries ─────────────────────────────────────────────────
+# One action may carry ONE optional reserved field, ``not_before``: an ISO-8601
+# timestamp naming the earliest instant at which THAT action may run. It is
+# data in the task definition, never model-resolved at execution: validated at
+# creation against the task's own timezone (and normalized to an absolute UTC
+# instant there, so the stored definition no longer depends on the timezone),
+# then re-proved before any execution. A wait is ELIGIBILITY, not a new action
+# state: the waiting action stays ``pending`` and is never marked succeeded by
+# the wait itself. The chain parks on the occurrence's existing durable
+# eligibility instant (``retry_pending`` + ``retry_at`` — the one non-terminal
+# state the schema constraint, the claim CAS, the recovery exemption and the
+# wake loop already agree on) and resumes through the Phase 3A skip rule.
+WAIT_KEY = "not_before"
+#: An ISO-8601 date+time with an optional offset fits far inside this.
+MAX_WAIT_CHARS = 64
+#: No boundary may name an instant further ahead than this (the interval
+#: schedule's 10-year cap, same order of magnitude). A PAST boundary is valid
+#: and immediately eligible — the requested instant is never shifted.
+MAX_WAIT_AHEAD_SECONDS = 366 * 24 * 3600 * 10
+_WAIT_ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?$"
+)
+
+
+def _wait_zone(name: Any):
+    """The task's IANA timezone, or a contract error (never a guess)."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    if not isinstance(name, str) or not name.strip():
+        raise TaskContractError(
+            "a wait boundary needs the task timezone to resolve a local instant"
+        )
+    text = name.strip()
+    if text == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+        raise TaskContractError(
+            "a wait boundary cannot resolve an invalid task timezone"
+        ) from exc
+
+
+def resolve_wait_boundary(value: Any, *, timezone_name: Any) -> datetime:
+    """The ONE accepted wait shape, resolved to an aware UTC instant.
+
+    A full ISO-8601 date+time is required. A naive value is the task's LOCAL
+    wall-clock time — exactly the convention the ``once``/``daily``/``weekly``
+    schedules already use — and an offset/``Z`` value is absolute. Everything
+    else fails closed here: a date without a time, a clock without a date, a
+    non-string, an unparseable or oversized value, or an unresolvable task
+    timezone, so no surface ever guesses an instant.
+    """
+    if not isinstance(value, str) or not value.strip() or len(value) > MAX_WAIT_CHARS:
+        raise TaskContractError("a wait boundary must be a bounded ISO-8601 timestamp string")
+    text = value.strip()
+    if not _WAIT_ISO_RE.match(text):
+        raise TaskContractError(
+            "a wait boundary must be an ISO-8601 date and time "
+            "(e.g. 2026-09-26T18:00:00)"
+        )
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise TaskContractError("a wait boundary is not a valid timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=_wait_zone(timezone_name)).astimezone(timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def resolve_action_waits(
+    actions: Any, *, timezone_name: Any, reference: Any
+) -> tuple[list[datetime | None], list[dict[str, Any]] | None, str]:
+    """``(boundaries, normalized actions, error)`` for one action chain.
+
+    Enforced at task creation — where the returned actions carry each
+    boundary as an absolute UTC ISO string, so persistence never stores an
+    instant that depends on the task's timezone — and re-proved verbatim
+    before any execution. Ordering is part of the contract: a boundary may
+    not be EARLIER than a previous action's boundary (the chain would
+    contradict its own order), and none may be more than
+    ``MAX_WAIT_AHEAD_SECONDS`` ahead of the reference. A past boundary stays
+    valid and immediately eligible. Anything else fails closed.
+    """
+    if not isinstance(actions, list) or not actions:
+        return [], None, ""
+    if not isinstance(reference, datetime) or reference.tzinfo is None:
+        return [], None, "a wait boundary requires a timezone-aware reference instant"
+    boundaries: list[datetime | None] = []
+    normalized: list[dict[str, Any]] = []
+    previous: datetime | None = None
+    for position, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            return [], None, "each action must be an object"
+        value = action.get(WAIT_KEY)
+        if value is None:
+            boundaries.append(None)
+            normalized.append(dict(action))
+            continue
+        try:
+            boundary = resolve_wait_boundary(value, timezone_name=timezone_name)
+        except TaskContractError as exc:
+            return [], None, f"action {position}: {exc}"
+        if (boundary - reference).total_seconds() > MAX_WAIT_AHEAD_SECONDS:
+            return [], None, f"action {position}: the wait boundary is unreasonably far ahead"
+        if previous is not None and boundary < previous:
+            return [], None, (
+                f"action {position}: the wait boundary is earlier than a previous "
+                "action's boundary"
+            )
+        previous = boundary
+        normalized.append({**action, WAIT_KEY: boundary.isoformat()})
+        boundaries.append(boundary)
+    return boundaries, normalized, ""
 
 
 @dataclass(frozen=True)

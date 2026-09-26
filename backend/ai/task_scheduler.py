@@ -182,7 +182,7 @@ class TaskScheduler:
         except Exception:
             logger.exception("Task notification failed for %s", occurrence_key)
 
-    async def _execute_claimed(self, occurrence: OccurrenceRecord) -> bool:
+    async def _execute_claimed(self, occurrence: OccurrenceRecord, reference: datetime) -> bool:
         coordinator = self.execution_coordinator
         if coordinator is None:
             return False
@@ -191,13 +191,18 @@ class TaskScheduler:
         )
         if claimed is None or claimed.status != "running":
             return False
-        result = await coordinator.execute(claimed)
+        # The wake loop's reference is the execution's clock too: one coherent
+        # instant per wake decides a durable wait boundary, so a woken
+        # boundary is judged against the same "now" that selected it.
+        result = await coordinator.execute(claimed, now=reference)
         await self._notify_outcome(
             occurrence.task_id, occurrence.occurrence_key, getattr(result, "status", "unknown")
         )
         return True
 
-    async def _execute_claimed_batch(self, occurrences: list[OccurrenceRecord]) -> int:
+    async def _execute_claimed_batch(
+        self, occurrences: list[OccurrenceRecord], reference: datetime
+    ) -> int:
         """Execute already-claimed occurrences with BOUNDED concurrency.
 
         Each occurrence is independent and durably claimed before it gets
@@ -212,7 +217,7 @@ class TaskScheduler:
         async def _one(occurrence: OccurrenceRecord) -> bool:
             async with semaphore:
                 try:
-                    return await self._execute_claimed(occurrence)
+                    return await self._execute_claimed(occurrence, reference)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -228,7 +233,7 @@ class TaskScheduler:
         due = await self.repository.list_due_retry_occurrences(
             self.owner_id, reference, MAX_RETRIES_PER_WAKE
         )
-        return await self._execute_claimed_batch(list(due or []))
+        return await self._execute_claimed_batch(list(due or []), reference)
 
     async def _process_due_task(self, task, reference: datetime) -> tuple[int, bool]:
         """Create the task's due occurrence, execute it, advance its boundary.
@@ -262,7 +267,7 @@ class TaskScheduler:
                     # the backoff), and running/interrupted/terminal states
                     # belong to recovery or are already finished. The claim CAS
                     # in _execute_claimed is the final duplicate guard.
-                    counted = 1 if await self._execute_claimed(occurrence) else 0
+                    counted = 1 if await self._execute_claimed(occurrence, reference) else 0
                 else:
                     # No execution authority: park the occurrence for
                     # deterministic recovery (same contract as the event

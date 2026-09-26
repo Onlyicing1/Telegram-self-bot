@@ -8,7 +8,7 @@ from typing import Any
 
 from backend.ai.database.task_repository import MAX_ACTIONS, MAX_PAYLOAD_BYTES
 from backend.ai.scheduling import ScheduleError, parse_schedule
-from backend.ai.task_contract import validate_ai_instruction
+from backend.ai.task_contract import WAIT_KEY, validate_ai_instruction
 
 MAX_LABEL_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
@@ -220,8 +220,19 @@ def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
     """Normalize one untrusted action to the registered execution contract."""
     name = action["name"].strip()
     args = dict(action.get("arguments") or {})
+    # The ONE optional field an action may carry besides its tool call: the
+    # earliest instant at which THAT action may run. Only its SHAPE is checked
+    # here (the creation boundary resolves and bounds the instant against the
+    # task's timezone); dropping it silently would turn a requested wait into
+    # an immediate execution, so it is preserved verbatim.
+    wait: dict[str, Any] = {}
+    if WAIT_KEY in action:
+        boundary = action[WAIT_KEY]
+        if not isinstance(boundary, str) or not boundary.strip():
+            raise TaskCandidateError("an action wait boundary must be a nonblank timestamp string")
+        wait = {WAIT_KEY: boundary}
     if name not in _SEND_ACTION_ALIASES:
-        return {"name": name, "arguments": args}
+        return {"name": name, "arguments": args, **wait}
     text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_SEND_TEXT_CHARS:
         raise TaskCandidateError("message action requires bounded nonblank text content")
@@ -238,7 +249,7 @@ def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
         if not is_valid_font(font):
             raise TaskCandidateError("message action font is not an allowed style")
         arguments["font"] = normalize_font_key(font)
-    return {"name": "send_message", "arguments": arguments}
+    return {"name": "send_message", "arguments": arguments, **wait}
 
 
 class TaskCandidateError(ValueError):

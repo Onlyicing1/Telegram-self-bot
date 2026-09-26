@@ -22,6 +22,7 @@ from backend.ai.task_contract import (
     bounded_action_output,
     build_action_run,
     resolve_action_arguments,
+    resolve_action_waits,
     validate_prepared_action,
 )
 from backend.ai.tools.base import declared_consumable_output_fields
@@ -290,6 +291,11 @@ class _ChainOutcome:
     failed_position: int | None = None
     failure: Any = ""
     skipped: int = 0
+    #: Set when the chain reached an action whose durable wait boundary has
+    #: not arrived yet: the walk stops there (the action and everything after
+    #: it stay ``pending``) and the occurrence parks on that instant.
+    paused_at: int | None = None
+    paused_until: datetime | None = None
 
     @property
     def succeeded(self) -> int:
@@ -382,11 +388,20 @@ class TaskExecutionCoordinator:
             extra=self.context.extra,
         )
 
-    async def execute(self, occurrence: OccurrenceRecord) -> TaskExecutionResult:
+    async def execute(
+        self, occurrence: OccurrenceRecord, *, now: datetime | None = None
+    ) -> TaskExecutionResult:
         if occurrence.owner_id != self.owner_id:
             return TaskExecutionResult(False, "failed", 0, 0, "owner_mismatch")
         if occurrence.status != "running":
             return TaskExecutionResult(False, occurrence.status, 0, 0, "occurrence_not_running")
+        # The instant wait eligibility is judged against: the caller's
+        # reference when it has one (the wake loop's own clock), otherwise the
+        # process clock. A naive value is read as UTC, exactly as the
+        # repository reads a naive stored instant.
+        reference = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if reference.tzinfo is None or reference.utcoffset() is None:
+            reference = reference.replace(tzinfo=timezone.utc)
 
         # Resolve the trusted destination for this task's actions.
         # For send_message tools, the chat_id comes from the task's
@@ -452,6 +467,20 @@ class TaskExecutionCoordinator:
                 occurrence, f"invalid_action_reference: {reference_error}", 0, 0
             )
 
+        # Durable wait boundaries, re-proved with the SAME rule creation
+        # enforced: a malformed timestamp, an absurdly distant instant or a
+        # boundary that contradicts the chain's own order fails the whole
+        # occurrence closed before any action runs — never a guessed wait.
+        waits, _, wait_error = resolve_action_waits(
+            actions,
+            timezone_name=getattr(task, "timezone", None) or execution_context.tz_str,
+            reference=reference,
+        )
+        if wait_error:
+            return await self._fail(
+                occurrence, f"invalid_wait_boundary: {wait_error}", 0, 0
+            )
+
         # Durable per-action state: written as each action completes, read back
         # on a retry so a succeeded side effect is never repeated and a failed
         # action resumes where it stopped.
@@ -491,7 +520,8 @@ class TaskExecutionCoordinator:
         try:
             outcome = await asyncio.wait_for(
                 self._execute_chain(
-                    occurrence, calls, execution_calls, state, execution_context
+                    occurrence, calls, execution_calls, state, execution_context,
+                    waits, reference,
                 ),
                 timeout=MAX_EXECUTION_SECONDS,
             )
@@ -502,6 +532,9 @@ class TaskExecutionCoordinator:
                 occurrence, exc, action_count=len(calls),
                 runs=_ordered_runs(state) or None,
             )
+
+        if outcome.paused_at is not None:
+            return await self._park_at_wait(occurrence, outcome, calls, started)
 
         successful = outcome.succeeded
         duration_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -538,31 +571,43 @@ class TaskExecutionCoordinator:
         execution_calls: list[dict[str, Any]],
         state: dict[int, dict[str, Any]],
         execution_context: ToolContext,
+        waits: list[datetime | None],
+        reference: datetime,
     ) -> _ChainOutcome:
         """Run ONE occurrence's ordered actions as a durable chain.
 
         Sequential by construction: action N+1 is not even resolved until
-        action N has SUCCEEDED, so a failure stops the chain (later actions are
-        recorded ``pending`` and never run). Each action's call still goes
-        through the single ToolExecutor (never ``tool.execute()`` directly),
-        its arguments may reference a declared output field of an EARLIER
-        action of this same occurrence (resolved here, deterministically), and
-        its bounded result/state is persisted through the occurrence's own
-        metadata before the next action starts. An action already recorded
-        ``succeeded`` in an earlier attempt is NOT re-executed: its recorded
-        output stays available to later references.
+        action N has SUCCEEDED, so a failure stops the chain (later actions
+        are recorded ``pending`` and never run). Each action's call still
+        goes through the single ToolExecutor (never ``tool.execute()``
+        directly), its arguments may reference a declared output field of an
+        EARLIER action of this same occurrence (resolved here,
+        deterministically), and its bounded result/state is persisted through
+        the occurrence's own metadata before the next action starts. An
+        action already recorded ``succeeded`` in an earlier attempt is NOT
+        re-executed: its recorded output stays available to later references.
+        An action whose durable wait boundary has not arrived stops the walk
+        BEFORE it is marked running or executed (it stays ``pending``), and
+        the occurrence parks on that instant until the wake loop serves it
+        again.
         """
         registry = self.executor._registry
         results: list[ToolExecutionResult] = []
         skipped = 0
         failed_position: int | None = None
         failure: Any = ""
+        paused_at: int | None = None
+        paused_until: datetime | None = None
         for position, call in enumerate(calls, start=1):
             name = call["name"]
             recorded = state.get(position)
             if recorded is not None and recorded["status"] == "succeeded":
                 skipped += 1
                 continue
+            boundary = waits[position - 1] if position - 1 < len(waits) else None
+            if boundary is not None and reference < boundary:
+                paused_at, paused_until = position, boundary
+                break
             arguments = execution_calls[position - 1].get("arguments", {})
             resolved, reason = resolve_action_arguments(arguments, _ordered_runs(state))
             if reason:
@@ -605,13 +650,91 @@ class TaskExecutionCoordinator:
                 occurrence.task_id, occurrence.occurrence_key, occurrence.attempt,
                 skipped, len(results),
             )
+        if paused_at is not None:
+            logger.info(
+                "TASK_CHAIN_PAUSED task_id=%s occurrence_key=%s action=%s "
+                "not_before=%s already_succeeded=%s",
+                occurrence.task_id, occurrence.occurrence_key, paused_at,
+                paused_until.isoformat() if paused_until else "-", skipped,
+            )
         return _ChainOutcome(
             results=results,
             runs=_ordered_runs(state),
             failed_position=failed_position,
             failure=failure,
             skipped=skipped,
+            paused_at=paused_at,
+            paused_until=paused_until,
         )
+
+    async def _park_at_wait(
+        self,
+        occurrence: OccurrenceRecord,
+        outcome: _ChainOutcome,
+        calls: list[dict[str, Any]],
+        started: float,
+    ) -> TaskExecutionResult:
+        """Persist a reached wait boundary and stop THIS attempt honestly.
+
+        The occurrence parks on the boundary as the existing durable
+        eligibility instant (``retry_pending`` + ``retry_at``): the one
+        non-terminal state the schema constraint allows, the claim CAS
+        accepts, the wake loop already polls (``list_due_retry_occurrences``,
+        generically, without knowing why), and recovery leaves alone — so a
+        waiting boundary can never be mistaken for a running action and
+        never becomes ``restart_side_effect_uncertain``. The attempt count is
+        untouched: a wait is not a failure. The bounded per-action record is
+        written to BOTH metadata channels, because the resume reader consults
+        ``error_metadata`` first (failures were the only mid-chain durable
+        write before waits existed) and a stale record there could replay an
+        action that already succeeded.
+        """
+        boundary = outcome.paused_until
+        if boundary is None or outcome.paused_at is None:
+            return TaskExecutionResult(
+                False, "unknown", len(calls), outcome.succeeded, "wait_boundary_missing"
+            )
+        successful = outcome.succeeded
+        try:
+            record = _bounded_metadata({
+                "action_count": len(calls),
+                "successful_action_count": successful,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "waiting_action": outcome.paused_at,
+                "waiting_until": boundary.isoformat(),
+                ACTION_RUNS_KEY: outcome.runs,
+            })
+        except ValueError as exc:
+            logger.warning(
+                "TASK_CHAIN_WAIT_RECORD_INVALID task_id=%s occurrence_key=%s exception=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+            )
+            return TaskExecutionResult(
+                False, "unknown", len(calls), successful, "wait_persist_failed"
+            )
+        try:
+            parked = await self.repository.transition_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+                "retry_pending", retry_at=boundary,
+                result_metadata=record, error_metadata=record,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "TASK_CHAIN_WAIT_PERSIST_FAILED task_id=%s occurrence_key=%s "
+                "exception=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+            )
+            parked = None
+        if parked is None:
+            # The wait was NOT durably persisted: report it truthfully instead
+            # of claiming the occurrence is parked (it is still `running`, so
+            # recovery will resolve it under its own contract).
+            return TaskExecutionResult(
+                False, "unknown", len(calls), successful, "wait_persist_failed", record
+            )
+        return TaskExecutionResult(False, "waiting", len(calls), successful, metadata=record)
 
     @staticmethod
     def _action_failure(result: ToolExecutionResult) -> str | BaseException:

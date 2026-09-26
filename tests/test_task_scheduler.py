@@ -113,7 +113,7 @@ async def test_recovered_occurrence_is_claimed_and_executed_once():
         def __init__(self):
             self.calls = 0
 
-        async def execute(self, occurrence):
+        async def execute(self, occurrence, *, now=None):
             self.calls += 1
             await repo.transition_occurrence(1, occurrence.task_id, occurrence.occurrence_key, "succeeded")
             return SimpleNamespace(status="succeeded")

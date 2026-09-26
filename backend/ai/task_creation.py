@@ -28,6 +28,7 @@ from backend.ai.task_contract import (
     AIInstruction,
     action_reference_error,
     is_action_reference,
+    resolve_action_waits,
     validate_ai_instruction,
 )
 from backend.ai.task_trace import bound_text, task_trace
@@ -372,6 +373,7 @@ class TaskCreationService:
             _creation_trace("semantic_incomplete", reason=semantic_error)
             raise TaskSemanticCompletenessError(semantic_error)
         actions = candidate.get("actions")
+        normalized_actions: list[dict[str, Any]] | None = None
         if isinstance(actions, list) and actions:
             registry = (
                 self._tool_registry
@@ -393,6 +395,19 @@ class TaskCreationService:
             if reference_error:
                 _creation_trace("action_ineligible", reason=reference_error)
                 raise _invalid(reference_error)
+            # Per-action wait boundaries are part of the durable definition:
+            # each one is resolved against the task's own timezone and stored
+            # as an absolute instant, so the persisted chain never depends on
+            # the timezone again and the execution boundary re-proves exactly
+            # what was stored.
+            _, normalized_actions, wait_error = resolve_action_waits(
+                actions,
+                timezone_name=candidate.get("timezone"),
+                reference=reference,
+            )
+            if wait_error:
+                _creation_trace("action_ineligible", reason=wait_error)
+                raise _invalid(wait_error)
         if (
             candidate.get("timezone") != candidate["schedule"].get("timezone")
             and candidate["schedule_type"] not in ("interval", "event", TODO_SCHEDULE_TYPE)
@@ -424,6 +439,8 @@ class TaskCreationService:
             _creation_trace("schedule_invalid", schedule_type=str(candidate.get("schedule_type")), error=str(exc)[:120])
             raise TaskCreationError(str(exc)) from exc
         payload = {key: candidate[key] for key in required}
+        if normalized_actions is not None:
+            payload["actions"] = normalized_actions
         if candidate.get("ai_instruction") is not None:
             instruction = candidate["ai_instruction"]
             if isinstance(instruction, dict):

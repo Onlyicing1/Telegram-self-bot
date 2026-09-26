@@ -45,7 +45,7 @@ class PersistingCoordinator:
         self.retry_in = retry_in
         self.seen = []
 
-    async def execute(self, occurrence):
+    async def execute(self, occurrence, *, now=None):
         self.seen.append(occurrence)
         if self.status == "succeeded":
             await self.repo.transition_occurrence(
@@ -133,7 +133,7 @@ async def test_persisted_cancelled_notifies():
     })
     sent = []
     scheduler, _ = make_scheduler(repo, "cancelled", sent)
-    await scheduler._execute_claimed(occurrence)
+    await scheduler._execute_claimed(occurrence, NOW)
     assert len(sent) == 1
     assert "cancelled" in sent[0][1]
 
@@ -172,7 +172,7 @@ async def test_no_notification_when_persisted_status_differs():
 
     # Coordinator reports succeeded but persists failed -> verifier must reject.
     class LyingCoordinator(PersistingCoordinator):
-        async def execute(self, occurrence):
+        async def execute(self, occurrence, *, now=None):
             self.seen.append(occurrence)
             await self.repo.transition_occurrence(
                 occurrence.owner_id, occurrence.task_id,

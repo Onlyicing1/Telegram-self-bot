@@ -86,6 +86,15 @@ CANDIDATE_SCHEMA = {
                 "properties": {
                     "name": {"type": "string"},
                     "arguments": {"type": "object"},
+                    "not_before": {
+                        "type": "string",
+                        "description": (
+                            "OPTIONAL per-action wait boundary: an ISO-8601 date+time "
+                            "(naive = the task timezone), e.g. '2026-09-26T18:00:00'. "
+                            "This action must not run before that instant; earlier "
+                            "actions still run at the task's own boundary."
+                        ),
+                    },
                 },
             },
         },
@@ -417,7 +426,12 @@ class TaskInterpreter:
             "fabricate seconds for months/years and do not return null for them. "
             "ACTION OBJECT CONTRACT: every element of 'actions' MUST be an object of the "
             "exact form {'name': <action name>, 'arguments': <object>} — a 'name' string "
-            "plus an 'arguments' object, no other keys inside the action object. Example: "
+            "plus an 'arguments' object — and OPTIONALLY one 'not_before' ISO-8601 "
+            "date+time (the earliest instant at which THAT action may run; earlier "
+            "actions still run now). No other keys inside the action object. Add "
+            "'not_before' ONLY when the user asks that a later part of the same "
+            "request happen at a later time; never put it on the first action of a "
+            "request that must start now. Example: "
             "{'name': 'send_message', 'arguments': {'text': 'hello'}}. For any "
             "message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
             "exactly the action name 'send_message' with arguments carrying a single "

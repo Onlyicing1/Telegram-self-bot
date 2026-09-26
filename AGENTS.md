@@ -351,8 +351,19 @@ error.
   per-action run record (`backend/ai/task_contract.py`; no schema change, no
   cross-task/cross-occurrence visibility, everything unknown fails closed).
   An action already recorded `succeeded` is never replayed on a retry: the
-  chain resumes at the action that did not succeed. Waiting/branching/
-  multi-turn continuation are later phases, not part of this mechanism.
+  chain resumes at the action that did not succeed. **Durable wait**: one
+  action may carry `not_before` — a bounded ISO-8601 instant (a naive value is
+  the TASK's local time; it may not precede a previous action's boundary nor
+  sit more than 10 years ahead), validated at creation against the task
+  timezone and re-proved before execution. When the chain reaches it early the
+  SAME occurrence parks on that instant as the existing eligibility pair
+  (`retry_pending` + `retry_at` — no new status, table or migration) with the
+  waiting action left `pending` and no attempt consumed; the single scheduler
+  claims it when due and the chain resumes at that action. A restart leaves a
+  parked wait untouched (it is excluded from recovery), and a running
+  occurrence keeps its `restart_side_effect_uncertain` contract.
+  Branching/conditional and multi-turn conversational continuation are later
+  phases, not part of this mechanism.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.

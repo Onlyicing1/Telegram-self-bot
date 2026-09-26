@@ -41,7 +41,7 @@ class RecordingCoordinator:
         self.delay = delay
         self.executed_keys: list[str] = []
 
-    async def execute(self, occurrence):
+    async def execute(self, occurrence, *, now=None):
         self.executed_keys.append(occurrence.occurrence_key)
         if self.delay:
             import asyncio

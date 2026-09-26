@@ -1,6 +1,226 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TODO PART 3A — DURABLE ACTION CHAINS + BOUNDED RESULT PASSING
+## Latest phase — TODO PART 3B — DURABLE ACTION-CHAIN WAITING
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `83c5abd` = `origin/main` (`feat(todo): add durable action chains`, Phase 3A).
+Every Phase 3A contract is reused unchanged: one workflow = one `ai_tasks` row, one
+execution authority (`TaskExecutionCoordinator` → `ToolExecutor`), one scheduler
+(`TaskScheduler`), the bounded per-action run record, and the skip-on-resume rule.
+
+### Phase objective
+
+“پری این موضوع رو سرچ کن، نتیجه رو توی Saved Messages ذخیره کن، تگش کن، ساعت ۶ بهم بده.”
+must run SEARCH → SAVE → TAG **now** and DELIVER only at/after 18:00, durably: a
+process death between the two parts must not lose the wait, must not run DELIVER
+early, and must never replay SEARCH/SAVE/TAG.
+
+    SEARCH → SAVE → TAG → (park: not eligible before 18:00) → DELIVER
+
+Explicitly NOT in this phase (they remain later phases): branching/conditions,
+question+answer or multi-turn conversational continuation, autonomous replanning,
+DAGs/arbitrary workflow expressions, any new UI, any second scheduler/executor/
+repository/timer, any change to `todo_steps`, any new table or migration.
+
+### The wait representation (exact)
+
+* ONE optional reserved field on an action: `not_before` — a bounded ISO-8601
+timestamp (≤ 64 chars) naming the earliest instant at which THAT action may run.
+An action is otherwise exactly what Phase 3A defined (name + arguments), and every
+existing action shape stays valid without the field.
+
+```json
+{"name": "send_message", "arguments": {"text": {"$ref": {"action": 3, "field": "summary"}}},
+ "not_before": "2026-09-26T18:00:00+00:00"}
+```
+
+* It is **data in the definition** — never generated per occurrence, never
+model-resolved at execution. `backend/ai/task_contract.py` is the ONE contract:
+`WAIT_KEY`, `resolve_wait_boundary(value, *, timezone_name)` (the only accepted
+shape → an aware UTC instant) and `resolve_action_waits(actions, *, timezone_name,
+reference)` (whole-chain validation → `(boundaries, normalized actions, error)`).
+* **No new state, no new table, no migration.** `ai_task_occurrences.status` is a
+constrained column (`CHECK (status IN (…))` in
+`supabase/migrations/20260829000001_create_ai_tasks.sql`), so a new `waiting`
+status would require an `ALTER TABLE`. The investigation proved the existing pair
+is sufficient and smaller: the chain parks on the existing
+`retry_pending` + `retry_at` eligibility pair — the ONE non-terminal state that
+(a) the schema constraint allows, (b) `claim_occurrence` accepts, (c)
+`list_due_retry_occurrences` already polls (`retry_at <= now`), (d)
+`list_recoverable_occurrences` excludes. The waiting ACTION keeps its execution
+state: it stays `pending` and is **never** marked succeeded by the wait.
+* The park record is the existing bounded per-action record, extended with the
+wait: `{action_count, successful_action_count, duration_ms, waiting_action,
+waiting_until, actions: […]}` — written to BOTH occurrence metadata channels
+(`result_metadata` and `error_metadata`) because the resume reader consults
+`error_metadata` first (failures were the only mid-chain durable write before
+waits existed): a stale record there could resume the chain from an outdated
+position and replay a succeeded side effect. Both stay inside the existing
+≤ 8192-byte per-channel budget (the runs list is ≤ 6144 bytes by construction).
+
+### Creation / model boundary
+
+* `TaskCandidate.from_untrusted` (the untrusted model boundary) preserves exactly
+one optional `not_before` string and still drops every other stray key; a
+non-string boundary is rejected there.
+* `TaskCreationService.create` (the ONE creation boundary, also reached by the
+wizard) validates the whole chain: shape, the task's own timezone, the 10-year
+forward bound (`MAX_WAIT_AHEAD_SECONDS`, the interval schedule's cap), and
+**ordering** — a boundary may not be earlier than a previous action's boundary.
+It then persists each boundary as an **absolute UTC ISO instant**, so the stored
+definition no longer depends on the timezone at all.
+* The interpreter schema advertises the optional field (one property + one
+sentence in the action-object contract); no prompting redesign, and the field is
+never required. Natural-language planning quality remains a later concern: the
+execution mechanism is what this phase makes real.
+
+### Timezone semantics
+
+* A NAIVE `not_before` is the **task's local wall-clock time**, exactly the
+convention `once`/`daily`/`weekly` schedules already use (`schedule.timezone`);
+an offset/`Z` value is absolute. `"18:00"` alone or a date without a time is
+rejected, and an unresolvable task timezone fails closed — no instant is ever
+guessed. Example: task tz `Asia/Tehran`, `2026-09-26T18:00:00` → stored
+`2026-09-26T14:30:00+00:00`.
+* Every stored/resolved value is timezone-aware; comparisons happen on aware UTC
+instants only.
+
+### Scheduler interaction
+
+* `TaskScheduler` gained **no new concept**: the scheduler only ever sees “this
+occurrence is not eligible until `retry_at`” and serves it when due — through the
+same `_run_due_retries` path, the same claim CAS and the same execution handoff.
+It never learns what an action or a wait means. No second scheduler, worker,
+timer, loop or occurrence system was added.
+* Latency: an occurrence that becomes eligible between wakes is served at the
+next wake; `run()` sleeps to the nearest boundary and is bounded by
+`WAKE_INTERVAL_SECONDS = 60`, so DELIVER runs within one poll interval of 18:00
+(or earlier if that boundary is nearer).
+* One small coherence change: the wake loop's reference instant is threaded into
+execution (`_execute_claimed(occurrence, reference)` →
+`coordinator.execute(claimed, now=reference)`), so the instant that selected the
+occurrence judges the boundary. In production this is a no-op (execution follows
+the wake by microseconds); it makes the whole timeline deterministic in tests.
+* No occurrence is created for a wait and no task boundary moves: the parked
+occurrence keeps its deterministic `occurrence_key`/`scheduled_for`, and a
+recurring task advances exactly as before (its next day is a NEW occurrence
+running the whole chain again).
+
+### Execution, resume and result references
+
+* `TaskExecutionCoordinator._execute_chain` walks the actions in order and,
+before each action, compares the chain's reference instant with that action's
+boundary. When the boundary has not arrived, the walk **stops there**: the
+waiting action is never marked `running` and never executed, later actions stay
+`pending`, and the occurrence parks on the exact instant.
+* Resume is the Phase 3A path verbatim: an action already recorded `succeeded` in
+the occurrence's durable per-action record is skipped (its bounded output stays
+available), and the waiting action is the first non-succeeded one, so the chain
+continues exactly there — through the single `ToolExecutor` (one batch per
+action), never a direct `tool.execute()`.
+* Result references (`{"$ref": {"action": N, "field": …}}`) resolve from the
+occurrence's own durable record, which was written **before** the wait: after a
+restart the DELIVER action still receives the `S0042` recorded by SAVE.
+* A second wait later in the same chain parks again on the same mechanism; there
+is no next-action index, because the per-action record already encodes progress.
+
+### Restart and crash safety
+
+* A parked wait is `retry_pending`, which `list_recoverable_occurrences` excludes:
+`recover()` never touches it, so a process that dies at 14:01 and returns at
+17:00 leaves the wait exactly where it was (nothing runs early, nothing is
+re-armed as a backoff).
+* The existing crash contract is untouched: an occurrence still `running` after a
+restart is still resolved to `failed` with `error_class =
+restart_side_effect_uncertain` — a waiting boundary can never be mistaken for a
+running action, because it is never left `running`.
+* A wait consumes **no attempt** (`attempt` is untouched, no `error_class` is
+written): it is eligibility, not failure.
+
+### Past-due and failure behavior
+
+* `not_before < now` (any past instant) is valid and immediately eligible: the
+chain executes in one attempt, no duplicate occurrence is created and the
+requested time is never shifted. This is also the restart case where the
+boundary passed while the process was down.
+* A failure AFTER a wait follows the existing Phase 3A contract unchanged: a
+retryable failure (e.g. a tool timeout) enters `retry_pending` with
+`attempt + 1` and the existing backoff, and the retry resumes at the failed
+action without replaying earlier ones; a deterministic failure fails the
+occurrence. No new retry system.
+* A malformed, out-of-bounds or out-of-order stored boundary fails the occurrence
+closed with `invalid_wait_boundary` **before any action runs**, as does an
+unregistered waiting action; a foreign owner is still rejected with
+`owner_mismatch` before anything is considered.
+
+### Tests
+
+New suite `tests/test_task_durable_wait.py` — **43 passed**: the boundary
+contract (naive/offset/`Z` equivalence, invalid shapes, invalid timezone, bounds,
+ordering), creation (normalization, rejections, candidate preservation, schema),
+chain behavior (actions before the wait run, later actions do not, the boundary
+is persisted, the waiting action stays `pending`, exact-boundary eligibility,
+past-due eligibility, resume skipping succeeded actions, references after the
+wait, single-executor batches), validation/ownership/registry boundaries,
+failure-after-wait (retryable and deterministic), the scheduler (no claim before
+eligibility, claim after, restart preserved, restart resume, no duplicate
+occurrence / no cadence shift, multiple wait points), and one end-to-end
+application test `SEARCH → SAVE → TAG → WAIT → DELIVER` driven through the REAL
+creation boundary + REAL `TaskScheduler` + REAL coordinator/registry/executor
+with only the four services behind the tools doubled: DELIVER is proven not to
+run at 17:59, to survive a simulated restart, and to run exactly once at 18:00
+with the save code recorded before the wait.
+
+Existing test files were touched only to follow the extended contracts (no
+assertion weakened): the pinned action-object schema test now admits exactly one
+optional field (`not_before`, still not required), and the fake coordinators in
+`test_stage15`, `test_stage16` (two), `test_task_reliability_repair`,
+`test_task_restart_recovery` and `test_task_scheduler` mirror the
+extended `execute(occurrence, *, now=None)` protocol.
+
+### Verification performed (automated only)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_durable_wait.py -q` | **43 passed** |
+| focused regression batch — 25 task/todo suites: durable wait, action chains, scheduler, restart recovery, execution, repository, reliability repair, prepare-ahead, AI preparation, hardening, candidate/contract, stage 15/16/17, todos (lifecycle/resolver/steps/steps-tools/tools/UI), DB schema reconciliation, capability exposure, external-call efficiency, delete-timeout hardening | **493 passed** |
+| `.venv/bin/python -m pytest -q` (full suite) | **5175 passed, 26 skipped** |
+| `.venv/bin/python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+**Live Telegram verification was NOT performed. Live Supabase verification was
+NOT performed** — no Telegram action, no SQL and no database contact of any kind
+happened in this phase, and the repo needs no migration (zero schema change).
+
+### Limitations (honest)
+
+1. A wait is not announced to the owner: the coordinator reports status
+`waiting`, which the outcome notifier deliberately does not treat as a
+retry/success outcome, so no false “will retry” message can be produced. An
+explicit “waiting until X” notification is deferred.
+2. The task-management surface still labels a parked occurrence with the
+existing `retry_pending` wording; the wait itself is visible in the occurrence's
+metadata (`waiting_action`/`waiting_until`). A truthful UI label is deferred.
+3. A task-definition edit while a chain is parked does not cancel the wait: the
+occurrence keeps its pinned `definition_version` snapshot and resumes with it
+(the pre-existing versioning contract).
+4. The wait boundary is an ABSOLUTE instant in the stored definition; a recurring
+task's later occurrences compare against that same instant, so “every day at
+18:00” is expressed by the task schedule, not by repeating waits.
+5. Natural-language quality for “ساعت ۶ بده” (deriving the split) is not tuned
+here; only the bounded representation and its validation were added.
+
+### Still deferred (Phase 3C+)
+
+Branching/conditions on a previous action's result, question + answer
+continuation, multi-turn conversational continuation of a pending workflow,
+autonomous replanning, DAGs/general workflow scheduling, a dedicated wait state,
+and every premium task-manager feature. The manual Supabase setup script remains
+owner-applied and unchanged by this phase.
+
+---
+
+## Previous phase — TODO PART 3A — DURABLE ACTION CHAINS + BOUNDED RESULT PASSING
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `7c0476d` = `origin/main` (`docs(todo): investigate agent workflow architecture`).

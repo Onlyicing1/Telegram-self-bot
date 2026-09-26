@@ -121,7 +121,12 @@ def test_provider_schema_declares_the_action_object_contract():
     assert items["minItems"] == 1
     item_schema = items["items"]
     assert item_schema["required"] == ["name", "arguments"]
-    assert set(item_schema["properties"]) == {"name", "arguments"}
+    # The action object contract is exactly name + arguments plus ONE optional
+    # Phase 3B field: the per-action wait boundary (`not_before`). It is never
+    # required, so every Phase 3A action shape stays valid unchanged.
+    assert set(item_schema["properties"]) == {"name", "arguments", "not_before"}
+    assert "not_before" not in item_schema["required"]
+    assert item_schema["additionalProperties"] is False
 
 
 def test_provider_schema_documents_the_schedule_shapes():

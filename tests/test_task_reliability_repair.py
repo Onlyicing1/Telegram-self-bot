@@ -67,7 +67,7 @@ class CountingCoordinator:
         self.peak = 0
         self._live = 0
 
-    async def execute(self, occurrence):
+    async def execute(self, occurrence, *, now=None):
         self._live += 1
         self.peak = max(self.peak, self._live)
         try:
