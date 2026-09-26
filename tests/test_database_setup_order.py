@@ -307,11 +307,21 @@ def test_the_setup_block_creates_no_secret_value():
 # ─── 4. the audited order and honest reporting ───────────────────────────────
 
 def test_the_audited_order_is_recorded_in_the_audit_table():
+    """§31.1 names every embedded migration, and its PART-7 table keeps the order.
+
+    The audit now also classifies the 21 pre-reconciliation migrations, so the
+    order contract is checked against the table of the seven EMBEDDED parts
+    (the second table in §31.1), not against the whole prose.
+    """
     section = _section_31()
-    table = section[: section.index("### 31.2")]
-    positions = [table.index(f"`{name}`") for name in DOCUMENTED_ORDER]
+    audit = section[: section.index("### 31.2")]
+    assert "all 28 migrations" in _flat(audit) or "28 files" in audit, (
+        "the audit must state that every repository migration was classified"
+    )
+    embedded_table = audit[audit.index("| Order | Migration") :]
+    positions = [embedded_table.index(f"`{name}`") for name in DOCUMENTED_ORDER]
     assert positions == sorted(positions), (
-        "§31.1 must list the required migrations in the documented execution order"
+        "§31.1 must list the embedded migrations in the documented execution order"
     )
 
 

@@ -67,14 +67,28 @@
 
 This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
-complete ordered setup: the canonical reconciliation snapshot first, then the
-six pending migrations, in one fenced block. There is no "step 0", no second
-block to paste and no shell workflow. Open this section, copy §31.3, paste it
-into the Supabase SQL Editor as `postgres` and run it.
+CURRENT canonical setup for the database the current code expects: the
+complete ordered setup, the canonical reconciliation snapshot first, then the
+six later additive migrations, in one fenced block. There is no "step 0", no
+second block to paste and no shell workflow. Open this section, copy §31.3,
+paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
+reconciliation audit that proves the block equals the effective final state of
+all 28 repository migrations — including the Todo migration
+`20260926000001_add_todo_schedule_type.sql`.
 
-### 31.1 Audit — every required migration, its objects, and its SQL
+### 31.1 Reconciliation audit — all 28 migrations, classified against the canonical script
 
-| Order | Migration (`supabase/migrations/`) | Objects it establishes | Its SQL in this document |
+The script in §31.3 was reconciled against **every file currently in
+`supabase/migrations/` (28 files)**, not against the list any earlier document
+carried. Each migration was classified by its **effective schema change** —
+what a fresh database must end up with after it runs — and the classification
+is pinned by `tests/test_database_setup_order.py` (statement-identity for the
+seven embedded parts) and `tests/test_canonical_schema_reconciliation.py`
+(column/constraint/seed equivalence for the snapshot).
+
+**The seven migrations whose SQL is embedded verbatim (parts 1–7 of §31.3):**
+
+| Order | Migration | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
 | 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 7** — the complete canonical reconciliation SQL, physically inside the one deployment block |
 | 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 7** (the object contract is also documented in §29.10) |
@@ -84,11 +98,91 @@ into the Supabase SQL Editor as `postgres` and run it.
 | 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 7** |
 | 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 7** (the row shape is documented in §15) |
 
-No migration file is rewritten, renamed or superseded by this section. The SQL of
-§31.3 is transcribed statement-for-statement from those seven files (their prose
-comment headers are dropped so the artifact is pure executable SQL; see §31.3),
-and `tests/test_database_setup_order.py` pins every statement of it back to the
-file it came from, so the combined block cannot drift from the migrations.
+**The other 21 migrations — the history the reconciliation snapshot already
+absorbs.** The snapshot of part 1 was audited against this entire history: its
+`CREATE TABLE IF NOT EXISTS` blocks declare exactly the FINAL shape every
+historical migration converges to, its per-table `ADD COLUMN IF NOT EXISTS`
+blocks re-assert those shapes on legacy tables, and its data-guarded
+constraint blocks establish the final constraints. Each row states the
+migration's effective change and where the final form lives in part 1:
+
+| Historical migration | Effective change | Where the final form lives in part 1 |
+|---|---|---|
+| `20260712234229_lifeos_schema.sql` (superseded by the next file) | First `saved_items`/`bio_state`/`bot_logs` shape (serial PKs, anon WRITE policies) | Superseded — the next file is the authoritative creation; part 1's table blocks carry the final columns, its `DROP POLICY`/`CREATE POLICY` block removes every anon write policy |
+| `20260714111706_create_lifeos_tables.sql` | Authoritative core tables: bigserial PKs, `bot_logs.level` DEFAULT, RLS + SELECT-only | part 1, sections 1–3 (`saved_items`, `bio_state`, `bot_logs`) |
+| `20260718143752_…save_ux_redesign.sql.sql` | `saved_items.file_name`, `saved_items.short_code` (+ partial unique index), five trigram GIN indexes | part 1, section 1: both columns re-asserted, `idx_saved_items_short_code` re-created with its duplicate guard, all five trigram indexes |
+| `20260726143924_create_panel_settings_table.sql` | `panel_settings` (3 columns) | part 1, section 5: all three re-asserted, then extended |
+| `20260729213959_…create_bot_settings_table.sql` | `bot_settings` key/value/value_type + the four legacy seeds | part 1, section 6: the table plus all five seeds (`panel_auto_close_seconds`, `max_deep_save_mb`, `delete_batch_size`, `log_cleanup_days`, `auto_close_enabled`) with targetless `ON CONFLICT DO NOTHING` |
+| `20260730210551_…add_update_stale_seconds.sql` | `panel_settings.update_stale_seconds integer NOT NULL DEFAULT 300` | part 1, section 5 (`ADD COLUMN IF NOT EXISTS update_stale_seconds`) |
+| `20260801215007_create_username_state_table.sql` | `username_state` + `username_state_owner_id_key` UNIQUE | part 1, section 2b: columns re-asserted; the UNIQUE lands via the identity-constraint block (§30.4) |
+| `20260804145402_create_ai_tables.sql` | `ai_sessions`, `ai_messages`, `ai_memories`, `ai_tool_history` (+ status/role/tier/category CHECKs, indexes) | part 1, sections 8–11: tables, columns, CHECKs and indexes in final form |
+| `20260805075707_…create_ai_config_table.sql.sql` | `ai_config` base columns + `ai_config_owner_id_key` UNIQUE | part 1, section 7: columns re-asserted; the UNIQUE lands via the identity-constraint block |
+| `20260822090000_create_ghost_chats_table.sql` | `ghost_chats` + index + SELECT policy (embedded verbatim in part 1 — it is one of the snapshot's own sections) | part 1, section 14 |
+| `20260823120000_add_dashboard_font_and_ghost_seen_settings.sql` | `dashboard_font` (+ CHECK), `ghost_seen_retention_days` (+ CHECK) — the days column is REPLACED by the next file, so only `dashboard_font` and its CHECK survive in the final schema | part 1, section 5: `dashboard_font` column + `panel_settings_dashboard_font_check`; `ghost_seen_retention_days` and its `panel_settings_ghost_seen_retention_check` are deliberately absent (obsolete final state) |
+| `20260823130000_ghost_seen_retention_duration.sql` | Replaces `ghost_seen_retention_days` with `ghost_seen_retention_seconds bigint NOT NULL DEFAULT 2592000` (+ range CHECK allowing 0) | part 1, section 5: `ghost_seen_retention_seconds` column + `panel_settings_ghost_seen_retention_seconds_check`; the days column is NOT recreated — migration semantics, applied |
+| `20260827000001_add_missing_panel_settings_columns.sql` | The ten missing typed `panel_settings` columns + range CHECKs + the `panel_settings('global')` seed | part 1, section 5: all ten columns re-asserted, all six range CHECKs data-guarded, the seed present |
+| `20260827000002_add_ai_config_trigger_columns.sql` | `ai_config.trigger_en`, `ai_config.trigger_fa` | part 1, section 7 (`ADD COLUMN IF NOT EXISTS` for both) |
+| `20260827000003_create_ai_usage_table.sql` | `ai_usage` table + 2 indexes + SELECT policy | part 1, section 12 (columns, indexes, policy in final form) |
+| `20260827000004_create_ai_provider_stats_table.sql` | `ai_provider_stats` with composite PK | part 1, section 13 (embedded verbatim — same statement text) |
+| `20260829000001_create_ai_tasks.sql` | `ai_tasks` + `ai_task_occurrences` (all size/count/state CHECKs, indexes, `ON DELETE RESTRICT` FK) | part 1, sections 16–17: tables, columns, CHECKs, indexes, FK — all in final form |
+| `20260904000001_add_event_schedule_type.sql` | `ai_tasks_schedule_type_check` gains `'event'` | part 1, section 16: the guarded schedule_type block already re-adds the enum WITH `'event'` (the check requires `'event'` in the constraint definition) |
+| `20260912000001_add_ai_task_occurrences_preparation_metadata.sql` | `preparation_metadata` column + its object/size CHECKs on a table that predated the column | part 1, section 17: column re-asserted in CREATE and `ADD COLUMN`, both CHECKs data-guarded |
+| `20260913000000_add_ai_config_show_question.sql` | `ai_config.show_question boolean NOT NULL DEFAULT false` | part 1, section 7 (`ADD COLUMN IF NOT EXISTS show_question`) |
+| `20260917000001_add_ai_config_stt_settings.sql` | `ai_config.stt_model`, `stt_language`, `stt_passes` (+ `ai_config_stt_passes_range`) | part 1, section 7: all three columns + the data-guarded CHECK |
+
+Nothing in the final script is an obsolete intermediate state: where one
+historical migration was later corrected (`ghost_seen_retention_days` →
+`ghost_seen_retention_seconds`; the five-type → six-type `schedule_type`
+enums), the script carries only the FINAL corrected form, and applying the
+script is equivalent to applying the whole history in order. `ai_preferences`
+and `ai_messages.tool_calls` remain deliberately non-canonical (§30.2) — no
+migration creates them.
+
+### 31.1.1 Reconciliation note — what changed while reconciling §31
+
+1. **What was already present.** The complete canonical reconciliation SQL
+   (part 1), the two Vault migrations (parts 2–3), the two Save V2 migrations
+   (parts 4–5) and the TTS settings migration (part 6) — all embedded
+   statement-for-statement, and the Todo migration's SQL (part 7) was already
+   present from the Part 1 phase.
+2. **What was missing.** Nothing was missing from the *block* after the Part 1
+   phase. What the previous §31 **prose** lacked was the audit trail: the
+   earlier §31.1 listed only the seven embedded migrations and was silent on
+   the other 21 files in `supabase/migrations/`, leaving the reader unable to
+   verify that a fresh database would end up equal to "all migrations
+   applied".
+3. **What was incomplete.** The per-historical-migration classification above
+   (which migration's change lives where inside part 1) did not exist; it is
+   now recorded.
+4. **What conflicted.** Nothing executable conflicts. The one superseded pair
+   (`ghost_seen_retention_days` → `ghost_seen_retention_seconds`, and the
+   five-type → six-type schedule enums) is resolved inside part 1 by design:
+   the script carries the final constraint, never the obsolete one, which is
+   exactly the migration-equivalence requirement.
+5. **What was added.** The §31.1 matrix row set above (21 historical
+   classifications + the seven embedded parts) and this note. No SQL was
+   added or removed in this pass: the block already contained every
+   migration's effective change, verified by the audit.
+6. **What was corrected.** Documentation only: the §31 intro, §31.1 and §20
+   now state the current count (28 migration files; 7 embedded parts; 16
+   canonical tables) and the reconciliation claim explicitly.
+7. **Todo-specific database changes.** Part 7 of §31.3 carries
+   `20260926000001_add_todo_schedule_type.sql` in full:
+   `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum, and
+   `ai_tasks_actions_count` re-added as the CONDITIONAL check
+   (`schedule_type = 'todo'` → 0–5 actions; otherwise 1–5). The final
+   `ai_tasks` schema therefore accepts the unscheduled, zero-action Todo row
+   the current implementation writes (`backend/ai/database/task_repository.py`)
+   while every scheduled task keeps the original guarantees. The row shape is
+   documented in §15; no additional Todo field, no `task_steps`, no
+   `parent_task_id`, no dependency/workflow/reminder object exists anywhere
+   in the script.
+8. **One script.** §31.3 is ONE fenced SQL block (banner
+   `ONE COMPLETE SUPABASE SETUP SCRIPT`), self-contained for a fresh
+   database: extensions, all 16 canonical tables + `api_credentials`, every
+   column re-asserted, seeds, constraints, indexes, functions, RLS and
+   policies, grants, the Todo constraints and the final drift report. There
+   is no second block to combine, no shell step and no placeholder.
 
 ### 31.2 The order, and why it is this order (source-proven)
 
@@ -171,7 +265,11 @@ part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
 from. It is idempotent and additive: no row, column or existing value is rewritten
-and no Vault secret is created.
+and no Vault secret is created. On a FRESH Supabase database the block is the
+complete setup: part 1 creates every canonical table in its final shape (the
+shape the 21 pre-reconciliation migrations converge to — see §31.1) and parts
+2–7 add the Vault, Save V2, TTS and Todo objects. No placeholder, no omitted
+section and no comment form like "add the remaining tables here" appears in it.
 
 ```sql
 -- ============================================================================
@@ -2435,6 +2533,10 @@ repository, which is exactly why every statement in the block is idempotent.
 * It changes no runtime behaviour, provider, handler, service, dependency or
   environment variable, and it adds no table, no column, no configuration store
   and no second secret path of its own.
+* The §31.1 reconciliation matrix is documentation derived from the repository
+  files (migrations, source, tests); it was verified statically — statement
+  identity and semantic equivalence — and **no SQL was executed against any
+  database** to produce it.
 
 ---
 
