@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from backend.ai.database.task_repository import TaskRecord, TaskRepository
+from backend.ai.database.task_repository import TaskRecord, TaskRepository, TODO_SCHEDULE_TYPE
 from backend.ai.preparation_policy import CONTENT_FIELDS
 from backend.ai.scheduling import (
     ScheduleError,
@@ -44,6 +44,12 @@ class TaskSemanticCompletenessError(TaskCreationError):
 
 
 _PROFILE_CONTENT_ACTIONS = frozenset({"bio_set_text", "username_set_text"})
+
+# The Todo title bound: the SAME 256-character bound the repository enforces
+# for every task label (``_validate_task_input``). Declared here so the todo
+# creation boundary refuses an over-long title with an honest message instead
+# of relying on the storage layer's error.
+MAX_TODO_TITLE_CHARS = 256
 
 
 def _attached_tool_registry() -> Any | None:
@@ -234,6 +240,37 @@ class TaskCreationService:
         #: (unit/service harness) may inject the real one explicitly.
         self._tool_registry = tool_registry
 
+    async def create_todo(self, label: str, timezone: str, reference: datetime) -> TaskRecord:
+        """Create ONE basic Todo through the SAME creation/persistence path.
+
+        A todo is the ONE unscheduled row this table stores: a title, the
+        owner's timezone, and nothing the scheduler could ever run (no
+        schedule payload, no action, no destination, no next run). It is
+        persisted by ``create`` -> ``TaskRepository.create_task`` exactly like
+        a scheduled task, so there is no second creation path, no second
+        candidate shape and no second persistence call.
+
+        The title is REQUIRED and never invented: a blank title is rejected
+        here instead of being filled with a placeholder.
+        """
+        text = " ".join(str(label or "").split())
+        if not text or len(text) > MAX_TODO_TITLE_CHARS:
+            raise TaskCreationError(
+                "a todo needs a title of at most "
+                f"{MAX_TODO_TITLE_CHARS} characters"
+            )
+        zone = str(timezone or "").strip() or "UTC"
+        candidate = {
+            "label": text,
+            "schedule_type": TODO_SCHEDULE_TYPE,
+            "schedule": {},
+            "timezone": zone,
+            "actions": [],
+            "notification_destination": {},
+            "next_run_at": None,
+        }
+        return await self.create(candidate, reference)
+
     async def create(self, candidate: dict[str, Any], reference: datetime) -> TaskRecord:
         started = time.perf_counter()
 
@@ -282,7 +319,7 @@ class TaskCreationService:
                     raise _invalid(eligibility_error)
         if (
             candidate.get("timezone") != candidate["schedule"].get("timezone")
-            and candidate["schedule_type"] not in ("interval", "event")
+            and candidate["schedule_type"] not in ("interval", "event", TODO_SCHEDULE_TYPE)
         ):
             raise _invalid(
                 "task and schedule timezones must match "
@@ -290,7 +327,14 @@ class TaskCreationService:
             )
         try:
             initial = candidate.get("next_run_at")
-            if candidate["schedule_type"] == "event":
+            if candidate["schedule_type"] == TODO_SCHEDULE_TYPE:
+                # A todo is UNSCHEDULED: there is no boundary to resolve and
+                # none may be fabricated (its ``schedule`` is empty on
+                # purpose). ``next_run_at`` stays None, and the repository
+                # rejects a todo that ever carries one, so the scheduler
+                # cannot run it.
+                initial = None
+            elif candidate["schedule_type"] == "event":
                 # Event-triggered tasks have no wall-clock time: next_run_at
                 # stays None (the event handler drives executions) and the
                 # UI reports the trigger, never a fake run time.

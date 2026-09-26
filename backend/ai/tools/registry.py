@@ -150,6 +150,11 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
         TaskTransitionTool,
         TaskDeleteTool,
     )
+    from backend.ai.tools.todo_tools import (
+        TodoAddTool,
+        TodoEditTool,
+        TodoFindTool,
+    )
     from backend.ai.tools.retrieve_save import (
         RetrieveSaveTool,
         PreviewSaveTool,
@@ -208,6 +213,9 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(TaskInspectTool(context))
     registry.register(TaskTransitionTool(context))
     registry.register(TaskDeleteTool(context))
+    registry.register(TodoAddTool(context))
+    registry.register(TodoFindTool(context))
+    registry.register(TodoEditTool(context))
     registry.register(RetrieveSaveTool(context))
     registry.register(PreviewSaveTool(context))
     registry.register(DeleteSaveTool(context))

@@ -74,6 +74,7 @@ def _build_menu_buttons() -> list:
         ("Settings", "panel:settings"),
         ("👻 Ghost Seen", "panel:ghost_seen_v2"),
     )
+    builder.add_row("📋 Todo", "panel:todo")
     builder.add_row("🧠 AI", "panel:ai")
     return builder.build()
 

@@ -131,6 +131,27 @@ def _list_header(status: str | None) -> list[str]:
     return lines
 
 
+def todo_detail_text(task: object) -> str:
+    """The detail block for ONE todo — only what a basic todo really has.
+
+    No schedule, destination, occurrence or action line: a todo has none of
+    them, and printing an empty one would suggest a feature that does not
+    exist. Created/updated/version are the existing durable facts.
+    """
+    title = " ".join(str(getattr(task, "label", "") or "").split()) or "Untitled"
+    return "\n".join(
+        [
+            f"Todo #{getattr(task, 'id', '?')}",
+            f"Title: {title}",
+            f"Status: {_status_text(getattr(task, 'status', ''))}",
+            f"Created: {_format_datetime(getattr(task, 'created_at', None), empty='Unknown')}",
+            f"Updated: {_format_datetime(getattr(task, 'updated_at', None), empty='Unknown')}",
+            f"Version: v{getattr(task, 'version', '?')}",
+            "Type: Todo (unscheduled)",
+        ]
+    )
+
+
 async def list_text(
     service: TaskManagementService,
     *,

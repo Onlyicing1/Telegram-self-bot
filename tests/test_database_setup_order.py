@@ -2,7 +2,7 @@
 
 DATABASE_ARCHITECTURE.md §31 must give the owner exactly ONE thing to paste: a
 single fenced SQL block that contains the complete ordered setup — the canonical
-reconciliation snapshot first, then the five pending migrations. This module pins
+reconciliation snapshot first, then every later pending migration. This module pins
 that property so the document cannot regress to a two-stage workflow (a "step 0"
 block plus a second block) or a shell `cat` command.
 
@@ -29,12 +29,15 @@ VAULT_PART2 = "20260919000002_credential_vault_management.sql"
 DISPLAY_NAME = "20260921000001_add_saved_items_display_name.sql"
 SEARCH_INDEXES = "20260922000001_add_saved_items_search_indexes.sql"
 TTS_SETTINGS = "20260923000001_add_ai_config_tts_settings.sql"
+TODO_SCHEDULE_TYPE = "20260926000001_add_todo_schedule_type.sql"
 
 #: The order §31 documents — verified against the sources, not assumed. The TTS
-#: settings migration is a LATER additive schema change, so it is appended last
-#: (the documented rule: a later change never edits the snapshot).
+#: settings migration and the Todo schedule type are LATER additive schema
+#: changes, so they are appended last, newest last (the documented rule: a later
+#: change never edits the snapshot).
 DOCUMENTED_ORDER = (
     RECONCILE, VAULT_PART1, VAULT_PART2, DISPLAY_NAME, SEARCH_INDEXES, TTS_SETTINGS,
+    TODO_SCHEDULE_TYPE,
 )
 
 #: The banner that marks the ONE complete deployment block.
@@ -229,6 +232,24 @@ def test_the_display_name_column_precedes_its_index():
     assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in spans[SEARCH_INDEXES]
 
 
+def test_the_todo_schedule_type_part_is_last_and_carries_both_constraints():
+    """The newest additive migration closes the block, and it is complete in it."""
+    spans = _part_spans(_setup_block())
+    assert list(spans)[-1] == TODO_SCHEDULE_TYPE, (
+        "the Todo schedule type is the newest additive change, so it is applied last"
+    )
+    part = spans[TODO_SCHEDULE_TYPE]
+    assert "DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check" in part
+    assert "'todo'" in part, "the widened schedule_type enum must name the Todo type"
+    assert "DROP CONSTRAINT IF EXISTS ai_tasks_actions_count" in part
+    assert "jsonb_array_length(actions) BETWEEN 0 AND 5" in part, (
+        "only a Todo row may store no action"
+    )
+    assert "jsonb_array_length(actions) BETWEEN 1 AND 5" in part, (
+        "every scheduled row must keep the 1-5 action guarantee"
+    )
+
+
 def test_the_vault_part_two_follows_part_one():
     block = _setup_block()
     assert "CREATE TABLE IF NOT EXISTS public.api_credentials" in _part_spans(block)[VAULT_PART1]
@@ -303,7 +324,8 @@ def test_the_documented_deviations_are_stated_explicitly():
     flat = _flat(_section_31())
     assert "display_name" in flat
     assert "42703" in flat, "the failure the ordering prevents must be named"
-    assert "six migrations" in flat, "the added sixth migration must be acknowledged"
+    assert "seven migrations" in flat, "the added sixth and seventh migrations must be acknowledged"
+    assert "add_todo_schedule_type" in flat, "the Todo schedule type must be acknowledged"
     assert "tts_provider" in flat, "the TTS settings columns must be acknowledged"
 
 

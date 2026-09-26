@@ -47,6 +47,9 @@ ACTION_NAMES = frozenset({
     "task_inspect",
     "task_transition",
     "task_delete",
+    "todo_add",
+    "todo_find",
+    "todo_edit",
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
@@ -77,6 +80,9 @@ EXECUTABLE_ACTION_NAMES = frozenset({
     "task_inspect",
     "task_transition",
     "task_delete",
+    "todo_add",
+    "todo_find",
+    "todo_edit",
     "retrieve_save",
     "preview_saved_item",
     "delete_saved_item",
@@ -116,7 +122,7 @@ ALLOWED_FIELDS = frozenset({
     "content", "reason", "link", "message_id", "fields", "request",
     "until_time", "after_time", "boundary_id", "semantic", "text",
     "task_id", "action_status", "expected_version", "save_code", "status",
-    "display_name", "file_name", "tags",
+    "display_name", "file_name", "tags", "title",
 })
 
 # The Save actions — the ones that may carry the owner's saved-item metadata
@@ -357,6 +363,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
             error="'file_name' is only valid for the rename_saved_item action.",
         )
 
+    # ``title`` is the owner's own words for a todo — a create or a rename.
+    # Nothing else can carry it: a task's own content lives in its actions.
+    if "title" in raw and action not in ("todo_add", "todo_edit"):
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error="'title' is only valid for the todo_add/todo_edit actions.",
+        )
+
     # ``save_code`` is only meaningful for the saved-item actions. It is
     # validated as a bounded string here; the canonical `S####` shape is
     # enforced by the tool (the code travels verbatim, upper-cased at the
@@ -374,14 +388,14 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
     # ``task_id``/``expected_version``/``action`` status fields are only
     # meaningful for the task lifecycle actions.
     _TASK_ONLY_FIELDS = ("task_id", "expected_version")
-    if action not in ("task_inspect", "task_transition", "task_delete"):
+    if action not in ("task_inspect", "task_transition", "task_delete", "todo_edit"):
         for field_name in _TASK_ONLY_FIELDS:
             if field_name in raw:
                 return ActionParseResult(
                     kind=KIND_INVALID,
                     error=(
                         f"'{field_name}' is only valid for the "
-                        "task_inspect/task_transition actions."
+                        "task_inspect/task_transition/todo_edit actions."
                     ),
                 )
 
@@ -396,6 +410,9 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 
     if action in ("task_inspect", "task_transition", "task_delete"):
         return _validate_task_lifecycle_action(action, raw)
+
+    if action in ("todo_add", "todo_find", "todo_edit"):
+        return _validate_todo_action(action, raw)
 
     if action in _SAVE_ITEM_ACTIONS:
         return _validate_saved_item_action(action, raw)
@@ -657,8 +674,19 @@ def validate_action(raw: dict[str, Any]) -> ActionParseResult:
 # ── Task lifecycle + saved-item retrieval actions ──
 
 _TASK_INSPECT_FIELDS = frozenset({"action", "task_id"})
-_TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version"})
-_TASK_DELETE_FIELDS = frozenset({"action", "task_id", "expected_version"})
+_TASK_TRANSITION_FIELDS = frozenset({"action", "task_id", "action_status", "expected_version", "query"})
+_TASK_DELETE_FIELDS = frozenset({"action", "task_id", "expected_version", "query"})
+# The basic Todo actions. ``title`` is the owner's own words for the todo (a
+# create or a rename) and ``query`` is a TITLE REFERENCE the deterministic
+# resolver turns into 0/1/N candidates — never a guess.
+_TODO_ADD_FIELDS = frozenset({"action", "title"})
+_TODO_FIND_FIELDS = frozenset({"action", "query"})
+_TODO_EDIT_FIELDS = frozenset({"action", "title", "task_id", "expected_version", "query"})
+# The todo title bound — the SAME 256-character bound the task service and the
+# repository enforce for every label.
+_MAX_TODO_TITLE_CHARS = 256
+# A title reference is a short phrase (mirrors the task service's bound).
+_MAX_TODO_QUERY_CHARS = 128
 # task_list's optional status filter (the normal list excludes a legacy
 # ``deleted`` row, see TaskManagementService).
 _TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
@@ -718,6 +746,52 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
             error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
         )
 
+    # A todo can be addressed by the OWNER'S OWN WORDS instead of an id: the
+    # tool's deterministic resolver then decides which todo (0 matches ->
+    # nothing was found, 2 or more -> the candidate list). No id or version is
+    # guessed here, and an ambiguous reference can never reach a mutation.
+    query = raw.get("query")
+    query = query.strip() if isinstance(query, str) else ""
+    if query:
+        task_id = coerce_int(raw.get("task_id"))
+        version = coerce_int(raw.get("expected_version"))
+        if task_id is not None or version is not None:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    f"Provide either 'task_id' with 'expected_version' or "
+                    f"'query' for {action}, not both."
+                ),
+            )
+        if len(query) > _MAX_TODO_QUERY_CHARS:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"'query' for {action} must be at most {_MAX_TODO_QUERY_CHARS} characters.",
+            )
+        if action == "task_delete":
+            return ActionParseResult(
+                kind=KIND_EXECUTABLE, action=action, target="schedule", query=query
+            )
+        status = raw.get("action_status")
+        if (
+            not isinstance(status, str)
+            or status.strip().lower() not in _TASK_TRANSITION_STATUS_VOCABULARY
+        ):
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=(
+                    "Invalid 'action_status' for task_transition "
+                    "(allowed: paused, active, completed)."
+                ),
+            )
+        return ActionParseResult(
+            kind=KIND_EXECUTABLE,
+            action=action,
+            target="schedule",
+            query=query,
+            action_status=status.strip().lower(),
+        )
+
     task_id = coerce_int(raw.get("task_id"))
     if task_id is None or task_id <= 0:
         return ActionParseResult(
@@ -769,6 +843,92 @@ def _validate_task_lifecycle_action(action: str, raw: dict[str, Any]) -> ActionP
         target="schedule",
         task_id=task_id,
         action_status=status.strip().lower(),
+        expected_version=version,
+    )
+
+
+def _validate_todo_action(action: str, raw: dict[str, Any]) -> ActionParseResult:
+    """Validate one basic Todo action object.
+
+    The todo's title (``title``) is the owner's own content and travels
+    verbatim into the tool; a title REFERENCE (``query``) is resolved by the
+    tool's deterministic resolver, which refuses to pick among several
+    matches. Ownership, persistence and the CAS version stay in the existing
+    TaskCreationService/TaskManagementService boundary.
+    """
+    allowed = {
+        "todo_add": _TODO_ADD_FIELDS,
+        "todo_find": _TODO_FIND_FIELDS,
+        "todo_edit": _TODO_EDIT_FIELDS,
+    }[action]
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Unknown field(s) for {action}: {', '.join(unknown)}",
+        )
+
+    if action == "todo_find":
+        query = raw.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Missing or invalid 'query' for todo_find.",
+            )
+        query = query.strip()
+        if len(query) > _MAX_TODO_QUERY_CHARS:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"'query' for todo_find must be at most {_MAX_TODO_QUERY_CHARS} characters.",
+            )
+        return ActionParseResult(kind=KIND_EXECUTABLE, action=action, query=query)
+
+    title = raw.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"Missing or invalid 'title' for {action}.",
+        )
+    title = " ".join(title.split())
+    if len(title) > _MAX_TODO_TITLE_CHARS:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=f"'title' for {action} must be at most {_MAX_TODO_TITLE_CHARS} characters.",
+        )
+    if action == "todo_add":
+        return ActionParseResult(kind=KIND_EXECUTABLE, action=action, text=title)
+
+    # A rename addresses ONE todo: by id with the CAS version, or by a title
+    # reference — never by both and never by neither.
+    query = raw.get("query")
+    query = query.strip() if isinstance(query, str) else ""
+    task_id = coerce_int(raw.get("task_id"))
+    version = coerce_int(raw.get("expected_version"))
+    if query:
+        if task_id is not None or version is not None:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error="Provide either 'task_id' with 'expected_version' or 'query' for todo_edit, not both.",
+            )
+        if len(query) > _MAX_TODO_QUERY_CHARS:
+            return ActionParseResult(
+                kind=KIND_INVALID,
+                error=f"'query' for todo_edit must be at most {_MAX_TODO_QUERY_CHARS} characters.",
+            )
+        return ActionParseResult(kind=KIND_EXECUTABLE, action=action, text=title, query=query)
+    if task_id is None or task_id <= 0 or version is None or version <= 0:
+        return ActionParseResult(
+            kind=KIND_INVALID,
+            error=(
+                "Missing or invalid 'task_id'/'expected_version' for todo_edit "
+                "(or provide 'query')."
+            ),
+        )
+    return ActionParseResult(
+        kind=KIND_EXECUTABLE,
+        action=action,
+        text=title,
+        task_id=task_id,
         expected_version=version,
     )
 
@@ -1026,6 +1186,13 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
         return [{"name": "task_inspect", "arguments": {"task_id": result.task_id}}]
 
     if action == "task_transition":
+        # A title reference resolves inside the tool (deterministically, and
+        # only for a todo); an id keeps its explicit CAS version.
+        if result.query:
+            return [{
+                "name": "task_transition",
+                "arguments": {"query": result.query, "action": result.action_status},
+            }]
         return [{
             "name": "task_transition",
             "arguments": {
@@ -1037,7 +1204,11 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
 
     if action == "task_delete":
         # Deletion is a REAL row removal through the dedicated tool/service
-        # operation — never a task_transition status write.
+        # operation — never a task_transition status write. A todo addressed
+        # by title travels as the resolver's query input; the tool then
+        # resolves at most ONE todo and refuses an ambiguous reference.
+        if result.query:
+            return [{"name": "task_delete", "arguments": {"query": result.query}}]
         return [{
             "name": "task_delete",
             "arguments": {
@@ -1045,6 +1216,24 @@ def resolve_tool_calls(result: ActionParseResult) -> list[dict[str, Any]]:
                 "expected_version": result.expected_version,
             },
         }]
+
+    if action == "todo_add":
+        return [{"name": "todo_add", "arguments": {"title": result.text}}]
+
+    if action == "todo_find":
+        return [{"name": "todo_find", "arguments": {"query": result.query}}]
+
+    if action == "todo_edit":
+        # The new title travels verbatim; the target is either the id with its
+        # CAS version or the owner's own words, which the tool resolves
+        # deterministically (never picking among several matches).
+        arguments: dict[str, Any] = {"title": result.text}
+        if result.query:
+            arguments["query"] = result.query
+        else:
+            arguments["task_id"] = result.task_id
+            arguments["expected_version"] = result.expected_version
+        return [{"name": "todo_edit", "arguments": arguments}]
 
     if action == "retrieve_save":
         # A name/tag request travels as the resolver's query input; the tool

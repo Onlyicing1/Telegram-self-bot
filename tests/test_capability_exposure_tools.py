@@ -190,7 +190,9 @@ async def test_task_transition_registered_and_reachable():
     delete_tool = registry.get("task_delete")
     assert delete_tool is not None
     assert delete_tool.permission_level.value == "read_write"
-    assert sorted(delete_tool.parameters) == ["expected_version", "task_id"]
+    # ``query`` addresses a TODO by the owner's own words instead of id+version;
+    # the resolver refuses to pick among several matches.
+    assert sorted(delete_tool.parameters) == ["expected_version", "query", "task_id"]
     # The list tool's filter enum deliberately stays narrower: a removed
     # task can never be listed through a status filter.
     list_tool = registry.get("task_list")
@@ -467,4 +469,7 @@ async def test_new_tools_are_provider_schema_visible():
 def test_no_duplicate_registrations():
     registry, _ctx, _executor = make_chain()
     names = registry.list_names()
-    assert len(names) == len(set(names)) == 46
+    assert len(names) == len(set(names)) == 49
+    # The basic Todo surface (Part 1) is registered exactly once each.
+    for name in ("todo_add", "todo_find", "todo_edit"):
+        assert name in names

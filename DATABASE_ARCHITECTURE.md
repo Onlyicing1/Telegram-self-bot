@@ -68,7 +68,7 @@
 This section answers one operational question: **what exactly does the owner
 paste?** The answer is exactly ONE SQL script — the block in §31.3. It is the
 complete ordered setup: the canonical reconciliation snapshot first, then the
-five pending migrations, in one fenced block. There is no "step 0", no second
+six pending migrations, in one fenced block. There is no "step 0", no second
 block to paste and no shell workflow. Open this section, copy §31.3, paste it
 into the Supabase SQL Editor as `postgres` and run it.
 
@@ -76,22 +76,23 @@ into the Supabase SQL Editor as `postgres` and run it.
 
 | Order | Migration (`supabase/migrations/`) | Objects it establishes | Its SQL in this document |
 |---|---|---|---|
-| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 6** — the complete canonical reconciliation SQL, physically inside the one deployment block |
-| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 6** (the object contract is also documented in §29.10) |
-| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 6** (documented in §29.14) |
-| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 6** |
-| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 6** |
-| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 6** |
+| 1 | `20260920000001_reconcile_canonical_schema.sql` | `pg_trgm`; all 16 canonical tables, every column re-asserted with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding; data-guarded constraints, indexes and identity constraints; RLS + SELECT-only `anon`/`authenticated` policies on all 16 tables; the `panel_settings('global')` and five `bot_settings` seeds; the post-`COMMIT` drift report | **§31.3, part 1 of 7** — the complete canonical reconciliation SQL, physically inside the one deployment block |
+| 2 | `20260919000001_create_api_credential_vault.sql` | `supabase_vault` extension (`WITH SCHEMA vault`); `api_credentials` metadata table (no secret column) + `idx_api_credentials_provider_order`, `idx_api_credentials_owner`, `uq_api_credentials_vault_secret`; RLS, `REVOKE`/`GRANT` and the column/table `COMMENT`s; `api_credential_pool(text, bigint)`; deprecated alias `stt_credential_pool(text, bigint)`; `NOTIFY pgrst` | **§31.3, part 2 of 7** (the object contract is also documented in §29.10) |
+| 3 | `20260919000002_credential_vault_management.sql` | `api_credential_list(bigint, text)`, `api_credential_create(bigint, text, text, text, integer, boolean)`, `api_credential_replace_secret(bigint, text, text)`, `api_credential_update(bigint, text, text, boolean, integer)`, `api_credential_delete(bigint, text)` — each `SECURITY DEFINER`, `SET search_path = ''`, `OWNER TO postgres`, `REVOKE`d from `PUBLIC`/`anon`/`authenticated`, `GRANT`ed to `service_role`, and carrying its own `COMMENT`; `NOTIFY pgrst` | **§31.3, part 3 of 7** (documented in §29.14) |
+| 4 | `20260921000001_add_saved_items_display_name.sql` | `saved_items.display_name text` (nullable, no default, no backfill); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 4 of 7** |
+| 5 | `20260922000001_add_saved_items_search_indexes.sql` | `pg_trgm` again (`IF NOT EXISTS`); `idx_saved_items_display_name_trgm` (GIN trigram on `display_name`); `idx_saved_items_tags` (GIN on `tags`); `NOTIFY pgrst`; a `SELECT`-based verification query | **§31.3, part 5 of 7** |
+| 6 | `20260923000001_add_ai_config_tts_settings.sql` | `ai_config.tts_provider text`, `ai_config.tts_model text`, `ai_config.tts_voice text` (all nullable, no default, no backfill, no CHECK — the capability registry is the authority on the tokens); `NOTIFY pgrst`; a `SELECT`-based verification query over `information_schema.columns` | **§31.3, part 6 of 7** |
+| 7 | `20260926000001_add_todo_schedule_type.sql` | `ai_tasks_schedule_type_check` re-added with `'todo'` in the enum (the basic Todo item — an unscheduled, owner-managed row); `ai_tasks_actions_count` re-added as a CONDITIONAL check so only a `'todo'` row may store 0 actions while every scheduled row keeps 1–5; `NOTIFY pgrst`. No table, no column, no index, no policy, no grant and no row change | **§31.3, part 7 of 7** (the row shape is documented in §15) |
 
 No migration file is rewritten, renamed or superseded by this section. The SQL of
-§31.3 is transcribed statement-for-statement from those six files (their prose
+§31.3 is transcribed statement-for-statement from those seven files (their prose
 comment headers are dropped so the artifact is pure executable SQL; see §31.3),
 and `tests/test_database_setup_order.py` pins every statement of it back to the
 file it came from, so the combined block cannot drift from the migrations.
 
 ### 31.2 The order, and why it is this order (source-proven)
 
-1. **The reconciliation snapshot runs first (part 1 of 6).** It is the only thing
+1. **The reconciliation snapshot runs first (part 1 of 7).** It is the only thing
    that creates `saved_items`, `ai_config`, `panel_settings`, `bot_settings`, the
    AI tables and the two task tables, and it is where every canonical column, the
    four `ai_config` columns and the drifted `panel_settings`/`bot_settings`
@@ -125,24 +126,39 @@ file it came from, so the combined block cannot drift from the migrations.
    deterministic backfills of a column that was just added or was `NULL`), and
    nothing in it creates a Vault secret.
 
-6. **The TTS settings migration runs last (part 6).** It is purely additive: three
-   nullable `ai_config` columns, no default binding, no backfill, no constraint
-   and no index. It depends only on `ai_config` existing (part 1) and is
-   independent of the Vault and Save V2 objects, so any position after part 1 is
-   valid; it is appended LAST so the recorded order of the pre-existing five
-   files is unchanged.
+6. **The TTS settings migration follows the Save V2 pair (part 6).** It is purely
+   additive: three nullable `ai_config` columns, no default binding, no backfill,
+   no constraint and no index. It depends only on `ai_config` existing (part 1)
+   and is independent of the Vault and Save V2 objects, so any position after
+   part 1 is valid; it was appended after the recorded five files so their order
+   stayed unchanged.
+
+7. **The Todo schedule type runs last (part 7).** It widens exactly two existing
+   `ai_tasks` constraints — the `schedule_type` enum gains `'todo'`, and
+   `ai_tasks_actions_count` becomes conditional so only a `'todo'` row may store
+   no action — and touches nothing else. It depends only on `ai_tasks` existing
+   (part 1; the two constraints themselves come from the reconciliation) and is
+   independent of the Vault, Save V2 and TTS objects, so any position after part
+   1 is valid; it is appended LAST so the recorded order of the pre-existing six
+   files is unchanged. It is a LATER schema change carried by its own additive
+   migration — the same rule the TTS part followed. The application works
+   without it for every scheduled task (only a basic Todo row needs the widened
+   enum), and reports the affected operation honestly instead of pretending it
+   was persisted.
 
 > **The order is repository-proven, recorded honestly.** The requested set named
 > four files, with the canonical reconciliation first and the Save V2 search
 > indexes last. The source proves that the search-index migration depends on a
 > fifth file — `20260921000001_add_saved_items_display_name.sql` — which was not in
 > the set, and that applying the index without the column fails. The single block
-> therefore contains six migrations, with the display-name migration placed
+> therefore contains seven migrations, with the display-name migration placed
 > immediately before the index migration and every other position unchanged. This
 > is the repository-proven order; it is the only change this audit made to the
 > requested sequence. The sixth file is a LATER schema change carried by its own
 > additive migration — exactly what this document's own rule requires (§30.11) — so
-> it is appended last rather than folded into the snapshot.
+> it is appended last rather than folded into the snapshot. The seventh file
+> (`20260926000001_add_todo_schedule_type.sql`, the basic Todo row) is appended
+> the same way, for the same reason.
 
 ### 31.3 ONE COMPLETE SUPABASE SETUP SCRIPT
 
@@ -150,7 +166,7 @@ Copy the entire SQL block below and paste it into the Supabase SQL Editor as
 `postgres`. This block contains the complete ordered setup. No other SQL block in
 this document needs to be executed manually.
 
-The block is the six migrations' executable SQL concatenated in order, with a
+The block is the seven migrations' executable SQL concatenated in order, with a
 part banner before each and the migrations' prose comments removed so the whole
 artifact is pure, runnable SQL. Every statement is verbatim from its migration,
 and `tests/test_database_setup_order.py` pins each one back to the file it came
@@ -163,7 +179,7 @@ and no Vault secret is created.
 --
 -- Copy this whole block and paste it into the Supabase SQL Editor as `postgres`.
 -- It is the complete ordered setup: the canonical reconciliation snapshot first,
--- then the five pending migrations.
+-- then the six pending migrations.
 --
 -- Order (source-derived from supabase/migrations/):
 --   1. 20260920000001_reconcile_canonical_schema.sql     (canonical snapshot)
@@ -171,14 +187,15 @@ and no Vault secret is created.
 --   3. 20260919000002_credential_vault_management.sql    (Vault PART 2)
 --   4. 20260921000001_add_saved_items_display_name.sql   (Save V2 column)
 --   5. 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes)
---   6. 20260923000001_add_ai_config_tts_settings.sql    (TTS settings)
+--   6. 20260923000001_add_ai_config_tts_settings.sql     (TTS settings)
+--   7. 20260926000001_add_todo_schedule_type.sql         (basic Todo items)
 --
 -- Idempotent and additive: no row, column or existing value is rewritten and no
 -- Vault secret is created. Every statement is verbatim from its migration; the
 -- migrations' prose comments are removed so the artifact is pure executable SQL.
 -- ============================================================================
 
--- ─── PART 1 of 6 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
+-- ─── PART 1 of 7 — 20260920000001_reconcile_canonical_schema.sql (canonical snapshot) ───
 
 BEGIN;
 
@@ -1754,7 +1771,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 2 of 6 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
+-- ─── PART 2 of 7 — 20260919000001_create_api_credential_vault.sql (Vault PART 1) ───
 
 CREATE EXTENSION IF NOT EXISTS supabase_vault WITH SCHEMA vault;
 
@@ -1877,7 +1894,7 @@ COMMENT ON FUNCTION public.stt_credential_pool(text, bigint) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 3 of 6 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
+-- ─── PART 3 of 7 — 20260919000002_credential_vault_management.sql (Vault PART 2) ───
 
 CREATE OR REPLACE FUNCTION public.api_credential_list(
     p_owner_id bigint,
@@ -2283,7 +2300,7 @@ COMMENT ON FUNCTION public.api_credential_delete(bigint, text) IS
 
 NOTIFY pgrst, 'reload schema';
 
--- ─── PART 4 of 6 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
+-- ─── PART 4 of 7 — 20260921000001_add_saved_items_display_name.sql (Save V2 column) ───
 
 ALTER TABLE saved_items
     ADD COLUMN IF NOT EXISTS display_name text;
@@ -2297,7 +2314,7 @@ LEFT JOIN information_schema.columns c
 WHERE c.column_name IS NULL
 ORDER BY 1;
 
--- ─── PART 5 of 6 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
+-- ─── PART 5 of 7 — 20260922000001_add_saved_items_search_indexes.sql (Save V2 indexes) ───
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -2316,7 +2333,7 @@ LEFT JOIN pg_indexes i
 WHERE i.indexname IS NULL
 ORDER BY 1;
 
--- ─── PART 6 of 6 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
+-- ─── PART 6 of 7 — 20260923000001_add_ai_config_tts_settings.sql (TTS settings) ───
 
 ALTER TABLE ai_config
     ADD COLUMN IF NOT EXISTS tts_provider text;
@@ -2330,6 +2347,22 @@ FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name   = 'ai_config'
   AND column_name IN ('tts_provider', 'tts_model', 'tts_voice');
+
+-- ─── PART 7 of 7 — 20260926000001_add_todo_schedule_type.sql (basic Todo items) ───
+
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
+
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
+    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event', 'todo'));
+
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_actions_count;
+
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
+    (schedule_type = 'todo' AND jsonb_array_length(actions) BETWEEN 0 AND 5)
+    OR (schedule_type <> 'todo' AND jsonb_array_length(actions) BETWEEN 1 AND 5)
+);
+
+NOTIFY pgrst, 'reload schema';
 ```
 
 ### 31.4 Verification after the run
@@ -2340,7 +2373,9 @@ line names a data-guarded constraint that a pre-existing row blocked. Its Save V
 parts each end with their own verification query (`missing_canonical_column` /
 `missing_save_v2_index`: zero rows means the column / both indexes now exist), and
 its Vault parts end with `NOTIFY pgrst, 'reload schema'`. Its TTS part ends with
-its own count query over `information_schema.columns`. The functions and
+its own count query over `information_schema.columns`, and its Todo part ends with
+`NOTIFY pgrst, 'reload schema'` alone: it adds no column and no index, so
+there is nothing for it to count. The functions and
 indexes can be confirmed read-only:
 
 ```sql
@@ -2380,6 +2415,12 @@ repository, which is exactly why every statement in the block is idempotent.
   tts_voice;` / `tts_model` / `tts_provider;` (stated in the migration's own header).
   Dropping them loses the stored selection only: `get_config` then serves the
   defaults, i.e. the default provider and its default model and voice.
+* **The Todo schedule type part** — reversible only while **no** `ai_tasks` row
+  has `schedule_type = 'todo'`: narrowing the enum again fails validation on
+  such a row, and `ai_tasks_actions_count` must stay conditional while a
+  zero-action row exists. The two `DROP CONSTRAINT IF EXISTS` / `ADD
+  CONSTRAINT` pairs in the migration's own header (`… todo_schedule_type.sql`,
+  *Rollback*) restore the exact pre-migration constraints. No row is deleted.
 * **The reconciliation part** — §30.9. The reconciliation is additive and has no
   safe automatic rollback; the only destructive cleanup in this repository is the
   explicitly OPTIONAL, owner-gated §30.10.
@@ -3196,11 +3237,11 @@ Durable owner-scoped AI task definitions for the future scheduler. This table ex
 | `label` | `text` | NO | Nonblank; max 256 enforced by repository |
 | `status` | `text` | NO | `'active'`; CHECK `active`, `paused`, `completed`, `failed`, `expired`, `deleted` |
 | `version` | `integer` | NO | `1`; CHECK `> 0` |
-| `schedule_type` | `text` | NO | CHECK `once`, `interval`, `daily`, `weekly`, `event` (extended by migration `20260904000001_add_event_schedule_type.sql`) |
+| `schedule_type` | `text` | NO | CHECK `once`, `interval`, `daily`, `weekly`, `event` (extended by migration `20260904000001_add_event_schedule_type.sql`), `todo` (added by migration `20260926000001_add_todo_schedule_type.sql`) |
 | `schedule` | `jsonb` | NO | Max 16,384 bytes by migration. Time schedules: `{seconds}`, `{at,timezone}`, `{hour,minute,timezone}`, `{weekday,hour,timezone}`. Event schedule: `{"trigger": {...}}` — the resolved trigger spec below |
 | `timezone` | `text` | NO | Explicit IANA identifier validated by application |
 | `next_run_at` | `timestamptz` | YES | UTC due instant |
-| `actions` | `jsonb` | NO | JSON array, 1–5 actions, max 32,768 bytes |
+| `actions` | `jsonb` | NO | JSON array, max 32,768 bytes; 1–5 actions for every scheduled type, 0–5 for a `todo` row (always 0 in practice) — the conditional `ai_tasks_actions_count` of migration `20260926000001_add_todo_schedule_type.sql` |
 | `notification_destination` | `jsonb` | NO | Max 4,096 bytes; explicit owner-scoped destination |
 | `created_at` | `timestamptz` | NO | `now()` |
 | `updated_at` | `timestamptz` | NO | `now()` |
@@ -3240,6 +3281,18 @@ deterministically against incoming Telegram events — no LLM per message.
 Matching occurrences use key `"<task_id>:ev:<chat_id>:<message_id>"` (unique
 with `task_id`), so duplicate delivery of the same event cannot create a
 second occurrence.
+
+### Todo row shape (schedule_type `todo`)
+
+A basic Todo item is an ordinary `ai_tasks` row: `schedule_type = 'todo'`,
+`schedule = {}`, `actions = []` and `next_run_at` NULL. It carries no action, so
+the scheduler never claims it and it produces no occurrence; `label` is the Todo
+title (nonblank, max 256 characters). The lifecycle is `active` → `completed`,
+and `completed` → `active` reopens it; both go through the same compare-and-set
+version check as every other task mutation, and so does a title edit. The
+migration's widened `ai_tasks_schedule_type_check` is what makes the row legal,
+and its conditional `ai_tasks_actions_count` is what makes the empty `actions`
+legal without relaxing the 1–5 guarantee for scheduled tasks.
 
 Indexes are `idx_ai_tasks_status_next_run (status, next_run_at)` and `idx_ai_tasks_owner_updated (owner_id, updated_at DESC)`. There is no trigger or SQL schedule logic. Task version edits and lifecycle validation are repository/application responsibilities. Actions are bounded JSON; no action or step table exists.
 
@@ -3879,6 +3932,7 @@ migration. No code change needed.
 | 15 | `20260920000001_reconcile_canonical_schema.sql` | The canonical reconciliation script (§30): re-asserts every canonical column of all 16 tables with `ADD COLUMN IF NOT EXISTS` + deterministic backfill + final default/NOT NULL binding, data-guards every constraint/index addition, adds the four missing `ai_config` columns and the two task tables, and ends with a drift report. Adds no table, no secret store and no data change beyond deterministic backfills | **NOT APPLIED — owner action required** (§30.11). Byte-identical to `supabase/canonical_bootstrap.sql`; its statements are embedded as part 1 of the ONE deployment block in §31.3; the reconciliation **snapshot**, extended only by additive successors |
 | 16 | `20260921000001_add_saved_items_display_name.sql` | Adds the nullable, default-less `display_name text` to `saved_items` (`ADD COLUMN IF NOT EXISTS`) — the owner-facing saved-item name — and reloads the PostgREST schema cache. Additive successor to #15: it touches no other table, creates no competing definition of `saved_items`, rewrites no row and changes no existing value (`tags` needs no DDL; only its producer changed) | **NOT APPLIED — owner action required.** Apply it BEFORE any Save surface starts writing a name (§2, *User-facing metadata*). On a database that has not run #15 it is safe only if `saved_items` already exists — #15 creates the table |
 | 17 | `20260922000001_add_saved_items_search_indexes.sql` | The Save V2 resolver's two search indexes on `saved_items`: `idx_saved_items_display_name_trgm` (GIN trigram for the `display_name ILIKE '%token%'` prefilter; enables `pg_trgm` itself) and `idx_saved_items_tags` (GIN for whole-tag containment `tags.cs.{…}`). Additive successor to #15/#16: indexes only — no column, no row, no `save_code` change; idempotent; reloads the PostgREST schema cache | **NOT APPLIED — owner action required** (§2 index table). Safe on any database that already has `saved_items` (created by #15 or earlier migrations) |
+| 18 | `20260926000001_add_todo_schedule_type.sql` | Widens exactly two existing `ai_tasks` constraints for the basic Todo item: `ai_tasks_schedule_type_check` gains `'todo'`, and `ai_tasks_actions_count` becomes conditional so a `'todo'` row stores 0–5 actions (0 in practice) while every scheduled row keeps 1–5. No table, no column, no index, no policy, no grant, no row and no backfill; ends with `NOTIFY pgrst, 'reload schema'` | **NOT APPLIED — owner action required** (§31.3, part 7 of 7; the row shape is documented in §15). Until it runs, the legacy enum and actions count still hold: a Todo *create* is rejected by the old CHECK and the application reports that honestly, while every scheduled task keeps working unchanged |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,

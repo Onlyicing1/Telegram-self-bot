@@ -696,8 +696,8 @@ def doc_setup_block() -> str:
 def doc_reconciliation_segment() -> str:
     """Part 1 of the setup block — the canonical snapshot, comment-stripped."""
     block = doc_setup_block()
-    start = block.index("-- ─── PART 1 of 6")
-    end = block.index("-- ─── PART 2 of 6")
+    start = block.index("-- ─── PART 1 of 7")
+    end = block.index("-- ─── PART 2 of 7")
     return block[start:end]
 
 

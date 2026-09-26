@@ -22,6 +22,7 @@ from backend.bot.handlers import (
     tasks,
     taskloom,
     task_events,
+    todo,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ def register_all(client, owner_id: int, tz_str: str):
         ("tasks", lambda: tasks.register(client, owner_id, tz_str)),
         ("taskloom", lambda: taskloom.register(client, owner_id, tz_str)),
         ("task_events", lambda: task_events.register(client, owner_id, tz_str)),
+        ("todo", lambda: todo.register(client, owner_id, tz_str)),
     ]
 
     for name, fn in handlers:

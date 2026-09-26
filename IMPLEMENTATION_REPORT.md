@@ -1,5 +1,265 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
+## Latest phase — TODO PART 1 — BASIC TODO LIST on the existing durable task foundation
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `ee5967f` = `origin/main` (`chore(tts): freeze tts and hide from user interface`).
+
+### Part 1 objective
+
+Make the existing durable task foundation usable as a SIMPLE Todo List from
+Telegram: create / list / inspect / edit / complete / reopen / delete a basic
+todo, with a manual Glass UI and basic Persian/English natural-language
+support. This is explicitly NOT a premium task manager: no priority, no
+categories, no projects, no calendar, no reminder engine, no workflow engine,
+no subtasks and no multi-step tasks (Part 2+). Everything reuses the existing
+`ai_tasks` / `ai_task_occurrences` foundation — TaskRepository CAS versioning,
+`TaskCreationService`, `TaskManagementService`, the AI tool layer and Taskloom
+conventions. No new table, no new repository, no new state model, no parallel
+database.
+
+### Audit conclusion (what already existed and was reused)
+
+| Existing foundation | Where | Reused how |
+|---|---|---|
+| Durable owner-scoped task rows, version/CAS, occurrence history | `backend/ai/database/task_repository.py` (InMemory + Supabase), `ai_tasks`/`ai_task_occurrences` | the todo IS a task row; every mutation goes through the same CAS paths |
+| Task creation (validation, bounded label, timezone) | `backend/ai/task_creation.py::TaskCreationService.create` | `create_todo` builds the one unscheduled candidate and calls the SAME `create` |
+| Task lifecycle transitions | `TaskManagementService.set_status` | complete = `set_status("completed")`; reopen = `set_status("active")` restricted to todos |
+| Deletion (real row removal, CAS, owner-scoped, `TaskDeletionResult`) | `TaskManagementService.delete` / `TaskRepository.delete_task` | todo delete uses the exact same service delete with its real outcome reporting |
+| Listing/inspection | `TaskManagementService.snapshot`, `task_management_interface` | `list_todos` filters `snapshot(todos_only=True)`; `todo_detail_text` renders a todo's basic facts |
+| AI execution spine | Dispatcher → ToolRegistry → ToolExecutor → service → repository | three new tools registered in the same registry; the JSON action path maps through the same tools |
+| Glass UI machinery | `backend/helper` panel/action/input registries | new `todo` module registers through the same registries, reached from `Menu` |
+
+### What was implemented
+
+**Database migration** — `supabase/migrations/20260926000001_add_todo_schedule_type.sql`
+(NEW). The current `ai_tasks` constraints could not express an unscheduled
+todo: `ai_tasks_schedule_type_check` allowed only the five scheduled types, and
+`ai_tasks_actions_count` required 1–5 actions. The migration widens exactly
+those two constraints and nothing else (no table, no column, no index, no
+policy, no grant, no row change, no backfill):
+
+```sql
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_schedule_type_check;
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_schedule_type_check
+    CHECK (schedule_type IN ('once', 'interval', 'daily', 'weekly', 'event', 'todo'));
+
+ALTER TABLE ai_tasks DROP CONSTRAINT IF EXISTS ai_tasks_actions_count;
+ALTER TABLE ai_tasks ADD CONSTRAINT ai_tasks_actions_count CHECK (
+    (schedule_type = 'todo' AND jsonb_array_length(actions) BETWEEN 0 AND 5)
+    OR (schedule_type <> 'todo' AND jsonb_array_length(actions) BETWEEN 1 AND 5)
+);
+
+NOTIFY pgrst, 'reload schema';
+```
+
+**Manual Supabase action required (NOT executed by the agent).** The schema
+change is owner-applied, idempotent, and additive: until it runs, every
+scheduled task keeps working unchanged and a todo *create* fails at the old
+CHECK with an honest error instead of a silent loss. Nothing was executed
+against Supabase and no live database was contacted.
+
+**Repository** — `backend/ai/database/task_repository.py`: `TODO_SCHEDULE_TYPE`,
+`SCHEDULE_TYPES` extended; `is_todo_schedule_type`; `_validate_json_payload`
+gains `allow_empty_array` (todo: 0–5 actions, scheduled: 1–5); `_validate_task_input`
+rejects `next_run_at` on a todo and permits `actions == []` only for one; the
+reopen edge `completed -> active` exists ONLY for a todo via
+`_task_status_transition_allowed` (a completed scheduled task stays terminal in
+BOTH repositories — in-memory and Supabase).
+
+**Creation** — `backend/ai/task_creation.py`: `MAX_TODO_TITLE_CHARS = 256`;
+`create_todo(label, timezone, reference)` normalizes the title, refuses to
+invent one, builds the candidate `{schedule_type:"todo", schedule:{}, actions:[],
+notification_destination:{}, next_run_at:None}` and calls the SAME `create()`;
+todo excluded from the schedule/timezone-match requirement; `initial = None`.
+
+**Management** — `backend/ai/task_management.py`: `list_todos(status)`,
+`snapshot(..., todos_only=False)`, `reopen(task_id, expected_version)`,
+`edit_todo_title(task_id, expected_version, label)` (CAS, todo-only), and THE
+ONE deterministic todo title resolver: `resolve_todos(query, limit=8)` with
+tiered matching (1. whole query coerced to an id → that todo; 2. every query
+token a substring of the normalized title; 3. the whole normalized title (≥3
+chars) inside the query), NFKC+normalization shared with semantic delete,
+deterministic ordering (`created_at DESC`, then id), bounded candidates
+(`MAX_TODO_CANDIDATES = 8`, `MAX_TODO_QUERY_CHARS = 128`,
+`MAX_TODO_QUERY_TOKENS = 12`), and outcomes NOT_FOUND / UNIQUE / AMBIGUOUS;
+`resolve_todo_target(task_id=0, query="")` refuses both/neither. `set_status`
+raises `ValueError` for reopening a completed scheduled task and for pausing a
+todo (a todo is completed or reopened, never paused).
+
+**Interface** — `backend/ai/task_management_interface.py::todo_detail_text`:
+Title / Status / Created / Updated / Version / `Type: Todo (unscheduled)`.
+
+**AI tools** — `backend/ai/tools/todo_tools.py` (NEW):
+`resolve_todo_argument` (refuses id+query together; requires the explicit
+version on the id path; stale version → refusal with the current version;
+returns `(task, None)` or `(None, ToolResult)`), and
+`TodoAddTool` (`todo_add`, READ_WRITE — a blank title asks for the title
+instead of inventing one),
+`TodoFindTool` (`todo_find`, READ_ONLY — unique match renders the detail text,
+0/2+ matches report honestly),
+`TodoEditTool` (`todo_edit`, READ_WRITE — by id+version or by title reference).
+All report `durable` through the shared fallback classification. All go through
+ToolRegistry → ToolExecutor → service → repository; the AI never touches the
+database, Supabase or Telegram directly.
+`backend/ai/tools/task_management_tools.py`: `task_transition` and `task_delete`
+gain the `query` parameter and resolve a title-addressed todo through the SAME
+resolver (reading the current version itself); `task_transition` reports
+"reopened" when the prior status was completed; descriptions updated
+(todo-aware). `backend/ai/tools/registry.py` registers the three tools
+(**total 49**); `backend/ai/tools/executor.py` adds their status labels.
+
+**JSON action path** — `backend/ai/actions.py`: `todo_add` / `todo_find` /
+`todo_edit` added to `ACTION_NAMES` + `EXECUTABLE_ACTION_NAMES`; `title` in
+`ALLOWED_FIELDS` (todo_add/todo_edit only); `query` accepted by
+task_transition/task_delete; `_validate_todo_action` and the query branch of
+`_validate_task_lifecycle_action` (id+version XOR query, bounded title/query);
+`resolve_tool_calls` maps all of them onto the SAME tools.
+
+**Prompt** — `backend/ai/prompt/template.py`: the task-management paragraph and
+the JSON schema/examples now cover todos: add/find/rename/complete/reopen/
+delete by the owner's own words, with the ambiguity rule stated to the model —
+0 matches means nothing was found, 2+ matches mean the owner MUST be asked
+(the model is never allowed to pick among candidates).
+
+**Manual Glass UI** — `backend/bot/handlers/todo.py` (NEW, registered in
+`backend/bot/router.py`; `Menu` gains the row `📋 Todo` in
+`backend/bot/handlers/misc.py`):
+
+* `panel:todo` — active todos (numbered), the completed count, degraded-read
+  note when the store fell back, `➕ Add` (input `todo:new`), `✅ Completed`
+  (`panel:todo_done`), back to `Menu`.
+* `panel:todo_done` — completed todos.
+* `panel:todo_task` — the detail view for ONE todo (id from the callback
+  extra, owner-scoped): active todo offers `✓ Complete`, `✏️ Edit`
+  (input `todo_task:edit`, carrying `task_id:version`), `🗑 Delete`;
+  completed todo offers `↩️ Reopen`, `🗑 Delete`.
+* `action:todo_complete` / `todo_reopen` / `todo_delete` — each performs the
+  service mutation under the version captured when the panel was rendered; a
+  stale version fails closed (nothing changes) and the refreshed panel shows
+  the current state; delete reports the real `TaskDeletionResult` outcome
+  (deleted / not found / stale).
+* Inputs ask for a missing title instead of inventing one; responses edit in
+  place (zero message spam), matching the repository's panel conventions.
+
+### Files changed (exact)
+
+| File | Change |
+|---|---|
+| `supabase/migrations/20260926000001_add_todo_schedule_type.sql` | NEW — the two widened `ai_tasks` constraints |
+| `backend/ai/database/task_repository.py` | todo schedule type + validation + todo-only reopen edge (both repositories) |
+| `backend/ai/task_creation.py` | `MAX_TODO_TITLE_CHARS`, `create_todo` through the same `create()` |
+| `backend/ai/task_management.py` | todo ops (list/reopen/edit) + the deterministic resolver + todo guards |
+| `backend/ai/task_management_interface.py` | `todo_detail_text` |
+| `backend/ai/tools/todo_tools.py` | NEW — `todo_add`, `todo_find`, `todo_edit`, `resolve_todo_argument` |
+| `backend/ai/tools/task_management_tools.py` | `query` path for task_transition/task_delete; reopen verb; todo-aware descriptions |
+| `backend/ai/tools/registry.py` | registers the three todo tools (49 total) |
+| `backend/ai/tools/executor.py` | status labels for the three tools |
+| `backend/ai/actions.py` | todo actions + `query` on the lifecycle actions + validation/mapping |
+| `backend/ai/prompt/template.py` | todo exposure in the task paragraph, schema and examples |
+| `backend/bot/handlers/todo.py` | NEW — the Todo Glass UI module |
+| `backend/bot/router.py` | registers the todo module |
+| `backend/bot/handlers/misc.py` | `Menu` gains the `📋 Todo` row |
+| `DATABASE_ARCHITECTURE.md` | §31 (audit row 7, order rationale, §31.3 part 7 of 7 with the migration's statements verbatim, §31.4, §31.5 reversal), §15 (schedule_type `todo`, conditional actions count, the Todo row shape), §20 (migration row 18, NOT APPLIED — owner action required) |
+| `tests/test_todo_lifecycle.py` | NEW — 11 tests |
+| `tests/test_todo_resolver.py` | NEW — 12 tests |
+| `tests/test_todo_tools.py` | NEW — 14 tests |
+| `tests/test_todo_ui.py` | NEW — 20 tests |
+| `tests/test_capability_exposure_tools.py` | delete params + registration count 46→49 + todo names |
+| `tests/test_database_setup_order.py` | `TODO_SCHEDULE_TYPE` appended to `DOCUMENTED_ORDER`, part-7 content pin, "seven migrations" |
+| `tests/test_canonical_schema_reconciliation.py` | the §31.3 segment markers `PART 1 of 7` / `PART 2 of 7` |
+| `tests/test_memory_tools.py`, `tests/test_tool_health_audit.py` | registry count 49 + the three todo tools in `EXPECTED_TOOLS` |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Security / ownership
+
+Every path is owner-scoped end to end: the handler fires only on the owner's
+outgoing messages; tools are constructed with the runtime `owner_id` and every
+repository call filters by it (verified by tests that a second owner cannot
+read, transition, edit or delete another owner's todo); the resolver searches
+only the owner's rows; ids supplied by the model are validated against the
+owner's rows and never trusted for authorization; CAS versions make a stale
+mutation a no-op that reports the current state; deletion stays the existing
+real-row-removal operation with its occurrence cascade under
+`ON DELETE RESTRICT`; RLS/service-role posture unchanged; no new env var, no
+new secret, no schema grant change.
+
+### Tests added and executed (exact)
+
+| Suite | Result |
+|---|---|
+| `tests/test_todo_lifecycle.py` + `test_todo_resolver.py` + `test_todo_tools.py` + `test_todo_ui.py` | **57 passed** (focused run: 57 passed in 0.44s) |
+| `tests/test_capability_exposure_tools.py` | **22 passed** |
+| `tests/test_database_setup_order.py` | **24 passed** |
+| Task regression (`-k "task or todo"`: all task/taskloom suites + todo) | **895 passed, 0 failed in 5.34s** |
+| Full suite `.venv/bin/python -m pytest tests -q` | **5041 passed, 26 skipped, 2 warnings in 121.76s** |
+| `py_compile` on every changed Python file | clean (exit 0) |
+| `git diff --check` | clean |
+
+Coverage of the required test areas: 1 create, 2 owner isolation
+(lifecycle/tools/UI), 3 list active, 4 list completed, 5 inspect, 6 edit,
+7 complete, 8 reopen, 9 delete, 10 stale edit rejection, 11 stale transition
+rejection, 12 ambiguous resolution, 13 zero-match, 14 single-match,
+15 multi-match, 16 tool registration (49 tools), 17 ToolExecutor path (native
+tools AND the JSON action path), 18 manual callback/navigation behavior,
+19–21 existing task_list/task_inspect/task_transition regression (the task
+regression batch, 895 passed, includes `test_task_repository.py`'s
+terminal-transition invariant).
+
+A regression found and fixed during validation: widening the repository's
+transition table alone let a completed SCHEDULED task reactivate; the guard is
+now `_task_status_transition_allowed` (reopen edge granted to a todo only),
+covered by `test_a_todo_is_never_pausable_and_a_scheduled_task_is_never_reopenable`
+and the pre-existing repository invariant test.
+
+### Validation results
+
+| Check | Result |
+|---|---|
+| Focused Todo suites | 57 passed |
+| Capability/audit/setup-order suites | passed (22 + 24 + audit/memory/canonical suites) |
+| Task regression batch | 895 passed |
+| Full suite | 5041 passed, 26 skipped |
+| `py_compile` (all changed Python files) | clean |
+| `git diff --check` | clean |
+| Manual smoke of the full lifecycle (create → list → detail → complete → completed list → reopen → delete, incl. a CAS-stale delete) | executed against the real service/repository in-process; all steps behaved as specified |
+
+### Limitations and honest boundaries
+
+1. **No live Telegram verification** was performed: no Telegram client was
+   driven, no message was sent, no panel was opened in a real chat. The UI is
+   proven by tests over the real handler code path with faked event objects.
+2. **No live Supabase verification** was performed: no SQL was executed against
+   any database. The migration is applied manually by the owner; until then a
+   todo create fails honestly at the old CHECK constraint.
+3. The scheduler never runs a todo (no `next_run_at`, no actions) — verified by
+   test; a todo produces no occurrence, so occurrence history for todos is
+   empty by design.
+4. The AI trigger word (default `Nova`) remains the activation path; Persian
+   support rides the existing trigger/translation conventions plus the
+   resolver's Persian spelling-variant normalization — no new NLP layer.
+
+### Intentionally NOT implemented (Part 2+)
+
+Multi-step tasks (`parent_task_id`, `task_steps`, `task_dependencies`,
+execution plans, action chains, task graphs), question+command mixing,
+multi-turn task completion, the conversational planner, priorities,
+categories, projects, due dates, reminders, recurring todos. No speculative
+abstraction for Part 2 was added; the todo reuses the task row shape directly.
+
+### Git
+
+| Item | Value |
+|---|---|
+| Branch | `main` |
+| Commit | `feat(todo): add basic todo list` — the single commit containing this section (the SHA is in `git log`; a document cannot contain its own commit hash) |
+| Starting HEAD | `ee5967f` |
+| Push | `git push origin main` |
+| Remote verification | `git fetch origin`; local HEAD == `origin/main` after push |
+| Working tree | clean of tracked changes after the commit; the pre-existing untracked nested repo `telegram-self-bot/` untouched and never staged |
+
+---
+
 ## TTS STATUS — FROZEN / DEFERRED
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.

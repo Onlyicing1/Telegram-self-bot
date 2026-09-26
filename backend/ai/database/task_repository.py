@@ -16,7 +16,15 @@ from backend.ai.task_contract import validate_ai_instruction, validate_prepared_
 logger = logging.getLogger(__name__)
 TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
 OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted"})
-SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly", "event"})
+TODO_SCHEDULE_TYPE = "todo"
+SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly", "event", TODO_SCHEDULE_TYPE})
+# The ONE unscheduled task kind: a basic Todo. A todo row has a title, a
+# status (active/completed) and NO schedule, NO action and NO destination —
+# the owner manages it from the Todo panel. It reuses this table, this
+# repository and this version/CAS contract; the only difference is that it
+# carries nothing the scheduler could ever run (``next_run_at`` stays NULL,
+# ``actions`` stays empty), so the due-task and event-task queries can never
+# return it.
 MAX_ACTIONS = 5
 MAX_PAYLOAD_BYTES = 32768
 MAX_METADATA_BYTES = 8192
@@ -34,6 +42,12 @@ DELETION_STALE = "stale"
 # repository performs (``delete_task``), never a lifecycle status write. The
 # status stays in TASK_STATUSES so a pre-existing row that already carries it
 # remains readable, and such a legacy row can only ever be updated to itself.
+# ``completed -> active`` is the REOPEN edge, and it exists for one row kind
+# only: a todo (``schedule_type='todo'``), whose lifecycle is active <->
+# completed and which has no schedule to reschedule. It is deliberately NOT in
+# this table: a completed SCHEDULED task stays terminal (resuming one would
+# have to invent a new execution boundary for it), and that rule is enforced
+# here — see ``_task_status_transition_allowed``.
 _ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired"}, "paused": {"paused", "active"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
 _ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
 
@@ -177,8 +191,21 @@ def _is_local_resource_failure(exc) -> bool:
 def _now(): return datetime.now(timezone.utc)
 def _copy(value): return copy.deepcopy(value)
 def _json_bytes(value): return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
-def _validate_json_payload(value, *, array=False, metadata=False):
-    if array and (not isinstance(value, list) or not 1 <= len(value) <= MAX_ACTIONS): raise ValueError("action payload must contain 1 through 5 actions")
+def is_todo_schedule_type(value) -> bool:
+    """True when a schedule_type names the unscheduled Todo kind."""
+    return str(value or "").strip().casefold() == TODO_SCHEDULE_TYPE
+def _task_status_transition_allowed(task, status) -> bool:
+    """The table above, plus the ONE edge it cannot express: a todo reopens.
+
+    ``completed -> active`` is granted to a ``schedule_type='todo'`` row only.
+    Every other completed task keeps the terminal rule the table states, so a
+    scheduled task can never be silently resumed into the scheduler.
+    """
+    if status in _ALLOWED_TASK_TRANSITIONS[task.status]:
+        return True
+    return task.status == "completed" and status == "active" and is_todo_schedule_type(task.schedule_type)
+def _validate_json_payload(value, *, array=False, metadata=False, allow_empty_array=False):
+    if array and (not isinstance(value, list) or not (0 if allow_empty_array else 1) <= len(value) <= MAX_ACTIONS): raise ValueError(("action payload must contain 0 through 5 actions" if allow_empty_array else "action payload must contain 1 through 5 actions"))
     if metadata and not isinstance(value, dict): raise ValueError("metadata must be an object")
     if _json_bytes(value) > (MAX_METADATA_BYTES if metadata else MAX_PAYLOAD_BYTES): raise ValueError("JSON payload exceeds its bounded size")
 def _validate_task_input(data):
@@ -186,11 +213,18 @@ def _validate_task_input(data):
     if not isinstance(data.get("label"), str) or not data["label"].strip() or len(data["label"]) > 256: raise ValueError("label must be a nonblank bounded string")
     if data.get("status", "active") not in TASK_STATUSES: raise ValueError("invalid task status")
     if data.get("schedule_type") not in SCHEDULE_TYPES: raise ValueError("invalid schedule type")
+    todo = is_todo_schedule_type(data.get("schedule_type"))
+    # A todo has no schedule, so it must never carry a due instant: the
+    # scheduler only ever runs a row whose next_run_at is set, and letting a
+    # todo hold one would make an unscheduled item executable. A scheduled
+    # task keeps its mandatory 1-5 action payload; only a todo may store none
+    # (never a fabricated placeholder action).
+    if todo and data.get("next_run_at") is not None: raise ValueError("a todo has no schedule and therefore no next run")
     if not isinstance(data.get("timezone"), str) or not data["timezone"].strip() or len(data["timezone"]) > 128: raise ValueError("timezone must be a bounded nonblank string")
     if not isinstance(data.get("schedule"), dict): raise ValueError("schedule must be an object")
     if not isinstance(data.get("notification_destination"), dict): raise ValueError("notification destination must be an object")
     if data.get("ai_instruction") is not None: validate_ai_instruction(data["ai_instruction"])
-    _validate_json_payload(data.get("actions"), array=True)
+    _validate_json_payload(data.get("actions"), array=True, allow_empty_array=todo)
     if _json_bytes(data["schedule"]) > 16384 or _json_bytes(data["notification_destination"]) > 4096: raise ValueError("task JSON payload exceeds its bounded size")
 def _validate_occurrence_input(data):
     if not isinstance(data.get("owner_id"), int): raise ValueError("owner_id must be an integer")
@@ -329,7 +363,7 @@ class InMemoryTaskRepository(TaskRepository):
     async def update_task(self, owner_id, task_id, expected_version, updates):
         r=self._tasks.get(task_id)
         if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
-        if updates.get("status") and updates["status"] not in _ALLOWED_TASK_TRANSITIONS[r.status]:raise ValueError("invalid task status transition")
+        if updates.get("status") and not _task_status_transition_allowed(r,updates["status"]):raise ValueError("invalid task status transition")
         merged=r.as_dict();merged.update(updates);merged["owner_id"]=owner_id;_validate_task_input(merged)
         for k in ("label","schedule_type","schedule","timezone","actions","notification_destination","status","next_run_at","ai_instruction"):setattr(r,k,_copy(merged.get(k,getattr(r,k))))
         r.version+=1;r.updated_at=_now()
@@ -339,7 +373,7 @@ class InMemoryTaskRepository(TaskRepository):
     async def transition_task(self, owner_id, task_id, status, expected_version=None):
         r=await self.get_task(owner_id,task_id)
         if not r:return None
-        if status not in TASK_STATUSES or status not in _ALLOWED_TASK_TRANSITIONS[r.status]:raise ValueError("invalid task status transition")
+        if status not in TASK_STATUSES or not _task_status_transition_allowed(r,status):raise ValueError("invalid task status transition")
         return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else r.version,{"status":status})
     async def delete_task(self, owner_id, task_id, expected_version):
         r=self._tasks.get(task_id)
@@ -621,7 +655,7 @@ class SupabaseTaskRepository(TaskRepository):
     async def update_task(self, owner_id, task_id, expected_version, updates):
         current=await self.get_task(owner_id,task_id)
         if current is None or current.version!=expected_version:return None
-        if "status" in updates and updates["status"] not in _ALLOWED_TASK_TRANSITIONS[current.status]:raise ValueError("invalid task status transition")
+        if "status" in updates and not _task_status_transition_allowed(current,updates["status"]):raise ValueError("invalid task status transition")
         merged=current.as_dict();merged.update(updates);merged["owner_id"]=owner_id;_validate_task_input(merged);outgoing={k:_serialize(v) for k,v in updates.items() if k not in {"id","created_at","updated_at","terminal_at","version"}};outgoing["version"]=expected_version+1
         if updates.get("status") in _TERMINAL_TASK_STATUSES and current.terminal_at is None:outgoing["terminal_at"]=_now().isoformat()
         try:
@@ -632,7 +666,7 @@ class SupabaseTaskRepository(TaskRepository):
     async def transition_task(self, owner_id, task_id, status, expected_version=None):
         current=await self.get_task(owner_id,task_id)
         if not current:return None
-        if status not in TASK_STATUSES or status not in _ALLOWED_TASK_TRANSITIONS[current.status]:raise ValueError("invalid task status transition")
+        if status not in TASK_STATUSES or not _task_status_transition_allowed(current,status):raise ValueError("invalid task status transition")
         return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else current.version,{"status":status})
     async def delete_task(self, owner_id, task_id, expected_version):
         """Physically DELETE the owner's task row (never a status write).

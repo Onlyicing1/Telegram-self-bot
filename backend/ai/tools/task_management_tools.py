@@ -40,10 +40,11 @@ class TaskListTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "List the owner's scheduled tasks (id, label, status, version, "
-            "next run). Deleted tasks are excluded. Optionally filter by "
-            "status (active / paused / completed). Use the returned id and "
-            "version for task_transition."
+            "List the owner's tasks — the basic TODOS and the durable "
+            "scheduled tasks together (id, label, status, next run). Deleted "
+            "tasks are excluded. Optionally filter by status "
+            "(active / paused / completed). Use the returned id and version "
+            "for task_transition / todo_edit / task_delete."
         )
 
     @property
@@ -166,7 +167,15 @@ class TaskInspectTool(Tool):
 
 
 class TaskTransitionTool(Tool):
-    """Pause / resume / complete a task (owner-scoped, CAS version check)."""
+    """Pause / resume / complete / reopen a task (owner-scoped, CAS check).
+
+    Reopening (``action="active"`` on a COMPLETED todo) is the Todo
+    lifecycle's other half; the service restricts it to a todo, so a
+    completed scheduled task stays terminal. A todo may also be addressed by
+    a title reference (``query``) instead of id+version: the SAME
+    deterministic resolver the Todo surface uses then decides 0/1/N, and an
+    ambiguous reference is answered with the candidate list — never a guess.
+    """
 
     def __init__(self, context: ToolContext) -> None:
         self._context = context
@@ -188,10 +197,13 @@ class TaskTransitionTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Change a scheduled task's status: pause, resume (set active), "
-            "or complete. Requires the task's CURRENT version (from "
-            "task_list or task_inspect) — a stale version fails and nothing "
-            "changes. Use task_delete to remove a task permanently."
+            "Change a task's status: pause, resume (set active), complete, "
+            "or — for a TODO — reopen a completed todo by setting it active "
+            "again. Requires the task's CURRENT version (from task_list, "
+            "task_inspect or todo_find) — a stale version fails and nothing "
+            "changes. A todo may instead be addressed by a title reference "
+            "(query), which resolves only when exactly one todo matches. Use "
+            "task_delete to remove a task permanently."
         )
 
     @property
@@ -211,6 +223,14 @@ class TaskTransitionTool(Tool):
                 "type": "integer",
                 "minimum": 1,
                 "description": "The task's current version (optimistic concurrency).",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Instead of task_id/expected_version, for a TODO: the "
+                    "owner's own title reference; it resolves only when "
+                    "exactly one todo matches."
+                ),
             },
         }
 
@@ -239,14 +259,28 @@ class TaskTransitionTool(Tool):
         # ``action``. Both names resolve here so one request shape is never
         # silently rejected as "unsupported status" on the fallback path.
         status = str(arguments.get("action") or arguments.get("action_status") or "").strip().lower()
+        resolved_by_title = bool(str(arguments.get("query") or "").strip())
+        if resolved_by_title:
+            # A todo addressed by the owner's own words: the deterministic
+            # resolver (0/1/N) decides which todo, and the version it just
+            # read is the CAS version used below. An ambiguous reference never
+            # reaches a mutation.
+            from backend.ai.tools.todo_tools import resolve_todo_argument
+
+            task, failure = await resolve_todo_argument(
+                context.owner_id, arguments, require_version=False
+            )
+            if failure is not None:
+                return failure
+            task_id, version = int(task.id), int(task.version)
         if task_id is None:
             return ToolResult(success=False, message="A positive task_id is required.")
         if version is None:
             return ToolResult(
                 success=False,
                 message=(
-                    "The task's current version is required (from task_list or "
-                    "task_inspect). Nothing was changed."
+                    "The task's current version is required (from task_list, "
+                    "task_inspect or todo_find). Nothing was changed."
                 ),
             )
         if status not in _TRANSITION_STATUSES:
@@ -259,8 +293,16 @@ class TaskTransitionTool(Tool):
                 ),
             )
 
+        service = None
+        prior_status = ""
         try:
             service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            if status == "active":
+                # Only the active target can be a REOPEN (completed -> active),
+                # so the read that tells the two apart happens here and not on
+                # every transition.
+                prior = await service.repository.get_task(service.owner_id, task_id)
+                prior_status = str(getattr(prior, "status", "") or "")
             task = await service.set_status(task_id, status, expected_version=version)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, message=f"Task transition failed: {exc}")
@@ -289,7 +331,7 @@ class TaskTransitionTool(Tool):
             )
         _STATUS_VERB = {
             "paused": "paused",
-            "active": "resumed",
+            "active": "reopened" if prior_status == "completed" else "resumed",
             "completed": "completed",
         }
         message = (
@@ -346,10 +388,12 @@ class TaskDeleteTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Permanently delete a scheduled task by id. Requires the task's "
-            "CURRENT version (from task_list or task_inspect) — a stale "
-            "version fails and nothing changes. The task is really removed "
-            "and disappears from the task list."
+            "Permanently delete a task by id (a todo too). Requires the "
+            "task's CURRENT version (from task_list, task_inspect or "
+            "todo_find) — a stale version fails and nothing changes. A TODO "
+            "may instead be addressed by a title reference (query), which "
+            "resolves only when exactly one todo matches. The task is really "
+            "removed and disappears from the task list."
         )
 
     @property
@@ -364,6 +408,14 @@ class TaskDeleteTool(Tool):
                 "type": "integer",
                 "minimum": 1,
                 "description": "The task's current version (optimistic concurrency).",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Instead of task_id/expected_version, for a TODO: the "
+                    "owner's own title reference; it resolves only when "
+                    "exactly one todo matches."
+                ),
             },
         }
 
@@ -389,14 +441,27 @@ class TaskDeleteTool(Tool):
 
         task_id = _coerce_positive_int(arguments.get("task_id"))
         version = _coerce_positive_int(arguments.get("expected_version"))
+        if str(arguments.get("query") or "").strip():
+            # A todo addressed by the owner's own words: the deterministic
+            # resolver (0/1/N) decides which todo, and the version it just
+            # read is the CAS version used below. An ambiguous reference never
+            # reaches a deletion.
+            from backend.ai.tools.todo_tools import resolve_todo_argument
+
+            task, failure = await resolve_todo_argument(
+                context.owner_id, arguments, require_version=False
+            )
+            if failure is not None:
+                return failure
+            task_id, version = int(task.id), int(task.version)
         if task_id is None:
             return ToolResult(success=False, message="A positive task_id is required.")
         if version is None:
             return ToolResult(
                 success=False,
                 message=(
-                    "The task's current version is required (from task_list or "
-                    "task_inspect). Nothing was changed."
+                    "The task's current version is required (from task_list, "
+                    "task_inspect or todo_find). Nothing was changed."
                 ),
             )
 
