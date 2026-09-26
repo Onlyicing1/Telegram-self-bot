@@ -25,10 +25,12 @@ from backend.ai.scheduling import (
 )
 from backend.ai.task_candidate import TaskCandidate
 from backend.ai.task_contract import (
+    CONDITION_KEY,
     AIInstruction,
     action_reference_error,
     is_action_reference,
     resolve_action_waits,
+    resolve_conditions,
     validate_ai_instruction,
 )
 from backend.ai.task_trace import bound_text, task_trace
@@ -143,6 +145,12 @@ def _action_eligibility_error(
     """
     if not isinstance(action, dict):
         return "each action must be an object"
+    if CONDITION_KEY in action:
+        # A condition declares no tool call: it has no tool to register, no
+        # approval round-trip and no reply dependency. Its whole contract —
+        # shape, source ownership, branch structure — is proven over the action
+        # list by ``resolve_conditions`` (fail closed), never here.
+        return None
     name = action.get("name")
     if not isinstance(name, str) or not name.strip():
         return "each action requires a tool name"
@@ -395,6 +403,17 @@ class TaskCreationService:
             if reference_error:
                 _creation_trace("action_ineligible", reason=reference_error)
                 raise _invalid(reference_error)
+            # The ONE bounded conditional structure of the chain: at most one
+            # condition, one contiguous run per branch, the true run first, and
+            # a condition that reads a declared chainable field of an EARLIER
+            # action of the same task. An invalid condition is a configuration
+            # failure — never a silently false branch.
+            _, condition_error = resolve_conditions(
+                actions, registry, generation_authorized=generation_authorized
+            )
+            if condition_error:
+                _creation_trace("action_ineligible", reason=condition_error)
+                raise _invalid(condition_error)
             # Per-action wait boundaries are part of the durable definition:
             # each one is resolved against the task's own timezone and stored
             # as an absolute instant, so the persisted chain never depends on

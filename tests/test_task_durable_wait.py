@@ -26,6 +26,7 @@ import pytest
 from backend.ai.database.task_repository import InMemoryTaskRepository
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError
 from backend.ai.task_contract import (
+    CONDITION_KEY,
     MAX_WAIT_AHEAD_SECONDS,
     MAX_WAIT_CHARS,
     WAIT_KEY,
@@ -401,9 +402,13 @@ def test_the_model_candidate_boundary_keeps_one_optional_wait_field():
 
 def test_the_candidate_schema_declares_the_optional_wait_field():
     item_schema = CANDIDATE_SCHEMA["properties"]["actions"]["items"]
-    assert item_schema["required"] == ["name", "arguments"]
     assert WAIT_KEY in item_schema["properties"]
-    assert WAIT_KEY not in item_schema["required"]
+    # Phase 3B added the optional wait boundary and Phase 3C added the condition
+    # action shape — the ONE action entry that declares no tool call — so the
+    # item object no longer requires name + arguments. The exact two shapes are
+    # enforced by the deterministic candidate boundary (never by this schema).
+    assert "required" not in item_schema
+    assert CONDITION_KEY in item_schema["properties"]
 
 
 # ── 6/7/8: execution parks the SAME occurrence at the boundary ─────────────

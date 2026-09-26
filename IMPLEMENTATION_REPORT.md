@@ -1,6 +1,360 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TODO PART 3B — DURABLE ACTION-CHAIN WAITING
+## Latest phase — TODO PART 3C — BOUNDED CONDITIONAL BRANCHING
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain waiting`, Phase 3B).
+Every Phase 3A and Phase 3B contract is reused unchanged: one workflow = one
+`ai_tasks` row, one execution authority (`TaskExecutionCoordinator` →
+`ToolExecutor`), one scheduler (`TaskScheduler`), the bounded per-action run
+record, the skip-on-resume rule, and the durable `not_before` wait.
+
+### Phase objective
+
+“پری این موضوع رو سرچ کن. اگر دانشگاه فردا تعطیل بود، نتیجه رو ذخیره کن و تگ
+تعطیلی بزن. اگر تعطیل نبود، فقط نتیجه رو ذخیره کن.”
+must run SEARCH, then decide ONCE, then run exactly one of two action runs —
+durably, so that a process death at any point after the decision resumes the SAME
+branch, never re-decides, and never starts the other branch.
+
+    SEARCH → CONDITION → (true) SAVE → TAG
+                       → (false) SAVE
+
+This is a bounded decision inside the EXISTING action chain, not a workflow
+engine: no arbitrary expressions (Python/JS/SQL), no model-generated code or
+predicates, no loops, recursion, DAGs, parallel branches, nested workflow graphs,
+no question/answer or conversational continuation, no human approval, no generic
+automation language, no workflow UI/editor, and no new scheduler, executor,
+repository or table. Nothing in this phase changed the execution path
+AI → Dispatcher → ToolRegistry → ToolExecutor → service → Telegram/Supabase.
+
+### The condition representation (exact)
+
+ONE action of the chain may be a condition. It is the ONLY action entry that
+declares no tool call: it carries the reserved key `condition` and nothing else
+(no `name`, no `arguments`, no `not_before`, no `branch`).
+
+```json
+{"condition": {"source": {"action": 1, "field": "is_closed"},
+               "operator": "equals", "value": true}}
+```
+
+Normalized by `backend/ai/task_contract.py::validate_condition` to exactly three
+keys:
+
+* `source` — `{action, field}`: the SAME bounded target shape a Phase 3A result
+  reference uses (one shared validator, `_validated_target`), naming ONE
+  **earlier** action of the SAME task occurrence and ONE field that action's tool
+  DECLARES as chainable (`Tool.consumable_output_fields`, via
+  `declared_consumable_output_fields`).
+* `operator` — `equals` or `not_equals`, nothing else.
+* `value` — a bounded scalar literal (below).
+
+### Supported operators (deliberately tiny)
+
+`CONDITION_OPERATORS = {"equals", "not_equals"}`. Source inspection of the
+current product found no endpoint that needs ordering, substring or
+presence semantics — the decision inputs that exist today are small, exact
+identities/flags (a save code, an outcome label, a boolean report field) — so
+`contains`, `exists`, `greater_than` and `less_than` are **not implemented**. An
+unsupported operator is a contract error at creation AND at the execution
+boundary, never a false branch.
+
+### Condition value types and comparison semantics
+
+`validate_condition_value` accepts exactly: **text** (nonblank, ≤ 128 characters —
+the same bound a recorded output field carries), **boolean**, **finite bounded
+number** (|n| ≤ 10¹⁵), and **null**. Objects, lists, nested values, NaN/∞,
+over-long text and over-range numbers are refused.
+
+Comparison is strict and type-preserving — `_condition_values_match` never
+coerces: a boolean only matches a boolean (Python's `True == 1` shortcut is
+explicitly refused), a number only matches a number, text only matches text
+exactly (`"closed"` ≠ `"CLOSED"`, `"a closed school"` ≠ `"closed"`), and no
+Persian/Arabic digit or case normalization is applied to a machine-recorded
+value. `null` only ever equals `null` — and because `bounded_action_output`
+never records null, a null comparison is DECIDED (unsatisfiable), never silently
+satisfied. A field the source action did not actually produce is NOT a
+comparison result at all: the condition fails closed (see below).
+
+### Condition input — no second data source
+
+A condition can consume only what an EARLIER action of the same occurrence
+already produced *through the ToolExecutor* and that the occurrence recorded in
+its own bounded run record (`bounded_action_output`). It cannot query Supabase,
+Telegram, the filesystem, HTTP or any service: any external fact must first come
+from an existing registered action. This is what keeps branch evaluation inside
+the mandated execution path instead of beside it.
+
+### Reference security (fail closed, never a silent false)
+
+Rejected — at creation AND re-proved at execution — are: a malformed condition
+shape; an unknown/extra key; an unsupported operator; a non-scalar or over-bound
+value; a source action that is the condition itself or a later/unknown position
+(future or out-of-range references); an unregistered source tool; a source field
+that tool does not declare as chainable; a condition combined with
+per-occurrence generated content (`ai_instruction`); a second condition (nesting);
+a branch label without a condition or before it; an unlabelled action after the
+condition; an empty branch; a split branch; a true branch placed after the false
+one; a cross-branch result reference; a reference to the condition itself; and a
+nested `$`-prefixed key inside any argument (the Phase 3A reserved-namespace rule
+is unchanged).
+
+An invalid condition is an **execution/configuration failure**: the occurrence
+fails with a deterministic reason and NEITHER branch runs. It is never
+interpreted as `false`, never guessed, never substituted.
+
+### Branch representation (smallest thing that fits)
+
+The `ai_tasks.actions` array stays what it was — a flat, ordered, 1–5 element
+list — and each branch is just a labelled run inside it. Every action AFTER the
+condition declares the reserved key `branch` (`"true"` or `"false"`); the TRUE
+run comes first and both runs are contiguous:
+
+```json
+[
+  {"name": "web_search", "arguments": {"query": "…"}},
+  {"condition": {"source": {"action": 1, "field": "is_closed"},
+                 "operator": "equals", "value": true}},
+  {"name": "save_by_link", "arguments": {"link": {"$ref": {"action": 1, "field": "top_url"}}},
+   "branch": "true"},
+  {"name": "update_save_tags", "arguments": {"save_code": {"$ref": {"action": 3, "field": "save_code"}},
+                           "tags": ["تعطیلی"], "mode": "add"}, "branch": "true"},
+  {"name": "save_by_link", "arguments": {"link": {"$ref": {"action": 1, "field": "top_url"}}},
+   "branch": "false"}
+]
+```
+
+No graph, no second list, no nested action arrays, no next-action index: the
+positions of the flat list ARE the branch membership, so the Phase 3A/3B
+machinery (per-position run records, positional references, `not_before` waits)
+keeps working verbatim.
+
+### Branch limits (explicit)
+
+* **One** condition per chain. A second condition is refused (`only one condition
+  per chain is supported; nested conditions are not implemented`).
+* Nesting depth is therefore **1** — a condition cannot live inside a branch, and
+a branch cannot contain a condition.
+* Total actions stay bounded by the existing `MAX_ACTIONS = 5` (the condition
+  consumes one slot, and the DB constraint
+  `ai_task_occurrences_action_count BETWEEN 1 AND 5` is untouched).
+* Both branches must contain at least one action; each branch is ONE contiguous
+run; the true run precedes the false run.
+* No parallelism (the two branches never run concurrently — exactly one is
+  selected), no loops, no action returning to a previous position, and no
+  repeated evaluation of a condition (except under the existing retry contract
+  for a condition that FAILED, which is deterministic and therefore never
+  retried in practice).
+
+### The condition result and the selected branch are DURABLE
+
+Both live in the mechanism that already exists — the occurrence's bounded
+per-action run record — so there is **no second result type**:
+
+```json
+{"position": 2, "tool": "condition", "status": "succeeded",
+ "output": {"matched": true, "selected_branch": "true"}}
+```
+
+* The condition is evaluated by `evaluate_condition(condition, runs)` from the
+  occurrence's own recorded runs, and the coordinator persists the record with
+  `_persist_runs` **BEFORE the first branch action executes** — the single
+  durability point the restart contract needs.
+* The unselected branch's actions are recorded with the new run status
+  **`skipped`** (`BRANCH_SKIPPED_STATUS`, added to the existing
+  `ACTION_RUN_STATUSES` vocabulary; it carries no output and no error). They are
+  marked `skipped` at every durable write — including the wait-park record and
+  the failure record — so a non-selected action never reads as “still to run”.
+* `result_metadata` (or `error_metadata` for a failure) therefore always carries
+  the complete per-position state: succeeded / skipped / failed / pending.
+
+### Restart and resume behavior
+
+* The selection is read back with `selected_branch_from_runs` from the recorded
+  condition run — it is never re-derived by evaluating the condition again.
+  A restart after the decision resumes the SAME branch.
+* A restart DURING the selected branch (the failing `tag` action in the tests)
+  resumes at the first non-succeeded action of that same branch: succeeded
+actions are skipped (Phase 3A rule), their recorded outputs stay available to
+references, and the condition's recorded `matched`/`selected_branch` are
+unchanged.
+* `skipped` entries are durable: a resumed attempt counts them out without
+  touching them, and they can never execute — not even if the selected branch
+  fails and the occurrence is retried to exhaustion.
+* The condition is evaluated exactly once per occurrence: an instrumented test
+  patches `evaluate_condition` and proves ONE call across two attempts.
+
+### Failure behavior (no branch switching, ever)
+
+* **Condition cannot be decided** (field never produced, source action not
+  succeeded, malformed stored condition, selection not recorded): the condition's
+  run is recorded `failed` with the deterministic reason, the occurrence fails
+  (the existing failure contract: a deterministic reason is not retryable), and
+  NEITHER branch runs. Later positions stay `pending` — no branch was chosen.
+* **Condition invalid as a configuration** (malformed shape, unsupported
+  operator, bad branch structure, generation conflict): the occurrence fails
+  before ANY action runs (`invalid_condition: …` / `invalid_action_reference: …`),
+  which is the same fail-closed behavior a Phase 3A reference produces.
+* **Selected-branch action fails**: the ordinary Phase 3A path (retry with
+  backoff while attempts remain, otherwise deterministic failure). The condition
+  is NOT re-evaluated and the other branch is NEVER selected as a fallback — a
+  failure is not a reason to switch branches. The unselected branch stays
+  durably `skipped`.
+
+### Phase 3A compatibility
+
+Result references are unchanged, and are now branch-scoped: a branch action may
+consume a declared field of an action executed BEFORE the branch (e.g. SEARCH's
+`top_url` in both branches) and of an EARLIER action of its OWN branch (e.g. the
+true branch's `save_code` feeding its tag), while a cross-branch reference is
+refused at creation and re-refused at the execution boundary. Per-action state,
+skip-on-resume and the bounded output contract are the Phase 3A ones, untouched.
+
+### Phase 3B compatibility
+
+A wait (`not_before`) inside the SELECTED branch parks the occurrence on the
+existing `retry_pending` + `retry_at` eligibility pair exactly as before, and the
+wake loop resumes the selected branch; previous successes are not replayed.
+Crucially, **branch gating happens BEFORE the wait check**: an unselected action's
+future boundary can never park the chain (tested), and the non-selected branch is
+recorded `skipped` in the park record itself. The scheduler was not modified; it
+still only sees “not eligible until `retry_at`”.
+
+### Creation / model boundary (no new prompt architecture)
+
+* `TaskCandidate.from_untrusted` keeps the bounded condition and the branch
+  labels and still drops every stray key; a condition dressed as a tool call, a
+  stray key beside it, an unknown operator, a non-scalar value or a fabricated
+  label fails there.
+* `TaskCreationService.create` proves the whole conditional structure with
+  `resolve_conditions` over the real registry (fail closed), and its per-action
+  eligibility check skips the condition entry (it has no tool, no approval and no
+  reply dependency to check).
+* `CANDIDATE_SCHEMA` advertises the bounded `condition` object and the `branch`
+  enum, and no longer requires `name` + `arguments` on the item (a condition
+  entry has neither) — the deterministic boundary, not the schema, enforces the
+  two shapes. One compact CONDITIONAL BRANCHES paragraph was added to the
+  interpreter instructions; the model still never writes code, an expression or
+  a predicate.
+
+### Security and ownership
+
+Every requirement of Phase 3A/3B holds unchanged: owner-gated execution
+(`owner_mismatch` refused), occurrence-scoped records (a condition can only read
+ITS occurrence's runs — proven by two occurrences of one task deciding
+differently), no invocation of a tool by the condition, `ToolRegistry` still the
+capability allowlist, `ToolExecutor` still the sole caller of `tool.execute()`,
+`TaskExecutionCoordinator` still the single occurrence authority, `TaskScheduler`
+still the only scheduler, and `RuntimeSupervisor` untouched.
+
+### Database
+
+**No migration, no schema change, no SQL executed.** Conditions and selections
+live inside the existing `ai_tasks.actions` JSONB array and the existing bounded
+occurrence metadata channels (`supabase/canonical_bootstrap.sql` and
+`DATABASE_ARCHITECTURE.md` are unchanged and remain accurate).
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/ai/task_contract.py` | the conditional contract: `CONDITION_KEY`/`BRANCH_KEY`/`BRANCH_SKIPPED_STATUS`, `validate_condition`, `validate_condition_value`, `_branch_structure`, `BranchLayout`, `resolve_conditions`, `evaluate_condition`, `condition_run_output`, `selected_branch_from_runs`, the shared `_validated_target`, and the branch-scoped rule inside `action_reference_error` |
+| `backend/ai/task_execution.py` | the condition entry in the calls snapshot, the execution-time `resolve_conditions` re-proof, and the walk's gating + condition evaluation + durable selection + `skipped` bookkeeping (`_ChainOutcome.not_selected`) |
+| `backend/ai/task_creation.py` | `resolve_conditions` proof at the creation boundary; the condition entry bypasses the tool-eligibility check (it declares no tool) |
+| `backend/ai/task_candidate.py` | `_reserved_contract_fields` (wait + branch), `_canonicalize_condition`, and the condition entry in the untrusted-action loop |
+| `backend/ai/task_interpreter.py` | `CANDIDATE_SCHEMA` advertises `condition`/`branch`; one bounded CONDITIONAL BRANCHES sentence block |
+| `tests/test_task_conditional_branches.py` | **new** — the Phase 3C suite (96 tests) |
+| `tests/test_task_durable_wait.py`, `tests/test_task_candidate_contract.py` | the two pinned action-schema assertions updated for the second (condition) action shape |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Tests added and exact results
+
+`tests/test_task_conditional_branches.py` (96 tests, all passing) covers: the
+accepted condition shape and every malformed variant; the operator set and the
+refusal of `contains`/`exists`/`greater_than`/`less_than`; bounded value types;
+strict, never-coerced comparison (incl. `True` vs `1`, digit/case/substring
+non-matching, null semantics); the whole branch-structure contract (two
+conditions, label before the condition, unlabelled action, unknown label,
+extra condition keys, a wait on the condition, an empty true branch, an empty
+false branch, a split true run, true-after-false); the condition source rules
+(future/self/unknown position, unregistered tool, undeclared field, generation
+conflict); cross-branch and condition-position references (validation AND the
+execution re-proof); TRUE and FALSE execution with the non-selected branch never
+executing; the condition never reaching the ToolExecutor; the persisted
+`{matched, selected_branch}` result and the `skipped` records; fail-closed
+condition failures (unavailable field, failed source, malformed stored operator,
+nested predicate) with NEITHER branch running; restart after the decision and
+restart inside the selected branch (same branch, no re-evaluation, no replay);
+the evaluated-exactly-once proof; a failed selected action never switching
+branches; per-occurrence/ownership scoping; Phase 3A references still resolving
+inside a branch; a Phase 3B wait inside the selected branch parking and resuming,
+plus an unselected action's boundary never parking the chain; the scheduler as
+the only server of branch occurrences; the creation and candidate boundaries;
+the advertised schema; and both end-to-end cases (TRUE: SEARCH → CONDITION →
+SAVE → TAG; FALSE: SEARCH → CONDITION → SAVE) through creation + scheduler +
+coordinator + real registry/executor, with `web_search`/`save_by_link`/
+`update_save_tags` doubles standing in only for the services they wrap.
+
+### Verification performed (automated only)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_conditional_branches.py -q` | **96 passed** |
+| Phase 3A + 3B + task/scheduler regressions (`test_task_action_chains`, `test_task_durable_wait`, `test_task_candidate_contract`, `test_task_scheduler`, `test_task_restart_recovery`, `test_task_reliability_repair`, `test_task_conditional_branches`) | **317 passed** |
+| `.venv/bin/python -m pytest tests/ -q --ignore=tests/test_live_supabase.py` (full suite) | **5271 passed, 26 skipped** |
+| `.venv/bin/python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+**Live Telegram verification was NOT performed. Live Supabase verification was
+NOT performed** — no Telegram session, no SQL, and no database contact of any
+kind happened in this phase, and the repo needs no migration (zero schema
+change).
+
+### Known limitations (honest)
+
+1. **The decision input must be DECLARED by a real tool.** A condition can only
+compare a field a registered tool declares as chainable. Today only `save_code`
+is declared (`save`/`save_by_link`/the retrieve tools), so a production chain can
+decide on a save code; a decision like the “university closed” example needs a
+boolean/report field declared on the searching tool — the mechanism is real and
+fully tested, the extra tool declaration is deliberately NOT added in this phase.
+2. Comparison is exact equality only (see the operator section); no ordering,
+substring, case-folding or numeric coercion.
+3. One condition per chain, both branches non-empty and contiguous, TRUE first;
+a one-sided “only if” workflow is not expressible yet.
+4. Conditions and per-occurrence generated content (`ai_instruction`) are
+mutually exclusive, exactly like Phase 3A result references.
+5. The condition consumes one of the five action slots, so the two branches share
+the remaining budget.
+6. A wait boundary is still a single monotone chain rule: a FALSE-branch action's
+`not_before` must not precede a TRUE-branch action's boundary even though only one
+of them can ever run (the existing Phase 3B ordering rule was deliberately not
+weakened).
+7. Natural-language quality for the Persian conditional request is not tuned
+here; only the bounded representation, its validation and the prompt sentence
+were added.
+
+### Still deferred (Phase 3D+)
+
+Nested/multi-level branching, one-sided conditions, additional operators
+(`contains`/`exists`/ordering), loops and any repeated/returning edge, DAGs or
+parallel branches, autonomous replanning, question + answer continuation,
+multi-turn conversational continuation of a pending workflow, human approval
+steps, a generic workflow/automation language, workflow UI or editor, and every
+premium task-manager feature. The manual Supabase setup script remains
+owner-applied and untouched by this phase.
+
+### Delivery
+
+Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain
+waiting`). One commit on top of it — no rebase, no force-push, no new branch, no
+unrelated file touched. Local `HEAD` and `origin/main` are re-verified equal after
+the push (`git fetch origin`, `git rev-parse HEAD`, `git rev-parse origin/main`).
+
+---
+
+## Previous phase — TODO PART 3B — DURABLE ACTION-CHAIN WAITING
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `83c5abd` = `origin/main` (`feat(todo): add durable action chains`, Phase 3A).
@@ -210,13 +564,15 @@ task's later occurrences compare against that same instant, so “every day at
 5. Natural-language quality for “ساعت ۶ بده” (deriving the split) is not tuned
 here; only the bounded representation and its validation were added.
 
-### Still deferred (Phase 3C+)
+### Still deferred after this phase
 
-Branching/conditions on a previous action's result, question + answer
-continuation, multi-turn conversational continuation of a pending workflow,
-autonomous replanning, DAGs/general workflow scheduling, a dedicated wait state,
-and every premium task-manager feature. The manual Supabase setup script remains
-owner-applied and unchanged by this phase.
+Branching/conditions on a previous action's result were delivered by the phase
+above (TODO Part 3C) using the very home this section predicted — a bounded
+condition over a DECLARED output field of a previous action. Still deferred:
+question + answer continuation, multi-turn conversational continuation of a
+pending workflow, autonomous replanning, DAGs/general workflow scheduling, a
+dedicated wait state, and every premium task-manager feature. The manual Supabase
+setup script remains owner-applied and unchanged by this phase.
 
 ---
 

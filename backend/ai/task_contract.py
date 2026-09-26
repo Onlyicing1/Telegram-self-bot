@@ -288,7 +288,13 @@ class AIInstruction:
 REFERENCE_KEY = "$ref"
 #: Occurrence-metadata key holding the bounded per-action run records.
 ACTION_RUNS_KEY = "actions"
-ACTION_RUN_STATUSES = frozenset({"pending", "running", "succeeded", "failed"})
+#: ``skipped`` is the ONE non-execution status the conditional-branch contract
+#: produces: the action belongs to the branch the chain's condition did NOT
+#: select, so it never ran and never will in this occurrence.
+BRANCH_SKIPPED_STATUS = "skipped"
+ACTION_RUN_STATUSES = frozenset(
+    {"pending", "running", "succeeded", "failed", BRANCH_SKIPPED_STATUS}
+)
 MAX_REFERENCE_FIELD_CHARS = 64
 MAX_ACTION_OUTPUT_FIELDS = 3
 MAX_ACTION_OUTPUT_TEXT_CHARS = 128
@@ -303,20 +309,27 @@ def is_action_reference(value: Any) -> bool:
     return isinstance(value, dict) and REFERENCE_KEY in value
 
 
+def _validated_target(target: Any, *, what: str) -> dict[str, Any]:
+    """The ONE accepted ``{action, field}`` shape, shared by result references
+    and condition sources; every deviation fails closed."""
+    if not isinstance(target, dict) or set(target) != {"action", "field"}:
+        raise TaskContractError(f"{what} must name exactly an action and a field")
+    position = target["action"]
+    if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+        raise TaskContractError(f"{what} action must be a positive action number")
+    field = target["field"]
+    if not isinstance(field, str) or not field.strip() or len(field) > MAX_REFERENCE_FIELD_CHARS:
+        raise TaskContractError(f"{what} field must be a bounded nonblank name")
+    return {"action": position, "field": field.strip()}
+
+
 def validate_action_reference(value: Any) -> dict[str, Any]:
     """The ONE accepted reference shape, normalized. Fails closed."""
     if not isinstance(value, dict) or set(value) != {REFERENCE_KEY}:
         raise TaskContractError("a reference must contain only '$ref'")
-    target = value[REFERENCE_KEY]
-    if not isinstance(target, dict) or set(target) != {"action", "field"}:
-        raise TaskContractError("a reference must name exactly an action and a field")
-    position = target["action"]
-    if isinstance(position, bool) or not isinstance(position, int) or position < 1:
-        raise TaskContractError("a reference action must be a positive action number")
-    field = target["field"]
-    if not isinstance(field, str) or not field.strip() or len(field) > MAX_REFERENCE_FIELD_CHARS:
-        raise TaskContractError("a reference field must be a bounded nonblank name")
-    return {REFERENCE_KEY: {"action": position, "field": field.strip()}}
+    return {
+        REFERENCE_KEY: _validated_target(value[REFERENCE_KEY], what="a reference")
+    }
 
 
 def _reserved_key_error(value: Any, argument: str) -> str | None:
@@ -388,6 +401,10 @@ def action_reference_error(
     if not isinstance(actions, list) or not actions:
         return None
     has_registry = registry is not None and hasattr(registry, "get")
+    # The branch structure (if any) decides which results an action may EVER
+    # consume: the two branches are mutually exclusive at execution, so a
+    # cross-branch reference could never resolve in a selected occurrence.
+    condition_position, branch_of, _structure_error = _branch_structure(actions)
     for position, action in enumerate(actions, start=1):
         references, error = _action_references(action)
         if error:
@@ -407,6 +424,20 @@ def action_reference_error(
                     f"action {position} argument '{argument}' references action "
                     f"{target_position}, which is not an earlier action of the same task"
                 )
+            if condition_position is not None:
+                if target_position == condition_position:
+                    return (
+                        f"action {position} argument '{argument}' references the "
+                        "condition action, which declares no output"
+                    )
+                source_branch = branch_of.get(position)
+                target_branch = branch_of.get(target_position)
+                if source_branch and target_branch and source_branch != target_branch:
+                    return (
+                        f"action {position} argument '{argument}' references action "
+                        f"{target_position} of the '{target_branch}' branch, whose "
+                        "result the selected occurrence never produces"
+                    )
             if not has_registry:
                 continue
             target_action = actions[target_position - 1]
@@ -595,6 +626,337 @@ def resolve_action_arguments(
             )
         resolved[argument] = output[target["field"]]
     return resolved, ""
+
+
+# ── Bounded conditional branches ────────────────────────────────────────────
+# ONE action of a chain may be a CONDITION. It declares no tool call: it
+# compares ONE declared, bounded output field of an EARLIER action of the SAME
+# occurrence against a bounded literal, and exactly ONE of two labelled runs of
+# actions executes —
+#
+#     [search, {"condition": {…}}, save(branch true), tag(branch true), save(branch false)]
+#
+# The condition is DATA in the task definition, never model-resolved: it is
+# validated at creation against the referenced tool's declared consumable
+# output fields, re-proved verbatim before any execution, and evaluated
+# deterministically by the TaskExecutionCoordinator from the bounded per-action
+# runs the occurrence already recorded. Its RESULT is the condition's own run
+# record (``{"matched": …, "selected_branch": "true"|"false"}``) — the same
+# structured result a tool action uses, so there is no second result type — and
+# that record is persisted BEFORE either branch runs, so a restart resumes the
+# SAME branch: the condition is never re-evaluated and the other branch never
+# starts. The language stays deliberately tiny: one comparison, two operators,
+# bounded scalar values, at most ONE condition per chain (no nesting), no loops,
+# no expressions, no traversal, no graph.
+CONDITION_KEY = "condition"
+BRANCH_KEY = "branch"
+BRANCH_TRUE = "true"
+BRANCH_FALSE = "false"
+BRANCH_VALUES = (BRANCH_TRUE, BRANCH_FALSE)
+#: The pseudo tool name a condition's run record carries. It is never a
+#: registered tool and is never handed to the ToolExecutor.
+CONDITION_TOOL = "condition"
+#: The two bounded fields of a condition's durable result.
+MATCHED_KEY = "matched"
+BRANCH_SELECTION_KEY = "selected_branch"
+#: Equality is what the current product needs (a flag, a report, or a query
+#: outcome); nothing in the codebase requires ordering, substring or presence
+#: operators today, so they are deliberately NOT implemented.
+CONDITION_OPERATORS = frozenset({"equals", "not_equals"})
+#: A condition value is a bounded scalar: text within the SAME bound a recorded
+#: output field carries, a boolean, null, or a finite number within this
+#: magnitude. No objects, no lists, no nesting, no expressions.
+MAX_CONDITION_NUMBER = 10**15
+_CONDITION_KEYS = frozenset({"source", "operator", "value"})
+
+
+def branch_name(matched: bool) -> str:
+    """The branch label a boolean condition outcome selects."""
+    return BRANCH_TRUE if matched else BRANCH_FALSE
+
+
+def validate_condition_value(value: Any) -> Any:
+    """The ONE accepted condition value: a bounded scalar. Fails closed."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > MAX_CONDITION_NUMBER:
+            raise TaskContractError("a condition value number is out of range")
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")) or abs(value) > MAX_CONDITION_NUMBER:
+            raise TaskContractError("a condition value must be a finite bounded number")
+        return value
+    if isinstance(value, str):
+        if not value.strip() or len(value) > MAX_ACTION_OUTPUT_TEXT_CHARS:
+            raise TaskContractError(
+                "a condition value text must be nonblank and within "
+                f"{MAX_ACTION_OUTPUT_TEXT_CHARS} characters"
+            )
+        return value
+    raise TaskContractError(
+        "a condition value must be a bounded scalar: text, a boolean, a finite "
+        "number, or null"
+    )
+
+
+def validate_condition(value: Any) -> dict[str, Any]:
+    """The ONE accepted condition shape, normalized. Fails closed."""
+    if not isinstance(value, dict) or set(value) != _CONDITION_KEYS:
+        raise TaskContractError(
+            "a condition must contain exactly a source, an operator and a value"
+        )
+    operator = value["operator"]
+    if operator not in CONDITION_OPERATORS:
+        raise TaskContractError(
+            "a condition operator must be one of: "
+            + ", ".join(sorted(CONDITION_OPERATORS))
+        )
+    return {
+        "source": _validated_target(value["source"], what="a condition source"),
+        "operator": operator,
+        "value": validate_condition_value(value["value"]),
+    }
+
+
+def _branch_structure(actions: Any) -> tuple[int | None, dict[int, str], str]:
+    """``(condition position, branch by position, error)`` — structure only.
+
+    A chain is either conditional or not, never something in between: at most
+    ONE action may be a condition, every action AFTER it must declare exactly one
+    branch, no action before it may declare one, each branch must be ONE
+    contiguous run, and the true run must come first. Anything else is refused
+    here (fail closed) instead of being interpreted.
+    """
+    if not isinstance(actions, list) or not actions:
+        return None, {}, ""
+    positions = [
+        position
+        for position, action in enumerate(actions, start=1)
+        if isinstance(action, dict) and CONDITION_KEY in action
+    ]
+    if not positions:
+        for position, action in enumerate(actions, start=1):
+            if isinstance(action, dict) and BRANCH_KEY in action:
+                return None, {}, (
+                    f"action {position} declares a branch, but the chain has no condition"
+                )
+        return None, {}, ""
+    if len(positions) > 1:
+        return None, {}, (
+            "only one condition per chain is supported; nested conditions are "
+            "not implemented"
+        )
+    condition_position = positions[0]
+    branches: dict[int, str] = {}
+    for position, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            return None, {}, "each action must be an object"
+        if position == condition_position:
+            if set(action) != {CONDITION_KEY}:
+                return None, {}, (
+                    f"action {position}: a condition action must contain only "
+                    f"'{CONDITION_KEY}'"
+                )
+            continue
+        label = action.get(BRANCH_KEY)
+        if position < condition_position:
+            if label is not None:
+                return None, {}, (
+                    f"action {position}: only actions after the condition may "
+                    "declare a branch"
+                )
+            continue
+        if label not in BRANCH_VALUES:
+            return None, {}, (
+                f"action {position}: every action after the condition must declare "
+                f"'{BRANCH_KEY}' as '{BRANCH_TRUE}' or '{BRANCH_FALSE}'"
+            )
+        branches[position] = label
+    trues = tuple(sorted(p for p, b in branches.items() if b == BRANCH_TRUE))
+    falses = tuple(sorted(p for p, b in branches.items() if b == BRANCH_FALSE))
+    if not trues or not falses:
+        return None, {}, "a condition needs at least one action in each branch"
+    if trues != tuple(range(trues[0], trues[-1] + 1)):
+        return None, {}, "the true branch must be one contiguous run of actions"
+    if falses != tuple(range(falses[0], falses[-1] + 1)):
+        return None, {}, "the false branch must be one contiguous run of actions"
+    if trues[-1] >= falses[0]:
+        return None, {}, "the true branch must come before the false branch"
+    return condition_position, branches, ""
+
+
+@dataclass(frozen=True)
+class BranchLayout:
+    """The bounded conditional structure of ONE action list.
+
+    ``branches`` maps every position AFTER the condition to the branch it
+    belongs to, and ``condition`` is the normalized condition payload. The whole
+    structure is proven over the list before anything runs, so no later stage
+    ever has to interpret a partial or ambiguous chain.
+    """
+    condition_position: int
+    condition: dict[str, Any]
+    branches: dict[int, str]
+
+    @property
+    def true_positions(self) -> tuple[int, ...]:
+        return tuple(sorted(p for p, b in self.branches.items() if b == BRANCH_TRUE))
+
+    @property
+    def false_positions(self) -> tuple[int, ...]:
+        return tuple(sorted(p for p, b in self.branches.items() if b == BRANCH_FALSE))
+
+
+def resolve_conditions(
+    actions: Any, registry: Any | None = None, *, generation_authorized: bool = False
+) -> tuple[BranchLayout | None, str]:
+    """``(layout, error)`` — the ONE conditional contract of an action list.
+
+    Enforced at task creation AND re-proved verbatim before any execution. A
+    condition may only read an EARLIER action of the same occurrence — which, by
+    construction, precedes both branches — and only a field that action's tool
+    DECLARES as chainable; a missing registry skips only those tool/field checks
+    (the execution boundary still fails the occurrence closed). A condition is
+    also refused together with per-occurrence generated arguments, exactly like a
+    result reference: the model would be free to reshape the chain around it.
+    """
+    condition_position, branches, error = _branch_structure(actions)
+    if error:
+        return None, error
+    if condition_position is None:
+        return None, ""
+    if generation_authorized:
+        return None, (
+            "the chain carries a condition, which cannot be combined with "
+            "per-occurrence generated arguments"
+        )
+    action = actions[condition_position - 1]
+    try:
+        condition = validate_condition(action.get(CONDITION_KEY))
+    except TaskContractError as exc:
+        return None, f"action {condition_position}: {exc}"
+    target = condition["source"]
+    if target["action"] >= condition_position:
+        return None, (
+            f"action {condition_position}: the condition reads action "
+            f"{target['action']}, which is not an earlier action of the same task"
+        )
+    if registry is not None and hasattr(registry, "get"):
+        source_action = actions[target["action"] - 1]
+        source_name = source_action.get("name") if isinstance(source_action, dict) else None
+        tool = registry.get(source_name) if isinstance(source_name, str) else None
+        if tool is None:
+            return None, (
+                f"action {condition_position}: the condition reads an action whose "
+                "tool is not registered"
+            )
+        if target["field"] not in _declared_fields(tool):
+            return None, (
+                f"action {condition_position}: the condition reads field "
+                f"'{target['field']}', which action {target['action']}'s tool does "
+                "not declare as chainable"
+            )
+    return (
+        BranchLayout(
+            condition_position=condition_position,
+            condition=condition,
+            branches=dict(branches),
+        ),
+        "",
+    )
+
+
+def _condition_values_match(recorded: Any, expected: Any) -> bool:
+    """Strict, type-preserving comparison — never a coercion.
+
+    Python's ``True == 1`` shortcut is exactly the guessing this contract
+    refuses: a boolean only ever matches a boolean, a number only ever a number,
+    and text only ever text. No digit normalization, no case folding, no
+    substring matching, no traversal. A ``null`` value only ever matches a
+    recorded ``null`` (and a recorded output never carries one — see
+    ``bounded_action_output``), so a null comparison is decided, never guessed.
+    """
+    if isinstance(expected, bool) or expected is None:
+        return recorded is expected
+    if isinstance(expected, str):
+        return isinstance(recorded, str) and recorded == expected
+    if isinstance(expected, (int, float)):
+        return (
+            not isinstance(recorded, bool)
+            and isinstance(recorded, (int, float))
+            and recorded == expected
+        )
+    return False
+
+
+def evaluate_condition(condition: Any, runs: Any) -> tuple[bool | None, str]:
+    """``(matched, reason)`` for ONE condition over THIS occurrence's runs.
+
+    Resolution mirrors result references exactly: only a run of the same
+    occurrence that is recorded ``succeeded`` and whose bounded output carries
+    the named field resolves. Everything else — a malformed condition, an
+    unrecorded source action, a source that did not succeed, a field the source
+    never produced — fails closed with a deterministic reason, never a guess and
+    never a silent ``false``: an invalid condition is an execution failure and
+    neither branch may run.
+    """
+    try:
+        normalized = validate_condition(condition)
+    except (TaskContractError, TypeError, ValueError):
+        return None, "invalid_condition"
+    try:
+        recorded = validate_action_runs(runs)
+    except (TaskContractError, TypeError, ValueError):
+        return None, "action_record_invalid"
+    by_position = {run["position"]: run for run in recorded}
+    target = normalized["source"]
+    run = by_position.get(target["action"])
+    if run is None or run["status"] != "succeeded":
+        return None, f"condition_source_not_succeeded (action {target['action']})"
+    output = run.get("output")
+    if not isinstance(output, dict) or target["field"] not in output:
+        return None, (
+            "condition_field_unavailable (action "
+            f"{target['action']}, field '{target['field']}')"
+        )
+    matched = _condition_values_match(output[target["field"]], normalized["value"])
+    return (matched if normalized["operator"] == "equals" else not matched), ""
+
+
+def condition_run_output(matched: bool) -> dict[str, Any]:
+    """The bounded durable result of ONE condition evaluation.
+
+    Exactly the structured shape a chain action's result uses — the occurrence's
+    existing per-action record — so no second result type exists: ``matched``
+    plus the ``selected_branch`` it selects.
+    """
+    selected = bool(matched)
+    return {MATCHED_KEY: selected, BRANCH_SELECTION_KEY: branch_name(selected)}
+
+
+def selected_branch_from_runs(runs: Any, position: int) -> tuple[str | None, str]:
+    """``(branch, reason)`` — the branch the occurrence's condition SELECTED.
+
+    Read back from the occurrence's own bounded runs, never re-derived by
+    evaluating the condition again: the recorded selection is durable state, so
+    a restart during either branch resumes the same one and can never switch.
+    """
+    try:
+        recorded = validate_action_runs(runs)
+    except (TaskContractError, TypeError, ValueError):
+        return None, "action_record_invalid"
+    run = {item["position"]: item for item in recorded}.get(position)
+    if run is None or run["status"] != "succeeded":
+        return None, "branch_selection_unavailable (the condition was not evaluated)"
+    output = run.get("output")
+    branch = output.get(BRANCH_SELECTION_KEY) if isinstance(output, dict) else None
+    if branch not in BRANCH_VALUES:
+        return None, (
+            "branch_selection_unavailable (the recorded condition result carries "
+            "no selected branch)"
+        )
+    return branch, ""
 
 
 # ── Durable wait boundaries ─────────────────────────────────────────────────

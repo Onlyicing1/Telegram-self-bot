@@ -8,7 +8,15 @@ from typing import Any
 
 from backend.ai.database.task_repository import MAX_ACTIONS, MAX_PAYLOAD_BYTES
 from backend.ai.scheduling import ScheduleError, parse_schedule
-from backend.ai.task_contract import WAIT_KEY, validate_ai_instruction
+from backend.ai.task_contract import (
+    BRANCH_KEY,
+    BRANCH_VALUES,
+    CONDITION_KEY,
+    WAIT_KEY,
+    TaskContractError,
+    validate_ai_instruction,
+    validate_condition,
+)
 
 MAX_LABEL_CHARS = 256
 MAX_TIMEZONE_CHARS = 128
@@ -216,23 +224,56 @@ _SEND_ACTION_ALIASES = frozenset({"send", "send_message", "write_message", "send
 _SEND_TEXT_ALIASES = frozenset({"text", "content", "message", "body"})
 
 
-def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
-    """Normalize one untrusted action to the registered execution contract."""
-    name = action["name"].strip()
-    args = dict(action.get("arguments") or {})
-    # The ONE optional field an action may carry besides its tool call: the
-    # earliest instant at which THAT action may run. Only its SHAPE is checked
-    # here (the creation boundary resolves and bounds the instant against the
-    # task's timezone); dropping it silently would turn a requested wait into
-    # an immediate execution, so it is preserved verbatim.
-    wait: dict[str, Any] = {}
+def _reserved_contract_fields(action: dict[str, Any]) -> dict[str, Any]:
+    """The bounded reserved fields an action may carry besides its tool call.
+
+    Two, and only two: the optional wait boundary of that action and the
+    optional branch label that ties it to the chain's ONE condition. Only their
+    SHAPES are checked here — the creation boundary resolves and bounds the
+    instant against the task's timezone and proves the branch structure over the
+    whole action list. Dropping either silently would turn a requested wait into
+    an immediate execution, or a branch action into an unconditional one, so
+    both are preserved verbatim.
+    """
+    reserved: dict[str, Any] = {}
     if WAIT_KEY in action:
         boundary = action[WAIT_KEY]
         if not isinstance(boundary, str) or not boundary.strip():
             raise TaskCandidateError("an action wait boundary must be a nonblank timestamp string")
-        wait = {WAIT_KEY: boundary}
+        reserved[WAIT_KEY] = boundary
+    if BRANCH_KEY in action:
+        branch = action[BRANCH_KEY]
+        if not isinstance(branch, str) or branch.strip() not in BRANCH_VALUES:
+            raise TaskCandidateError("an action branch must be 'true' or 'false'")
+        reserved[BRANCH_KEY] = branch.strip()
+    return reserved
+
+
+def _canonicalize_condition(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one untrusted CONDITION action to the bounded contract.
+
+    A condition is the ONE action that declares no tool call, so it carries the
+    reserved condition key and nothing else: it has no arguments a model could
+    prepare and no wait of its own, and its value is a bounded literal — never
+    code, an expression, or a nested object.
+    """
+    if set(action) != {CONDITION_KEY}:
+        raise TaskCandidateError(
+            f"a condition action must contain only '{CONDITION_KEY}'"
+        )
+    try:
+        return {CONDITION_KEY: validate_condition(action[CONDITION_KEY])}
+    except TaskContractError as exc:
+        raise TaskCandidateError(f"invalid condition: {exc}") from exc
+
+
+def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one untrusted action to the registered execution contract."""
+    name = action["name"].strip()
+    args = dict(action.get("arguments") or {})
+    reserved = _reserved_contract_fields(action)
     if name not in _SEND_ACTION_ALIASES:
-        return {"name": name, "arguments": args, **wait}
+        return {"name": name, "arguments": args, **reserved}
     text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_SEND_TEXT_CHARS:
         raise TaskCandidateError("message action requires bounded nonblank text content")
@@ -249,7 +290,7 @@ def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
         if not is_valid_font(font):
             raise TaskCandidateError("message action font is not an allowed style")
         arguments["font"] = normalize_font_key(font)
-    return {"name": "send_message", "arguments": arguments, **wait}
+    return {"name": "send_message", "arguments": arguments, **reserved}
 
 
 class TaskCandidateError(ValueError):
@@ -301,6 +342,14 @@ class TaskCandidate:
             raise TaskCandidateError("actions must contain 1 through 5 items")
         canonical: list[dict[str, Any]] = []
         for action in actions:
+            if isinstance(action, dict) and CONDITION_KEY in action:
+                # The ONE action shape that is not a tool call: a bounded
+                # condition over an earlier action's declared output field.
+                # Never alias-normalized — a stray `name`/`arguments` beside it
+                # means the provider answered a different contract, so it fails
+                # closed instead of being interpreted.
+                canonical.append(_canonicalize_condition(action))
+                continue
             # Tolerate the field-name aliases a model may emit (`tool` for
             # `name`, `parameters`/`args` for `arguments` — the same aliases
             # the execution layer already accepts) by normalizing the shape

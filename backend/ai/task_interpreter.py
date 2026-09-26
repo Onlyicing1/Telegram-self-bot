@@ -82,7 +82,6 @@ CANDIDATE_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["name", "arguments"],
                 "properties": {
                     "name": {"type": "string"},
                     "arguments": {"type": "object"},
@@ -93,6 +92,30 @@ CANDIDATE_SCHEMA = {
                             "(naive = the task timezone), e.g. '2026-09-26T18:00:00'. "
                             "This action must not run before that instant; earlier "
                             "actions still run at the task's own boundary."
+                        ),
+                    },
+                    "condition": {
+                        "type": "object",
+                        "description": (
+                            "A CONDITION action declares NO name and NO arguments: it "
+                            "compares ONE declared output field of an EARLIER action of "
+                            "the same run. Exactly: {'source': {'action': <number of an "
+                            "earlier action>, 'field': '<its declared output field>'}, "
+                            "'operator': 'equals' | 'not_equals', 'value': <text | boolean "
+                            "| number | null>}. Never code, an expression, a nested "
+                            "object or a new tool. At most ONE condition per task, and "
+                            "every action AFTER it must declare 'branch'."
+                        ),
+                    },
+                    "branch": {
+                        "type": "string",
+                        "enum": ["true", "false"],
+                        "description": (
+                            "ONLY together with a condition action: which branch this "
+                            "action belongs to. Exactly one branch runs; all actions "
+                            "after the condition must declare it, the true-branch "
+                            "actions come first, and each branch needs at least one "
+                            "action."
                         ),
                     },
                 },
@@ -446,6 +469,24 @@ class TaskInterpreter:
             "into the arguments. For first_name/username changes use exactly 'username_set_text' "
             "with {'text': ''}. Never invent other action names: an action name that is not "
             "registered is rejected. Keep exactly one action object in 'actions'. "
+            "CONDITIONAL BRANCHES (bounded, at most ONE condition per task): when the "
+            "user asks to do something ONLY IF a result says so ('اگر ... بود ... "
+            "وگرنه ...', 'if ... then ... otherwise ...'), emit 'actions' as: the "
+            "earlier actions, then ONE condition action — exactly "
+            "{\"condition\": {\"source\": {\"action\": <number of an EARLIER action>, "
+            "\"field\": \"<a field that action's tool declares as chainable>\"}, "
+            "\"operator\": \"equals\"|\"not_equals\", \"value\": <text | boolean | "
+            "number | null>}} — then the true-branch actions (each with "
+            "\"branch\": \"true\") and finally the false-branch actions (each with "
+            "\"branch\": \"false\"). Both branches need at least one action, the "
+            "true branch comes first, each branch is one contiguous run, and a "
+            "branch action may only reference results of an earlier action of its "
+            "OWN branch (or of an action before the condition). The condition is "
+            "data, never code and never an expression, and it never decides by "
+            "itself: if the decision needs information no registered action can "
+            "return, return JSON null instead of inventing a field. A conditional "
+            "chain never carries 'ai_instruction' (conditions and per-run generated "
+            "content are not combined). "
             "NON-INVENTION CONTRACT: schema validity is not semantic completeness. "
             "Never invent missing schedule, content, source, language, destination, "
             "recurrence, or generation requirements merely to fill the JSON schema. "

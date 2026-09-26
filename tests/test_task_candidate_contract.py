@@ -120,12 +120,18 @@ def test_provider_schema_declares_the_action_object_contract():
     assert items["type"] == "array"
     assert items["minItems"] == 1
     item_schema = items["items"]
-    assert item_schema["required"] == ["name", "arguments"]
-    # The action object contract is exactly name + arguments plus ONE optional
-    # Phase 3B field: the per-action wait boundary (`not_before`). It is never
-    # required, so every Phase 3A action shape stays valid unchanged.
-    assert set(item_schema["properties"]) == {"name", "arguments", "not_before"}
-    assert "not_before" not in item_schema["required"]
+    # The action object contract is the Phase 3A tool call (name + arguments)
+    # plus THREE bounded reserved keys: the Phase 3B per-action wait boundary
+    # (`not_before`), and the Phase 3C condition (`condition`) with its branch
+    # label (`branch`). The item object does not REQUIRE name + arguments any
+    # more because the condition action is the ONE entry that declares no tool
+    # call — the deterministic candidate boundary still enforces exactly
+    # ``{name, arguments}`` for a tool action, so every Phase 3A shape stays
+    # valid unchanged.
+    assert set(item_schema["properties"]) == {
+        "name", "arguments", "not_before", "condition", "branch",
+    }
+    assert "required" not in item_schema
     assert item_schema["additionalProperties"] is False
 
 

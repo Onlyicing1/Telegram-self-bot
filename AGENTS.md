@@ -362,8 +362,24 @@ error.
   claims it when due and the chain resumes at that action. A restart leaves a
   parked wait untouched (it is excluded from recovery), and a running
   occurrence keeps its `restart_side_effect_uncertain` contract.
-  Branching/conditional and multi-turn conversational continuation are later
-  phases, not part of this mechanism.
+  **Bounded conditional branching**: at most ONE action of a chain may be a
+  condition — `{"condition": {"source": {"action": <earlier action>,
+  "field": <a field that action's tool declares chainable>}, "operator":
+  "equals"|"not_equals", "value": <text|boolean|number|null>}}` — the ONE
+  action entry that declares no tool call, and every action AFTER it declares
+  `branch` (`"true"`/`"false"`, one contiguous run each, true run first, both
+  non-empty; no nesting, no loops, no parallel branches). Exactly one branch
+  runs; the condition's own bounded run record carries the durable result
+  (`{"matched": …, "selected_branch": "true"|"false"}`) and is persisted
+  BEFORE either branch runs, so a restart resumes the SAME branch, never
+  re-evaluates the condition and never starts the other one — which is marked
+  `skipped` at every durable write. Gating precedes the wait check, a
+  condition failure runs NEITHER branch, and a failed action in the selected
+  branch never falls back to the other branch. Conditions and per-occurrence
+  generated content (`ai_instruction`) are mutually exclusive. Everything
+  unknown or malformed fails closed (no schema change).
+  Multi-turn conversational continuation is a later phase, not part of this
+  mechanism.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.

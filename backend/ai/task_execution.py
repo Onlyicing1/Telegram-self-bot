@@ -14,15 +14,24 @@ import re
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.task_contract import (
     ACTION_RUNS_KEY,
+    BRANCH_SKIPPED_STATUS,
+    CONDITION_KEY,
+    CONDITION_TOOL,
     SCHEDULED_OCCURRENCE_EXTRA,
+    BranchLayout,
     PreparedAction,
     TaskContractError,
     action_reference_error,
     action_runs_from_metadata,
     bounded_action_output,
+    branch_name,
     build_action_run,
+    condition_run_output,
+    evaluate_condition,
     resolve_action_arguments,
     resolve_action_waits,
+    resolve_conditions,
+    selected_branch_from_runs,
     validate_prepared_action,
 )
 from backend.ai.tools.base import declared_consumable_output_fields
@@ -296,6 +305,9 @@ class _ChainOutcome:
     #: it stay ``pending``) and the occurrence parks on that instant.
     paused_at: int | None = None
     paused_until: datetime | None = None
+    #: Actions of the branch the chain's condition did NOT select: recorded
+    #: ``skipped``, never executed, while the selected branch runs.
+    not_selected: int = 0
 
     @property
     def succeeded(self) -> int:
@@ -437,6 +449,13 @@ class TaskExecutionCoordinator:
         for action in actions:
             if not isinstance(action, dict):
                 return await self._fail(occurrence, "invalid_action", 0, 0)
+            if CONDITION_KEY in action:
+                # A condition declares no tool call: it is recorded under its own
+                # reserved name — and never handed to the executor — so the chain's
+                # per-action record stays position-complete. Its entire contract
+                # is re-proved by ``resolve_conditions`` below, fail closed.
+                calls.append({"name": CONDITION_TOOL, "arguments": {}})
+                continue
             name = action.get("name") or action.get("tool")
             arguments = action.get("arguments", action.get("parameters", {}))
             if not isinstance(name, str) or not name or not isinstance(arguments, dict):
@@ -465,6 +484,21 @@ class TaskExecutionCoordinator:
         if reference_error:
             return await self._fail(
                 occurrence, f"invalid_action_reference: {reference_error}", 0, 0
+            )
+
+        # The bounded conditional structure, re-proved with the SAME rule
+        # creation enforced: at most one condition, one contiguous run per
+        # branch, the true run first, and a condition that reads a declared
+        # output field of an EARLIER action of this same occurrence. A stored
+        # chain that cannot be one fails closed BEFORE anything executes.
+        layout, condition_error = resolve_conditions(
+            actions,
+            self.executor._registry,
+            generation_authorized=generation_authorized,
+        )
+        if condition_error:
+            return await self._fail(
+                occurrence, f"invalid_condition: {condition_error}", 0, 0
             )
 
         # Durable wait boundaries, re-proved with the SAME rule creation
@@ -521,7 +555,7 @@ class TaskExecutionCoordinator:
             outcome = await asyncio.wait_for(
                 self._execute_chain(
                     occurrence, calls, execution_calls, state, execution_context,
-                    waits, reference,
+                    waits, reference, layout,
                 ),
                 timeout=MAX_EXECUTION_SECONDS,
             )
@@ -573,6 +607,7 @@ class TaskExecutionCoordinator:
         execution_context: ToolContext,
         waits: list[datetime | None],
         reference: datetime,
+        layout: BranchLayout | None = None,
     ) -> _ChainOutcome:
         """Run ONE occurrence's ordered actions as a durable chain.
 
@@ -590,10 +625,19 @@ class TaskExecutionCoordinator:
         BEFORE it is marked running or executed (it stays ``pending``), and
         the occurrence parks on that instant until the wake loop serves it
         again.
+
+        When the chain carries the ONE bounded condition (``layout``), exactly
+        one of its two labelled branches runs: the condition is evaluated from
+        the recorded results of earlier actions and its selection is persisted
+        BEFORE the branch starts, so a restart resumes the SAME branch, the
+        condition is never re-evaluated, and the other branch's actions are
+        recorded ``skipped`` without ever running. Gating happens BEFORE the
+        wait check, so an unselected action can never park the chain.
         """
         registry = self.executor._registry
         results: list[ToolExecutionResult] = []
         skipped = 0
+        not_selected = 0
         failed_position: int | None = None
         failure: Any = ""
         paused_at: int | None = None
@@ -604,6 +648,58 @@ class TaskExecutionCoordinator:
             if recorded is not None and recorded["status"] == "succeeded":
                 skipped += 1
                 continue
+            if recorded is not None and recorded["status"] == BRANCH_SKIPPED_STATUS:
+                # Durable proof that this action belongs to the branch this
+                # occurrence never selected: nothing to re-derive, never run.
+                not_selected += 1
+                continue
+            if layout is not None and position == layout.condition_position:
+                # The ONE conditional decision of this occurrence: its source is
+                # an EARLIER action's recorded result, it is never a tool call of
+                # its own, and it selects exactly one branch. A condition that
+                # cannot be decided fails the occurrence closed WITHOUT choosing
+                # a branch, so neither branch runs.
+                matched, condition_reason = evaluate_condition(
+                    layout.condition, _ordered_runs(state)
+                )
+                if condition_reason:
+                    state[position] = build_action_run(
+                        position, name, "failed", error=condition_reason
+                    )
+                    failed_position, failure = position, condition_reason
+                    break
+                state[position] = build_action_run(
+                    position, name, "succeeded", output=condition_run_output(matched)
+                )
+                # The SELECTION becomes durable BEFORE either branch runs: a
+                # crash after this write resumes the SAME branch and can never
+                # re-evaluate the condition or start the other branch.
+                await self._persist_runs(occurrence, state)
+                logger.info(
+                    "TASK_CONDITION_EVALUATED task_id=%s occurrence_key=%s action=%s "
+                    "matched=%s selected_branch=%s already_succeeded=%s",
+                    occurrence.task_id, occurrence.occurrence_key, position,
+                    matched, branch_name(matched), skipped,
+                )
+                continue
+            if layout is not None and layout.branches.get(position) is not None:
+                selected, selection_reason = selected_branch_from_runs(
+                    _ordered_runs(state), layout.condition_position
+                )
+                if selection_reason:
+                    state[position] = build_action_run(
+                        position, name, "failed", error=selection_reason
+                    )
+                    failed_position, failure = position, selection_reason
+                    break
+                if layout.branches[position] != selected:
+                    # The non-selected branch is permanently inactive for this
+                    # occurrence — including across restarts.
+                    state[position] = build_action_run(
+                        position, name, BRANCH_SKIPPED_STATUS
+                    )
+                    not_selected += 1
+                    continue
             boundary = waits[position - 1] if position - 1 < len(waits) else None
             if boundary is not None and reference < boundary:
                 paused_at, paused_until = position, boundary
@@ -640,22 +736,41 @@ class TaskExecutionCoordinator:
             )
             await self._persist_runs(occurrence, state)
         # Actions the chain never reached are recorded explicitly pending, so
-        # the occurrence always carries the full per-action state.
+        # the occurrence always carries the full per-action state — except the
+        # branch the condition did NOT select, which is recorded ``skipped`` at
+        # every durable write: it is permanently inactive for this occurrence
+        # and must never read as "still to run", not even while the selected
+        # branch is parked on a wait boundary or stopped by a failure.
+        selected_branch: str | None = None
+        if layout is not None:
+            selected_branch, _selection_error = selected_branch_from_runs(
+                _ordered_runs(state), layout.condition_position
+            )
         for position, call in enumerate(calls, start=1):
-            state.setdefault(position, build_action_run(position, call["name"], "pending"))
+            if position in state:
+                continue
+            label = layout.branches.get(position) if layout is not None else None
+            if label is not None and selected_branch is not None and label != selected_branch:
+                state[position] = build_action_run(
+                    position, call["name"], BRANCH_SKIPPED_STATUS
+                )
+                not_selected += 1
+                continue
+            state[position] = build_action_run(position, call["name"], "pending")
         if skipped:
             logger.info(
                 "TASK_CHAIN_RESUMED task_id=%s occurrence_key=%s attempt=%s "
-                "already_succeeded=%s executed=%s",
+                "already_succeeded=%s not_selected=%s executed=%s",
                 occurrence.task_id, occurrence.occurrence_key, occurrence.attempt,
-                skipped, len(results),
+                skipped, not_selected, len(results),
             )
         if paused_at is not None:
             logger.info(
                 "TASK_CHAIN_PAUSED task_id=%s occurrence_key=%s action=%s "
-                "not_before=%s already_succeeded=%s",
+                "not_before=%s already_succeeded=%s not_selected=%s",
                 occurrence.task_id, occurrence.occurrence_key, paused_at,
                 paused_until.isoformat() if paused_until else "-", skipped,
+                not_selected,
             )
         return _ChainOutcome(
             results=results,
@@ -665,6 +780,7 @@ class TaskExecutionCoordinator:
             skipped=skipped,
             paused_at=paused_at,
             paused_until=paused_until,
+            not_selected=not_selected,
         )
 
     async def _park_at_wait(
