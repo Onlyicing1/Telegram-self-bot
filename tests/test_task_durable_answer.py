@@ -244,10 +244,17 @@ def test_the_question_takes_exactly_one_bounded_argument():
     assert question_chain_error(
         [{"name": QUESTION_TOOL, "arguments": {"text": QUESTION}}]
     ) is not None
+    # Since Phase 3E a chain MAY carry several questions — each is an
+    # independent checkpoint, and at most one is ever active (the chain parks
+    # at the first). The exact-argument rule still holds for EVERY question.
     assert question_chain_error([
         {"name": QUESTION_TOOL, "arguments": {"question": QUESTION}},
         {"name": QUESTION_TOOL, "arguments": {"question": "دومی؟"}},
-    ]) == "only one question per chain is supported"
+    ]) is None
+    assert question_chain_error([
+        {"name": QUESTION_TOOL, "arguments": {"question": QUESTION}},
+        {"name": QUESTION_TOOL, "arguments": {"question": "دومی؟", "chat_id": 5}},
+    ]) == "action 2: 'ask_owner' takes exactly one bounded 'question' argument"
 
 
 def test_no_wait_boundary_may_sit_before_the_question():
@@ -287,7 +294,10 @@ def test_no_wait_boundary_may_sit_before_the_question():
     assert question_chain_error(after) is None
 
 
-def test_a_question_cannot_live_inside_a_conditional_branch():
+def test_a_question_may_live_inside_a_selected_branch_since_part_3e():
+    """A branch question is always AFTER the chain's condition (never its
+    source), and the non-selected branch never asks — so the Part 3D refusal
+    became unnecessary in Phase 3E."""
     actions = [
         {"name": "web_search", "arguments": {"query": "x"}},
         {
@@ -298,9 +308,10 @@ def test_a_question_cannot_live_inside_a_conditional_branch():
             }
         },
         {"name": QUESTION_TOOL, "arguments": {"question": QUESTION}, "branch": "true"},
+        {"name": "send_message", "arguments": {"text": "t"}, "branch": "true"},
         {"name": "send_message", "arguments": {"text": "f"}, "branch": "false"},
     ]
-    assert "a question cannot live inside a conditional branch" in question_chain_error(actions)
+    assert question_chain_error(actions) is None
 
 
 def test_a_condition_may_consume_the_answer():

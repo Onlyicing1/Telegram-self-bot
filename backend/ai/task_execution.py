@@ -534,9 +534,11 @@ class TaskExecutionCoordinator:
             )
 
         # The bounded question contract, re-proved with the SAME rule creation
-        # enforced: at most one ask_owner action, a bounded question argument,
-        # and no question inside a conditional branch. A stored chain that
-        # cannot be one fails closed BEFORE anything executes.
+        # enforced: bounded question arguments, no question inside a
+        # conditional branch, and no wait boundary before the first question.
+        # SEVERAL questions are allowed — the chain parks at each one, so at
+        # most ONE is ever active. A stored chain that cannot satisfy the
+        # rule fails closed BEFORE anything executes.
         question_error = question_chain_error(actions)
         if question_error:
             return await self._fail(
@@ -559,12 +561,17 @@ class TaskExecutionCoordinator:
         # that record here (the coordinator never trusts metadata it did not
         # just build): the pending-question record must be answered, carry the
         # bounded answer text, and the question run must be succeeded with the
-        # SAME answer in its output. Anything else fails closed instead of
-        # executing the downstream chain with an unproven answer.
+        # SAME answer in its output. A record naming an action that is ALREADY
+        # recorded ``succeeded`` in the durable run record is an EARLIER
+        # checkpoint of a multi-question chain (the park write replaced it when
+        # the chain reached the next question) — that record is stale and must
+        # NOT gate this wake. Anything else fails closed instead of executing
+        # the downstream chain with an unproven answer.
         resume_question = pending_question_from_metadata(occurrence.result_metadata)
         if resume_question is not None and resume_question.get("answered"):
+            answered_position = resume_question.get("action")
             answered_run = next(
-                (run for run in prior_runs if run["position"] == resume_question.get("action")),
+                (run for run in prior_runs if run["position"] == answered_position),
                 None,
             )
             recorded_answer = (
@@ -572,20 +579,22 @@ class TaskExecutionCoordinator:
                 if isinstance(answered_run, dict) and isinstance(answered_run.get("output"), dict)
                 else None
             )
-            if (
-                answered_run is None
-                or answered_run.get("status") != "succeeded"
-                or not isinstance(recorded_answer, str)
-                or not recorded_answer
-            ):
+            already_proven = (
+                answered_run is not None
+                and answered_run.get("status") == "succeeded"
+                and isinstance(recorded_answer, str)
+                and bool(recorded_answer)
+            )
+            if not already_proven and answered_run is not None:
                 return await self._fail(
                     occurrence, "answered_question_record_invalid", 0, 0
                 )
-            logger.info(
-                "TASK_CHAIN_ANSWER_RESUMED task_id=%s occurrence_key=%s action=%s",
-                occurrence.task_id, occurrence.occurrence_key,
-                resume_question.get("action"),
-            )
+            if already_proven:
+                logger.info(
+                    "TASK_CHAIN_ANSWER_RESUMED task_id=%s occurrence_key=%s action=%s",
+                    occurrence.task_id, occurrence.occurrence_key,
+                    answered_position,
+                )
 
         if generation_authorized:
             try:
@@ -662,6 +671,27 @@ class TaskExecutionCoordinator:
         await self._deliver_result(task, outcome.results, execution_context, occurrence.occurrence_key)
         return TaskExecutionResult(True, "succeeded", len(calls), successful, metadata=metadata)
 
+    @staticmethod
+    def _answered_question_position(
+        state: dict[int, dict[str, Any]]
+    ) -> int | None:
+        """The LAST question position this chain already consumed.
+
+        The highest question-tool run recorded ``succeeded`` with the bounded
+        answer in its output — the checkpoint whose park tail may have been
+        labelled ``skipped`` and which a resumed wake must re-open.
+        """
+        answered = [
+            run["position"]
+            for run in state.values()
+            if isinstance(run, dict)
+            and run.get("tool") == QUESTION_TOOL
+            and run.get("status") == "succeeded"
+            and isinstance(run.get("output"), dict)
+            and ANSWER_FIELD in run["output"]
+        ]
+        return max(answered) if answered else None
+
     async def _execute_chain(
         self,
         occurrence: OccurrenceRecord,
@@ -708,9 +738,51 @@ class TaskExecutionCoordinator:
         paused_until: datetime | None = None
         asked_at: int | None = None
         question_record: dict[str, Any] | None = None
+        if layout is not None and any(
+            run.get("status") == BRANCH_SKIPPED_STATUS for run in state.values()
+        ):
+            # A conditional chain that PARKED on a question after its branch
+            # selection: the park tail labelled the rest of the SELECTED run
+            # ``skipped`` (the walk had stopped at the open question). If that
+            # question has since been answered, those labels described the
+            # interrupted wait — not a branch the condition rejected — and
+            # the resumed walk must run them in order. The non-selected
+            # branch keeps its skip (it is on the other side of the durable
+            # selection, which survived the park in the run record).
+            selected = selected_branch_from_runs(
+                _ordered_runs(state), layout.condition_position
+            )[0]
+            answered_position = self._answered_question_position(state)
+            if selected is not None:
+                for position, call in enumerate(calls, start=1):
+                    run = state.get(position)
+                    if (
+                        isinstance(run, dict)
+                        and run.get("status") == BRANCH_SKIPPED_STATUS
+                        and layout.branches.get(position) == selected
+                        and (answered_position is None or position > answered_position)
+                    ):
+                        state[position] = build_action_run(
+                            position, call["name"], "pending"
+                        )
         for position, call in enumerate(calls, start=1):
             name = call["name"]
             recorded = state.get(position)
+            if (
+                recorded is None
+                and name == QUESTION_TOOL
+                and any(
+                    run.get("position") == position
+                    and run.get("tool") == QUESTION_TOOL
+                    and run.get("status") == "succeeded"
+                    for run in state.values()
+                )
+            ):
+                # Impossible in production (a succeeded question run makes the
+                # walk skip this position), but if the durable record ever
+                # disagreed with itself, refusing beats re-asking the owner.
+                failed_position, failure = position, "question_record_conflict"
+                break
             if recorded is not None and recorded["status"] == "succeeded":
                 skipped += 1
                 continue
@@ -823,6 +895,29 @@ class TaskExecutionCoordinator:
                     )
                     break
                 asked_at = position
+                # A conditional chain parking on a BRANCH question: the other
+                # branch's actions can never run for this occurrence, so they
+                # are marked ``skipped`` in the SAME durable write the park
+                # carries (3C's inactive-branch rule, applied at the park).
+                if layout is not None:
+                    selected, _err = selected_branch_from_runs(
+                        _ordered_runs(state), layout.condition_position
+                    )
+                    if selected is not None:
+                        for later, later_call in enumerate(calls, start=1):
+                            if later <= position:
+                                continue
+                            recorded_later = state.get(later)
+                            if (
+                                isinstance(recorded_later, dict)
+                                and recorded_later.get("status") == "succeeded"
+                            ):
+                                continue
+                            if layout.branches.get(later) not in (None, selected):
+                                state[later] = build_action_run(
+                                    later, later_call["name"], BRANCH_SKIPPED_STATUS
+                                )
+                                not_selected += 1
                 break
             arguments = execution_calls[position - 1].get("arguments", {})
             resolved, reason = resolve_action_arguments(arguments, _ordered_runs(state))
@@ -1008,6 +1103,33 @@ class TaskExecutionCoordinator:
                 False, "unknown", len(calls), outcome.succeeded, "question_record_missing"
             )
         successful = outcome.succeeded
+        # A multi-question chain re-enters _execute_chain after each answer:
+        # when the walk reaches the question position whose run is ALREADY
+        # recorded ``succeeded`` (the answer's own run record), the walk never
+        # stops there (skipped), so an asked_at outcome can only be a LATER
+        # question. An answered_at outcome naming an already-succeeded run
+        # would mean a re-send of a question this occurrence already consumed
+        # — refused here as a durable no-op instead of re-parking.
+        prior_at_position = next(
+            (
+                run for run in outcome.runs
+                if run.get("position") == position
+            ),
+            None,
+        )
+        if (
+            isinstance(prior_at_position, dict)
+            and prior_at_position.get("status") == "succeeded"
+            and prior_at_position.get("tool") == QUESTION_TOOL
+        ):
+            logger.warning(
+                "TASK_CHAIN_QUESTION_RESEND_REFUSED task_id=%s occurrence_key=%s "
+                "action=%s",
+                occurrence.task_id, occurrence.occurrence_key, position,
+            )
+            return TaskExecutionResult(
+                False, "unknown", len(calls), successful, "question_resend_refused"
+            )
         try:
             record = _bounded_metadata({
                 "action_count": len(calls),

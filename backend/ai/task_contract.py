@@ -1118,11 +1118,14 @@ def validate_pending_question(value: Any) -> dict[str, Any]:
 
 
 def pending_question_from_metadata(metadata: Any) -> dict[str, Any] | None:
-    """``(record | None)`` — the ONE open question of ONE occurrence, or None.
+    """``(record | None)`` — the ONE ACTIVE question of ONE occurrence, or None.
 
     Read from the occurrence's own bounded metadata channels only. A
     malformed record raises so the caller fails closed instead of resuming a
-    workflow it cannot account for.
+    workflow it cannot account for. With several questions in one chain the
+    stored record is the ACTIVE one (the park write replaces it whenever the
+    chain reaches the next question); the answers of earlier questions live
+    in their own run records, never here.
     """
     if not isinstance(metadata, dict):
         return None
@@ -1137,17 +1140,23 @@ def pending_question_from_metadata(metadata: Any) -> dict[str, Any] | None:
 
 
 def question_chain_error(actions: Any) -> str | None:
-    """``(error | None)`` — the ONE bounded question contract of an action list.
+    """``(error | None)`` — the bounded multi-question contract of a chain.
 
-    Enforced at task creation AND re-proved verbatim before any execution: at
-    most ONE question per chain, the question's registered tool call carries
-    ONLY its bounded ``question`` argument (never a destination, a reference
-    is still allowed only through the shared 3A reference contract), no wait
-    boundary may sit BEFORE the question (a question parks on its own answer,
-    not on a clock), and — after the 3C branch gate has accepted the chain —
-    no question may live inside either branch (a question needs the OWNER's
-    answer, and the chain must not depend on an answer for a branch the
-    condition could then re-decide around). Anything else fails closed.
+    Enforced at task creation AND re-proved verbatim before any execution:
+    every ``ask_owner`` action carries ONLY its bounded ``question`` argument
+    (never a destination, a reference is still allowed only through the
+    shared 3A reference contract), and no wait boundary may sit BEFORE the
+    FIRST question (a question parks on its own answer, not on a clock).
+    SEVERAL questions are allowed — at most ONE at a time can be waiting (a
+    chain parks the moment it reaches one, so no later question can ever
+    become active before an earlier one is answered) — and since Phase 3E a
+    question MAY live inside a conditional branch: the branch question is
+    always AFTER the chain's condition (so it can never be that condition's
+    source), a skipped branch never asks, and the answer of each question
+    rides the SAME bounded ``answer`` run field — the exact 3A reference
+    mechanism (``{"$ref": {"action": N, "field": "answer"}}``) reads
+    question N's answer like any other earlier result. Anything else fails
+    closed.
     """
     if not isinstance(actions, list) or not actions:
         return None
@@ -1158,55 +1167,29 @@ def question_chain_error(actions: Any) -> str | None:
     ]
     if not positions:
         return None
-    if len(positions) > 1:
-        return "only one question per chain is supported"
-    question_position = positions[0]
-    condition_position, branches, structure_error = _branch_structure(actions)
+    _condition_position, _branches, structure_error = _branch_structure(actions)
     if structure_error:
         return None  # the condition contract reports its own failure verbatim
-    if branches.get(question_position) is not None:
-        return (
-            f"action {question_position}: a question cannot live inside a "
-            "conditional branch"
-        )
-    if condition_position is not None:
-        condition = actions[condition_position - 1]
-        source = condition.get(CONDITION_KEY)
-        target = source.get("source") if isinstance(source, dict) else None
-        condition_reads_answer = (
-            isinstance(target, dict) and target.get("action") == question_position
-        )
-        if not condition_reads_answer:
-            # The condition does NOT consume the answer, so a conditional
-            # structure around the question is the one thing that could
-            # re-decide around an answer the owner may never give.
-            for position, branch in branches.items():
-                if position < question_position:
-                    continue
-                if branch == BRANCH_TRUE:
-                    return (
-                        f"action {position}: a branch after a question must wait for "
-                        "the answer outside the conditional structure"
-                    )
-    for position in range(1, question_position):
+    for position in range(1, positions[0]):
         earlier = actions[position - 1]
         if isinstance(earlier, dict) and earlier.get(WAIT_KEY) is not None:
             return (
                 f"action {position}: a wait boundary may not sit before the "
-                f"question at action {question_position} — a question parks on "
+                f"question at action {positions[0]} — a question parks on "
                 "its own answer, not on a clock"
             )
-    action = actions[question_position - 1]
-    arguments = action.get("arguments")
-    if not isinstance(arguments, dict) or set(arguments) != {"question"}:
-        return (
-            f"action {question_position}: '{QUESTION_TOOL}' takes exactly one "
-            "bounded 'question' argument"
-        )
-    try:
-        validate_question_text(arguments.get("question"))
-    except TaskContractError as exc:
-        return f"action {question_position}: {exc}"
+    for question_position in positions:
+        action = actions[question_position - 1]
+        arguments = action.get("arguments")
+        if not isinstance(arguments, dict) or set(arguments) != {"question"}:
+            return (
+                f"action {question_position}: '{QUESTION_TOOL}' takes exactly one "
+                "bounded 'question' argument"
+            )
+        try:
+            validate_question_text(arguments.get("question"))
+        except TaskContractError as exc:
+            return f"action {question_position}: {exc}"
     return None
 
 
@@ -1215,7 +1198,10 @@ def answer_run_output(answer: str) -> dict[str, Any]:
 
     Exactly the structured shape a chain action's result uses — the single
     declared field ``answer`` — so no second result type exists and the
-    existing reference/condition mechanisms read it unchanged.
+    existing reference/condition mechanisms read it unchanged. With several
+    questions in one chain each answer keeps its OWN question action's run
+    record, so ``{"$ref": {"action": N, "field": "answer"}}`` reads
+    question N's answer and never another question's.
     """
     return {ANSWER_FIELD: answer}
 

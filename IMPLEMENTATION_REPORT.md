@@ -347,7 +347,13 @@ remains owner-applied and untouched by this phase.
 
 ---
 
-## Latest phase — TODO PART 3D — DURABLE QUESTION/ANSWER CONTINUATION
+## Previous phase — TODO PART 3D — DURABLE QUESTION/ANSWER CONTINUATION
+
+> **Superseded in one point by Part 3E (below):** the "ONE
+`ask_owner` action per chain" rule became "several question
+checkpoints per chain, at most ONE waiting at a time". Every other
+3D contract below is unchanged and reused verbatim.
+
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `e702c18` = `origin/main` (`feat(todo): add bounded conditional
@@ -607,6 +613,214 @@ Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain
 waiting`). One commit on top of it — no rebase, no force-push, no new branch, no
 unrelated file touched. Local `HEAD` and `origin/main` are re-verified equal after
 the push (`git fetch origin`, `git rev-parse HEAD`, `git rev-parse origin/main`).
+
+---
+
+## Latest phase — TODO PART 3E — MULTI-TURN QUESTION / INSTRUCTION CONTINUATION
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `16519fb` = `origin/main` (`feat(todo): add durable
+question-answer continuation`, Phase 3D). Every Phase 3A/3B/3C/3D contract is
+reused unchanged: ONE task, ONE occurrence, ONE ordered action chain, ONE
+execution authority (`TaskExecutionCoordinator` → `ToolExecutor`), ONE
+scheduler, the bounded per-action run record, the durable `not_before` wait
+and the bounded conditional branching. Phase 3E lifts exactly ONE 3D
+restriction: a durable chain may now carry SEVERAL `ask_owner` actions —
+each an independent durable question checkpoint — while everything else
+about the 3D question mechanism (the tool, the park, the correlation CAS,
+the `answer` run field) stays byte-for-byte the same.
+
+### Phase objective
+
+“پری اول درباره دانشگاه سرچ کن، اگر لازم شد ازم اسم دانشگاه رو بپرس، بعد
+درباره رشته بپرس و نتیجه رو ذخیره کن و ساعت ۶ بهم بده.” must run
+
+    SEARCH → Q1 → SEARCH(A1) → Q2 → SEARCH(A1,A2) → SAVE → WAIT 18:00 → DELIVER
+
+as ONE task and ONE occurrence, resuming at the exact point after every
+answer, across restarts, without re-asking an answered question, without
+consuming a wrong reply, and without executing any later action before its
+preceding question is answered.
+
+### Multiple-question semantics (what changed, exactly)
+
+* `question_chain_error` (`backend/ai/task_contract.py`) no longer refuses a
+  second (or third) `ask_owner` action. It still refuses, for EVERY question
+  action: an argument shape other than exactly one bounded plain-text
+  `question`, and (unchanged from 3D) a wait boundary sitting before the
+  FIRST question.
+* **A question MAY now live inside a conditional branch** (the 3D refusal is
+  lifted): a branch question is always AFTER the chain's condition, so it can
+  never be that condition's source; the non-selected branch never runs and
+  therefore never asks; and a question before the condition remains
+  impossible (the condition gate runs first). The 3D test that pinned the
+  refusal was updated to pin the new permission; every other 3D test passes
+  unchanged.
+* The interpreter prompt and the `CANDIDATE_SCHEMA` `question` description
+  now say several `ask_owner` actions are allowed, one per checkpoint, each
+  answer consumed through that question's OWN action number.
+
+### The one-active-question invariant (structural, not enforced)
+
+At any point 0 or 1 question is waiting — the walk in `_execute_chain` STOPS
+the moment it reaches an open question (`asked_at`), so no later question can
+even be SENT while an earlier one is unanswered. There is no counter, no new
+status and no second park state: the existing `waiting_answer` status plus
+the ordered walk make "more than one active question" structurally
+impossible. A chain like `[Q1, Q2, Q3, SEND]` parks three times, in order.
+
+### Question identity and correlation (unchanged, per checkpoint)
+
+Each question's durable identity is its OWN stored `pending_question` record
+(action position, `question_chat_id`, `question_message_id`, bounded text,
+`asked_at`, `answered`/`answered_at`). The park write REPLACES the record
+when the chain reaches the NEXT question, so the stored record is always the
+ONE ACTIVE checkpoint. Correlation is unchanged: `TaskAnswerResolver` gates
+on sender identity, then matches `chat_id + reply_to_msg_id` against the
+stored record — a reply to Question #1's message can never answer Question
+#2, and a late duplicate reply to Question #1 after Question #2 became
+active answers nothing (identity is immutable; the record no longer names
+Question #1). Never "latest question", never "latest message".
+
+### Answer persistence (no generic "current answer")
+
+Each answer lives in ITS OWN question action's run record as
+`{"answer": <text>}` (the single declared `consumable_output_field`).
+Answer #1 and Answer #2 remain distinct forever — the resolver never
+overwrites a previous answer, and the resumed chain reads each one through
+the EXISTING 3A reference mechanism:
+`{"$ref": {"action": N, "field": "answer"}}` resolves question N's answer
+exactly like any other earlier result. A 3C condition source may read any
+question's answer the same way.
+
+### Duplicate answers and wrong replies
+
+* A duplicate reply to the active question loses the `resume_waiting_for_answer`
+  CAS (the row is no longer `waiting_answer`) — the downstream chain can
+  never execute twice.
+* A late reply to an ALREADY-ANSWERED question matches no parked row (its
+  record was replaced) and mutates nothing.
+* Unrelated messages (no reply target), other chats, other senders and other
+  tasks' question identities are refused before anything is consumed — all
+  re-tested against multi-question chains.
+
+### Restart / recovery / no replay
+
+A parked occurrence (any checkpoint) survives restarts by construction:
+`waiting_answer` is excluded from the due-retry query, the recovery query and
+the claim CAS, and the event duplicate guard skips it. No question is ever
+re-sent: on resume the walk re-enters at the question position, sees its run
+record `succeeded` (the answer consumed) and skips forward. An answered
+checkpoint's `pending_question` record may still be in metadata when a later
+park replaced it — the coordinator's resume re-proof now treats a record
+naming an ALREADY-PROVEN `succeeded` run as a stale earlier checkpoint (not
+an error) while still failing closed on anything genuinely inconsistent
+(`answered_question_record_invalid`).
+
+### Crash during answer processing (audit result)
+
+The existing ONE-CAS consume (`resume_waiting_for_answer`) already covers the
+crash window: the answer metadata, the succeeded question run and the
+eligibility instant are ONE atomic write — there is no state where an answer
+is stored but the question stays pending, or the downstream executes twice
+(the CAS is lost by any racing second reply), or a sent question is lost
+(the park write precedes the status flip and is reported honestly as
+`question_park_failed` if it fails). A defensive `question_resend_refused`
+guard was added: a park outcome naming an already-succeeded question run is
+refused instead of re-parked.
+
+### Branch and wait compatibility
+
+* **3C**: a question inside a selected branch parks that branch exactly like
+  a top-level question; the non-selected branch's actions are recorded
+  `skipped` in the SAME durable write the park carries (they can never run);
+  a condition may read any earlier question's answer; a question before the
+  condition remains impossible; `ai_instruction` and questions remain
+  mutually exclusive through the existing 3A rule.
+* **3B**: `not_before` and `waiting_answer` stay semantically distinct — a
+  question has NO clock (`retry_at` stays NULL while parked), a wait has NO
+  correlation. A wait AFTER questions parks on the boundary (`retry_pending`
+  + `retry_at = boundary`) through the existing scheduler wake; multiple
+  questions followed by a wait are tested end to end.
+
+### Context isolation
+
+The executor receives ONLY the structured, referenced values: the answer
+enters a later action as the resolved `$ref` value (bounded plain text), and
+nothing else — no chat history, no sender context, no event envelope, no
+conversation state (verified by test: the recorded call arguments are exactly
+the resolved references).
+
+### Database — NO schema change
+
+The existing Part 3D representation already supports multiple checkpoints:
+questions are rows in the bounded `action_snapshot`, answers are entries in
+the bounded per-action run record, and the active checkpoint is the bounded
+`pending_question` metadata record (replaced at each park). No migration, no
+column, no table, no §31 change. The two metadata size bounds
+(`MAX_PENDING_QUESTION_BYTES` per record, the existing metadata budget per
+row) are unchanged.
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/ai/task_contract.py` | `question_chain_error` multi-question rules (argument shape per question, wait-before-FIRST-question, branch questions allowed); docstrings for `pending_question_from_metadata`/`answer_run_output` |
+| `backend/ai/task_execution.py` | resume re-proof treats a proven answered checkpoint as stale (not invalid); `_park_at_question` refuses a re-send of an answered question (`question_resend_refused`); park-on-branch-question marks the non-selected branch `skipped` in the park write; conditional-chain wake re-opens park-tail skips of the selected run |
+| `backend/ai/task_interpreter.py` | prompt + schema description: several questions allowed, per-question answer references |
+| `tests/test_task_multi_question.py` | NEW — 31 tests (matrix below) |
+| `tests/test_task_durable_answer.py` | the branch-question test now pins the 3E permission; the two-question contract test pins the new rule |
+
+### Tests added and exact results
+
+`tests/test_task_multi_question.py` — 31 tests over the REAL registry,
+`ToolExecutor`, `AskOwnerTool`, coordinator, scheduler and repository:
+
+| Area | Tests |
+|---|---|
+| Contract: 2–3 questions valid, per-question argument shape, wait-before-first, branch questions, condition reads any answer, creation end-to-end | 6 |
+| Execution: 1/2/3 sequential questions, question after/before normal actions, blocking, distinct answers, both-answer references, future/unanswered references, cross-task | 11 |
+| Identity/correlation: late reply to Q1 ≠ answer to Q2, wrong message/user/chat/task, unrelated messages, active-record invariant | 6 |
+| Branch/wait compatibility: question in selected branch, time wait after questions, `waiting_answer` vs clock | 4 |
+| Isolation/boundaries: structured-answer-only execution, executor sole authority | 2 |
+| End-to-end: SEARCH → Q1 → SEARCH(A1) → Q2 → WAIT → DELIVER as one occurrence | 2 |
+
+### Verification performed (automated only)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_multi_question.py -q` | **31 passed** |
+| Phase 3A/3B/3C/3D + task/scheduler/repository/creation/execution/interpretation regressions (15 suites) | **408 passed** |
+| Task NL/management/UI/trigger + tool-registry tripwire suites (26 suites) | **701 passed** |
+| `.venv/bin/python -m pytest tests/ -q` (full suite) | **5331 passed, 26 skipped** |
+| `.venv/bin/python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+**Live Telegram verification was NOT performed. Live Supabase verification
+was NOT performed.** No database change exists in this phase (see above), so
+no migration or SQL step is required.
+
+### Known limitations (honest)
+
+1. The bounded chain is still 1–5 actions (`MAX_ACTIONS`), so a workflow with
+   several questions shares that budget with its real actions — the example
+   request above fits at 5 actions, richer ones do not.
+2. At most ONE condition per chain (3C, unchanged), so multi-question chains
+   get at most one decision point.
+3. Question answers remain bounded plain text (≤128 chars collapsed); no
+   media, no buttons, no multi-turn chat memory.
+4. The interpreter is prompt-guided only: whether the model emits two
+   `ask_owner` actions for a two-question request is model quality, not a
+   contract — the creation gate accepts or refuses whatever it emits, fail
+   closed.
+
+### Still deferred (Part 3F+)
+
+Autonomous replanning, dynamic action generation, loops, parallel execution,
+DAGs, arbitrary conversational memory, generic chatbot mode, question
+timeout/reminders/expiry, human approval steps, arbitrary Telegram
+automation, multimodal answers, a workflow editor, and any generic workflow
+DSL.
 
 ---
 

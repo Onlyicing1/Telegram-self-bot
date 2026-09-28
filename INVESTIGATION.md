@@ -752,7 +752,12 @@ status untouched, so a restart cannot lose or re-ask a sent question. See
 `backend/ai/task_contract.py` (3D block) and
 `supabase/migrations/20260927020000_add_waiting_answer_status.sql`. Multi-turn
 conversational continuation (an answer driving a NEW question in the same turn)
-remains deferred.
+remains deferred. **Source-verified extension (Phase 3E, implemented):** the
+single-question restriction was lifted — a chain now carries SEVERAL question
+checkpoints (at most ONE waiting at a time; the walk stops at the first), each
+with its own correlation identity and its own answer stored in that question's
+run record, read through the existing reference mechanism. No schema change was
+required.
 
 ---
 

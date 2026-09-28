@@ -378,8 +378,10 @@ error.
   branch never falls back to the other branch. Conditions and per-occurrence
   generated content (`ai_instruction`) are mutually exclusive. Everything
   unknown or malformed fails closed (no schema change).
-  **Durable question/answer continuation**: at most ONE action of a chain may
-  be a question — a REGISTERED `ask_owner` tool call with a single bounded
+  **Durable question/answer continuation**: SEVERAL actions of a chain may be
+  questions (Phase 3E; at most ONE is ever waiting — the walk stops at the
+  first, so a later question cannot be sent before an earlier one is
+  answered) — each a REGISTERED `ask_owner` tool call with a single bounded
   plain-text `question` argument (≤512 chars), sent to the owner's own chat
   through the existing `ToolExecutor` → Telegram boundary
   (`backend/ai/tools/question.py`). When the chain reaches it the occurrence
@@ -394,16 +396,22 @@ error.
   the EXACT question message: `backend/ai/task_answers.py` (`TaskAnswerResolver`,
   wired into the existing task-events handler — no second update loop) gates on
   sender identity, correlates `chat_id + reply_to_msg_id` against the stored
-  record, normalizes the bounded answer (plain text ≤128 chars), and performs
-  ONE CAS (`resume_waiting_for_answer`: `waiting_answer → retry_pending(now)`,
-  real wall clock) that persists the answer, flips the question run to
-  `succeeded` with output `{"answer": …}`, and lets the EXISTING scheduler wake
-  resume the SAME occurrence. The resolver never executes a tool; downstream
-  actions consume the answer through the existing 3A reference
-  (`{"$ref": {"action": N, "field": "answer"}}`) or a 3C condition source;
-  a duplicate/racing reply loses the CAS and mutates nothing; one message
-  consumes at most one parked occurrence. Multi-turn conversational
-  continuation (an answer driving a new question in the same turn) remains a
+  ACTIVE checkpoint's record, normalizes the bounded answer (plain text ≤128
+  chars), and performs ONE CAS (`resume_waiting_for_answer`:
+  `waiting_answer → retry_pending(now)`, real wall clock) that persists the
+  answer, flips THAT question run to `succeeded` with output `{"answer": …}`,
+  and lets the EXISTING scheduler wake resume the SAME occurrence. Each
+  answer lives in its OWN question action's run record, so downstream
+  actions consume a SPECIFIC question's answer through the existing 3A
+  reference (`{"$ref": {"action": N, "field": "answer"}}`) or a 3C condition
+  source; the park write replaces the stored record when the chain reaches
+  the next question, a duplicate/racing reply loses the CAS and mutates
+  nothing, a late reply to an already-answered checkpoint matches no parked
+  row, and one message consumes at most one parked occurrence. A question
+  may live inside a selected conditional branch (the non-selected branch
+  never asks; its actions are marked `skipped` in the park write). No
+  schema change beyond the `waiting_answer` status. Multi-turn conversational
+  continuation (an answer driving a NEW question in the same turn) remains a
   later phase.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
