@@ -471,8 +471,10 @@ def test_no_duplicate_registrations():
     names = registry.list_names()
     # The count is a deliberate tripwire: a new tool must be registered ONCE,
     # and this number is updated together with the tool that changed it — the
-    # basic Todo surface (Part 1) and the ordered Todo-step surface (Part 2).
-    assert len(names) == len(set(names)) == 54
+    # basic Todo surface (Part 1), the ordered Todo-step surface (Part 2), and
+    # the durable ask_owner question tool (Part 3D).
+    assert len(names) == len(set(names)) == 55
+    assert "ask_owner" in names
     for name in ("todo_add", "todo_find", "todo_edit"):
         assert name in names
     for name in (

@@ -12,10 +12,12 @@ from backend.ai.task_contract import (
     BRANCH_KEY,
     BRANCH_VALUES,
     CONDITION_KEY,
+    QUESTION_TOOL,
     WAIT_KEY,
     TaskContractError,
     validate_ai_instruction,
     validate_condition,
+    validate_question_text,
 )
 
 MAX_LABEL_CHARS = 256
@@ -272,6 +274,21 @@ def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
     name = action["name"].strip()
     args = dict(action.get("arguments") or {})
     reserved = _reserved_contract_fields(action)
+    if name == QUESTION_TOOL:
+        # A question is displayable content, never an instruction carrier:
+        # exactly one bounded plain-text argument survives (no destination,
+        # no ids, no parse mode), so the owner is asked exactly what was
+        # persisted — and the model can never smuggle a Telegram operation
+        # into the ask.
+        if set(args) != {"question"}:
+            raise TaskCandidateError(
+                f"the '{QUESTION_TOOL}' action takes exactly one 'question' argument"
+            )
+        try:
+            question = validate_question_text(args["question"])
+        except TaskContractError as exc:
+            raise TaskCandidateError(f"invalid question: {exc}") from exc
+        return {"name": QUESTION_TOOL, "arguments": {"question": question}, **reserved}
     if name not in _SEND_ACTION_ALIASES:
         return {"name": name, "arguments": args, **reserved}
     text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")

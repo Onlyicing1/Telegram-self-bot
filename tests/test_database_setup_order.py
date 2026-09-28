@@ -344,7 +344,7 @@ def test_the_audited_order_is_recorded_in_the_audit_table():
     """
     section = _section_31()
     audit = section[: section.index("### 31.2")]
-    assert "all 29 migrations" in _flat(audit) or "29 files" in audit, (
+    assert "all 30 migrations" in _flat(audit) or "30 files" in audit, (
         "the audit must state that every repository migration was classified"
     )
     embedded_table = audit[audit.index("| Order | Migration") :]

@@ -378,8 +378,33 @@ error.
   branch never falls back to the other branch. Conditions and per-occurrence
   generated content (`ai_instruction`) are mutually exclusive. Everything
   unknown or malformed fails closed (no schema change).
-  Multi-turn conversational continuation is a later phase, not part of this
-  mechanism.
+  **Durable question/answer continuation**: at most ONE action of a chain may
+  be a question — a REGISTERED `ask_owner` tool call with a single bounded
+  plain-text `question` argument (≤512 chars), sent to the owner's own chat
+  through the existing `ToolExecutor` → Telegram boundary
+  (`backend/ai/tools/question.py`). When the chain reaches it the occurrence
+  parks on the ONE new status `waiting_answer` (additive migration
+  `supabase/migrations/20260927020000_add_waiting_answer_status.sql`) with a
+  durable `pending_question` record in BOTH metadata channels and the
+  question's run record left `pending` — no attempt consumed, no wait boundary
+  may precede the question, and a question may not live inside a conditional
+  branch. The scheduler, retry query, recovery query, claim CAS and event
+  duplicate guard all leave `waiting_answer` untouched by construction, so a
+  parked question survives restarts. The ONLY edge out is the owner's reply to
+  the EXACT question message: `backend/ai/task_answers.py` (`TaskAnswerResolver`,
+  wired into the existing task-events handler — no second update loop) gates on
+  sender identity, correlates `chat_id + reply_to_msg_id` against the stored
+  record, normalizes the bounded answer (plain text ≤128 chars), and performs
+  ONE CAS (`resume_waiting_for_answer`: `waiting_answer → retry_pending(now)`,
+  real wall clock) that persists the answer, flips the question run to
+  `succeeded` with output `{"answer": …}`, and lets the EXISTING scheduler wake
+  resume the SAME occurrence. The resolver never executes a tool; downstream
+  actions consume the answer through the existing 3A reference
+  (`{"$ref": {"action": N, "field": "answer"}}`) or a 3C condition source;
+  a duplicate/racing reply loses the CAS and mutates nothing; one message
+  consumes at most one parked occurrence. Multi-turn conversational
+  continuation (an answer driving a new question in the same turn) remains a
+  later phase.
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.

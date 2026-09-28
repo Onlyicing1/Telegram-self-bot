@@ -25,6 +25,7 @@ from typing import Any
 
 from backend.ai.database.task_repository import TaskRepository
 from backend.ai.scheduling import ScheduleError, is_event_schedule, parse_schedule
+from backend.ai.task_contract import WAITING_ANSWER_STATUS
 from backend.ai.task_trigger import event_trigger_matches
 
 logger = logging.getLogger(__name__)
@@ -226,11 +227,14 @@ class TaskEventDispatcher:
         # Duplicate delivery of the same (task, chat, message): a fresh
         # occurrence is created as "claimed", so any other status means the
         # key already exists and is owned by an earlier delivery (running /
-        # terminal / retry-pending). The claim CAS in ``_execute_one`` is the
-        # final guard for the concurrent-race window — two dispatches of the
-        # same event can never both move it to running.
+        # terminal / retry-pending / waiting-answer). The claim CAS in
+        # ``_execute_one`` is the final guard for the concurrent-race window —
+        # two dispatches of the same event can never both move it to running.
         status = str(getattr(occurrence, "status", "") or "")
-        if status in _EVENT_TERMINAL_OCCURRENCE_STATUSES or status in ("running", "retry_pending"):
+        if (
+            status in _EVENT_TERMINAL_OCCURRENCE_STATUSES
+            or status in ("running", "retry_pending", WAITING_ANSWER_STATUS)
+        ):
             logger.debug(
                 "TASK_EVENT_TRACE stage=duplicate_skipped task_id=%s occurrence_key=%s status=%s",
                 task.id, key, status,

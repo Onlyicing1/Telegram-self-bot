@@ -170,6 +170,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
         UpdateSaveTagsTool,
     )
     from backend.ai.tools.message import SendMessageTool
+    from backend.ai.tools.question import AskOwnerTool
     from backend.ai.tools.memory import MemoryListTool, MemoryStoreTool
     from backend.ai.tools.speech import SpeakTool
 
@@ -236,6 +237,7 @@ tool receives the same ``ToolContext`` (telegram, owner_id, tz_str).
     registry.register(TranslateHistoryTool(context))
     registry.register(SummarizeHistoryTool(context))
     registry.register(SendMessageTool(context))
+    registry.register(AskOwnerTool(context))
     registry.register(SpeakTool(context))
     registry.register(MemoryStoreTool(context))
     registry.register(MemoryListTool(context))

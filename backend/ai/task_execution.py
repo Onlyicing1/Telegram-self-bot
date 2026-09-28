@@ -14,25 +14,37 @@ import re
 from backend.ai.database.task_repository import OccurrenceRecord, TaskRepository
 from backend.ai.task_contract import (
     ACTION_RUNS_KEY,
+    ANSWER_FIELD,
     BRANCH_SKIPPED_STATUS,
     CONDITION_KEY,
     CONDITION_TOOL,
+    PENDING_QUESTION_KEY,
+    QUESTION_CHAT_ID_KEY,
+    QUESTION_MESSAGE_ID_KEY,
+    QUESTION_TEXT_KEY,
+    QUESTION_TOOL,
     SCHEDULED_OCCURRENCE_EXTRA,
+    WAITING_ANSWER_STATUS,
     BranchLayout,
     PreparedAction,
     TaskContractError,
     action_reference_error,
     action_runs_from_metadata,
+    answer_run_output,
     bounded_action_output,
     branch_name,
     build_action_run,
+    build_pending_question,
     condition_run_output,
     evaluate_condition,
+    pending_question_from_metadata,
     resolve_action_arguments,
     resolve_action_waits,
     resolve_conditions,
     selected_branch_from_runs,
     validate_prepared_action,
+    validate_question_text,
+    question_chain_error,
 )
 from backend.ai.tools.base import declared_consumable_output_fields
 from backend.ai.tools.context import ToolContext
@@ -308,6 +320,12 @@ class _ChainOutcome:
     #: Actions of the branch the chain's condition did NOT select: recorded
     #: ``skipped``, never executed, while the selected branch runs.
     not_selected: int = 0
+    #: Set when the chain reached the ONE question action: the question was
+    #: SENT (tool result carries the correlation ids), the walk stops there
+    #: (the action stays ``pending``) and the occurrence parks on
+    #: ``waiting_answer`` until the owner's correlated reply resumes it.
+    asked_at: int | None = None
+    question_record: dict[str, Any] | None = None
 
     @property
     def succeeded(self) -> int:
@@ -515,6 +533,16 @@ class TaskExecutionCoordinator:
                 occurrence, f"invalid_wait_boundary: {wait_error}", 0, 0
             )
 
+        # The bounded question contract, re-proved with the SAME rule creation
+        # enforced: at most one ask_owner action, a bounded question argument,
+        # and no question inside a conditional branch. A stored chain that
+        # cannot be one fails closed BEFORE anything executes.
+        question_error = question_chain_error(actions)
+        if question_error:
+            return await self._fail(
+                occurrence, f"invalid_question: {question_error}", 0, 0
+            )
+
         # Durable per-action state: written as each action completes, read back
         # on a retry so a succeeded side effect is never repeated and a failed
         # action resumes where it stopped.
@@ -524,6 +552,40 @@ class TaskExecutionCoordinator:
         mismatch = _run_record_mismatch(prior_runs, calls)
         if mismatch:
             return await self._fail(occurrence, mismatch, 0, 0)
+
+        # A resumed question: the answer-consuming CAS already flipped this
+        # occurrence to retry_pending and recorded the bounded answer + the
+        # question run's ``succeeded`` result in the SAME durable write. Re-prove
+        # that record here (the coordinator never trusts metadata it did not
+        # just build): the pending-question record must be answered, carry the
+        # bounded answer text, and the question run must be succeeded with the
+        # SAME answer in its output. Anything else fails closed instead of
+        # executing the downstream chain with an unproven answer.
+        resume_question = pending_question_from_metadata(occurrence.result_metadata)
+        if resume_question is not None and resume_question.get("answered"):
+            answered_run = next(
+                (run for run in prior_runs if run["position"] == resume_question.get("action")),
+                None,
+            )
+            recorded_answer = (
+                answered_run.get("output", {}).get(ANSWER_FIELD)
+                if isinstance(answered_run, dict) and isinstance(answered_run.get("output"), dict)
+                else None
+            )
+            if (
+                answered_run is None
+                or answered_run.get("status") != "succeeded"
+                or not isinstance(recorded_answer, str)
+                or not recorded_answer
+            ):
+                return await self._fail(
+                    occurrence, "answered_question_record_invalid", 0, 0
+                )
+            logger.info(
+                "TASK_CHAIN_ANSWER_RESUMED task_id=%s occurrence_key=%s action=%s",
+                occurrence.task_id, occurrence.occurrence_key,
+                resume_question.get("action"),
+            )
 
         if generation_authorized:
             try:
@@ -569,6 +631,8 @@ class TaskExecutionCoordinator:
 
         if outcome.paused_at is not None:
             return await self._park_at_wait(occurrence, outcome, calls, started)
+        if outcome.asked_at is not None:
+            return await self._park_at_question(occurrence, outcome, calls, started)
 
         successful = outcome.succeeded
         duration_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -642,6 +706,8 @@ class TaskExecutionCoordinator:
         failure: Any = ""
         paused_at: int | None = None
         paused_until: datetime | None = None
+        asked_at: int | None = None
+        question_record: dict[str, Any] | None = None
         for position, call in enumerate(calls, start=1):
             name = call["name"]
             recorded = state.get(position)
@@ -703,6 +769,60 @@ class TaskExecutionCoordinator:
             boundary = waits[position - 1] if position - 1 < len(waits) else None
             if boundary is not None and reference < boundary:
                 paused_at, paused_until = position, boundary
+                break
+            if name == QUESTION_TOOL:
+                arguments = execution_calls[position - 1].get("arguments", {})
+                resolved, reason = resolve_action_arguments(arguments, _ordered_runs(state))
+                if reason:
+                    state[position] = build_action_run(position, name, "failed", error=reason)
+                    failed_position, failure = position, reason
+                    break
+                # The ONE question of this occurrence: SEND it through the
+                # executor (the registered tool, the real Telegram boundary),
+                # then stop the walk. The action's durable run record stays
+                # ``pending`` — QUESTION WAITING is never QUESTION RUNNING and
+                # never QUESTION SUCCESS — and the occurrence parks on
+                # ``waiting_answer`` with the question's durable correlation
+                # identity (chat + message id of the SENT message) until the
+                # owner's correlated reply consumes it.
+                state[position] = build_action_run(position, name, "pending")
+                await self._persist_runs(occurrence, state)
+                result = (await self.executor.execute_calls(
+                    [{"name": name, "arguments": resolved}],
+                    owner_id=self.owner_id,
+                    session_id=f"task:{occurrence.task_id}:{occurrence.occurrence_key}",
+                    context_override=execution_context,
+                ))[0]
+                results.append(result)
+                if not result.success:
+                    # Existing action failure semantics: the question was NOT
+                    # asked, nothing is answered, nothing is parked — the
+                    # ordinary retry/failure contract applies.
+                    failure = self._action_failure(result)
+                    state[position] = build_action_run(
+                        position, name, "failed", error=str(failure)
+                    )
+                    failed_position, failure = position, failure
+                    break
+                sent_chat = result.data.get(QUESTION_CHAT_ID_KEY)
+                sent_message = result.data.get(QUESTION_MESSAGE_ID_KEY)
+                try:
+                    question_record = build_pending_question(
+                        action=position,
+                        chat_id=sent_chat,
+                        message_id=sent_message,
+                        question_text=result.data.get(QUESTION_TEXT_KEY) or arguments.get("question"),
+                        asked_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                except (TaskContractError, TypeError, ValueError) as exc:
+                    state[position] = build_action_run(
+                        position, name, "failed", error=f"question_identity_unavailable: {exc}"
+                    )
+                    failed_position, failure = position, (
+                        f"question_identity_unavailable: {exc}"
+                    )
+                    break
+                asked_at = position
                 break
             arguments = execution_calls[position - 1].get("arguments", {})
             resolved, reason = resolve_action_arguments(arguments, _ordered_runs(state))
@@ -781,6 +901,8 @@ class TaskExecutionCoordinator:
             paused_at=paused_at,
             paused_until=paused_until,
             not_selected=not_selected,
+            asked_at=asked_at,
+            question_record=question_record,
         )
 
     async def _park_at_wait(
@@ -851,6 +973,85 @@ class TaskExecutionCoordinator:
                 False, "unknown", len(calls), successful, "wait_persist_failed", record
             )
         return TaskExecutionResult(False, "waiting", len(calls), successful, metadata=record)
+
+    async def _park_at_question(
+        self,
+        occurrence: OccurrenceRecord,
+        outcome: _ChainOutcome,
+        calls: list[dict[str, Any]],
+        started: float,
+    ) -> TaskExecutionResult:
+        """Persist the sent question and park THIS occurrence on the answer.
+
+        The occurrence parks on ``waiting_answer`` — the ONE non-terminal
+        status that is neither a retry nor a running action: the wake loop,
+        the retry query, recovery and the claim CAS never consume it, and the
+        attempt count is untouched (a question is not a failure). The bounded
+        pending-question record (action position, question message chat/id,
+        bounded text, asked-at) rides BOTH metadata channels exactly like a
+        wait-park record, together with the per-action run record whose
+        question entry stays ``pending`` — QUESTION WAITING is never QUESTION
+        SUCCESS. The downstream actions are re-listed ``pending``, so the
+        parked row always carries the complete per-action state.
+
+        If the park itself fails to persist, the question HAS been sent but
+        is NOT durably recorded: the outcome is reported honestly as
+        ``question_park_failed`` (the row is still ``running`` and recovery
+        resolves it under its own contract) — never as a success, and the
+        owner may re-answer; the resume CAS refuses anything that is not the
+        parked row, so no answer can be consumed twice.
+        """
+        position = outcome.asked_at
+        record_payload = outcome.question_record
+        if position is None or not isinstance(record_payload, dict):
+            return TaskExecutionResult(
+                False, "unknown", len(calls), outcome.succeeded, "question_record_missing"
+            )
+        successful = outcome.succeeded
+        try:
+            record = _bounded_metadata({
+                "action_count": len(calls),
+                "successful_action_count": successful,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "asking_action": position,
+                PENDING_QUESTION_KEY: record_payload,
+                ACTION_RUNS_KEY: outcome.runs,
+            })
+        except ValueError as exc:
+            logger.warning(
+                "TASK_CHAIN_QUESTION_RECORD_INVALID task_id=%s occurrence_key=%s exception=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+            )
+            return TaskExecutionResult(
+                False, "unknown", len(calls), successful, "question_persist_failed"
+            )
+        try:
+            parked = await self.repository.transition_occurrence(
+                self.owner_id, occurrence.task_id, occurrence.occurrence_key,
+                WAITING_ANSWER_STATUS,
+                result_metadata=record, error_metadata=record,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "TASK_CHAIN_QUESTION_PERSIST_FAILED task_id=%s occurrence_key=%s "
+                "exception=%s",
+                occurrence.task_id, occurrence.occurrence_key, type(exc).__name__,
+            )
+            parked = None
+        if parked is None:
+            return TaskExecutionResult(
+                False, "unknown", len(calls), successful, "question_park_failed", record
+            )
+        logger.info(
+            "TASK_CHAIN_WAITING_ANSWER task_id=%s occurrence_key=%s action=%s "
+            "question_message=%s:%s already_succeeded=%s",
+            occurrence.task_id, occurrence.occurrence_key, position,
+            record_payload.get(QUESTION_CHAT_ID_KEY),
+            record_payload.get(QUESTION_MESSAGE_ID_KEY), successful,
+        )
+        return TaskExecutionResult(False, WAITING_ANSWER_STATUS, len(calls), successful, metadata=record)
 
     @staticmethod
     def _action_failure(result: ToolExecutionResult) -> str | BaseException:

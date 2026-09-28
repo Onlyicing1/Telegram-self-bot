@@ -734,6 +734,26 @@ resolution rule reusing the existing reply-to-AI/trigger entry point; the
 answer becomes the argument of the pending action and the chain continues.
 Reuse `ai_config`/`ai_messages`/the existing handler — **no new session store**.
 
+**Source-verified correction (Phase 3D, implemented).** The durable core of
+this requirement shipped as the question/answer continuation: the pending
+question is a real registered `ask_owner` tool call (never a conversation
+flag), the durable record lives in the occurrence's OWN bounded metadata
+(`pending_question`: action position, `question_chat_id`, `question_message_id`,
+`question_text`, `asked_at`, `answered`/`answered_at` — the "expiry" field was
+deliberately NOT built; a parked question waits without a clock), and the
+resolution rule is stricter than reply-to-AI: the owner's `chat_id +
+reply_to_msg_id` must name EXACTLY the stored question message, gated by sender
+identity, and consuming the answer is ONE repository CAS
+(`resume_waiting_for_answer`) — the resolver never executes a tool. The answer
+enters the chain through the existing Phase 3A reference mechanism, and the
+scheduler/claim/recovery/duplicate paths all leave the parked `waiting_answer`
+status untouched, so a restart cannot lose or re-ask a sent question. See
+`backend/ai/task_answers.py`, `backend/ai/tools/question.py`,
+`backend/ai/task_contract.py` (3D block) and
+`supabase/migrations/20260927020000_add_waiting_answer_status.sql`. Multi-turn
+conversational continuation (an answer driving a NEW question in the same turn)
+remains deferred.
+
 ---
 
 ## 16. Required architecture for the next implementation phase

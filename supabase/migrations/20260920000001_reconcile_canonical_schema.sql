@@ -1500,14 +1500,14 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_status_check') THEN
         IF NOT EXISTS (
             SELECT 1 FROM ai_task_occurrences
-            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted')
+            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer')
         ) THEN
             ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_status_check
-                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer'));
         ELSE
             RAISE WARNING 'ai_task_occurrences_status_check NOT added - % row(s) have an unrecognized status.',
                 (SELECT count(*) FROM ai_task_occurrences
-                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer'));
         END IF;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_metadata_check') THEN

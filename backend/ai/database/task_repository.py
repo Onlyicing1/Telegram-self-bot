@@ -11,11 +11,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.ai.task_contract import validate_ai_instruction, validate_prepared_action
+from backend.ai.task_contract import (
+    PENDING_QUESTION_KEY,
+    WAITING_ANSWER_STATUS,
+    validate_ai_instruction,
+    validate_pending_question,
+    validate_prepared_action,
+)
 
 logger = logging.getLogger(__name__)
 TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
-OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted"})
+OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted", WAITING_ANSWER_STATUS})
 TODO_SCHEDULE_TYPE = "todo"
 SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly", "event", TODO_SCHEDULE_TYPE})
 # The ONE unscheduled task kind: a basic Todo. A todo row has a title, a
@@ -66,7 +72,28 @@ DELETION_STALE = "stale"
 # have to invent a new execution boundary for it), and that rule is enforced
 # here — see ``_task_status_transition_allowed``.
 _ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired"}, "paused": {"paused", "active"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
-_ALLOWED_OCCURRENCE_TRANSITIONS = {"claimed": {"claimed", "running", "cancelled", "expired", "interrupted"}, "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted"}, "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"}, "succeeded": {"succeeded"}, "failed": {"failed"}, "cancelled": {"cancelled"}, "expired": {"expired"}, "interrupted": {"interrupted", "retry_pending", "failed"}}
+# ── Durable questions (Part 3D) ─────────────────────────────────────────────
+# A claimed occurrence may park on ``waiting_answer`` while its ONE question
+# action waits for the owner's correlated reply. It is the ONE non-terminal
+# status that is neither a retry nor a running action: no scheduler query,
+# recovery rule, attempt count or claim CAS ever consumes it — the ONLY edge
+# that leaves it is ``resume_waiting_for_answer`` (the CAS that consumes the
+# correlated answer) and, in recovery, a bounded cancel path. Terminal
+# occurrences and ``waiting_answer`` rows are excluded from every list the
+# scheduler/recovery polls, exactly like succeeded/failed history.
+_PARKED_ANSWER_STATUS = WAITING_ANSWER_STATUS
+
+_ALLOWED_OCCURRENCE_TRANSITIONS = {
+    "claimed": {"claimed", "running", "cancelled", "expired", "interrupted"},
+    "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted", WAITING_ANSWER_STATUS},
+    "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"},
+    "succeeded": {"succeeded"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+    "expired": {"expired"},
+    "interrupted": {"interrupted", "retry_pending", "failed"},
+    WAITING_ANSWER_STATUS: {WAITING_ANSWER_STATUS},
+}
 
 
 # Degraded-store reasons. ``unavailable`` is claimed ONLY when the failure is
@@ -264,6 +291,15 @@ def _validate_occurrence_input(data):
             validate_prepared_action(preparation.get("action"))
     _validate_json_payload(data.get("action_snapshot"), array=True); _validate_json_payload(data.get("error_metadata", {}), metadata=True); _validate_json_payload(data.get("result_metadata", {}), metadata=True)
     if data.get("status") == "retry_pending" and data.get("retry_at") is None: raise ValueError("retry_pending requires retry_at")
+    if data.get("status") == WAITING_ANSWER_STATUS:
+        record = data.get("result_metadata")
+        pending = (record or {}).get(PENDING_QUESTION_KEY) if isinstance(record, dict) else None
+        if not pending:
+            raise ValueError("waiting_answer requires a pending_question record")
+        try:
+            validate_pending_question(pending)
+        except ValueError as exc:
+            raise ValueError(f"invalid pending question record: {exc}") from exc
 def normalize_step_title(value) -> str:
     """The owner's own words for a step, whitespace-collapsed and bounded.
 
@@ -356,6 +392,10 @@ class TaskRepository:
     async def list_occurrences(self, owner_id, task_id=None, limit=100): raise NotImplementedError
     async def list_recoverable_occurrences(self, owner_id, limit=100): raise NotImplementedError
     async def list_due_retry_occurrences(self, owner_id, now, limit=10): raise NotImplementedError
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10): raise NotImplementedError
+    async def resume_waiting_for_answer(
+        self, owner_id, task_id, occurrence_key, *, answer, answer_metadata
+    ): raise NotImplementedError
     async def claim_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
     async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
     async def next_run_hint(self, owner_id): raise NotImplementedError
@@ -460,6 +500,28 @@ class InMemoryTaskRepository(TaskRepository):
     async def list_recoverable_occurrences(self, owner_id, limit=100): return [_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status in {"claimed","running","interrupted"}][:max(0,limit)]
     async def list_due_retry_occurrences(self, owner_id, now, limit=10):
         ref=_parse_dt(now); return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status=="retry_pending" and r.retry_at is not None and r.retry_at<=ref], key=lambda r:(r.retry_at,r.id))[:max(0,limit)]
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10):
+        """The owner's occurrences parked on an open question (order-stable)."""
+        return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status==WAITING_ANSWER_STATUS], key=lambda r:(r.updated_at,r.id))[:max(0,limit)]
+    async def resume_waiting_for_answer(self, owner_id, task_id, occurrence_key, *, answer, answer_metadata):
+        """The ONE resume edge for a parked question: park → retry_pending(now).
+
+        ONE in-memory dict write carries the whole consume atomically with
+        respect to the event loop: the answer metadata, the succeeded question
+        run record, and the eligibility instant. A second correlated reply
+        finds the occurrence already ``retry_pending``/``running`` and is
+        refused by the transition rule (ValueError) — the downstream actions
+        can never be executed twice by a duplicate answer.
+        """
+        r=self._occurrences.get((task_id,occurrence_key))
+        if not r or r.owner_id!=owner_id or r.status!=WAITING_ANSWER_STATUS:
+            return None
+        now=_now()
+        r.result_metadata=_copy(answer_metadata)
+        r.error_metadata={}
+        r.status="retry_pending"; r.retry_at=now; r.updated_at=now
+        r.finished_at=None
+        return _copy(r)
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         r=self._occurrences.get((task_id,occurrence_key))
         if not r or r.owner_id!=owner_id or r.status not in {"claimed","retry_pending","interrupted"}:return None
@@ -854,6 +916,12 @@ class SupabaseTaskRepository(TaskRepository):
         try:
             result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status","retry_pending").lte("retry_at",_serialize(now)).order("retry_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
         except Exception as exc:self._degrade("Supabase retry query failed; using fallback: %s",exc);return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10):
+        """The owner's parked questions (oldest first); degrades to the fallback."""
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status",WAITING_ANSWER_STATUS).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except asyncio.CancelledError:raise
+        except Exception as exc:self._degrade("Supabase pending-question query failed; using fallback: %s",exc);return await self._fallback.list_waiting_answer_occurrences(owner_id,limit)
     async def claim_occurrence(self, owner_id, task_id, occurrence_key):
         current=await self.get_occurrence(owner_id,task_id,occurrence_key)
         if not current or current.status not in {"claimed","retry_pending","interrupted"}:return None
@@ -902,6 +970,32 @@ class SupabaseTaskRepository(TaskRepository):
                 self._degrade("Supabase occurrence transition failed; using fallback: %s",exc)
                 return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
         row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+    async def resume_waiting_for_answer(self, owner_id, task_id, occurrence_key, *, answer, answer_metadata):
+        """The ONE resume edge for a parked question: ONE CAS write consumes it.
+
+        ``waiting_answer -> retry_pending`` is applied ONLY to the row that is
+        still parked (the ``.eq("status", ...)`` CAS guard is the duplicate
+        guard): the persisted metadata carries the bounded answer, the
+        question run's ``succeeded`` record, and the eligibility pair
+        (``retry_pending`` + ``retry_at`` = the write's own now) — so the
+        wake loop resumes the SAME occurrence through the existing claim
+        path. A racing second reply loses the CAS and returns None; it can
+        never execute the downstream chain twice. ``updated_at`` is the
+        authoritative write instant, so a stale/absent client clock can
+        never corrupt the eligibility boundary.
+        """
+        current=await self.get_occurrence(owner_id,task_id,occurrence_key)
+        if not current or current.status!=WAITING_ANSWER_STATUS:return None
+        now=_now().isoformat()
+        outgoing={k:_serialize(v) for k,v in answer_metadata.items()}
+        outgoing["error_metadata"]={};outgoing["status"]="retry_pending";outgoing["retry_at"]=now;outgoing["finished_at"]=None;outgoing["updated_at"]=now
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",WAITING_ANSWER_STATUS).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase answer-resume failed; using fallback: %s",exc)
+            return await self._fallback.resume_waiting_for_answer(owner_id,task_id,occurrence_key,answer=answer,answer_metadata=answer_metadata)
+
     def _step_payload(self, owner_id, payload):
         value={**payload,"owner_id":owner_id};_validate_step_input(value);return {k:_serialize(v) for k,v in value.items() if k not in {"id","created_at","updated_at"}}
     async def create_steps(self, owner_id, task_id, titles):

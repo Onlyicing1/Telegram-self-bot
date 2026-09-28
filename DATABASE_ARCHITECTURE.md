@@ -73,14 +73,17 @@ seven later additive migrations, in one fenced block. There is no "step 0", no
 second block to paste and no shell workflow. Open this section, copy §31.3,
 paste it into the Supabase SQL Editor as `postgres` and run it. §31.1 is the
 reconciliation audit that proves the block equals the effective final state of
-all 29 repository migrations — including the two Todo migrations
-`20260926000001_add_todo_schedule_type.sql` and
-`20260927000001_add_todo_steps.sql`.
+all 30 repository migrations — including the two Todo migrations
+`20260926000001_add_todo_schedule_type.sql`,
+`20260927000001_add_todo_steps.sql` and the Taskloom question-status widening
+`20260927020000_add_waiting_answer_status.sql` (classified additive: it only
+widens the `ai_task_occurrences` status CHECK, which part 1 already re-adds in
+final form).
 
-### 31.1 Reconciliation audit — all 29 migrations, classified against the canonical script
+### 31.1 Reconciliation audit — all 30 migrations, classified against the canonical script
 
 The script in §31.3 was reconciled against **every file currently in
-`supabase/migrations/` (29 files)**, not against the list any earlier document
+`supabase/migrations/` (30 files)**, not against the list any earlier document
 carried. Each migration was classified by its **effective schema change** —
 what a fresh database must end up with after it runs — and the classification
 is pinned by `tests/test_database_setup_order.py` (statement-identity for the
@@ -168,7 +171,7 @@ migration creates them.
    `todo_steps` table of the multi-step phase, embedded verbatim from its
    migration file.
 6. **What was corrected.** Documentation only: the §31 intro, §31.1 and §20
-   now state the current count (29 migration files; 8 embedded parts; 16
+   now state the current count (30 migration files; 8 embedded parts; 16
    canonical tables + `todo_steps`) and the reconciliation claim explicitly.
 7. **Todo-specific database changes.** Part 7 of §31.3 carries
    `20260926000001_add_todo_schedule_type.sql` in full:
@@ -1651,14 +1654,14 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_status_check') THEN
         IF NOT EXISTS (
             SELECT 1 FROM ai_task_occurrences
-            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted')
+            WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer')
         ) THEN
             ALTER TABLE ai_task_occurrences ADD CONSTRAINT ai_task_occurrences_status_check
-                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+                CHECK (status IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer'));
         ELSE
             RAISE WARNING 'ai_task_occurrences_status_check NOT added - % row(s) have an unrecognized status.',
                 (SELECT count(*) FROM ai_task_occurrences
-                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted'));
+                  WHERE status NOT IN ('claimed', 'running', 'succeeded', 'failed', 'retry_pending', 'cancelled', 'expired', 'interrupted', 'waiting_answer'));
         END IF;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_task_occurrences_error_metadata_check') THEN
@@ -3557,7 +3560,7 @@ Durable occurrence/attempt history for `ai_tasks`. The base definition lives in 
 | `action_snapshot` | `jsonb` | NO | JSON array, 1–5 actions, max 32,768 bytes |
 | `scheduled_for` | `timestamptz` | NO | UTC scheduled instant |
 | `attempt` | `smallint` | NO | `1`; CHECK 1–3 |
-| `status` | `text` | NO | `'claimed'`; CHECK `claimed`, `running`, `succeeded`, `failed`, `retry_pending`, `cancelled`, `expired`, `interrupted` |
+| `status` | `text` | NO | `'claimed'`; CHECK `claimed`, `running`, `succeeded`, `failed`, `retry_pending`, `cancelled`, `expired`, `interrupted`, `waiting_answer` |
 | `claimed_at` | `timestamptz` | YES | Claim timestamp |
 | `started_at` | `timestamptz` | YES | Start timestamp |
 | `finished_at` | `timestamptz` | YES | Finish timestamp |
@@ -4181,6 +4184,7 @@ migration. No code change needed.
 | 17 | `20260922000001_add_saved_items_search_indexes.sql` | The Save V2 resolver's two search indexes on `saved_items`: `idx_saved_items_display_name_trgm` (GIN trigram for the `display_name ILIKE '%token%'` prefilter; enables `pg_trgm` itself) and `idx_saved_items_tags` (GIN for whole-tag containment `tags.cs.{…}`). Additive successor to #15/#16: indexes only — no column, no row, no `save_code` change; idempotent; reloads the PostgREST schema cache | **NOT APPLIED — owner action required** (§2 index table). Safe on any database that already has `saved_items` (created by #15 or earlier migrations) |
 | 18 | `20260926000001_add_todo_schedule_type.sql` | Widens exactly two existing `ai_tasks` constraints for the basic Todo item: `ai_tasks_schedule_type_check` gains `'todo'`, and `ai_tasks_actions_count` becomes conditional so a `'todo'` row stores 0–5 actions (0 in practice) while every scheduled row keeps 1–5. No table, no column, no index, no policy, no grant, no row and no backfill; ends with `NOTIFY pgrst, 'reload schema'` | **NOT APPLIED — owner action required** (§31.3, part 7 of 7; the row shape is documented in §15). Until it runs, the legacy enum and actions count still hold: a Todo *create* is rejected by the old CHECK and the application reports that honestly, while every scheduled task keeps working unchanged |
 | 19 | `20260927000001_add_todo_steps.sql` | Creates the ONE new table of the multi-step phase: `todo_steps` — the ordered steps of ONE todo. `task_id` REFERENCES `ai_tasks(id)` `ON DELETE CASCADE` (a step can never be orphaned), denormalized `owner_id` (every repository read/write filters by it), 1-based `position` with `UNIQUE (task_id, position)` (never renumbered), nonblank ≤256-char `title`, `status` CHECK `active`/`completed` (no other state exists), CAS `version` (a stale mutation writes nothing), `completed_at` bound to the status, timestamps; RLS + SELECT-only `anon`/`authenticated`; ends with `NOTIFY pgrst` and a verification query. Additive: no existing table, column, index, policy, grant or row is touched | **NOT APPLIED — owner action required** (§31.3, part 8 of 8; the table is documented in §15). Without it the application keeps every Part 1 Todo behaviour and reports step operations as not-durable instead of pretending they persisted |
+| 20 | `20260927020000_add_waiting_answer_status.sql` | Widens exactly the `ai_task_occurrences_status_check` constraint to admit the Taskloom question-park status `waiting_answer` (durable question/answer continuation). No table, no column, no index, no policy, no grant, no row; the widened enum accepts every row the old constraint accepted; ends with `NOTIFY pgrst` | **NOT APPLIED — owner action required**. Until it runs, the repository's status validation refuses the park write (fail closed): a question chain reports the park honestly instead of pretending a question was stored, and every scheduled/waiting/branch behaviour keeps working unchanged |
 
 > This table is not exhaustive: the `20260827…`–`20260917…` migration files
 > (`ai_config` trigger / `show_question` / STT columns, `ai_usage`,

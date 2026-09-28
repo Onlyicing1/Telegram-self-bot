@@ -510,10 +510,18 @@ class RuntimeSupervisor:
             # Event-driven automation shares the same repository, execution
             # coordinator, and outcome notifier as the time scheduler — no
             # parallel authorities. The handler is a no-op until configured.
+            from backend.ai.task_answers import TaskAnswerResolver
             from backend.ai.task_event_dispatcher import TaskEventDispatcher
             from backend.bot.handlers import task_events
             task_events.configure(TaskEventDispatcher(
                 get_task_repository(), self.owner_id, coordinator, outcome_notifier
+            ))
+            # Durable question/answer correlation (Part 3D): the SAME event
+            # handler also feeds the resolver, so the owner's explicit reply
+            # to a sent question resumes the parked occurrence through the
+            # existing scheduler path. No second loop, no second authority.
+            task_events.configure_answer_resolver(TaskAnswerResolver(
+                get_task_repository(), self.owner_id
             ))
         await self._task_scheduler.start()
 

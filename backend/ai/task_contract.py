@@ -959,6 +959,296 @@ def selected_branch_from_runs(runs: Any, position: int) -> tuple[str | None, str
     return branch, ""
 
 
+# ── Durable question / answer continuation ──────────────────────────────────
+# ONE action of a chain may be a QUESTION: a REGISTERED tool call (the same
+# ToolRegistry → ToolExecutor → TelegramAPI boundary every scheduled action
+# uses) whose result is produced LATER, by the owner's correlated reply. When
+# the chain reaches it, the question is sent through the tool, the occurrence
+# parks durably on the ``waiting_answer`` status (the ONE non-terminal,
+# non-retry state the scheduler, the wake loop, recovery and the claim CAS
+# already keep their hands off), and the SAME occurrence resumes exactly where
+# it stopped when the answer arrives. The question is DATA in the task
+# definition — bounded text, never an executable instruction — and the ANSWER
+# enters the chain through the EXISTING Phase 3A reference mechanism: the
+# question action's run record carries the single bounded field ``answer``, so
+# a later action consumes it with {"$ref": {"action": N, "field": "answer"}}
+# and a condition reads it with its existing source/operator/value contract.
+# No second reference language, no second result type, no conversation.
+QUESTION_TOOL = "ask_owner"
+#: The single field of the question action's durable result.
+ANSWER_FIELD = "answer"
+#: Occurrence-metadata key holding the bounded pending-question record.
+PENDING_QUESTION_KEY = "pending_question"
+#: Identity of the exact Telegram message that carries the question.
+QUESTION_MESSAGE_ID_KEY = "question_message_id"
+QUESTION_CHAT_ID_KEY = "question_chat_id"
+QUESTION_TEXT_KEY = "question_text"
+QUESTION_ASKED_AT_KEY = "asked_at"
+QUESTION_ANSWERED_KEY = "answered"
+QUESTION_ANSWER_AT_KEY = "answered_at"
+#: Statuses an occurrence may park on while a question is open (the smallest
+#: state extension compatible with 3A/3B: the question action's own run record
+#: stays ``pending`` — QUESTION WAITING is never QUESTION SUCCESS).
+WAITING_ANSWER_STATUS = "waiting_answer"
+MAX_QUESTION_CHARS = 512
+MAX_ANSWER_CHARS = 128
+MAX_PENDING_QUESTION_BYTES = 1024
+_QUESTION_META_KEYS = frozenset({
+    "action", QUESTION_CHAT_ID_KEY, QUESTION_MESSAGE_ID_KEY, QUESTION_TEXT_KEY,
+    QUESTION_ASKED_AT_KEY, QUESTION_ANSWERED_KEY, QUESTION_ANSWER_AT_KEY,
+})
+
+
+def validate_question_text(value: Any) -> str:
+    """The ONE accepted question payload: bounded, nonblank, ordinary text.
+
+    A question is displayable content for the owner, never an instruction
+    carrier: no object, no list, no HTML/Telegram parse mode beyond plain
+    text, and within the bounded size. Everything else fails closed.
+    """
+    if not isinstance(value, str):
+        raise TaskContractError("a question must be plain text")
+    text = " ".join(value.split())
+    if not text:
+        raise TaskContractError("a question must be nonblank")
+    if len(text) > MAX_QUESTION_CHARS:
+        raise TaskContractError(
+            f"a question must be at most {MAX_QUESTION_CHARS} characters"
+        )
+    return text
+
+
+def normalize_answer(value: Any) -> tuple[str | None, str]:
+    """``(answer, error)`` — the ONE accepted correlated answer.
+
+    Ordinary text only, whitespace-collapsed and bounded; media, captions and
+    everything Telegram does not deliver as plain text are refused with an
+    honest reason (never silently consumed). A bounded blank answer is a
+    refusal, not an empty resume.
+    """
+    if not isinstance(value, str):
+        return None, "answer_not_text"
+    text = " ".join(value.split())
+    if not text:
+        return None, "answer_blank"
+    if len(text) > MAX_ANSWER_CHARS:
+        return None, "answer_too_long"
+    return text, ""
+
+
+def build_pending_question(
+    *,
+    action: int,
+    chat_id: Any,
+    message_id: Any,
+    question_text: Any,
+    asked_at: Any,
+) -> dict[str, Any]:
+    """The bounded durable record of ONE open question, validated as built.
+
+    Everything the resume needs and nothing else: which action of THIS
+    occurrence asked, the exact Telegram identity of the question message
+    (chat + message id — the explicit correlation handle), the bounded text
+    the owner saw, and when it was asked. ``answered`` is False until a
+    correlated answer is durably consumed.
+    """
+    if isinstance(action, bool) or not isinstance(action, int) or not 1 <= action <= MAX_ACTIONS:
+        raise TaskContractError("a pending question needs the asking action's position")
+    chat = chat_id if isinstance(chat_id, int) and chat_id != 0 else None
+    message = message_id if isinstance(message_id, int) and message_id > 0 else None
+    if chat is None or message is None:
+        raise TaskContractError(
+            "a pending question needs the question message's chat and message id"
+        )
+    text = validate_question_text(question_text)
+    stamp = " ".join(str(asked_at or "").split())
+    if not stamp:
+        raise TaskContractError("a pending question needs its asked-at instant")
+    value = {
+        "action": action,
+        QUESTION_CHAT_ID_KEY: chat,
+        QUESTION_MESSAGE_ID_KEY: message,
+        QUESTION_TEXT_KEY: text,
+        QUESTION_ASKED_AT_KEY: stamp,
+        QUESTION_ANSWERED_KEY: False,
+    }
+    if len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PENDING_QUESTION_BYTES:
+        raise TaskContractError("a pending question record exceeds its bounded size")
+    return value
+
+
+def validate_pending_question(value: Any) -> dict[str, Any]:
+    """Normalize ONE stored pending-question record; every deviation fails closed.
+
+    The consumed state rides the same record: once the resume CAS has durably
+    consumed a reply, the stored record carries ``answered`` plus its
+    ``answered_at`` instant. Both are preserved verbatim — never re-derived,
+    never guessed — and an answered record without its stamp fails closed.
+    """
+    if not isinstance(value, dict):
+        raise TaskContractError("a pending question must be an object")
+    extra = set(value) - _QUESTION_META_KEYS
+    if extra:
+        raise TaskContractError("a pending question carries unsupported fields")
+    if not value:
+        raise TaskContractError("a pending question must not be empty")
+    try:
+        built = build_pending_question(
+            action=value.get("action"),
+            chat_id=value.get(QUESTION_CHAT_ID_KEY),
+            message_id=value.get(QUESTION_MESSAGE_ID_KEY),
+            question_text=value.get(QUESTION_TEXT_KEY),
+            asked_at=value.get(QUESTION_ASKED_AT_KEY),
+        )
+    except TaskContractError as exc:
+        raise TaskContractError(f"invalid pending question: {exc}") from exc
+    answered = value.get(QUESTION_ANSWERED_KEY, False)
+    if not isinstance(answered, bool):
+        raise TaskContractError("invalid pending question: answered must be a boolean")
+    if answered:
+        stamp = value.get(QUESTION_ANSWER_AT_KEY)
+        if not isinstance(stamp, str) or not stamp.strip():
+            raise TaskContractError(
+                "invalid pending question: an answered question carries its "
+                "answered-at instant"
+            )
+        built[QUESTION_ANSWERED_KEY] = True
+        built[QUESTION_ANSWER_AT_KEY] = " ".join(stamp.split())
+    return built
+
+
+def pending_question_from_metadata(metadata: Any) -> dict[str, Any] | None:
+    """``(record | None)`` — the ONE open question of ONE occurrence, or None.
+
+    Read from the occurrence's own bounded metadata channels only. A
+    malformed record raises so the caller fails closed instead of resuming a
+    workflow it cannot account for.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    for channel in (PENDING_QUESTION_KEY,):
+        record = metadata.get(channel)
+        if record is None:
+            continue
+        if isinstance(record, dict) and not record:
+            continue
+        return validate_pending_question(record)
+    return None
+
+
+def question_chain_error(actions: Any) -> str | None:
+    """``(error | None)`` — the ONE bounded question contract of an action list.
+
+    Enforced at task creation AND re-proved verbatim before any execution: at
+    most ONE question per chain, the question's registered tool call carries
+    ONLY its bounded ``question`` argument (never a destination, a reference
+    is still allowed only through the shared 3A reference contract), no wait
+    boundary may sit BEFORE the question (a question parks on its own answer,
+    not on a clock), and — after the 3C branch gate has accepted the chain —
+    no question may live inside either branch (a question needs the OWNER's
+    answer, and the chain must not depend on an answer for a branch the
+    condition could then re-decide around). Anything else fails closed.
+    """
+    if not isinstance(actions, list) or not actions:
+        return None
+    positions = [
+        position
+        for position, action in enumerate(actions, start=1)
+        if isinstance(action, dict) and action.get("name") == QUESTION_TOOL
+    ]
+    if not positions:
+        return None
+    if len(positions) > 1:
+        return "only one question per chain is supported"
+    question_position = positions[0]
+    condition_position, branches, structure_error = _branch_structure(actions)
+    if structure_error:
+        return None  # the condition contract reports its own failure verbatim
+    if branches.get(question_position) is not None:
+        return (
+            f"action {question_position}: a question cannot live inside a "
+            "conditional branch"
+        )
+    if condition_position is not None:
+        condition = actions[condition_position - 1]
+        source = condition.get(CONDITION_KEY)
+        target = source.get("source") if isinstance(source, dict) else None
+        condition_reads_answer = (
+            isinstance(target, dict) and target.get("action") == question_position
+        )
+        if not condition_reads_answer:
+            # The condition does NOT consume the answer, so a conditional
+            # structure around the question is the one thing that could
+            # re-decide around an answer the owner may never give.
+            for position, branch in branches.items():
+                if position < question_position:
+                    continue
+                if branch == BRANCH_TRUE:
+                    return (
+                        f"action {position}: a branch after a question must wait for "
+                        "the answer outside the conditional structure"
+                    )
+    for position in range(1, question_position):
+        earlier = actions[position - 1]
+        if isinstance(earlier, dict) and earlier.get(WAIT_KEY) is not None:
+            return (
+                f"action {position}: a wait boundary may not sit before the "
+                f"question at action {question_position} — a question parks on "
+                "its own answer, not on a clock"
+            )
+    action = actions[question_position - 1]
+    arguments = action.get("arguments")
+    if not isinstance(arguments, dict) or set(arguments) != {"question"}:
+        return (
+            f"action {question_position}: '{QUESTION_TOOL}' takes exactly one "
+            "bounded 'question' argument"
+        )
+    try:
+        validate_question_text(arguments.get("question"))
+    except TaskContractError as exc:
+        return f"action {question_position}: {exc}"
+    return None
+
+
+def answer_run_output(answer: str) -> dict[str, Any]:
+    """The bounded durable result of ONE answered question.
+
+    Exactly the structured shape a chain action's result uses — the single
+    declared field ``answer`` — so no second result type exists and the
+    existing reference/condition mechanisms read it unchanged.
+    """
+    return {ANSWER_FIELD: answer}
+
+
+def pending_question_correlation_error(
+    record: Any, *, owner_id: Any, chat_id: Any, reply_to_message_id: Any
+) -> str | None:
+    """``(error | None)`` — the EXPLICIT correlation proof for one reply.
+
+    A reply may resume a question only when EVERY identity agrees: the same
+    owner (the answerer is the task owner), the same chat the question was
+    sent to, and the reply's ``reply_to_msg_id`` naming EXACTLY the stored
+    question message. Anything else — no reply target, a reply to another
+    message, another chat — is not an answer and fails closed without
+    touching the pending workflow.
+    """
+    try:
+        question = validate_pending_question(record)
+    except (TaskContractError, TypeError, ValueError):
+        return "pending_question_invalid"
+    if not isinstance(owner_id, int) or owner_id <= 0:
+        return "answer_owner_unverified"
+    if not isinstance(chat_id, int) or chat_id != question[QUESTION_CHAT_ID_KEY]:
+        return "answer_chat_mismatch"
+    if (
+        isinstance(reply_to_message_id, bool)
+        or not isinstance(reply_to_message_id, int)
+        or reply_to_message_id != question[QUESTION_MESSAGE_ID_KEY]
+    ):
+        return "answer_not_correlated"
+    return None
+
+
 # ── Durable wait boundaries ─────────────────────────────────────────────────
 # One action may carry ONE optional reserved field, ``not_before``: an ISO-8601
 # timestamp naming the earliest instant at which THAT action may run. It is

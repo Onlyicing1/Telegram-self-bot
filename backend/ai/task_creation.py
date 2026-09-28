@@ -29,6 +29,7 @@ from backend.ai.task_contract import (
     AIInstruction,
     action_reference_error,
     is_action_reference,
+    question_chain_error,
     resolve_action_waits,
     resolve_conditions,
     validate_ai_instruction,
@@ -414,6 +415,14 @@ class TaskCreationService:
             if condition_error:
                 _creation_trace("action_ineligible", reason=condition_error)
                 raise _invalid(condition_error)
+            # The ONE bounded question contract of the chain: at most one
+            # ask_owner action, a bounded plain-text question, and no question
+            # inside a conditional branch. An invalid question is a
+            # configuration failure — never a silently skipped ask.
+            question_error = question_chain_error(actions)
+            if question_error:
+                _creation_trace("action_ineligible", reason=question_error)
+                raise _invalid(question_error)
             # Per-action wait boundaries are part of the durable definition:
             # each one is resolved against the task's own timezone and stored
             # as an absolute instant, so the persisted chain never depends on

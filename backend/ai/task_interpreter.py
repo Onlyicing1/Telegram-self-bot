@@ -118,6 +118,14 @@ CANDIDATE_SCHEMA = {
                             "action."
                         ),
                     },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "ONLY for the 'ask_owner' tool: the single bounded "
+                            "plain-text question to send the owner. The workflow "
+                            "pauses until the owner replies to it."
+                        ),
+                    },
                 },
             },
         },
@@ -596,6 +604,15 @@ class TaskInterpreter:
             "actions. Set 'notify_on_outcome': true ONLY when the user explicitly asks to be notified "
             "when the task runs or fails ('notify me', 'خبرم کن', 'به من اطلاع بده'). Otherwise omit "
             "both flags: scheduled execution must stay silent by default."
+            "\n\n"
+            "QUESTIONS (bounded, at most ONE 'ask_owner' action per task): when the user asks the "
+            "task to ASK them something mid-run ('از من بپرس …', 'ask me …', 'if not enough "
+            "information, ask me …'), insert ONE action {'name': 'ask_owner', 'arguments': "
+            "{'question': '<the short question>'}} between the actions. The question is plain "
+            "text only (≤ 512 chars) — never a destination, ids or code — and a later action "
+            "consumes the reply with a reference {'$ref': {'action': <question's action "
+            "number>, 'field': 'answer'}}; a condition may read the same field. Never combine "
+            "ask_owner with per-occurrence generated arguments ('ai_instruction')."
             "\n\n"
             "EXAMPLE (mirrors the multi-line Persian structure): user writes:\n"
             "هر ۵ دقیقه\n"

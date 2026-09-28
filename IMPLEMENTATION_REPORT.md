@@ -1,6 +1,6 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Latest phase — TODO PART 3C — BOUNDED CONDITIONAL BRANCHING
+## Previous phase — TODO PART 3C — BOUNDED CONDITIONAL BRANCHING
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain waiting`, Phase 3B).
@@ -339,11 +339,267 @@ were added.
 
 Nested/multi-level branching, one-sided conditions, additional operators
 (`contains`/`exists`/ordering), loops and any repeated/returning edge, DAGs or
-parallel branches, autonomous replanning, question + answer continuation,
-multi-turn conversational continuation of a pending workflow, human approval
-steps, a generic workflow/automation language, workflow UI or editor, and every
-premium task-manager feature. The manual Supabase setup script remains
-owner-applied and untouched by this phase.
+parallel branches, autonomous replanning, multi-turn conversational continuation
+of a pending workflow (durable question/answer shipped later, in Phase 3D),
+human approval steps, a generic workflow/automation language, workflow UI or
+editor, and every premium task-manager feature. The manual Supabase setup script
+remains owner-applied and untouched by this phase.
+
+---
+
+## Latest phase — TODO PART 3D — DURABLE QUESTION/ANSWER CONTINUATION
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `e702c18` = `origin/main` (`feat(todo): add bounded conditional
+branching`, Phase 3C). Every Phase 3A/3B/3C contract is reused unchanged: one
+workflow = one `ai_tasks` row, ONE scheduler (`TaskScheduler`), ONE occurrence
+authority (`TaskExecutionCoordinator`), ONE executor (`ToolExecutor`), the
+bounded per-action run record, the skip-on-resume rule, the durable
+`not_before` wait and the bounded conditional branching. Phase 3D adds exactly
+ONE capability: a durable chain may carry ONE `ask_owner` action whose answer
+is the owner's correlated Telegram reply.
+
+### Phase objective
+
+“ساعت ۹ ازم بپرس دانشگاه فردا تعطیله یا نه. جوابمو با تگ تعطیلی ذخیره کن.”
+must ASK (a real Telegram message from the bot), PARK until the owner replies
+to that exact message, and then resume the SAME occurrence and run the rest of
+the chain with the answer — durably, across restarts, without ever re-asking,
+re-executing a finished action, or resuming on a wrong reply.
+
+    ASK → (park: waiting_answer, no clock) → (owner replies) → SEND/TAG
+
+This is NOT a conversational loop, NOT multi-turn chat continuation, NOT human
+approval plumbing, and NOT a second scheduler: the question is one tool call,
+the park is one status value, the resume is one repository CAS, and the answer
+enters the chain through the EXISTING Phase 3A reference mechanism.
+
+### The question representation (exact)
+
+ONE action of the chain may be a question. It is a REGISTERED tool call —
+`QUESTION_TOOL = "ask_owner"` (`backend/ai/tools/question.py`, registered by
+the existing `ToolRegistry`; the registry stays the capability allowlist and
+now exposes 55 tools) — whose arguments are exactly one bounded key:
+
+```json
+{"name": "ask_owner", "arguments": {"question": "آیا دانشگاه فردا تعطیل است؟"}}
+```
+
+Validated by `backend/ai/task_contract.py`:
+
+* `validate_question_text` — plain nonblank text, at most
+  `MAX_QUESTION_CHARS = 512` characters (fail closed).
+* `MAX_ANSWER_CHARS = 128` — the accepted answer is whitespace-collapsed plain
+  text at most this long (`normalize_answer`); media, captions, stickers and
+  over-long replies are honest refusals (`answer_not_text`, `answer_blank`,
+  `answer_too_long`), never silently consumed.
+* `MAX_PENDING_QUESTION_BYTES = 1024` — the whole durable question record must
+  serialize under one kilobyte.
+* The question tool call takes ONLY the `question` argument — never a
+  destination. The destination is always the owner's own chat
+  (`context.extra["chat_id"]` when present, else `context.owner_id`), resolved
+  inside the tool, never by the model.
+
+### Chain rules (fail closed, creation AND re-proof)
+
+`question_chain_error` is enforced at task creation (`task_creation.py`, after
+the condition gate and before the wait gate) and re-proved verbatim by the
+coordinator before any execution (`backend/ai/task_execution.py`):
+
+1. **At most ONE question per chain.**
+2. **The question tool call takes exactly one bounded `question` argument**;
+   a 3A result reference is still allowed INSIDE later actions' arguments, but
+   the question call itself carries no destination, no reference, no extras.
+3. **No wait boundary before the question** (`action N: a wait boundary may
+   not sit before the question at action M — a question parks on its own
+   answer, not on a clock`). A `not_before` earlier in the chain would make
+   the scheduler claim the occurrence before the question could be asked and
+   park, which the two-park contract below cannot express.
+4. **No question inside a conditional branch.** After the 3C branch gate has
+   accepted the chain, a question inside either branch is rejected: the chain
+   must not depend on an answer for a branch the condition could re-decide
+   around. (A condition that READS the answer — the documented 3C composition
+   "condition after question" — remains legal and is explicitly allowed by
+   this rule's early-return path, which skips only the branch check, never the
+   wait check or argument validation.)
+5. Conditions and `ai_instruction` stay mutually exclusive (3C rule); the
+   question composes with references exactly like any other tool result.
+
+### The park: `waiting_answer` — ONE new status value
+
+When `_execute_chain` reaches the question action, the REAL registered tool
+runs through the existing `ToolExecutor` → `telegram_api` boundary and sends
+the question to the owner's chat. The occurrence then parks:
+
+* status `WAITING_ANSWER_STATUS = "waiting_answer"` — the ONE new occurrence
+  status (plus the existing eleven). The question action's own run record is
+  persisted as `pending` — QUESTION WAITING is never QUESTION SUCCESS/RUNNING.
+* `result_metadata` AND `error_metadata` both carry the complete per-action
+  state (the Phase 3A dual-channel rule), plus the durable
+  `pending_question` record (`PENDING_QUESTION_KEY`): action position,
+  `question_chat_id`, `question_message_id`, `question_text`, `asked_at`,
+  `answered` — a restart cannot forget a question that was physically sent.
+* `attempt` is NOT consumed: a question is not a failure.
+
+The scheduler leaves the parked row alone BY CONSTRUCTION: `waiting_answer`
+is not in the terminal set, not in `list_due_retry_occurrences`, not in the
+recovery set, not claimable (claim CAS transitions only from `claimed`), and
+added to the event-dispatcher duplicate guard so a duplicate chat event never
+re-executes a parked chain. A parked question survives any number of restarts.
+
+### The resume: ONE correlated CAS, then the EXISTING wake path
+
+`backend/ai/task_answers.py` (`TaskAnswerResolver`, wired into the EXISTING
+`backend/bot/handlers/task_events.py` NewMessage handler — no second update
+loop, no second client) resolves one incoming message to at most one parked
+occurrence:
+
+```
+reply → owner gate (sender_id == owner) → list_waiting_answer_occurrences(≤20)
+      → pending_question_correlation_error: chat_id + reply_to_msg_id must name
+        EXACTLY the stored (question_chat_id, question_message_id)
+      → normalize_answer → ONE CAS: resume_waiting_for_answer
+      → status retry_pending, retry_at = now (real wall clock)
+      → the existing scheduler wake resumes the SAME occurrence
+```
+
+* The resolver NEVER executes a tool. Consuming an answer is a repository CAS
+  (`resume_waiting_for_answer`, InMemory + Supabase) against `waiting_answer`:
+  a racing duplicate reply loses and mutates nothing (one question can never
+  resume a chain twice). `MAX_RESUMES_PER_MESSAGE = 1` — one message consumes
+  at most one parked occurrence; all other parked questions stay open.
+* The CAS write persists the answer durably: `pending_answer`, the updated
+  `pending_question` (`answered: true` + `answered_at` stamp), and the
+  question action's run record flipped to `succeeded` with output
+  `answer_run_output(answer)` — exactly `{"answer": <answer>}`, the single
+  field the tool declares (`consumable_output_fields = ("answer",)`).
+* `retry_at` is deliberately the REAL wall clock, not a planned instant: the
+  answer arrives when it arrives. Tests must read the stored `retry_at` and
+  wake at `retry_at + 1s`, never fixed datetimes.
+* Downstream actions consume the answer through the EXISTING 3A reference
+  (`{"$ref": {"action": N, "field": "answer"}}`) or a 3C condition source —
+  nothing new: same validator, same bounded run-record output contract.
+
+### Coordinator resume re-proof (fail closed)
+
+When the wake claims a resumed occurrence whose `pending_question` says
+`answered`, the coordinator re-proves the answer record: the question action's
+run must be `succeeded` with a matching `answer` field in its output. Anything
+else fails with `answered_question_record_invalid` — a resumed chain can never
+run on an answer that was not durably consumed. `validate_pending_question`
+round-trips the consumed state (an `answered` record requires a nonblank
+`answered_at` stamp), and `pending_question_correlation_error` refuses
+mismatches with honest reasons (`pending_question_invalid`,
+`answer_owner_unverified`, `answer_chat_mismatch`, `answer_not_correlated`).
+
+### Failure behavior
+
+A failing question SEND is an ordinary bounded chain failure: the error channel
+keeps the failed run record (`error_metadata["actions"]`), the result channel
+keeps the last running write, and `classify_failure` treats a generic send
+error as `unknown`/non-retryable (only timeout-ish failures retry, bounded by
+`MAX_ATTEMPTS = 3`). A question that was never sent never parks — there is no
+half-asked state.
+
+### Security and ownership
+
+Owner-only end to end: the resolver's FIRST gate is the sender identity (a
+non-owner's reply in a shared chat can never be an answer, even to a visible
+question), then chat match, then exact message correlation. The question is
+always sent to the owner's own chat; the model never chooses a destination;
+the answer enters the chain only through the validated bounded record.
+
+### Database (one additive migration)
+
+`supabase/migrations/20260927020000_add_waiting_answer_status.sql` widens
+EXACTLY the `ai_task_occurrences_status_check` constraint to admit
+`waiting_answer` — no new table, no new column, no index, no policy, no grant;
+the widened enum accepts every row the old constraint accepted. The canonical
+snapshot (`supabase/canonical_bootstrap.sql`) and its embedded §31.3 copy in
+`DATABASE_ARCHITECTURE.md` were updated to match (the schema-repair migration
+re-adds the widened constraint on the reconciliation path); the status table
+row documents the new value. Manual application via the Supabase SQL editor
+remains the owner's step — the coding agent never executes SQL.
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/ai/task_contract.py` | 3D block: question constants, `validate_question_text`, `normalize_answer`, `build_pending_question`, `validate_pending_question` (answered-state round-trip), `pending_question_from_metadata`, `question_chain_error` (wait-before-question rule, condition-reads-answer path), `answer_run_output`, `pending_question_correlation_error` |
+| `backend/ai/tools/question.py` | NEW — `AskOwnerTool` (ToolContext in ctor, `consumable_output_fields=("answer",)`, 30s timeout) |
+| `backend/ai/task_answers.py` | NEW — `TaskAnswerResolver`: owner gate → park list → correlation → `normalize_answer` → ONE CAS |
+| `backend/ai/task_execution.py` | QUESTION branch in `_execute_chain` (real tool run, run record persisted `pending`, park), `_park_at_question`, resume re-proof (`answered_question_record_invalid`) |
+| `backend/ai/database/task_repository.py` | `WAITING_ANSWER_STATUS` in statuses/transitions, `_validate_occurrence_input` (parked rows require `pending_question`), `list_waiting_answer_occurrences`, CAS `resume_waiting_for_answer` (InMemory + Supabase + fallback) |
+| `backend/ai/task_scheduler.py` | leaves `waiting_answer` untouched by construction (not due, not retryable, not recoverable, not claimable) |
+| `backend/ai/task_event_dispatcher.py` | duplicate-skip guard includes `WAITING_ANSWER_STATUS` |
+| `backend/ai/task_creation.py` | question gate (after condition, before waits) |
+| `backend/ai/task_candidate.py` / `task_interpreter.py` | canonicalization + CANDIDATE_SCHEMA top-level `question` property + prompt sentence |
+| `backend/ai/tools/registry.py` | registers `AskOwnerTool` (55 tools) |
+| `backend/bot/handlers/task_events.py` | answers the NewMessage event through the resolver |
+| `backend/runtime/supervisor.py` | wires the resolver into the existing event path |
+| `supabase/migrations/20260927020000_add_waiting_answer_status.sql` | NEW — additive status-check widening |
+| `supabase/canonical_bootstrap.sql` + `supabase/migrations/20260920000001_reconcile_canonical_schema.sql` | snapshot widened to match (same file content, reconciliation path) |
+| `DATABASE_ARCHITECTURE.md` | §31.3 embedded snapshot + occurrences status row |
+| `tests/test_task_durable_answer.py` | NEW — 29 tests |
+| tripwire suites (`test_tool_health_audit`, `test_capability_exposure_tools`, `test_memory_tools`) | registry-count / exposure expectations updated |
+
+### Tests added and exact results
+
+`tests/test_task_durable_answer.py` — 29 tests over the REAL registry, REAL
+`ToolExecutor`, REAL `AskOwnerTool` (only the Telegram transport is doubled)
+and the REAL scheduler/coordinator/repository chain:
+
+| Area | Tests |
+|---|---|
+| Contract unit: `validate_question_text`, `normalize_answer`, `build_pending_question`/`validate_pending_question`/`pending_question_from_metadata` (incl. answered-state round-trip, byte bound), `answer_run_output`, correlation refusals | 12 |
+| Chain rules: one question, argument shape, wait-before-question, question-in-branch, condition-reads-answer accepted, wait-after-question accepted, 3C composition | 6 |
+| End-to-end park → correlated reply → resume → reference/condition consumption through a scheduler wake; duplicate reply loses the CAS | 7 |
+| Ownership/chat/message mismatches, non-text and over-long answers, park-then-restart persistence | 4 |
+
+### Verification performed (automated only)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_durable_answer.py -q` | **29 passed** |
+| Phase 3A/3B/3C + task/scheduler/repository/creation/execution/interpretation/hardening regressions (36 task suites) | **976 passed** |
+| `.venv/bin/python -m pytest tests/test_canonical_schema_reconciliation.py -q` | **33 passed** |
+| `.venv/bin/python -m pytest tests/ -q` (full suite) | **5300 passed, 26 skipped** |
+| `.venv/bin/python -m py_compile` on every changed Python file | clean |
+
+**Live Telegram verification was NOT performed. Live Supabase verification was
+NOT performed** — no Telegram session and no SQL execution happened in this
+phase. The one migration (`waiting_answer` status widening) must be applied by
+the owner via the Supabase SQL editor before parking is used in production;
+until then the repository's status validation would refuse the park write
+(fail closed), which is the intended degradation.
+
+### Known limitations (honest)
+
+1. **One question per chain**, and the question must not sit inside a
+   conditional branch; a question after a branch is allowed only outside the
+   conditional structure (the condition must not re-decide around an answer).
+2. No wait boundary may precede the question (a question parks on its own
+   answer, not on a clock); a wait AFTER the question is fine.
+3. Answers are bounded plain text (≤128 chars after whitespace collapse) — no
+   media answers, no buttons/inline keyboard flows, no answer validation
+   beyond the type/length bound.
+4. There is no expiry: a parked question waits indefinitely (bounded by the
+   owner deleting the task); no reminder/re-ask loop, no timeout status.
+5. Multi-turn conversational continuation of a pending workflow (the answer
+   driving a NEW question in the same turn) is explicitly deferred; the
+   resumed chain may contain at most the ONE question contract again on a
+   LATER occurrence only through a new task.
+6. `list_waiting_answer_occurrences` scans at most 20 parked rows per reply —
+   sufficient for a single-owner bot, deliberately not a query planner.
+7. Natural-language quality for Persian ask-me requests is not tuned here;
+   only the bounded representation, its validation and the prompt sentence
+   were added.
+
+### Still deferred (Phase 3E+)
+
+Multi-turn conversational continuation, question reminders/expiry, answer
+validation predicates, inline-keyboard question UIs, media answers, several
+questions per chain, and every premium task-manager feature.
 
 ### Delivery
 
