@@ -126,7 +126,9 @@ CANDIDATE_SCHEMA = {
                             "pauses until the owner replies to it. Several "
                             "ask_owner actions are allowed (one per checkpoint); "
                             "each reply is consumed through that question's own "
-                            "action number."
+                            "action number. Actions and questions may interleave "
+                            "in one chain; the answer only feeds already-defined "
+                            "actions."
                         ),
                     },
                 },
@@ -612,8 +614,11 @@ class TaskInterpreter:
             "waiting at a time): when the user asks the task to ASK them something mid-run "
             "('از من بپرس …', 'ask me …', 'if not enough information, ask me …'), insert an "
             "action {'name': 'ask_owner', 'arguments': {'question': '<the short question>'}} "
-            "between the actions — one per question the user asked for. The workflow stops at "
-            "each question until the owner replies to it, then continues. The question is plain "
+            "between the actions — one per question the user asked for. Registered actions and "
+            "questions INTERLEAVE freely in the one ordered chain; the workflow stops at "
+            "each question until the owner replies to it, then continues with the NEXT "
+            "already-defined action — the reply fills only the references/branches of "
+            "actions that already exist, it never invents new ones. The question is plain "
             "text only (≤ 512 chars) — never a destination, ids or code — and a later action "
             "consumes a question's reply with a reference {'$ref': {'action': <that question's "
             "action number>, 'field': 'answer'}} (each question's answer is read from ITS OWN "

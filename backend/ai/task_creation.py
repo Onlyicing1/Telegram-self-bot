@@ -415,10 +415,12 @@ class TaskCreationService:
             if condition_error:
                 _creation_trace("action_ineligible", reason=condition_error)
                 raise _invalid(condition_error)
-            # The ONE bounded question contract of the chain: at most one
-            # ask_owner action, a bounded plain-text question, and no question
-            # inside a conditional branch. An invalid question is a
-            # configuration failure — never a silently skipped ask.
+            # The ONE bounded question contract of the chain (SEVERAL
+            # ask_owner actions are allowed since Part 3E): every question
+            # takes exactly one bounded plain-text argument, no wait boundary
+            # may sit before the FIRST question, and a question may live only
+            # in a selected branch. An invalid question is a configuration
+            # failure — never a silently skipped ask.
             question_error = question_chain_error(actions)
             if question_error:
                 _creation_trace("action_ineligible", reason=question_error)

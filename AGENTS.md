@@ -389,8 +389,8 @@ error.
   `supabase/migrations/20260927020000_add_waiting_answer_status.sql`) with a
   durable `pending_question` record in BOTH metadata channels and the
   question's run record left `pending` — no attempt consumed, no wait boundary
-  may precede the question, and a question may not live inside a conditional
-  branch. The scheduler, retry query, recovery query, claim CAS and event
+  may precede the FIRST question, and a question may live only inside a
+  SELECTED conditional branch (Phase 3E). The scheduler, retry query, recovery query, claim CAS and event
   duplicate guard all leave `waiting_answer` untouched by construction, so a
   parked question survives restarts. The ONLY edge out is the owner's reply to
   the EXACT question message: `backend/ai/task_answers.py` (`TaskAnswerResolver`,
@@ -410,9 +410,12 @@ error.
   row, and one message consumes at most one parked occurrence. A question
   may live inside a selected conditional branch (the non-selected branch
   never asks; its actions are marked `skipped` in the park write). No
-  schema change beyond the `waiting_answer` status. Multi-turn conversational
-  continuation (an answer driving a NEW question in the same turn) remains a
-  later phase.
+  schema change beyond the `waiting_answer` status. Registered actions and
+  questions interleave freely in one chain (Phase 3F): the answer of each
+  question resumes the SAME occurrence into the next ALREADY-DEFINED action
+  and reaches it only as structured data through the 3A reference/3C
+  condition mechanisms — it never invents new actions (no dynamic
+  replanning, no chat history ever enters the execution context).
 - **Persistence**: `backend/ai/persistence.py` + `backend/ai/database/`
   record config, sessions, usage, tool history, and provider stats with the
   same Supabase-or-fallback pattern.

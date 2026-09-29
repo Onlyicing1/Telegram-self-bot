@@ -1,6 +1,220 @@
 # IMPLEMENTATION REPORT — CURRENT STATE
 
-## Previous phase — TODO PART 3C — BOUNDED CONDITIONAL BRANCHING
+## Latest phase — TODO PART 3F — CONVERSATIONAL CONTINUATION: MIXED QUESTIONS + COMMANDS
+
+Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
+Starting HEAD `58086a6` = `origin/main` (`feat(todo): add multi-turn question
+continuation`, Phase 3E). Every Phase 3A–3E contract is reused unchanged: ONE
+task, ONE occurrence, ONE ordered action chain, ONE execution authority
+(`TaskExecutionCoordinator` → `ToolExecutor`), ONE scheduler, ONE answer
+resolver, the bounded per-action run record, the durable `not_before` wait,
+the bounded conditional branching and the `waiting_answer` park. No new
+question system, no new answer correlation, no new scheduler, no new
+execution model — and **no schema change**.
+
+### Phase objective (verified against the current source first)
+
+A durable Agent workflow must be able to mix questions and registered
+commands in one pre-built chain and use each answer as structured workflow
+data for later already-defined actions:
+
+    ACTION → QUESTION → ANSWER → ACTION → QUESTION → ANSWER → ACTION
+
+The audit of current `main` confirmed the central fact this phase builds on:
+**Part 3D/3E already implemented the mixed continuation machinery** — answers
+resume the SAME occurrence through the ONE CAS
+(`resume_waiting_for_answer`), the resumed walk continues to the next
+already-defined action, and every action consumes a specific question's
+answer through the EXISTING 3A reference (`{"$ref": {"action": N, "field":
+"answer"}}`). What was genuinely missing was coverage and documentation at
+the MIXED level (several spec scenarios had no pinning test), a prompt
+clarification, and two stale doc/comment statements contradicting the code.
+
+### Documentation-vs-code discrepancies found and fixed
+
+1. `AGENTS.md` (Phase 3D bullet) still said "at most ONE action of a chain
+   may be a question" while Phase 3E lifted that to SEVERAL — fixed.
+2. `backend/ai/task_creation.py` comment still said "at most one
+   ask_owner action" while it only calls the 3E `question_chain_error` —
+   comment corrected to match the code.
+3. Both discrepancies were documentation-only; the behavior was already
+   correct (the 3E tests pinned it). INVESTIGATION.md records the 3E
+   architecture accurately and needed no change.
+
+### Exact continuation semantics (unchanged, now pinned)
+
+* **Answer → next action.** When an answer is accepted: it is persisted
+  exactly once (the ONE CAS), the question run becomes `succeeded` with
+  `{"answer": …}` in its own bounded run record, the occurrence flips to
+  `retry_pending(now)`, and the EXISTING scheduler wake resumes the SAME
+  occurrence. The walk re-enters, skips every succeeded position, and
+  continues to the next already-defined action — it never replays a
+  succeeded action and never re-evaluates a completed question.
+* **One active question.** 0 or 1 question is ever waiting (structural: the
+  walk stops the moment it reaches an open question; a later question cannot
+  even be SENT before an earlier one is answered). No parallel questions, no
+  background question execution, no race.
+* **One execution model.** Questions remain registered `ask_owner` tool calls
+  and commands registered tool calls — both entries of the same bounded
+  chain, both through AI → Dispatcher → ToolRegistry → ToolExecutor →
+  service → Telegram/Supabase. There is no second execution path for
+  conversational actions.
+
+### Answer reference behavior (unchanged, now pinned)
+
+Later actions reference the current or earlier answers and earlier successful
+action outputs through the existing `$ref` mechanism — no second reference
+syntax. Fail-closed reference security is re-proved at the execution
+boundary (`action_reference_error` before any execution plus
+`resolve_action_arguments` per action): future/unanswered references,
+positions that do not exist, undeclared fields, malformed shapes and
+arbitrary `$` keys are refused. A question answer feeds a condition only
+through the existing 3C bounded condition system (source `{action, field}` +
+`equals`/`not_equals` + bounded literal) — no new operators, no coercion.
+
+### Telegram correlation, duplicate protection, restart recovery
+
+Unchanged from 3D/3E and re-pinned on mixed chains: the reply must match the
+owner, the chat, and the EXACT stored question message id of the ONE active
+checkpoint; an unrelated message, another sender, another chat, another
+task's identity, a late reply to an answered question or a duplicate reply
+consumes nothing (the CAS is the duplicate guard — one answer accepted, one
+continuation, no downstream side effect twice). A parked occurrence survives
+restart untouched (`waiting_answer` is excluded from the due-retry, recovery
+and claim paths); accepted answers survive restarts in their own run records;
+no question is ever re-sent; no completed checkpoint re-opens.
+
+### Failure behavior
+
+Answer-processing failure: nothing is consumed and nothing advances (the
+CAS refuses a non-parked row). A downstream action failure keeps the
+existing retry semantics — a deterministic refusal fails the occurrence
+(later actions stay `pending`), a retryable timeout retries and resumes AT
+the failed action — and in every case the earlier question is never re-asked,
+accepted answers are never discarded, and the workflow never restarts from
+the beginning.
+
+### Context isolation (no chat history)
+
+The execution context of every action carries only: the trusted
+scheduled-occurrence marker, the task's trusted destination chat id, the
+current action's inputs (with references resolved to the bounded recorded
+values) and durable occurrence/task state. No chat history, no sender
+history, no captions, no "last message", no inferred conversational state,
+no global memory ever reaches a tool call — the recorded arguments of every
+executed call are exactly the resolved references, pinned by test.
+
+### Dynamic replanning: none
+
+The workflow structure is created before execution and is byte-identical
+before and after every answer (pinned by test). An answer may fill the
+arguments of later already-defined actions, select an existing 3C branch, or
+determine that the next already-defined question comes next — it can never
+invent new actions, arbitrary code, or arbitrary Telegram RPC.
+
+### Database — NO schema change
+
+Questions are entries of the bounded `action_snapshot`, answers are entries
+of the bounded per-action run record, the active checkpoint is the bounded
+`pending_question` metadata record (replaced at each park), and the park
+status is the additive `waiting_answer` from Phase 3D. No migration, no
+column, no table, no §31 change, no SQL executed.
+
+### Interpreter / model boundary (minimal clarification)
+
+The planner schema already supports mixed chains. Two prompt sentences were
+clarified (`backend/ai/task_interpreter.py`): registered actions and
+questions may interleave freely in the one ordered chain, and the owner's
+reply fills only the references/branches of already-defined actions — it
+never invents new ones. No redesign, no free-form conversational behavior,
+no new fields; `TaskCandidate.from_untrusted` and `TaskCreationService`
+validate whatever the model emits, fail closed.
+
+### Tests added and exact results
+
+`tests/test_task_conversational_continuation.py` — NEW, 26 tests over the
+REAL registry, `ToolExecutor`, `AskOwnerTool`, coordinator, scheduler,
+repository and answer resolver (external Telegram/Supabase mocked):
+
+| # | Matrix item | Test(s) |
+|---|---|---|
+| 1 | action → question → answer → action | `test_action_question_answer_action_continues_in_order` |
+| 2 | question → answer → question → answer → action | `test_question_answer_question_answer_action` |
+| 3 | action → question → answer → question → answer → action | `test_action_question_answer_question_answer_action` |
+| 4–5 | answer reference in next action / multiple references | `test_multiple_answer_references_each_consume_their_own_question` |
+| 6 | answer feeds existing condition | `test_a_question_answer_feeds_the_existing_condition` |
+| 7–11 | unrelated/wrong chat/sender/task/occurrence refused | `test_unrelated_and_wrong_chat_replies_are_ignored`, `test_wrong_sender_wrong_task_and_late_replies_are_refused`, `test_a_reply_to_a_second_occurrence_consumes_only_that_occurrence` |
+| 12 | late answer rejected | `test_wrong_sender_wrong_task_and_late_replies_are_refused` |
+| 13–14 | duplicate once / downstream once | `test_a_duplicate_reply_is_accepted_once_and_the_action_runs_once` |
+| 15–19 | restart boundaries (pending, after answer, between actions, second question, answers survive) | `test_a_restart_while_a_question_is_pending_never_re_asks`, `test_a_restart_after_an_answer_resumes_at_the_next_action`, `test_a_restart_between_actions_parks_on_the_wait_and_never_replays`, `test_a_restart_while_the_second_question_is_pending_preserves_both` |
+| 20–21 | question never reopens / failed action does not reopen | `test_an_answered_question_never_becomes_active_again`, `test_a_failed_downstream_action_never_reopens_the_answered_question`, `test_a_retryable_downstream_failure_resumes_at_the_failed_action` |
+| 22–23 | question in branch / answer in branch | `test_a_branch_question_and_its_answer_drive_the_branch_action` |
+| 24–28 | 3A/3B/3C/3D/3E regressions | existing suites, all green (below) |
+| 29–30 | ToolRegistry boundary / executor sole authority | `test_the_tool_registry_boundary_refuses_unresolvable_mixed_chains`, `test_the_tool_executor_remains_the_sole_execution_authority` |
+| 31–32 | no history leakage / no conversational context | `test_the_execution_context_carries_only_structured_workflow_data` |
+| 33 | no dynamic replanning | `test_no_dynamic_replanning_the_recorded_snapshot_is_the_whole_workflow` |
+| 34–35 | full task suite / full project suite | commands below |
+| — | mixed-chain contract + creation + prompt pin | `test_a_mixed_chain_of_actions_and_questions_is_the_valid_shape`, `test_creation_accepts_a_mixed_action_question_chain`, `test_the_interpreter_contract_describes_the_mixed_continuation` |
+| — | wait compatibility | `test_a_wait_after_questions_parks_on_the_clock_not_a_question` |
+| — | end-to-end | `test_end_to_end_search_question_save_question_deliver` |
+
+The end-to-end test drives `Q1 → SEARCH(A1) → SAVE(search result) → Q2 →
+DELIVER at 18:00` as ONE task, ONE occurrence through the real scheduler,
+with process restarts (fresh registries/coordinators/resolvers) between
+checkpoints, a duplicate-reply probe, and final assertions on ordered
+execution, durable per-action outputs, exact correlation, one occurrence,
+and no replay.
+
+### Verification performed (automated only)
+
+| Command | Result |
+|---|---|
+| `.venv/bin/python -m pytest tests/test_task_conversational_continuation.py -q` | **26 passed** |
+| 3A–3E + contract/candidate suites (8 files: action chains, durable wait, conditional branches, durable answer, multi-question, conversational continuation, candidate contract, contract) | **335 passed** |
+| Task NL/management/UI/todo/trigger/tool-audit suites (39 files) | **818 passed** |
+| `.venv/bin/python -m pytest tests/ -q` (full suite) | **5357 passed, 26 skipped** |
+| `.venv/bin/python -m py_compile` on every changed Python file | clean |
+| `git diff --check` | clean |
+
+**Live Telegram verification was NOT performed. Live Supabase verification
+was NOT performed.** No database change exists in this phase, so no migration
+or SQL step is required.
+
+### Files changed by this phase
+
+| File | Change |
+|---|---|
+| `backend/ai/task_interpreter.py` | prompt + `CANDIDATE_SCHEMA` question description: interleave allowed, answer feeds only already-defined actions |
+| `backend/ai/task_creation.py` | comment corrected to the 3E multi-question reality (behavior unchanged) |
+| `AGENTS.md` | Phase 3D bullet corrected: SEVERAL questions per chain, 3F continuation status |
+| `tests/test_task_conversational_continuation.py` | NEW — 26 tests (matrix above) |
+| `IMPLEMENTATION_REPORT.md` | this section |
+
+### Known limitations (honest)
+
+1. The bounded chain is still 1–5 actions (`MAX_ACTIONS`), shared between
+   questions and real actions; a mixed workflow with more checkpoints does
+   not fit.
+2. At most ONE condition per chain (3C, unchanged); at most one answer per
+   argument (one `$ref` per whole argument value).
+3. Answers remain bounded plain text (≤ 128 chars collapsed); no media, no
+   buttons, no multi-turn chat memory.
+4. The interpreter is prompt-guided only: whether the model emits the mixed
+   structure for a mixed request is model quality, not a contract — creation
+   accepts or refuses whatever it emits, fail closed.
+5. Question timeout/reminders/expiry remain absent (deferred).
+
+### Still deferred (unchanged)
+
+Generic chatbot mode, unlimited conversational memory, autonomous
+replanning, dynamic workflow mutation, arbitrary loops/recursive workflows,
+parallel actions, arbitrary DAGs, arbitrary code execution, arbitrary
+Telegram RPC, human approval framework, workflow editor, unlimited action
+chains, multimodal/voice answers, question timeout/reminders.
+
+---
+
+## Previous phase — TODO PART 3E — MULTI-TURN QUESTION / INSTRUCTION CONTINUATION
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain waiting`, Phase 3B).
