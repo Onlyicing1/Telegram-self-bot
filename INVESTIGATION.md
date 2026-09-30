@@ -1322,6 +1322,22 @@ belongs to the durable-store degradation path (§5/§11 territory of this
 document — truthful fallback rendering is already correct behavior), not to
 the command-parsing path.
 
+**Implementation status (2026-09-30).** Items 1–3 of this list are now
+implemented (commit `fix: remove regex based tool command routing`): the
+four clock-anchor regexes were replaced by token-adjacency detection
+(`_words_contain_clock_anchor` / `_text_has_clock_anchor`, the SAME helper
+the `create_task` completeness gate now imports — the gate and the parser
+can no longer disagree), `_SAVE_CODE_RE` was consolidated into the one
+declared shape contract beside its token classifiers, and `Menu` is matched
+by exact equality in a pattern-less handler. Item 4 was already the state of
+the code. Full suite: 5383 passed, 26 skipped (26 new behavior pins in
+tests/test_regex_routing_removal.py); two suites that pinned the old
+`^Menu$` pattern were updated to pin the equality guard. Item 1's glued
+"at 5pm" form deliberately still does NOT anchor — the retired
+`\bat\s+\d{1,2}\b` never matched it either, and parity was chosen over
+extension. No execution-boundary component was touched: every route still
+terminates at the single ToolRegistry → ToolExecutor boundary.
+
 ### 24.11 Files inspected for this audit
 
 `AGENTS.md`, `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`,

@@ -10,7 +10,9 @@
 >
 > **Scope:** documentation only. No Python source, test, migration, SQL file,
 > configuration, prompt, or runtime behavior was modified. The only file this
-> rebuild changes is `IMPLEMENTATION_REPORT.md` itself.
+> rebuild changes is `IMPLEMENTATION_REPORT.md` itself. (**Update,
+> 2026-09-30:** Part 4 of §3 and §13 document the regex-command-routing
+> removal implemented AFTER this rebuild — they carry their own provenance.)
 >
 > **Verification honesty rule:** nothing in this report claims that the running
 > bot was exercised against live Telegram or that any SQL was executed against
@@ -341,6 +343,80 @@ gap documented), **DEFERRED** (planned, deliberately not built now),
   snapshot; there is no free-form dialogue inside an occurrence — the owner's
   answer is data (≤128 chars) consumed by later actions, not a conversation
   the AI improvises from.
+
+### Part 4 — Regex-command routing removal — **IMPLEMENTED**
+
+- **Change:** `fix: remove regex based tool command routing` (2026-09-30),
+  implementing INVESTIGATION.md §24.10 (the §24 regex/command-parsing audit).
+- **Architectural reason:** the intended boundary is "AI reasons and proposes
+  structured actions; the runtime validates and executes." Regex participated
+  in **command/intent detection** at four points, so a character pattern —
+  not the model's structured proposal and not an equality check — could steer
+  what the runtime executes next. The §24 audit found no execution-boundary
+  bypass (every route already converged on `ToolRegistry` → `ToolExecutor`),
+  so this phase removes the regex from *detection* without touching the
+  execution boundary.
+- **Previous flow → why unsafe → replacement flow** (one entry per removed
+  route):
+  1. **Clock-anchored scheduling intent** (`ai/actions.py`
+     `_has_future_clock_request`): previous flow — three regexes
+     (`\d{1,2}:\d{2}`, `ساعت\s*\d`, `\bat\s+\d{1,2}\b`) over digit-normalized
+     text decided whether a future-anchored request routes to `create_task`;
+     unsafe — a character pattern, not a structured proposal, made the
+     routing decision (and glued forms like "at 5pm" silently escaped it);
+     replacement — token-adjacency detection on the same `_tokenize` stream
+     (`_words_contain_clock_anchor` / `_text_has_clock_anchor`: clock word +
+     digit, `at` + number, `am`/`pm` after a digit, `H:MM` / `H` `:` `MM`
+     triples). Same decisions, no regex.
+  2. **create_task completeness gate** (`ai/tools/task.py`): previous flow —
+     the pre-provider gate kept its own inline `re.search(r"\d{1,2}:\d{2}")`
+     plus duplicated vocabulary imports; unsafe — the gate and the parser
+     could disagree about what proves a clock (two implementations of one
+     decision); replacement — the gate imports the SAME
+     `_text_has_clock_anchor` helper; the gate and the deterministic parser
+     can no longer disagree, and no regex runs before the provider call.
+  3. **Save-code shape** (`ai/actions.py` `_SAVE_CODE_RE` vs
+     `_SAVE_CODE_TOKEN_RE`/`_SAVE_CODE_RANDOM_TOKEN_RE`/`
+     _SAVE_CODE_CANONICAL_RE`): previous flow — two independent shape
+     declarations validated the same `S####` artifact; unsafe —
+     inconsistent validation between the JSON-action validator and the token
+     classifier; replacement — one declared shape contract (consolidated,
+     documented next to its token twin). These shape regexes REMAIN by
+     design: fixed-format artifact matching is exactly what regex is for
+     (§24.8), and the retrieval resolver keeps its owner-typography variants.
+  4. **`Menu` command** (`bot/handlers/misc.py`): previous flow — the only
+     Telethon `pattern=r"^Menu$"` regex in the codebase matched the single
+     text command; unsafe — a regex was the router for the one command, a
+     mechanism the rest of the command surface (trigger words) already
+     replaced with equality; replacement — pattern-less outgoing handler with
+     an exact-equality guard (`raw_text == "Menu"`), mirroring
+     `config_store.match_trigger`. Only the literal word opens the panel; the
+     decorative Glass UI font is render-time only.
+- **AI-hallucinated invocation protections (verified, plus new pins):** text
+  mentioning a tool name resolves no tool call (`parse_command_intent` on
+  "I want to know what the todo_add tool does" → zero calls); keyword strings
+  without the deterministic vocabulary reach the provider as conversation;
+  malformed tool requests are rejected by the executor's structured
+  `malformed_arguments` failure (never executed with fake `{}`);
+  unknown tools are refused by the registry (`not_found`) and by the JSON
+  action contract (`KIND_INVALID: Unknown action`); `ToolExecutor` remains
+  the sole caller of `tool.execute()` — no second parser, no second
+  dispatcher, no parallel execution path was added.
+- **Affected components:** `backend/ai/actions.py`, `backend/ai/tools/task.py`,
+  `backend/bot/handlers/misc.py`, `AGENTS.md` (§5 command row), tests
+  `test_50_font_system.py` / `test_51_execution27.py` (updated to pin the
+  equality guard), new `tests/test_regex_routing_removal.py` (26 tests).
+- **Persistence/database impact:** none.
+- **Tests:** full suite **5383 passed, 26 skipped** at the change HEAD
+  (baseline 5357 + 26 new); focused: the 9 touched suites (actions, font,
+  execution27, NL creation/interval, semantic triggers/completeness,
+  hardening, tool-health) all pass.
+- **Limitations:** detection regex is removed only where the §24 audit named
+  it (command/intent routing); shape/artifact, JSON-extraction, resilience,
+  provenance, policy, and security regex intentionally remain (§24.8). The
+  deterministic token vocabulary of `parse_command_intent` is unchanged data,
+  not regex, and stays authoritative for the narrow save/delete/send
+  vocabulary exactly as before.
 
 ### Prior phases the Taskloom arc builds on — **IMPLEMENTED**
 
@@ -797,6 +873,12 @@ owner-side verification work.
 - Repository `Onlyicing1/Telegram-self-bot`, branch `main`, HEAD
   `d80ee369ed8151242c7bd90dda3b67d0db8ddece`, equal to `origin/main`; the
   tree is clean except the pre-existing untracked `telegram-self-bot/`.
+- **Part 4 (2026-09-30):** regex-command routing removal implemented
+  (INVESTIGATION.md §24.10): clock-anchored intent detection, the
+  `create_task` completeness gate, and the `Menu` command are decided on
+  tokens/equality, one save-code shape contract; the full suite passes at
+  5383. Detection-level regex is gone; shape/extraction/resilience/security
+  regex intentionally remains (§24.8 of INVESTIGATION.md).
 - The durable task system (Taskloom) is complete through **Part 3F**:
   bounded multi-action chains with result references (3A), durable time waits
   (3B), single conditional branching with durable branch selection (3C),

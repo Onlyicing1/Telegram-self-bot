@@ -700,9 +700,16 @@ def register(client, owner_id: int):
     except Exception as exc:
         logger.warning("Inline builder registration failed: %s", exc)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^Menu$"))
+    # The ONE text command is matched by EXACT EQUALITY on the raw outgoing
+    # text — no Telethon pattern, no regex anywhere in command routing
+    # (INVESTIGATION.md §24.10.1). Only the literal word opens the panel; the
+    # decorative Glass UI font is render-time only and can never influence
+    # the match.
+    @client.on(events.NewMessage(outgoing=True))
     async def menu_cmd(event):
         if not is_owner(event, owner_id):
+            return
+        if getattr(event, "raw_text", None) != "Menu":
             return
 
         helper = get_client()

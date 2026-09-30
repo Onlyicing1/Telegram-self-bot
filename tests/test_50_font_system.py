@@ -214,10 +214,11 @@ class TestMenuCommandIndependence:
         ]
         assert offenders == []  # fonts are render-time only
 
-    def test_menu_matches_raw_text_via_regex_pattern(self):
+    def test_menu_matches_raw_text_by_exact_equality(self):
         from pathlib import Path
         src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
-        assert 'pattern=r"^Menu$"' in src  # raw incoming text, pre-render
+        assert "pattern=" not in src  # no regex participates in command routing
+        assert '!= "Menu"' in src  # exact equality on raw incoming text, pre-render
         assert '.menu' not in src  # the legacy dot command is fully removed
 
     def test_dispatch_data_never_passes_through_apply_font(self):

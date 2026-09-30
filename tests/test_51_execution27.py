@@ -435,10 +435,14 @@ class TestFontCoverageBioUsername:
 
 
 class TestMenuCommandRename:
-    def test_pattern_is_literal_menu_word(self):
+    def test_menu_word_is_matched_by_exact_equality(self):
+        """`Menu` is the single textual command, matched by EXACT EQUALITY on
+        the raw outgoing text — no Telethon pattern regex participates in
+        command routing (INVESTIGATION.md §24.10.1)."""
         from pathlib import Path
         src = Path("backend/bot/handlers/misc.py").read_text(encoding="utf-8")
-        assert 'pattern=r"^Menu$"' in src
+        assert "pattern=" not in src  # no Telethon regex pattern remains
+        assert '!= "Menu"' in src  # exact equality guard on the literal word
         assert r'pattern=r"^\.menu$"' not in src
 
     def test_no_hidden_dot_menu_alias_anywhere_active(self):

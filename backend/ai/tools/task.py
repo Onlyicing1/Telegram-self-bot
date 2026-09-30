@@ -164,19 +164,10 @@ class CreateTaskTool(Tool):
             unbind(bind_token)
 
     async def _execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-        import re as _re
-
         from backend.ai.actions import (
-            _FA_CLOCK_WORDS,
-            _EN_CLOCK_WORDS,
+            _text_has_clock_anchor,
             _FA_NUMBER_WORDS,
-            _FA_RECUR_WORDS,
-            _EN_RECUR_WORDS,
-            _FA_PLAN_WORDS,
-            _EN_PLAN_WORDS,
-            _INTERVAL_INTRO,
             _TIME_UNITS,
-            _has_time_unit,
             _is_event_intent,
             _is_scheduling_intent,
             _tokenize,
@@ -200,27 +191,24 @@ class CreateTaskTool(Tool):
         # Taskloom creation wizard through the same structured signal the
         # delivery layer already consumes.
         words = _tokenize(request)
-        words_lower = [w.lower() for w in words]
-        clock_anchor = bool(
-            set(words_lower) & _FA_CLOCK_WORDS
-            or set(words_lower) & _EN_CLOCK_WORDS
-            or "at" in words_lower
-            or _re.search(r"\d{1,2}:\d{2}", request)
-        )
-        # A bare number+unit pair ("5 دقیقه", "پنج دقیقه یکبار") also proves
-        # a schedule was expressed even without an interval intro word.
-        def _is_number_token(token: str) -> bool:
-            return token.isdigit() or token in _FA_NUMBER_WORDS
-
+        # The clock anchor is the shared token-based detector — the same
+        # helper the deterministic command parser uses, so the gate and the
+        # parser can never disagree about what proves a clock (and no regex
+        # participates in command/intent detection, §24.10.2).
+        clock_anchor = _text_has_clock_anchor(request)
         has_schedule_expression = (
             _is_scheduling_intent(words, require_action_verb=False)
             or clock_anchor
         )
         if not has_schedule_expression and _is_event_intent(request, words):
             has_schedule_expression = True
+        # A bare number+unit pair ("5 دقیقه", "in 2 hours") also proves a
+        # schedule was expressed even without an interval intro word — the
+        # completeness proof the interval branch of _is_scheduling_intent
+        # cannot cover (it requires هر/every/plan vocabulary).
         if not has_schedule_expression:
             for i, token in enumerate(words):
-                if _is_number_token(token) and i + 1 < len(words) and words[i + 1] in _TIME_UNITS:
+                if (token.isdigit() or token in _FA_NUMBER_WORDS) and i + 1 < len(words) and words[i + 1] in _TIME_UNITS:
                     has_schedule_expression = True
                     break
         if not has_schedule_expression:

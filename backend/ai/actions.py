@@ -765,6 +765,12 @@ _TASK_LIST_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
 # ``deleted`` is NOT one of them: deleting a task is the dedicated
 # ``task_delete`` action, which removes the durable row (never a status write).
 _TASK_TRANSITION_STATUS_VOCABULARY = frozenset({"paused", "active", "completed"})
+# The save-code value shape: canonical uppercase ``S0001`` form with an
+# optional short lowercase/loose variant accepted from model output before
+# normalization. This is the ONE declared shape contract — the token
+# classifiers below (``_SAVE_CODE_TOKEN_RE`` / ``_SAVE_CODE_RANDOM_TOKEN_RE``)
+# are its tokenized twin, and the retrieval resolver keeps its own
+# owner-typography variants (``retrieve_service._SAVE_CODE_SHAPE``).
 _SAVE_CODE_RE = re.compile(r"^[A-Z0-9]{1,12}$")
 
 # Actions that address ONE stored item.
@@ -2047,6 +2053,80 @@ def _is_stem_token(tok: str, stems: tuple[str, ...]) -> bool:
     return False
 
 
+# ── Clock-anchor detection (token-based) ──
+#
+# A clock anchor is proven by ADJACENT TOKENS after normalization, never by a
+# character pattern: ``ساعت`` + digit, ``at`` + digit, ``am``/``pm`` after a
+# digit, or an ``H`` ``:`` ``MM`` token triple. All four survive ``_tokenize``
+# (digits are ASCII after ``normalize_digits``), so no regex participates in
+# command/intent detection (INVESTIGATION.md §24.10.2). The number bound
+# matches the retired clock regexes' 1–2 digit width (1..99); the minute
+# field keeps its exact two-digit shape.
+_CLOCK_PUNCT = frozenset(
+    "!\"#$%&'()*+,-./\u060c\u061b\u061f\u066d…«»\u2018\u2019\u201c\u201d\u2026"
+)
+
+
+def _strip_clock_punct(tok: str) -> str:
+    return tok.strip("".join(_CLOCK_PUNCT))
+
+
+def _looks_like_clock_token(tok: str) -> bool:
+    """True for a bare ``H:MM`` clock token (``15:35``, ``9:05``, ``9:05``)."""
+    tok = _strip_clock_punct(tok)
+    parts = tok.split(":")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        return 1 <= len(parts[0]) <= 2 and len(parts[1]) == 2
+    return False
+
+
+def _words_contain_clock_anchor(words: list[str]) -> bool:
+    """True when the token stream carries any clock anchor.
+
+    Recognizes the exact anchors the retired clock patterns proved, decided
+    on ADJACENT tokens instead of patterns: ``ساعت`` followed by a number,
+    ``at`` followed by a 1–2 digit number, ``am``/``pm`` after a digit, a
+    bare ``H:MM`` token, and an hour with a detached ``:MM`` minute field.
+    Bare clock WORDS never anchor — "ساعت‌ها", "atmosphere" and
+    "هر 5 دقیقه" stay anchorless, exactly as the retired patterns required.
+    """
+    for i, tok in enumerate(words):
+        nxt = _strip_clock_punct(words[i + 1]) if i + 1 < len(words) else ""
+        prv = _strip_clock_punct(words[i - 1]) if i > 0 else ""
+        if tok in _FA_CLOCK_WORDS:
+            if nxt[:1].isdigit() or _looks_like_clock_token(nxt):
+                return True
+        elif tok == "at":
+            if (nxt.isdigit() and len(nxt) <= 2) or _looks_like_clock_token(nxt):
+                return True
+        elif tok in _EN_CLOCK_WORDS:
+            if prv.isdigit():
+                return True
+        elif tok.isdigit():
+            if _looks_like_clock_token(tok):
+                return True
+            if nxt == ":" or _looks_like_clock_token(nxt):
+                return True
+            if prv == ":" and 1 <= len(tok) <= 2:
+                return True
+        elif tok.startswith(":") and tok[1:].isdigit():
+            return True
+    return False
+
+
+def _text_has_clock_anchor(text: str) -> bool:
+    """Token-level clock-anchor test for raw text (no regex).
+
+    Normalizes digits, drops zero-width joiners, then lowercases and
+    tokenizes exactly like ``_tokenize`` (minus the letter filter, so
+    digits and punctuation survive) — the same substrate the token-based
+    detectors read.
+    """
+    s = normalize_digits(text)
+    s = s.replace("\u200c", " ").replace("\u200b", " ")
+    return _words_contain_clock_anchor(s.lower().split())
+
+
 def _imperative_present(words: list[str], stems: tuple[str, ...]) -> bool:
     """True when a Persian imperative (stem + کن/کنی/کنید) is present."""
     for i, tok in enumerate(words):
@@ -2526,17 +2606,13 @@ def _has_future_clock_request(text: str, words: list[str]) -> bool:
     A clock reference ("ساعت 15:35", "15:35", "at 5 pm") must co-occur with
     a future day marker ("فردا"/"tomorrow"). Same-day and historical clock
     references ("تا ساعت ۶", "ساعت ۹ دیروز") stay on their command paths.
-    Clock times survive _tokenize only as separated digit tokens, so this is
-    matched against the digit-normalized text.
+    The anchor is a TOKEN-ADJACENCY decision over the same normalized stream
+    ``_tokenize`` produces — no regex participates in command/intent routing
+    (INVESTIGATION.md §24.10.2).
     """
     if not any(w in _FUTURE_REF_WORDS for w in words):
         return False
-    normalized = normalize_digits(text)
-    return (
-        re.search(r"\d{1,2}:\d{2}", normalized) is not None
-        or re.search(r"ساعت\s*\d", normalized) is not None
-        or re.search(r"\bat\s+\d{1,2}\b", normalized) is not None
-    )
+    return _text_has_clock_anchor(text)
 
 
 def _has_delete_imperative(words: list[str]) -> bool:

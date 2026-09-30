@@ -185,7 +185,7 @@ All handlers fire on `events.NewMessage(outgoing=True)`. Every handler calls
 
 | Command | Pattern | Behavior |
 |---|---|---|
-| `Menu` | `^Menu$` | Opens the Glass UI mother panel (inline via helper bot; falls back to edit-in-place text if the helper is unavailable). Matching happens on the raw outgoing text — the decorative Glass UI font never affects the command. |
+| `Menu` | exact equality (`raw_text == "Menu"`, no regex) | Opens the Glass UI mother panel (inline via helper bot; falls back to edit-in-place text if the helper is unavailable). Matching is exact equality on the raw outgoing text — the decorative Glass UI font never affects the command. |
 
 The legacy dot command `.menu` has been removed (no hidden alias).
 Legacy text commands (`.ping`, `.help`, `.save`, `.del`, `.bio`,
