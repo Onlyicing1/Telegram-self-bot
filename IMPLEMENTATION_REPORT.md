@@ -214,7 +214,7 @@ chains, multimodal/voice answers, question timeout/reminders.
 
 ---
 
-## Previous phase — TODO PART 3E — MULTI-TURN QUESTION / INSTRUCTION CONTINUATION
+## Previous phase — TODO PART 3C — BOUNDED CONDITIONAL BRANCHING
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `f73af60` = `origin/main` (`feat(todo): add durable action-chain waiting`, Phase 3B).
@@ -525,7 +525,14 @@ NOT performed** — no Telegram session, no SQL, and no database contact of any
 kind happened in this phase, and the repo needs no migration (zero schema
 change).
 
-### Known limitations (honest)
+### Known limitations (honest, as of Phase 3C)
+
+> **Superseded in one point by Part 3E (below):** the "no question inside a
+conditional branch" rule was lifted by Phase 3E — a question MAY now live
+inside a conditional branch (a branch question is always AFTER the chain's
+condition, so it can never be that condition's source; the non-selected branch
+never runs and therefore never asks). The 3C mechanism itself is unchanged and
+reused verbatim by 3D/3E/3F.
 
 1. **The decision input must be DECLARED by a real tool.** A condition can only
 compare a field a registered tool declares as chainable. Today only `save_code`
@@ -553,11 +560,13 @@ were added.
 
 Nested/multi-level branching, one-sided conditions, additional operators
 (`contains`/`exists`/ordering), loops and any repeated/returning edge, DAGs or
-parallel branches, autonomous replanning, multi-turn conversational continuation
-of a pending workflow (durable question/answer shipped later, in Phase 3D),
-human approval steps, a generic workflow/automation language, workflow UI or
-editor, and every premium task-manager feature. The manual Supabase setup script
-remains owner-applied and untouched by this phase.
+parallel branches, autonomous replanning, human approval steps, a generic
+workflow/automation language, workflow UI or editor, and every premium
+task-manager feature. (Multi-turn conversational continuation of a pending
+workflow was delivered later — durable question/answer in Phase 3D, several
+question checkpoints per chain in Phase 3E, and mixed question/command chains
+with a shared 1–5 action budget in Phase 3F; see the sections above.) The
+manual Supabase setup script remains owner-applied and untouched by this phase.
 
 ---
 
@@ -798,6 +807,9 @@ until then the repository's status validation would refuse the park write
 1. **One question per chain**, and the question must not sit inside a
    conditional branch; a question after a branch is allowed only outside the
    conditional structure (the condition must not re-decide around an answer).
+   > **Superseded by Part 3E:** the one-question limit and the branch refusal
+   were both lifted — SEVERAL questions per chain are valid and a question MAY
+   live inside a branch.
 2. No wait boundary may precede the question (a question parks on its own
    answer, not on a clock); a wait AFTER the question is fine.
 3. Answers are bounded plain text (≤128 chars after whitespace collapse) — no
@@ -809,17 +821,23 @@ until then the repository's status validation would refuse the park write
    driving a NEW question in the same turn) is explicitly deferred; the
    resumed chain may contain at most the ONE question contract again on a
    LATER occurrence only through a new task.
+   > **Superseded by Part 3E (below):** the resumed SAME chain may now carry
+   SEVERAL question checkpoints, so the answer does drive a new question in the
+   same chain. The remaining deferral is the genuinely absent one: no
+   free-form conversational loop, no multi-turn chat memory, no media answers.
 6. `list_waiting_answer_occurrences` scans at most 20 parked rows per reply —
    sufficient for a single-owner bot, deliberately not a query planner.
 7. Natural-language quality for Persian ask-me requests is not tuned here;
    only the bounded representation, its validation and the prompt sentence
    were added.
 
-### Still deferred (Phase 3E+)
+### Still deferred (status: delivered by Phase 3E)
 
-Multi-turn conversational continuation, question reminders/expiry, answer
-validation predicates, inline-keyboard question UIs, media answers, several
-questions per chain, and every premium task-manager feature.
+Multi-turn conversational continuation of a pending workflow was DELIVERED by
+Phase 3E (several `ask_owner` actions per chain, one active checkpoint at a
+time) and its mixed question/command form by Phase 3F. Still deferred:
+question reminders/expiry, answer validation predicates, inline-keyboard
+question UIs, media answers, and every premium task-manager feature.
 
 ### Delivery
 
@@ -830,7 +848,7 @@ the push (`git fetch origin`, `git rev-parse HEAD`, `git rev-parse origin/main`)
 
 ---
 
-## Latest phase — TODO PART 3E — MULTI-TURN QUESTION / INSTRUCTION CONTINUATION
+## Previous phase — TODO PART 3E — MULTI-TURN QUESTION / INSTRUCTION CONTINUATION
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 Starting HEAD `16519fb` = `origin/main` (`feat(todo): add durable
@@ -1022,19 +1040,24 @@ no migration or SQL step is required.
 2. At most ONE condition per chain (3C, unchanged), so multi-question chains
    get at most one decision point.
 3. Question answers remain bounded plain text (≤128 chars collapsed); no
-   media, no buttons, no multi-turn chat memory.
+   media, no buttons, no multi-turn chat memory. **Mixed continuation status:**
+   the machinery this section documented for question→question chains was
+   already the mixed question/command machinery — Part 3F (latest phase, top of
+   this report) added the mixed-level test matrix, one prompt clarification and
+   two doc/comment fixes; no behavior changed.
 4. The interpreter is prompt-guided only: whether the model emits two
    `ask_owner` actions for a two-question request is model quality, not a
    contract — the creation gate accepts or refuses whatever it emits, fail
    closed.
 
-### Still deferred (Part 3F+)
+### Still deferred (status after Phase 3F)
 
-Autonomous replanning, dynamic action generation, loops, parallel execution,
-DAGs, arbitrary conversational memory, generic chatbot mode, question
-timeout/reminders/expiry, human approval steps, arbitrary Telegram
-automation, multimodal answers, a workflow editor, and any generic workflow
-DSL.
+Mixed question/command continuation was DELIVERED by Part 3F (latest phase,
+top of this report). Still deferred: autonomous replanning, dynamic action
+generation, loops, parallel execution, DAGs, arbitrary conversational memory,
+generic chatbot mode, question timeout/reminders/expiry, human approval steps,
+arbitrary Telegram automation, multimodal answers, a workflow editor, and any
+generic workflow DSL.
 
 ---
 
@@ -1248,15 +1271,20 @@ task's later occurrences compare against that same instant, so “every day at
 5. Natural-language quality for “ساعت ۶ بده” (deriving the split) is not tuned
 here; only the bounded representation and its validation were added.
 
-### Still deferred after this phase
+### Still deferred (superseded status: delivered by 3D–3F)
 
-Branching/conditions on a previous action's result were delivered by the phase
-above (TODO Part 3C) using the very home this section predicted — a bounded
-condition over a DECLARED output field of a previous action. Still deferred:
-question + answer continuation, multi-turn conversational continuation of a
-pending workflow, autonomous replanning, DAGs/general workflow scheduling, a
-dedicated wait state, and every premium task-manager feature. The manual Supabase
-setup script remains owner-applied and unchanged by this phase.
+Delivered after this phase by later TODO phases: durable question/answer
+continuation (Phase 3D — `waiting_answer` park + ONE correlated CAS resume),
+several question checkpoints per chain with one always waiting (Phase 3E),
+mixed question/command continuation with the answer feeding already-defined
+actions (Phase 3F). Still genuinely deferred:
+
+question + answer continuation beyond the 3F bounds (media answers, answer
+validation predicates, inline-keyboard question UIs, question
+timeout/reminders/expiry), multi-turn conversational memory, autonomous
+replanning, DAGs/general workflow scheduling, a dedicated wait state, and every
+premium task-manager feature. The manual Supabase setup script remains
+owner-applied and unchanged by this phase.
 
 ---
 
@@ -1486,17 +1514,22 @@ exactly as the existing suites are.
   tools (`save_by_link`, or the saved-item management tools).
 * **Bounded by contract**: 3 declared fields × 128 characters per action; a
   longer/nested value is simply not chainable and the reference fails closed.
-* **AI-authored chains stay reference-free**: prompting was not redesigned, so
-  the model proposes the existing ordered action lists while the reference
-  contract is *validated*, not generated. Producing a reference-bearing chain
-  from a natural-language request is a later phase.
+* **AI-authored chains now carry references when a workflow needs them**: the
+  reference contract is validated, never generated, and the model still writes
+  no code or expression — but the interpreter prompt (`task_interpreter.py`,
+  Phase 3F) explicitly teaches the model to emit a bounded answer reference
+  `{'$ref': {'action': N, 'field': 'answer'}}` for question-driven workflows,
+  and every reference a model emits is re-proved by the same fail-closed
+  `action_reference_error` / `resolve_action_arguments` boundary.
 
-### Intentionally NOT implemented (Phase 3B+)
+### Intentionally NOT implemented (Phase 3B+ — status: delivered by 3B–3F where marked)
 
-Continuation boundary / delayed delivery, conditional execution, owner-answer
-resumption, autonomous replanning, per-action retry beyond the resume rule, any
-new table/migration, any scheduler/executor/repository change, any `todo_steps`
-change, any new UI.
+Continuation boundary / delayed delivery (**delivered in 3B** as the durable
+`not_before` wait), conditional execution (**delivered in 3C**),
+owner-answer resumption (**delivered in 3D/3E/3F** as the durable
+question/answer continuation), autonomous replanning, per-action retry beyond
+the resume rule, any new table/migration, any scheduler/executor/repository
+change, any `todo_steps` change, any new UI.
 
 ### Git
 
@@ -1520,6 +1553,12 @@ tasks, task graphs, workflow engine, Kanban, analytics, deadlines or background
 execution. Part 2 ends at "one Todo can contain ordered, independently
 completable steps" — question+command mixing, conversational continuation and
 multi-turn planning stay out (they belong to later phases).
+> **Status update:** Parts 3A–3F (below) have since delivered exactly the
+> bounded forms of those deferred items that exist today: ordered action chains
+> with bounded result passing (3A), durable time waits (3B), conditional
+> branching (3C), and durable question/answer continuation up to mixed
+> question/command chains (3D–3F). Multi-turn planning beyond the bounded
+> chain, a generic chatbot and a premium task manager remain out.
 
 ### Audit conclusion (what Part 1 actually is — source-verified, not assumed)
 
@@ -1761,12 +1800,13 @@ suites).
    is no silent parent auto-completion and no notification, reminder or
    scheduling of any kind.
 
-### Intentionally NOT implemented (Part 3+)
+### Intentionally NOT implemented (Part 3+ — status: delivered by Parts 3A–3F where marked)
 
-Question + command mixing, conversational continuation, multi-turn planning,
-autonomous execution plans, arbitrary action chains, workflow graphs,
-reordering, priorities, categories, projects, calendar, reminders, recurring
-todos, deadlines, analytics, external integrations.
+Question + command mixing (**delivered in 3F**), conversational continuation
+(**delivered in 3D–3F**, bounded), multi-turn planning beyond the bounded
+chain, autonomous execution plans, arbitrary action chains beyond `MAX_ACTIONS`
+= 5, workflow graphs, reordering, priorities, categories, projects, calendar,
+reminders, recurring todos, deadlines, analytics, external integrations.
 
 ### Git
 
@@ -1979,7 +2019,7 @@ capabilities + credential pool), `tts_engine_factory.py`, `tts_credential_pool.p
 4. No conversion layer exists by design; a provider whose container Telegram
    rejects outright would need a future transcode phase (not started).
 
-## Latest phase — TTS PART 1 — DURABLE SETTINGS PERSISTENCE: stored, recovered after a restart, and never faked from RAM
+## Previous phase — TTS PART 1 — DURABLE SETTINGS PERSISTENCE: stored, recovered after a restart, and never faked from RAM
 
 Repository `Onlyicing1/Telegram-self-bot` · branch `main`.
 
@@ -3055,6 +3095,12 @@ Perform live Telegram verification of the complete Save V2 flow: save with a
 name and tags, retrieve by name and by tag (0/1/N), rename, add/replace/clear
 tags, delete — through both the `Menu` panels and the AI trigger path.
 
+> **Still outstanding, scoped to what later phases did not deliver:** the Save
+> V2 implementation phases that followed shipped Parts 1–4 and the Telegram
+> sync (all sections above), but every one of them records live Telegram
+> verification as NOT performed. It remains an owner action, exactly as
+> recorded phase by phase.
+
 ---
 
 ## Previous phase — DATABASE SETUP CONSOLIDATION: ONE complete Supabase setup script
@@ -3174,12 +3220,19 @@ and no old workflow wording; (h) the bootstrap section keeps no second block.
 * No live Supabase/Telegram verification — this phase changed documentation and
   tests only; the SQL was **not** executed.
 
-### Exact next phase
+### Exact next phase — superseded
 
 Apply **§31.3** to the live Supabase project as `postgres` (owner action), then
 confirm the drift report returns empty. The report's `missing_canonical_column`
 result set is the success signal; any `WARNING` names a data-guarded constraint a
 pre-existing row blocked.
+
+> **Still outstanding and unchanged in kind:** the manual application of §31.3
+> and the reconciliation SQL remains an owner action, and no later phase has
+> executed SQL against live Supabase. What changed since: the canonical block
+> is now the §31.3 parts 1–8 deployment script (Todo schedule type and
+> `todo_steps` added), so the §30-era "parts 1–6" framing of this section is
+> historical.
 
 ---
 
@@ -3356,12 +3409,13 @@ Not implemented in this phase, and not claimed anywhere:
 * embeddings/vector search, `file_name`/`short_code` cleanup, and any
   `update_save_field` allow-list redesign.
 
-### Exact next phase
+### Exact next phase — superseded
 
-**SAVE V2 PART 3 (retrieval)** — resolve a saved item from what the owner calls
-it: candidate lookup by `display_name` and tags (owner-scoped), the 0/1/N
-ambiguity contract, and the AI action(s) that select a candidate before
-`retrieve_save` runs. Its own report section, its own commit.
+This was the plan as Part 2 recorded it at its commit.
+**SAVE V2 PART 3 (retrieval) was subsequently delivered** — its report section
+is above. The remaining investigation phases (parts D–G of the original plan)
+were delivered or superseded as recorded by their own sections (Part 4 shipped
+management; the rename/move persistence defects were fixed there).
 
 ---
 
@@ -3590,6 +3644,11 @@ rows/codes/tags.
    the management-UI phase must close it before rename/tag editing ships.
 3. `do_rename` / `do_move` still report success without persisting, and the
    saved-item delete still has no confirmation. Unchanged, unfixed, out of scope.
+   > **Superseded by Part 4 (its section is above):** `do_rename` now persists
+   (via the owner-scoped `update_save_field`/`update_save_fields` writer) and
+   `do_move` was removed — a saved item has no folder concept. The "no delete
+   confirmation" statement no longer describes the current source either: the
+   Part 4 delete path is the one the current code carries.
 4. Legacy rows keep their `#`-prefixed tags until a gated cleanup decides
    otherwise.
 5. Applying the migration is a manual Supabase action. Until it is applied, the
@@ -3597,6 +3656,13 @@ rows/codes/tags.
    honest insert failure for a named one.
 
 ### Explicitly deferred (Save V2 parts C–G)
+
+> **Status:** Parts C–E and the retrieval-resolution plan of F were
+> subsequently DELIVERED (Parts 2, 3, 4 and the Telegram sync above). Still
+> genuinely deferred: embeddings/vector search, `file_name`/`short_code`
+> cleanup (the columns are still dead in the current source), and any
+> `update_save_field` allow-list redesign. **The Save V2 A–G sequence is
+> complete as far as the repository carries it.**
 
 Search and semantic retrieval (querying `display_name`/`tags`, the deterministic
 0/1/N resolver, the typed candidate-list tool contract), ambiguity handling, the
@@ -3607,7 +3673,7 @@ branch, `resolve_tool_calls`, `SaveTool.parameters`, the prompt template),
 optional future indexes. **Save V2 is NOT complete — this is part 1 of the
 investigation's A–G sequence.**
 
-### Exact next phase
+### Exact next phase — superseded
 
 The investigation's **Phase C** (manual Save: an optional "Name & tags" step in
 the Save panel, routed through the existing input machinery, with the plain reply
@@ -3615,6 +3681,9 @@ path staying prompt-free) and **Phase E** (the AI `name`/`tags` fields, changed
 atomically across `ALLOWED_FIELDS`, the validation branch, `resolve_tool_calls`,
 `SaveTool.parameters` and the prompt template) — after the migration is applied,
 so a name written by either surface has a column to land in.
+
+> **Status:** both phases were subsequently DELIVERED — the manual panel step
+> and the AI fields shipped in Save V2 Part 2 (its section is above).
 
 ## SAVE V2 — PART 3 — DETERMINISTIC RETRIEVAL RESOLUTION (0 / 1 / N)
 
@@ -3848,9 +3917,15 @@ migrations).
 
 ## SAVE V2 INVESTIGATION — investigation only, NOTHING IMPLEMENTED
 
-> Historical: the investigation itself changed no code. Save V2 Part 3
-> (the section above) implemented the retrieval-resolution part of its plan;
-> the rest remains deferred as recorded there.
+> Historical: the investigation itself changed no code. Its implementation plan
+> was subsequently executed by the Save V2 sections above: the data model and
+> the shared metadata model (Phases A/B) as **Part 1**, the manual + AI
+> metadata wiring (Phases C/E) as **Part 2**, the retrieval-resolution layer
+> (Phase F's resolver and 0/1/N contract) as **Part 3**, and the management
+> layer (Phase D) as **Part 4** plus the Telegram sync. What remains deferred
+> is exactly what those sections record as deferred (embeddings/vector search,
+> the dead `file_name`/`short_code` cleanup, an `update_save_field`
+> allow-list redesign).
 
 > **Status: investigation / design audit.** This task changed no code, no
 > schema, no migration, no tool schema, no panel and no retrieval behavior.
@@ -5950,6 +6025,9 @@ from a rotation, and no new consensus mechanism exists.
   credential modules import nothing from `backend.bot` or Telethon.
 * **No user-visible credential UI**: this phase adds no panel and exposes no key
   through Telegram. Credential management, if it is ever wanted, is a later phase.
+  > **Delivered later by API Credential Vault PART 2** (its section is below):
+  > the owner-facing credential surface now exists under
+  > AI → Media Analysis → API Credentials.
 
 ### Supabase Vault configuration that MUST be performed manually
 
@@ -6148,6 +6226,9 @@ files; `git diff --check` clean.
 5. **No credential-management UI.** Enabling/disabling, reordering, viewing health
    and testing a credential from Telegram were explicitly out of scope and remain
    a later phase; credentials are managed in the secret backend and Render.
+   > **Delivered later by API Credential Vault PART 2** (its section is below):
+   > list/enable/disable/priority/replace-key/test/delete all exist now, behind
+   > the one management boundary over the §29 functions.
 6. **A credential is trusted by its label.** Rotating between keys of the same
    provider can only change quota and validity, never the response format; the
    adapters' existing validation is unchanged and still refuses a malformed or
@@ -6843,6 +6924,11 @@ transcript timing/diarization, TTS, and any change to OCR.
    message) — the provider, credential and account work an offline suite cannot do.
 3. **FLAC division** only if a supported container truly needs it, and only with a real
    frame parser rather than a guess.
+
+> **No later phase delivered any of these.** STT was frozen at the M-line when
+> TTS was frozen (`chore(tts): freeze tts and hide from user interface`); every
+> item above remains genuinely deferred with no successor section in this
+> report.
 
 ### Delivery
 
