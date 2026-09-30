@@ -14,6 +14,15 @@
 > verified current state plus the smallest architecture the next phase can
 > implement. No claim of implementation success is made anywhere in this
 > document.
+>
+> **Regex / command-parsing audit (§24):** the complete regex/command-parsing
+> audit of the AI tool command flow — executed as a separate response-only
+> investigation at audit revision `5c47f66`, published as commit `cd2eb3b`,
+> and consolidated into this document as §24 — likewise changed **no code**.
+> Its headline finding: the AI tool flow is structured-first, **no regex
+> bypasses `ToolRegistry` → `ToolExecutor`**, no architectural violation
+> exists, and the live "No active todos" + "Memory fallback" failure is a
+> durable-store degradation event (§24.6), not a parsing defect.
 
 ---
 
@@ -49,7 +58,10 @@ This document answers, from source (not from the reports):
    Items, conditional requests and conversational continuation interact with
    what already exists (§6–§15);
 5. the recommended next implementation phase (§22) and the open decisions the
-   owner must settle first (§23).
+   owner must settle first (§23);
+6. where regex/pattern matching participates in the AI tool command flow —
+   user commands, intent detection, fallback parsing, argument extraction —
+   and how that relates to the Todo failure (§24).
 
 **Explicit non-goals of this document** (also the guard-rails for §22): no
 generic workflow platform, no DAG engine, no BPM/automation builder, no
@@ -88,7 +100,7 @@ with later edits — the symbol names are the durable citation.
 |---|---|
 | `python3 -m pytest tests/test_todo_lifecycle.py tests/test_todo_resolver.py tests/test_todo_tools.py tests/test_todo_steps.py tests/test_todo_steps_tools.py tests/test_todo_ui.py -q` | **108 passed** in 0.93 s |
 | `python3 -m pytest tests/test_database_setup_order.py tests/test_canonical_schema_reconciliation.py -q` | **59 passed** in 1.22 s |
-| `git diff --check` | run immediately before the commit (§24) |
+| `git diff --check` | run immediately before the commit (§25) |
 
 `IMPLEMENTATION_REPORT.md` states the full suite result of the Part 2 phase
 (**5094 passed, 26 skipped**). That number is **REPORTED, NOT RE-VERIFIED** by
@@ -1050,7 +1062,288 @@ evidence of the previous one; neither is designed further here on purpose.
 
 ---
 
-## 24. Exact files inspected
+## 24. Regex / command-parsing audit (AI tool command flow)
+
+> **Investigation only — this section adds no code.** It records where user
+> commands, AI tool commands, or command-like inputs depend on
+> regex/pattern matching, why each pattern exists, what behavior depends on
+> it, whether it is required or legacy, what would break if it were removed,
+> and what should replace it if the architecture required its removal. The
+> audit was executed as a response-only investigation at audit revision
+> `5c47f66` (== `origin/main` at the time; clean tree), published as commit
+> `cd2eb3b` (`investigate: audit regex command parsing`), and is consolidated
+> here as the canonical record; the previously separate file was removed and
+> this section is its complete content. Line numbers were read at the audit
+> revision and will drift with later edits; the symbol names are the durable
+> citation (same discipline as §1).
+
+### 24.1 Scope and method
+
+Search scope: every `re.compile / re.match / re.search / re.fullmatch /
+re.findall / re.sub / re.split` call site in the backend (**21 files, ~60
+call sites**), plus the keyword sweep over *pattern, parse, command, intent,
+route, handler, fallback, trigger, extract, normalize*. Every
+command-relevant match was inspected with surrounding code — no conclusion
+rests on grep output alone — and each execution path was traced end-to-end
+(Telegram message → handler → normalization → AI/router/parser → tool
+selection → ToolRegistry → ToolExecutor → service → database). Purely
+unrelated regex (generic URL/email validation, output formatting) was
+catalogued and is reported only where it affects command execution. The
+audit was investigation-only by contract: no regex was removed, no handler,
+tool, executor, registry, service, scheduler, database, schema, prompt or
+test file was modified.
+
+### 24.2 Findings (executive summary)
+
+The repository contains regex in **21 backend files (~60 call sites)**, but
+only **~15 locations across ~12 files** are command-flow-relevant. Exactly
+**one** is a Telegram text-command pattern (`^Menu$`); everything else is
+extraction (save codes, links, JSON blocks), validation, resilience
+classification, or security/formatting.
+
+The AI tool flow is **structured-first by design**: native provider tool
+calls are preferred, and the deterministic token/vocabulary parser
+(`parse_command_intent`) is a *fallback* layer explicitly scoped to a narrow
+command vocabulary (save/delete/send/scheduling). Task/todo management is
+deliberately routed **semantically** through provider tool schemas.
+
+**No regex bypasses `ToolRegistry` → `ToolExecutor`** — every execution
+path, native or parsed, converges on the single executor boundary. **No
+architectural violations found.**
+
+The live "No active todos" + "Memory fallback" failure is **not
+regex-related**: it is a local-resource degradation in `task_repository`
+that truthfully degraded to in-memory storage (§24.6).
+
+### 24.3 Complete regex inventory
+
+Command-relevant inventory (verified with surrounding code, not grep-only):
+
+| Location | Command/Input | Regex Used | Purpose | Required? | Replacement Candidate |
+|---|---|---|---|---|---|
+| `bot/handlers/misc.py:703` | `Menu` (the only text command) | `pattern=r"^Menu$"` in `events.NewMessage(outgoing=True)` | Opens Glass UI mother panel | Required (Telethon-idiomatic) | Plain `text == "Menu"` guard inside a pattern-less handler (like trigger matching) — see §24.10 |
+| `ai/actions.py:165` | t.me link in prompt | `_TELEGRAM_LINK_RE` | Link extraction → save-by-link | Required | — (URL shapes need pattern matching) |
+| `ai/actions.py:768` | save-code argument | `_SAVE_CODE_RE = ^[A-Z0-9]{1,12}$` | Validates save-code tool args | Partially redundant | Consolidate with `_SAVE_CODE_TOKEN_RE` (2220) |
+| `ai/actions.py:2037` | any text | `_tokenize` → `re.findall(r"[a-z0-9\u0621-\u06ff]+")` | Substrate for the deterministic vocabulary (token sets, not regex command detection) | Required | — |
+| `ai/actions.py:2220` | token `s0001` | `_SAVE_CODE_TOKEN_RE = ^s[0-9a-z]{1,11}$` | Classifies tokenized word as save code | Required | — |
+| `ai/actions.py:2221` | random code `sxxxx` | `_SAVE_CODE_RANDOM_TOKEN_RE = ^s[0-9a-z]{4}$` | Collision-issued random codes | Required | — |
+| `ai/actions.py:2228` | `S0001` in text | `_SAVE_CODE_CANONICAL_RE = (?<![A-Za-z0-9])S[A-Z0-9]{4}(?![A-Za-z0-9])` | Canonical code detection with boundary guards | Required | — |
+| `ai/actions.py:2536-2538` | scheduling phrase | `\d{1,2}:\d{2}`, `ساعت\s*\d`, `\bat\s+\d{1,2}\b` in `_has_future_clock_request` | Detects clock-anchored scheduling intent | **Removable candidate** | Token-digit adjacency scan (`_tokenize` already preserves digits) |
+| `ai/tools/task.py:208` | create_task request | `re.search(r"\d{1,2}:\d{2}", request)` | Completeness gate (clock anchor present?) before wizard | **Removable candidate** | Same token-digit scan via actions helpers |
+| `ai/task_interpreter.py:21` | model output | `_JSON_BLOCK_RE` — fenced (triple-backtick) JSON block extractor (DOTALL) | Extracts model's fenced JSON candidate | Required (structured-output extraction, not command parsing) | — |
+| `ai/task_execution.py:71` | occurrence prep output | Same fenced-JSON pattern | Occurrence-time preparation extraction | Required | — |
+| `ai/task_candidate.py:56` | model-emitted candidate keys | `_COMPOUND_KEY_RE = ^(?:interval|every|each|repeat)_(minutes?|...)$` | Normalizes structured candidate keys | Required (schema normalization) | — |
+| `ai/database/task_repository.py:131` | PostgREST error | `_UNKNOWN_COLUMN_RE = could not find the '([^']+)' column` | PGRST204 detection → optional-column retry | Required (resilience, not commands) | — |
+| `services/retrieve_service.py:388-389` | user-typed code | `_SAVE_CODE_SHAPE = ^S[A-Z0-9]{4}$`, `_SEPARATOR_RE` | 0/1/N save-code resolution with spelling variants | Required | — |
+| `services/save_service.py:43` | link input | `_LINK_RE` | Parses Telegram link for `save_by_link` | Required | — |
+| `ai/preparation_policy.py:300-372` | task instruction | exact/max character patterns (e.g. Persian/English "at most N characters") | Derives deterministic content policy (validation of generated content, not commands) | Required (fail-closed policy) | Data-driven only if instruction grammar changed |
+| `ai/semantic_delete.py` | deletion query | `^(\d+)(word|words)$`, `^(.+?)(کلمه)...$`, diacritic normalization | Structural deletion predicates | Required (deterministic, tested) | Structured-AI path only as architecture evolution |
+
+**Non-command regex (out of scope but verified present):** secret redaction
+(`web_search_service.py` Bearer, `ai/discovery.py:71`, `model_tester.py:51-56`),
+output formatting (`tools/delivery.py`, `helper/font_style.py`), chat-title
+whitespace normalization (`chat_resolution.py:42-43`), language-tag
+validation (`ai_stt_settings.py`), provenance digits/links
+(`task_contract.py`), `providers/you_search.py`.
+
+**Verified regex-free (grep-confirmed zero matches):** `task_wizard.py`
+(str.split/int/strptime), `bot/handlers/taskloom.py`, `bot/handlers/todo.py`,
+`bot/handlers/tasks.py` (`.task` is a string prefix, not regex),
+`ai/task_management.py`, `ai/tools/todo_tools.py`, `ai/tools/executor.py`,
+`ai/config_store.py` (`match_trigger` is case-insensitive `==`).
+
+### 24.4 User command flow (where regex participates)
+
+```
+Telegram outgoing message
+  → is_owner gate (no regex)
+  → handler selection:  Menu → misc.py pattern ^Menu$  (the ONLY regex command match)
+                        AI text → ai_unified.py (NO pattern; fires on all outgoing)
+                        .task (legacy dot-command) → tasks.py string prefix (NO regex)
+  → normalization: raw text only; Glass UI decorative font never affects the Menu match
+  → AI/router: first-word trigger via match_trigger (equality, no regex)
+               → dispatcher
+  → tool selection: native provider tool_calls OR _apply_structured_action fallback (§24.5)
+  → ToolRegistry.get(tool_name) (executor.py:264)
+  → ToolExecutor.execute_calls → tool.execute()
+  → service layer (save/retrieve/delete/bio/username/todo services)
+  → db/client.py (Supabase or in-memory fallback)
+```
+
+Regex participates at exactly **one** user-command point (`^Menu$`) and at
+**argument/artifact** points downstream (save-code shape checks, link
+parsing). Command *routing* for everything else is equality or semantics —
+not regex.
+
+### 24.5 AI tool invocation paths — structured tool calls vs text/regex parsing
+
+Three invocation paths exist — a **designed mixture**, not an accident:
+
+- **(A) Native structured tool calls (primary/authoritative):** providers
+  emit real `tool_calls`/`functionCall` (OpenAI format; Gemini translates to
+  `functionDeclarations`) → `dispatcher` → `ToolExecutor.execute_calls`.
+  Task/todo management is deliberately routed only this way (actions.py
+  ~2660 comment: "task management is routed semantically rather than by
+  per-phrase vocabulary").
+- **(B) Deterministic token/vocabulary fallback:** when the provider returns
+  prose only (`tools_allowed and response.success and not
+  response.tool_calls`), `_apply_structured_action` (~1928) runs
+  `parse_command_intent(request.user_message, ...)` **first** (authoritative
+  for the narrow save/deep_save/delete/send vocabulary; built on token
+  frozensets, not regex), then `parse_action_text(text)` for model-JSON
+  contracts. Scheduling requests additionally pre-build a
+  `deterministic_task_candidate` in `_build_tool_context` (1275).
+- **(C) Model-JSON parsing:** `parse_action_text` → `validate_action` →
+  `resolve_tool_calls` — structured output validated against the action
+  contract.
+
+**Authoritative:** native tool calls; the deterministic parser is
+authoritative only for the narrow command vocabulary when the model produces
+prose.
+
+**Critical compliance fact:** paths A, B, and C all terminate at the **same**
+`ToolRegistry.get` → `ToolExecutor.execute_calls` boundary (`executor.py` is
+the sole caller of `tool.execute()`; unknown tool → not found; malformed
+args rejected). **No regex constructs or executes a tool call outside this
+boundary → no architectural violation.**
+
+The only theoretical concern is ambiguity *within* the fallback parser
+(false-positive command vocabulary), which is bounded by its small token
+sets and the exclusion of task/todo vocabulary from it (§24.9).
+
+### 24.6 Todo creation flow and the observed live failure
+
+Three routes, none regex-parsing commands:
+
+1. **Glass UI:** Menu → todo panel → structured `input:*` callbacks →
+   `TodoService` (no regex anywhere in `todo.py`).
+2. **AI native tool call:** provider emits `todo_add` → `validate_action` →
+   `TodoAddTool` → `TodoService` (no regex).
+3. **Scheduling create_task:** completeness gate (`tools/task.py` ~195-235;
+   one clock regex at 208) → incomplete requests route to the Taskloom
+   wizard (`open_taskloom_wizard`) → `TaskInterpreter` (`_JSON_BLOCK_RE`
+   extracts *model* JSON) → `TaskCandidate` (`_COMPOUND_KEY_RE` normalizes
+   keys) → `TaskCreationService` → `task_repository`.
+
+Live-test failure ("No active todos" + "Memory fallback — a local resource
+error prevented the durable store from being reached") — root cause, not
+assumed:
+
+- `"No active todos."` is rendered by `bot/handlers/todo.py:124` when the
+  `active` list is empty.
+- The fallback string is `FALLBACK_RESOURCE_NOTE`
+  (`ai/task_management_interface.py:27-31`), selected by
+  `fallback_note(reason)` when `reason == FALLBACK_REASON_LOCAL_RESOURCE`.
+- Root: `ai/database/task_repository.py` — `_is_local_resource_failure` (213,
+  walks `__cause__`/`__context__` chains; httpx/httpcore wrap OSError) →
+  `_classify_degradation` (198) → `_mark_fallback` (633) sets
+  `_fallback_active` with a 5.0 s `LocalResourceCooldown`. The durable read
+  failed with a **local resource error** (socket/resource exhaustion class)
+  → in-memory fallback served (empty) → panel truthfully shows "No active
+  todos" **plus** the fallback note, because a degraded read is not an
+  authoritative empty list.
+- Creation succeeded through the fallback with a truthful `durable: False`
+  marker (`tools/task.py:715-740`).
+
+**Conclusion: regex parsing contributes NOTHING to this failure.** It is a
+DB-access/degradation-path event; the note machinery worked as designed and
+told the truth.
+
+### 24.7 Regex that can be removed
+
+- **Clock anchor regexes** — `ai/actions.py:2536-2538` (3 patterns) and
+  `ai/tools/task.py:208` (1). Digits survive `_tokenize`, so a token-adjacency
+  digit scan (`12` `:` `30` / `ساعت` + digit) can replace them.
+  Behavior-equivalent replacement is testable against
+  `tests/test_19_ai_actions.py` and the NL-creation suites.
+- **`_SAVE_CODE_RE` (`ai/actions.py:768`)** — redundant with
+  `_SAVE_CODE_TOKEN_RE` (2220); consolidate to one shape definition.
+  Cleanup, not a behavior fix.
+
+No regex is *harmful*; removal is optional hygiene.
+
+### 24.8 Regex that must stay
+
+- Canonical save-code shapes (`actions.py:2220/2221/2228`,
+  `retrieve_service.py:388`) — fixed-format artifact matching is exactly what
+  regex is for; removal invites false-positive tool calls on arbitrary words.
+- Link extraction (`actions.py:165`, `save_service.py:43`).
+- Fenced-JSON extractors (`task_interpreter.py:21`, `task_execution.py:71`)
+  — structured-output recovery from prose-wrapped model replies.
+- `_COMPOUND_KEY_RE` (`task_candidate.py:56`) — schema normalization of
+  structured keys.
+- `_UNKNOWN_COLUMN_RE` (`task_repository.py:131`) — PGRST204 resilience.
+- Provenance digit extraction (`task_contract.py`), preparation-policy
+  patterns (fail-closed validation), semantic-delete predicates
+  (deterministic, tested), and all security redaction.
+- `^Menu$` — required today (see §24.10 for the optional migration).
+
+### 24.9 Architectural findings
+
+Measured against the intended architecture ("AI reasons and proposes
+structured actions; runtime validates and executes"):
+
+1. **No architectural violations.** Regex is never used where AI structured
+   output should rule: the model's own tool calls and model-JSON candidates
+   are schema-validated (`validate_action`), and regex participates only in
+   *extraction* (JSON blocks, links, codes), *validation*, *resilience
+   classification*, and *security/formatting*.
+2. **No execution-boundary bypass.** Nothing constructs or executes a tool
+   call outside `ToolRegistry` → `ToolExecutor`; the deterministic fallback
+   parser only *resolves intent into existing tool calls* that then travel
+   through the same executor.
+3. **Residual (bounded, by design) risk:** the fallback parser's
+   token-vocabulary decision layer is a parallel command-detection path to
+   the provider's own tool-call decision. It is deliberately narrow
+   (save/delete/send/scheduling; task/todo vocabulary excluded) and
+   deterministic, so the residual exposure is false-positive command
+   detection within that narrow vocabulary — not an authority violation.
+
+### 24.10 Recommended fix direction
+
+**Nothing is mandatory** — the architecture already satisfies "AI reasons
+and proposes structured actions; runtime validates and executes." If zero
+command regex is a hard goal:
+
+1. Replace `pattern=r"^Menu$"` with a pattern-less outgoing handler +
+   exact-match guard (`text == "Menu"`), mirroring `match_trigger`'s
+   equality style. Regression risk: near zero.
+2. Replace the 4 clock regexes with token-based digit-adjacency checks
+   reusing `_tokenize`; pin behavior with the existing action/NL test
+   suites.
+3. Consolidate `_SAVE_CODE_RE` into `_SAVE_CODE_TOKEN_RE`.
+4. Leave `parse_command_intent`'s token vocabulary as-is (it is data, not
+   regex); schema validation already lives in `validate_action`; no
+   ToolRegistry/ToolExecutor change is needed or desirable — the boundary is
+   already regex-free and single.
+
+The observed Todo failure is **not** addressed by any of these: its fix
+belongs to the durable-store degradation path (§5/§11 territory of this
+document — truthful fallback rendering is already correct behavior), not to
+the command-parsing path.
+
+### 24.11 Files inspected for this audit
+
+`AGENTS.md`, `IMPLEMENTATION_REPORT.md`, `INVESTIGATION.md`,
+`DATABASE_ARCHITECTURE.md`; `backend/bot/handlers/` (misc, ai_unified,
+tasks, task_events, taskloom, todo, ai_stt_settings, router); `backend/ai/`
+(actions, engine/dispatcher, tools/executor, tools/task, tools/todo_tools,
+task_interpreter, task_execution, task_candidate, task_contract,
+task_wizard, task_management, task_management_interface,
+database/task_repository, preparation_policy, semantic_delete, discovery,
+config_store, model_tester); `backend/services/` (save_service,
+retrieve_service, web_search_service); `backend/helper/font_style.py`.
+
+Test suites consulted (behavior pins, not modified):
+`tests/test_19_ai_actions.py`, `test_task_nl_creation.py`,
+`test_task_nl_interval_creation.py`, `test_task_fallback_classification.py`,
+`test_task_fallback_cooldown.py`, `test_task_list_consistency.py`,
+`test_task_list_reliability.py`, `test_task_hardening.py`,
+`test_tool_health_audit.py`.
+
+---
+
+## 25. Exact files inspected
 
 Read in full (or in the cited windows) at HEAD `3f8f197`:
 
@@ -1118,12 +1411,34 @@ Read in full (or in the cited windows) at HEAD `3f8f197`:
   (via the tool call sites: `resolve_saved_items`, `do_retrieve`,
   `do_edit_tags`, `do_preview`, `do_delete`)
 
+**Regex/command-parsing audit (§24)** — read at audit revision `5c47f66`:
+* `backend/ai/actions.py` (regex definitions + `parse_command_intent` /
+  `parse_action_text`), `backend/ai/engine/dispatcher.py`
+  (`_apply_structured_action`, `_build_tool_context`), `backend/ai/tools/task.py`
+  (completeness gate), `backend/ai/tools/executor.py` (registry lookup),
+  `backend/ai/task_interpreter.py`, `backend/ai/task_execution.py`,
+  `backend/ai/task_candidate.py`, `backend/ai/database/task_repository.py`
+  (`_UNKNOWN_COLUMN_RE`, degradation classification),
+  `backend/ai/task_management_interface.py` (`fallback_note`),
+  `backend/ai/preparation_policy.py`, `backend/ai/semantic_delete.py`,
+  `backend/ai/discovery.py`, `backend/ai/model_tester.py`,
+  `backend/ai/config_store.py` (`match_trigger`), `backend/ai/tools/delivery.py`,
+  `backend/ai/providers/you_search.py`, `backend/services/save_service.py`,
+  `backend/services/retrieve_service.py`, `backend/services/web_search_service.py`,
+  `backend/helper/font_style.py`, and `backend/bot/handlers/` (misc,
+  ai_unified, tasks, task_events, taskloom, todo, ai_stt_settings, router)
+
 **Tests**
 * `tests/test_todo_steps.py`, `tests/test_todo_steps_tools.py`,
   `tests/test_todo_tools.py`, `tests/test_todo_lifecycle.py`,
-  `tests/test_todo_resolver.py`, `tests/test_todo_ui.py`
-* `tests/test_database_setup_order.py`,
+  `tests/test_todo_resolver.py`, `tests/test_todo_ui.py`* `tests/test_database_setup_order.py`,
   `tests/test_canonical_schema_reconciliation.py`
+* `tests/test_19_ai_actions.py`, `tests/test_task_nl_creation.py`,
+  `tests/test_task_nl_interval_creation.py`,
+  `tests/test_task_fallback_classification.py`,
+  `tests/test_task_fallback_cooldown.py`, `tests/test_task_list_consistency.py`,
+  `tests/test_task_list_reliability.py`, `tests/test_task_hardening.py`
+  (§24 regex-audit behavior pins, located by search)
 * `tests/test_capability_exposure_tools.py` (registry-count assertion),
   `tests/test_memory_tools.py`, `tests/test_tool_health_audit.py`
   (Todo-tool expectations, located by search)
