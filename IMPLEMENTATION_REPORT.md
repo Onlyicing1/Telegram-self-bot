@@ -871,8 +871,16 @@ owner-side verification work.
 ## 13. Final Current State
 
 - Repository `Onlyicing1/Telegram-self-bot`, branch `main`, HEAD
-  `d80ee369ed8151242c7bd90dda3b67d0db8ddece`, equal to `origin/main`; the
-  tree is clean except the pre-existing untracked `telegram-self-bot/`.
+  `6bec69488d4da873b0e05694c05ef426c250063f` (`fix: remove regex based tool
+  command routing`), equal to `origin/main` — re-verified against the GitHub
+  remote on 2026-10-01 (`git fetch origin`, `git rev-parse origin/main`,
+  `git merge-base --is-ancestor … origin/main`): **the commit is present on
+  `origin/main` (delivery state: pushed; no push was required).** This
+  supersedes the earlier `d80ee369ed8151242c7bd90dda3b67d0db8ddece` recorded
+  as final state in the previous revision (and as audit-time state in §2) —
+  delivery status comes only from a current remote verification, never from an
+  older conversational claim such as "the work was not pushed". The tree is
+  clean except the pre-existing untracked `telegram-self-bot/`.
 - **Part 4 (2026-09-30):** regex-command routing removal implemented
   (INVESTIGATION.md §24.10): clock-anchored intent detection, the
   `create_task` completeness gate, and the `Menu` command are decided on

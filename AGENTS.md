@@ -526,6 +526,30 @@ Docs (`/docs`, `/redoc`) are disabled.
 5. **Verify before pushing** — compile checks + tests pass.
 6. **Remote:** always push to the repository already connected to the current
    workspace; never hardcode a URL or owner name.
+7. **Push status is verified against the remote — never assumed, never
+   remembered.** Before stating whether a commit is pushed: `git fetch origin`
+   → `git rev-parse origin/main` → `git merge-base --is-ancestor <sha>
+   origin/main`. **Current GitHub remote/main verification is authoritative for
+   push status. Historical statements that a commit was not pushed must not
+   override a later verified remote state.** Old conversational wording such as
+   "it wasn't pushed" is not evidence; only a fresh remote check is. Repository
+   state (tree, HEAD) and delivery state (push status) are tracked as distinct
+   facts.
+
+### Verified delivery state (canonical, 2026-10-01)
+
+| Item | Value |
+|---|---|
+| Repository | `Onlyicing1/Telegram-self-bot` |
+| Branch | `main` |
+| Local HEAD | `6bec69488d4da873b0e05694c05ef426c250063f` (`fix: remove regex based tool command routing`) |
+| `origin/main` | `6bec69488d4da873b0e05694c05ef426c250063f` (verified with `git fetch origin` + `git rev-parse origin/main` + `git merge-base --is-ancestor` — exit 0) |
+| Delivery state | **PUSHED / ALREADY PRESENT** — the regex routing fix and its full ancestry (incl. `c402284`, `96cf965`, `cd2eb3b`) are on `origin/main`; no push was required |
+| Working tree | clean except the pre-existing untracked `telegram-self-bot/` (never touched) |
+
+This table records a verified snapshot, not a permanent assumption: re-verify
+with the commands above before any future push-related claim, and if a fresh
+check disagrees, the fresh remote state wins.
 
 ---
 
