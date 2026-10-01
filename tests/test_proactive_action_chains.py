@@ -422,13 +422,19 @@ def _usage():
     return {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105}
 
 
-def _make_engine(provider, log):
+def _make_engine(provider, log, *, with_create_task: bool = False):
     from backend.ai.engine.engine import Engine
 
     engine = Engine(providers=_manager(provider))
     registry = ToolRegistry()
     registry.register(_Probe("probe_one", log))
     registry.register(_Probe("probe_two", log))
+    if with_create_task:
+        # The REAL registered create_task tool — the composition tests run
+        # the genuine dispatcher -> ToolExecutor -> CreateTaskTool path.
+        registry.register(CreateTaskTool(
+            ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC", client=None)
+        ))
     real_ctx = ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC", client=None)
     engine.attach_tools(registry, real_ctx, owner_id=OWNER, tz_str="UTC")
     return engine
@@ -538,3 +544,175 @@ async def test_plain_request_gets_no_expansion_rules():
     )
     # The tool context carries the same fail-closed False.
     assert log == [("probe_one", False)]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Full composition — ONE authorized message becomes ONE multi-action task
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _candidate_payload():
+    """The task candidate the interpreter round returns for AUTH_REQUEST.
+
+    Uses REAL registered tools (send_message) — never arbitrary fakes — and
+    models exactly the derived chain the expansion contract asks for: the
+    owner's stated action first, then the directly useful follow-ups.
+    """
+    return _payload(
+        [
+            _send("plan step 1"),
+            _send("plan step 2"),
+            _send("plan step 3"),
+        ],
+        label="Authorized plan",
+    )
+
+
+def _compose_provider(
+    candidate_payload: dict, *, distilled_request: str = AUTH_REQUEST
+) -> ScriptedProvider:
+    """Scripted provider for the FULL composition: only the provider boundary
+    is mocked. The response ORDER mirrors the real call sequence —
+
+      1. dispatcher round -> the model emits ONE real create_task tool call
+         (the model's distilled task request);
+      2. TaskInterpreter (INSIDE create_task execution) -> the candidate;
+      3. dispatcher continuation -> the final answer.
+    """
+    return ScriptedProvider(
+        [
+            ProviderResponse(
+                text="",
+                provider_name="scripted",
+                success=True,
+                tool_calls=[
+                    {
+                        "id": "t1",
+                        "name": "create_task",
+                        "arguments": {"request": distilled_request},
+                    }
+                ],
+                usage=_usage(),
+            ),
+            ProviderResponse(
+                text=json.dumps(candidate_payload),
+                provider_name="scripted",
+                success=True,
+                usage=_usage(),
+            ),
+            ProviderResponse(
+                text="done",
+                provider_name="scripted",
+                success=True,
+                usage=_usage(),
+            ),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_authorized_message_composes_one_multi_action_task():
+    """THE planner-composition regression: one natural-language message with
+    explicit initiative authorization, answered by the model with ONE real
+    create_task tool call, must produce ONE persisted task whose action
+    chain carries the derived ordered actions — through the REAL dispatcher
+    -> ToolExecutor -> CreateTaskTool -> TaskInterpreter ->
+    TaskCreationService path. Nothing expands the chain executor-side.
+    """
+    from backend.ai.session.request import AIRequest
+
+    provider = _compose_provider(_candidate_payload())
+    log: list = []
+    engine = _make_engine(provider, log, with_create_task=True)
+
+    repository_manager = dbm.RepositoryManager(supabase_available=False)
+    with patch.object(
+        dbm, "get_repository_manager", return_value=repository_manager
+    ):
+        result = await engine.execute(
+            AIRequest(
+                session_id="proactive-compose",
+                user_message=SAMPLE_RELATED_PERSIAN,
+                owner_id=OWNER,
+                chat_id=-1,
+                message_id=1,
+            )
+        )
+
+    assert result.success is True, result.errors
+    assert result.metadata.get("proactive_authorized") is True
+    # Call sequence proves the shape: conversational round, ONE interpreter
+    # round inside create_task, ONE continuation — no repeated create_task.
+    assert len(provider.received) == 3
+    # ONE create_task call -> ONE task with the DERIVED ordered actions.
+    tasks = await repository_manager.task.list_tasks(OWNER)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert len(task.actions) == 3
+    assert [a["name"] for a in task.actions] == ["send_message"] * 3
+    assert [a["arguments"]["text"] for a in task.actions] == [
+        "plan step 1",
+        "plan step 2",
+        "plan step 3",
+    ]
+    # The conversational round carried the AUTHORIZED rules line (and nothing
+    # else injected the expansion — it is the interpreter's contract).
+    assert any(
+        str(m.get("content", "")).startswith("Proactive authorization: AUTHORIZED")
+        for m in provider.received[0]
+        if m.get("role") == "system"
+    )
+    # The interpreter round (inside create_task) received the EXPANSION
+    # contract — the planner, not the executor, is what multiplies actions.
+    assert "PROACTIVE EXPANSION (AUTHORIZED" in " ".join(
+        str(m.get("content"))
+        for m in provider.received[1]
+        if m.get("role") == "system"
+    )
+    assert result.response == "done"
+
+
+@pytest.mark.asyncio
+async def test_one_unauthorized_message_composes_no_expanded_chain():
+    """Mode A composition: the same single create_task tool call under a
+    request WITHOUT authorization still creates the literally named task,
+    but the planner never received the expansion contract."""
+    from backend.ai.session.request import AIRequest
+
+    provider = _compose_provider(
+        _payload([_send("just this one")], label="Literal plan"),
+        distilled_request=PLAIN_REQUEST,
+    )
+    log: list = []
+    engine = _make_engine(provider, log, with_create_task=True)
+
+    repository_manager = dbm.RepositoryManager(supabase_available=False)
+    with patch.object(
+        dbm, "get_repository_manager", return_value=repository_manager
+    ):
+        result = await engine.execute(
+            AIRequest(
+                session_id="proactive-compose-a",
+                user_message=PLAIN_REQUEST,
+                owner_id=OWNER,
+                chat_id=-1,
+                message_id=1,
+            )
+        )
+
+    assert result.success is True, result.errors
+    assert result.metadata.get("proactive_authorized") is False
+    assert len(provider.received) == 3
+    tasks = await repository_manager.task.list_tasks(OWNER)
+    assert len(tasks) == 1
+    assert len(tasks[0].actions) == 1
+    assert not any(
+        str(m.get("content", "")).startswith("Proactive authorization: AUTHORIZED")
+        for m in provider.received[0]
+        if m.get("role") == "system"
+    )
+    assert "PROACTIVE EXPANSION" not in " ".join(
+        str(m.get("content"))
+        for m in provider.received[1]
+        if m.get("role") == "system"
+    )
