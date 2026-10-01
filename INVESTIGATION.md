@@ -1465,3 +1465,35 @@ origin/main`, `git log`, `git diff --stat`, `wc -l`, `grep`/`rg`, and the two
 `python3 -m pytest` focused runs. No file other than `INVESTIGATION.md` was
 written; no SQL, Supabase operation, migration, or Telegram action was
 performed.
+
+---
+
+## 26. Proactive-initiative authorization (per-request, no persisted preference)
+
+Follow-up audit finding recorded 2026-10-01 (HEAD context: Part 5, see
+IMPLEMENTATION_REPORT.md §5.1). The question this section settles: does the
+repository need a persisted preference to authorize proactive initiative?
+
+- **No persisted proactive/initiative preference exists** —
+  `PreferencesRecord` (language, personality, response_style,
+  custom_instructions, auto_memory, auto_tools) has no such field, and none
+  was invented. A second permission model would compete with the existing
+  confirmation/permission architecture (`PermissionLevel`,
+  `requires_owner_confirmation`) for no benefit in a single-owner self-bot.
+- **The owner's own message is the authorization.**
+  `backend/ai/proactive.py::has_proactive_authorization` is the ONE detector:
+  a conservative Persian/English phrase vocabulary matched over normalized
+  tokens (no regex command patterns — the same token discipline as §24's
+  clock anchor), fail-closed on unknown/ambiguous/ordinary phrasing.
+  Authorization is never persisted, never global; it lives exactly as long
+  as the request that carried it.
+- **What authorization does and does not permit.** It permits planning ONE
+  bounded ordered action chain (≤5 actions) inside ONE task toward the stated
+  goal. It never permits: unrelated work, new side-effect categories,
+  repeated `create_task` calls for one goal, or bypassing a confirmation
+  gate — expanded actions remain subject to `task_creation`'s eligibility
+  checks (`_action_eligibility_error`) exactly as literal actions are.
+- **Tests** — `tests/test_proactive_action_chains.py` (24) covers the
+  detector, both modes, bounds, confirmation gating, recursion-forbid pins,
+  and an AST import scan proving no scheduler/executor/registry/dispatcher
+  coupling from the detector module.

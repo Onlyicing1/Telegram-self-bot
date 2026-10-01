@@ -555,6 +555,56 @@ dynamic replanning, workflow mutation after creation, cross-task data
 visibility, and any second scheduler/executor. (See §10 for the limitation
 consequences.)
 
+### 5.1 Bounded proactive multi-action planning (per-request authorization)
+
+The dispatcher/interpreter path gained ONE capability: when the owner's own
+message explicitly authorizes additional useful work, the AI may plan a small
+ordered action chain toward the stated goal instead of only the literally
+named action — as ONE coherent task with multiple validated actions, never as
+repeated `create_task` calls. This is bounded, user-authorized proactive
+multi-action execution within the existing Todo/ToolExecutor architecture.
+
+- **Authorization is per-request and fail-closed.**
+  `backend/ai/proactive.py` is the single detector
+  (`has_proactive_authorization`): a conservative Persian/English phrase
+  vocabulary (e.g. «چیزهای مرتبط دیگه‌ای», «هر کار کوچیکی», "use your
+  judgment", "do what is needed") matched over normalized tokens; bare
+  delegation ("خودت انجام بده"), opinion prompts, and permission-adjacent
+  social phrasing are deliberately NOT authorization. There is no persisted
+  preference, no global mode, and no schema: the flag lives exactly as long
+  as the request that carried it (ZWNJ is removed rather than spaced so
+  «دیگه‌ای» ≡ «دیگهای» ≡ «دیگه ای").
+- **Durable create_task path** — `CreateTaskTool` proves authorization from
+  the owner's raw message (`extra["proactive_authorized"]`, set by
+  `Dispatcher._build_tool_context`, with the distilled request as fallback)
+  and passes it to `TaskInterpreter.interpret`, which appends
+  `PROACTIVE_EXPANSION_INSTRUCTIONS` (six hard rules a–f: goal-related only,
+  1..5 actions unchanged, `create_task` NEVER inside actions, registered
+  names only, ordered dependencies, all other contracts unchanged, no safety
+  bypass). Trace lines carry `proactive_authorized=true/false`.
+- **Conversational path** — the Dispatcher inserts ONE
+  `PROACTIVE_AUTHORIZED_RULES` system message before the user input and
+  records `metadata["proactive_authorized"]`; a plain request produces
+  byte-identical messages to before. `RUNTIME_RULES_TEMPLATE` gained one
+  PER-REQUEST bullet so the base prompt states the default (perform ONLY the
+  asked operations).
+- **Bounds unchanged** — `MAX_ACTIONS = 5`, `MAX_TOOLS_PER_TURN = 5`,
+  `MAX_TOOL_ROUNDS = 3`, the candidate schema's `maxItems: 5`, confirmation
+  gating (`settings_set` stays ADMIN_ONLY), and the recursive-creation
+  backstop (`scheduled_creation_error`) all hold under authorization.
+- **Prohibited under authorization** — unrelated work, new side-effect
+  categories (raw Telegram RPC, SQL, filesystem, HTTP, shell), touching
+  unrelated saved items/messages/account state, repeated `create_task` for
+  one goal, and bypassing confirmation gates. Ambiguous requests still return
+  NULL / ask ONE clarifying question.
+- **Regression suite** — `tests/test_proactive_action_chains.py` (24 tests):
+  detector positives/negatives and fail-closed behavior; Mode A (no
+  expansion) vs Mode B (one request → one task, one provider call, ordered
+  ≤5 actions); bounds and eligibility pins (unregistered tool, `settings_set`
+  confirmation); recursion-forbid pins; dispatcher rules-message insertion
+  and ordered tool execution; an AST import scan proving `proactive.py`
+  imports no scheduler/executor/registry/dispatcher/bot module.
+
 ---
 
 ## 6. Durable Question / Answer Model
@@ -887,6 +937,14 @@ owner-side verification work.
   tokens/equality, one save-code shape contract; the full suite passes at
   5383. Detection-level regex is gone; shape/extraction/resilience/security
   regex intentionally remains (§24.8 of INVESTIGATION.md).
+- **Part 5 (2026-10-01): bounded proactive multi-action planning** — a
+  per-request, fail-closed authorization detector (`backend/ai/proactive.py`)
+  lets ONE owner request expand into ONE coherent task with an ordered,
+  validated action chain (≤5 actions, all bounds unchanged) when — and only
+  when — the owner's own message explicitly authorizes additional useful
+  work. No schema, no migration, no new scheduler/executor/dispatcher, no
+  persisted preference; see §5.1. New suite `tests/test_proactive_action_chains.py`
+  (24 tests); full suite at this feature: **5407 passed, 26 skipped**.
 - The durable task system (Taskloom) is complete through **Part 3F**:
   bounded multi-action chains with result references (3A), durable time waits
   (3B), single conditional branching with durable branch selection (3C),

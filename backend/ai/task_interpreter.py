@@ -10,6 +10,7 @@ from dataclasses import replace
 from typing import Any
 
 from backend.ai.providers.base.contract import ProviderResponse
+from backend.ai.proactive import has_proactive_authorization
 from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
 from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS, ground_ai_instruction
 
@@ -150,6 +151,37 @@ CANDIDATE_SCHEMA = {
 
 class TaskInterpretationError(ValueError):
     """Natural-language interpretation did not yield a safe candidate."""
+
+
+#: Appended to the planning instructions ONLY when the owner's own message
+#: explicitly authorizes proactive initiative (the shared detector in
+#: ``backend.ai.proactive`` — per-request, fail-closed). This RELAXES nothing:
+#: every existing contract above still applies verbatim; what it adds is the
+#: permission to derive a small ordered chain toward the stated goal instead
+#: of the single literally-named action, inside the SAME unchanged 1..5
+#: action bound (schema ``maxItems: 5`` → ``MAX_ACTIONS``).
+PROACTIVE_EXPANSION_INSTRUCTIONS = (
+    "PROACTIVE EXPANSION (AUTHORIZED — the owner's message explicitly permits "
+    "useful additional work toward THIS goal): within this ONE candidate you may "
+    "derive a small ordered action chain instead of only the literally named "
+    "action(s). Hard rules: (a) every derived action must directly help complete, "
+    "verify, or report the owner's requested goal — never unrelated work, never "
+    "actions that merely demonstrate initiative; (b) the chain stays 1..5 actions "
+    "(the schema's maxItems=5 is unchanged — never more, never a second task, and "
+    "'create_task' may NEVER appear inside actions: a task cannot create tasks); "
+    "(c) use ONLY already-registered action names with their declared arguments — "
+    "an unregistered or confirmation-gated action is rejected at creation; "
+    "(d) keep dependent actions ordered AFTER the action whose result they need, "
+    "and never pretend an earlier action succeeded; (e) all other contracts are "
+    "UNCHANGED — still never invent schedule, content, source, language, "
+    "destination, recurrence, or generation requirements (NON-INVENTION CONTRACT), "
+    "still return JSON null when the request is genuinely ambiguous (NULL RULE), "
+    "and the conditional/branch, question, and wait contracts are untouched; "
+    "(f) this authorization never bypasses safety: no confirmation-free destructive "
+    "actions, no new side-effect categories (no arbitrary Telegram RPC, SQL, "
+    "filesystem, HTTP, or shell), and no changes to unrelated saved items, chats, "
+    "or account state."
+)
 
 
 class TaskUnsupportedError(TaskInterpretationError):
@@ -433,13 +465,26 @@ class TaskInterpreter:
             return _outer_object_span(text) is not None
         return True
 
-    async def interpret(self, request: str, timezone: str = "", request_id: str = "") -> TaskCandidate:
+    async def interpret(
+        self,
+        request: str,
+        timezone: str = "",
+        request_id: str = "",
+        *,
+        proactive_authorized: bool = False,
+    ) -> TaskCandidate:
         started = time.perf_counter()
         if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
             raise TaskInterpretationError("task request is empty or too long")
+        # The caller (create_task) may prove authorization from the OWNER'S
+        # full raw message even when the model distilled this request; the
+        # interpreter also detects on the request text it was given, so every
+        # caller (.task command included) gets the same per-request answer.
+        authorized = bool(proactive_authorized) or has_proactive_authorization(request)
         logger.info(
-            "AI_TASK_TRACE request_id=%s stage=interpretation_start mode=provider request_len=%s",
-            request_id or "-", len(request),
+            "AI_TASK_TRACE request_id=%s stage=interpretation_start mode=provider "
+            "request_len=%s proactive_authorized=%s",
+            request_id or "-", len(request), str(authorized).lower(),
         )
         instructions = (
             "Return exactly one JSON object matching the supplied task candidate schema. "
@@ -643,6 +688,8 @@ class TaskInterpreter:
                 "schedule type. Only the SCHEDULE OBJECT itself carries no timezone "
                 "field for interval schedules."
             )
+        if authorized:
+            instructions += " " + PROACTIVE_EXPANSION_INSTRUCTIONS
         messages = [
             {"role": "system", "content": instructions},
             {"role": "system", "content": json.dumps(CANDIDATE_SCHEMA, separators=(",", ":"))},

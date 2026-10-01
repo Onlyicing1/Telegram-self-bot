@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.ai.task_trace import bind_request, unbind
+from backend.ai.proactive import has_proactive_authorization
 from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
 from backend.ai.tools.context import ToolContext
 from backend.ai.task_candidate import TaskCandidate
@@ -235,6 +236,15 @@ class CreateTaskTool(Tool):
         extra = getattr(context, "extra", None) or {}
         request_id = str(extra.get("request_id") or "-")
         chat_id = extra.get("chat_id")
+        # Per-request proactive authorization: the OWNER'S raw message is the
+        # only source of consent (the Dispatcher already proved it into
+        # ``extra["proactive_authorized"]``); the model-distilled ``request``
+        # argument is a fallback for direct callers. Never stored, never a
+        # global mode — the flag lives exactly as long as this request.
+        proactive_authorized = (
+            bool(extra.get("proactive_authorized"))
+            or has_proactive_authorization(request)
+        )
 
         def _trace(stage: str, **fields: Any) -> None:
             """Emit one AI_TASK_TRACE lifecycle record for this request."""
@@ -314,6 +324,7 @@ class CreateTaskTool(Tool):
             "create_task_received", owner_scope=owner_id,
             chat_id=chat_id if isinstance(chat_id, int) else "-",
             request_len=len(request),
+            proactive_authorized="true" if proactive_authorized else "false",
             preview=" ".join(request.split())[:80],
         )
         _trace("create_task_validation_start")
@@ -340,11 +351,13 @@ class CreateTaskTool(Tool):
             _trace(
                 "create_task_interpretation_start", mode="provider",
                 request_len=len(request),
+                proactive_authorized="true" if proactive_authorized else "false",
             )
             try:
                 candidate = await asyncio.wait_for(
                     TaskInterpreter(provider_manager).interpret(
                         request, timezone=tz_str, request_id=request_id,
+                        proactive_authorized=proactive_authorized,
                     ),
                     timeout=INTERPRET_TIMEOUT_SECONDS,
                 )

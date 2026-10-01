@@ -44,6 +44,7 @@ from backend.ai.engine.result import EngineResult
 from backend.ai.engine.telemetry import telemetry
 from backend.ai.memory.limits import MEMORY_READ_TIMEOUT_S
 from backend.ai.prompt.builder import PromptBuilder
+from backend.ai.proactive import PROACTIVE_AUTHORIZED_RULES, has_proactive_authorization
 from backend.ai.providers.base import ProviderResponse
 from backend.ai.providers.manager.manager import ProviderManager
 from backend.ai.providers.registry.registry import ProviderRegistry
@@ -492,6 +493,27 @@ class Dispatcher:
         # ── Stage 4: Provider + Tool Loop ──
         try:
             messages = self._build_messages(prompt_package)
+            # Per-request proactive initiative: when — and only when — the
+            # owner's OWN message explicitly authorizes additional useful
+            # work, ONE bounded rules message is inserted before the user
+            # input (the shared detector is fail-closed, so a plain request
+            # produces byte-identical messages to before). The bound stated
+            # there is the already-enforced MAX_TOOLS_PER_TURN / MAX_ACTIONS
+            # value of 5 — no existing limit changes.
+            proactive_authorized = has_proactive_authorization(request.user_message)
+            metadata["proactive_authorized"] = proactive_authorized
+            if proactive_authorized:
+                insert_at = len(messages)
+                if messages and messages[-1].get("role") == "user":
+                    insert_at = len(messages) - 1
+                messages.insert(
+                    insert_at,
+                    {"role": "system", "content": PROACTIVE_AUTHORIZED_RULES},
+                )
+                logger.info(
+                    "AI_EXEC_TRACE id=%s stage=proactive_authorized max_tools=%s",
+                    rid or "-", 5,
+                )
             _stage("PROVIDER_REQUEST")
             logger.info("AI_PROVIDER_REQUEST_START id=%s provider=%s", rid or "-", provider_name)
             logger.info(
@@ -1263,6 +1285,10 @@ class Dispatcher:
         # than from model output — see task_contract's provenance rule.
         extra["request_text"] = request.user_message
         extra["request_id"] = request.request_id
+        # Per-request proactive consent, proved from the OWNER'S message by the
+        # ONE shared detector. Tools (create_task) read this instead of
+        # re-deciding authorization — never stored, never a global mode.
+        extra["proactive_authorized"] = has_proactive_authorization(request.user_message)
         # The caller's wall-clock envelope for this request. Long-running tools
         # derive their internal budget from it, so no second, contradictable
         # timeout constant exists in the tool layer.
