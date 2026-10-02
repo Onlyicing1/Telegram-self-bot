@@ -1751,6 +1751,23 @@ _EN_SAVE = frozenset({"save", "saving", "saved", "store", "storing"})
 _EN_SEND = frozenset({"send", "sending", "forward", "forwarding"})
 _EN_NEGATION = frozenset({"not", "never", "dont", "didnt"})
 
+# A question or a meta-discussion frame is never an English COMMAND, whatever
+# else the sentence contains. "What does save mean?" and "let's talk about the
+# save capability." MENTION the capability; they do not request it, so they
+# must stay conversational and reach the model. The Persian path already gets
+# this for free because ``_imperative_present`` requires the imperative suffix
+# ("سیو کن") and never fires on a bare topic word ("سیو یعنی چی؟"). The English
+# path had no equivalent, so the verb token alone decided.
+#
+# Deliberately narrow — only unambiguous interrogative/meta tokens, and NOT
+# "about" (a real semantic-delete frame, see ``_SEMANTIC_DELETE_WORDS``) and
+# NOT "when" (a real event-automation frame, see ``_EN_EVENT_WORDS``). Both of
+# those are already routed to their own paths and must keep working.
+_EN_META_FRAME_WORDS = frozenset({
+    "what", "why", "how", "which", "who", "whom", "whose",
+    "mean", "means", "meaning", "explain", "talk", "discuss", "describe",
+})
+
 # ── owner-supplied saved-item metadata vocabulary ──
 #
 # The deterministic save path resolves the save COMMAND, never the metadata: a
@@ -2774,10 +2791,27 @@ def parse_command_intent(
     # itself the object of the send ("send S0001 here").
     send_intent = send_pos or en_send
 
-    # A bare English verb with no target/count/reply is likely a question
+    # A bare English verb with no target in the MESSAGE is likely a question
     # ("what does save mean?") rather than a command.
-    en_has_target = has_reply or is_this or is_last or count is not None or has_message_word
+    #
+    # A reply is CONTEXT, not a verb TARGET, so ``has_reply`` must NOT
+    # satisfy this gate on its own: while replying to anything, the presence
+    # of the bare word "save" turned meta-discussion into a real save. The
+    # command must name its own object in the message — a positional target
+    # ("save this", "delete the last 5 messages") or a message word ("save the
+    # message"). Every pinned English save command carries one of those, so
+    # deterministic routing for genuinely explicit commands is unchanged.
+    en_has_target = is_this or is_last or count is not None or has_message_word
     if not en_has_target:
+        en_save = False
+    # An explicit save code additionally addresses an EXISTING stored item, so
+    # it is a target for the verbs that operate on one ("delete saved item
+    # S0001"). It deliberately does NOT arm the SAVE verb: "save" never takes a
+    # save code as its object, and in "saved item S0001 details" the word
+    # "saved" is an attributive noun, not a command — treating the code as a
+    # save target there hijacked the saved-item preview.
+    en_has_item_target = en_has_target or _extract_save_code(words, text) is not None
+    if not en_has_item_target or any(w in _EN_META_FRAME_WORDS for w in words):
         en_delete = en_save = en_send = False
 
     if en_delete:
@@ -2798,7 +2832,13 @@ def parse_command_intent(
         return ActionParseResult(kind=KIND_CONVERSATIONAL)
 
     delete_mentioned = delete_pos or delete_neg
-    save_mentioned = save_pos or save_neg
+    # "Mentioned" and "commanded" are different predicates and must not share a
+    # source. ``save_pos``/``save_neg`` now carry the English verb gate, so the
+    # mention predicate adds the English save FORMS directly: in "delete saved
+    # item S0001" the word "saved" is an attributive noun identifying the
+    # object as a stored item, without being a save command. Deriving the
+    # mention from the command flag made these two behaviors inseparable.
+    save_mentioned = save_pos or save_neg or any(w in _EN_SAVE for w in words)
     send_mentioned = send_pos
 
     link_url = _extract_telegram_link(text)

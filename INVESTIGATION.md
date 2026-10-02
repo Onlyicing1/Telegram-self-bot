@@ -1497,3 +1497,148 @@ repository need a persisted preference to authorize proactive initiative?
   detector, both modes, bounds, confirmation gating, recursion-forbid pins,
   and an AST import scan proving no scheduler/executor/registry/dispatcher
   coupling from the detector module.
+
+## 27. Intent-routing boundary audit (immediate workflow vs durable task)
+
+Recorded 2026-10-02 (HEAD context: commit `c69df41`, the audit was run
+against the current `main`, not a historical snapshot). Question: an owner
+asked for an immediate workflow in Persian — "اول سرچ کن، بعد نتیجه رو
+سیو کن، بعد تگ بزن" (search, then save, then tag) — and the UI showed
+"🗓 Creating task...". Which layer is responsible, and is an immediate
+multi-action request being conflated with a durable task?
+
+### 27.1 The traced decision path (owner message → service)
+
+`ai_unified` → `Dispatcher.dispatch` → in this exact order:
+
+1. pending-confirmation consumption (deterministic, pre-provider);
+2. **`_try_local_fast_path` → `actions.parse_command_intent`** — the ONLY
+   deterministic intent layer. Non-conversational ⇒ tools run through the
+   SAME `ToolExecutor` and the provider is never called;
+3. deterministic media analysis;
+4. prompt build (`SYSTEM_RULES` + `RUNTIME_RULES` + `OUTPUT_INSTRUCTIONS`
+   + rendered tool schemas);
+5. `has_proactive_authorization` (`backend/ai/proactive.py`) — fail-closed
+   phrase detector; on a match ONE `PROACTIVE_AUTHORIZED_RULES` system
+   message is inserted for this request only;
+6. provider round with native tool definitions (`_build_tool_definitions`);
+7. structured-action fallback (`parse_action_text` → `validate_action` →
+   `resolve_tool_calls`) + one bounded `_append_action_nudge` recovery;
+8. `ToolExecutor.execute_calls` — the sole caller of `tool.execute()`,
+   `MAX_TOOLS_PER_TURN = 5`, sequential within a round, and `MAX_TOOL_ROUNDS`
+   continuation rounds;
+9. service layer (`save_service` etc.).
+
+**Finding: the infrastructure already supports the immediate workflow.**
+`execute_calls` runs every call in a batch, in order, up to five, and the
+dispatcher keeps iterating rounds. Nothing in the execution path needs to
+change for `web_search → save → update_save_tags`; the plan simply never
+reached it.
+
+### 27.2 Why "Creating task..." appeared — NOT the parser, NOT proactive
+
+Measured in-process against `c69df41` with no network:
+
+| probe | `parse_command_intent` | `save_metadata_requested` | `_is_scheduling_intent` | `has_proactive_authorization` |
+|---|---|---|---|---|
+| "اول سرچ کن، بعد نتیجه رو سیو کن، بعد تگ بزن" | `conversational` | **True** | False | **False** |
+| "هر هفته این کار رو انجام بده" | `conversational` | False | False | **False** |
+
+Both probes deliberately abstain locally and both reach the provider. So the
+"🗓 Creating task..." status (`executor._STATUS_LABELS["create_task"]`) proves
+a real `create_task` tool call came back **from the provider**. The
+responsible layer is **native provider tool selection**, driven by prompt
+structure. Three concrete prompt-level causes, all in
+`backend/ai/prompt/template.py`:
+
+1. **The immediate/durable distinction was never stated.** The system rules
+   mentioned `create_task` only as "anything timed or recurring", with no
+   instruction about a chain of actions to be performed NOW.
+2. **The one "multi-step" rule taught the durable shape.** "A multi-step
+   request … is ONE todo_add call carrying `steps`" is an ordered-multi-part
+   request mapped to ONE stored object — the exact shape the model then
+   transferred to `create_task` for a workflow it was asked to run NOW.
+   Sequencing words ("اول/بعد/بعدش") were undocumented.
+3. **Multi-call planning read as authorization-only.** `RUNTIME_RULES` said
+   "Tools are sequential. One tool at a time. Max 5 tools per turn." and then
+   granted a bounded ordered sequence only "with" the proactive line, so a
+   plain request had no sanctioned way to plan three calls.
+
+Note `OUTPUT_INSTRUCTIONS` rule 8 lists the JSON-action vocabulary and does
+**not** contain `create_task`, so the only way to reach it is a native call —
+consistent with a provider-selection failure rather than a fallback one.
+
+### 27.3 Conversational "save" → the save tool (a REAL parser defect)
+
+The Persian imperative path is tight: `_imperative_present` requires the stem
+plus `کن/کنی/کنید/کنین`, so "سیو یعنی چی؟", "چرا سیستم سیو اینطوری کار
+می‌کنه؟" and "درباره قابلیت سیو صحبت کنیم" were all already conversational.
+
+The **English** path was not. `_english_action` reports the bare token
+`save`, and its only guard was
+`en_has_target = has_reply or is_this or is_last or count is not None or has_message_word`.
+`has_reply` is **context, not a verb target**, so while replying to anything
+the bare word "save" became a real command and ran through the executor with
+**no provider round at all**. Measured pre-fix, `has_reply=True`:
+
+- "what does save mean?" → `executable` / `save`
+- "why does the save system work this way?" → `executable` / `save`
+- "let's talk about the save capability." → `executable` / `save`
+- "how does this bot store things?" → `executable` / `save`
+
+This is exactly the "talking ABOUT save invokes save" report, and it is the
+residual false-positive exposure §24.9(3) predicted, now demonstrated. Note
+"چرا سیستم سیو اینطوری کار می‌کنه؟" is also true in English only — the Persian
+spelling was never the hole.
+
+### 27.4 Two other findings worth recording
+
+- **"این رو سیو کن و بعد تگش کن" silently dropped its second action.**
+  `"تگش"` is not in `_SAVE_TAG_MARKERS` (only `تگ/تگ‌ها/برچسب/هشتگ` are), so
+  `save_metadata_requested` is False and the fast path executed `save` alone.
+  A requested second action vanished with no error — partial execution.
+- **Deterministic scheduling coverage is narrower than it looks.**
+  "هر هفته این کار رو انجام بده" does NOT match `_is_scheduling_intent`,
+  because `انجام/بده` are absent from `_FA_ACTION_VERBS`. It fails closed to
+  the provider, which is architecturally acceptable (the parser never
+  fabricates a schedule), but it means cadence wording is currently carried
+  entirely by the prompt.
+
+### 27.5 What was changed (smallest correction, both causes separated)
+
+**Cause 1 — parser too eager** (`backend/ai/actions.py`):
+- `has_reply` removed from the English verb target gate: the command must name
+  its own object in the message. Every pinned English command ("save this
+  message with deep mode", "delete this message", "send this") already does.
+- A narrow interrogative/meta frame set (`_EN_META_FRAME_WORDS`) zeroes the
+  English verbs — deliberately excluding `about` (semantic-delete frame) and
+  `when` (event frame), which keep their own routing.
+- An explicit save code is accepted as a target for delete/send only, never
+  for save: "saved item S0001" has an attributive "saved" noun, and letting
+  the code arm the save verb hijacked the saved-item preview.
+- `save_mentioned` no longer derives from the (now gated) command flag. A
+  mention and a command are different predicates; in "delete saved item
+  S0001" the mention is what routes to `delete_saved_item`.
+
+**Cause 2 — prompt structure** (`backend/ai/prompt/template.py`): an explicit
+"Immediate workflows vs durable tasks" contract in the system rules (with the
+anime chain as the worked example), the `todo_add` "multi-step" rule scoped to
+durable todos, `RUNTIME_RULES` stating that running the owner's own ordered
+sequence needs no proactive authorization, and an output rule that forbids
+answering "do this now" with a stored object.
+
+Deterministic routing for genuinely explicit commands is unchanged, and no
+new dispatcher, executor, scheduler, permission system, or heuristic tool
+routing was introduced. Every route still terminates at the single
+`ToolRegistry` → `ToolExecutor` boundary.
+
+### 27.6 Tests
+
+`tests/test_intent_routing_boundary.py` (51) pins the five categories at the
+decision boundary: conversational capability mention (Persian + English, with
+and without a reply), explicit single action (kept deterministic), explicit
+immediate multi-action (never `create_task`), durable/scheduled request, and
+proactive authorized workflow. It asserts what the boundary RESOLVES and what
+the prompt contract states — it never injects a correct tool call and asserts
+the executor runs it.
+

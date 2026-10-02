@@ -418,6 +418,53 @@ gap documented), **DEFERRED** (planned, deliberately not built now),
   not regex, and stays authoritative for the narrow save/delete/send
   vocabulary exactly as before.
 
+### Audit — Intent-routing boundary (immediate workflow vs durable task) — **IMPLEMENTED**
+
+- **Base commit audited:** `c69df41` (current `main`), read fresh from the
+  tree. Full findings in `INVESTIGATION.md` §27.
+- **Reported symptom:** "اول سرچ کن، بعد نتیجه رو سیو کن، بعد تگ بزن"
+  (search, then save, then tag) displayed "🗓 Creating task..." instead of
+  running the immediate workflow.
+- **Cause 1 — provider tool selection driven by prompt structure (not the
+  parser, not proactive).** Measured in-process: the request is
+  `conversational` locally because a tag was requested, `_is_scheduling_intent`
+  is False, and `has_proactive_authorization` is False. It therefore reaches
+  the provider, and `executor._STATUS_LABELS["create_task"]` proves the
+  provider returned a real `create_task` call. The prompt never defined the
+  immediate/durable distinction, taught "multi-step request → ONE `todo_add`
+  with `steps`" (the durable shape), and read multi-call planning as
+  authorization-only. **Fixed in `backend/ai/prompt/template.py`** by an
+  explicit "Immediate workflows vs durable tasks" contract (with the anime
+  chain as the worked example), by scoping the `todo_add` multi-step rule to
+  durable todos, by stating in `RUNTIME_RULES` that running the owner's own
+  ordered sequence needs no proactive authorization, and by forbidding an
+  output rule that answers "do this now" with a stored object.
+- **Cause 2 — the deterministic parser treated a capability mention as a
+  command (failure A).** `_english_action` reports the bare token `save`, and
+  its only guard included `has_reply`. A reply is CONTEXT, not a verb TARGET,
+  so while replying to anything, "what does save mean?", "let's talk about the
+  save capability." and "how does this bot store things?" all became an
+  executed `save` with NO provider round. The Persian path was never affected
+  (`_imperative_present` requires stem + `کن`). **Fixed in
+  `backend/ai/actions.py`**: `has_reply` removed from the English target gate,
+  a narrow interrogative/meta frame set added (excluding `about` and `when`,
+  which have their own routing), a save code accepted as a target for
+  delete/send only, and `save_mentioned` decoupled from the now-gated command
+  flag so a mention and a command stay different predicates.
+- **Not changed, deliberately:** no second dispatcher, executor, scheduler, or
+  permission system; no heuristic tool routing; no schema/SQL change; no
+  weakening of `ToolRegistry` → `ToolExecutor`. Deterministic routing for
+  genuinely explicit commands is unchanged, and the execution infrastructure
+  already supported multi-call turns (`MAX_TOOLS_PER_TURN = 5`,
+  `MAX_TOOL_ROUNDS` continuation) — the plan simply never reached it.
+- **Also recorded, not fixed (documented gaps):** "این رو سیو کن و بعد تگش کن"
+  silently drops its second action because `تگش` is not in
+  `_SAVE_TAG_MARKERS`; and "هر هفته این کار رو انجام بده" does not match
+  `_is_scheduling_intent` (`انجام/بده` absent from `_FA_ACTION_VERBS`), so
+  cadence wording is carried entirely by the prompt.
+- **Tests:** `tests/test_intent_routing_boundary.py` (51), pinning the five
+  categories at the decision boundary.
+
 ### Prior phases the Taskloom arc builds on — **IMPLEMENTED**
 
 - **Part 1 (basic todo list, `af0a8d7`):** the unscheduled `schedule_type =
@@ -771,10 +818,19 @@ Note: per-file `grep -c "def test_"` counts (30/32/41/29/31/26 definitions)
 differ from collected totals where parametrization expands cases — the
 collected numbers above are the authoritative ones.
 
-**Full suite.** `.venv/bin/python -m pytest tests/ -q` at HEAD `d80ee36`:
-**5357 passed, 26 skipped** in ~118 s. (For continuity with prior phases'
-full-suite runs, the same totals were recorded at `679ae09`; the run during
-this audit confirms the totals still hold at the docs-only commit `d80ee36`.)
+**Intent-routing boundary suite.** `tests/test_intent_routing_boundary.py`
+(51 collected, 51 passed) — conversational capability mention (Persian and
+English, with and without a reply), explicit single action kept deterministic,
+explicit immediate multi-action never `create_task`, durable/scheduled request,
+and proactive authorized workflow. It exercises what the boundary RESOLVES and
+what the prompt contract states; it never injects a correct tool call and
+asserts the executor runs it.
+
+**Full suite.** `.venv/bin/python -m pytest tests/ -q` after the
+intent-routing fix on top of `c69df41`: **5460 passed, 26 skipped** in
+~118 s, 0 failed. (The preceding totals in this section were recorded at
+`d80ee36`; the newer Taskloom commits and this suite account for the
+difference.)
 
 **Contract pins.** Tool registry size pinned at exactly 55
 (`test_tool_health_audit.py` line 169;
